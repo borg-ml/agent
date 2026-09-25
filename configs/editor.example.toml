@@ -31,6 +31,7 @@ diff_expansion = "expanded" # expanded | collapsed | until_next_action
 auto_expand_tools = false
 auto_expand_thinking = false
 tool_click_behavior = "fullscreen" # expandable timeline details: fullscreen | inline
+response_streaming = "paragraph" # replies appear a finished block at a time: paragraph | token
 # Show the short "Generating edit…" descriptor while a tool call is assembled.
 action_descriptors = true
 # Omit to choose the microphone icon on first use. Valid values: nerd_font, emoji.

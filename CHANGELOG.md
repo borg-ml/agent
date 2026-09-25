@@ -21,6 +21,12 @@ Git comparison.
 
 ### Terminal
 
+- Replies stream a finished paragraph at a time by default: a paragraph once a
+  blank line ends it, lists item by item, code blocks once their fence closes,
+  and titles together with the text under them. `/streaming token` (or
+  Settings → Response streaming) shows every token as it arrives instead.
+- Settings menu choices after "Auto-expand tools" opened the setting below
+  them; each now opens its own.
 - Watch and other action rows sit in the action list with no extra spacing,
   uniform with Ran and Reasoned rows.
 - Truncated diff previews end with "click to expand".

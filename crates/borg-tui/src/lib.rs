@@ -42,8 +42,8 @@ use borg_remote::{
 use borg_remote::{tool_call_summary, tool_code_view};
 use borg_ui::localization::{UiLanguage, text as ui_text};
 use borg_ui::preferences::{
-    CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy, ToolClickBehavior,
-    TranscriptPreferences, parse_hex_color,
+    CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy, ResponseStreaming,
+    ToolClickBehavior, TranscriptPreferences, parse_hex_color,
 };
 use borg_ui::timeline::tool_lifecycle_label;
 use chrono::{DateTime, Local, NaiveDate, Utc};
@@ -878,6 +878,7 @@ pub enum UiAction {
     SetAutoExpandTools(bool),
     SetAutoExpandThinking(bool),
     SetToolClickBehavior(ToolClickBehavior),
+    SetResponseStreaming(ResponseStreaming),
     SetActionDescriptors(bool),
     SetWrapActionRows(bool),
     SetRunningSweeps(bool),
@@ -1632,6 +1633,7 @@ pub struct BorgTerminal {
     running_sweeps: bool,
     action_descriptors: bool,
     tool_click_behavior: ToolClickBehavior,
+    response_streaming: ResponseStreaming,
     thread_find: Option<ThreadFindState>,
     completion_notifications: CompletionAlertPolicy,
     completion_sound: CompletionAlertPolicy,
@@ -1907,6 +1909,7 @@ enum PickerKind {
     AutoExpandTools,
     AutoExpandThinking,
     ToolClickBehavior,
+    ResponseStreaming,
     ActionDescriptors,
     WrapActionRows,
     RunningSweeps,
@@ -2871,6 +2874,7 @@ impl BorgTerminal {
             running_sweeps: true,
             action_descriptors: true,
             tool_click_behavior: ToolClickBehavior::Fullscreen,
+            response_streaming: ResponseStreaming::Paragraph,
             thread_find: None,
             completion_notifications: CompletionAlertPolicy::Unfocused,
             completion_sound: CompletionAlertPolicy::Unfocused,
@@ -4847,7 +4851,9 @@ impl BorgTerminal {
             "Keep machine awake".to_string(),
             "Auto-expand edits".to_string(),
             "Auto-expand tools".to_string(),
+            "Auto-expand thinking".to_string(),
             "Tool click behavior".to_string(),
+            "Response streaming".to_string(),
             "Action descriptors".to_string(),
             "Running sweep animations".to_string(),
             "Wrap action rows".to_string(),
@@ -4875,6 +4881,7 @@ impl BorgTerminal {
             "/expand-tools",
             "/expand-thinking",
             "/tool-click",
+            "/streaming",
             "/action-descriptors",
             "/animations",
             "/wrap-actions",
@@ -5227,6 +5234,18 @@ impl BorgTerminal {
         ));
     }
 
+    pub fn open_response_streaming_picker(&mut self) {
+        self.picker = Some(Picker::new(
+            PickerKind::ResponseStreaming,
+            "Response streaming",
+            ["Paragraph", "Token"],
+            Some(match self.response_streaming {
+                ResponseStreaming::Paragraph => "Paragraph",
+                ResponseStreaming::Token => "Token",
+            }),
+        ));
+    }
+
     pub fn open_action_descriptors_picker(&mut self) {
         self.picker = Some(Picker::new(
             PickerKind::ActionDescriptors,
@@ -5460,6 +5479,12 @@ impl BorgTerminal {
             self.capture_transcript_anchor_for_collapse();
         }
         self.transcript.set_auto_expand_thinking(enabled);
+        self.invalidate_transcript_render_cache();
+    }
+
+    pub fn set_response_streaming(&mut self, streaming: ResponseStreaming) {
+        self.response_streaming = streaming;
+        self.transcript.set_response_streaming(streaming);
         self.invalidate_transcript_render_cache();
     }
 
@@ -7149,6 +7174,13 @@ impl BorgTerminal {
                     ToolClickBehavior::Fullscreen
                 })
             }
+            PickerKind::ResponseStreaming => {
+                UiAction::SetResponseStreaming(if picker.selected_value() == "Token" {
+                    ResponseStreaming::Token
+                } else {
+                    ResponseStreaming::Paragraph
+                })
+            }
             PickerKind::ActionDescriptors => {
                 UiAction::SetActionDescriptors(picker.selected_value() == "On")
             }
@@ -7261,6 +7293,11 @@ impl BorgTerminal {
     fn draw_internal(&mut self, input_fast_path: bool) -> Result<()> {
         if self.transcript.tool_click_behavior != self.tool_click_behavior {
             self.transcript.tool_click_behavior = self.tool_click_behavior;
+            self.invalidate_transcript_render_cache();
+        }
+        if self.transcript.response_streaming != self.response_streaming {
+            self.transcript
+                .set_response_streaming(self.response_streaming);
             self.invalidate_transcript_render_cache();
         }
         // Child and resumed transcripts are built fresh; whichever one is shown
@@ -10646,6 +10683,7 @@ fn fresh_transcript_like(previous: &Transcript) -> Transcript {
         auto_expand_tools: previous.auto_expand_tools,
         auto_expand_thinking: previous.auto_expand_thinking,
         tool_click_behavior: previous.tool_click_behavior,
+        response_streaming: previous.response_streaming,
         show_subagent_messages: previous.show_subagent_messages,
         follow_tail: previous.follow_tail,
         user_label: previous.user_label.clone(),

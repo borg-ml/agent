@@ -45,7 +45,7 @@ use crate::dictation::{
 };
 use crate::editor_preferences::{
     ActiveMessageBehavior, CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy,
-    EditorPreferences, LidSleepSetup, ToolClickBehavior,
+    EditorPreferences, LidSleepSetup, ResponseStreaming, ToolClickBehavior,
 };
 use crate::sleep_inhibitor::{LidSleepStatus, SleepInhibitor, authorize_lid_sleep};
 use crate::terminal_ui::{
@@ -2770,6 +2770,7 @@ async fn run_local_agent_session(
         terminal.set_auto_expand_tools(editor_preferences.presentation.auto_expand_tools);
         terminal.set_auto_expand_thinking(editor_preferences.presentation.auto_expand_thinking);
         terminal.set_tool_click_behavior(editor_preferences.presentation.tool_click_behavior);
+        terminal.set_response_streaming(editor_preferences.presentation.response_streaming);
         terminal.set_action_descriptors(editor_preferences.presentation.action_descriptors);
         terminal.set_running_sweeps(editor_preferences.presentation.running_sweeps);
         terminal.set_wrap_action_rows(editor_preferences.presentation.wrap_action_rows);
@@ -3894,6 +3895,9 @@ async fn run_local_agent_session(
                                 );
                                 terminal.set_tool_click_behavior(
                                     editor_preferences.presentation.tool_click_behavior,
+                                );
+                                terminal.set_response_streaming(
+                                    editor_preferences.presentation.response_streaming,
                                 );
                                 terminal.set_action_descriptors(
                                     editor_preferences.presentation.action_descriptors,
@@ -5603,6 +5607,14 @@ async fn run_local_agent_session(
                             tool_click_behavior_label(behavior)
                         ));
                     }
+                    UiAction::SetResponseStreaming(streaming) => {
+                        apply_response_streaming(
+                            streaming,
+                            &mut editor_preferences,
+                            &editor_preferences_tx,
+                            terminal.as_mut().expect("terminal"),
+                        );
+                    }
                     UiAction::SetActionDescriptors(enabled) => {
                         editor_preferences.presentation.action_descriptors = enabled;
                         dispatch_editor_preferences_save(
@@ -6305,6 +6317,32 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .open_tool_click_behavior_picker();
+                        } else if line == "/streaming" && attachments.is_empty() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .open_response_streaming_picker();
+                        } else if let Some(value) = line.strip_prefix("/streaming ")
+                            && attachments.is_empty()
+                        {
+                            let terminal = terminal.as_mut().expect("terminal");
+                            match value.trim() {
+                                "paragraph" => apply_response_streaming(
+                                    ResponseStreaming::Paragraph,
+                                    &mut editor_preferences,
+                                    &editor_preferences_tx,
+                                    terminal,
+                                ),
+                                "token" => apply_response_streaming(
+                                    ResponseStreaming::Token,
+                                    &mut editor_preferences,
+                                    &editor_preferences_tx,
+                                    terminal,
+                                ),
+                                _ => terminal.set_notice(
+                                    "Choose /streaming paragraph or /streaming token",
+                                ),
+                            }
                         } else if line == "/action-descriptors" && attachments.is_empty() {
                             terminal
                                 .as_mut()
@@ -9227,6 +9265,21 @@ fn parse_on_off(value: &str) -> Option<bool> {
         "off" | "false" | "0" => Some(false),
         _ => None,
     }
+}
+
+fn apply_response_streaming(
+    streaming: ResponseStreaming,
+    editor_preferences: &mut EditorPreferences,
+    editor_preferences_tx: &mpsc::UnboundedSender<EditorPreferences>,
+    terminal: &mut BorgTerminal,
+) {
+    editor_preferences.presentation.response_streaming = streaming;
+    dispatch_editor_preferences_save(editor_preferences_tx, editor_preferences);
+    terminal.set_response_streaming(streaming);
+    terminal.set_notice(match streaming {
+        ResponseStreaming::Paragraph => "Replies appear a finished paragraph at a time",
+        ResponseStreaming::Token => "Replies appear token by token",
+    });
 }
 
 fn parse_tool_click_behavior(value: &str) -> Option<ToolClickBehavior> {

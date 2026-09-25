@@ -110,6 +110,16 @@ pub enum DiffExpansionPolicy {
     UntilNextAction,
 }
 
+/// How a reply appears while it streams: a finished block at a time, or every
+/// token as it arrives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseStreaming {
+    #[default]
+    Paragraph,
+    Token,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolClickBehavior {
@@ -169,6 +179,7 @@ pub struct PresentationPreferences {
     pub auto_expand_tools: bool,
     pub auto_expand_thinking: bool,
     pub tool_click_behavior: ToolClickBehavior,
+    pub response_streaming: ResponseStreaming,
     pub action_descriptors: bool,
     pub running_sweeps: bool,
     /// Let tool and action rows wrap onto more lines; off keeps each row on one line.
@@ -192,6 +203,7 @@ impl Default for PresentationPreferences {
             auto_expand_tools: false,
             auto_expand_thinking: false,
             tool_click_behavior: ToolClickBehavior::Fullscreen,
+            response_streaming: ResponseStreaming::Paragraph,
             action_descriptors: true,
             running_sweeps: true,
             wrap_action_rows: false,
@@ -565,6 +577,7 @@ keep = true
                 auto_expand_tools: true,
                 auto_expand_thinking: false,
                 tool_click_behavior: ToolClickBehavior::Inline,
+                response_streaming: ResponseStreaming::Token,
                 action_descriptors: false,
                 running_sweeps: false,
                 wrap_action_rows: true,

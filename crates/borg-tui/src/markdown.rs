@@ -1001,3 +1001,117 @@ mod tests {
         }
     }
 }
+
+/// How much of a streaming reply is finished Markdown, as a byte offset.
+///
+/// Paragraph streaming shows a reply a block at a time: a paragraph once a
+/// blank line ends it, a list one item at a time, a code block once its fence
+/// closes. A heading or bold-only title waits for the content under it, so it
+/// never sits alone above nothing.
+pub(super) fn paragraph_release(text: &str) -> usize {
+    let mut release = 0;
+    let mut in_fence = false;
+    // A title whose content has not arrived holds everything from its start.
+    let mut held_title: Option<usize> = None;
+    let mut offset = 0;
+    fn advance(release: &mut usize, candidate: usize, held: Option<usize>) {
+        *release = (*release).max(held.map_or(candidate, |title| candidate.min(title)));
+    }
+    for line in text.split_inclusive('\n') {
+        let start = offset;
+        if !line.ends_with('\n') {
+            // A new item's marker already proves the one before it finished.
+            if !in_fence && is_list_item(line) {
+                advance(&mut release, start, held_title);
+            }
+            break;
+        }
+        offset += line.len();
+        let trimmed = line.trim();
+        let fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        if in_fence {
+            if fence {
+                in_fence = false;
+                held_title = None;
+                advance(&mut release, offset, held_title);
+            }
+            continue;
+        }
+        if fence {
+            in_fence = true;
+            advance(&mut release, start, held_title);
+        } else if trimmed.is_empty() {
+            advance(&mut release, offset, held_title);
+        } else if is_title(trimmed) {
+            advance(&mut release, start, held_title);
+            held_title.get_or_insert(start);
+        } else if is_list_item(line) {
+            advance(&mut release, start, held_title);
+            held_title = None;
+        } else {
+            held_title = None;
+        }
+    }
+    release
+}
+
+fn is_title(line: &str) -> bool {
+    let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
+    (1..=6).contains(&hashes) && line[hashes..].starts_with(' ')
+        || line.len() > 4
+            && line.starts_with("**")
+            && line.ends_with("**")
+            && !line[2..line.len() - 2].contains("**")
+}
+
+fn is_list_item(line: &str) -> bool {
+    let item = line.trim_start();
+    if let Some(rest) = item.strip_prefix(['-', '*', '+']) {
+        return rest.starts_with([' ', '\t']);
+    }
+    let digits = item.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0
+        && item[digits..].starts_with(['.', ')'])
+        && item[digits + 1..].starts_with([' ', '\t'])
+}
+
+#[cfg(test)]
+mod paragraph_release_tests {
+    use super::paragraph_release;
+
+    fn shown(text: &str) -> &str {
+        &text[..paragraph_release(text)]
+    }
+
+    #[test]
+    fn a_paragraph_appears_once_a_blank_line_ends_it() {
+        assert_eq!(shown("First para"), "");
+        assert_eq!(shown("First para\n\nSecond"), "First para\n\n");
+    }
+
+    #[test]
+    fn a_code_block_waits_for_its_closing_fence() {
+        assert_eq!(shown("Intro\n\n```rust\nfn a() {}\n\nfn b"), "Intro\n\n");
+        assert_eq!(
+            shown("Intro\n\n```rust\nfn a() {}\n```\nmore"),
+            "Intro\n\n```rust\nfn a() {}\n```\n"
+        );
+    }
+
+    #[test]
+    fn list_items_stream_one_at_a_time() {
+        assert_eq!(
+            shown("## Steps\n\n- one\n- two\n- thr"),
+            "## Steps\n\n- one\n- two\n"
+        );
+    }
+
+    #[test]
+    fn a_title_waits_for_the_content_under_it() {
+        assert_eq!(shown("Done.\n\n## Risks\n\n"), "Done.\n\n");
+        assert_eq!(
+            shown("Done.\n\n**Risks**\n\nFirst risk.\n\n"),
+            "Done.\n\n**Risks**\n\nFirst risk.\n\n"
+        );
+    }
+}
