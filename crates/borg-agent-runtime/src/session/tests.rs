@@ -8691,12 +8691,20 @@ async fn resuming_a_goal_mid_turn_releases_the_stop_latch() {
 /// not resume it, and a separate /goal pause must remain paused.
 #[tokio::test]
 async fn fresh_human_input_resumes_only_an_interrupted_goal() {
-    for (stopped, pre_stop_turn) in [(true, false), (true, true), (false, false)] {
+    // A blocked goal also reopens: fresh human input is the new direction it
+    // was waiting for, with or without a stop latch.
+    for (stopped, pre_stop_turn, initial) in [
+        (true, false, GoalStatus::Paused),
+        (true, true, GoalStatus::Paused),
+        (false, false, GoalStatus::Paused),
+        (false, false, GoalStatus::Blocked),
+    ] {
+        let resumes = stopped || initial == GoalStatus::Blocked;
         let root = tempdir().unwrap();
         let session_id = Uuid::new_v4();
         let (scratch, store, mut journal) = runtime_store(session_id).await;
         let mut goal = SessionGoal::new("Finish verification".to_string(), None);
-        goal.status = GoalStatus::Paused;
+        goal.status = initial;
         let mut events = vec![
             SessionEventKind::SessionStarted,
             SessionEventKind::SessionConfigured {
@@ -8780,7 +8788,7 @@ async fn fresh_human_input_resumes_only_an_interrupted_goal() {
         }).await.expect("session is ready for the fresh prompt");
         assert_eq!(
             store.state(session_id).await.unwrap().goal.unwrap().status,
-            GoalStatus::Paused
+            initial
         );
 
         command_tx
@@ -8804,7 +8812,7 @@ async fn fresh_human_input_resumes_only_an_interrupted_goal() {
         let state = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let state = store.state(session_id).await.unwrap();
-                if !stopped
+                if !resumes
                     || (!state.user_stopped
                         && state
                             .goal
@@ -8820,11 +8828,7 @@ async fn fresh_human_input_resumes_only_an_interrupted_goal() {
         .expect("fresh input resumes the interrupted goal");
         assert_eq!(
             state.goal.unwrap().status,
-            if stopped {
-                GoalStatus::Active
-            } else {
-                GoalStatus::Paused
-            }
+            if resumes { GoalStatus::Active } else { initial }
         );
         if stopped {
             assert!(!state.user_stopped);
