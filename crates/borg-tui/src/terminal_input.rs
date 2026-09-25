@@ -14,6 +14,17 @@ const DRAG_FLUSH_INTERVAL: Duration = Duration::from_millis(8);
 const RESIZE_FLUSH_INTERVAL: Duration = Duration::from_millis(33);
 const MAX_PENDING_WHEEL_EVENTS: isize = 32;
 
+/// When the reader last saw Enter, before the event loop handled it, so prompt
+/// timing can include time the key spent waiting behind a busy loop.
+static LAST_ENTER_READ: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+pub fn take_last_enter_read() -> Option<std::time::Instant> {
+    LAST_ENTER_READ
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
 pub struct TerminalInputEvent {
     pub(super) event: Event,
     pub(super) scroll_repetitions: usize,
@@ -354,6 +365,15 @@ async fn pump_terminal_events<S>(
                     );
                     return;
                 };
+                if let Ok(Event::Key(key)) = &event
+                    && key.code == KeyCode::Enter
+                    && key.kind == KeyEventKind::Press
+                {
+                    *LAST_ENTER_READ
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        Some(std::time::Instant::now());
+                }
                 if let Ok(Event::Resize(_, _)) = &event {
                     pending_resize = event.ok();
                 } else if let Ok(Event::Mouse(mouse)) = &event

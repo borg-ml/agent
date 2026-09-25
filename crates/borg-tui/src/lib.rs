@@ -79,7 +79,7 @@ use self::markdown::{
     markdown_lines, markdown_link_ranges, markdown_plain_text, open_link, truncate_table_cell,
 };
 use self::terminal_input::TerminalInput;
-pub use self::terminal_input::TerminalInputEvent;
+pub use self::terminal_input::{TerminalInputEvent, take_last_enter_read};
 use borg_ui::KeybindingConfig;
 
 const INLINE_VIEWPORT_HEIGHT: u16 = 24;

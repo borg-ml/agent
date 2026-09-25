@@ -162,6 +162,37 @@ enum UiInteractionCompletion {
     CoordinatorClosed,
 }
 
+/// Where the latest prompt's time went between Enter and Running, logged once
+/// so a slow "starting" phase can be attributed to the loop, the durable
+/// admission, the host, or the provider setup.
+struct PromptTiming {
+    message_id: Uuid,
+    enter: Option<std::time::Instant>,
+    submitted: std::time::Instant,
+    routed: Option<std::time::Instant>,
+    host: Option<std::time::Instant>,
+    idle: bool,
+    delivery: PromptDelivery,
+}
+
+impl PromptTiming {
+    fn log(&self, running: Option<std::time::Instant>) {
+        let ms = |from: std::time::Instant, to: Option<std::time::Instant>| {
+            to.map(|to| to.saturating_duration_since(from).as_millis() as u64)
+        };
+        tracing::info!(
+            message_id = %self.message_id,
+            idle = self.idle,
+            delivery = ?self.delivery,
+            enter_to_submit_ms = ?self.enter.map(|enter| self.submitted.saturating_duration_since(enter).as_millis() as u64),
+            submit_to_routed_ms = ?ms(self.submitted, self.routed),
+            submit_to_host_ms = ?ms(self.submitted, self.host),
+            submit_to_running_ms = ?ms(self.submitted, running),
+            "prompt start timing"
+        );
+    }
+}
+
 fn spawn_ui_interaction_dispatcher(
     store: Arc<dyn SessionStore>,
     commands: mpsc::Sender<HostCommand>,
@@ -2914,6 +2945,7 @@ async fn run_local_agent_session(
     // still reports Ready. Preserve that handoff on terminal hangup instead
     // of mistaking the short admission window for an idle session.
     let mut pending_prompt_ids = HashSet::new();
+    let mut prompt_timing: Option<PromptTiming> = None;
     let mut stop_sent = false;
     let mut user_requested_exit = false;
     let mut exit_notice = None;
@@ -3369,6 +3401,12 @@ async fn run_local_agent_session(
                             message_id = %submission.message_id,
                             "durable UI prompt reached the session coordinator"
                         );
+                        if let Some(timing) = prompt_timing
+                            .as_mut()
+                            .filter(|timing| timing.message_id == submission.message_id)
+                        {
+                            timing.routed = Some(std::time::Instant::now());
+                        }
                     }
                     UiInteractionCompletion::Prompt {
                         submission,
@@ -4009,6 +4047,27 @@ async fn run_local_agent_session(
                     server.publish_live_event(&event);
                 }
                 delivered_projection.observe(&event)?;
+                if let Some(timing) = prompt_timing.as_mut() {
+                    match &event.kind {
+                        SessionEventKind::Message { message_id, .. }
+                            if *message_id == timing.message_id && timing.host.is_none() =>
+                        {
+                            timing.host = Some(std::time::Instant::now());
+                            if !timing.idle {
+                                timing.log(None);
+                                prompt_timing = None;
+                            }
+                        }
+                        SessionEventKind::StatusChanged {
+                            status: SessionStatus::Running,
+                            ..
+                        } if timing.host.is_some() => {
+                            timing.log(Some(std::time::Instant::now()));
+                            prompt_timing = None;
+                        }
+                        _ => {}
+                    }
+                }
                 if let Some(message_id) = committed_prompt_id(&event.kind) {
                     pending_prompt_ids.remove(&message_id);
                     local_prompt_admissions
@@ -7324,6 +7383,15 @@ async fn run_local_agent_session(
                                             output_schema: None,
                                             delivery,
                                         };
+                                        prompt_timing = Some(PromptTiming {
+                                            message_id,
+                                            enter: borg_tui::take_last_enter_read(),
+                                            submitted: std::time::Instant::now(),
+                                            routed: None,
+                                            host: None,
+                                            idle: !active,
+                                            delivery,
+                                        });
                                         let submission = UiPromptSubmission {
                                             journal_session_id: session_id,
                                             target: None,
