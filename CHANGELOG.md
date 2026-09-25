@@ -11,11 +11,15 @@ Git comparison.
   including for subagents, without adding a second `run` timer.
 - The Running status highlight sweeps more slowly and narrowly, without
   changing tool-row sweep speed.
+- The full-width status strips above and below the composer are black, and the
+  redundant send/Enter footer hint is gone.
 
 ### Agents and teams
 
 - Yielding on watchers is enabled by default for new sessions. Set
   `capabilities.watcher_yield = false` to disable it.
+- Queued follow-ups arriving a few milliseconds apart at a turn boundary are
+  batched into the same model turn instead of leaving a late sibling pending.
 
 ### Providers and dictation
 

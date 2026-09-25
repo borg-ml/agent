@@ -9696,6 +9696,71 @@ async fn inactive_wake_report_is_retained_for_the_root_provider_turn() {
 }
 
 #[tokio::test]
+async fn turn_boundary_waits_for_a_late_sibling_of_pending_input() {
+    let session_id = Uuid::new_v4();
+    let (scratch, _store, mut journal) = runtime_store(session_id).await;
+    let (event_tx, _event_rx) = mpsc::channel(8);
+    let (command_tx, mut command_rx) = mpsc::channel(8);
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    let mut pending = VecDeque::new();
+    let mut team_message_ids = HashSet::new();
+    queue_pending_prompt(
+        &mut journal,
+        &event_tx,
+        session_id,
+        &mut pending,
+        &mut team_message_ids,
+        first_id,
+        "first".into(),
+        Vec::new(),
+        None,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: second_id,
+                text: "second".into(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Queue,
+            })
+            .await
+            .unwrap();
+    });
+    let mut deferred = VecDeque::new();
+    let mut stale = HashSet::new();
+    collect_input_at_turn_boundary(
+        &mut journal,
+        &event_tx,
+        session_id,
+        &mut pending,
+        &mut command_rx,
+        &mut deferred,
+        &mut team_message_ids,
+        &mut stale,
+    )
+    .await
+    .unwrap();
+    coalesce_queued_prompts(&mut pending);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].text, "first\n\nsecond");
+    assert_eq!(
+        pending[0]
+            .batch_entries()
+            .iter()
+            .map(|entry| entry.message_id)
+            .collect::<Vec<_>>(),
+        [first_id, second_id]
+    );
+    scratch.discard().await;
+}
+
+#[tokio::test]
 async fn turn_boundary_collects_all_emitted_prompts_before_escape() {
     let session_id = Uuid::new_v4();
     let (scratch, _store, mut journal) = runtime_store(session_id).await;
