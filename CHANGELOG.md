@@ -47,7 +47,8 @@ Git comparison.
 - The action list is regrouped: every batch of actions sits under one header
   with its start time, action count and working directory (`17:41 · 7 actions ·
   ~/project`); finished batches fold to that header until clicked and can be
-  clicked again to collapse. The group uses an empty indent instead of a rail.
+  clicked again to collapse. Expanded groups show `▾`, collapsed ones `▸`,
+  with their timestamps in the same column.
   Rows drop their clock time and leading `cd …`, name what a command did
   (`Read src/main.rs:1-40`, `Search “pattern”`, `Write build.py`, `Run Python`),
   show its result beside the duration (`6 matches`, `exit 1`, `12 passed`,
@@ -61,7 +62,8 @@ Git comparison.
   are rose-purple; todos use orange. Action-group timestamps align with rows.
 - With an empty composer, press Down to focus the status line; arrows and Tab
   navigate its menus, Enter or Space activates a control, and Escape returns
-  to the composer. The focused control is visibly highlighted.
+  to the composer. Ctrl+1–9/0 (Cmd+1–9/0 on macOS) reaches the visible
+  controls on both composer lines in reading order. Focus is highlighted.
 - `/team` broadcasts appear in the timeline immediately and show how many
   live addressed teammates durably acknowledged the message; the count keeps
   updating while the session is active and survives reconnects.

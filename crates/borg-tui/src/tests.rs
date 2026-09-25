@@ -11003,6 +11003,36 @@ async fn keyboard_reaches_status_line_menus_without_a_mouse() {
         "{targets:?}"
     );
 
+    // Number keys traverse the complete visible target list across both
+    // composer lines. A lower-line Watch menu is represented explicitly.
+    let platform_modifier = if cfg!(target_os = "macos") {
+        KeyModifiers::SUPER
+    } else {
+        KeyModifiers::CONTROL
+    };
+    terminal.watch_status_area = Some(Rect::new(
+        2,
+        terminal.composer_area.expect("drawn composer").bottom() + 1,
+        8,
+        1,
+    ));
+    let all_targets = terminal.status_focus_targets();
+    assert!(all_targets.len() > 3);
+    assert_eq!(
+        all_targets.last().map(|(focus, _)| *focus),
+        Some(StatusFocus::Watch)
+    );
+    for (index, (expected, _)) in all_targets.iter().take(10).enumerate() {
+        let digit = char::from_digit((index as u32 + 1) % 10, 10).unwrap();
+        terminal
+            .handle_key(KeyEvent::new(KeyCode::Char(digit), platform_modifier))
+            .unwrap();
+        assert_eq!(terminal.status_focus, Some(*expected));
+    }
+    terminal.handle_key(key(KeyCode::Esc)).unwrap();
+    terminal.watch_status_area = None;
+    assert_eq!(terminal.status_focus, None);
+
     // Down from the empty composer focuses the first status control, and
     // Right visits every control before wrapping.
     terminal.handle_key(key(KeyCode::Down)).unwrap();
@@ -12737,6 +12767,10 @@ fn a_finished_action_group_folds_to_its_summary_until_clicked() {
         folded.contains("▸ 12:00 · 4 actions · /srv/ore-cues · click to expand"),
         "{folded}"
     );
+    assert_eq!(
+        "▸ ".chars().count(),
+        TOOL_WINDOW_HEADER_INDENT.chars().count()
+    );
     assert!(!folded.contains("first-read"), "{folded}");
     assert!(
         folded.contains("second-run"),
@@ -12745,6 +12779,7 @@ fn a_finished_action_group_folds_to_its_summary_until_clicked() {
 
     assert!(transcript.toggle_tool_run_expansion(0));
     let unfolded = render(&transcript);
+    assert!(unfolded.contains("▾ 12:00 · 4 actions"), "{unfolded}");
     assert!(unfolded.contains("first-read"), "{unfolded}");
     assert!(unfolded.contains("3 matches"), "{unfolded}");
 }
@@ -12926,7 +12961,7 @@ fn agent_lifecycle_rows_keep_one_continuous_actions_accordion() {
         .collect::<Vec<_>>()
         .join("\n");
     assert_eq!(rendered.matches(" actions").count(), 1);
-    assert!(rendered.contains("  19:38 · 11 actions"), "{rendered}");
+    assert!(rendered.contains("▾ 19:38 · 11 actions"), "{rendered}");
     assert!(
         rendered.contains("\n  19:38  agent · /root/v391_scaling_audit · started"),
         "{rendered}"
@@ -17082,4 +17117,32 @@ fn search_actions_use_a_magnifying_glass_marker() {
         assert_eq!(tool_kind_marker(name, false), "🔍");
     }
     assert_eq!(tool_kind_marker("Read file", false), "≡");
+}
+
+#[test]
+fn status_number_shortcuts_use_platform_modifier_not_generic_super() {
+    let expected = if cfg!(target_os = "macos") {
+        KeyModifiers::SUPER
+    } else {
+        KeyModifiers::CONTROL
+    };
+    for (number, index) in [('1', 0), ('2', 1), ('3', 2), ('9', 8), ('0', 9)] {
+        assert_eq!(
+            status_focus_shortcut(&KeyEvent::new(KeyCode::Char(number), expected)),
+            Some(index)
+        );
+    }
+    let other = if cfg!(target_os = "macos") {
+        KeyModifiers::CONTROL
+    } else {
+        KeyModifiers::SUPER
+    };
+    assert_eq!(
+        status_focus_shortcut(&KeyEvent::new(KeyCode::Char('1'), other)),
+        None
+    );
+    assert_eq!(
+        status_focus_shortcut(&KeyEvent::new(KeyCode::Char('x'), expected)),
+        None
+    );
 }
