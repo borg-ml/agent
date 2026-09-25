@@ -1011,7 +1011,7 @@ pub struct SessionCapabilities {
     #[serde(default = "default_true")]
     pub auto_resume_usage_limits: bool,
     /// Permit a goal to yield until a running watcher reports progress.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub watcher_yield: bool,
     /// Providers or model ids whose mid-turn human messages are framed with an
     /// instruction to address them in the next visible response. Those models
@@ -1074,7 +1074,7 @@ impl Default for SessionCapabilities {
             web_relay: true,
             telemetry: false,
             auto_resume_usage_limits: true,
-            watcher_yield: false,
+            watcher_yield: true,
             steer_reply_prompt: SteerReplyPrompt::default(),
             provider_capabilities: Vec::new(),
             luna_titles_for_all_providers: false,
