@@ -741,33 +741,72 @@ fn compaction_has_expandable_detail(summary: &str) -> bool {
 
 /// Keep the collapsed Thinking row current without laying out an unbounded
 /// reasoning line on every streamed fragment. The full text stays in code_view.
+/// One readable line for a reasoning row: the latest bold summary title when
+/// the model writes them, otherwise the latest sentence, shown from its start
+/// so the row only ever clips its end. Only the recent end of the text is read,
+/// so a long stream costs the same on every delta.
 fn reasoning_preview(source: &str) -> String {
     const MAX_CHARS: usize = 160;
-    let mut start = source.len().saturating_sub(MAX_CHARS * 4);
-    while !source.is_char_boundary(start) {
-        start += 1;
+    const WINDOW_BYTES: usize = 2_000;
+    // Words a sentence still arriving needs before it replaces the one before.
+    const MIN_LIVE_WORDS: usize = 6;
+    let mut window_start = source.len().saturating_sub(WINDOW_BYTES);
+    while !source.is_char_boundary(window_start) {
+        window_start += 1;
     }
-    let tail = &source[start..];
-    let line = tail
-        .rsplit('\n')
+    let window = &source[window_start..];
+    let paragraph = window
+        .trim_end()
+        .rsplit("\n\n")
         .map(str::trim)
-        .find(|line| !line.is_empty())
+        .find(|paragraph| !paragraph.is_empty())
         .unwrap_or_default();
-    let line = line
-        .strip_prefix("**")
-        .and_then(|line| line.strip_suffix("**"))
-        .unwrap_or(line);
-    let preview_start = line
-        .char_indices()
-        .rev()
-        .nth(MAX_CHARS - 1)
-        .map_or(0, |(index, _)| index);
-    let preview = &line[preview_start..];
-    if start > 0 || preview_start > 0 {
-        format!("…{preview}")
-    } else {
-        preview.to_string()
+    let title = |line: &str| {
+        line.trim()
+            .strip_prefix("**")
+            .and_then(|line| line.strip_suffix("**"))
+            .map(str::trim)
+            .filter(|title| !title.is_empty() && !title.contains("**"))
+            .map(str::to_string)
+    };
+    // A title names the whole section under it, not just its own paragraph.
+    if let Some(title) = window.lines().rev().find_map(title) {
+        return title.chars().take(MAX_CHARS).collect();
     }
+    let text = paragraph.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    for (index, character) in text.char_indices() {
+        let end = index + character.len_utf8();
+        if matches!(character, '.' | '?' | '!') && text[end..].starts_with(' ') {
+            sentences.push(&text[start..end]);
+            start = end + 1;
+        }
+    }
+    if start < text.len() {
+        sentences.push(&text[start..]);
+    }
+    // The window may begin inside a sentence; that one has no readable start.
+    let clipped = window_start > 0 && paragraph.len() == window.trim().len();
+    if clipped && !sentences.is_empty() {
+        sentences.remove(0);
+    }
+    let Some(last) = sentences.last() else {
+        // No sentence starts in view: the recent end is all there is to show.
+        let tail_start = text
+            .char_indices()
+            .rev()
+            .nth(MAX_CHARS - 2)
+            .map_or(0, |(index, _)| index);
+        return format!("…{}", &text[tail_start..]);
+    };
+    let unfinished = !last.ends_with(['.', '?', '!']) && last.split(' ').count() < MIN_LIVE_WORDS;
+    let chosen = if unfinished && sentences.len() > 1 {
+        sentences[sentences.len() - 2]
+    } else {
+        last
+    };
+    chosen.chars().take(MAX_CHARS).collect()
 }
 
 fn rotating_reasoning_summary_lines(source: &str) -> Option<Vec<&str>> {
@@ -6360,6 +6399,21 @@ mod parallel_preparation_tests {
         assert!(detail.len() <= 164);
         assert!(detail.ends_with("recent thinking"));
         assert_eq!(source, &format!("{initial}recent thinking"));
+    }
+
+    #[test]
+    fn a_reasoning_row_shows_a_whole_sentence_from_its_start() {
+        let finished = "I checked the decals. They project straight down with pitch -90, set before RegisterComponent.";
+        assert_eq!(
+            reasoning_preview(finished),
+            "They project straight down with pitch -90, set before RegisterComponent."
+        );
+        // Two words of a new sentence say less than the finished one before it.
+        assert_eq!(
+            reasoning_preview(&format!("{finished} Next I")),
+            "They project straight down with pitch -90, set before RegisterComponent."
+        );
+        assert_eq!(reasoning_preview("**Tracing ore cues**\n\nLooking at"), "Tracing ore cues");
     }
 
     #[test]
