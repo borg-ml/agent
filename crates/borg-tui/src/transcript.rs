@@ -569,13 +569,8 @@ fn billing_status_for(
 }
 
 impl SessionDisplayConfig {
-    fn cache_signature(&self, claude_direct_auth: bool) -> CacheSignature {
-        CacheSignature::for_session(
-            self.provider,
-            self.model.as_deref(),
-            self.effort.as_deref(),
-            claude_direct_auth,
-        )
+    fn cache_signature(&self) -> CacheSignature {
+        CacheSignature::for_session(self.provider, self.model.as_deref(), self.effort.as_deref())
     }
 }
 
@@ -587,13 +582,8 @@ struct ActiveTurnDisplayConfig {
 }
 
 impl ActiveTurnDisplayConfig {
-    fn cache_signature(&self, claude_direct_auth: bool) -> CacheSignature {
-        CacheSignature::for_session(
-            self.provider,
-            self.model.as_deref(),
-            self.effort.as_deref(),
-            claude_direct_auth,
-        )
+    fn cache_signature(&self) -> CacheSignature {
+        CacheSignature::for_session(self.provider, self.model.as_deref(), self.effort.as_deref())
     }
 }
 
@@ -790,21 +780,26 @@ fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: 
     parts.join(" · ")
 }
 
+/// Indent of an open action group's header; selection treats it as chrome.
+const TOOL_WINDOW_HEADER_INDENT: &str = "    ";
+
 /// A group header in grey, with its `N failed` count in red.
-fn tool_window_header(text: String) -> Line<'static> {
+fn tool_window_header(prefix: &'static str, text: String) -> Line<'static> {
     let grey = Style::default().fg(Color::DarkGray);
     let failed = text.find(" failed").and_then(|end| {
         let start = text[..end].rfind(" · ")? + " · ".len();
         Some((start, end + " failed".len()))
     });
+    let mut spans = vec![Span::styled(prefix, grey)];
     match failed {
-        Some((start, end)) => Line::from(vec![
+        Some((start, end)) => spans.extend([
             Span::styled(text[..start].to_string(), grey),
             Span::styled(text[start..end].to_string(), Style::default().fg(Color::LightRed)),
             Span::styled(text[end..].to_string(), grey),
         ]),
-        None => Line::from(Span::styled(text, grey)),
+        None => spans.push(Span::styled(text, grey)),
     }
+    Line::from(spans)
 }
 
 /// A command result that means it went wrong.
@@ -1848,16 +1843,15 @@ impl Transcript {
                         .as_ref()
                         .is_some_and(|active| active.message_id == turn_id)
                 });
-                let claude_direct_auth = self.claude_direct_auth();
                 if usage_belongs_to_active_turn
                     && let Some(signature) = self
                         .active_turn
                         .as_ref()
-                        .map(|active| active.cache_signature(claude_direct_auth))
+                        .map(ActiveTurnDisplayConfig::cache_signature)
                         .or_else(|| {
                             self.config
                                 .as_ref()
-                                .map(|config| config.cache_signature(claude_direct_auth))
+                                .map(SessionDisplayConfig::cache_signature)
                         })
                     && let Some(notice) = self.cache_diagnostics.observe(
                         event.created_at,
@@ -3528,7 +3522,11 @@ impl Transcript {
         let presentation = project_tool_presentation(name, input, None, false);
         let cwd = presentation.cwd.clone();
         let display_name = presentation.label;
-        let detail = presentation.detail;
+        // A follow-up names only a process handle; show the command it started.
+        let detail = tool_process_followup_handle(name, Some(input))
+            .and_then(|handle| self.provider_backgrounds.get(&handle))
+            .map(|process| process.command.clone())
+            .unwrap_or(presentation.detail);
         let code_view = presentation.input.map(|body| (body.language, body.text));
         let is_edit_diff = matches!(
             code_view.as_ref(),
@@ -4234,21 +4232,8 @@ impl Transcript {
         if self.active_turn.is_some() {
             return None;
         }
-        let signature = self
-            .config
-            .as_ref()?
-            .cache_signature(self.claude_direct_auth());
+        let signature = self.config.as_ref()?.cache_signature();
         self.cache_diagnostics.status(now, &signature)
-    }
-
-    fn claude_direct_auth(&self) -> bool {
-        self.provider_capabilities.iter().any(|capability| {
-            capability.provider == CodingProvider::Claude
-                && matches!(
-                    capability.billing,
-                    Some(borg_remote::BillingLane::Subscription | borg_remote::BillingLane::ApiKey)
-                )
-        })
     }
 
     fn active_subagent_count(&self) -> usize {
@@ -5030,7 +5015,7 @@ impl Transcript {
             if let Some(window) = tool_window.filter(|window| index == window.start) {
                 let row = lines.len();
                 lines.push(Line::from(Span::styled(
-                    format!("┌─ {}", tool_window_summary(&self.order[window.start..window.end], window.total, &today_prefix)),
+                    format!("    {}", tool_window_summary(&self.order[window.start..window.end], window.total, &today_prefix)),
                     Style::default().fg(Color::DarkGray),
                 )));
                 tool_run_starts.insert(
@@ -5377,7 +5362,7 @@ impl Transcript {
                 }
                 TranscriptEntry::Activity { text, time } => {
                     let time = display_local_time(time, &today_prefix);
-                    let prefix = if tool_window.is_some() { "│ " } else { "  " };
+                    let prefix = "  ";
                     let activity_color = if text == USER_INTERRUPT_ACTIVITY {
                         Color::LightRed
                     } else if is_subagent_activity_text(text) {
@@ -5410,7 +5395,7 @@ impl Transcript {
                     expanded,
                 } => {
                     let time = display_local_time(time, &today_prefix);
-                    let prefix = if tool_window.is_some() { "│ " } else { "  " };
+                    let prefix = "  ";
                     let glyph = transcript_action_glyph(*state);
                     let color = transcript_action_color(*kind, *state);
                     let mut summary = if detail.is_empty() {
@@ -5476,7 +5461,7 @@ impl Transcript {
                             lines.push(Line::from(vec![
                                 Span::styled(
                                     if tool_window.is_some() {
-                                        "│   │ "
+                                        "    │ "
                                     } else {
                                         "  │ "
                                     },
@@ -5884,7 +5869,7 @@ impl Transcript {
                     if let Some(lifecycle) = lifecycle {
                         summary.push_str(&format!(" · {lifecycle}"));
                     }
-                    let prefix = if tool_window.is_some() { "│ " } else { "  " };
+                    let prefix = "  ";
                     let elapsed = format_tool_elapsed_at(*started_at, *completed_at, render_time);
                     let right = match (outcome.as_deref(), elapsed.as_deref()) {
                         (Some(outcome), Some(elapsed)) => Some(format!("{outcome}  {elapsed}")),
@@ -5964,7 +5949,7 @@ impl Transcript {
                     {
                         let body_start = lines.len();
                         let body_prefix = if tool_window.is_some() {
-                            "│   │ "
+                            "    │ "
                         } else {
                             "  │ "
                         };
@@ -6026,7 +6011,7 @@ impl Transcript {
                         && let Some((language, source)) = output_view
                     {
                         let body_prefix = if tool_window.is_some() {
-                            "│   │ "
+                            "    │ "
                         } else {
                             "  │ "
                         };
@@ -6100,10 +6085,9 @@ impl Transcript {
                         let content_start = header_row + 1;
                         let content_end = lines.len();
                         let total_lines = content_end.saturating_sub(content_start);
-                        let folded = open_window_start != Some(window.start)
-                            && total_lines > 0
-                            && !self.tool_run_expanded(window.start);
-                        let expandable = folded || total_lines > tool_run_viewport_height;
+                        let foldable = open_window_start != Some(window.start) && total_lines > 0;
+                        let folded = foldable && !self.tool_run_expanded(window.start);
+                        let expandable = foldable || total_lines > tool_run_viewport_height;
                         let expanded = expandable && self.tool_run_expanded(window.start);
                         let viewport_height = if expanded {
                             total_lines
@@ -6152,9 +6136,10 @@ impl Transcript {
                         } else {
                             " · click to expand"
                         };
-                        lines[header_row] = tool_window_header(format!(
-                            "{}{}{}",
-                            if folded { "▸ " } else { "┌─ " },
+                        lines[header_row] = tool_window_header(
+                            if folded { "▸ " } else { TOOL_WINDOW_HEADER_INDENT },
+                            format!(
+                            "{}{}",
                             tool_window_summary(
                                 &self.order[window.start..window.end],
                                 window.total,
@@ -6165,9 +6150,9 @@ impl Transcript {
                         if !folded {
                             lines.push(Line::from(Span::styled(
                                 if visible_end < total_lines {
-                                    "└─ ↓ more"
+                                    "  ↓ more"
                                 } else {
-                                    "└─"
+                                    ""
                                 },
                                 Style::default().fg(Color::DarkGray),
                             )));
