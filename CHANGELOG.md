@@ -9,6 +9,8 @@ Git comparison.
 
 - Pending Input is quieter and gives queued text more room. In the tool
   inspector, Back to actions no longer overlaps the compaction status row.
+- Inline diffs show a shorter preview with a hint to inspect the full diff.
+  Wait-for-agents shows the maximum timeout as “up to 15m”, not an elapsed timer.
 - The Running timer now keeps cumulative active time across action handoffs,
   including for subagents, without adding a second `run` timer.
 - The Running status highlight sweeps more slowly and narrowly, without
@@ -28,6 +30,8 @@ Git comparison.
   together before the flush, preserving the same batch as the session owner.
 - Messaging an idle child now reports `queued_idle` and explains how to wake it,
   rather than implying the message was already read.
+- `spawn_agent` supports `fresh: true` to start a new child instead of reusing
+  an idle session with an old conversation.
 
 ### Providers and dictation
 

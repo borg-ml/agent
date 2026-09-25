@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn inline_diff_preview_stops_early_but_inspector_keeps_every_line() {
+    let diff = format!(
+        "--- a/src/file.rs\n+++ b/src/file.rs\n@@ -1,0 +1,50 @@\n{}",
+        (0..50).map(|i| format!("+line {i}\n")).collect::<String>()
+    );
+    let inline = rendering::tool_body_lines("diff", &diff, 80, "  │ ");
+    assert_eq!(inline.len(), 19);
+    assert!(
+        inline
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("more lines · inspect for full diff")
+    );
+    let full = rendering::tool_detail_lines("diff", &diff, 80, "  │ ");
+    assert!(full.len() > 50);
+    assert!(
+        !full
+            .iter()
+            .any(|line| line.to_string().contains("inspect for full diff"))
+    );
+    let short = rendering::tool_body_lines("diff", "+one line\n", 80, "  │ ");
+    assert_eq!(short.len(), 1);
+}
+
+#[test]
 fn watcher_yield_labels_ready_as_waiting_until_resumed_or_restarted() {
     let mut transcript = Transcript::default();
     let session = Uuid::new_v4();
@@ -12712,7 +12738,7 @@ fn returning_to_the_tail_discards_a_stale_growth_anchor() {
     );
 }
 
-fn tall_expanded_diff_transcript() -> Transcript {
+fn tall_expanded_tool_transcript() -> Transcript {
     let mut transcript = Transcript::default();
     for index in 0..20 {
         transcript.order.push(TranscriptEntry::Activity {
@@ -12725,7 +12751,7 @@ fn tall_expanded_diff_transcript() -> Transcript {
         name: "Edit".to_string(),
         detail: "very-tall.rs".to_string(),
         code_view: Some((
-            "diff:rs".to_string(),
+            "command".to_string(),
             (0..240)
                 .map(|line| format!("+changed line {line}"))
                 .collect::<Vec<_>>()
@@ -12752,8 +12778,8 @@ fn tall_expanded_diff_transcript() -> Transcript {
 }
 
 #[test]
-fn mouse_collapse_of_tall_diff_keeps_the_tool_header_at_the_anchor_row() {
-    let mut transcript = tall_expanded_diff_transcript();
+fn mouse_collapse_of_tall_tool_keeps_the_tool_header_at_the_anchor_row() {
+    let mut transcript = tall_expanded_tool_transcript();
     let before = transcript.render(100, None, None, None);
     let viewport_height = 12;
     let scroll_max = before.0.len() - viewport_height;
@@ -12793,7 +12819,7 @@ fn mouse_collapse_of_tall_diff_keeps_the_tool_header_at_the_anchor_row() {
 
 #[test]
 fn keyboard_collapse_of_tall_output_uses_the_same_reflow_anchor() {
-    let mut transcript = tall_expanded_diff_transcript();
+    let mut transcript = tall_expanded_tool_transcript();
     if let Some(TranscriptEntry::Tool {
         code_view,
         output_view,
@@ -14656,7 +14682,7 @@ fn released_selection_follows_expanded_tool_text_during_nested_scroll() {
             name: "Edit".to_string(),
             detail: format!("file-{index}.rs"),
             code_view: Some((
-                "diff:rs".to_string(),
+                "command".to_string(),
                 (0..24)
                     .map(|line| format!("+changed-{line}"))
                     .collect::<Vec<_>>()
