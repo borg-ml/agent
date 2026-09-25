@@ -2920,7 +2920,7 @@ impl BorgTerminal {
             composer_cursor_style: ComposerCursorStyle::Underline,
             action_descriptors: true,
             tool_click_behavior: ToolClickBehavior::Fullscreen,
-            response_streaming: ResponseStreaming::Paragraph,
+            response_streaming: ResponseStreaming::default(),
             thread_find: None,
             completion_notifications: CompletionAlertPolicy::Unfocused,
             completion_sound: CompletionAlertPolicy::Unfocused,
