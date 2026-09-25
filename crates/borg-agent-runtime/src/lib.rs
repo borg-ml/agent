@@ -117,7 +117,8 @@ pub use runtime_protocol::{
 pub use session::run_agent_session_with_store_and_writer_and_lsp_policy;
 pub use session::{
     SessionConsultationTools, SessionGoalTools, SessionTodoTools,
-    run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
+    run_agent_session_with_priority_commands, run_agent_session_with_store_and_writer,
+    run_agent_session_with_store_writer_and_peers,
 };
 pub use session_action::{
     ActionDeliveryPolicy, ActionWakePolicy, SessionAction, SessionActionKind, SessionActionState,

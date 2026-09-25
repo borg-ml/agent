@@ -18,8 +18,10 @@ Git comparison.
 
 - Yielding on watchers is enabled by default for new sessions. Set
   `capabilities.watcher_yield = false` to disable it.
-- Queued follow-ups arriving a few milliseconds apart at a turn boundary are
-  batched into the same model turn instead of leaving a late sibling pending.
+- Queued human follow-ups are batched into one turn at the boundary, even
+  without an interrupt; each message keeps its own durable identity.
+- Esc on an owned local session bypasses the general command backlog so a
+  busy actor can stop the active turn promptly.
 
 ### Providers and dictation
 

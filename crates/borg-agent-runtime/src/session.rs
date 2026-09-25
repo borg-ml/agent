@@ -1525,6 +1525,58 @@ impl SessionConsultationTools {
     }
 }
 
+/// Keep local interrupt input out of the bounded general-purpose command queue.
+/// The actor still processes it after ready provider acknowledgements.
+struct HostCommandInbox {
+    commands: mpsc::Receiver<HostCommand>,
+    priority: Option<mpsc::Receiver<HostCommand>>,
+}
+
+impl HostCommandInbox {
+    fn new(
+        commands: mpsc::Receiver<HostCommand>,
+        priority: Option<mpsc::Receiver<HostCommand>>,
+    ) -> Self {
+        Self { commands, priority }
+    }
+
+    fn try_recv_priority(&mut self) -> Option<HostCommand> {
+        let priority = self.priority.as_mut()?;
+        match priority.try_recv() {
+            Ok(command) => Some(command),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.priority = None;
+                None
+            }
+            Err(mpsc::error::TryRecvError::Empty) => None,
+        }
+    }
+
+    fn try_recv(&mut self) -> std::result::Result<HostCommand, mpsc::error::TryRecvError> {
+        self.try_recv_priority()
+            .map(Ok)
+            .unwrap_or_else(|| self.commands.try_recv())
+    }
+
+    async fn recv(&mut self) -> Option<HostCommand> {
+        loop {
+            tokio::select! {
+                biased;
+                command = async {
+                    match self.priority.as_mut() {
+                        Some(priority) => priority.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => match command {
+                    Some(command) => return Some(command),
+                    None => self.priority = None,
+                },
+                command = self.commands.recv() => return command,
+            }
+        }
+    }
+}
+
 /// Run the canonical session actor against a caller-owned typed store.
 ///
 /// Local callers must hold their per-session writer lease for the duration of
@@ -1585,6 +1637,42 @@ pub async fn run_agent_session_with_store_and_writer_and_lsp_policy(
         lsp_policy,
         None,
         Vec::new(),
+        None,
+    ))
+    .await
+}
+
+/// Run a local root with a dedicated interrupt lane, including initial peers.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agent_session_with_priority_commands(
+    session_root: &Path,
+    session_id: Uuid,
+    launch: LaunchSession,
+    commands: mpsc::Receiver<HostCommand>,
+    priority_commands: mpsc::Receiver<HostCommand>,
+    events: mpsc::Sender<SessionEvent>,
+    executor: Arc<dyn AgentTurnExecutor>,
+    store: Arc<dyn SessionStore>,
+    _writer: SessionWriterLease,
+    initial_peers: Vec<crate::SpawnSubagent>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !launch.fast.unwrap_or(false) || launch.provider.supports_fast(),
+        "fast mode is not supported by the {:?} transport",
+        launch.provider
+    );
+    Box::pin(run_agent_session_store_kernel(
+        session_root,
+        session_id,
+        launch,
+        commands,
+        events,
+        executor,
+        store,
+        crate::LspPathPolicy::unrestricted(),
+        None,
+        initial_peers,
+        Some(priority_commands),
     ))
     .await
 }
@@ -1619,6 +1707,7 @@ pub async fn run_agent_session_with_store_writer_and_peers(
         crate::LspPathPolicy::unrestricted(),
         None,
         initial_peers,
+        None,
     ))
     .await
 }
@@ -1651,6 +1740,7 @@ pub(crate) async fn run_agent_session_with_store_and_writer_and_team(
         crate::LspPathPolicy::unrestricted(),
         Some(team),
         Vec::new(),
+        None,
     ))
     .await
 }
@@ -1723,6 +1813,7 @@ async fn run_agent_session_store_kernel(
     lsp_policy: crate::LspPathPolicy,
     shared_team: Option<SubagentCoordinator>,
     initial_peers: Vec<crate::SpawnSubagent>,
+    priority_commands: Option<mpsc::Receiver<HostCommand>>,
 ) -> Result<()> {
     // Every session entry point funnels here, so this is the one place the
     // live-delivery budget needs installing for the actor task.
@@ -1738,6 +1829,7 @@ async fn run_agent_session_store_kernel(
             lsp_policy,
             shared_team,
             initial_peers,
+            priority_commands,
         ));
     with_live_delivery_budget(kernel).await
 }
@@ -1747,14 +1839,16 @@ async fn run_agent_session_store_kernel_inner(
     session_root: &Path,
     session_id: Uuid,
     mut launch: LaunchSession,
-    mut commands: mpsc::Receiver<HostCommand>,
+    commands: mpsc::Receiver<HostCommand>,
     events: mpsc::Sender<SessionEvent>,
     executor: Arc<dyn AgentTurnExecutor>,
     store: Arc<dyn SessionStore>,
     lsp_policy: crate::LspPathPolicy,
     shared_team: Option<SubagentCoordinator>,
     initial_peers: Vec<crate::SpawnSubagent>,
+    priority_commands: Option<mpsc::Receiver<HostCommand>>,
 ) -> Result<()> {
+    let mut commands = HostCommandInbox::new(commands, priority_commands);
     validate_launch_session(&mut launch)?;
     let effective_capabilities = launch.capabilities.apply_dependency_intersection();
     let runtime_mcp_context = launch
@@ -9719,7 +9813,7 @@ fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
     let mut prompts = Vec::new();
     let mut retained = VecDeque::with_capacity(pending.len());
     while let Some(prompt) = pending.pop_front() {
-        if prompt.interrupt_batch {
+        if prompt.actor == EventActor::User && prompt.delivery == PromptDelivery::Queue {
             prompts.push(prompt);
         } else {
             retained.push_back(prompt);
@@ -9774,8 +9868,11 @@ async fn wait_for_retry_deadline(deadline: Option<Instant>) {
 
 async fn next_host_command(
     deferred: &mut VecDeque<HostCommand>,
-    commands: &mut mpsc::Receiver<HostCommand>,
+    commands: &mut HostCommandInbox,
 ) -> Option<HostCommand> {
+    if let Some(command) = commands.try_recv_priority() {
+        return Some(command);
+    }
     match deferred.pop_front() {
         Some(command) => Some(command),
         None => commands.recv().await,
@@ -9840,7 +9937,7 @@ async fn recall_queued_prompt_before_provider_admission(
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
     pending: &mut VecDeque<QueuedPrompt>,
-    commands: &mut mpsc::Receiver<HostCommand>,
+    commands: &mut HostCommandInbox,
     deferred: &mut VecDeque<HostCommand>,
     team_message_ids: &mut HashSet<Uuid>,
     current: &QueuedPrompt,
@@ -9936,7 +10033,7 @@ async fn collect_input_at_turn_boundary(
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
     pending: &mut VecDeque<QueuedPrompt>,
-    commands: &mut mpsc::Receiver<HostCommand>,
+    commands: &mut HostCommandInbox,
     deferred: &mut VecDeque<HostCommand>,
     team_message_ids: &mut HashSet<Uuid>,
     stale_user_prompts: &mut HashSet<Uuid>,
@@ -9945,7 +10042,11 @@ async fn collect_input_at_turn_boundary(
     // queued prompt into a turn. Prompt, Up, and Escape must stay ordered at
     // this boundary so none of them is stranded behind a newly started turn.
     tokio::task::yield_now().await;
-    let mut ready = std::mem::take(deferred);
+    let mut ready = VecDeque::new();
+    if let Some(command) = commands.try_recv_priority() {
+        ready.push_back(command);
+    }
+    ready.append(deferred);
     while let Ok(command) = commands.try_recv() {
         ready.push_back(command);
     }

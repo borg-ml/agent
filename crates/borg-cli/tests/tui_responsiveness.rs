@@ -192,6 +192,80 @@ fn live_tui_input_latency_under_storage_pressure() {
 }
 
 #[test]
+#[ignore = "requires an isolated live TUI and streaming provider"]
+fn esc_stops_a_streaming_provider_without_waiting_for_its_turn() {
+    run_esc_probe(0);
+}
+
+#[test]
+#[ignore = "requires an isolated live TUI and streaming provider"]
+fn esc_overtakes_a_burst_of_queued_input() {
+    run_esc_probe(65);
+}
+
+fn run_esc_probe(queued_prompts: usize) {
+    let runtime = tempfile::tempdir().expect("isolated Borg runtime");
+    let borg_home = runtime.path().join("borg-home");
+    let config_home = runtime.path().join("config");
+    fs::create_dir_all(config_home.join("borg")).expect("config root");
+    fs::write(
+        config_home.join("borg/agent.toml"),
+        "[updates]\nauto_install = false\n",
+    )
+    .expect("disable updates");
+    let (endpoint, stream_started, server) = spawn_streaming_provider();
+    let executable = std::env::var("BORG_TUI_STRESS_EXE")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_borg").to_string());
+    let mut terminal = PtyChild::spawn(
+        &executable,
+        runtime.path(),
+        &borg_home,
+        &config_home,
+        &endpoint,
+    )
+    .expect("start isolated Borg TUI");
+    terminal
+        .wait_for_output(Duration::from_secs(10))
+        .expect("first TUI paint");
+    stream_started
+        .recv_timeout(Duration::from_secs(10))
+        .expect("provider started");
+    terminal
+        .wait_for_screen_text("live-", Duration::from_secs(10))
+        .expect("streaming turn is active");
+    assert!(!server.is_finished(), "stream must be live before Esc");
+    terminal.drain_output().expect("drain previous frames");
+    for index in 0..queued_prompts {
+        terminal
+            .write_all_retry(format!("/queue pending-{index}\r").as_bytes())
+            .expect("queue pending input");
+    }
+    let started = Instant::now();
+    terminal.write_all_retry(b"\x1b").expect("press Esc");
+    terminal
+        .wait_for_screen_text("agent interrupted by user", Duration::from_secs(2))
+        .expect("Esc feedback");
+    let feedback = started.elapsed();
+    while !server.is_finished() && started.elapsed() < Duration::from_secs(2) {
+        terminal.read_available(None).expect("drain TUI output");
+        thread::sleep(Duration::from_millis(2));
+    }
+    let stopped = started.elapsed();
+    eprintln!("Esc feedback={feedback:?}, provider stream stopped={stopped:?}");
+    assert!(server.is_finished(), "provider stream outlived interrupt");
+    let limit = if queued_prompts == 0 { 250 } else { 500 };
+    assert!(
+        feedback <= Duration::from_millis(limit),
+        "Esc UI feedback too slow: {feedback:?}"
+    );
+    assert!(
+        stopped <= Duration::from_millis(limit),
+        "Esc provider cancellation too slow: {stopped:?}"
+    );
+    server.join().expect("mock provider thread");
+}
+
+#[test]
 #[ignore = "explicit read-only viewer gate against a live Borg session"]
 fn live_attached_session_interaction_latency() {
     let session_id = std::env::var("BORG_TUI_LIVE_SESSION")

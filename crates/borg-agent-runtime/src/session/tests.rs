@@ -9358,6 +9358,72 @@ fn coalescing_keeps_the_last_prompts_attachments_on_its_batch_entry() {
     assert_eq!(entries[0].attachments, [image]);
 }
 
+#[tokio::test]
+async fn interrupt_overtakes_a_full_command_queue_and_deferred_input() {
+    let session_id = Uuid::new_v4();
+    let (normal_tx, normal_rx) = mpsc::channel(1);
+    let (urgent_tx, urgent_rx) = mpsc::channel(1);
+    normal_tx
+        .try_send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "queued".into(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .unwrap();
+    urgent_tx
+        .try_send(HostCommand::Interrupt { session_id })
+        .unwrap();
+    let mut inbox = HostCommandInbox::new(normal_rx, Some(urgent_rx));
+    let mut deferred = VecDeque::from([HostCommand::FlushPendingInput { session_id }]);
+    assert!(matches!(
+        next_host_command(&mut deferred, &mut inbox).await,
+        Some(HostCommand::Interrupt { .. })
+    ));
+    assert!(matches!(
+        next_host_command(&mut deferred, &mut inbox).await,
+        Some(HostCommand::FlushPendingInput { .. })
+    ));
+    assert!(matches!(
+        next_host_command(&mut deferred, &mut inbox).await,
+        Some(HostCommand::Prompt { .. })
+    ));
+}
+
+#[test]
+fn all_queued_human_input_is_one_turn_even_without_an_interrupt() {
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    let prompt = |message_id, text: &str| QueuedPrompt {
+        message_id,
+        text: text.to_string(),
+        actor: EventActor::User,
+        attachments: Vec::new(),
+        output_schema: None,
+        delivery: PromptDelivery::Queue,
+        visible: true,
+        interrupt_batch: false,
+        batch: Vec::new(),
+    };
+    let mut pending = VecDeque::from([
+        prompt(first_id, "first follow-up"),
+        prompt(second_id, "second follow-up"),
+    ]);
+    coalesce_queued_prompts(&mut pending);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].text, "first follow-up\n\nsecond follow-up");
+    assert_eq!(
+        pending[0]
+            .batch_entries()
+            .iter()
+            .map(|entry| entry.message_id)
+            .collect::<Vec<_>>(),
+        [first_id, second_id],
+    );
+}
+
 #[test]
 fn escape_batch_coalesces_queued_prompts_in_fifo_order() {
     let first_image = PathBuf::from("/tmp/first.png");
@@ -9700,7 +9766,7 @@ async fn turn_boundary_waits_for_a_late_sibling_of_pending_input() {
     let session_id = Uuid::new_v4();
     let (scratch, _store, mut journal) = runtime_store(session_id).await;
     let (event_tx, _event_rx) = mpsc::channel(8);
-    let (command_tx, mut command_rx) = mpsc::channel(8);
+    let (command_tx, command_rx) = mpsc::channel(8);
     let first_id = Uuid::new_v4();
     let second_id = Uuid::new_v4();
     let mut pending = VecDeque::new();
@@ -9732,6 +9798,7 @@ async fn turn_boundary_waits_for_a_late_sibling_of_pending_input() {
             .await
             .unwrap();
     });
+    let mut command_rx = HostCommandInbox::new(command_rx, None);
     let mut deferred = VecDeque::new();
     let mut stale = HashSet::new();
     collect_input_at_turn_boundary(
@@ -9765,7 +9832,7 @@ async fn turn_boundary_collects_all_emitted_prompts_before_escape() {
     let session_id = Uuid::new_v4();
     let (scratch, _store, mut journal) = runtime_store(session_id).await;
     let (event_tx, _event_rx) = mpsc::channel(8);
-    let (command_tx, mut command_rx) = mpsc::channel(8);
+    let (command_tx, command_rx) = mpsc::channel(8);
     let last_id = Uuid::new_v4();
     for (message_id, text) in [
         (Uuid::new_v4(), "first follow-up"),
@@ -9789,6 +9856,7 @@ async fn turn_boundary_collects_all_emitted_prompts_before_escape() {
         .unwrap();
 
     let mut pending = VecDeque::new();
+    let mut command_rx = HostCommandInbox::new(command_rx, None);
     let mut deferred = VecDeque::new();
     let mut team_message_ids = HashSet::new();
     let mut stale_user_prompts = HashSet::new();
