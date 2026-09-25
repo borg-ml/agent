@@ -7,6 +7,8 @@ Git comparison.
 
 ### Agents
 
+- An image pasted into the chat comes with its file path, so the agent can
+  forward it to a subagent with `send_message`/`followup_task` `attachments`.
 - Commands can call Borg from code: `import borg` in Python and
   `import borg from "borg"` in Bun (Node: `require("borg")`), with results as
   data and failures as `BorgError`. Calls from code and from `borg call` show in
