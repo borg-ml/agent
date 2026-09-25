@@ -12,6 +12,11 @@ Git comparison.
 - The Running status highlight sweeps more slowly and narrowly, without
   changing tool-row sweep speed.
 
+### Agents and teams
+
+- Yielding on watchers is enabled by default for new sessions. Set
+  `capabilities.watcher_yield = false` to disable it.
+
 ### Providers and dictation
 
 - The shared Claude subscription connector selects the pinned, checksummed

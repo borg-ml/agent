@@ -294,7 +294,7 @@ impl Default for CapabilityConfig {
             web_relay: true,
             telemetry: false,
             auto_resume_usage_limits: true,
-            watcher_yield: false,
+            watcher_yield: true,
             steer_reply_prompt: borg_remote::SteerReplyPrompt::default(),
             harness: borg_remote::HarnessMode::Borg,
         }
@@ -1779,11 +1779,11 @@ reasoning_format = "deepseek"
     }
 
     #[test]
-    fn watcher_yield_requires_explicit_opt_in() {
-        assert!(!AgentConfig::default().capabilities.watcher_yield);
+    fn watcher_yield_is_enabled_by_default_and_can_be_disabled() {
+        assert!(AgentConfig::default().capabilities.watcher_yield);
         let configured: AgentConfig =
-            toml::from_str("[capabilities]\nwatcher_yield = true\n").unwrap();
-        assert!(borg_remote::SessionCapabilities::from(&configured.capabilities).watcher_yield);
+            toml::from_str("[capabilities]\nwatcher_yield = false\n").unwrap();
+        assert!(!borg_remote::SessionCapabilities::from(&configured.capabilities).watcher_yield);
     }
 
     #[test]
