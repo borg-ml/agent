@@ -5,6 +5,21 @@ Git comparison.
 
 ## Unreleased (since 0.11.4)
 
+### Terminal
+
+- Tool and action rows are single-line by default, with the tool name in a
+  fixed column and the duration right-aligned, so rows line up like a table.
+  Settings › Wrap action rows (or `/wrap-actions on`) restores wrapping.
+- Pending Input puts its controls in the title (click to collapse, Esc to send,
+  ↑ to recall) in grey with white keys, leaving a blank row above the status line.
+- The status and footer strips inherit the terminal background, and action
+  rows keep the same gap before the composer as every other entry.
+
+### Agents and teams
+
+- New human input reopens a blocked goal.
+- Fixed the release build's Clippy failure in the provider image-tile test.
+
 ## 0.11.4 (2026-09-25)
 
 ### Terminal
