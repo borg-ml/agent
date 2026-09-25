@@ -32,6 +32,8 @@ Git comparison.
 
 ### Terminal
 
+- Reasoning rows show the latest summary title or a whole sentence from its
+  start, instead of a fragment cut at both ends.
 - The running timer starts from zero for each new turn, including one a
   message starts after the session was waiting, instead of adding to the last.
 - Replies stream a finished paragraph at a time by default: a paragraph once a
