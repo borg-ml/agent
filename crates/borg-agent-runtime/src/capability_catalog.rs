@@ -1,6 +1,6 @@
 //! One compact view of the session's capabilities, shared by every way a model
 //! finds them: the budgeted list in the system prompt, `borg tools --search`,
-//! `borg.search(...)` from code, and the hint a malformed call returns.
+//! `borg.tools(...)` from code, and the hint a malformed call returns.
 
 use serde_json::{Value, json};
 
@@ -200,12 +200,12 @@ pub(crate) fn prompt_listing(specs: &[Value], budget: usize) -> String {
     listed.sort_unstable();
     let coverage = if listed.len() == signatures.len() {
         format!(
-            "All {} Borg capabilities (descriptions and full fields: `borg tools --search QUERY` or `borg.search(\"query\")`)",
+            "All {} Borg capabilities (descriptions and full fields: `borg tools --search QUERY` or `borg.tools(\"query\")`)",
             signatures.len()
         )
     } else {
         format!(
-            "{} of {} Borg capabilities (find the rest with `borg tools --search QUERY` or `borg.search(\"query\")`)",
+            "{} of {} Borg capabilities (find the rest with `borg tools --search QUERY` or `borg.tools(\"query\")`)",
             listed.len(),
             signatures.len()
         )

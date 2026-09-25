@@ -51,6 +51,8 @@ pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
         "Read" => Some(("Reading", "Read")),
         "Edit" => Some(("Editing", "Edited")),
         "Update" => Some(("Updating", "Updated")),
+        "Refine" => Some(("Refining", "Refined")),
+        "Roll" => Some(("Rolling", "Rolled")),
         "Search" => Some(("Searching", "Searched")),
         "List" => Some(("Listing", "Listed")),
         "Check" => Some(("Checking", "Checked")),

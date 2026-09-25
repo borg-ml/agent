@@ -154,6 +154,7 @@ async fn workspace_mutations_preserve_authorization_and_file_contents_on_failure
         ..HostResourceLimits::default()
     }));
     let mut host = DispatcherRuntimeHost {
+        parent_tool_call_id: "test-runtime-call".to_string(),
         session_id,
         root: root.clone(),
         allow_effects: false,
@@ -993,6 +994,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
         .python_for_session(Uuid::new_v4(), directory.path(), None)
         .await;
     let host: Arc<dyn RuntimeHost> = Arc::new(DispatcherRuntimeHost {
+        parent_tool_call_id: "test-runtime-call".to_string(),
         session_id: Uuid::new_v4(),
         root: directory.path().to_path_buf(),
         allow_effects: false,

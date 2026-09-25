@@ -340,6 +340,16 @@ pub fn tool_code_view(name: &str, input: &Value) -> Option<(String, String)> {
     {
         return Some(("command".to_string(), unwrapped_shell_command(command)));
     }
+    if tool_leaf_name(name) == "runtime_exec"
+        && let Some(code) = string_field(input, "code")
+    {
+        let language = match runtime_label(input) {
+            "Python" => "python",
+            "TypeScript" => "typescript",
+            _ => "javascript",
+        };
+        return Some((language.to_string(), code.to_string()));
+    }
     if tool_leaf_name(name) == "exec" && input.get("session_id").is_some() {
         return None;
     }
@@ -505,6 +515,31 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
             format!("Generate {}", compact_text(label, 64)),
             String::new(),
         );
+    }
+
+    if tool == "runtime_exec" {
+        let first_line = string_field(input, "code")
+            .and_then(|code| code.lines().map(str::trim).find(|line| !line.is_empty()))
+            .unwrap_or_default();
+        return (
+            format!("Run {}", runtime_label(input)),
+            compact_text(first_line, 160),
+        );
+    }
+
+    if tool == "harness" {
+        let op = string_field(input, "op").unwrap_or("overview");
+        let label = match op {
+            "create" | "update" | "delete" => "Update harness",
+            "refine" => "Refine harness",
+            "rollback" => "Roll back harness",
+            _ => "Read harness",
+        };
+        let detail = ["title", "trigger", "id", "kind"]
+            .iter()
+            .find_map(|field| string_field(input, field))
+            .unwrap_or(op);
+        return (label.to_string(), compact_text(detail, 160));
     }
 
     // A follow-up on a command that is still running names what it did to that
@@ -2038,6 +2073,14 @@ fn format_duration(milliseconds: u64) -> String {
         format!("{}s", milliseconds / 1_000)
     } else {
         format!("{milliseconds}ms")
+    }
+}
+
+fn runtime_label(input: &Value) -> &'static str {
+    match string_field(input, "runtime") {
+        Some("javascript") => "JavaScript",
+        Some("typescript") => "TypeScript",
+        _ => "Python",
     }
 }
 

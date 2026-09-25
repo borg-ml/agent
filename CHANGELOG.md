@@ -13,10 +13,16 @@ Git comparison.
   the transcript as steps of the command that made them.
 - `borg call … | head` no longer panics when the reader closes the pipe.
 - The system prompt lists every Borg capability as a compact signature, and
-  `borg tools --search QUERY`, `borg.search("query")` (Python and Bun) rank
+  `borg tools --search QUERY`, `borg.tools("query")` (Python and Bun) rank
   capabilities with one-line descriptions.
 - A call with a wrong field or name says what was expected: the capability's
   signature, or the closest capability names.
+- `runtime_exec` is back beside `exec`: a persistent Python or Bun namespace
+  whose variables survive between calls, with `borg` preloaded (the same
+  capability calls as `import borg`, plus `borg.checkpoint`/`borg.restore`).
+- The `harness` capability lets an agent improve how it works in a project:
+  prompt, memory, skill and subagent entries added to its later turns, with
+  `refine` recording the evidence and `rollback` undoing recent changes.
 
 ### Models
 

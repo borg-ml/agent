@@ -3,6 +3,7 @@
     import borg
     borg.send_message(target="/root/worker", message=report)
     plan = borg.get_plan()
+    borg.tools("message")  # find capabilities
     borg.call("create_goal", objective="...")
 
 Each call goes to the running session over its tool socket, exactly like
@@ -14,7 +15,7 @@ import json
 import os
 import socket
 
-__all__ = ["BorgError", "call", "search", "tools"]
+__all__ = ["BorgError", "call", "tools"]
 
 
 class BorgError(Exception):
@@ -60,14 +61,10 @@ def call(name, arguments=None, /, **fields):
     return _request(name, {**(arguments or {}), **fields})
 
 
-def tools():
-    """Every capability this session offers, with its input schema."""
-    return _request("__borg_tools", {})
-
-
-def search(query, limit=10):
-    """Capabilities ranked for `query`, each with a compact signature."""
-    return _request("__borg_tools", {"query": query, "limit": limit})
+def tools(query=None, limit=10):
+    """Every capability with its input schema, or those ranked for `query`
+    with a compact signature each."""
+    return _request("__borg_tools", {} if query is None else {"query": query, "limit": limit})
 
 
 def __getattr__(name):
