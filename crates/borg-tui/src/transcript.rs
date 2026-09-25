@@ -494,6 +494,7 @@ struct RenderResume {
     director_prompt_row: Option<usize>,
     tool_run_offsets: HashMap<usize, usize>,
     expanded_tool_runs: HashSet<usize>,
+    open_tool_run: Option<usize>,
     windows: Vec<Option<ToolRunWindow>>,
     trace: RenderTrace,
     render: Arc<TranscriptRender>,
@@ -669,6 +670,10 @@ enum TranscriptEntry {
         user_interrupted: bool,
         backgrounded: bool,
         expanded: bool,
+        /// A command's result in a few words: matches, exit status, tests.
+        outcome: Option<String>,
+        /// Where a command ran; shown once on its group's header.
+        cwd: Option<String>,
     },
 }
 
@@ -741,6 +746,107 @@ fn compaction_has_expandable_detail(summary: &str) -> bool {
 
 /// Keep the collapsed Thinking row current without laying out an unbounded
 /// reasoning line on every streamed fragment. The full text stays in code_view.
+/// A group's header: when it started, where its commands ran, and what it
+/// did, e.g. `17:41 · ~/abundance-wt/ore-cues · read 4 · searched 2 · 7 actions`.
+fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: &str) -> String {
+    let mut time = None;
+    let mut cwd = None;
+    // A folded group must not hide that something in it went wrong.
+    let mut failed = 0;
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for entry in entries {
+        let TranscriptEntry::Tool {
+            name,
+            code_view,
+            time: row_time,
+            cwd: row_cwd,
+            error,
+            outcome,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        if *error || outcome.as_deref().is_some_and(outcome_is_failure) {
+            failed += 1;
+        }
+        time.get_or_insert(row_time.as_str());
+        if row_cwd.is_some() {
+            cwd = row_cwd.as_deref();
+        }
+        let reasoning = matches!(code_view, Some((language, _)) if language == "reasoning");
+        let kind = match tool_kind_marker(name, reasoning) {
+            "∴" => continue,
+            "≡" => "read",
+            "⌕" => "searched",
+            "✎" => "edited",
+            "▶" => "ran",
+            "◆" => "agents",
+            _ => continue,
+        };
+        match counts.iter_mut().find(|(existing, _)| *existing == kind) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((kind, 1)),
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(time) = time {
+        parts.push(display_local_time(time, today_prefix).to_string());
+    }
+    if let Some(cwd) = cwd {
+        let home = std::env::var("HOME").unwrap_or_default();
+        parts.push(match cwd.strip_prefix(&home) {
+            Some(rest) if !home.is_empty() => format!("~{rest}"),
+            _ => cwd.to_string(),
+        });
+    }
+    parts.extend(counts.into_iter().map(|(kind, count)| format!("{kind} {count}")));
+    parts.push(format!("{total} action{}", if total == 1 { "" } else { "s" }));
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    parts.join(" · ")
+}
+
+/// A group header in grey, with its `N failed` count in red.
+fn tool_window_header(text: String) -> Line<'static> {
+    let grey = Style::default().fg(Color::DarkGray);
+    let failed = text.find(" failed").and_then(|end| {
+        let start = text[..end].rfind(" · ")? + " · ".len();
+        Some((start, end + " failed".len()))
+    });
+    match failed {
+        Some((start, end)) => Line::from(vec![
+            Span::styled(text[..start].to_string(), grey),
+            Span::styled(text[start..end].to_string(), Style::default().fg(Color::LightRed)),
+            Span::styled(text[end..].to_string(), grey),
+        ]),
+        None => Line::from(Span::styled(text, grey)),
+    }
+}
+
+/// A command result that means it went wrong.
+fn outcome_is_failure(outcome: &str) -> bool {
+    outcome.starts_with("exit ") || outcome.ends_with(" failed") || outcome == "timed out"
+}
+
+/// A finished row's marker: what kind of work it was, at a glance.
+fn tool_kind_marker(name: &str, is_reasoning: bool) -> &'static str {
+    if is_reasoning {
+        return "∴";
+    }
+    if is_subagent_tool(name) {
+        return "◆";
+    }
+    match name.split(' ').next().unwrap_or(name) {
+        "Read" | "List" | "View" | "Open" | "Inspect" => "≡",
+        "Search" | "Find" | "Grep" => "⌕",
+        "Write" | "Edit" | "Update" | "Create" | "Delete" | "Apply" | "Rename" | "Move" => "✎",
+        "Run" | "Wait" | "Send" | "Stop" | "Build" | "Test" => "▶",
+        _ => "✓",
+    }
+}
+
 /// One readable line for a reasoning row: the latest bold summary title when
 /// the model writes them, otherwise the latest sentence, shown from its start
 /// so the row only ever clips its end. Only the recent end of the text is read,
@@ -2205,6 +2311,8 @@ impl Transcript {
                         backgrounded,
                         expanded,
                         payload_refs,
+                        outcome,
+                        cwd,
                         ..
                     } = &mut self.order[index]
                 {
@@ -2219,12 +2327,24 @@ impl Transcript {
                     {
                         *detail = format!("“{}”", compact_text(&query, 120));
                     }
+                    // The command, when the completion does not repeat it.
+                    let started_input = code_view
+                        .as_ref()
+                        .filter(|(language, _)| language == "command")
+                        .map(|(_, command)| serde_json::json!({ "cmd": command }));
                     let completion_presentation = project_tool_presentation(
                         source_name,
-                        input.as_ref().unwrap_or(&serde_json::Value::Null),
+                        input
+                            .as_ref()
+                            .or(started_input.as_ref())
+                            .unwrap_or(&serde_json::Value::Null),
                         Some(&run_output),
                         *is_error,
                     );
+                    *outcome = completion_presentation.outcome.clone();
+                    if completion_presentation.cwd.is_some() {
+                        *cwd = completion_presentation.cwd.clone();
+                    }
                     if *is_error && !output.trim().is_empty() {
                         let message = completion_presentation
                             .result
@@ -3330,6 +3450,7 @@ impl Transcript {
             user_interrupted: false,
             backgrounded: false,
             expanded: self.auto_expand_thinking,
+            outcome: None, cwd: None,
         });
         self.active_reasoning = Some(index);
         self.reasoning_has_preview = false;
@@ -3423,6 +3544,7 @@ impl Transcript {
                 .insert(tool_call_id.to_string(), handle);
         }
         let presentation = project_tool_presentation(name, input, None, false);
+        let cwd = presentation.cwd.clone();
         let display_name = presentation.label;
         let detail = presentation.detail;
         let code_view = presentation.input.map(|body| (body.language, body.text));
@@ -3457,10 +3579,12 @@ impl Transcript {
                 backgrounded: stored_backgrounded,
                 expanded: stored_expanded,
                 completed_at: stored_completed_at,
+                cwd: stored_cwd,
                 ..
             }) = self.order.get_mut(tool_index)
             && !*stored_complete
         {
+            *stored_cwd = cwd.clone();
             if !*stored_backgrounded {
                 self.foreground_tool = Some(tool_call_id.to_string());
             }
@@ -3497,6 +3621,8 @@ impl Transcript {
             user_interrupted: false,
             backgrounded: false,
             expanded,
+            outcome: None,
+            cwd,
         });
         if is_edit_diff {
             self.last_edit = Some(tool_index);
@@ -3577,6 +3703,7 @@ impl Transcript {
             user_interrupted: false,
             backgrounded: false,
             expanded,
+            outcome: None, cwd: None,
         });
         self.command_edit_rows
             .insert(tool_call_id.to_string(), index);
@@ -4674,6 +4801,7 @@ impl Transcript {
             director_prompt_row,
             tool_run_offsets: self.tool_run_offsets.clone(),
             expanded_tool_runs: self.expanded_tool_runs.clone(),
+            open_tool_run: self.open_tool_run(&windows),
             windows,
             trace,
             render: Arc::clone(&render),
@@ -4684,6 +4812,18 @@ impl Transcript {
     }
 
     /// The first entry whose rows may differ from `resume`'s render.
+    /// The action group still being worked in. It stays open; finished groups
+    /// fold to their summary header until clicked. The last group is open
+    /// while a turn runs or while nothing follows it.
+    fn open_tool_run(&self, windows: &[Option<ToolRunWindow>]) -> Option<usize> {
+        windows
+            .iter()
+            .flatten()
+            .max_by_key(|window| window.start)
+            .filter(|window| self.active_turn.is_some() || window.end >= self.order.len())
+            .map(|window| window.start)
+    }
+
     fn render_resume_start(
         &self,
         resume: &RenderResume,
@@ -4711,6 +4851,13 @@ impl Transcript {
             && let Some(row) = resume.trace.running_tool_rows.first()
         {
             start = start.min(*row);
+        }
+        // A group folds or unfolds when it stops or starts being the open one.
+        let open = self.open_tool_run(windows);
+        if open != resume.open_tool_run
+            && let Some(run) = open.into_iter().chain(resume.open_tool_run).min()
+        {
+            start = start.min(run);
         }
         if director_prompt_row != resume.director_prompt_row
             && let Some(row) = director_prompt_row
@@ -4842,6 +4989,7 @@ impl Transcript {
         render_time: DateTime<Utc>,
     ) {
         let today_prefix = today.format("%Y-%m-%d ").to_string();
+        let open_window_start = self.open_tool_run(tool_run_windows);
         if focused_tool.is_none() && start == 0 {
             self.prepare_message_markdown_cache(width);
         }
@@ -4900,7 +5048,7 @@ impl Transcript {
             if let Some(window) = tool_window.filter(|window| index == window.start) {
                 let row = lines.len();
                 lines.push(Line::from(Span::styled(
-                    format!("┌─ actions · {}", window.total),
+                    format!("┌─ {}", tool_window_summary(&self.order[window.start..window.end], window.total, &today_prefix)),
                     Style::default().fg(Color::DarkGray),
                 )));
                 tool_run_starts.insert(
@@ -5635,6 +5783,7 @@ impl Transcript {
                     user_interrupted,
                     backgrounded,
                     expanded,
+                    outcome,
                     ..
                 } => {
                     // Tool and action rows (Watch, Peer) form one uniform run.
@@ -5658,14 +5807,15 @@ impl Transcript {
                         code_view.as_ref().map(|(language, _)| language.as_str()),
                     );
                     let summary_start = lines.len();
-                    let glyph = if *error {
+                    let failed = *error || outcome.as_deref().is_some_and(outcome_is_failure);
+                    let glyph = if failed {
                         "!"
                     } else if *user_interrupted {
                         "■"
                     } else if *backgrounded {
                         "↗"
-                    } else if *complete && !is_instant {
-                        "✓"
+                    } else if *complete && (!is_instant || is_command_tool(source_name)) {
+                        tool_kind_marker(name, is_reasoning)
                     } else {
                         "◇"
                     };
@@ -5674,7 +5824,7 @@ impl Transcript {
                     } else {
                         Style::default().fg(Color::DarkGray)
                     };
-                    let style = if *error || *user_interrupted {
+                    let style = if failed || *user_interrupted {
                         Style::default().fg(Color::Red)
                     } else if *backgrounded {
                         Style::default().fg(USER_LABEL_BLUE)
@@ -5685,7 +5835,7 @@ impl Transcript {
                         Style::default()
                             .fg(Color::Gray)
                             .add_modifier(Modifier::BOLD | Modifier::ITALIC)
-                    } else if *error || *user_interrupted {
+                    } else if failed || *user_interrupted {
                         Style::default()
                             .fg(Color::LightRed)
                             .add_modifier(Modifier::BOLD)
@@ -5738,16 +5888,27 @@ impl Transcript {
                     })
                     .flatten();
                     let display_detail = rotating_detail.as_deref().unwrap_or(detail);
-                    let mut summary = if display_detail.is_empty() || focused_tool == Some(index) {
-                        format!("{time}  {glyph} {display_name}")
+                    // Inside a group the header carries the time.
+                    let time = if tool_window.is_some() {
+                        String::new()
                     } else {
-                        format!("{time}  {glyph} {display_name:<8}  {display_detail}")
+                        format!("{time}  ")
+                    };
+                    let mut summary = if display_detail.is_empty() || focused_tool == Some(index) {
+                        format!("{time}{glyph} {display_name}")
+                    } else {
+                        format!("{time}{glyph} {display_name:<8}  {display_detail}")
                     };
                     if let Some(lifecycle) = lifecycle {
                         summary.push_str(&format!(" · {lifecycle}"));
                     }
                     let prefix = if tool_window.is_some() { "│ " } else { "  " };
                     let elapsed = format_tool_elapsed_at(*started_at, *completed_at, render_time);
+                    let right = match (outcome.as_deref(), elapsed.as_deref()) {
+                        (Some(outcome), Some(elapsed)) => Some(format!("{outcome}  {elapsed}")),
+                        (Some(outcome), None) => Some(outcome.to_string()),
+                        (None, elapsed) => elapsed.map(str::to_string),
+                    };
                     if completed_at.is_none() || rotating_detail.is_some() {
                         trace.clock_rows.push(index);
                     }
@@ -5757,7 +5918,7 @@ impl Transcript {
                     for (line_index, line) in
                         tool_summary_lines(
                             &summary,
-                            elapsed.as_deref(),
+                            right.as_deref(),
                             prefix,
                             width,
                             self.wrap_action_rows,
@@ -5957,10 +6118,15 @@ impl Transcript {
                         let content_start = header_row + 1;
                         let content_end = lines.len();
                         let total_lines = content_end.saturating_sub(content_start);
-                        let expandable = total_lines > tool_run_viewport_height;
+                        let folded = open_window_start != Some(window.start)
+                            && total_lines > 0
+                            && !self.tool_run_expanded(window.start);
+                        let expandable = folded || total_lines > tool_run_viewport_height;
                         let expanded = expandable && self.tool_run_expanded(window.start);
                         let viewport_height = if expanded {
                             total_lines
+                        } else if folded {
+                            0
                         } else {
                             tool_run_viewport_height
                         };
@@ -5989,7 +6155,9 @@ impl Transcript {
 
                         lines.truncate(content_start);
                         lines.extend(visible_lines);
-                        let action_hint = if !expandable {
+                        let action_hint = if folded {
+                            " · click to expand"
+                        } else if !expandable {
                             ""
                         } else if expanded {
                             if offset > 0 {
@@ -6002,18 +6170,26 @@ impl Transcript {
                         } else {
                             " · click to expand"
                         };
-                        lines[header_row] = Line::from(Span::styled(
-                            format!("┌─ actions · {}{}", window.total, action_hint),
-                            Style::default().fg(Color::DarkGray),
+                        lines[header_row] = tool_window_header(format!(
+                            "{}{}{}",
+                            if folded { "▸ " } else { "┌─ " },
+                            tool_window_summary(
+                                &self.order[window.start..window.end],
+                                window.total,
+                                &today_prefix,
+                            ),
+                            action_hint
                         ));
-                        lines.push(Line::from(Span::styled(
-                            if visible_end < total_lines {
-                                "└─ ↓ more"
-                            } else {
-                                "└─"
-                            },
-                            Style::default().fg(Color::DarkGray),
-                        )));
+                        if !folded {
+                            lines.push(Line::from(Span::styled(
+                                if visible_end < total_lines {
+                                    "└─ ↓ more"
+                                } else {
+                                    "└─"
+                                },
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
 
                         let run_tool_rows = tool_rows.split_off(first_tool_row);
                         for (tool_index, start, end) in run_tool_rows {

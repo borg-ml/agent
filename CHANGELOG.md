@@ -34,6 +34,18 @@ Git comparison.
 
 ### Terminal
 
+- The action list is regrouped: every batch of actions sits under one header
+  with its start time, working directory and a summary (`read 4 · searched 2 ·
+  7 actions · 1 failed`); finished batches fold to that header until clicked.
+  Rows drop their clock time and leading `cd …`, name what a command did
+  (`Read src/main.rs:1-40`, `Search “pattern”`, `Write build.py`, `Run Python`),
+  show its result beside the duration (`6 matches`, `exit 1`, `12 passed`,
+  `+14 -3`) and carry a marker for the kind of work; failures show in red.
+- The shell keeps its working directory between commands, so agents no longer
+  repeat `cd DIR &&` on every call.
+- "Back to thread" (was "Back to actions") sits beside Jump to bottom on the
+  status row, and one row of terminal background always separates the
+  transcript from the status line.
 - Reasoning rows show the latest summary title or a whole sentence from its
   start, instead of a fragment cut at both ends.
 - The running timer starts from zero for each new turn, including one a
