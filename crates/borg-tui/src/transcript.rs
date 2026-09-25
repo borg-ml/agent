@@ -1236,24 +1236,24 @@ impl Transcript {
             .as_ref()
             .is_some_and(|(language, body)| is_diff_language(language) && !body.trim().is_empty())
         {
-            Some("left click inspect · right click copy diff")
+            Some("click inspect · right-click copy diff")
         } else if output_view
             .as_ref()
             .is_some_and(|(_, body)| !body.trim().is_empty())
         {
-            Some("left click inspect · right click copy output")
+            Some("click inspect · right-click copy output")
         } else if code_view
             .as_ref()
             .is_some_and(|(language, body)| language == "reasoning" && !body.trim().is_empty())
         {
-            Some("left click inspect · right click copy thinking")
+            Some("click inspect · right-click copy thinking")
         } else if code_view
             .as_ref()
             .is_some_and(|(_, body)| !body.trim().is_empty())
         {
-            Some("left click inspect · right click copy tool call")
+            Some("click inspect · right-click copy tool call")
         } else if !detail.trim().is_empty() {
-            Some("right click copy tool details")
+            Some("right-click copy tool details")
         } else {
             None
         }

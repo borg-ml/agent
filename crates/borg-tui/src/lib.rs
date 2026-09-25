@@ -7634,10 +7634,7 @@ impl BorgTerminal {
             } else if let Some(notice) = copy_notice_text.as_ref() {
                 vec![copy_notice_line(notice.clone())]
             } else if let Some(hint) = hover_notice_hint {
-                vec![Line::from(Span::styled(
-                    hint,
-                    Style::default().fg(Color::Yellow),
-                ))]
+                vec![Line::from(hint_spans(hint))]
             } else if let Some(notice) = notice {
                 if copy_notice_active {
                     vec![copy_notice_line(notice)]
@@ -7650,16 +7647,13 @@ impl BorgTerminal {
                     .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Yellow))))
                     .collect()
             } else if showing_transcript_interaction_hint {
-                vec![Line::from(Span::styled(
+                vec![Line::from(hint_spans(
                     transcript_interaction_hint.expect("transcript interaction hint is present"),
-                    Style::default().fg(Color::Yellow),
                 ))]
             } else {
                 vec![if let Some(hint) = interaction_hint {
-                    let mut spans = vec![
-                        Span::styled(hint, Style::default().fg(Color::Yellow)),
-                        Span::raw(" · "),
-                    ];
+                    let mut spans = hint_spans(hint);
+                    spans.push(Span::raw(" · "));
                     if resume_picker_open {
                         spans.push(Span::raw(primary_controls.clone()));
                     } else {
@@ -16016,6 +16010,26 @@ fn todo_tooltip_row_style(completed: bool) -> Style {
         })
 }
 
+/// A hover hint in the footer: the mouse action in white, what it does in grey,
+/// matching the Pending Input controls.
+fn hint_spans(hint: &'static str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, part) in hint.split(" · ").enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        }
+        let (key, rest) = ["right-click", "click"]
+            .into_iter()
+            .find_map(|key| part.strip_prefix(key).map(|rest| (key, rest)))
+            .unwrap_or(("", part));
+        if !key.is_empty() {
+            spans.push(Span::styled(key, Style::default().fg(Color::White)));
+        }
+        spans.push(Span::styled(rest, Style::default().fg(Color::Gray)));
+    }
+    spans
+}
+
 fn message_interaction_hint(
     entries: &[TranscriptEntry],
     hovered_message: Option<usize>,
@@ -16028,7 +16042,7 @@ fn message_interaction_hint(
                 ..
             })
         )
-        .then_some("left click copy message")
+        .then_some("click copy message")
     })
 }
 
@@ -16047,19 +16061,19 @@ struct BottomInteractionHintState {
 
 fn bottom_interaction_hint(state: BottomInteractionHintState) -> Option<&'static str> {
     if state.status_hovered && state.status_is_interruptible {
-        Some("left click interrupt")
+        Some("click interrupt")
     } else if state.goal_status_hovered && state.goal_available {
-        Some("left click toggle/manage · right click clear goal")
+        Some("click toggle/manage · right-click clear goal")
     } else if state.shell_status_hovered {
-        Some("left click to open shells menu")
+        Some("click to open shells menu")
     } else if state.agents_status_hovered {
-        Some("left click to open subagents menu")
+        Some("click to open subagents menu")
     } else if state.model_status_hovered {
-        Some("left click change model")
+        Some("click change model")
     } else if state.effort_status_hovered {
-        Some("left click change effort")
+        Some("click change effort")
     } else if state.permission_status_hovered {
-        Some("left click change permissions")
+        Some("click change permissions")
     } else {
         None
     }
