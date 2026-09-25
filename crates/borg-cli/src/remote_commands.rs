@@ -25,9 +25,8 @@ use borg_remote::{
     local_session_owner_is_active, local_session_owner_uses_current_binary, login_provider,
     mirror_local_session, obsolete_local_session_owner_pid, probe_capabilities,
     probe_provider_admission_capabilities, provider_credentials_present,
-    run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
-    run_attached_session, run_host_with_executor_factory, send_local_session_command,
-    session_control_socket_path,
+    run_agent_session_with_priority_commands, run_attached_session, run_host_with_executor_factory,
+    send_local_session_command, session_control_socket_path,
 };
 use chrono::{DateTime, Local, TimeZone, Utc};
 use futures_util::{FutureExt, StreamExt};
@@ -2555,6 +2554,7 @@ async fn run_local_agent_session(
     }
 
     let (session_command_tx, session_commands) = mpsc::channel(64);
+    let (interrupt_tx, interrupt_commands) = mpsc::channel(1);
     // The owned actor is the single ordered live source. A generous bounded
     // queue absorbs bursty child/tool traffic while preserving backpressure;
     // do not merge the same actor stream back through the store here, because a
@@ -2596,32 +2596,19 @@ async fn run_local_agent_session(
         let actor_store = Arc::clone(&durable_store);
         let actor_session_root = sessions_dir.clone();
         tokio::spawn(async move {
-            if initial_peers.is_empty() {
-                run_agent_session_with_store_and_writer(
-                    &actor_session_root,
-                    session_id,
-                    launch,
-                    session_commands,
-                    session_event_tx,
-                    executor,
-                    actor_store,
-                    writer,
-                )
-                .await
-            } else {
-                run_agent_session_with_store_writer_and_peers(
-                    &actor_session_root,
-                    session_id,
-                    launch,
-                    session_commands,
-                    session_event_tx,
-                    executor,
-                    actor_store,
-                    writer,
-                    initial_peers,
-                )
-                .await
-            }
+            run_agent_session_with_priority_commands(
+                &actor_session_root,
+                session_id,
+                launch,
+                session_commands,
+                interrupt_commands,
+                session_event_tx,
+                executor,
+                actor_store,
+                writer,
+                initial_peers,
+            )
+            .await
         })
     };
     let (ui_interaction_tx, mut ui_interaction_completions, ui_interaction_task) =
@@ -5735,7 +5722,11 @@ async fn run_local_agent_session(
                                 | SessionStatus::WaitingForApproval
                         ) {
                             dispatch_host_command_without_blocking(
-                                &session_command_tx,
+                                if session_access.is_attached() {
+                                    &session_command_tx
+                                } else {
+                                    &interrupt_tx
+                                },
                                 HostCommand::Interrupt { session_id },
                             )
                         } else {
