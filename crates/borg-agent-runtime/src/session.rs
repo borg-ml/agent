@@ -2193,6 +2193,9 @@ async fn run_agent_session_store_kernel_inner(
             .map(|deadline| Instant::now() + (deadline - Utc::now()).to_std().unwrap_or_default())
     });
     let mut usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
+    // When each route of the model fallback chain may be tried again.
+    let mut route_limits =
+        crate::model_fallback::RouteLimits::from_events(journal.context_events());
     let mut network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
     let mut network_retry_attempts = 0_usize;
     let mut network_retry_message_id = None;
@@ -5070,12 +5073,35 @@ async fn run_agent_session_store_kernel_inner(
                             }
                             let usage_limit_reset_delay =
                                 provider_error_usage_limit_reset_delay(&error);
-                            let usage_limit_retry = launch.capabilities.auto_resume_usage_limits
-                                && provider_supports_usage_limit_resume(launch.provider)
-                                && provider_error_is_temporary_usage_limited(&error)
+                            // With a fallback chain any usage limit, including a
+                            // weekly or billing one, moves the turn to the next
+                            // route instead of stopping it.
+                            let chain_fallback = !launch.capabilities.model_fallback.is_empty()
+                                && provider_error_is_usage_limited(&error)
                                 && !interrupted;
-                            let usage_limit_wait = usage_limit_retry
+                            let usage_limit_retry = chain_fallback
+                                || (launch.capabilities.auto_resume_usage_limits
+                                    && provider_supports_usage_limit_resume(launch.provider)
+                                    && provider_error_is_temporary_usage_limited(&error)
+                                    && !interrupted);
+                            let mut usage_limit_wait = usage_limit_retry
                                 .then(|| usage_limit_reset_delay.unwrap_or(usage_limit_retry_delay));
+                            let mut fallback_switch = None;
+                            if chain_fallback {
+                                fallback_switch = fall_back_on_usage_limit(
+                                    &mut journal,
+                                    &events,
+                                    session_id,
+                                    &mut launch,
+                                    &mut route_limits,
+                                    usage_limit_reset_delay,
+                                    &mut usage_limit_wait,
+                                )
+                                .await?;
+                                provider_switch_pending |= fallback_switch
+                                    .as_ref()
+                                    .is_some_and(|switch: &FallbackSwitch| switch.provider_changed);
+                            }
                             // Once the turn has run tools or produced output,
                             // the user's message has been delivered and acted
                             // on. Re-sending it would repeat that work, so the
@@ -5176,6 +5202,8 @@ async fn run_agent_session_store_kernel_inner(
                                         NETWORK_RETRY_MAX_ATTEMPTS,
                                         network_retry_delay.as_secs()
                                     )
+                                } else if let Some(switch) = &fallback_switch {
+                                    switch.status(usage_limit_wait.unwrap_or_default())
                                 } else if let Some(wait) = usage_limit_wait {
                                     if usage_limit_continue {
                                         format!(
@@ -6725,6 +6753,19 @@ async fn run_agent_session_store_kernel_inner(
             }
         }
         at_turn_boundary = true;
+        // Back up the chain once an earlier route's limit has reset.
+        if !interrupted
+            && let Some(switch) = return_to_preferred_route(
+                &mut journal,
+                &events,
+                session_id,
+                &mut launch,
+                &route_limits,
+            )
+            .await?
+        {
+            provider_switch_pending |= switch.provider_changed;
+        }
         if active_provider != launch.provider || active_model != launch.model {
             provider_context_usage_valid = false;
         }
@@ -10865,6 +10906,191 @@ async fn settle_accepted_steers(
         .await;
     }
     Ok(())
+}
+
+/// A move along the model fallback chain.
+struct FallbackSwitch {
+    from: String,
+    to: String,
+    provider_changed: bool,
+}
+
+impl FallbackSwitch {
+    fn status(&self, wait: Duration) -> String {
+        if wait.is_zero() {
+            format!(
+                "{} reached its usage limit; continuing this turn on {} · Borg returns to it once it resets.",
+                self.from, self.to
+            )
+        } else {
+            format!(
+                "Every model in the fallback chain is at its usage limit; Borg continues on {} when it resets in {} · Esc to cancel.",
+                self.to,
+                format_reset_delay(wait)
+            )
+        }
+    }
+}
+
+/// Run the session on `route`, journaled like a `/model` change.
+async fn apply_route(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    launch: &mut LaunchSession,
+    route: &crate::ModelRoute,
+) -> Result<bool> {
+    let provider_changed = apply_session_config(
+        journal,
+        events,
+        session_id,
+        launch,
+        crate::SessionConfigAction::SetProvider {
+            provider: route.provider,
+            model: route.model.clone(),
+        },
+    )
+    .await?;
+    if let Some(effort) = &route.effort
+        && launch.effort.as_deref() != Some(effort.as_str())
+    {
+        apply_session_config(
+            journal,
+            events,
+            session_id,
+            launch,
+            crate::SessionConfigAction::SetEffort {
+                effort: effort.clone(),
+            },
+        )
+        .await?;
+    }
+    Ok(provider_changed)
+}
+
+/// The active route hit a usage limit: record when it resets, then move the
+/// session to the first route with quota and retry at once. When every route
+/// is limited, move to the one that resets first and wait for it.
+async fn fall_back_on_usage_limit(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    launch: &mut LaunchSession,
+    route_limits: &mut crate::model_fallback::RouteLimits,
+    reset_delay: Option<Duration>,
+    usage_limit_wait: &mut Option<Duration>,
+) -> Result<Option<FallbackSwitch>> {
+    // A limit without a reset time is assumed to last an hour before the route
+    // is tried again; a shorter guess only costs a failed attempt.
+    const UNKNOWN_RESET: Duration = Duration::from_secs(60 * 60);
+    let chain = launch.capabilities.model_fallback.clone();
+    let now = Utc::now();
+    let from =
+        crate::model_fallback::current_route(&chain, launch.provider, launch.model.as_deref());
+    let limited = from.map_or_else(
+        || crate::ModelRoute {
+            provider: launch.provider,
+            model: launch.model.clone(),
+            effort: launch.effort.clone(),
+            allow_api_billing: false,
+        },
+        |index| chain[index].clone(),
+    );
+    let until =
+        now + chrono::Duration::from_std(reset_delay.unwrap_or(UNKNOWN_RESET)).unwrap_or_default();
+    route_limits.limit(&limited, until);
+    record(
+        journal,
+        events,
+        session_id,
+        SessionEventKind::ProviderEvent {
+            provider: launch.provider,
+            kind: crate::model_fallback::ROUTE_LIMITED_EVENT.to_string(),
+            payload: serde_json::json!({ "route": limited, "until": until.to_rfc3339() }),
+        },
+    )
+    .await?;
+    let (next, wait) = match crate::model_fallback::preferred_route(
+        &chain,
+        route_limits,
+        &launch.capabilities.provider_capabilities,
+        now,
+    ) {
+        Some(next) => (next, Duration::ZERO),
+        None => match route_limits.earliest_reset(&chain) {
+            Some((next, reset)) => (next, (reset - now).to_std().unwrap_or_default()),
+            None => return Ok(None),
+        },
+    };
+    *usage_limit_wait = Some(wait);
+    if Some(next) == from {
+        return Ok(None);
+    }
+    let provider_changed = apply_route(journal, events, session_id, launch, &chain[next]).await?;
+    let switch = FallbackSwitch {
+        from: limited.label(),
+        to: chain[next].label(),
+        provider_changed,
+    };
+    record(
+        journal,
+        events,
+        session_id,
+        SessionEventKind::ProviderEvent {
+            provider: launch.provider,
+            kind: "model_fallback".to_string(),
+            payload: serde_json::json!({ "from": switch.from, "to": switch.to, "until": until.to_rfc3339() }),
+        },
+    )
+    .await?;
+    Ok(Some(switch))
+}
+
+/// Between turns, return to the earliest route of the chain that has quota
+/// again. A session moved off the chain by hand is left where it is.
+async fn return_to_preferred_route(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    launch: &mut LaunchSession,
+    route_limits: &crate::model_fallback::RouteLimits,
+) -> Result<Option<FallbackSwitch>> {
+    let chain = launch.capabilities.model_fallback.clone();
+    let Some(current) =
+        crate::model_fallback::current_route(&chain, launch.provider, launch.model.as_deref())
+    else {
+        return Ok(None);
+    };
+    let Some(preferred) = crate::model_fallback::preferred_route(
+        &chain,
+        route_limits,
+        &launch.capabilities.provider_capabilities,
+        Utc::now(),
+    ) else {
+        return Ok(None);
+    };
+    if preferred >= current {
+        return Ok(None);
+    }
+    let provider_changed =
+        apply_route(journal, events, session_id, launch, &chain[preferred]).await?;
+    let switch = FallbackSwitch {
+        from: chain[current].label(),
+        to: chain[preferred].label(),
+        provider_changed,
+    };
+    record(
+        journal,
+        events,
+        session_id,
+        SessionEventKind::ProviderEvent {
+            provider: launch.provider,
+            kind: "model_fallback_restored".to_string(),
+            payload: serde_json::json!({ "from": switch.from, "to": switch.to }),
+        },
+    )
+    .await?;
+    Ok(Some(switch))
 }
 
 async fn apply_session_config(

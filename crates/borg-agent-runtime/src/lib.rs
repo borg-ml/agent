@@ -24,6 +24,7 @@ mod imported_memory;
 mod lane_tools;
 mod local_control;
 mod lsp;
+mod model_fallback;
 mod native_context;
 mod native_harness;
 mod native_io;

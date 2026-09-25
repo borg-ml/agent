@@ -25,9 +25,92 @@ pub(crate) struct AgentConfig {
     pub(crate) shell: ShellConfig,
     pub(crate) git: GitConfig,
     pub(crate) local: LocalProviderConfig,
+    /// Ordered model fallback chains.
+    pub(crate) models: ModelsConfig,
     /// Named OpenAI-compatible routes. The durable session keeps the generic
     /// native provider kind and records the stable `provider/model` alias.
     pub(crate) providers: BTreeMap<String, ConfiguredProvider>,
+}
+
+/// `[models]`: the ordered routes a session falls back through when a model
+/// reaches its usage limit.
+///
+/// ```toml
+/// [models]
+/// fallback = ["claude-opus-5-5@max", "chain:subscriptions", "opencode-go/deepseek-v4.1"]
+///
+/// [models.chains]
+/// subscriptions = ["gpt-6-sol@xhigh"]
+/// paid = [{ route = "anthropic/claude-opus-5-5", allow_api_billing = true }]
+/// ```
+///
+/// Entries are route specs (`model`, `model@effort`, `provider/model@effort`),
+/// `chain:<name>` to include a named chain, or a table to opt a route into
+/// API billing. Includes may nest; a route listed twice keeps its first place.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub(crate) struct ModelsConfig {
+    pub(crate) fallback: Vec<RouteEntry>,
+    pub(crate) chains: BTreeMap<String, Vec<RouteEntry>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum RouteEntry {
+    Spec(String),
+    Route {
+        route: String,
+        #[serde(default)]
+        allow_api_billing: bool,
+    },
+}
+
+impl ModelsConfig {
+    /// Expand the fallback chain into the flat, ordered list a session runs.
+    pub(crate) fn resolve(&self) -> Result<Vec<borg_remote::ModelRoute>> {
+        let mut routes = Vec::new();
+        self.expand(&self.fallback, &mut Vec::new(), &mut routes)?;
+        Ok(routes)
+    }
+
+    fn expand(
+        &self,
+        entries: &[RouteEntry],
+        including: &mut Vec<String>,
+        routes: &mut Vec<borg_remote::ModelRoute>,
+    ) -> Result<()> {
+        for entry in entries {
+            let (spec, allow_api_billing) = match entry {
+                RouteEntry::Spec(spec) => (spec.as_str(), false),
+                RouteEntry::Route {
+                    route,
+                    allow_api_billing,
+                } => (route.as_str(), *allow_api_billing),
+            };
+            if let Some(name) = spec.trim().strip_prefix("chain:") {
+                let name = name.trim();
+                anyhow::ensure!(
+                    !including.iter().any(|open| open == name),
+                    "models.chains.{name} includes itself"
+                );
+                let chain = self
+                    .chains
+                    .get(name)
+                    .with_context(|| format!("models: unknown chain `{name}`"))?;
+                including.push(name.to_string());
+                self.expand(chain, including, routes)?;
+                including.pop();
+                continue;
+            }
+            let mut route = borg_remote::ModelRoute::parse(spec)
+                .with_context(|| format!("models: invalid route `{spec}`"))?;
+            route.allow_api_billing = allow_api_billing;
+            if !routes.iter().any(|known| known.label() == route.label()) {
+                routes.push(route);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -280,6 +363,9 @@ pub(crate) struct CapabilityConfig {
     /// `native` is the explicit direct-tool fallback.
     #[serde(alias = "tool_mode")]
     pub(crate) harness: borg_remote::HarnessMode,
+    /// Resolved from `[models]` when the config loads.
+    #[serde(skip)]
+    pub(crate) model_fallback: Vec<borg_remote::ModelRoute>,
 }
 
 impl Default for CapabilityConfig {
@@ -297,6 +383,7 @@ impl Default for CapabilityConfig {
             watcher_yield: true,
             steer_reply_prompt: borg_remote::SteerReplyPrompt::default(),
             harness: borg_remote::HarnessMode::Borg,
+            model_fallback: Vec::new(),
         }
     }
 }
@@ -314,6 +401,7 @@ impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
             telemetry: value.telemetry,
             auto_resume_usage_limits: value.auto_resume_usage_limits,
             watcher_yield: value.watcher_yield,
+            model_fallback: value.model_fallback.clone(),
             steer_reply_prompt: value.steer_reply_prompt.clone(),
             provider_capabilities: Vec::new(),
             luna_titles_for_all_providers: false,
@@ -491,8 +579,13 @@ impl AgentConfig {
                 "agent config contains keys this Borg build does not understand; they have no effect"
             );
         }
+        let mut config = config;
         config
             .validate()
+            .with_context(|| format!("invalid agent config {}", path.display()))?;
+        config.capabilities.model_fallback = config
+            .models
+            .resolve()
             .with_context(|| format!("invalid agent config {}", path.display()))?;
         Ok(config)
     }
@@ -2145,5 +2238,40 @@ reasoning_format = "deepseek"
         )
         .expect("configured provider parses");
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn model_chains_compose_and_reject_cycles() {
+        let config: AgentConfig = toml::from_str(
+            r#"
+[models]
+fallback = ["claude-opus-5-5@max", "chain:subscriptions", "opencode-go/deepseek-v4.1"]
+
+[models.chains]
+subscriptions = ["gpt-6-sol@xhigh", "chain:paid", "claude-opus-5-5@max"]
+paid = [{ route = "anthropic/claude-opus-5-5", allow_api_billing = true }]
+"#,
+        )
+        .expect("config parses");
+        let routes = config.models.resolve().expect("chain resolves");
+        let labels = routes.iter().map(|route| route.label()).collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                "claude-opus-5-5@max",
+                "gpt-6-sol@xhigh",
+                "anthropic/claude-opus-5-5",
+                "opencode-go/deepseek-v4.1"
+            ]
+        );
+        assert_eq!(routes[2].provider, borg_remote::CodingProvider::Anthropic);
+        assert!(routes[2].allow_api_billing);
+        assert!(!routes[0].allow_api_billing);
+
+        let cyclic: AgentConfig = toml::from_str(
+            "[models]\nfallback = [\"chain:a\"]\n[models.chains]\na = [\"chain:a\"]\n",
+        )
+        .expect("config parses");
+        assert!(cyclic.models.resolve().is_err());
     }
 }
