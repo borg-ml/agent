@@ -5,6 +5,47 @@ Git comparison.
 
 ## Unreleased (since 0.12.0)
 
+### Context
+
+- An interrupted or resumed turn no longer compacts early. When a request
+  reuses the provider's cached prefix, Borg now measures context from the
+  provider's reported usage plus the new message, instead of its own replay
+  estimate (which could read 223k of 258k while the provider reported 95k).
+
+### Providers
+
+- A Codex backend `invalid_api_key` 401 is reported as a provider outage
+  instead of triggering a reconnect.
+
+### Terminal UI
+
+- Replies stream token by token by default. `/streaming paragraph` (or
+  Settings → Response streaming) holds unfinished paragraphs, list items and
+  code blocks; in that mode the reply header waits for the first finished
+  block, and reloading settings no longer reveals the unfinished tail.
+- `/team` broadcasts appear in the timeline immediately and show how many
+  live addressed teammates durably acknowledged the message; the count keeps
+  updating while the session is active and survives reconnects.
+- With an empty composer, press Down to focus the status line; arrows and Tab
+  navigate its menus, Enter or Space activates a control, and Escape returns
+  to the composer. Ctrl+1–9/0 (Cmd+1–9/0 on macOS) reaches the visible
+  controls on both composer lines in reading order. Focus is highlighted.
+- Action groups show `▾` when expanded and `▸` when collapsed, with their
+  timestamps in the same column, and collapse again when clicked. The header
+  no longer carries a failed count; failed rows stay red.
+- The composer prompt is `›` with a blinking underscore cursor; `/cursor
+  underline`, `/cursor bar` and `/cursor block` select a persisted style.
+  Finished command rows use the same slim chevron, edits use `◈`, and pending
+  or agent actions keep diamond markers.
+- The inactive agent roster is collapsed by default. Goal and watcher accents
+  are rose-purple; todos use orange.
+- A waiting command row names its command, and its poll rows stop showing
+  "Waiting on…" once the command exits. `git show` rows say "Show commit(s)".
+- Opus 5.5 and Fable 5.1 effort changes no longer warn of a cold cache just
+  because a resumed transcript has not loaded provider capabilities yet.
+- The TUI logs bounded timing summaries for stream, input, frame and
+  interrupt bottlenecks.
+
 ## 0.12.0 (2026-09-25)
 
 ### Agents
@@ -46,32 +87,12 @@ Git comparison.
 
 - The action list is regrouped: every batch of actions sits under one header
   with its start time, action count and working directory (`17:41 · 7 actions ·
-  ~/project`); finished batches fold to that header until clicked and can be
-  clicked again to collapse. Expanded groups show `▾`, collapsed ones `▸`,
-  with their timestamps in the same column.
+  ~/project`, plus `1 failed` in red when something failed); finished batches
+  fold to that header until clicked.
   Rows drop their clock time and leading `cd …`, name what a command did
   (`Read src/main.rs:1-40`, `Search “pattern”`, `Write build.py`, `Run Python`),
   show its result beside the duration (`6 matches`, `exit 1`, `12 passed`,
   `+14 -3`) and carry a marker for the kind of work; failures show in red.
-- The composer prompt is `›` with a blinking underscore cursor; finished
-  command rows use the same slim chevron, edits use `◈`, and pending or agent
-  actions retain diamond markers.
-- `/cursor underline`, `/cursor bar`, and `/cursor block` select a persisted
-  composer cursor style.
-- The inactive agent roster is collapsed by default. Goal and watcher accents
-  are rose-purple; todos use orange. Action-group timestamps align with rows.
-- With an empty composer, press Down to focus the status line; arrows and Tab
-  navigate its menus, Enter or Space activates a control, and Escape returns
-  to the composer. Ctrl+1–9/0 (Cmd+1–9/0 on macOS) reaches the visible
-  controls on both composer lines in reading order. Focus is highlighted.
-- `/team` broadcasts appear in the timeline immediately and show how many
-  live addressed teammates durably acknowledged the message; the count keeps
-  updating while the session is active and survives reconnects.
-- Opus 5.5 and Fable 5.1 effort changes no longer warn of a cold cache just
-  because a resumed transcript has not loaded provider capabilities yet.
-- A waiting command row names its command, and `git show` rows say "Show
-  commit(s)" instead of "Show revision(s)". The TUI logs bounded timing
-  summaries for stream, input, frame, and interrupt bottlenecks.
 - The shell keeps its working directory between commands, so agents no longer
   repeat `cd DIR &&` on every call.
 - "Back to thread" (was "Back to actions") sits beside Jump to bottom on the
@@ -81,9 +102,10 @@ Git comparison.
   start, instead of a fragment cut at both ends.
 - The running timer starts from zero for each new turn, including one a
   message starts after the session was waiting, instead of adding to the last.
-- Replies stream token by token by default. `/streaming paragraph` (or
-  Settings → Response streaming) holds unfinished paragraphs, list items,
-  and code blocks until they are ready.
+- Replies stream a finished paragraph at a time by default: a paragraph once a
+  blank line ends it, lists item by item, code blocks once their fence closes,
+  and titles together with the text under them. `/streaming token` (or
+  Settings → Response streaming) shows every token as it arrives instead.
 - Settings menu choices after "Auto-expand tools" opened the setting below
   them; each now opens its own.
 - Watch and other action rows sit in the action list with no extra spacing,
