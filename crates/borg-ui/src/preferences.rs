@@ -168,6 +168,8 @@ pub struct PresentationPreferences {
     pub tool_click_behavior: ToolClickBehavior,
     pub action_descriptors: bool,
     pub running_sweeps: bool,
+    /// Let tool and action rows wrap onto more lines; off keeps each row on one line.
+    pub wrap_action_rows: bool,
     pub dictation_icon: Option<DictationIconStyle>,
     /// Selected managed dictation model id (e.g. "parakeet-v2"); `None` uses
     /// the built-in default.
@@ -189,6 +191,7 @@ impl Default for PresentationPreferences {
             tool_click_behavior: ToolClickBehavior::Fullscreen,
             action_descriptors: true,
             running_sweeps: true,
+            wrap_action_rows: false,
             dictation_icon: None,
             dictation_model: None,
             dictation_accelerator: None,
@@ -555,6 +558,7 @@ keep = true
                 tool_click_behavior: ToolClickBehavior::Inline,
                 action_descriptors: false,
                 running_sweeps: false,
+                wrap_action_rows: true,
                 dictation_icon: Some(DictationIconStyle::NerdFont),
                 dictation_model: Some("lightweight".to_string()),
                 dictation_accelerator: Some("auto".to_string()),

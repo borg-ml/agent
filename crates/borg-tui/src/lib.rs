@@ -879,6 +879,7 @@ pub enum UiAction {
     SetAutoExpandThinking(bool),
     SetToolClickBehavior(ToolClickBehavior),
     SetActionDescriptors(bool),
+    SetWrapActionRows(bool),
     SetRunningSweeps(bool),
     SetCompletionNotifications(CompletionAlertPolicy),
     SetCompletionSound(CompletionAlertPolicy),
@@ -1907,6 +1908,7 @@ enum PickerKind {
     AutoExpandThinking,
     ToolClickBehavior,
     ActionDescriptors,
+    WrapActionRows,
     RunningSweeps,
     CompletionNotifications,
     CompletionSound,
@@ -4848,6 +4850,7 @@ impl BorgTerminal {
             "Tool click behavior".to_string(),
             "Action descriptors".to_string(),
             "Running sweep animations".to_string(),
+            "Wrap action rows".to_string(),
             "Completion notifications".to_string(),
             "Completion sound".to_string(),
             "Auto-copy selections".to_string(),
@@ -4874,6 +4877,7 @@ impl BorgTerminal {
             "/tool-click",
             "/action-descriptors",
             "/animations",
+            "/wrap-actions",
             "/notifications",
             "/sound",
             "auto-copy",
@@ -5230,6 +5234,26 @@ impl BorgTerminal {
             ["On", "Off"],
             Some(if self.action_descriptors { "On" } else { "Off" }),
         ));
+    }
+
+    pub fn open_wrap_action_rows_picker(&mut self) {
+        self.picker = Some(Picker::new(
+            PickerKind::WrapActionRows,
+            "Wrap action rows onto more lines",
+            ["Off", "On"],
+            Some(if self.transcript.wrap_action_rows {
+                "On"
+            } else {
+                "Off"
+            }),
+        ));
+    }
+
+    pub fn set_wrap_action_rows(&mut self, enabled: bool) {
+        if self.transcript.wrap_action_rows != enabled {
+            self.transcript.wrap_action_rows = enabled;
+            self.invalidate_transcript_render_cache();
+        }
     }
 
     pub fn open_running_sweeps_picker(&mut self) {
@@ -7128,6 +7152,9 @@ impl BorgTerminal {
             PickerKind::ActionDescriptors => {
                 UiAction::SetActionDescriptors(picker.selected_value() == "On")
             }
+            PickerKind::WrapActionRows => {
+                UiAction::SetWrapActionRows(picker.selected_value() == "On")
+            }
             PickerKind::RunningSweeps => {
                 UiAction::SetRunningSweeps(picker.selected_value() == "On")
             }
@@ -8508,20 +8535,18 @@ impl BorgTerminal {
                         Block::default()
                             .borders(Borders::TOP | Borders::LEFT)
                             .border_style(Style::default().fg(Color::DarkGray))
-                            .title(Span::styled(
-                                pending_input_title(
+                            .title(pending_input_title_line(
+                                &pending_input_title(
                                     ui_language,
                                     queued_prompts.len(),
                                     self.pending_input_expanded,
                                     chunks[1].width,
                                 ),
-                                Style::default()
-                                    .fg(if self.focused_child.is_some() {
-                                        SUBAGENT_PINK
-                                    } else {
-                                        BORG_ORANGE
-                                    })
-                                    .add_modifier(Modifier::BOLD),
+                                if self.focused_child.is_some() {
+                                    SUBAGENT_PINK
+                                } else {
+                                    BORG_ORANGE
+                                },
                             )),
                     ),
                     chunks[1],
@@ -13067,7 +13092,7 @@ fn queued_prompt_panel_height(
         .sum::<usize>();
     text_lines
         .saturating_add(usize::from(queued_prompts.len() > visible))
-        // One top-border/title row plus one contextual shortcut row.
+        // One top-border/title row plus one blank row above the status line.
         .saturating_add(2)
         .min(u16::MAX as usize) as u16
 }
@@ -13083,6 +13108,20 @@ fn pending_input_title(
     } else {
         ("▸", "expand")
     };
+    let with_controls = format!(
+        " {arrow} {} · {count} · click to {action} · esc send input · ↑ edit / recall input ",
+        ui_text(language, "Pending Input")
+    );
+    if with_controls.width() < usize::from(panel_width) {
+        return with_controls;
+    }
+    let short_controls = format!(
+        " {arrow} {} · {count} · click to {action} · esc send · ↑ recall ",
+        ui_text(language, "Pending Input")
+    );
+    if short_controls.width() < usize::from(panel_width) {
+        return short_controls;
+    }
     let full = format!(
         " {arrow} {} · {count} · click to {action} ",
         ui_text(language, "Pending Input")
@@ -13100,6 +13139,30 @@ fn pending_input_title(
     } else {
         format!(" {arrow} {count} ")
     }
+}
+
+/// Accent the heading and count; controls are grey with their keys in white.
+fn pending_input_title_line(title: &str, accent: Color) -> Line<'static> {
+    let (head, controls) = match title.match_indices(" · ").nth(1) {
+        Some((at, _)) => title.split_at(at),
+        None => (title, ""),
+    };
+    let mut spans = vec![Span::styled(
+        head.to_string(),
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    )];
+    for (index, word) in controls.split(' ').enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let color = if matches!(word, "click" | "esc" | "↑") {
+            Color::White
+        } else {
+            Color::Gray
+        };
+        spans.push(Span::styled(word.to_string(), Style::default().fg(color)));
+    }
+    Line::from(spans)
 }
 
 fn wrapped_pending_prompt_lines(text: &str, width: usize) -> Vec<String> {
@@ -13152,10 +13215,8 @@ fn queued_prompt_lines(
             Style::default().fg(Color::DarkGray),
         )));
     }
-    lines.push(Line::from(Span::styled(
-        "   esc send input · keep running  ·  ↑ edit / recall input",
-        Style::default().fg(Color::DarkGray),
-    )));
+    // Controls live in the title; keep a blank row above the status line.
+    lines.push(Line::default());
     lines
 }
 
@@ -15439,7 +15500,11 @@ fn tool_summary_lines(
     elapsed: Option<&str>,
     prefix: &str,
     width: usize,
+    wrap: bool,
 ) -> Vec<String> {
+    if wrap {
+        return wrapped_tool_summary_lines(summary, elapsed, prefix, width);
+    }
     // One row per action: long details end in an ellipsis (the full text is
     // one click away) and the timer keeps a fixed right-aligned column.
     const ELAPSED_COLUMN_WIDTH: usize = 8;
@@ -15473,6 +15538,48 @@ fn tool_summary_lines(
         line.push_str(elapsed);
     }
     vec![line]
+}
+
+fn wrapped_tool_summary_lines(
+    summary: &str,
+    elapsed: Option<&str>,
+    prefix: &str,
+    width: usize,
+) -> Vec<String> {
+    let content_width = width.saturating_sub(UnicodeWidthStr::width(prefix));
+    let Some(elapsed) = elapsed else {
+        return wrap_display(summary, content_width.max(1));
+    };
+    // Keep action text at one stable width while the timer changes from
+    // tenths to seconds, minutes, hours, or days.
+    const ELAPSED_COLUMN_WIDTH: usize = 8;
+    let elapsed_width = UnicodeWidthStr::width(elapsed);
+    let reserved_width = ELAPSED_COLUMN_WIDTH.saturating_add(2);
+    if content_width <= reserved_width {
+        return wrap_display(&format!("{summary} · {elapsed}"), content_width.max(1));
+    }
+
+    let first_width = content_width - reserved_width;
+    let Some((first_start, first_end)) = display_ranges(summary, first_width, false)
+        .into_iter()
+        .next()
+    else {
+        return vec![format!("{:>content_width$}", elapsed)];
+    };
+    let mut lines = vec![summary[first_start..first_end].to_string()];
+    let remaining = summary[first_end..].trim_start();
+    if !remaining.is_empty() {
+        lines.extend(wrap_display(remaining, content_width));
+    }
+    if let Some(first) = lines.first_mut() {
+        let padding = content_width
+            .saturating_sub(UnicodeWidthStr::width(first.as_str()))
+            .saturating_sub(ELAPSED_COLUMN_WIDTH)
+            .saturating_add(ELAPSED_COLUMN_WIDTH.saturating_sub(elapsed_width));
+        first.push_str(&" ".repeat(padding));
+        first.push_str(elapsed);
+    }
+    lines
 }
 
 #[cfg(test)]

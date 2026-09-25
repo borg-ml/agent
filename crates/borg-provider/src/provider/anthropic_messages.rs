@@ -1386,7 +1386,7 @@ mod tests {
         assert!(expected > 1);
         let blocks = image_blocks(&[large, encode(800, 600)]);
         assert_eq!(blocks.len(), 2 * expected + 1);
-        for (index, pair) in blocks[..2 * expected].chunks_exact(2).enumerate() {
+        for (index, pair) in blocks[..2 * expected].as_chunks::<2>().0.iter().enumerate() {
             assert_eq!(pair[0]["type"], "text");
             let label = pair[0]["text"].as_str().unwrap().to_ascii_lowercase();
             assert!(label.contains(if index == 0 { "overview" } else { "tile" }));

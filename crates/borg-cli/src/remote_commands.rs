@@ -2698,6 +2698,7 @@ async fn run_local_agent_session(
         terminal.set_tool_click_behavior(editor_preferences.presentation.tool_click_behavior);
         terminal.set_action_descriptors(editor_preferences.presentation.action_descriptors);
         terminal.set_running_sweeps(editor_preferences.presentation.running_sweeps);
+        terminal.set_wrap_action_rows(editor_preferences.presentation.wrap_action_rows);
         terminal.set_ui_language(editor_preferences.presentation.ui_language);
         terminal.set_layout_preferences(&editor_preferences.layout);
         terminal.set_completion_alerts(
@@ -3818,6 +3819,9 @@ async fn run_local_agent_session(
                                 );
                                 terminal.set_running_sweeps(
                                     editor_preferences.presentation.running_sweeps,
+                                );
+                                terminal.set_wrap_action_rows(
+                                    editor_preferences.presentation.wrap_action_rows,
                                 );
                                 terminal.set_ui_language(
                                     editor_preferences.presentation.ui_language,
@@ -5493,6 +5497,19 @@ async fn run_local_agent_session(
                             if enabled { "on" } else { "off" }
                         ));
                     }
+                    UiAction::SetWrapActionRows(enabled) => {
+                        editor_preferences.presentation.wrap_action_rows = enabled;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_wrap_action_rows(enabled);
+                        terminal.set_notice(format!(
+                            "Wrap action rows: {}",
+                            if enabled { "on" } else { "off" }
+                        ));
+                    }
                     UiAction::SetRunningSweeps(enabled) => {
                         editor_preferences.presentation.running_sweeps = enabled;
                         dispatch_editor_preferences_save(
@@ -6174,6 +6191,11 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .open_action_descriptors_picker();
+                        } else if line == "/wrap-actions" && attachments.is_empty() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .open_wrap_action_rows_picker();
                         } else if line == "/animations" && attachments.is_empty() {
                             terminal
                                 .as_mut()
@@ -6661,6 +6683,26 @@ async fn run_local_agent_session(
                             } else {
                                 terminal.as_mut().expect("terminal").set_notice(
                                     "Choose /action-descriptors on or /action-descriptors off",
+                                );
+                            }
+                        } else if let Some(value) = line.strip_prefix("/wrap-actions ")
+                            && attachments.is_empty()
+                        {
+                            if let Some(enabled) = parse_on_off(value) {
+                                editor_preferences.presentation.wrap_action_rows = enabled;
+                                dispatch_editor_preferences_save(
+                                    &editor_preferences_tx,
+                                    &editor_preferences,
+                                );
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.set_wrap_action_rows(enabled);
+                                terminal.set_notice(format!(
+                                    "Wrap action rows: {}",
+                                    if enabled { "on" } else { "off" }
+                                ));
+                            } else {
+                                terminal.as_mut().expect("terminal").set_notice(
+                                    "Choose /wrap-actions on or /wrap-actions off",
                                 );
                             }
                         } else if let Some(value) = line.strip_prefix("/animations ")

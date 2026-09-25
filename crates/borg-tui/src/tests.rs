@@ -3559,8 +3559,8 @@ fn thread_find_advances_and_wraps_through_regex_matches() {
 #[test]
 fn running_tool_timing_column_never_rewraps_action_text() {
     let summary = "12:10  ↗ Generating tool call · wait for corrected full editor build · Running in background";
-    let short = tool_summary_lines(summary, Some("0.1s"), "  ", 88);
-    let long = tool_summary_lines(summary, Some("1m 00s"), "  ", 88);
+    let short = tool_summary_lines(summary, Some("0.1s"), "  ", 88, false);
+    let long = tool_summary_lines(summary, Some("1m 00s"), "  ", 88, false);
 
     assert_eq!((short.len(), long.len()), (1, 1));
     assert_eq!(
@@ -10140,6 +10140,7 @@ fn agent_message_is_visible_while_stopped_once_on_replay_and_never_human_pending
     // The received agent-message row is opt-in.
     let mut transcript = Transcript {
         show_subagent_messages: true,
+        wrap_action_rows: true,
         ..Transcript::default()
     };
     let mut pending = Vec::new();
@@ -10592,7 +10593,11 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
         .collect::<String>();
     assert!(content.contains("Next"));
     assert!(content.contains("visible follow-up"));
-    assert!(hint.contains("↑ edit / recall input"));
+    let header = (0..area.width)
+        .map(|x| buffer[(x, 0)].symbol())
+        .collect::<String>();
+    assert!(header.contains("click to collapse"), "{header}");
+    assert!(hint.trim_start_matches('│').trim().is_empty(), "{hint}");
 }
 
 #[test]
@@ -10730,8 +10735,10 @@ fn pending_steer_ui_uses_the_shared_next_label_and_live_flush_action() {
     assert!(!rendered.contains("NEXT TOOL"));
     assert!(!rendered.contains("NEXT TURN"));
     assert!(rendered.contains("focus on the failing test"));
-    assert!(rendered.contains("esc send input · keep running"));
-    assert!(rendered.contains("recall input"));
+    assert!(!rendered.contains("esc send input"));
+    let title = pending_input_title(UiLanguage::Auto, 1, true, 120);
+    assert!(title.contains("esc send input · ↑"), "{title}");
+    assert!(title.contains("↑ edit / recall input"), "{title}");
 }
 
 #[test]
@@ -15987,6 +15994,19 @@ fn peer_agent_message_is_visible_without_subagent_opt_in() {
     let mut transcript = Transcript::default();
     assert!(!transcript.show_subagent_messages);
     transcript.apply(&peer);
+    // Single-line by default: the row carries the message's first line.
+    let single = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        single
+            .iter()
+            .any(|line| line.contains("Peer") && line.contains("steer orphaning")),
+        "{single:?}"
+    );
+    transcript.wrap_action_rows = true;
     let rendered = transcript
         .lines(100)
         .into_iter()
