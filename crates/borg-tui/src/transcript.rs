@@ -5554,7 +5554,7 @@ impl Transcript {
                     let mut summary = if display_detail.is_empty() || focused_tool == Some(index) {
                         format!("{time}  {glyph} {display_name}")
                     } else {
-                        format!("{time}  {glyph} {display_name}  {display_detail}")
+                        format!("{time}  {glyph} {display_name:<8}  {display_detail}")
                     };
                     if let Some(lifecycle) = lifecycle {
                         summary.push_str(&format!(" · {lifecycle}"));
