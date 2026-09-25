@@ -239,6 +239,9 @@ pub struct AgentToolDispatcher {
     /// socket are journaled here as children of that command. Weak, so a
     /// finished turn's stream still closes.
     turn_events: Arc<RwLock<Option<tokio::sync::mpsc::WeakSender<SessionEventKind>>>>,
+    /// Where the last `cd` left the shell, so commands carry on there like in
+    /// one terminal instead of every command repeating `cd DIR &&`.
+    shell_directory: Arc<RwLock<Option<PathBuf>>>,
     persistent_runtimes: PersistentRuntimeRegistry,
     #[cfg(unix)]
     lanes: crate::lane_tools::LaneTools,
@@ -868,6 +871,7 @@ impl AgentToolDispatcher {
             execution_provider: Arc::new(RwLock::new(execution_provider)),
             command_environment: Arc::new(RwLock::new(BTreeMap::new())),
             turn_events: Arc::new(RwLock::new(None)),
+            shell_directory: Arc::new(RwLock::new(None)),
             persistent_runtimes: PersistentRuntimeRegistry::default(),
             #[cfg(unix)]
             lanes: crate::lane_tools::LaneTools::default(),
@@ -1102,12 +1106,17 @@ impl AgentToolDispatcher {
             .clone();
         // Names this command as the parent of any Borg call it makes.
         environment.insert("BORG_TOOL_CALL_ID".to_string(), Uuid::new_v4().to_string());
+        let (command, shell_directory) = if args.workdir.is_some() {
+            (args.cmd, None)
+        } else {
+            self.in_shell_directory(args.cmd)
+        };
         let mut result = serde_json::to_value(
             execution_provider
                 .command(crate::ExecutionCommandRequest {
                     owner_session_id: self.actor_session_id,
                     root: self.runtime_root.clone(),
-                    command: args.cmd,
+                    command,
                     workdir: args.workdir,
                     yield_time_ms: args.yield_time_ms,
                     max_output_tokens: args.max_output_tokens,
@@ -1121,6 +1130,11 @@ impl AgentToolDispatcher {
                 })
                 .await?,
         )?;
+        if let Some(directory) = shell_directory
+            && let Some(result) = result.as_object_mut()
+        {
+            result.insert("cwd".to_string(), json!(directory));
+        }
         // Measured orchestrators spent hours in `sleep 300; echo waited` while
         // children worked. Not refused, since a timed pause can be legitimate,
         // but pointed at the wait that returns on the child's own progress.
@@ -1134,6 +1148,40 @@ impl AgentToolDispatcher {
             );
         }
         Ok(result)
+    }
+
+    /// Run `command` where the last `cd` left the shell, and remember where a
+    /// leading `cd DIR` of its own goes. Returns the command to run and the
+    /// directory it starts in, when that is not the workspace root.
+    fn in_shell_directory(&self, command: String) -> (String, Option<PathBuf>) {
+        let mut remembered = self
+            .shell_directory
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = remembered.clone();
+        let run = match &current {
+            Some(directory) => format!(
+                "cd '{}' && {command}",
+                directory.display().to_string().replace('\'', "'\\''")
+            ),
+            None => command.clone(),
+        };
+        if let Some((target, _)) = crate::tool_presentation::split_leading_cd(&command) {
+            let target = match target.strip_prefix('~') {
+                Some(rest) => std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(rest.trim_start_matches('/')))
+                    .unwrap_or_else(|| PathBuf::from(target)),
+                None => PathBuf::from(target),
+            };
+            let base = current.clone().unwrap_or_else(|| self.runtime_root.clone());
+            if let Ok(directory) = base.join(target).canonicalize()
+                && directory.is_dir()
+            {
+                *remembered = Some(directory.clone());
+                return (run, Some(directory));
+            }
+        }
+        (run, current)
     }
 
     /// The catalog served to a provider CLI over MCP. `workspace_tools` adds
@@ -8918,7 +8966,7 @@ fn workspace_effect(name: &str, arguments: &Value) -> Option<(&'static str, Stri
 pub(crate) fn exec_tool_spec() -> Value {
     tool(
         "exec",
-        "Run a shell command, or poll, interact with, or terminate a running process. Supply exactly one of cmd (start) or session_id (interact). Shell commands may invoke any installed language runtime. Use `borg tools` and `borg call NAME JSON` inside the shell, or `import borg` from Python and Bun code, for Borg and Blu capabilities.",
+        "Run a shell command, or poll, interact with, or terminate a running process. Supply exactly one of cmd (start) or session_id (interact). Shell commands may invoke any installed language runtime. Use `borg tools` and `borg call NAME JSON` inside the shell, or `import borg` from Python and Bun code, for Borg and Blu capabilities. The shell keeps its directory between commands like one terminal: after `cd DIR`, later commands run in DIR, so do not repeat `cd DIR &&`; the result's `cwd` shows where a command ran.",
         json!({
             "type": "object",
             "properties": {
