@@ -242,6 +242,8 @@ pub struct AgentToolDispatcher {
     /// Where the last `cd` left the shell, so commands carry on there like in
     /// one terminal instead of every command repeating `cd DIR &&`.
     shell_directory: Arc<RwLock<Option<PathBuf>>>,
+    /// Nested AGENTS.md/CLAUDE.md files already handed to the model.
+    announced_guidance: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
     persistent_runtimes: PersistentRuntimeRegistry,
     #[cfg(unix)]
     lanes: crate::lane_tools::LaneTools,
@@ -872,6 +874,7 @@ impl AgentToolDispatcher {
             command_environment: Arc::new(RwLock::new(BTreeMap::new())),
             turn_events: Arc::new(RwLock::new(None)),
             shell_directory: Arc::new(RwLock::new(None)),
+            announced_guidance: Arc::new(std::sync::Mutex::new(HashSet::new())),
             persistent_runtimes: PersistentRuntimeRegistry::default(),
             #[cfg(unix)]
             lanes: crate::lane_tools::LaneTools::default(),
@@ -1106,6 +1109,7 @@ impl AgentToolDispatcher {
             .clone();
         // Names this command as the parent of any Borg call it makes.
         environment.insert("BORG_TOOL_CALL_ID".to_string(), Uuid::new_v4().to_string());
+        let command_text = args.cmd.clone();
         let (command, shell_directory) = if args.workdir.is_some() {
             (args.cmd, None)
         } else {
@@ -1130,10 +1134,14 @@ impl AgentToolDispatcher {
                 })
                 .await?,
         )?;
-        if let Some(directory) = shell_directory
-            && let Some(result) = result.as_object_mut()
-        {
-            result.insert("cwd".to_string(), json!(directory));
+        let guidance = self.newly_reached_guidance(&command_text, shell_directory.as_deref());
+        if let Some(result) = result.as_object_mut() {
+            if let Some(directory) = shell_directory {
+                result.insert("cwd".to_string(), json!(directory));
+            }
+            if !guidance.is_empty() {
+                result.insert("project_guidance".to_string(), json!(guidance));
+            }
         }
         // Measured orchestrators spent hours in `sleep 300; echo waited` while
         // children worked. Not refused, since a timed pause can be legitimate,
@@ -1148,6 +1156,54 @@ impl AgentToolDispatcher {
             );
         }
         Ok(result)
+    }
+
+    /// AGENTS.md/CLAUDE.md files in directories this command worked in or
+    /// named, below the workspace root (whose chain the prompt already has),
+    /// that the model has not been given yet in this session.
+    fn newly_reached_guidance(&self, command: &str, directory: Option<&Path>) -> String {
+        let Ok(root) = self.runtime_root.canonicalize() else {
+            return String::new();
+        };
+        let base = directory.map_or_else(|| root.clone(), Path::to_path_buf);
+        let mut reached = vec![base.clone()];
+        for word in command.split_whitespace().take(64) {
+            let word = word.trim_matches(|character| "\"'();|&<>".contains(character));
+            if word.is_empty() || word.starts_with('-') {
+                continue;
+            }
+            let Ok(path) = base.join(word).canonicalize() else {
+                continue;
+            };
+            reached.push(if path.is_dir() {
+                path
+            } else {
+                path.parent().map_or(path.clone(), Path::to_path_buf)
+            });
+        }
+        let mut announced = self
+            .announced_guidance
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut blocks = String::new();
+        for directory in reached {
+            let Ok(relative) = directory.strip_prefix(&root) else {
+                continue;
+            };
+            let mut current = root.clone();
+            for component in relative.components() {
+                current.push(component);
+                if !announced.insert(current.clone()) {
+                    continue;
+                }
+                for (path, content) in
+                    crate::native_context::guidance_files(&current).unwrap_or_default()
+                {
+                    blocks.push_str(&crate::native_context::guidance_block(&path, &content));
+                }
+            }
+        }
+        blocks.trim_start().to_string()
     }
 
     /// Run `command` where the last `cd` left the shell, and remember where a
