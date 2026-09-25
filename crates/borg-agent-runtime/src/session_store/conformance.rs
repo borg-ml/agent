@@ -593,6 +593,7 @@ async fn an_oversized_tool_output_is_deferred_and_reloadable() {
                     is_error: false,
                     input: None,
                     input_ref: None,
+                    parent_tool_call_id: None,
                 },
             ))
             .await
@@ -651,6 +652,7 @@ async fn deferred_command_changes_survive_journal_replay() {
                     is_error: false,
                     input: None,
                     input_ref: None,
+                    parent_tool_call_id: None,
                 },
             ))
             .await
@@ -1855,6 +1857,7 @@ async fn an_event_body_containing_a_nul_round_trips_on_both_backends() {
                     is_error: false,
                     input: None,
                     input_ref: None,
+                    parent_tool_call_id: None,
                 },
             ))
             .await

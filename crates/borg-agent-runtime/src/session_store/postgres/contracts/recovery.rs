@@ -371,6 +371,7 @@ async fn narrowed_recovery_preserves_a_cut_inside_inherited_history() {
                     is_error: false,
                     input: None,
                     input_ref: None,
+                    parent_tool_call_id: None,
                 },
             ))
             .await
@@ -465,6 +466,7 @@ async fn narrowed_recovery_skips_the_context_payloads_a_resume_never_reads() {
                     is_error: false,
                     input: None,
                     input_ref: None,
+                    parent_tool_call_id: None,
                 },
             ))
             .await

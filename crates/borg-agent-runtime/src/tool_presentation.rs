@@ -546,10 +546,6 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
         return (git.label, git.detail);
     }
 
-    if let Some(team) = borg_call_team_summary(input) {
-        return team;
-    }
-
     if matches!(
         tool.as_str(),
         "update_plan" | "update_todo" | "update_todos"
@@ -1397,88 +1393,6 @@ fn git_call(name: &str, input: &Value) -> Option<GitCall> {
         label: action.label().to_string(),
         detail: git_tool_detail(action, input),
     })
-}
-
-/// Shell-first harnesses invoke Borg's own capabilities as `borg call NAME
-/// JSON` rather than as provider tool calls, so a team message would
-/// otherwise render as an anonymous shell run. Recover the collaboration
-/// identity of subagent and team calls; every other capability keeps its
-/// ordinary shell summary, and the card still shows the real command.
-fn borg_call_team_summary(input: &Value) -> Option<(String, String)> {
-    let command = command_from_input(input)?;
-    let (label, detail, arguments) = borg_call_invocation(command)
-        .into_iter()
-        .chain(script_borg_calls(command))
-        .find_map(|(capability, arguments)| {
-            let (label, detail) = tool_call_summary(&capability, &arguments);
-            is_subagent_tool(&label).then_some((label, detail, arguments))
-        })?;
-    // Arguments read from stdin or a heredoc are not on the command line, so
-    // describe the call with the command itself instead of a placeholder.
-    Some(if arguments.is_null() {
-        (label, compact_text(command, 120))
-    } else {
-        (label, detail)
-    })
-}
-
-/// Agents often send long team messages from a script, as
-/// `subprocess.run(["borg", "call", "send_message", json.dumps({...})])`, so
-/// the message needs no shell quoting. Recover the capability and a literal
-/// target from that argument list; the message itself is usually a variable.
-fn script_borg_calls(command: &str) -> Vec<(String, Value)> {
-    static CALL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"["'][^"'\s]*borg["']\s*,\s*["']call["']\s*,\s*["']([a-z_]+)["']"#)
-            .expect("valid borg call pattern")
-    });
-    static TARGET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"["']target["']\s*:\s*["']([^"']+)["']"#).expect("valid target pattern")
-    });
-    CALL.captures_iter(command)
-        .filter_map(|call| {
-            let arguments = TARGET
-                .captures(&command[call.get(0)?.end()..])
-                .and_then(|target| target.get(1))
-                .map_or(
-                    Value::Null,
-                    |target| serde_json::json!({ "target": target.as_str() }),
-                );
-            Some((call[1].to_string(), arguments))
-        })
-        .collect()
-}
-
-/// The capability and JSON arguments of the first `borg call` in a command
-/// line, looking through shell wrappers, chains and pipelines.
-fn borg_call_invocation(command: &str) -> Option<(String, Value)> {
-    let words = shell_words(command);
-    if let Some(script) = shell_script(&words) {
-        return borg_call_invocation(script);
-    }
-    shell_command_segments(&words)
-        .into_iter()
-        .find_map(|(_, segment)| borg_call_segment(&segment))
-}
-
-fn borg_call_segment(segment: &[String]) -> Option<(String, Value)> {
-    let borg = segment.iter().enumerate().find_map(|(index, word)| {
-        (matches!(word.rsplit('/').next(), Some("borg" | "borg.exe"))
-            && segment[..index]
-                .iter()
-                .all(|prefix| prefix == "env" || prefix.contains('=')))
-        .then_some(index)
-    })?;
-    let mut rest = segment[borg + 1..]
-        .iter()
-        .skip_while(|word| word.as_str() != "call")
-        .skip(1);
-    let capability = rest.find(|word| !word.starts_with('-'))?;
-    let arguments = rest
-        .next()
-        .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
-        .filter(Value::is_object)
-        .unwrap_or(Value::Null);
-    Some((capability.clone(), arguments))
 }
 
 fn git_action_from_tool_name(name: &str) -> Option<GitAction> {
@@ -3317,70 +3231,6 @@ all green"
         assert_eq!(presentation.detail, "opposite provider · persistent peer");
         assert_eq!(presentation.category, ToolPresentationCategory::Agent);
         assert!(!presentation.detail.contains("/root/claude"));
-    }
-
-    #[test]
-    fn shell_first_borg_team_calls_keep_their_collaboration_identity() {
-        // A shell-first harness runs Borg's own capabilities through `exec`,
-        // so the team identity has to come back out of the command line.
-        for command in [
-            r#"borg call send_message '{"target":"/root","message":"checkpoint"}'"#,
-            r#"/usr/local/bin/borg call send_message '{"target":"/root","message":"checkpoint"}'"#,
-            r#"cd /home/shulgin/agent && borg call send_message '{"target":"/root","message":"checkpoint"}'"#,
-            r#"bash -lc 'borg call send_message '"'"'{"target":"/root","message":"checkpoint"}'"'"' | tee log'"#,
-        ] {
-            let presentation =
-                project_tool_presentation("exec", &json!({"cmd": command}), Some("{}"), false);
-            assert_eq!(presentation.label, "Message agent", "{command}");
-            assert_eq!(presentation.detail, "/root · checkpoint", "{command}");
-            assert_eq!(
-                presentation.category,
-                ToolPresentationCategory::Agent,
-                "{command}"
-            );
-            // The card still shows the real shell command it ran.
-            let body = presentation.input.expect("the shell command stays visible");
-            assert_eq!(body.language, "command", "{command}");
-            assert!(
-                body.text
-                    .contains(r#"borg call send_message '{"target":"/root""#),
-                "{command} -> {}",
-                body.text
-            );
-        }
-
-        // Arguments off the command line still identify the call.
-        let piped = project_tool_presentation(
-            "exec",
-            &json!({"cmd": "borg call send_message -"}),
-            None,
-            false,
-        );
-        assert_eq!(piped.label, "Message agent");
-        assert_eq!(piped.detail, "borg call send_message -");
-
-        // A script builds the message and passes it as an argument list.
-        let scripted = tool_call_summary(
-            "exec",
-            &json!({"cmd": "python3 - <<'PY'\nimport json,subprocess\nsubprocess.run([\"borg\",\"call\",\"get_plan\",\"{}\"])\nm=('long message')\nsubprocess.run([\"borg\", \"call\", \"send_message\", json.dumps({\"target\": \"/root/worker\", \"message\": m})])\nPY"}),
-        );
-        assert_eq!(
-            scripted,
-            ("Message agent".to_string(), "/root/worker".to_string())
-        );
-
-        // Capabilities that are not team work keep the ordinary shell summary.
-        for command in [
-            r#"borg call read_file '{"path":"README.md"}'"#,
-            r#"borg tools"#,
-            r#"echo 'borg call send_message'"#,
-        ] {
-            assert_eq!(
-                tool_call_summary("exec", &json!({"cmd": command})).0,
-                "Run",
-                "{command}"
-            );
-        }
     }
 
     #[test]

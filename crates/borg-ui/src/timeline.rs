@@ -634,6 +634,7 @@ mod tests {
                 name: "exec_command".into(),
                 input: serde_json::json!({"cmd": "first"}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ));
         projector.push(&SessionEvent::new(
@@ -646,6 +647,7 @@ mod tests {
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ));
         projector.push(&SessionEvent::new(
@@ -656,6 +658,7 @@ mod tests {
                 name: "exec_command".into(),
                 input: serde_json::json!({"cmd": "second"}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ));
 
@@ -679,6 +682,7 @@ mod tests {
                 name: "exec_command".into(),
                 input: serde_json::json!({"cmd": "server"}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ));
         projector.push(&SessionEvent::new(
@@ -700,6 +704,7 @@ mod tests {
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ));
 
@@ -818,6 +823,7 @@ mod tests {
                     name: name.into(),
                     input,
                     input_ref: None,
+                    parent_tool_call_id: None,
                 },
             ));
         }
@@ -890,6 +896,7 @@ mod tests {
                 name: "read_file".into(),
                 input: serde_json::json!({"path": "config.toml"}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ));
         assert_eq!(projector.entries.len(), 1);
@@ -938,6 +945,7 @@ mod tests {
                 name: "exec_command".into(),
                 input: serde_json::json!({"cmd": "cargo test"}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ));
         let promoted_title = projector.entries[1].title.clone();
@@ -965,6 +973,7 @@ mod tests {
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ));
         projector.push(&SessionEvent::new(

@@ -619,6 +619,7 @@ async fn session_generation_waits_on_silence_and_resumes_without_exposing_fragme
                     name: "read_file".into(),
                     input: json!({}),
                     input_ref: None,
+                    parent_tool_call_id: None,
                 })
                 .await?;
             Ok(AgentTurnResult {
@@ -2077,6 +2078,7 @@ impl AgentTurnExecutor for UsageLimitThenSuccessExecutor {
                         name: "shell".into(),
                         input: serde_json::json!({"command": "git commit"}),
                         input_ref: None,
+                        parent_tool_call_id: None,
                     })
                     .await;
                 let _ = events
@@ -2087,6 +2089,7 @@ impl AgentTurnExecutor for UsageLimitThenSuccessExecutor {
                         is_error: false,
                         input: None,
                         input_ref: None,
+                        parent_tool_call_id: None,
                     })
                     .await;
             }
@@ -2544,6 +2547,7 @@ impl AgentTurnExecutor for BoundaryRetrySteerExecutor {
                 name: "command_execution".to_string(),
                 input: json!({"command": "long-running-check"}),
                 input_ref: None,
+                parent_tool_call_id: None,
             })
             .await
             .unwrap();
@@ -2563,6 +2567,7 @@ impl AgentTurnExecutor for BoundaryRetrySteerExecutor {
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             })
             .await
             .unwrap();
@@ -6728,6 +6733,7 @@ async fn compaction_defers_steers_preserves_next_attachments_and_respects_stop()
         is_error: false,
         input: None,
         input_ref: None,
+        parent_tool_call_id: None,
     };
     for completion_kind in ["context_compaction", "item/completed:contextCompaction"] {
         for stop in [false, true] {
@@ -10485,6 +10491,7 @@ fn crashed_turn_events(session_id: Uuid, message_id: Uuid) -> Vec<SessionEventKi
             name: "Bash".to_string(),
             input: json!({}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ]
 }
@@ -10642,6 +10649,7 @@ async fn a_resumed_turn_continues_the_original_prompt_and_settles_it_once() {
             name: "Bash".to_string(),
             input: json!({}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
         SessionEventKind::ToolCompleted {
             tool_call_id: "call-1".to_string(),
@@ -10650,6 +10658,7 @@ async fn a_resumed_turn_continues_the_original_prompt_and_settles_it_once() {
             is_error: false,
             input: None,
             input_ref: None,
+            parent_tool_call_id: None,
         },
         // No TurnCompleted: this is the host dying mid-turn.
     ] {
@@ -12293,6 +12302,7 @@ fn provider_neutral_replay_carries_subscription_tools_across_provider_switches()
                 name: "read_file".to_string(),
                 input: json!({"path": "Cargo.toml"}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ),
         SessionEvent::new(
@@ -12305,6 +12315,7 @@ fn provider_neutral_replay_carries_subscription_tools_across_provider_switches()
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ),
         SessionEvent::new(
@@ -12486,6 +12497,7 @@ fn subscription_compaction_projection_truncates_large_tool_results() {
                 name: "read_file".to_string(),
                 input: json!({"path": "large.txt"}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ),
         SessionEvent::new(
@@ -12498,6 +12510,7 @@ fn subscription_compaction_projection_truncates_large_tool_results() {
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ),
         SessionEvent::new(
@@ -12541,6 +12554,7 @@ fn subscription_compaction_projection_truncates_large_tool_results() {
                 name: "read_file".to_string(),
                 input: json!({"path": "recent.txt"}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ),
         SessionEvent::new(
@@ -12553,6 +12567,7 @@ fn subscription_compaction_projection_truncates_large_tool_results() {
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ),
         SessionEvent::new(
@@ -12596,6 +12611,7 @@ fn subscription_compaction_projection_truncates_large_tool_results() {
                 name: "read_file".to_string(),
                 input: json!({"path": "newest.txt"}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ),
         SessionEvent::new(
@@ -12608,6 +12624,7 @@ fn subscription_compaction_projection_truncates_large_tool_results() {
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ),
         SessionEvent::new(
@@ -13187,6 +13204,7 @@ fn subscription_projection_is_append_only_until_compaction() {
                 name: "read_file".to_string(),
                 input: json!({"path": "Cargo.toml"}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ),
         SessionEvent::new(
@@ -13199,6 +13217,7 @@ fn subscription_projection_is_append_only_until_compaction() {
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ),
         SessionEvent::new(
@@ -15073,6 +15092,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
             name: "exec".to_string(),
             input: json!({"cmd": "cargo test"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     );
 
@@ -15302,6 +15322,7 @@ impl AgentTurnExecutor for FloodingExecutor {
                     name: "exec_command".into(),
                     input: serde_json::json!({"cmd": "echo"}),
                     input_ref: None,
+                    parent_tool_call_id: None,
                 })
                 .await
                 .ok();
@@ -15313,6 +15334,7 @@ impl AgentTurnExecutor for FloodingExecutor {
                     is_error: false,
                     input: None,
                     input_ref: None,
+                    parent_tool_call_id: None,
                 })
                 .await
                 .ok();
@@ -15582,6 +15604,7 @@ impl AgentTurnExecutor for NetworkThenSuccessExecutor {
                     name: "exec_command".into(),
                     input: serde_json::json!({"cmd": "git status"}),
                     input_ref: None,
+                    parent_tool_call_id: None,
                 })
                 .await
                 .unwrap();
@@ -15593,6 +15616,7 @@ impl AgentTurnExecutor for NetworkThenSuccessExecutor {
                     is_error: false,
                     input: None,
                     input_ref: None,
+                    parent_tool_call_id: None,
                 })
                 .await
                 .unwrap();
@@ -15629,6 +15653,7 @@ impl AgentTurnExecutor for NetworkThenSuccessExecutor {
                 name: "exec".into(),
                 input: json!({"cmd": "git status"}),
                 input_ref: None,
+                parent_tool_call_id: None,
             })
             .await?;
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -16759,6 +16784,7 @@ async fn an_in_flight_tool_call_extends_the_active_budget_without_removing_it() 
             name: "bash".to_string(),
             input: json!({ "command": "cargo test" }),
             input_ref: None,
+            parent_tool_call_id: None,
         },
         true,
     );
@@ -16785,6 +16811,7 @@ async fn an_in_flight_tool_call_extends_the_active_budget_without_removing_it() 
             is_error: false,
             input: None,
             input_ref: None,
+            parent_tool_call_id: None,
         },
         true,
     );
@@ -17459,6 +17486,7 @@ fn interrupted_subscription_turn_keeps_its_delivered_output() {
             name: "Bash".to_string(),
             input: serde_json::json!({"command": "pgrep -x UnrealEditor"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
         SessionEventKind::UserStopChanged { engaged: true },
         user(

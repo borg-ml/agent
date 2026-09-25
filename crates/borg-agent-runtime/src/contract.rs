@@ -2465,6 +2465,12 @@ pub enum SessionEventKind {
         input: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_ref: Option<SessionPayloadRef>,
+        /// Set when a running command called this capability through Borg's
+        /// tool socket. The call is shown and journaled like any other, but it
+        /// is the command's work, never a model tool call, so it stays out of
+        /// replayed model context.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_call_id: Option<String>,
     },
     /// A provider supplied a newer snapshot of an in-progress tool call.
     /// Updates replace the pending presentation and never create another
@@ -2484,6 +2490,8 @@ pub enum SessionEventKind {
         input: Option<Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_ref: Option<SessionPayloadRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_call_id: Option<String>,
     },
     /// A native process has been admitted to the session runtime. Process
     /// handles are host-local, so these events are durable for recovery but

@@ -2131,6 +2131,7 @@ async fn run_borg_provider_turn(
                         name,
                         input,
                         input_ref: None,
+                        parent_tool_call_id: None,
                     },
                 )
                 .await;
@@ -2165,6 +2166,7 @@ async fn run_borg_provider_turn(
                         is_error,
                         input,
                         input_ref: None,
+                        parent_tool_call_id: None,
                     },
                 )
                 .await;

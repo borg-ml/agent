@@ -485,7 +485,7 @@ impl NativeHarness {
                 "Include a short `action` summary first in every tool call so the live UI can display it while the remaining arguments stream. ",
                 "Use shell commands for orchestration and invoke the language or installed runtime that best fits the problem, such as TypeScript/JavaScript for web and JSON work or Python for data and scientific work. ",
                 "This is trusted user-authority execution, not a security sandbox. ",
-                "Use `borg tools` to discover Borg, Blu, plugin, history, workflow, and collaboration capabilities on demand, and `borg call NAME JSON` to invoke one. ",
+                "Use `borg tools` to discover Borg, Blu, plugin, history, workflow, and collaboration capabilities on demand, and `borg call NAME JSON` to invoke one; from code, `import borg` in Python (`borg.send_message(target=..., message=...)`, raising `borg.BorgError`) or `import borg from \"borg\"` in Bun does the same without quoting or subprocesses. ",
                 "Inside commands, `$BORG_AGENT_CLI` is the exact Borg executable when `borg` is not on PATH. Keep intermediate data in files, pipes, or programs and return only useful results. ",
                 "To actually see an image, run `borg image FILE` on a PNG or JPEG; printing base64 to stdout does not work, because shell output is truncated and arrives as text."
             )),
@@ -1078,6 +1078,7 @@ impl NativeHarness {
                         name: tool_call.function.name.clone(),
                         input: resolved_input,
                         input_ref: None,
+                        parent_tool_call_id: None,
                     },
                 )
                 .await;
@@ -3970,6 +3971,7 @@ async fn record_native_tool_result(
             is_error,
             input: None,
             input_ref: None,
+            parent_tool_call_id: None,
         },
     )
     .await;

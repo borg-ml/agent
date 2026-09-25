@@ -2393,6 +2393,7 @@ async fn run_agent_session_store_kernel_inner(
     // A command runs only after the session's permission policy admitted it,
     // so what it asks of Borg through `borg call` is admitted with it.
     command_environment.insert("BORG_AGENT_TOOL_APPROVED".to_string(), "1".to_string());
+    crate::command_clients::install(session_root, &mut command_environment)?;
     dispatcher.configure_command_environment(command_environment);
     let (autonomy_dispatch_tx, mut autonomy_dispatch_rx) = mpsc::channel(16);
     let autonomy_cancel = CancellationToken::new();
@@ -3190,6 +3191,7 @@ async fn run_agent_session_store_kernel_inner(
                                 name: command.clone(),
                                 input: arguments.clone(),
                                 input_ref: None,
+                                parent_tool_call_id: None,
                             },
                         )
                         .await?;
@@ -3223,6 +3225,7 @@ async fn run_agent_session_store_kernel_inner(
                                 is_error,
                                 input: Some(arguments),
                                 input_ref: None,
+                                parent_tool_call_id: None,
                             },
                         )
                         .await?;
@@ -4433,6 +4436,7 @@ async fn run_agent_session_store_kernel_inner(
         }
 
         let (provider_events_tx, mut provider_events) = mpsc::channel(128);
+        dispatcher.set_turn_events(&provider_events_tx);
         let (control_tx, control_rx) = mpsc::channel(32);
         let mut retained_for_turn = retained_context.take();
         let unseen_notices = if reuse_subscription_context {
@@ -7425,6 +7429,7 @@ fn native_conversation_with_images(
                 tool_call_id,
                 name,
                 input,
+                parent_tool_call_id: None,
                 ..
             } if active_provider.is_some() => {
                 let tool_call = borg_provider::provider::ModelToolCall::function(
@@ -7462,6 +7467,7 @@ fn native_conversation_with_images(
             SessionEventKind::ToolCompleted {
                 tool_call_id,
                 output,
+                parent_tool_call_id: None,
                 ..
             } if active_provider.is_some() => {
                 pending_generic.push(borg_provider::provider::ModelMessage::Tool {
@@ -8565,6 +8571,7 @@ fn provider_neutral_conversation(
                 tool_call_id,
                 name,
                 input,
+                parent_tool_call_id: None,
                 ..
             } => conversation.push(borg_provider::provider::ModelMessage::assistant(
                 None,
@@ -8579,6 +8586,7 @@ fn provider_neutral_conversation(
             SessionEventKind::ToolCompleted {
                 tool_call_id,
                 output,
+                parent_tool_call_id: None,
                 ..
             } => conversation.push(borg_provider::provider::ModelMessage::Tool {
                 tool_call_id: tool_call_id.clone(),

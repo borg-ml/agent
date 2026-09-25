@@ -227,6 +227,7 @@ mod tests {
                 name: "read_file".into(),
                 input: json!({}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
             start + Duration::from_secs(7),
         );

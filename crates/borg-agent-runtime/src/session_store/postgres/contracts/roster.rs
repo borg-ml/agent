@@ -129,6 +129,7 @@ async fn mirrored_child_provider_audit_events_are_live_only() {
             name: "exec".to_string(),
             input: serde_json::json!({"cmd": "cargo test"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
         SessionEventKind::ToolCompleted {
             tool_call_id: "call-1".to_string(),
@@ -137,6 +138,7 @@ async fn mirrored_child_provider_audit_events_are_live_only() {
             is_error: false,
             input: None,
             input_ref: None,
+            parent_tool_call_id: None,
         },
         SessionEventKind::Message {
             message_id: Uuid::new_v4(),
@@ -385,6 +387,7 @@ async fn dropping_live_only_child_rows_does_not_change_the_reconstructed_roster(
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             }),
         ),
         // Both of these are now live-only, and both are LAST.

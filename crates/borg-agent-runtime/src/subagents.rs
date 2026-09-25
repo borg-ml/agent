@@ -235,6 +235,10 @@ pub struct AgentToolDispatcher {
     /// Environment for commands the model runs through Borg's shell tools, so
     /// a shell reaches this session with `borg call` and `borg image`.
     command_environment: Arc<RwLock<BTreeMap<String, String>>>,
+    /// The running turn's event stream. Calls a command makes through the tool
+    /// socket are journaled here as children of that command. Weak, so a
+    /// finished turn's stream still closes.
+    turn_events: Arc<RwLock<Option<tokio::sync::mpsc::WeakSender<SessionEventKind>>>>,
     persistent_runtimes: PersistentRuntimeRegistry,
     #[cfg(unix)]
     lanes: crate::lane_tools::LaneTools,
@@ -615,6 +619,8 @@ struct AgentToolWireRequest {
     token: Option<String>,
     #[serde(default)]
     workflow_approved: bool,
+    #[serde(default)]
+    parent: Option<String>,
 }
 
 async fn serve_agent_tool_connection<S>(
@@ -650,12 +656,34 @@ async fn serve_agent_tool_connection<S>(
             }
             Ok(request) => {
                 let cancel = shutdown.child_token();
-                let call = dispatcher.call_with_workflow_control(
-                    &request.name,
-                    request.arguments,
-                    request.workflow_approved,
-                    Some(cancel.clone()),
-                );
+                let dispatcher = &dispatcher;
+                let request_name = request.name.clone();
+                let call_cancel = cancel.clone();
+                let call = async move {
+                    match request.parent {
+                        Some(parent) => {
+                            dispatcher
+                                .call_from_command(
+                                    parent,
+                                    &request.name,
+                                    request.arguments,
+                                    request.workflow_approved,
+                                    Some(call_cancel),
+                                )
+                                .await
+                        }
+                        None => {
+                            dispatcher
+                                .call_with_workflow_control(
+                                    &request.name,
+                                    request.arguments,
+                                    request.workflow_approved,
+                                    Some(call_cancel),
+                                )
+                                .await
+                        }
+                    }
+                };
                 tokio::pin!(call);
                 tokio::select! {
                     result = &mut call => match result {
@@ -672,7 +700,7 @@ async fn serve_agent_tool_connection<S>(
                         cancel.cancel();
                         // Poll cancellation cleanup before dropping the tool future.
                         if tokio::time::timeout(Duration::from_secs(2), &mut call).await.is_err() {
-                            tracing::warn!(tool = %request.name, "agent tool cancellation cleanup timed out");
+                            tracing::warn!(tool = %request_name, "agent tool cancellation cleanup timed out");
                         }
                         match next {
                             Ok(Some(_)) => json!({
@@ -828,6 +856,7 @@ impl AgentToolDispatcher {
             resource_limits: None,
             execution_provider: Arc::new(RwLock::new(execution_provider)),
             command_environment: Arc::new(RwLock::new(BTreeMap::new())),
+            turn_events: Arc::new(RwLock::new(None)),
             persistent_runtimes: PersistentRuntimeRegistry::default(),
             #[cfg(unix)]
             lanes: crate::lane_tools::LaneTools::default(),
@@ -924,6 +953,65 @@ impl AgentToolDispatcher {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = environment;
     }
 
+    pub(crate) fn set_turn_events(&self, events: &tokio::sync::mpsc::Sender<SessionEventKind>) {
+        *self
+            .turn_events
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(events.downgrade());
+    }
+
+    /// A capability called by a running command (`borg call`, or the Python
+    /// and Bun clients) under `parent`, the command's `BORG_TOOL_CALL_ID`. It
+    /// runs exactly like a model call and is journaled as the command's child.
+    pub(crate) async fn call_from_command(
+        &self,
+        parent: String,
+        name: &str,
+        arguments: Value,
+        workflow_approved: bool,
+        cancellation: Option<CancellationToken>,
+    ) -> Result<Value> {
+        let events = self
+            .turn_events
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(tokio::sync::mpsc::WeakSender::upgrade);
+        let tool_call_id = format!("{parent}/{}", Uuid::new_v4());
+        if let Some(events) = &events {
+            let _ = events
+                .send(SessionEventKind::ToolStarted {
+                    tool_call_id: tool_call_id.clone(),
+                    name: name.to_string(),
+                    input: arguments.clone(),
+                    input_ref: None,
+                    parent_tool_call_id: Some(parent.clone()),
+                })
+                .await;
+        }
+        let result = self
+            .call_with_workflow_control(name, arguments, workflow_approved, cancellation)
+            .await;
+        if let Some(events) = &events {
+            let (output, is_error) = match &result {
+                Ok(value) => (value.to_string(), false),
+                Err(error) => (format!("{error:#}"), true),
+            };
+            let _ = events
+                .send(SessionEventKind::ToolCompleted {
+                    tool_call_id,
+                    output,
+                    output_ref: None,
+                    is_error,
+                    input: None,
+                    input_ref: None,
+                    parent_tool_call_id: Some(parent),
+                })
+                .await;
+        }
+        result
+    }
+
     /// Borg's shell: `exec` starts a command or drives a running one, and the
     /// native catalog's `exec_command`/`write_stdin` pair splits the same
     /// operations. Every provider's commands run here, so they share one
@@ -996,11 +1084,13 @@ impl AgentToolDispatcher {
         }
         let args = command.expect("a shell call is a command or a process write");
         let sleep_seconds = bare_sleep_seconds(&args.cmd);
-        let environment = self
+        let mut environment = self
             .command_environment
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        // Names this command as the parent of any Borg call it makes.
+        environment.insert("BORG_TOOL_CALL_ID".to_string(), Uuid::new_v4().to_string());
         let mut result = serde_json::to_value(
             execution_provider
                 .command(crate::ExecutionCommandRequest {
@@ -8704,7 +8794,7 @@ fn workspace_effect(name: &str, arguments: &Value) -> Option<(&'static str, Stri
 pub(crate) fn exec_tool_spec() -> Value {
     tool(
         "exec",
-        "Run a shell command, or poll, interact with, or terminate a running process. Supply exactly one of cmd (start) or session_id (interact). Shell commands may invoke any installed language runtime. Use `borg tools` and `borg call NAME JSON` inside the shell for Borg and Blu capabilities.",
+        "Run a shell command, or poll, interact with, or terminate a running process. Supply exactly one of cmd (start) or session_id (interact). Shell commands may invoke any installed language runtime. Use `borg tools` and `borg call NAME JSON` inside the shell, or `import borg` from Python and Bun code, for Borg and Blu capabilities.",
         json!({
             "type": "object",
             "properties": {

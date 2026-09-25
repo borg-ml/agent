@@ -2063,6 +2063,7 @@ impl Transcript {
                 name,
                 input,
                 input_ref,
+                ..
             } => {
                 if !self.tools.contains_key(tool_call_id)
                     && self.has_preparing_tool(tool_call_id)
@@ -2088,6 +2089,7 @@ impl Transcript {
                 is_error,
                 input,
                 input_ref,
+                ..
             } => {
                 self.complete_preparing_tool(tool_call_id);
                 if self.foreground_tool.as_deref() == Some(tool_call_id) {
@@ -6320,6 +6322,7 @@ mod parallel_preparation_tests {
                     name: name.to_string(),
                     input,
                     input_ref: None,
+                    parent_tool_call_id: None,
                 },
             ));
         }
