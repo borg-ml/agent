@@ -7,6 +7,10 @@ Git comparison.
 
 ### Agents
 
+- Project guidance loads from `CLAUDE.md` as well as `AGENTS.md` (an identical
+  pair is read once), for the main thread and every subagent. As an agent
+  works in or names a subdirectory, that subtree's `AGENTS.md`/`CLAUDE.md`
+  arrive once with the command's result.
 - An image pasted into the chat comes with its file path, so the agent can
   forward it to a subagent with `send_message`/`followup_task` `attachments`.
 - Commands can call Borg from code: `import borg` in Python and

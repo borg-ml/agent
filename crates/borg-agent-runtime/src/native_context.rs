@@ -36,28 +36,17 @@ impl NativeContext {
         let project_chain = project_chain(&cwd);
         let mut project_instructions = String::new();
         for directory in &project_chain {
-            let path = directory.join("AGENTS.md");
-            let Ok(metadata) = path.metadata() else {
-                continue;
-            };
-            if !metadata.is_file() {
-                continue;
+            for (path, content) in guidance_files(directory)? {
+                if project_instructions.len().saturating_add(content.len())
+                    > MAX_PROJECT_INSTRUCTIONS_BYTES
+                {
+                    bail!(
+                        "applicable AGENTS.md/CLAUDE.md files exceed the {} KiB native context limit",
+                        MAX_PROJECT_INSTRUCTIONS_BYTES / 1024
+                    );
+                }
+                project_instructions.push_str(&guidance_block(&path, &content));
             }
-            let content = std::fs::read_to_string(&path)
-                .with_context(|| format!("read project guidance {}", path.display()))?;
-            if project_instructions.len().saturating_add(content.len())
-                > MAX_PROJECT_INSTRUCTIONS_BYTES
-            {
-                bail!(
-                    "applicable AGENTS.md files exceed the {} KiB native context limit",
-                    MAX_PROJECT_INSTRUCTIONS_BYTES / 1024
-                );
-            }
-            project_instructions.push_str(&format!(
-                "\n\n<project_guidance path=\"{}\">\n{}\n</project_guidance>",
-                path.display(),
-                content.trim()
-            ));
         }
         let mut skill_roots = user_skill_roots();
         for directory in &project_chain {
@@ -210,6 +199,36 @@ pub(crate) async fn extension_skill_prompt_appendix(roots: Vec<PathBuf>) -> Resu
     })
     .await
     .context("extension skill catalog loader stopped")?
+}
+
+/// A directory's project guidance: `AGENTS.md`, and `CLAUDE.md` unless it is
+/// the same file or says the same thing.
+pub(crate) fn guidance_files(directory: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        let path = directory.join(name);
+        if !path.metadata().is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("read project guidance {}", path.display()))?;
+        let same = files.iter().any(|(existing, text)| {
+            text.trim() == content.trim()
+                || existing.canonicalize().ok() == path.canonicalize().ok()
+        });
+        if !same {
+            files.push((path, content));
+        }
+    }
+    Ok(files)
+}
+
+pub(crate) fn guidance_block(path: &Path, content: &str) -> String {
+    format!(
+        "\n\n<project_guidance path=\"{}\">\n{}\n</project_guidance>",
+        path.display(),
+        content.trim()
+    )
 }
 
 fn project_chain(cwd: &Path) -> Vec<PathBuf> {
@@ -422,5 +441,27 @@ mod tests {
             .await
             .expect_err("extension skill must remain within its root");
         assert!(error.to_string().contains("escapes its declared root"));
+    }
+}
+
+#[cfg(test)]
+mod guidance_tests {
+    use super::guidance_files;
+
+    #[test]
+    fn claude_md_loads_unless_it_repeats_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "claude rules").unwrap();
+        let only_claude = guidance_files(dir.path()).unwrap();
+        assert_eq!(only_claude.len(), 1);
+        assert!(only_claude[0].0.ends_with("CLAUDE.md"));
+
+        std::fs::write(dir.path().join("AGENTS.md"), "claude rules\n").unwrap();
+        let duplicate = guidance_files(dir.path()).unwrap();
+        assert_eq!(duplicate.len(), 1, "an identical CLAUDE.md is not repeated");
+        assert!(duplicate[0].0.ends_with("AGENTS.md"));
+
+        std::fs::write(dir.path().join("AGENTS.md"), "agent rules").unwrap();
+        assert_eq!(guidance_files(dir.path()).unwrap().len(), 2);
     }
 }
