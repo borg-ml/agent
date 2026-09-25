@@ -38,6 +38,10 @@ pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
             "Updating Git index…"
         });
     }
+    if let Some(rest) = name.strip_prefix("Wait on") {
+        let form = if complete { "Waited on" } else { "Waiting on" };
+        return Cow::Owned(format!("{form}{rest}{}", if complete { "" } else { "…" }));
+    }
     let (verb, rest) = name.split_once(' ').unwrap_or((name, ""));
     let forms = match verb {
         "Run" => Some(("Running", "Ran")),
