@@ -6073,7 +6073,7 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
         },
     ));
     let completed = rendered(&completed);
-    assert!(completed.contains("✎ Edited"), "{completed}");
+    assert!(completed.contains("◈ Edited"), "{completed}");
     assert!(!completed.contains("in progress"), "{completed}");
     assert!(completed.contains("− one"), "{completed}");
     assert!(completed.contains("+ two"), "{completed}");
@@ -6131,7 +6131,7 @@ fn completed_edit_replaces_a_stale_json_preview_with_the_authoritative_diff() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("✎ Edited"), "{rendered}");
+    assert!(rendered.contains("◈ Edited"), "{rendered}");
     assert!(rendered.contains("+ # Long edit"), "{rendered}");
     assert!(rendered.contains("− old"), "{rendered}");
     assert!(rendered.contains("+ new"), "{rendered}");
@@ -6215,7 +6215,7 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(completed.contains("✎ Edited"), "{completed}");
+    assert!(completed.contains("◈ Edited"), "{completed}");
     assert!(!completed.contains("in progress"), "{completed}");
 
     let mut plan = Transcript::default();
@@ -13856,7 +13856,7 @@ fn turn_completion_settles_unresolved_foreground_tools() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("▶ Ran"), "{rendered}");
+    assert!(rendered.contains("› Ran"), "{rendered}");
     assert!(!rendered.contains("completed"));
 }
 

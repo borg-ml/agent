@@ -40,7 +40,7 @@ fn structured_user_message_lines(
 
 fn goal_status_label(status: GoalStatus) -> &'static str {
     match status {
-        GoalStatus::Active => "▶ active",
+        GoalStatus::Active => "◇ active",
         GoalStatus::Paused => "▮▮ paused",
         GoalStatus::Blocked => "■ blocked",
         GoalStatus::UsageLimited => "■ usage limit reached",
@@ -795,8 +795,8 @@ fn tool_kind_marker(name: &str, is_reasoning: bool) -> &'static str {
     match name.split(' ').next().unwrap_or(name) {
         "Read" | "List" | "View" | "Open" | "Inspect" => "≡",
         "Search" | "Find" | "Grep" => "⌕",
-        "Write" | "Edit" | "Update" | "Create" | "Delete" | "Apply" | "Rename" | "Move" => "✎",
-        "Run" | "Wait" | "Send" | "Stop" | "Build" | "Test" => "▶",
+        "Write" | "Edit" | "Update" | "Create" | "Delete" | "Apply" | "Rename" | "Move" => "◈",
+        "Run" | "Wait" | "Send" | "Stop" | "Build" | "Test" => "›",
         _ => "✓",
     }
 }
