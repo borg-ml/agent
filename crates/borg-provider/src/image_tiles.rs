@@ -79,15 +79,31 @@ fn encode(image: &DynamicImage) -> Option<(&'static str, Vec<u8>)> {
     Some(("image/jpeg", jpeg))
 }
 
-/// The image as an overview followed by its tiles, or `None` when it should
-/// be sent as one image (it nearly fits, or cannot be decoded).
-pub fn tile(bytes: &[u8]) -> Option<Vec<Piece>> {
-    // The header gives the size without decoding the pixels.
-    let (width, height) = image::ImageReader::new(Cursor::new(bytes))
+/// The number of image blocks `tile` will produce, without decoding pixels.
+/// A malformed or nearly fitting image is charged as one block.
+pub fn piece_count(bytes: &[u8]) -> usize {
+    let Some((width, height)) = dimensions(bytes) else {
+        return 1;
+    };
+    if width == 0 || height == 0 || fit_scale(width, height) >= TILE_BELOW_SCALE {
+        return 1;
+    }
+    let (cols, rows, _) = plan(width, height);
+    (1 + cols * rows) as usize
+}
+
+fn dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .ok()?
         .into_dimensions()
-        .ok()?;
+        .ok()
+}
+
+/// The image as an overview followed by its tiles, or `None` when it should
+/// be sent as one image (it nearly fits, or cannot be decoded).
+pub fn tile(bytes: &[u8]) -> Option<Vec<Piece>> {
+    let (width, height) = dimensions(bytes)?;
     if width == 0 || height == 0 || fit_scale(width, height) >= TILE_BELOW_SCALE {
         return None;
     }
@@ -155,6 +171,7 @@ mod tests {
     /// every later request; a gap loses part of the image.
     #[test]
     fn tiles_cover_the_image_within_the_model_limit() {
+        assert_eq!(piece_count(b"not an image"), 1);
         assert_eq!(
             plan(3840, 2160),
             (4, 2, 1.0),
@@ -192,6 +209,8 @@ mod tests {
                 .unwrap();
             bytes
         };
+        assert_eq!(piece_count(&png(3840, 2160)), 9);
+        assert_eq!(piece_count(&png(1920, 1080)), 1);
         assert_eq!(
             tile(&png(3840, 2160)).map(|pieces| pieces.len()),
             Some(9),
