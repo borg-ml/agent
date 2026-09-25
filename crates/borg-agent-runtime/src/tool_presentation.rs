@@ -632,7 +632,14 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
         let timeout = input
             .get("timeout_ms")
             .and_then(Value::as_u64)
-            .map(format_duration)
+            .map(|milliseconds| {
+                let duration = if milliseconds >= 60_000 && milliseconds % 60_000 == 0 {
+                    format!("{}m", milliseconds / 60_000)
+                } else {
+                    format_duration(milliseconds)
+                };
+                format!("up to {duration}")
+            })
             .unwrap_or_else(|| "updates".to_string());
         return ("Wait for agents".to_string(), timeout);
     }
@@ -2609,6 +2616,17 @@ fn patch_source(source: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wait_agent_timeout_is_labeled_as_a_limit_not_elapsed_time() {
+        let presentation = super::project_tool_presentation(
+            "mcp__borg_agent__wait_agent",
+            &serde_json::json!({"timeout_ms": 900_000}),
+            None,
+            false,
+        );
+        assert_eq!(presentation.detail, "up to 15m");
+    }
+
     #[test]
     fn mixed_shell_chains_are_not_searches() {
         for command in [

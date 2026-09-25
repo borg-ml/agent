@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthStr;
 const SPLIT_DIFF_MIN_WIDTH: usize = 160;
 const CODE_GUTTER_WIDTH: usize = 5;
 const DIFF_NUMBER_WIDTH: usize = 4;
+const INLINE_DIFF_PREVIEW_ROWS: usize = 18;
 pub(crate) const DIFF_ADDED_BG: Color = Color::Rgb(25, 57, 39);
 pub(crate) const DIFF_REMOVED_BG: Color = Color::Rgb(67, 31, 34);
 const TOML_SYNTAX: &str = r#"%YAML 1.2
@@ -89,7 +90,16 @@ pub(super) fn tool_body_lines(
     prefix: &str,
 ) -> Vec<Line<'static>> {
     let prefix_width = UnicodeWidthStr::width(prefix);
-    code_block_lines(language, source, width.saturating_sub(prefix_width).max(1))
+    let mut lines = code_block_lines(language, source, width.saturating_sub(prefix_width).max(1));
+    let is_diff = matches!(language.split(':').next(), Some("diff" | "patch" | "udiff"));
+    let hidden = if is_diff && lines.len() > INLINE_DIFF_PREVIEW_ROWS {
+        let hidden = lines.len() - INLINE_DIFF_PREVIEW_ROWS;
+        lines.truncate(INLINE_DIFF_PREVIEW_ROWS);
+        hidden
+    } else {
+        0
+    };
+    let mut lines: Vec<_> = lines
         .into_iter()
         .map(|mut line| {
             line.spans.insert(
@@ -98,7 +108,17 @@ pub(super) fn tool_body_lines(
             );
             line
         })
-        .collect()
+        .collect();
+    if hidden > 0 {
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("… {hidden} more lines · inspect for full diff"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    lines
 }
 
 pub(super) fn tool_detail_lines(
