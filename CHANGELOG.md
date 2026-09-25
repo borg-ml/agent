@@ -55,6 +55,16 @@ Git comparison.
 - The composer prompt is `›` with a blinking underscore cursor; finished
   command rows use the same slim chevron, edits use `◈`, and pending or agent
   actions retain diamond markers.
+- Search actions use a magnifying glass (`🔍`). `/cursor underline`, `/cursor
+  bar`, and `/cursor block` select a persisted composer cursor style.
+- The inactive agent roster is collapsed by default. Goal and watcher accents
+  are rose-purple; todos use orange. Action-group timestamps align with rows.
+- With an empty composer, press Down to focus the status line; arrows and Tab
+  navigate its menus, Enter or Space activates a control, and Escape returns
+  to the composer. The focused control is visibly highlighted.
+- `/team` broadcasts appear in the timeline immediately and show how many
+  live addressed teammates durably acknowledged the message; the count keeps
+  updating while the session is active and survives reconnects.
 - Opus 5.5 and Fable 5.1 effort changes no longer warn of a cold cache just
   because a resumed transcript has not loaded provider capabilities yet.
 - A waiting command row names its command, and `git show` rows say "Show

@@ -17075,3 +17075,11 @@ fn team_broadcast_timeline_updates_one_durable_row_across_replay_and_insertion()
         detail, state: TranscriptActionState::Complete, ..
     } if detail == "sent · 2/2 acknowledged"));
 }
+
+#[test]
+fn search_actions_use_a_magnifying_glass_marker() {
+    for name in ["Search web", "Find files", "Grep workspace"] {
+        assert_eq!(tool_kind_marker(name, false), "🔍");
+    }
+    assert_eq!(tool_kind_marker("Read file", false), "≡");
+}
