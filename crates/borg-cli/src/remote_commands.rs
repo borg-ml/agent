@@ -2998,6 +2998,7 @@ async fn run_local_agent_session(
     let mut render_frame_interval = tui_frame_interval(tui_fps);
     let mut render_tick = tui_render_interval(render_frame_interval);
     let mut interaction_tick = tui_render_interval(tui_frame_interval(tui_fps));
+    let mut tui_timing = TuiTiming::default();
     let mut activity_tick = tokio::time::interval(ACTIVITY_FRAME_INTERVAL);
     activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tool_timer_tick = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -3698,15 +3699,19 @@ async fn run_local_agent_session(
                     }
                 }
             }
-            _ = interaction_tick.tick(), if terminal.is_some() && interaction_dirty => {
+            scheduled = interaction_tick.tick(), if terminal.is_some() && interaction_dirty => {
+                tui_timing.observe("input_wait", scheduled.elapsed(), 0);
                 let terminal = terminal.as_mut().expect("terminal");
                 if terminal.has_pending_scroll_frame() {
                     terminal.advance_scroll_frame();
                 }
+                let started = std::time::Instant::now();
                 terminal.draw_for_interaction()?;
+                tui_timing.observe("interaction_draw", started.elapsed(), 0);
                 interaction_dirty = false;
             }
-            _ = render_tick.tick(), if terminal.is_some() && terminal_dirty => {
+            scheduled = render_tick.tick(), if terminal.is_some() && terminal_dirty => {
+                tui_timing.observe("frame_wait", scheduled.elapsed(), 0);
                 if tool_started_frame_hold_until
                     .is_some_and(|until| tokio::time::Instant::now() < until)
                 {
@@ -3729,6 +3734,7 @@ async fn run_local_agent_session(
                 }
                 let draw_started = std::time::Instant::now();
                 terminal.draw()?;
+                tui_timing.observe("frame_draw", draw_started.elapsed(), 0);
                 interaction_dirty = false;
                 let next_interval = responsive_tui_frame_interval(
                     tui_fps,
@@ -4036,6 +4042,11 @@ async fn run_local_agent_session(
                     )));
                     continue;
                 }
+                let event_age_ms = chrono::Utc::now()
+                    .signed_duration_since(event.created_at)
+                    .num_milliseconds()
+                    .max(0) as u64;
+                let queued_events = queued_session_events.len();
                 let schema_rejected = local_owner_rejected_newer_schema(&event);
                 let handoff_stale_owner = stale_local_owner
                     && stale_owner_handoff_task.is_none()
@@ -4237,7 +4248,12 @@ async fn run_local_agent_session(
                         tool_started_frame_hold_until = None;
                         streaming_frame_pending = true;
                     }
+                    let apply_started = std::time::Instant::now();
                     terminal_dirty |= terminal.apply_session_event(&event);
+                    tui_timing.observe("event_apply", apply_started.elapsed(), queued_events);
+                    if stream_text && event_age_ms < 600_000 {
+                        tui_timing.observe("stream_age", std::time::Duration::from_millis(event_age_ms), queued_events);
+                    }
                     if stream_burst_started && terminal_dirty {
                         render_frame_interval = tui_frame_interval(tui_fps.max(STREAMING_TUI_FPS));
                         render_tick = tui_render_interval(render_frame_interval);
@@ -4271,6 +4287,7 @@ async fn run_local_agent_session(
                         if render_frame_interval <= ACTIVITY_FRAME_INTERVAL {
                             let draw_started = std::time::Instant::now();
                             terminal.draw()?;
+                            tui_timing.observe("immediate_draw", draw_started.elapsed(), queued_events);
                             let next_interval = responsive_tui_frame_interval(
                                 tui_fps,
                                 draw_started.elapsed(),
@@ -5044,6 +5061,11 @@ async fn run_local_agent_session(
                         continue;
                     }
                 };
+                if terminal_event.is_escape() {
+                    if let Some(read_at) = borg_tui::take_last_escape_read() {
+                        tracing::info!(%session_id, key_queue_ms = read_at.elapsed().as_millis(), "tui escape received");
+                    }
+                }
                 // Resume hydration is deliberately deferred until after the
                 // first paint. Never await it from a key handler: even history
                 // recall must leave the input/render loop schedulable while
@@ -5070,7 +5092,9 @@ async fn run_local_agent_session(
                 let interaction_may_change_transcript =
                     terminal_event.may_change_transcript_view();
                 let terminal_dirty_before_input = terminal_dirty;
+                let input_started = std::time::Instant::now();
                 let action = terminal.as_mut().expect("terminal").handle_event(terminal_event)?;
+                tui_timing.observe("input_handle", input_started.elapsed(), 0);
                 let action_is_none = matches!(&action, UiAction::None);
                 let event_redraw_needed = terminal
                     .as_mut()
@@ -5851,6 +5875,8 @@ async fn run_local_agent_session(
                         }
                     }
                     UiAction::Interrupt { target } => {
+                        tracing::info!(%session_id, target = ?target, "tui interrupt handled");
+                        let dispatch_started = std::time::Instant::now();
                         let dispatched = if let Some(target) = target {
                             dispatch_host_command_without_blocking(
                                 &session_command_tx,
@@ -5872,12 +5898,14 @@ async fn run_local_agent_session(
                                 let socket = control_socket_path.clone();
                                 let fallback = session_command_tx.clone();
                                 tokio::spawn(async move {
+                                    let started = std::time::Instant::now();
                                     if let Err(error) = send_local_session_command(
                                         &socket, session_id, HostCommand::Interrupt { session_id },
                                     ).await {
                                         tracing::warn!(%error, "direct viewer interrupt failed; retrying through attached actor");
                                         let _ = fallback.send(HostCommand::Interrupt { session_id }).await;
                                     }
+                                    tracing::info!(%session_id, elapsed_ms = started.elapsed().as_millis(), "tui interrupt forwarded");
                                 });
                                 true
                             } else {
@@ -5889,6 +5917,7 @@ async fn run_local_agent_session(
                         } else {
                             true
                         };
+                        tracing::info!(%session_id, dispatched, dispatch_ms = dispatch_started.elapsed().as_millis(), "tui interrupt dispatched");
                         if !dispatched {
                             terminal
                                 .as_mut()
@@ -9880,6 +9909,45 @@ fn print_agent_help() {
 
 pub(crate) fn parse_goal_action(line: &str) -> Result<GoalAction> {
     borg_ui::parse_goal_action(line)
+}
+
+// Aggregated timing keeps heavy streams observable without logging every token.
+#[derive(Default)]
+struct TuiTiming {
+    started: Option<std::time::Instant>,
+    samples: [u64; 7],
+    maxima_ms: [u128; 7],
+    queue_max: usize,
+}
+
+impl TuiTiming {
+    fn observe(&mut self, phase: &str, elapsed: std::time::Duration, queued: usize) {
+        let index = match phase {
+            "event_apply" => 0,
+            "stream_age" => 1,
+            "frame_wait" => 2,
+            "frame_draw" => 3,
+            "immediate_draw" => 4,
+            "input_wait" | "input_handle" => 5,
+            "interaction_draw" => 6,
+            _ => return,
+        };
+        let started = *self.started.get_or_insert_with(std::time::Instant::now);
+        self.samples[index] += 1;
+        self.maxima_ms[index] = self.maxima_ms[index].max(elapsed.as_millis());
+        self.queue_max = self.queue_max.max(queued);
+        if started.elapsed() >= std::time::Duration::from_secs(5) {
+            if self.maxima_ms.iter().any(|&ms| ms >= 100) || self.queue_max >= 100 {
+                tracing::warn!(
+                    samples = ?self.samples,
+                    max_ms = ?self.maxima_ms,
+                    max_queued_events = self.queue_max,
+                    "tui latency (event_apply, stream_age, frame_wait, frame_draw, immediate_draw, input_wait_or_handle, interaction_draw)"
+                );
+            }
+            *self = Self::default();
+        }
+    }
 }
 
 fn dispatch_host_command_without_blocking(

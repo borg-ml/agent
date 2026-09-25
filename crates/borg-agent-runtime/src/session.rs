@@ -6139,6 +6139,7 @@ async fn run_agent_session_store_kernel_inner(
                         }
                         HostCommand::Interrupt { .. } if interrupted => {}
                         HostCommand::Interrupt { .. } => {
+                            tracing::info!(%session_id, "session interrupt received (active turn)");
                             snapshot_stale_user_prompts(&mut stale_user_prompts, &pending);
                             stale_user_prompts.extend(
                                 pending_steers.iter().map(|steer| steer.prompt.message_id),
@@ -10232,6 +10233,7 @@ async fn collect_input_at_turn_boundary(
             HostCommand::Interrupt {
                 session_id: command_session_id,
             } if command_session_id == session_id => {
+                tracing::info!(%session_id, "session interrupt received (pending commands)");
                 interrupted = true;
                 // Snapshot at the exact point Escape is seen: prompts drained
                 // from `ready` after this are post-Escape input and must stay

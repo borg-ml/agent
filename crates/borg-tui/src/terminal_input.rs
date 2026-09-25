@@ -25,6 +25,15 @@ pub fn take_last_enter_read() -> Option<std::time::Instant> {
         .take()
 }
 
+static LAST_ESCAPE_READ: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+pub fn take_last_escape_read() -> Option<std::time::Instant> {
+    LAST_ESCAPE_READ
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
 pub struct TerminalInputEvent {
     pub(super) event: Event,
     pub(super) scroll_repetitions: usize,
@@ -36,6 +45,10 @@ impl TerminalInputEvent {
             event,
             scroll_repetitions: 1,
         }
+    }
+
+    pub fn is_escape(&self) -> bool {
+        matches!(&self.event, Event::Key(key) if key.code == KeyCode::Esc && key.kind != KeyEventKind::Release)
     }
 
     pub fn is_up(&self) -> bool {
@@ -365,6 +378,13 @@ async fn pump_terminal_events<S>(
                     );
                     return;
                 };
+                if let Ok(Event::Key(key)) = &event
+                    && key.code == KeyCode::Esc
+                    && key.kind != KeyEventKind::Release
+                {
+                    *LAST_ESCAPE_READ.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        Some(std::time::Instant::now());
+                }
                 if let Ok(Event::Key(key)) = &event
                     && key.code == KeyCode::Enter
                     && key.kind == KeyEventKind::Press
