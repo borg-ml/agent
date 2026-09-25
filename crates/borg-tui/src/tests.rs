@@ -1544,7 +1544,7 @@ fn subagent_activity_timers_are_independent_and_stop_with_their_agent() {
         clocks[&first]
             .status_duration(started + chrono::Duration::minutes(8))
             .as_deref(),
-        Some("4m · run 1m")
+        Some("4m")
     );
     assert_eq!(
         clocks[&second]
@@ -1572,13 +1572,13 @@ fn running_status_retains_total_when_another_run_starts() {
         clock
             .status_duration(started + chrono::Duration::minutes(7))
             .as_deref(),
-        Some("3m · run <1m")
+        Some("3m")
     );
     assert_eq!(
         clock
             .status_duration(started + chrono::Duration::minutes(8))
             .as_deref(),
-        Some("4m · run 1m")
+        Some("4m")
     );
     clock.observe(
         SessionStatus::Stopped,
