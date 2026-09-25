@@ -78,6 +78,7 @@ persisted to `editor.toml`.
 | Expand tool details | `/expand-tools` | `presentation.auto_expand_tools = true` or `false` |
 | Expand thinking while it streams | `/expand-thinking` | `presentation.auto_expand_thinking = true` or `false` |
 | Timeline detail click behavior | `/tool-click` | `presentation.tool_click_behavior = "fullscreen"` or `"inline"` |
+| Reply streaming | `/streaming` | `presentation.response_streaming = "paragraph"` or `"token"` |
 | Action descriptors | `/action-descriptors` | `presentation.action_descriptors = true` or `false` |
 | Running animations | `/animations` | `presentation.running_sweeps = true` or `false` |
 | Dictation icon | `/icons` | `presentation.dictation_icon = "nerd_font"` or `"emoji"` |

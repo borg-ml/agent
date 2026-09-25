@@ -252,6 +252,10 @@ struct Transcript {
     auto_expand_thinking: bool,
     action_descriptors: bool,
     pub(crate) wrap_action_rows: bool,
+    pub(crate) response_streaming: borg_ui::preferences::ResponseStreaming,
+    /// Paragraph streaming: the unfinished end of each in-progress reply,
+    /// shown once it completes a block or the reply ends.
+    streaming_tails: HashMap<Uuid, String>,
     show_subagent_messages: bool,
     tool_click_behavior: ToolClickBehavior,
     user_label: String,
@@ -381,6 +385,10 @@ impl Default for Transcript {
             auto_expand_thinking: false,
             action_descriptors: true,
             wrap_action_rows: false,
+            // A bare transcript shows text as it arrives; the terminal applies
+            // the user's streaming preference to every transcript it shows.
+            response_streaming: borg_ui::preferences::ResponseStreaming::Token,
+            streaming_tails: HashMap::new(),
             show_subagent_messages: false,
             tool_click_behavior: ToolClickBehavior::Fullscreen,
             user_label: "user".to_string(),
@@ -1786,6 +1794,10 @@ impl Transcript {
                 attachments,
                 delivery: _,
             } => {
+                // A snapshot carries the whole reply so far: it is compared
+                // with what is shown plus what paragraph streaming holds back.
+                let held_tail = self.streaming_tails.remove(message_id).unwrap_or_default();
+                let mut replaced_text = false;
                 let event_time = self.message_event_time(event);
                 // A coalesced live snapshot can arrive after its durable
                 // terminal boundary during reconnect. Never resurrect a
@@ -1871,14 +1883,19 @@ impl Transcript {
                     } = &mut self.order[index]
                     {
                         *stored_actor = *actor;
-                        if !(*actor == EventActor::Assistant
+                        if *actor == EventActor::Assistant
                             && *status == MessageStatus::InProgress
                             && *stored_status == MessageStatus::InProgress
-                            && stored_text.starts_with(text))
+                            && format!("{stored_text}{held_tail}").starts_with(text.as_str())
                         {
+                            if !held_tail.is_empty() {
+                                self.streaming_tails.insert(*message_id, held_tail);
+                            }
+                        } else {
                             *stored_text = text.clone();
                         }
                         *stored_status = *status;
+                        replaced_text = true;
                         *complete =
                             matches!(*status, MessageStatus::Complete | MessageStatus::Failed);
                         // A durable redelivery of the same message carries the
@@ -1888,6 +1905,9 @@ impl Transcript {
                         if let Some(attachments) = numbered_attachments {
                             *stored_attachments = attachments;
                         }
+                    }
+                    if replaced_text && !self.streaming_tails.contains_key(message_id) {
+                        self.hold_back_unfinished(*message_id);
                     }
                 } else {
                     let attachments =
@@ -1957,6 +1977,7 @@ impl Transcript {
                             redirected: false,
                         },
                     );
+                    self.hold_back_unfinished(*message_id);
                 }
             }
             SessionEventKind::MessageDelta { message_id, delta } => {
@@ -2337,19 +2358,23 @@ impl Transcript {
                 status: SessionStatus::Ready,
                 detail: Some(detail),
             } if detail.eq_ignore_ascii_case("interrupted") => {
+                self.flush_streaming_tails();
                 self.mark_running_tools_user_interrupted(event.created_at);
             }
             SessionEventKind::TurnCompleted {
                 error: Some(error), ..
             } if error.to_ascii_lowercase().contains("interrupted") => {
+                self.flush_streaming_tails();
                 self.mark_running_tools_user_interrupted(event.created_at);
             }
             SessionEventKind::TurnCompleted {
                 error: Some(error), ..
             } => {
+                self.flush_streaming_tails();
                 self.finish_running_tools(event.created_at, true, error);
             }
             SessionEventKind::TurnCompleted { error: None, .. } => {
+                self.flush_streaming_tails();
                 self.finish_running_tools(event.created_at, false, "");
             }
             SessionEventKind::ApprovalRequested { title, detail, .. } => {
@@ -3055,19 +3080,7 @@ impl Transcript {
                 return;
             }
             self.finish_reasoning(event.created_at);
-            if let Some(TranscriptEntry::Message {
-                actor: EventActor::Assistant,
-                text,
-                status: MessageStatus::InProgress,
-                ..
-            }) = self.order.get_mut(index)
-            {
-                text.push_str(delta);
-                self.message_markdown_cache
-                    .get_mut()
-                    .messages
-                    .retain(|(entry_index, _), _| *entry_index != index);
-            }
+            self.stream_into_message(message_id, delta);
             return;
         }
         self.finish_reasoning(event.created_at);
@@ -3086,7 +3099,7 @@ impl Transcript {
         self.messages.insert(message_id, self.order.len());
         self.order.push(TranscriptEntry::Message {
             actor: EventActor::Assistant,
-            text: delta.to_string(),
+            text: String::new(),
             attachments: Vec::new(),
             model,
             effort,
@@ -3096,6 +3109,89 @@ impl Transcript {
             user_interrupted: false,
             redirected: false,
         });
+        self.stream_into_message(message_id, delta);
+    }
+
+    /// Add streamed text to an in-progress reply. Token streaming shows it at
+    /// once; paragraph streaming holds it until it finishes a Markdown block,
+    /// so the reply grows a block at a time and re-renders only when it does.
+    fn stream_into_message(&mut self, message_id: Uuid, delta: &str) {
+        let Some(index) = self.messages.get(&message_id).copied() else {
+            return;
+        };
+        let Some(TranscriptEntry::Message {
+            actor: EventActor::Assistant,
+            text,
+            status: MessageStatus::InProgress,
+            ..
+        }) = self.order.get_mut(index)
+        else {
+            return;
+        };
+        if self.response_streaming == borg_ui::preferences::ResponseStreaming::Paragraph {
+            let tail = self.streaming_tails.entry(message_id).or_default();
+            tail.push_str(delta);
+            let release = crate::markdown::paragraph_release(&format!("{text}{tail}"));
+            if release <= text.len() {
+                return;
+            }
+            let rest = tail.split_off(release - text.len());
+            text.push_str(tail);
+            *tail = rest;
+        } else {
+            text.push_str(delta);
+        }
+        self.message_markdown_cache
+            .get_mut()
+            .messages
+            .retain(|(entry_index, _), _| *entry_index != index);
+    }
+
+    /// Paragraph streaming: move the unfinished end of an in-progress reply
+    /// out of view, as when its text arrives whole in a snapshot.
+    fn hold_back_unfinished(&mut self, message_id: Uuid) {
+        if self.response_streaming != borg_ui::preferences::ResponseStreaming::Paragraph {
+            return;
+        }
+        let Some(index) = self.messages.get(&message_id).copied() else {
+            return;
+        };
+        if let Some(TranscriptEntry::Message {
+            actor: EventActor::Assistant,
+            text,
+            status: MessageStatus::InProgress,
+            ..
+        }) = self.order.get_mut(index)
+        {
+            let tail = text.split_off(crate::markdown::paragraph_release(text));
+            if !tail.is_empty() {
+                self.streaming_tails.insert(message_id, tail);
+            }
+        }
+    }
+
+    /// Show every held reply tail: the turn ended or streaming became
+    /// token-by-token, so there is no later block to wait for.
+    fn flush_streaming_tails(&mut self) {
+        for (message_id, tail) in std::mem::take(&mut self.streaming_tails) {
+            if let Some(index) = self.messages.get(&message_id).copied()
+                && let Some(TranscriptEntry::Message { text, .. }) = self.order.get_mut(index)
+            {
+                text.push_str(&tail);
+                self.message_markdown_cache
+                    .get_mut()
+                    .messages
+                    .retain(|(entry_index, _), _| *entry_index != index);
+            }
+        }
+    }
+
+    pub(crate) fn set_response_streaming(
+        &mut self,
+        streaming: borg_ui::preferences::ResponseStreaming,
+    ) {
+        self.response_streaming = streaming;
+        self.flush_streaming_tails();
     }
 
     fn append_reasoning_text_delta(

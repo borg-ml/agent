@@ -15662,6 +15662,52 @@ fn a_cleanly_completed_response_is_not_marked_interrupted() {
 }
 
 #[test]
+fn paragraph_streaming_holds_the_unfinished_block_across_snapshots() {
+    let session_id = Uuid::new_v4();
+    let prompt_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.set_response_streaming(borg_ui::preferences::ResponseStreaming::Paragraph);
+    transcript.apply(&turn_started(session_id, 1, prompt_id));
+    let event = |kind| SessionEvent::new(session_id, 0, kind);
+    let shown = |transcript: &Transcript| match transcript.order.first() {
+        Some(TranscriptEntry::Message { text, .. }) => text.clone(),
+        _ => panic!("expected one assistant message"),
+    };
+    for delta in ["First para", "graph.\n\nSec"] {
+        transcript.apply(&event(SessionEventKind::MessageDelta {
+            message_id,
+            delta: delta.into(),
+        }));
+    }
+    assert_eq!(shown(&transcript), "First paragraph.\n\n");
+    let snapshot = |text: &str, status| {
+        event(SessionEventKind::Message {
+            message_id,
+            actor: EventActor::Assistant,
+            text: text.into(),
+            attachments: Vec::new(),
+            status,
+            delivery: None,
+        })
+    };
+    transcript.apply(&snapshot(
+        "First paragraph.\n\nSecond",
+        MessageStatus::InProgress,
+    ));
+    assert_eq!(
+        shown(&transcript),
+        "First paragraph.\n\n",
+        "a snapshot revealed an unfinished block"
+    );
+    transcript.apply(&snapshot(
+        "First paragraph.\n\nSecond one.",
+        MessageStatus::Complete,
+    ));
+    assert_eq!(shown(&transcript), "First paragraph.\n\nSecond one.");
+}
+
+#[test]
 fn live_message_preview_reconciles_snapshots_and_stops_at_completion() {
     let session_id = Uuid::new_v4();
     let prompt_id = Uuid::new_v4();
