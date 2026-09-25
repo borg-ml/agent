@@ -38,14 +38,19 @@ impl CacheSignature {
         }
     }
 
+    /// Opus 5.5 and Fable 5.1 keep their prompt cache across effort changes.
+    /// This depends only on provider and model, never on capabilities that a
+    /// resumed transcript learns after replaying its history.
     pub(super) fn for_session(
         provider: CodingProvider,
         model: Option<&str>,
         effort: Option<&str>,
-        claude_direct_auth: bool,
     ) -> Self {
-        let effort_can_reuse_cache = claude_direct_auth
-            && provider == CodingProvider::Claude
+        // A Claude session without an explicit model runs the product default.
+        let model = model.or_else(|| {
+            (provider == CodingProvider::Claude).then(borg_provider::claude_product_model)
+        });
+        let effort_can_reuse_cache = provider == CodingProvider::Claude
             && matches!(model, Some("claude-opus-5-5" | "claude-fable-5-1"));
         Self {
             effort_can_reuse_cache,
@@ -799,18 +804,10 @@ mod tests {
     fn direct_claude_effort_switch_waits_for_measured_cache_usage() {
         let at = Utc::now();
         for model in ["claude-opus-5-5", "claude-fable-5-1"] {
-            let at_medium = CacheSignature::for_session(
-                CodingProvider::Claude,
-                Some(model),
-                Some("medium"),
-                true,
-            );
-            let at_xhigh = CacheSignature::for_session(
-                CodingProvider::Claude,
-                Some(model),
-                Some("xhigh"),
-                true,
-            );
+            let at_medium =
+                CacheSignature::for_session(CodingProvider::Claude, Some(model), Some("medium"));
+            let at_xhigh =
+                CacheSignature::for_session(CodingProvider::Claude, Some(model), Some("xhigh"));
             let mut diagnostics = CacheDiagnostics::default();
             let mut warm = usage(1_000, 99_000);
             warm.context_tokens = Some(100_000);
@@ -856,20 +853,6 @@ mod tests {
                 CacheMissCause::Unknown,
                 "{model}: do not misattribute the measured loss to effort"
             );
-
-            let unknown_route_medium = CacheSignature::for_session(
-                CodingProvider::Claude,
-                Some(model),
-                Some("medium"),
-                false,
-            );
-            let unknown_route_xhigh = CacheSignature::for_session(
-                CodingProvider::Claude,
-                Some(model),
-                Some("xhigh"),
-                false,
-            );
-            assert_ne!(unknown_route_medium, unknown_route_xhigh);
         }
     }
 

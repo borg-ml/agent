@@ -13545,7 +13545,7 @@ fn apply_composer_selection(
 /// A message margin may precede the actual gutter span.
 fn code_gutter_span<'a>(line: &'a Line<'static>) -> Option<(usize, &'a Span<'static>)> {
     let first = line.spans.first()?;
-    let (margin, gutter) = if matches!(first.content.as_ref(), "  " | "  │ ") {
+    let (margin, gutter) = if matches!(first.content.as_ref(), "  " | "  │ " | "    │ ") {
         (first.width(), line.spans.get(1)?)
     } else {
         (0, first)
@@ -13604,6 +13604,11 @@ fn selection_line_ranges(line: &Line<'static>) -> Vec<(usize, usize)> {
     if width == 0 || line.spans.iter().all(|span| span.content.trim().is_empty()) {
         return Vec::new();
     }
+    if line.spans.first().is_some_and(|span| {
+        span.content == TOOL_WINDOW_HEADER_INDENT && span.style.fg == Some(Color::DarkGray)
+    }) {
+        return Vec::new();
+    }
     let rendered = line.to_string();
     let trimmed = rendered.trim();
     let content_trimmed = trimmed.strip_prefix("│ ").unwrap_or(trimmed);
@@ -13649,7 +13654,7 @@ fn selection_line_ranges(line: &Line<'static>) -> Vec<(usize, usize)> {
                 0
             }
         })
-    } else if first.starts_with("│   │ ")
+    } else if first.starts_with("    │ ")
         || first.starts_with("  │ ")
         || matches!(first, "+ " | "− ")
     {
@@ -13675,7 +13680,7 @@ fn diff_selection_ranges(line: &Line<'static>) -> Option<Vec<(usize, usize)>> {
         if content == " │ " {
             split_separator = Some(span_start);
         }
-        if content.starts_with("│   │ ") {
+        if content.starts_with("    │ ") {
             span_start = span_start.saturating_add(span.width());
             continue;
         }

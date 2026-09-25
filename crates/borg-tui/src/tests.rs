@@ -12295,32 +12295,24 @@ fn peer_reports_and_errors_keep_one_continuous_neutral_actions_gutter() {
     let lines = transcript
         .render_with_tool_run_viewport(80, 40, None, None, None)
         .0;
-    let start = lines
-        .iter()
-        .position(|line| line.to_string().starts_with("┌─"))
-        .unwrap();
-    let end = lines
-        .iter()
-        .rposition(|line| line.to_string().starts_with("└─"))
-        .unwrap();
     assert_eq!(
         lines
             .iter()
-            .filter(|line| line.to_string().starts_with("┌─"))
+            .filter(|line| {
+                line.spans
+                    .first()
+                    .is_some_and(|span| span.content == TOOL_WINDOW_HEADER_INDENT)
+            })
             .count(),
         1
     );
-    for line in &lines[start + 1..end] {
-        assert!(line.to_string().starts_with("│ "), "{line:?}");
-        assert_eq!(line.spans[0].style.fg, Some(Color::DarkGray));
-    }
     let line = lines
         .iter()
         .find(|line| line.to_string().contains("Ran failed"))
         .expect("failed action");
     assert_eq!(
         line.spans.first().map(|span| span.content.as_ref()),
-        Some("│ ")
+        Some("  ")
     );
     assert_ne!(line.spans[0].style.fg, Some(Color::Red));
     assert!(line.spans.iter().any(|span| {
@@ -12851,10 +12843,10 @@ fn agent_lifecycle_rows_keep_one_continuous_actions_accordion() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert_eq!(rendered.matches("┌─ ").count(), 1);
-    assert!(rendered.contains("11 actions"));
+    assert_eq!(rendered.matches(" actions").count(), 1);
+    assert!(rendered.contains("    19:38 · 11 actions"), "{rendered}");
     assert!(
-        rendered.contains("│ 19:38  agent · /root/v391_scaling_audit · started"),
+        rendered.contains("\n  19:38  agent · /root/v391_scaling_audit · started"),
         "{rendered}"
     );
 }
@@ -13139,7 +13131,7 @@ fn line_scrolling_preserves_expanded_actions() {
         &transcript.order[8],
         TranscriptEntry::Tool { expanded: true, .. }
     ));
-    assert!(render.0.iter().any(|line| line.to_string() == "└─"));
+    assert!(!render.0.iter().any(|line| line.to_string() == "  ↓ more"));
 
     assert!(transcript.scroll_tool_run(0, max_offset, -3));
     assert!(matches!(
@@ -13152,7 +13144,7 @@ fn line_scrolling_preserves_expanded_actions() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("└─ ↓ more"));
+    assert!(rendered.contains("  ↓ more"));
 }
 
 #[test]
@@ -14202,7 +14194,7 @@ fn transcript_selection_omits_visual_chrome_and_normalizes_diff_copy() {
         Some("+ literal text")
     );
 
-    let nested_code_lines = rendering::tool_body_lines("text", "let value = 1;", 100, "│   │ ");
+    let nested_code_lines = rendering::tool_body_lines("text", "let value = 1;", 100, "    │ ");
     assert_eq!(
         selected_transcript_text(
             &nested_code_lines,
@@ -14807,7 +14799,12 @@ fn mixed_actions_window_selection_ranges_match_the_visible_rows() {
         .expect("agent activity is visible");
     let activity_anchor = selection_point_for_row_in_lines(&render.6, &render.0, activity_row, 16);
     for (row, line) in render.0.iter().enumerate() {
-        if line.to_string().starts_with('┌') || line.to_string().starts_with('└') {
+        if line
+            .spans
+            .first()
+            .is_some_and(|span| span.content == TOOL_WINDOW_HEADER_INDENT)
+            || line.to_string().trim().is_empty()
+        {
             continue;
         }
         let point = selection_point_for_row_in_lines(&render.6, &render.0, row, 8);
@@ -16833,4 +16830,69 @@ fn watch_rows_sit_in_the_action_run_without_extra_spacing() {
     };
     let (first, watch, second) = (row("echo first"), row("Watch"), row("echo second"));
     assert_eq!((watch - first, second - watch), (1, 1), "{lines:#?}");
+}
+
+#[test]
+fn resumed_opus_and_fable_history_keeps_effort_switches_warm() {
+    // A resumed transcript replays usage before it learns provider
+    // capabilities; the effort exemption must not depend on them.
+    for model in [Some("claude-opus-5-5"), Some("claude-fable-5-1"), None] {
+        let session_id = Uuid::new_v4();
+        let turn = Uuid::new_v4();
+        let mut transcript = Transcript::default();
+        let mut sequence = 1;
+        let mut apply = |transcript: &mut Transcript, kind| {
+            transcript.apply(&SessionEvent::new(session_id, sequence, kind));
+            sequence += 1;
+        };
+        let configured = |effort: &str| SessionEventKind::SessionConfigured {
+            cwd: PathBuf::from("/workspace"),
+            provider: CodingProvider::Claude,
+            model: model.map(str::to_string),
+            effort: Some(effort.to_string()),
+            fast: false,
+            response_language: ResponseLanguage::English,
+            permission_mode: PermissionMode::FullAccess,
+        };
+        apply(&mut transcript, configured("medium"));
+        apply(
+            &mut transcript,
+            SessionEventKind::TurnStarted {
+                message_id: turn,
+                provider: CodingProvider::Claude,
+                model: model.map(str::to_string),
+                effort: Some("medium".to_string()),
+                fast: false,
+            },
+        );
+        apply(
+            &mut transcript,
+            SessionEventKind::UsageUpdated {
+                provider_duration_ms: 10,
+                turn_id: Some(turn),
+                provider_context_reused: None,
+                input_tokens: 1_000,
+                output_tokens: 100,
+                cached_input_tokens: 90_000,
+                cache_creation_input_tokens: 0,
+                total_tokens: 91_100,
+                cost_microusd: None,
+                cost_basis: String::new(),
+                cost_usd: None,
+                context_tokens: Some(91_000),
+                context_window_tokens: Some(1_000_000),
+            },
+        );
+        apply(
+            &mut transcript,
+            SessionEventKind::TurnCompleted {
+                message_id: turn,
+                provider_session_id: None,
+                final_text: String::new(),
+                error: None,
+            },
+        );
+        apply(&mut transcript, configured("xhigh"));
+        assert_eq!(transcript.cache_status(Utc::now()), None, "{model:?}");
+    }
 }
