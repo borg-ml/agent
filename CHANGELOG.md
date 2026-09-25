@@ -18,6 +18,13 @@ Git comparison.
 ### Agents and teams
 
 - New human input reopens a blocked goal.
+- A session takeover or owner restart no longer kills the team: children are
+  parked with their parent instead of stopped, and those that were mid-task
+  resume on their own when the session restarts.
+- ↑ now recalls every pending steer, including one typed while another was
+  still pending (it was misfiled as team input and could not be recalled).
+- Escape on a long turn no longer resurfaces its opening messages as failed
+  when the model had already acted on them.
 - Fixed the release build's Clippy failure in the provider image-tile test.
 
 ## 0.11.4 (2026-09-25)
