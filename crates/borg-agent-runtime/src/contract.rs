@@ -2651,6 +2651,14 @@ pub enum SessionEventKind {
     GoalCleared {
         goal_id: Uuid,
     },
+    /// `/team` send and subsequent durable recipient acknowledgements. Recipient IDs
+    /// are the live team targets at send time, not all workspace members.
+    TeamBroadcastUpdated {
+        message_id: Uuid,
+        text: String,
+        recipient_ids: Vec<Uuid>,
+        acknowledged: u32,
+    },
     AgentMessageReceived {
         message_id: Uuid,
         sender_id: Uuid,

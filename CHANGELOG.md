@@ -46,12 +46,20 @@ Git comparison.
 
 - The action list is regrouped: every batch of actions sits under one header
   with its start time, action count and working directory (`17:41 · 7 actions ·
-  ~/project`, plus `1 failed` in red when something failed); finished batches
-  fold to that header until clicked.
+  ~/project`); finished batches fold to that header until clicked and can be
+  clicked again to collapse. The group uses an empty indent instead of a rail.
   Rows drop their clock time and leading `cd …`, name what a command did
   (`Read src/main.rs:1-40`, `Search “pattern”`, `Write build.py`, `Run Python`),
   show its result beside the duration (`6 matches`, `exit 1`, `12 passed`,
   `+14 -3`) and carry a marker for the kind of work; failures show in red.
+- The composer prompt is `›` with a blinking underscore cursor; finished
+  command rows use the same slim chevron, edits use `◈`, and pending or agent
+  actions retain diamond markers.
+- Opus 5.5 and Fable 5.1 effort changes no longer warn of a cold cache just
+  because a resumed transcript has not loaded provider capabilities yet.
+- A waiting command row names its command, and `git show` rows say "Show
+  commit(s)" instead of "Show revision(s)". The TUI logs bounded timing
+  summaries for stream, input, frame, and interrupt bottlenecks.
 - The shell keeps its working directory between commands, so agents no longer
   repeat `cd DIR &&` on every call.
 - "Back to thread" (was "Back to actions") sits beside Jump to bottom on the

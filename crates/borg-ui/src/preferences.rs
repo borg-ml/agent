@@ -120,6 +120,15 @@ pub enum ResponseStreaming {
     Token,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerCursorStyle {
+    #[default]
+    Underline,
+    Bar,
+    Block,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolClickBehavior {
@@ -182,6 +191,7 @@ pub struct PresentationPreferences {
     pub response_streaming: ResponseStreaming,
     pub action_descriptors: bool,
     pub running_sweeps: bool,
+    pub composer_cursor_style: ComposerCursorStyle,
     /// Let tool and action rows wrap onto more lines; off keeps each row on one line.
     pub wrap_action_rows: bool,
     pub dictation_icon: Option<DictationIconStyle>,
@@ -206,6 +216,7 @@ impl Default for PresentationPreferences {
             response_streaming: ResponseStreaming::Paragraph,
             action_descriptors: true,
             running_sweeps: true,
+            composer_cursor_style: ComposerCursorStyle::Underline,
             wrap_action_rows: false,
             dictation_icon: None,
             dictation_model: None,
@@ -580,6 +591,7 @@ keep = true
                 response_streaming: ResponseStreaming::Token,
                 action_descriptors: false,
                 running_sweeps: false,
+                composer_cursor_style: ComposerCursorStyle::Bar,
                 wrap_action_rows: true,
                 dictation_icon: Some(DictationIconStyle::NerdFont),
                 dictation_model: Some("lightweight".to_string()),

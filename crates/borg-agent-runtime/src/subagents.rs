@@ -3531,6 +3531,16 @@ impl SubagentCoordinator {
             .await
     }
 
+    pub(crate) async fn team_message_deliveries(
+        &self,
+        message_id: Uuid,
+    ) -> Result<Vec<crate::RecipientDelivery>> {
+        self.workspace_store()
+            .await?
+            .message_deliveries(message_id)
+            .await
+    }
+
     async fn workspace_store(&self) -> Result<&Arc<dyn WorkspaceStore>> {
         self.workspace_store
             .get_or_try_init(|| async {
@@ -5479,6 +5489,18 @@ impl SubagentCoordinator {
         actor_session_id: Uuid,
         message: &str,
     ) -> Result<WorkspaceMessageReceipt> {
+        self.broadcast_message_as_targeted(actor_session_id, message)
+            .await
+            .map(|(receipt, _)| receipt)
+    }
+
+    /// Also return the team participants eligible when the send began. The
+    /// workspace receipt may contain historical members outside this live team.
+    pub async fn broadcast_message_as_targeted(
+        &self,
+        actor_session_id: Uuid,
+        message: &str,
+    ) -> Result<(WorkspaceMessageReceipt, Vec<Uuid>)> {
         anyhow::ensure!(
             self.root_launch.capabilities.multiplayer,
             "team broadcast requires multiplayer capability"
@@ -5501,6 +5523,14 @@ impl SubagentCoordinator {
             .workspace_binding(actor_session_id)
             .await?
             .context("team sender has no workspace")?;
+        let mut target_ids = Vec::new();
+        for recipient in &recipients {
+            if *recipient != actor_session_id
+                && let Some(binding) = self.store.workspace_binding(*recipient).await?
+            {
+                target_ids.push(binding.participant_id);
+            }
+        }
         let idempotency_id = Uuid::new_v4();
         let receipt = self
             .workspace_store()
@@ -5549,7 +5579,10 @@ impl SubagentCoordinator {
                 }
             }
         }
-        Ok(receipt)
+        target_ids.retain(|id| receipt.recipient_ids.contains(id));
+        target_ids.sort_unstable();
+        target_ids.dedup();
+        Ok((receipt, target_ids))
     }
 
     /// Send a team-attributed message. Child reports addressed to `/root` use

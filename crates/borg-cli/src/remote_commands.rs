@@ -44,8 +44,8 @@ use crate::dictation::{
     LocalDictationRecorder, ensure_backend, parakeet_is_installed,
 };
 use crate::editor_preferences::{
-    ActiveMessageBehavior, CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy,
-    EditorPreferences, LidSleepSetup, ResponseStreaming, ToolClickBehavior,
+    ActiveMessageBehavior, CompletionAlertPolicy, ComposerCursorStyle, DictationIconStyle,
+    DiffExpansionPolicy, EditorPreferences, LidSleepSetup, ResponseStreaming, ToolClickBehavior,
 };
 use crate::sleep_inhibitor::{LidSleepStatus, SleepInhibitor, authorize_lid_sleep};
 use crate::terminal_ui::{
@@ -2773,6 +2773,7 @@ async fn run_local_agent_session(
         terminal.set_response_streaming(editor_preferences.presentation.response_streaming);
         terminal.set_action_descriptors(editor_preferences.presentation.action_descriptors);
         terminal.set_running_sweeps(editor_preferences.presentation.running_sweeps);
+        terminal.set_composer_cursor_style(editor_preferences.presentation.composer_cursor_style);
         terminal.set_wrap_action_rows(editor_preferences.presentation.wrap_action_rows);
         terminal.set_ui_language(editor_preferences.presentation.ui_language);
         terminal.set_layout_preferences(&editor_preferences.layout);
@@ -3911,6 +3912,9 @@ async fn run_local_agent_session(
                                 terminal.set_running_sweeps(
                                     editor_preferences.presentation.running_sweeps,
                                 );
+                                terminal.set_composer_cursor_style(
+                                    editor_preferences.presentation.composer_cursor_style,
+                                );
                                 terminal.set_wrap_action_rows(
                                     editor_preferences.presentation.wrap_action_rows,
                                 );
@@ -4388,7 +4392,7 @@ async fn run_local_agent_session(
                     && !args.json
                     && terminal.is_none()
                 {
-                    print!("> ");
+                    print!("› ");
                     io::stdout().flush()?;
                 }
                 if !interactive
@@ -5665,6 +5669,13 @@ async fn run_local_agent_session(
                             if enabled { "on" } else { "off" }
                         ));
                     }
+                    UiAction::SetComposerCursorStyle(style) => {
+                        editor_preferences.presentation.composer_cursor_style = style;
+                        dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_composer_cursor_style(style);
+                        terminal.set_notice(format!("Composer cursor: {}", composer_cursor_label(style)));
+                    }
                     UiAction::SetRunningSweeps(enabled) => {
                         editor_preferences.presentation.running_sweeps = enabled;
                         dispatch_editor_preferences_save(
@@ -6382,6 +6393,28 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .open_wrap_action_rows_picker();
+                        } else if line == "/cursor" && attachments.is_empty() {
+                            terminal.as_mut().expect("terminal").open_composer_cursor_style_picker();
+                        } else if let Some(value) = line.strip_prefix("/cursor ")
+                            && attachments.is_empty()
+                        {
+                            let style = match value.trim().to_ascii_lowercase().as_str() {
+                                "underline" => Some(ComposerCursorStyle::Underline),
+                                "bar" => Some(ComposerCursorStyle::Bar),
+                                "block" => Some(ComposerCursorStyle::Block),
+                                _ => None,
+                            };
+                            if let Some(style) = style {
+                                editor_preferences.presentation.composer_cursor_style = style;
+                                dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.set_composer_cursor_style(style);
+                                terminal.set_notice(format!("Composer cursor: {}", composer_cursor_label(style)));
+                            } else {
+                                terminal.as_mut().expect("terminal").set_notice(
+                                    "Choose /cursor underline, /cursor bar, or /cursor block",
+                                );
+                            }
                         } else if line == "/animations" && attachments.is_empty() {
                             terminal
                                 .as_mut()
@@ -10401,6 +10434,14 @@ fn live_extension_summary(
     lines.join("\n")
 }
 
+fn composer_cursor_label(style: ComposerCursorStyle) -> &'static str {
+    match style {
+        ComposerCursorStyle::Underline => "underline",
+        ComposerCursorStyle::Bar => "bar",
+        ComposerCursorStyle::Block => "block",
+    }
+}
+
 fn live_customization_summary(
     editor: &EditorPreferences,
     agent: &AgentConfig,
@@ -10418,14 +10459,15 @@ fn live_customization_summary(
             }
         ),
         format!(
-            "rendering: {} FPS · edits {} · tools {} · thinking {} · tool clicks {} · action descriptors {} · sweeps {}",
+            "rendering: {} FPS · edits {} · tools {} · thinking {} · tool clicks {} · action descriptors {} · sweeps {} · cursor {}",
             editor.presentation.refresh_rate_fps,
             diff_expansion_label(editor.presentation.effective_diff_expansion()),
             editor.presentation.auto_expand_tools,
             editor.presentation.auto_expand_thinking,
             tool_click_behavior_label(editor.presentation.tool_click_behavior),
             editor.presentation.action_descriptors,
-            editor.presentation.running_sweeps
+            editor.presentation.running_sweeps,
+            composer_cursor_label(editor.presentation.composer_cursor_style)
         ),
         format!(
             "theme: user {} / {} · assistant {} / {}",
