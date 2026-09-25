@@ -73,7 +73,18 @@ fn history_filter_sql(query: &SessionHistoryQuery, alias: &str, next: &mut usize
         ));
     }
     if !query.actors.is_empty() {
-        sql.push_str(&format!(" and {alias}.actor = any(${})", next_index(next)));
+        let index = next_index(next);
+        if alias == "e" {
+            // A journal row keeps its body compressed, so its actor is read from
+            // the search index row the event was written with.
+            sql.push_str(&format!(
+                " and exists (select 1 from session_event_search a \
+                 where a.session_id = e.session_id and a.event_id = e.event_id \
+                 and a.actor = any(${index}))"
+            ));
+        } else {
+            sql.push_str(&format!(" and {alias}.actor = any(${index})"));
+        }
     }
     sql
 }
@@ -968,6 +979,24 @@ mod tests {
         assert!(
             by_kind.hits.is_empty(),
             "a kind filter must exclude messages"
+        );
+
+        // An actor filter works without search text too, straight off the
+        // journal.
+        let by_actor_exact = store
+            .query_history(
+                session_id,
+                SessionHistoryQuery {
+                    actors: vec![EventActor::Assistant],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("actor-filtered read");
+        assert_eq!(by_actor_exact.backend, "postgres_exact");
+        assert_eq!(
+            hit_texts(&by_actor_exact),
+            vec!["shared keyword from the assistant"]
         );
 
         // An empty query is a typed/range read that never consults the index.
