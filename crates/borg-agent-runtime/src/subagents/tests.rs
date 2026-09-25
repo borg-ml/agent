@@ -1596,6 +1596,8 @@ fn child_identity_is_stable_and_inherits_execution_context() {
         max_children: 2,
         entries: HashMap::new(),
         task_names: HashMap::new(),
+        parking: None,
+        resume_after_restore: Vec::new(),
     };
     let child = table.reserve("review_api", &launch()).unwrap();
     assert_eq!(child.parent_session_id, root);
@@ -2599,6 +2601,8 @@ fn live_child_limit_and_task_names_are_enforced() {
         max_children: 1,
         entries: HashMap::new(),
         task_names: HashMap::new(),
+        parking: None,
+        resume_after_restore: Vec::new(),
     };
     let child = table.reserve("first", &launch()).unwrap();
     assert!(table.reserve("second", &launch()).is_err());
@@ -2619,6 +2623,8 @@ fn ready_children_do_not_consume_live_child_limit() {
         max_children: 1,
         entries: HashMap::new(),
         task_names: HashMap::new(),
+        parking: None,
+        resume_after_restore: Vec::new(),
     };
     let child = table.reserve("completed", &launch()).unwrap();
     table
@@ -2638,6 +2644,8 @@ async fn an_idle_child_releases_retained_context_and_a_stop_still_stops() {
         max_children: 4,
         entries: HashMap::new(),
         task_names: HashMap::new(),
+        parking: None,
+        resume_after_restore: Vec::new(),
     }));
     let (child_id, mut released_rx) = {
         let mut table = table.lock().await;
@@ -4570,7 +4578,7 @@ async fn restore_mirrors_a_child_stop_journaled_before_the_parent_crashed() {
 }
 
 #[tokio::test]
-async fn restored_live_child_stays_dormant_and_stops_with_its_root() {
+async fn restored_live_child_stays_dormant_and_parks_with_its_root() {
     let directory = tempdir().unwrap();
     let workspace = directory.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -4674,36 +4682,79 @@ async fn restored_live_child_stays_dormant_and_stops_with_its_root() {
             .is_none(),
         "explicit wake should own the child writer"
     );
-    let terminal_updates = coordinator.stop_all().await;
+    // The root shutting down (quit, exit or an ownership handoff) parks the
+    // child rather than stopping it: a restart must be able to bring it back.
+    let parked = match coordinator.stop_all().await.as_slice() {
+        [SubagentActivity::Completed { agent }] if agent.session_id == child_id => agent.clone(),
+        other => panic!("root shutdown parks the child: {other:?}"),
+    };
+    assert_eq!(parked.status, SubagentStatus::Ready);
     assert!(matches!(
-        terminal_updates.as_slice(),
-        [SubagentActivity::Stopped { agent }] if agent.session_id == child_id
+        parked.detail.as_deref(),
+        Some(PARKED_MID_TASK | PARKED_WITH_PARENT)
     ));
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if matches!(
                 activity_rx.recv().await.unwrap(),
-                SubagentActivity::Stopped { .. }
+                SubagentActivity::Completed { .. }
             ) {
                 break;
             }
         }
     })
     .await
-    .expect("restored child emits stop activity");
+    .expect("parked child emits its activity");
     let released_writer = crate::SessionWriterLease::try_acquire(&child_path)
         .unwrap()
-        .expect("root stop must release the child writer");
+        .expect("root shutdown must release the child writer");
     drop(released_writer);
 
-    // Stopped is not a dead end: an explicit follow-up, wake or prompt (all of
-    // which go through ensure_child_actor) starts the same child session again
-    // instead of failing with "not running".
+    // A new owner restores the parked child as wakeable even though the
+    // child's own journal ends in stopped, and queues it to resume if it was
+    // mid-task.
+    for (detail, resumes) in [(PARKED_MID_TASK, true), (PARKED_WITH_PARENT, false)] {
+        let restarted = SubagentCoordinator::new_with_store_and_executor(
+            directory.path(),
+            root,
+            launch(),
+            3,
+            Arc::new(crate::LocalAgentTurnExecutor::default()),
+            store.clone() as Arc<dyn SessionStore>,
+        )
+        .unwrap();
+        let mut agent = parked.clone();
+        agent.detail = Some(detail.to_string());
+        restarted
+            .restore_from_events(&[SessionEvent::new(
+                root,
+                2,
+                SessionEventKind::SubagentActivity {
+                    activity: SubagentActivityKind::Completed,
+                    agent,
+                    event: None,
+                },
+            )])
+            .await
+            .unwrap();
+        let restored = restarted
+            .resolve_snapshot(&child_id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(restored.status, SubagentStatus::Ready);
+        assert_eq!(
+            restarted.table.lock().await.resume_after_restore,
+            if resumes { vec![child_id] } else { Vec::new() }
+        );
+    }
+
+    // Parked is not a dead end: an explicit follow-up, wake or prompt (all of
+    // which go through ensure_child_actor) starts the same child session again.
     let stopped = coordinator
         .resolve_snapshot(&child_id.to_string())
         .await
         .unwrap();
-    assert_eq!(stopped.status, SubagentStatus::Stopped);
+    assert_eq!(stopped.status, SubagentStatus::Ready);
     coordinator
         .ensure_child_actor(child_id)
         .await

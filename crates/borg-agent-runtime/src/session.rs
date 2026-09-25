@@ -2305,6 +2305,9 @@ async fn run_agent_session_store_kernel_inner(
             record_subagent_activity(&mut journal, &events, session_id, team, &watches, activity)
                 .await?;
         }
+        // A child the last owner parked mid-task continues on its own; the
+        // wake runs before the watcher sees it, so it is never read as idle.
+        team.resume_interrupted_children().await;
         // The recorded activity reports changes; this is the state itself, so a
         // child that finished while this session was not running is already
         // known to the watcher before any watch can name it.

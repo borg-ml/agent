@@ -2962,7 +2962,18 @@ struct SubagentTable {
     max_children: usize,
     entries: HashMap<Uuid, SubagentEntry>,
     task_names: HashMap<String, Uuid>,
+    /// Set while the root shuts down: the children that were mid-task. A
+    /// child that exits then is parked with its parent, not stopped.
+    parking: Option<HashSet<Uuid>>,
+    /// Children restored as parked mid-task, woken once restore is recorded.
+    resume_after_restore: Vec<Uuid>,
 }
+
+/// A child parked idle when its parent shut down.
+const PARKED_WITH_PARENT: &str = "Paused with the parent session; follow up to wake";
+/// A child parked in the middle of a task; restore wakes it to continue.
+const PARKED_MID_TASK: &str = "Paused mid-task with the parent session; resumes when it restarts";
+const RESUME_AFTER_RESTART: &str = "Borg restarted while you were working on your assigned task, which cut off your last turn. Continue the task from where you left off; your conversation and workspace are intact.";
 
 impl SubagentTable {
     fn reserve(&mut self, task_name: &str, launch: &LaunchSession) -> Result<SubagentSnapshot> {
@@ -3145,6 +3156,8 @@ impl SubagentCoordinator {
                 max_children,
                 entries: HashMap::new(),
                 task_names: HashMap::new(),
+                parking: None,
+                resume_after_restore: Vec::new(),
             })),
             activity_tx,
             root_inbox: Arc::new(Mutex::new(Vec::new())),
@@ -3741,6 +3754,8 @@ impl SubagentCoordinator {
                 continue;
             }
             let mirrored_status = snapshot.status;
+            let parked_mid_task = mirrored_status == SubagentStatus::Ready
+                && snapshot.detail.as_deref() == Some(PARKED_MID_TASK);
             let actor_path = child_lock_path(&self.journal_root, snapshot.session_id);
             let mut recovery_failed = false;
             if !snapshot.status.is_terminal() {
@@ -3758,10 +3773,19 @@ impl SubagentCoordinator {
                 match recovered {
                     Ok(state) if state.latest_sequence > 0 => {
                         project_child_state(&mut snapshot, &state);
-                        if !snapshot.status.is_terminal() {
+                        // A child the parent parked on shutdown journals its own
+                        // exit as stopped; the parent's record is the authority.
+                        let parked_by_parent = snapshot.status == SubagentStatus::Stopped
+                            && mirrored_status == SubagentStatus::Ready;
+                        if !snapshot.status.is_terminal() || parked_by_parent {
                             snapshot.status = SubagentStatus::Ready;
                             snapshot.detail = Some(
-                                "Paused with the parent session; follow up to wake".to_string(),
+                                if parked_mid_task {
+                                    PARKED_MID_TASK
+                                } else {
+                                    PARKED_WITH_PARENT
+                                }
+                                .to_string(),
                             );
                         }
                     }
@@ -3811,6 +3835,9 @@ impl SubagentCoordinator {
                         dormant: !snapshot.status.is_terminal() && !recovery_failed,
                     },
                 );
+                if parked_mid_task && !recovery_failed && !snapshot.status.is_terminal() {
+                    table.resume_after_restore.push(snapshot.session_id);
+                }
             }
             if snapshot.status != mirrored_status {
                 let update = match snapshot.status {
@@ -6006,20 +6033,34 @@ impl SubagentCoordinator {
     /// Stop every currently live child when the owning root session stops.
     /// Dormant metadata-only children have no process or command channel and
     /// therefore require no work here.
+    /// Stop every live child because the root is shutting down (quit, exit or
+    /// an ownership handoff). Children are parked, not stopped: a restart
+    /// restores them, and one that was mid-task is woken to continue.
     pub(crate) async fn stop_all(&self) -> Vec<SubagentActivity> {
-        let children = self
-            .table
-            .lock()
-            .await
-            .entries
-            .iter()
-            .filter_map(|(session_id, entry)| {
-                entry
-                    .commands
-                    .clone()
-                    .map(|commands| (*session_id, commands))
-            })
-            .collect::<Vec<_>>();
+        let children = {
+            let mut table = self.table.lock().await;
+            table.parking = Some(
+                table
+                    .entries
+                    .iter()
+                    .filter(|(_, entry)| {
+                        entry.commands.is_some()
+                            && entry.snapshot.status.consumes_concurrency_slot()
+                    })
+                    .map(|(session_id, _)| *session_id)
+                    .collect(),
+            );
+            table
+                .entries
+                .iter()
+                .filter_map(|(session_id, entry)| {
+                    entry
+                        .commands
+                        .clone()
+                        .map(|commands| (*session_id, commands))
+                })
+                .collect::<Vec<_>>()
+        };
         let child_ids = children
             .iter()
             .map(|(session_id, _)| *session_id)
@@ -6055,6 +6096,9 @@ impl SubagentCoordinator {
                     return None;
                 }
                 match entry.snapshot.status {
+                    SubagentStatus::Ready => Some(SubagentActivity::Completed {
+                        agent: entry.snapshot.clone(),
+                    }),
                     SubagentStatus::Stopped => Some(SubagentActivity::Stopped {
                         agent: entry.snapshot.clone(),
                     }),
@@ -6065,6 +6109,20 @@ impl SubagentCoordinator {
                 }
             })
             .collect()
+    }
+
+    /// Wake the children restored as parked mid-task so they continue their
+    /// task. A child that cannot be woken stays parked for a follow-up.
+    pub(crate) async fn resume_interrupted_children(&self) {
+        let resume = std::mem::take(&mut self.table.lock().await.resume_after_restore);
+        for session_id in resume {
+            if let Err(error) = self
+                .followup_task(&session_id.to_string(), RESUME_AFTER_RESTART)
+                .await
+            {
+                tracing::warn!(%error, %session_id, "could not resume a child parked mid-task");
+            }
+        }
     }
 
     pub async fn approve(
@@ -9306,15 +9364,30 @@ async fn finish_agent(
     error: Option<anyhow::Error>,
 ) -> Option<SubagentActivity> {
     let mut table = table.lock().await;
+    let parked_mid_task = table
+        .parking
+        .as_ref()
+        .map(|busy| busy.contains(&session_id));
     let entry = table.entries.get_mut(&session_id)?;
-    entry.snapshot.status = if error.is_some() {
-        SubagentStatus::Failed
-    } else {
-        SubagentStatus::Stopped
+    entry.snapshot.status = match (&error, parked_mid_task) {
+        (Some(_), _) => SubagentStatus::Failed,
+        (None, Some(_)) => SubagentStatus::Ready,
+        (None, None) => SubagentStatus::Stopped,
     };
-    entry.snapshot.detail = error.map(|error| format!("{error:#}"));
+    entry.snapshot.detail = match (error, parked_mid_task) {
+        (Some(error), _) => Some(format!("{error:#}")),
+        (None, Some(true)) => Some(PARKED_MID_TASK.to_string()),
+        (None, Some(false)) => Some(PARKED_WITH_PARENT.to_string()),
+        (None, None) => None,
+    };
     entry.snapshot.updated_at = Utc::now();
     entry.commands = None;
+    if entry.snapshot.status == SubagentStatus::Ready {
+        entry.dormant = true;
+        return Some(SubagentActivity::Completed {
+            agent: entry.snapshot.clone(),
+        });
+    }
     Some(if entry.snapshot.status == SubagentStatus::Failed {
         SubagentActivity::Failed {
             agent: entry.snapshot.clone(),
