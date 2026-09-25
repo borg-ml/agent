@@ -2012,6 +2012,7 @@ struct HoldingSteerExecutor {
     turns: RecordedPromptTurns,
     turn_started: Arc<Notify>,
     steer_seen: Arc<Notify>,
+    native: bool,
 }
 
 struct CommittingSteerExecutor {
@@ -2343,6 +2344,10 @@ impl AgentTurnExecutor for RejectingSteerExecutor {
 
 #[async_trait::async_trait]
 impl AgentTurnExecutor for HoldingSteerExecutor {
+    fn uses_native_harness(&self, _provider: CodingProvider) -> bool {
+        self.native
+    }
+
     async fn execute(
         &self,
         turn: AgentTurn,
@@ -6926,6 +6931,7 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
         turns: Arc::clone(&turns),
         turn_started: Arc::clone(&turn_started),
         steer_seen: Arc::clone(&steer_seen),
+        native: false,
     });
     let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
@@ -7052,112 +7058,123 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
 
 #[tokio::test]
 async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
-    let root = tempdir().unwrap();
-    let journal_path = root.path().join("session.lock");
-    let session_id = Uuid::new_v4();
-    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
-    let store: Arc<dyn SessionStore> = Arc::new(store);
-    store.create_session(session_id).await.unwrap();
-    let (command_tx, command_rx) = mpsc::channel(8);
-    let (event_tx, mut event_rx) = mpsc::channel(32);
-    let turns = Arc::new(Mutex::new(Vec::new()));
-    let turn_started = Arc::new(Notify::new());
-    let steer_seen = Arc::new(Notify::new());
-    let executor = Arc::new(HoldingSteerExecutor {
-        turns,
-        turn_started: Arc::clone(&turn_started),
-        steer_seen: Arc::clone(&steer_seen),
-    });
-    let actor_store = Arc::clone(&store);
-    let actor = tokio::spawn(async move {
-        run_session_actor(
-            &journal_path,
-            session_id,
-            LaunchSession {
-                request_id: Uuid::new_v4(),
-                cwd: root.path().to_path_buf(),
-                provider: CodingProvider::Codex,
-                model: None,
-                effort: None,
-                fast: Some(false),
-                response_language: crate::ResponseLanguage::Auto,
-                permission_mode: PermissionMode::Manual,
-                name: None,
-                initial_prompt: None,
-                capabilities: Default::default(),
-                subagent_concurrency_limit: None,
-                extension_skill_roots: Vec::new(),
-                team_policy: None,
-            },
-            command_rx,
-            event_tx,
-            executor,
-            actor_store,
-        )
-        .await
-    });
-
-    command_tx
-        .send(HostCommand::Prompt {
-            session_id,
-            message_id: Uuid::new_v4(),
-            text: "first".to_string(),
-            attachments: Vec::new(),
-            output_schema: None,
-            delivery: PromptDelivery::Steer,
-        })
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
-        .await
-        .expect("first turn starts");
-
-    let followup_id = Uuid::new_v4();
-    command_tx
-        .send(HostCommand::Prompt {
-            session_id,
-            message_id: followup_id,
-            text: "recall this follow-up".to_string(),
-            attachments: Vec::new(),
-            output_schema: None,
-            delivery: PromptDelivery::Steer,
-        })
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), steer_seen.notified())
-        .await
-        .expect("provider has received the unacknowledged steer");
-
-    command_tx
-        .send(HostCommand::RecallQueuedPrompt {
-            session_id,
-            message_id: Some(followup_id),
-        })
-        .await
-        .unwrap();
-    loop {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+    // Native harness steers wait for the tool boundary; until then they must
+    // stay recallable, whether Up recalls everything or one message is named.
+    for (native, targeted) in [(false, true), (false, false), (true, true), (true, false)] {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.lock");
+        let session_id = Uuid::new_v4();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        store.create_session(session_id).await.unwrap();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let turns = Arc::new(Mutex::new(Vec::new()));
+        let turn_started = Arc::new(Notify::new());
+        let steer_seen = Arc::new(Notify::new());
+        let executor = Arc::new(HoldingSteerExecutor {
+            turns,
+            turn_started: Arc::clone(&turn_started),
+            steer_seen: Arc::clone(&steer_seen),
+            native,
+        });
+        let actor_store = Arc::clone(&store);
+        let actor = tokio::spawn(async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd: root.path().to_path_buf(),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                actor_store,
+            )
             .await
-            .expect("recall event arrives")
-            .expect("session remains open");
-        if matches!(
-            event.kind,
-            SessionEventKind::PromptRecalled { message_id, .. } if message_id == followup_id
-        ) {
-            break;
-        }
-    }
+        });
 
-    command_tx
-        .send(HostCommand::Interrupt { session_id })
-        .await
-        .unwrap();
-    command_tx
-        .send(HostCommand::Stop { session_id })
-        .await
-        .unwrap();
-    actor.await.unwrap().unwrap();
-    scratch.discard().await;
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: Uuid::new_v4(),
+                text: "first".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
+            .await
+            .expect("first turn starts");
+
+        let followup_id = Uuid::new_v4();
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: followup_id,
+                text: "recall this follow-up".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        if native {
+            // The native session holds a steer until the tool boundary.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        } else {
+            tokio::time::timeout(Duration::from_secs(1), steer_seen.notified())
+                .await
+                .expect("provider has received the unacknowledged steer");
+        }
+
+        command_tx
+            .send(HostCommand::RecallQueuedPrompt {
+                session_id,
+                // Up in the composer names no message; recall every pending one.
+                message_id: targeted.then_some(followup_id),
+            })
+            .await
+            .unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("recall event arrives")
+                .expect("session remains open");
+            if matches!(
+                event.kind,
+                SessionEventKind::PromptRecalled { message_id, .. } if message_id == followup_id
+            ) {
+                break;
+            }
+        }
+
+        command_tx
+            .send(HostCommand::Interrupt { session_id })
+            .await
+            .unwrap();
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
+        scratch.discard().await;
+    }
 }
 
 #[tokio::test]

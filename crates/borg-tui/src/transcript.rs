@@ -251,6 +251,7 @@ struct Transcript {
     auto_expand_tools: bool,
     auto_expand_thinking: bool,
     action_descriptors: bool,
+    pub(crate) wrap_action_rows: bool,
     show_subagent_messages: bool,
     tool_click_behavior: ToolClickBehavior,
     user_label: String,
@@ -379,6 +380,7 @@ impl Default for Transcript {
             auto_expand_tools: false,
             auto_expand_thinking: false,
             action_descriptors: true,
+            wrap_action_rows: false,
             show_subagent_messages: false,
             tool_click_behavior: ToolClickBehavior::Fullscreen,
             user_label: "user".to_string(),
@@ -5133,8 +5135,21 @@ impl Transcript {
                     let mut summary = if detail.is_empty() {
                         format!("{time}  {glyph} {label}")
                     } else {
-                        format!("{time}  {glyph} {label}  {detail}")
+                        format!("{time}  {glyph} {label:<8}  {detail}")
                     };
+                    // A single-line row still says what the message is about.
+                    if !self.wrap_action_rows
+                        && *kind == TranscriptActionKind::Agent
+                        && label == "Peer"
+                        && !*expanded
+                        && focused_tool.is_none()
+                        && let Some(first) = body
+                            .as_deref()
+                            .and_then(|body| body.lines().find(|line| !line.trim().is_empty()))
+                    {
+                        summary.push_str(" · ");
+                        summary.push_str(first.trim());
+                    }
                     if focused_tool.is_none()
                         && body.as_deref().is_some_and(|body| !body.trim().is_empty())
                     {
@@ -5149,9 +5164,12 @@ impl Transcript {
                         );
                     }
                     let action_start = lines.len();
-                    for line in wrap_display(
+                    for line in tool_summary_lines(
                         &summary,
-                        width.saturating_sub(UnicodeWidthStr::width(prefix) + 2),
+                        None,
+                        prefix,
+                        width.saturating_sub(2),
+                        self.wrap_action_rows,
                     ) {
                         lines.push(Line::from(vec![
                             Span::styled(prefix, Style::default().fg(Color::DarkGray)),
@@ -5160,7 +5178,9 @@ impl Transcript {
                     }
                     if (*expanded
                         || focused_tool == Some(index)
-                        || (*kind == TranscriptActionKind::Agent && label == "Peer"))
+                        || (self.wrap_action_rows
+                            && *kind == TranscriptActionKind::Agent
+                            && label == "Peer"))
                         && let Some(body) = body.as_deref().filter(|body| !body.trim().is_empty())
                     {
                         let mut body_lines = wrap_display(
@@ -5196,6 +5216,10 @@ impl Transcript {
                     } else {
                         SelectionRowRange::transcript_entry(index, entry_start, lines.len())
                     });
+                    // Same gap after the row as every other transcript entry.
+                    if tool_window.is_none() {
+                        lines.push(Line::default());
+                    }
                 }
                 TranscriptEntry::Plan {
                     items,
@@ -5568,7 +5592,13 @@ impl Transcript {
                         running_tool_elapsed.push((index, elapsed.clone()));
                     }
                     for (line_index, line) in
-                        tool_summary_lines(&summary, elapsed.as_deref(), prefix, width)
+                        tool_summary_lines(
+                            &summary,
+                            elapsed.as_deref(),
+                            prefix,
+                            width,
+                            self.wrap_action_rows,
+                        )
                             .into_iter()
                             .enumerate()
                     {
