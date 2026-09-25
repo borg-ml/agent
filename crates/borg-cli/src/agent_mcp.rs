@@ -44,15 +44,39 @@ pub(crate) async fn list_tools(name: Option<&str>) -> Result<()> {
     print_json(&output)
 }
 
-/// Print one JSON line. A reader that stopped early (`| head`) is not an
-/// error of the call, so a closed pipe ends output quietly.
 fn print_json(value: &Value) -> Result<()> {
+    print_line(&serde_json::to_string(value)?)
+}
+
+/// A reader that stopped early (`| head`) is not an error of the call, so a
+/// closed pipe ends output quietly.
+fn print_line(line: &str) -> Result<()> {
     use std::io::Write as _;
     let mut stdout = std::io::stdout().lock();
-    match writeln!(stdout, "{}", serde_json::to_string(value)?).and_then(|()| stdout.flush()) {
+    match writeln!(stdout, "{line}").and_then(|()| stdout.flush()) {
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         result => Ok(result?),
     }
+}
+
+/// `borg tools --search`: one ranked signature per line.
+pub(crate) async fn search_tools(query: &str, limit: u64) -> Result<()> {
+    let endpoint = AgentToolEndpoint::from_env()?;
+    let found = forward(
+        &endpoint,
+        "__borg_tools",
+        json!({ "query": query, "limit": limit }),
+        None,
+    )
+    .await?;
+    let lines = found
+        .as_array()
+        .context("Borg capability search did not return a list")?
+        .iter()
+        .filter_map(|entry| entry.get("signature").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    print_line(&lines)
 }
 
 pub(crate) async fn workspace_instances() -> Result<Value> {

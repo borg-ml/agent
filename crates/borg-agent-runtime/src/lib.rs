@@ -12,6 +12,7 @@ mod blu_workflow;
 mod computer_use;
 #[cfg(target_os = "linux")]
 pub use computer_use::run_linux_helper;
+mod capability_catalog;
 mod command_clients;
 mod contract;
 mod execution;

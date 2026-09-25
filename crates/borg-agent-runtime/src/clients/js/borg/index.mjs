@@ -58,8 +58,11 @@ export const call = (name, args) => request(name, args);
 /** Every capability this session offers, with its input schema. */
 export const tools = () => request("__borg_tools", {});
 
+/** Capabilities ranked for `query`, each with a compact signature. */
+export const search = (query, limit = 10) => request("__borg_tools", { query, limit });
+
 const borg = new Proxy(
-  { call, tools, BorgError },
+  { call, search, tools, BorgError },
   // `then` stays undefined so the object is never mistaken for a promise.
   { get: (target, name) => (name in target || typeof name !== "string" || name === "then" ? target[name] : (args) => call(name, args)) },
 );

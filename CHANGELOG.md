@@ -12,6 +12,11 @@ Git comparison.
   data and failures as `BorgError`. Calls from code and from `borg call` show in
   the transcript as steps of the command that made them.
 - `borg call … | head` no longer panics when the reader closes the pipe.
+- The system prompt lists every Borg capability as a compact signature, and
+  `borg tools --search QUERY`, `borg.search("query")` (Python and Bun) rank
+  capabilities with one-line descriptions.
+- A call with a wrong field or name says what was expected: the capability's
+  signature, or the closest capability names.
 
 ### Models
 

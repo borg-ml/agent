@@ -144,6 +144,12 @@ pub(crate) enum Command {
     Tools {
         /// Show one capability by name.
         name: Option<String>,
+        /// Rank capabilities for a query and print compact signatures.
+        #[arg(long, conflicts_with = "name")]
+        search: Option<String>,
+        /// How many search results to print.
+        #[arg(long, default_value_t = 10, requires = "search")]
+        limit: u64,
     },
     /// Invoke one session-scoped Borg or Blu capability with JSON arguments.
     Call {
@@ -797,7 +803,7 @@ mod tests {
             .command_or_agent();
         assert!(matches!(
             tools,
-            Command::Tools { name: Some(name) } if name == "get_goal"
+            Command::Tools { name: Some(name), .. } if name == "get_goal"
         ));
 
         let call = try_parse_direct(["borg", "call", "get_goal", "{}"])

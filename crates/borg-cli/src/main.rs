@@ -139,7 +139,12 @@ async fn run() -> Result<()> {
         Command::Update(args) => updater::run(args).await,
         Command::Capabilities(args) => print_capabilities(args),
         Command::Image { files, session } => image_delivery::run(files, session).await,
-        Command::Tools { name } => agent_mcp::list_tools(name.as_deref()).await,
+        Command::Tools {
+            search: Some(query),
+            limit,
+            ..
+        } => agent_mcp::search_tools(&query, limit).await,
+        Command::Tools { name, .. } => agent_mcp::list_tools(name.as_deref()).await,
         Command::Call { name, arguments } => {
             agent_mcp::call_tool(&name, arguments.as_deref()).await
         }

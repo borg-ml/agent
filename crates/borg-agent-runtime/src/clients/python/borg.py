@@ -14,7 +14,7 @@ import json
 import os
 import socket
 
-__all__ = ["BorgError", "call", "tools"]
+__all__ = ["BorgError", "call", "search", "tools"]
 
 
 class BorgError(Exception):
@@ -63,6 +63,11 @@ def call(name, arguments=None, /, **fields):
 def tools():
     """Every capability this session offers, with its input schema."""
     return _request("__borg_tools", {})
+
+
+def search(query, limit=10):
+    """Capabilities ranked for `query`, each with a compact signature."""
+    return _request("__borg_tools", {"query": query, "limit": limit})
 
 
 def __getattr__(name):

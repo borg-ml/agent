@@ -88,7 +88,8 @@ capabilities are discovered from that shell with `borg tools` and invoked with
 `borg call NAME JSON`, or from code with `import borg` in Python
 (`borg.send_message(target=..., message=...)`) and `import borg from "borg"` in
 Bun. Every such call shows in the transcript as a step of the command that made
-it. Set `capabilities.harness = "native"` only when the
+it. `borg tools --search QUERY` and `borg.search("query")` find capabilities by
+name or purpose, and a malformed call answers with the expected signature. Set `capabilities.harness = "native"` only when the
 direct one-tool-per-capability fallback is preferred.
 
 Ask Borg to watch a log or deployment, for example: “Watch the build log and
