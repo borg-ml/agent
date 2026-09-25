@@ -5565,6 +5565,7 @@ async fn run_agent_session_store_kernel_inner(
                             // batch.
                             let mut drained = vec![(message_id, text, attachments, output_schema)];
                             while let Ok(waiting) = commands.try_recv() {
+                                let team = matches!(waiting, HostCommand::TeamPrompt { .. });
                                 match waiting {
                                     HostCommand::TeamPrompt {
                                         message_id,
@@ -5587,7 +5588,12 @@ async fn run_agent_session_store_kernel_inner(
                                         executor.uses_native_harness(launch.provider),
                                     ) =>
                                     {
-                                        team_message_ids.insert(message_id);
+                                        // Only a team message is a team message: a
+                                        // human steer drained behind another must stay
+                                        // the human's, or Up cannot recall it.
+                                        if team {
+                                            team_message_ids.insert(message_id);
+                                        }
                                         drained.push((message_id, text, attachments, output_schema));
                                     }
                                     other => {

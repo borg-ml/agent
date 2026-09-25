@@ -2359,7 +2359,10 @@ impl AgentTurnExecutor for HoldingSteerExecutor {
             .unwrap()
             .push((turn.prompt.clone(), turn.attachments));
         self.turn_started.notify_one();
-        if subscription_prompt_ends_with(&turn.prompt, "first") {
+        // A native turn carries the raw prompt; a subscription turn frames it.
+        if subscription_prompt_ends_with(&turn.prompt, "first")
+            || (self.native && turn.prompt.trim_end().ends_with("first"))
+        {
             let mut controls = controls.expect("active turn has controls");
             let mut held_ack = None;
             while let Some(control) = controls.recv().await {
@@ -7122,45 +7125,61 @@ async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
             .await
             .expect("first turn starts");
 
+        // Two steers back to back: the second is drained behind the first and
+        // must stay the human's, or Up cannot recall it.
         let followup_id = Uuid::new_v4();
-        command_tx
-            .send(HostCommand::Prompt {
-                session_id,
-                message_id: followup_id,
-                text: "recall this follow-up".to_string(),
-                attachments: Vec::new(),
-                output_schema: None,
-                delivery: PromptDelivery::Steer,
-            })
-            .await
-            .unwrap();
-        if native {
-            // The native session holds a steer until the tool boundary.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        } else {
-            tokio::time::timeout(Duration::from_secs(10), steer_seen.notified())
+        let drained_id = Uuid::new_v4();
+        for (message_id, text) in [
+            (followup_id, "recall this follow-up"),
+            (drained_id, "and this one"),
+        ] {
+            command_tx
+                .send(HostCommand::Prompt {
+                    session_id,
+                    message_id,
+                    text: text.to_string(),
+                    attachments: Vec::new(),
+                    output_schema: None,
+                    delivery: PromptDelivery::Steer,
+                })
                 .await
-                .expect("provider has received the unacknowledged steer");
+                .unwrap();
         }
+        tokio::time::timeout(Duration::from_secs(10), steer_seen.notified())
+            .await
+            .expect("provider has received the unacknowledged steer");
 
         command_tx
             .send(HostCommand::RecallQueuedPrompt {
                 session_id,
                 // Up in the composer names no message; recall every pending one.
-                message_id: targeted.then_some(followup_id),
+                message_id: targeted.then_some(drained_id),
             })
             .await
             .unwrap();
-        loop {
+        let mut expected = if targeted {
+            HashSet::from([drained_id])
+        } else {
+            HashSet::from([followup_id, drained_id])
+        };
+        let mut seen = Vec::new();
+        while !expected.is_empty() {
             let event = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
                 .await
-                .expect("recall event arrives")
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "recall event arrives (native={native}, targeted={targeted}) after {seen:?}"
+                    )
+                })
                 .expect("session remains open");
-            if matches!(
-                event.kind,
-                SessionEventKind::PromptRecalled { message_id, .. } if message_id == followup_id
-            ) {
-                break;
+            seen.push(
+                format!("{:?}", event.kind)
+                    .chars()
+                    .take(160)
+                    .collect::<String>(),
+            );
+            if let SessionEventKind::PromptRecalled { message_id, .. } = event.kind {
+                expected.remove(&message_id);
             }
         }
 
