@@ -9011,9 +9011,11 @@ impl BorgTerminal {
                         width,
                         height: 1,
                     },
+                    // On the status row, never over the transcript's last line
+                    // where it hid the newest text and its timing column.
                     None => Rect {
-                        x: chunks[2].right().saturating_sub(width + 1),
-                        y: chunks[0].bottom().saturating_sub(1),
+                        x: status_area.right().saturating_sub(width + 1),
+                        y: status_area.y,
                         width,
                         height: 1,
                     },

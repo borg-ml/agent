@@ -2168,7 +2168,23 @@ async fn run_local_agent_session(
                 .context("current project directory does not exist")?,
         ),
     };
-    let requested_provider = if args
+    // With a fallback chain and no explicit choice, a fresh session starts on
+    // the chain's first route, provided its subscription is signed in (or the
+    // route opted into API billing). Otherwise the usual default applies.
+    let chain_start = (!resuming && args.provider.is_none() && args.model.is_none())
+        .then(|| agent_config.capabilities.model_fallback.first().cloned())
+        .flatten()
+        .filter(|route| {
+            route.allow_api_billing
+                || !matches!(
+                    route.provider,
+                    CodingProvider::Claude | CodingProvider::Codex
+                )
+                || borg_remote::provider_subscription_credentials_present(route.provider)
+        });
+    let requested_provider = if let Some(route) = &chain_start {
+        route.provider
+    } else if args
         .model
         .as_deref()
         .is_some_and(|model| agent_config.has_configured_model(model))
@@ -2178,6 +2194,7 @@ async fn run_local_agent_session(
         args.provider().into()
     };
     if !resuming
+        && chain_start.is_none()
         && args.provider.is_none()
         && matches!(
             requested_provider,
@@ -2190,32 +2207,44 @@ async fn run_local_agent_session(
              sign in or pass --provider explicitly (no API-key billing was selected)"
         );
     }
-    let codex_backup = automatic_codex_backup_profile(requested_provider, args.provider.is_some());
+    let codex_backup = automatic_codex_backup_profile(
+        requested_provider,
+        args.provider.is_some() || chain_start.is_some(),
+    );
     let requested_model = args
         .model
         .clone()
+        .or_else(|| chain_start.as_ref().and_then(|route| route.model.clone()))
         .or_else(|| codex_backup.map(|(model, _)| model.to_string()))
         .or_else(|| default_model_for_provider(requested_provider));
-    let requested_effort = args.effort.clone().or_else(|| {
-        codex_backup
-            .map(|(_, effort)| effort.to_string())
-            .or_else(|| match requested_provider {
-                CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
-                // OpenRouter spans reasoning and non-reasoning models. Only send its
-                // optional reasoning parameter after an explicit user selection.
-                CodingProvider::OpenRouter => None,
-                CodingProvider::OpenAiCompatible => None,
-                CodingProvider::Claude => Some(borg_provider::claude_default_effort().to_string()),
-                CodingProvider::OpenCode => None,
-                CodingProvider::Kimi | CodingProvider::Glm => {
-                    Some(borg_provider::kimi_default_effort().to_string())
-                }
-                CodingProvider::Qwen => Some(borg_provider::qwen_default_effort().to_string()),
-                // Grok Build and Muse Code choose their own reasoning depth, and the
-                // Anthropic lane sends extended thinking only when asked for it.
-                CodingProvider::Anthropic | CodingProvider::Grok | CodingProvider::Muse => None,
-            })
-    });
+    let requested_effort = args
+        .effort
+        .clone()
+        .or_else(|| chain_start.as_ref().and_then(|route| route.effort.clone()))
+        .or_else(|| {
+            codex_backup.map(|(_, effort)| effort.to_string()).or_else(
+                || match requested_provider {
+                    CodingProvider::Codex => {
+                        Some(borg_provider::codex_default_effort().to_string())
+                    }
+                    // OpenRouter spans reasoning and non-reasoning models. Only send its
+                    // optional reasoning parameter after an explicit user selection.
+                    CodingProvider::OpenRouter => None,
+                    CodingProvider::OpenAiCompatible => None,
+                    CodingProvider::Claude => {
+                        Some(borg_provider::claude_default_effort().to_string())
+                    }
+                    CodingProvider::OpenCode => None,
+                    CodingProvider::Kimi | CodingProvider::Glm => {
+                        Some(borg_provider::kimi_default_effort().to_string())
+                    }
+                    CodingProvider::Qwen => Some(borg_provider::qwen_default_effort().to_string()),
+                    // Grok Build and Muse Code choose their own reasoning depth, and the
+                    // Anthropic lane sends extended thinking only when asked for it.
+                    CodingProvider::Anthropic | CodingProvider::Grok | CodingProvider::Muse => None,
+                },
+            )
+        });
     let (
         recorded_cwd,
         mut provider,

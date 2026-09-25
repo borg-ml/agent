@@ -12,6 +12,8 @@ Git comparison.
   and a usage limit moves the same turn to the next model with quota, then back
   once the limit resets. Named chains compose with `chain:<name>`, and a route
   never spends API credit unless it opts in. See docs/model-fallback.md.
+- A new session started without `--provider` or `--model` begins on the first
+  route of the chain when that subscription is signed in.
 
 ### Terminal
 
@@ -20,6 +22,8 @@ Git comparison.
 - Stopped and failed subagents stay on the team roster, after the working ones,
   marked "click to resume"; the status line shows "N stopped" when none are
   working so the roster stays reachable.
+- "Jump to bottom" sits on the status row instead of covering the newest
+  transcript line.
 
 ### History
 
