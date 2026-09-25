@@ -2311,6 +2311,23 @@ fn command_has_shell_control_operator(command: &str) -> bool {
     escaped || quote.is_some()
 }
 
+/// A command's leading `cd DIR` and what follows it (`cd DIR && rest`,
+/// `cd DIR; rest` or a bare `cd DIR`). The shell tool remembers `DIR` for later
+/// commands, and rows show `rest` under the directory instead of the prefix.
+pub(crate) fn split_leading_cd(command: &str) -> Option<(&str, &str)> {
+    static LEADING_CD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|'"]+))\s*(?:(?:&&|;)\s*|$)"#)
+            .expect("valid leading cd pattern")
+    });
+    let captures = LEADING_CD.captures(command)?;
+    let directory = captures
+        .get(1)
+        .or_else(|| captures.get(2))
+        .or_else(|| captures.get(3))?
+        .as_str();
+    Some((directory, &command[captures.get(0)?.end()..]))
+}
+
 fn unwrapped_shell_command(command: &str) -> String {
     let words = shell_words(command);
     shell_script(&words).unwrap_or(command).to_string()
@@ -2635,6 +2652,18 @@ mod tests {
             false,
         );
         assert_eq!(presentation.detail, "up to 15m");
+    }
+
+    #[test]
+    fn a_leading_cd_is_split_from_the_command_it_prefixes() {
+        assert_eq!(
+            split_leading_cd("cd ~/abundance-wt/ore-cues && git fetch -q origin"),
+            Some(("~/abundance-wt/ore-cues", "git fetch -q origin"))
+        );
+        assert_eq!(split_leading_cd("cd 'my dir'; ls"), Some(("my dir", "ls")));
+        assert_eq!(split_leading_cd("cd src"), Some(("src", "")));
+        assert_eq!(split_leading_cd("cdx && ls"), None);
+        assert_eq!(split_leading_cd("git status && cd x"), None);
     }
 
     #[test]
