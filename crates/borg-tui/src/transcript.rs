@@ -4781,7 +4781,6 @@ impl Transcript {
                     TranscriptEntry::Plan { .. }
                         | TranscriptEntry::Goal { .. }
                         | TranscriptEntry::Info { .. }
-                        | TranscriptEntry::Action { .. }
                         | TranscriptEntry::Compaction { .. }
                 );
             let is_chat_message = matches!(
@@ -5231,8 +5230,19 @@ impl Transcript {
                     } else {
                         SelectionRowRange::transcript_entry(index, entry_start, lines.len())
                     });
-                    // Same gap after the row as every other transcript entry.
-                    if tool_window.is_none() {
+                    // Close a run of tool and action rows with the same gap a tool
+                    // row leaves, and none between rows of the run.
+                    let next_in_run = focused_tool.is_none()
+                        && matches!(
+                            self.order.get(index + 1),
+                            Some(TranscriptEntry::Tool { .. } | TranscriptEntry::Action { .. })
+                        );
+                    if tool_window.is_none()
+                        && !next_in_run
+                        && lines
+                            .last()
+                            .is_none_or(|line| !line_is_unstyled_blank(line))
+                    {
                         lines.push(Line::default());
                     }
                 }
@@ -5490,10 +5500,11 @@ impl Transcript {
                     expanded,
                     ..
                 } => {
+                    // Tool and action rows (Watch, Peer) form one uniform run.
                     let next_is_tool = focused_tool.is_none()
                         && matches!(
                             self.order.get(index + 1),
-                            Some(TranscriptEntry::Tool { .. })
+                            Some(TranscriptEntry::Tool { .. } | TranscriptEntry::Action { .. })
                         );
                     let time = display_local_time(time, &today_prefix);
                     let is_reasoning = matches!(
