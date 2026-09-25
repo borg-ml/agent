@@ -1360,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn a_screenshot_larger_than_the_many_image_limit_is_downscaled() {
+    fn large_screenshot_is_tiled_and_small_image_stays_whole() {
         use base64::Engine as _;
         let engine = base64::engine::general_purpose::STANDARD;
         let encode = |width, height| {
@@ -1381,9 +1381,19 @@ mod tests {
             image::load_from_memory(&bytes).unwrap().dimensions()
         };
         use image::GenericImageView as _;
-        let blocks = image_blocks(&[encode(2560, 1440), encode(800, 600)]);
-        assert_eq!(size(&blocks[0]), (2000, 1125));
-        assert_eq!(size(&blocks[1]), (800, 600));
+        let large = encode(2560, 1440);
+        let expected = crate::image_tiles::piece_count(&engine.decode(&large.data_base64).unwrap());
+        assert!(expected > 1);
+        let blocks = image_blocks(&[large, encode(800, 600)]);
+        assert_eq!(blocks.len(), 2 * expected + 1);
+        for (index, pair) in blocks[..2 * expected].chunks_exact(2).enumerate() {
+            assert_eq!(pair[0]["type"], "text");
+            let label = pair[0]["text"].as_str().unwrap().to_ascii_lowercase();
+            assert!(label.contains(if index == 0 { "overview" } else { "tile" }));
+            let (width, height) = size(&pair[1]);
+            assert!(width.max(height) <= 1568);
+        }
+        assert_eq!(size(blocks.last().unwrap()), (800, 600));
     }
 
     #[test]
