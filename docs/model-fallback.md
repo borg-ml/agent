@@ -13,6 +13,10 @@ first. This is what lets a `/goal` run unattended around the clock.
 fallback = ["claude-opus-5-5@max", "gpt-6-sol@xhigh", "opencode-go/deepseek-v4.1"]
 ```
 
+A new session started without `--provider` or `--model` begins on the first
+route, provided its subscription is signed in (or the route allows API
+billing); resumed sessions keep their recorded model.
+
 ## Routes
 
 Each entry is a route: `model`, `model@effort`, `provider/model@effort` or
