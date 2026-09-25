@@ -12,6 +12,14 @@ Git comparison.
 - The Running status highlight sweeps more slowly and narrowly, without
   changing tool-row sweep speed.
 
+### Providers and dictation
+
+- The shared Claude subscription connector selects the pinned, checksummed
+  runtime for macOS, Linux ARM, and Windows, not just Linux x86-64.
+- Managed dictation retries a recording on an isolated default-accelerator
+  server when the existing local server returns a 5xx error; it does not stop
+  another process's server.
+
 ## 0.11.3 (2026-09-24)
 
 ### Terminal
