@@ -495,6 +495,14 @@ impl NativeHarness {
                 "Use `query_history` when compacted context is insufficient."
             )),
         }
+        if self.harness == HarnessMode::Borg {
+            // Stable for the session, so it stays in the cached prefix.
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&crate::capability_catalog::prompt_listing(
+                &turn.agent_tools.mcp_specs(false),
+                CAPABILITY_LISTING_BUDGET_CHARS,
+            ));
+        }
         // The three parts of the leading instructions that genuinely vary
         // mid-conversation are collected rather than appended, so a lane that
         // can carry them in conversation position keeps its cached prefix.
@@ -4567,6 +4575,10 @@ pub(crate) async fn native_user_message(
     }
     Ok(ModelMessage::user_with_attachments(prompt, encoded))
 }
+
+/// How much of the system prompt the capability signatures may take; the
+/// listing says when it is partial and how to find the rest.
+const CAPABILITY_LISTING_BUDGET_CHARS: usize = 8_000;
 
 fn builtin_tool_specs() -> Vec<Value> {
     let mut specs = crate::subagents::file_mutation_tool_specs();

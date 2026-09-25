@@ -652,7 +652,18 @@ async fn serve_agent_tool_connection<S>(
                     .get("workspace_tools")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                json!({ "result": dispatcher.mcp_specs(workspace_tools) })
+                let specs = dispatcher.mcp_specs(workspace_tools);
+                match request.arguments.get("query").and_then(Value::as_str) {
+                    Some(query) => {
+                        let limit = request
+                            .arguments
+                            .get("limit")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(10) as usize;
+                        json!({ "result": crate::capability_catalog::search(&specs, query, limit) })
+                    }
+                    None => json!({ "result": specs }),
+                }
             }
             Ok(request) => {
                 let cancel = shutdown.child_token();
@@ -1555,7 +1566,34 @@ impl AgentToolDispatcher {
         .await
     }
 
+    /// Run one capability. A call with the wrong name or arguments fails with
+    /// the shape the capability expects, so the caller's next try can be right.
     pub(crate) async fn call_with_workflow_control(
+        &self,
+        name: &str,
+        arguments: Value,
+        workflow_approved: bool,
+        workflow_cancel: Option<CancellationToken>,
+    ) -> Result<Value> {
+        self.dispatch(name, arguments, workflow_approved, workflow_cancel)
+            .await
+            .map_err(|error| {
+                let specs = self.mcp_specs(true);
+                let known = specs
+                    .iter()
+                    .any(|spec| spec.get("name").and_then(Value::as_str) == Some(name));
+                if known && !error.chain().any(|cause| cause.is::<serde_json::Error>()) {
+                    return error;
+                }
+                anyhow::anyhow!(crate::capability_catalog::corrective_error(
+                    &specs,
+                    name,
+                    &format!("{error:#}"),
+                ))
+            })
+    }
+
+    async fn dispatch(
         &self,
         name: &str,
         arguments: Value,
