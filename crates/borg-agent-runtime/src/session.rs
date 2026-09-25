@@ -11616,7 +11616,8 @@ async fn pause_active_goal(
     Ok(())
 }
 
-/// Fresh human input releases an Escape stop and the goal it paused.
+/// Fresh human input releases an Escape stop and the goal it paused, and
+/// reopens a blocked goal: new direction is what a blocked goal waits for.
 /// A standalone /goal pause leaves the stop latch clear and stays paused.
 async fn resume_interrupted_goal_on_human_input(
     journal: &mut RuntimeSessionStore,
@@ -11626,11 +11627,9 @@ async fn resume_interrupted_goal_on_human_input(
     active_since: &mut Option<Instant>,
     user_stop: &mut bool,
 ) -> Result<()> {
-    if *user_stop
-        && goal
-            .as_ref()
-            .is_some_and(|goal| goal.status == GoalStatus::Paused)
-    {
+    if goal.as_ref().is_some_and(|goal| {
+        goal.status == GoalStatus::Blocked || (*user_stop && goal.status == GoalStatus::Paused)
+    }) {
         apply_goal_action(
             journal,
             events,
