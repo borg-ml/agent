@@ -568,7 +568,7 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
         } else {
             "Wait on"
         };
-        return (label.to_string(), "running command".to_string());
+        return (label.to_string(), "command".to_string());
     }
 
     if is_mcp_resource_probe(name) {
@@ -1016,9 +1016,12 @@ pub fn tool_output_background_handle(output: &str) -> Option<String> {
 }
 
 pub fn tool_process_followup_handle(name: &str, input: Option<&Value>) -> Option<String> {
-    matches!(tool_leaf_name(name).as_str(), "wait" | "write_stdin")
-        .then(|| input.and_then(process_handle_value))
-        .flatten()
+    let input = input?;
+    let tool = tool_leaf_name(name);
+    (matches!(tool.as_str(), "wait" | "write_stdin")
+        || (tool == "exec" && command_from_input(input).is_none()))
+    .then(|| process_handle_value(input))
+    .flatten()
 }
 
 pub fn tool_process_output_text(output: &str) -> String {

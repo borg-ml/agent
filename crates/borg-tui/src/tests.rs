@@ -15056,6 +15056,51 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
         backgrounded.contains("Running in background"),
         "{backgrounded}"
     );
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        4,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "shell-poll".to_string(),
+            name: "exec".to_string(),
+            input: serde_json::json!({"session_id": process_id}),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    let poll = transcript.order.iter().find(|entry| {
+        matches!(
+            entry,
+            TranscriptEntry::Tool { source_name, detail, .. }
+                if source_name == "exec" && detail == "cargo test"
+        )
+    });
+    assert!(
+        poll.is_some(),
+        "a native command poll should name its command"
+    );
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        5,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "shell-poll".to_string(),
+            output: serde_json::json!({"session_id": process_id, "running": true}).to_string(),
+            output_ref: None,
+            is_error: false,
+            input: Some(serde_json::json!({"session_id": process_id})),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    assert!(
+        transcript.order.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Tool { source_name, detail, complete: true, .. }
+                if source_name == "exec" && detail == "cargo test"
+        )),
+        "a completed poll should keep the command name"
+    );
+
     let running_verb = transcript
         .lines(120)
         .into_iter()
@@ -15066,7 +15111,7 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
 
     transcript.apply(&SessionEvent::new(
         session_id,
-        4,
+        6,
         SessionEventKind::RuntimeProcessCompleted {
             process_id,
             pid: 4242,
