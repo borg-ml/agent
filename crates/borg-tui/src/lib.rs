@@ -8521,10 +8521,16 @@ impl BorgTerminal {
                         height: footer_area.bottom().saturating_sub(composer_area.y),
                     },
                 );
-                frame.render_widget(
-                    Block::default().style(Style::default().bg(Color::Black)),
-                    footer_area,
-                );
+                for strip in [status_area, footer_area] {
+                    frame.render_widget(
+                        Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0))),
+                        Rect {
+                            x: 0,
+                            width: terminal_size.width,
+                            ..strip
+                        },
+                    );
+                }
             }
             let composer_block = Block::default()
                 .style(Style::default().bg(if is_launch_screen {
@@ -14493,9 +14499,7 @@ fn slash_help(matches: &[&(&str, &str)]) -> String {
 
 fn primary_controls_line(keymap: &KeyMap, language: UiLanguage) -> String {
     format!(
-        "{} {} · {} / · {} tab or {}",
-        ui_text(language, "send"),
-        keymap.label(KeyAction::Send),
+        "{} / · {} tab or {}",
         ui_text(language, "commands"),
         ui_text(language, "palette menu"),
         keymap.label(KeyAction::Keybindings)
@@ -14506,12 +14510,7 @@ fn primary_controls_spans(keymap: &KeyMap, language: UiLanguage) -> Vec<Span<'st
     let binding_style = Style::default().fg(Color::DarkGray);
     let key_style = Style::default().fg(Color::Gray);
     vec![
-        Span::styled(format!("{} ", ui_text(language, "send")), binding_style),
-        Span::styled(keymap.label(KeyAction::Send), key_style),
-        Span::styled(
-            format!(" · {} ", ui_text(language, "commands")),
-            binding_style,
-        ),
+        Span::styled(format!("{} ", ui_text(language, "commands")), binding_style),
         Span::styled("/", key_style),
         Span::styled(
             format!(" · {} ", ui_text(language, "palette menu")),

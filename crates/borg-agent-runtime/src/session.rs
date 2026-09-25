@@ -9949,6 +9949,42 @@ async fn collect_input_at_turn_boundary(
     while let Ok(command) = commands.try_recv() {
         ready.push_back(command);
     }
+    // The UI durably admits each submitted prompt before forwarding it to
+    // this actor. A queued batch can therefore arrive in successive scheduler
+    // ticks even when all its messages were already visible in Pending Input.
+    // Give an in-flight sibling one short handoff window before starting the
+    // next turn; never delay a boundary without queued human input.
+    if (pending
+        .iter()
+        .any(|prompt| prompt.actor == EventActor::User)
+        || ready
+            .iter()
+            .any(|command| matches!(command, HostCommand::Prompt { .. })))
+        && !ready
+            .iter()
+            .any(|command| matches!(command, HostCommand::Interrupt { .. }))
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(60);
+        while let Ok(Some(command)) = tokio::time::timeout_at(
+            (tokio::time::Instant::now() + Duration::from_millis(20)).min(deadline),
+            commands.recv(),
+        )
+        .await
+        {
+            let interrupt = matches!(command, HostCommand::Interrupt { .. });
+            ready.push_back(command);
+            while let Ok(command) = commands.try_recv() {
+                ready.push_back(command);
+            }
+            if interrupt
+                || ready
+                    .iter()
+                    .any(|command| matches!(command, HostCommand::Interrupt { .. }))
+            {
+                break;
+            }
+        }
+    }
 
     let mut interrupted = false;
     while let Some(command) = ready.pop_front() {
