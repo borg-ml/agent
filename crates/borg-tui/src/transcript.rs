@@ -741,22 +741,15 @@ fn compaction_has_expandable_detail(summary: &str) -> bool {
 fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: &str) -> String {
     let mut time = None;
     let mut cwd = None;
-    // A folded group must not hide that something in it went wrong.
-    let mut failed = 0;
     for entry in entries {
         let TranscriptEntry::Tool {
             time: row_time,
             cwd: row_cwd,
-            error,
-            outcome,
             ..
         } = entry
         else {
             continue;
         };
-        if *error || outcome.as_deref().is_some_and(outcome_is_failure) {
-            failed += 1;
-        }
         time.get_or_insert(row_time.as_str());
         if row_cwd.is_some() {
             cwd = row_cwd.as_deref();
@@ -774,32 +767,16 @@ fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: 
             _ => cwd.to_string(),
         });
     }
-    if failed > 0 {
-        parts.push(format!("{failed} failed"));
-    }
     parts.join(" · ")
 }
 
 /// Indent of an open action group's header; selection treats it as chrome.
 const TOOL_WINDOW_HEADER_INDENT: &str = "    ";
 
-/// A group header in grey, with its `N failed` count in red.
+/// A group header in grey.
 fn tool_window_header(prefix: &'static str, text: String) -> Line<'static> {
     let grey = Style::default().fg(Color::DarkGray);
-    let failed = text.find(" failed").and_then(|end| {
-        let start = text[..end].rfind(" · ")? + " · ".len();
-        Some((start, end + " failed".len()))
-    });
-    let mut spans = vec![Span::styled(prefix, grey)];
-    match failed {
-        Some((start, end)) => spans.extend([
-            Span::styled(text[..start].to_string(), grey),
-            Span::styled(text[start..end].to_string(), Style::default().fg(Color::LightRed)),
-            Span::styled(text[end..].to_string(), grey),
-        ]),
-        None => spans.push(Span::styled(text, grey)),
-    }
-    Line::from(spans)
+    Line::from(vec![Span::styled(prefix, grey), Span::styled(text, grey)])
 }
 
 /// A command result that means it went wrong.
