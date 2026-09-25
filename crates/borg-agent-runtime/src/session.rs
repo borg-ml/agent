@@ -132,6 +132,7 @@ async fn record_generated_session_title(
 }
 
 const ROOT_INBOX_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+const TEAM_ACK_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How many child activities the actor may queue from the coordinator before
 /// the forwarder has to wait for it to catch up.
@@ -2290,6 +2291,12 @@ async fn run_agent_session_store_kernel_inner(
         .unwrap_or_else(|| disabled_root_tx.subscribe());
     let mut root_inbox_tick = tokio::time::interval(ROOT_INBOX_REFRESH_INTERVAL);
     root_inbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut team_ack_tick = tokio::time::interval(TEAM_ACK_REFRESH_INTERVAL);
+    team_ack_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The recovery slice includes these lightweight rows without replaying
+    // provider context. Keep all unfinished sends so they resume updating.
+    let mut team_broadcasts = recover_team_broadcasts(&recovery.subagent_events);
+
     // Watchers exist before the restored activity is recorded: recording a
     // child's lifecycle and telling the watcher about it are one place, and the
     // resume path below is one of them.
@@ -2808,6 +2815,12 @@ async fn run_agent_session_store_kernel_inner(
                                             subagents.as_ref().expect("team inbox requires coordinator"),
                                             &watches,
                                         ).await?;
+                                        continue;
+                                    }
+                                    _ = team_ack_tick.tick(), if owns_team && !team_broadcasts.is_empty() => {
+                                        refresh_team_broadcasts(&mut journal, &events, session_id,
+                                            subagents.as_ref().expect("team broadcast requires coordinator"),
+                                            &mut team_broadcasts).await?;
                                         continue;
                                     }
                                     Some(providers) = capability_refresh_rx.recv() => {
@@ -3398,6 +3411,7 @@ async fn run_agent_session_store_kernel_inner(
                             &events,
                             session_id,
                             subagents.as_ref(),
+                            &mut team_broadcasts,
                             text,
                         )
                         .await?;
@@ -6217,6 +6231,7 @@ async fn run_agent_session_store_kernel_inner(
                                 &events,
                                 session_id,
                                 subagents.as_ref(),
+                                &mut team_broadcasts,
                                 text,
                             )
                             .await?;
@@ -6379,6 +6394,11 @@ async fn run_agent_session_store_kernel_inner(
                         subagents.as_ref().expect("team inbox requires coordinator"),
                         &watches,
                     ).await?;
+                }
+                _ = team_ack_tick.tick(), if owns_team && !team_broadcasts.is_empty() => {
+                    refresh_team_broadcasts(&mut journal, &events, session_id,
+                        subagents.as_ref().expect("team broadcast requires coordinator"),
+                        &mut team_broadcasts).await?;
                 }
                 // Suspended while a human owns the turn: an operator may sit on
                 // an approval or a provider question indefinitely without the
@@ -9555,29 +9575,145 @@ fn recall_withdrawable_steers(
 /// `/team` command). Reuses the same queue-to-every-non-terminal-child path as
 /// the `broadcast_team` agent tool. Failures and the "no team" case surface as
 /// visible errors rather than panicking.
+#[derive(Clone)]
+struct TeamBroadcastProgress {
+    text: String,
+    recipient_ids: Vec<Uuid>,
+    acknowledged: u32,
+}
+
+fn recover_team_broadcasts(events: &[SessionEvent]) -> HashMap<Uuid, TeamBroadcastProgress> {
+    let mut pending = HashMap::new();
+    for event in events {
+        if let SessionEventKind::TeamBroadcastUpdated {
+            message_id,
+            text,
+            recipient_ids,
+            acknowledged,
+        } = &event.kind
+        {
+            let progress = TeamBroadcastProgress {
+                text: text.clone(),
+                recipient_ids: recipient_ids.clone(),
+                acknowledged: *acknowledged,
+            };
+            if *acknowledged < recipient_ids.len() as u32 {
+                pending.insert(*message_id, progress);
+            } else {
+                pending.remove(message_id);
+            }
+        }
+    }
+    pending
+}
+
+fn acknowledged_team_recipients(
+    recipients: &[Uuid],
+    deliveries: &[crate::RecipientDelivery],
+) -> u32 {
+    deliveries
+        .iter()
+        .filter(|delivery| {
+            recipients.contains(&delivery.recipient_id)
+                && delivery.state == crate::DeliveryState::Acknowledged
+        })
+        .count() as u32
+}
+
+async fn refresh_team_broadcasts(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    coordinator: &SubagentCoordinator,
+    pending: &mut HashMap<Uuid, TeamBroadcastProgress>,
+) -> Result<()> {
+    let mut completed = Vec::new();
+    for (message_id, progress) in pending.iter_mut() {
+        let deliveries = match coordinator.team_message_deliveries(*message_id).await {
+            Ok(deliveries) => deliveries,
+            Err(error) => {
+                tracing::warn!(%message_id, %error, "team acknowledgement refresh failed");
+                continue;
+            }
+        };
+        let acknowledged = acknowledged_team_recipients(&progress.recipient_ids, &deliveries);
+        if acknowledged != progress.acknowledged {
+            record(
+                journal,
+                events,
+                session_id,
+                SessionEventKind::TeamBroadcastUpdated {
+                    message_id: *message_id,
+                    text: progress.text.clone(),
+                    recipient_ids: progress.recipient_ids.clone(),
+                    acknowledged,
+                },
+            )
+            .await?;
+            progress.acknowledged = acknowledged;
+        }
+        if acknowledged == progress.recipient_ids.len() as u32 {
+            completed.push(*message_id);
+        }
+    }
+    for message_id in completed {
+        pending.remove(&message_id);
+    }
+    Ok(())
+}
+
 async fn broadcast_team_message(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
     subagents: Option<&SubagentCoordinator>,
+    pending: &mut HashMap<Uuid, TeamBroadcastProgress>,
     text: String,
 ) -> Result<()> {
     let message = match subagents {
-        Some(coordinator) => coordinator.broadcast_message_as(session_id, &text).await,
+        Some(coordinator) => {
+            coordinator
+                .broadcast_message_as_targeted(session_id, &text)
+                .await
+        }
         None => Err(anyhow::anyhow!(
             "no agent team is active to broadcast to; spawn a subagent first"
         )),
     };
-    if let Err(error) = message {
-        record(
-            journal,
-            events,
-            session_id,
-            SessionEventKind::Error {
-                message: format!("team broadcast failed: {error:#}"),
-            },
-        )
-        .await?;
+    match message {
+        Ok((receipt, recipient_ids)) => {
+            let progress = TeamBroadcastProgress {
+                text: text.clone(),
+                recipient_ids,
+                acknowledged: 0,
+            };
+            record(
+                journal,
+                events,
+                session_id,
+                SessionEventKind::TeamBroadcastUpdated {
+                    message_id: receipt.message_id,
+                    text,
+                    recipient_ids: progress.recipient_ids.clone(),
+                    acknowledged: 0,
+                },
+            )
+            .await?;
+            if !progress.recipient_ids.is_empty() {
+                pending.insert(receipt.message_id, progress);
+            }
+        }
+        Err(error) => {
+            record(
+                journal,
+                events,
+                session_id,
+                SessionEventKind::Error {
+                    message: format!("team broadcast failed: {error:#}"),
+                },
+            )
+            .await?
+        }
     }
     Ok(())
 }

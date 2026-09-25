@@ -19857,3 +19857,55 @@ async fn a_usage_limit_continues_the_turn_on_the_next_fallback_route() {
     actor.await.unwrap().unwrap();
     scratch.discard().await;
 }
+
+#[test]
+fn team_broadcast_recovery_tracks_only_unfinished_receipts() {
+    let session = Uuid::new_v4();
+    let sent = Uuid::new_v4();
+    let complete = Uuid::new_v4();
+    let recipient_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
+    let event = |sequence, message_id, acknowledged| {
+        SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::TeamBroadcastUpdated {
+                message_id,
+                text: "check in".into(),
+                recipient_ids: recipient_ids.clone(),
+                acknowledged,
+            },
+        )
+    };
+    let pending = recover_team_broadcasts(&[
+        event(1, sent, 0),
+        event(2, complete, 0),
+        event(3, sent, 1),
+        event(4, complete, 2),
+    ]);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[&sent].acknowledged, 1);
+    assert_eq!(pending[&sent].recipient_ids, recipient_ids);
+}
+
+#[test]
+fn team_ack_count_excludes_queued_historical_members_and_admitted_recipients() {
+    let [acknowledged, admitted, historical] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    let delivery = |recipient_id, state| crate::RecipientDelivery {
+        workspace_id: Uuid::nil(),
+        sequence: 1,
+        recipient_id,
+        mode: crate::DeliveryMode::NextTurn,
+        state,
+        attempts: 0,
+        last_attempt: None,
+    };
+    let deliveries = vec![
+        delivery(acknowledged, crate::DeliveryState::Acknowledged),
+        delivery(admitted, crate::DeliveryState::Admitted),
+        delivery(historical, crate::DeliveryState::Acknowledged),
+    ];
+    assert_eq!(
+        acknowledged_team_recipients(&[acknowledged, admitted], &deliveries),
+        1
+    );
+}

@@ -238,8 +238,10 @@ struct Transcript {
     watch_messages: HashSet<Uuid>,
     subagent_entries: HashMap<Uuid, usize>,
     agent_messages: HashSet<Uuid>,
+    team_broadcast_entries: HashMap<Uuid, usize>,
     agent_message_senders: HashSet<Uuid>,
     runtime_processes: HashMap<Uuid, RuntimeProcessProjection>,
+    poll_processes: HashMap<Uuid, Vec<String>>,
     provider_backgrounds: HashMap<String, ProviderBackgroundProjection>,
     provider_followups: HashMap<String, String>,
     queued_messages: HashSet<Uuid>,
@@ -370,8 +372,10 @@ impl Default for Transcript {
             watch_messages: HashSet::new(),
             subagent_entries: HashMap::new(),
             agent_messages: HashSet::new(),
+            team_broadcast_entries: HashMap::new(),
             agent_message_senders: HashSet::new(),
             runtime_processes: HashMap::new(),
+            poll_processes: HashMap::new(),
             provider_backgrounds: HashMap::new(),
             provider_followups: HashMap::new(),
             queued_messages: HashSet::new(),
@@ -670,6 +674,7 @@ enum TranscriptEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TranscriptActionKind {
     Agent,
+    Watch,
     Approval,
     ProviderInteraction,
     Error,
@@ -770,8 +775,8 @@ fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: 
     parts.join(" · ")
 }
 
-/// Indent of an open action group's header; selection treats it as chrome.
-const TOOL_WINDOW_HEADER_INDENT: &str = "    ";
+/// Align the open group's time with the action glyphs below it.
+const TOOL_WINDOW_HEADER_INDENT: &str = "  ";
 
 /// A group header in grey.
 fn tool_window_header(prefix: &'static str, text: String) -> Line<'static> {
@@ -1080,6 +1085,8 @@ impl Transcript {
         self.command_edit_rows.clear();
         self.subagent_entries.clear();
         self.agent_messages.clear();
+        self.team_broadcast_entries.clear();
+        self.poll_processes.clear();
         self.agent_message_senders.clear();
         self.watch_messages.clear();
         self.queued_messages.clear();
@@ -1914,7 +1921,7 @@ impl Transcript {
                 {
                     if *status != MessageStatus::Queued && self.watch_messages.insert(*message_id) {
                         self.order.push(TranscriptEntry::Action {
-                            kind: TranscriptActionKind::Agent,
+                            kind: TranscriptActionKind::Watch,
                             label: "Watch".to_string(),
                             detail: label,
                             body: Some(body),
@@ -2240,6 +2247,9 @@ impl Transcript {
                 let followup_handle =
                     tool_process_followup_handle(&source_name_for_process, input.as_ref())
                         .or(stored_followup_handle);
+                let native_followup_process = followup_handle
+                    .as_deref()
+                    .and_then(|handle| Uuid::parse_str(handle).ok());
                 let edit_origin = followup_handle
                     .as_deref()
                     .and_then(|handle| Uuid::parse_str(handle).ok())
@@ -2456,6 +2466,14 @@ impl Transcript {
                     }
                     *backgrounded = false;
                 }
+                if let (Some(process_id), Some(index)) = (native_followup_process, tool_index) {
+                    if self.runtime_processes.get(&process_id).is_some_and(|process| process.running) {
+                        self.poll_processes.entry(process_id).or_default().push(tool_call_id.clone());
+                    } else if let Some(TranscriptEntry::Tool { backgrounded, .. }) = self.order.get_mut(index) {
+                        // A late poll event must not revive an exited process.
+                        *backgrounded = false;
+                    }
+                }
                 if let Some(edit) = command_edit {
                     self.upsert_command_edit(
                         &edit_origin,
@@ -2601,6 +2619,15 @@ impl Transcript {
                         *output_view = Some(("text".to_string(), output));
                     }
                     *backgrounded = false;
+                }
+                if let Some(polls) = self.poll_processes.remove(process_id) {
+                    for tool_call_id in polls {
+                        if let Some(index) = self.tools.get(&tool_call_id).copied()
+                            && let Some(TranscriptEntry::Tool { backgrounded, .. }) = self.order.get_mut(index)
+                        {
+                            *backgrounded = false;
+                        }
+                    }
                 }
                 if !changes.is_empty()
                     && let Some(tool_call_id) = edit_origin
@@ -2784,6 +2811,40 @@ impl Transcript {
                             complete: true,
                         });
                     }
+                }
+            }
+            SessionEventKind::TeamBroadcastUpdated {
+                message_id,
+                text,
+                recipient_ids,
+                acknowledged,
+            } => {
+                let total = recipient_ids.len();
+                let detail = format!("sent · {acknowledged}/{total} acknowledged");
+                let state = if usize::try_from(*acknowledged).unwrap_or(usize::MAX) >= total {
+                    TranscriptActionState::Complete
+                } else {
+                    TranscriptActionState::Waiting
+                };
+                if let Some(index) = self.team_broadcast_entries.get(message_id).copied() {
+                    if let Some(TranscriptEntry::Action { detail: row_detail, state: row_state, .. }) =
+                        self.order.get_mut(index)
+                    {
+                        *row_detail = detail;
+                        *row_state = state;
+                    }
+                } else {
+                    let index = self.order.len();
+                    self.order.push(TranscriptEntry::Action {
+                        kind: TranscriptActionKind::Agent,
+                        label: "Team".to_string(),
+                        detail,
+                        body: Some(text.clone()),
+                        time: local_event_time(event),
+                        state,
+                        expanded: true,
+                    });
+                    self.team_broadcast_entries.insert(*message_id, index);
                 }
             }
             SessionEventKind::AgentMessageReceived {
@@ -2977,6 +3038,7 @@ impl Transcript {
             .values_mut()
             .chain(self.tools.values_mut())
             .chain(self.subagent_entries.values_mut())
+            .chain(self.team_broadcast_entries.values_mut())
         {
             if *stored_index > index {
                 *stored_index -= 1;
@@ -3135,6 +3197,7 @@ impl Transcript {
             .chain(self.tools.values_mut())
             .chain(self.command_edit_rows.values_mut())
             .chain(self.subagent_entries.values_mut())
+            .chain(self.team_broadcast_entries.values_mut())
         {
             if *stored_index >= index {
                 *stored_index += 1;
@@ -5505,7 +5568,7 @@ impl Transcript {
                         Span::styled(
                             "▌ Plan",
                             Style::default()
-                                .fg(Color::Yellow)
+                                .fg(TODO_ORANGE)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
@@ -5530,10 +5593,10 @@ impl Transcript {
                             PlanItemStatus::InProgress => (
                                 "●",
                                 Style::default()
-                                    .fg(Color::LightGreen)
+                                    .fg(TODO_ORANGE)
                                     .add_modifier(Modifier::BOLD),
                                 Style::default()
-                                    .fg(Color::LightGreen)
+                                    .fg(TODO_ORANGE)
                                     .add_modifier(Modifier::BOLD),
                             ),
                             PlanItemStatus::Pending => (
@@ -5592,7 +5655,7 @@ impl Transcript {
                         Span::styled(
                             "▌ Goal",
                             Style::default()
-                                .fg(Color::Yellow)
+                                .fg(GOAL_WATCH_PURPLE)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(

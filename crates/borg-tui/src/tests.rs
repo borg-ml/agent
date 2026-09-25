@@ -1747,25 +1747,30 @@ fn team_roster_hit_testing_selects_each_exact_agent_row() {
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
     let hit_areas = [
-        (Rect::new(4, 10, 40, 1), None),
-        (Rect::new(4, 11, 40, 1), Some(first)),
-        (Rect::new(4, 12, 40, 1), Some(second)),
+        (Rect::new(4, 10, 40, 1), TeamRosterTarget::Director),
+        (Rect::new(4, 11, 40, 1), TeamRosterTarget::Child(first)),
+        (Rect::new(4, 12, 40, 1), TeamRosterTarget::Inactive),
+        (Rect::new(4, 13, 40, 1), TeamRosterTarget::Child(second)),
     ];
 
     assert_eq!(
         team_roster_target_at(&hit_areas, Position::new(8, 10)),
-        Some((0, None))
+        Some((0, TeamRosterTarget::Director))
     );
     assert_eq!(
         team_roster_target_at(&hit_areas, Position::new(8, 11)),
-        Some((1, Some(first)))
+        Some((1, TeamRosterTarget::Child(first)))
     );
     assert_eq!(
         team_roster_target_at(&hit_areas, Position::new(8, 12)),
-        Some((2, Some(second)))
+        Some((2, TeamRosterTarget::Inactive))
     );
     assert_eq!(
         team_roster_target_at(&hit_areas, Position::new(8, 13)),
+        Some((3, TeamRosterTarget::Child(second)))
+    );
+    assert_eq!(
+        team_roster_target_at(&hit_areas, Position::new(8, 14)),
         None
     );
 }
@@ -5561,8 +5566,8 @@ fn composer_wraps_every_line_after_the_prompt_marker() {
 
     let mut composer = Composer::default();
     composer.insert("abcdef");
-    let rendered = composer.styled_lines(3, " > ");
-    assert_eq!(rendered[0].to_string(), " > abc");
+    let rendered = composer.styled_lines(3, " › ");
+    assert_eq!(rendered[0].to_string(), " › abc");
     assert_eq!(rendered[1].to_string(), "   def");
 }
 
@@ -5634,7 +5639,7 @@ fn composer_expands_numbered_pasted_text_tokens_on_submit() {
     composer.insert(" after");
 
     assert_eq!(composer.text, "before [Pasted Text 1] after");
-    let rendered = composer.styled_lines(80, " > ");
+    let rendered = composer.styled_lines(80, " › ");
     assert!(
         rendered[0]
             .spans
@@ -6333,7 +6338,7 @@ fn footer_todo_metadata_keeps_the_todo_segment_interactive() {
     let line = footer_todo_metadata_line("2 to-dos", "~/borg-cli · git:main", false, usize::MAX);
 
     assert_eq!(line.spans[0].content, "2 to-dos");
-    assert_eq!(line.spans[0].style.fg, Some(Color::LightGreen));
+    assert_eq!(line.spans[0].style.fg, Some(TODO_ORANGE));
     assert_eq!(line.spans[1].content, STATUS_SEPARATOR);
     assert_eq!(line.spans[2].content, "~/borg-cli · git:main ");
     assert_eq!(line.spans[2].style.fg, Some(Color::Gray));
@@ -6460,7 +6465,7 @@ fn footer_shell_metadata_uses_the_blue_background_action_identity() {
     assert_eq!(line.spans[0].content, "1 shell");
     assert_eq!(line.spans[0].style.fg, Some(USER_LABEL_BLUE));
     assert_eq!(line.spans[1].content, STATUS_SEPARATOR);
-    assert_eq!(line.spans[2].style.fg, Some(Color::LightGreen));
+    assert_eq!(line.spans[2].style.fg, Some(TODO_ORANGE));
     assert_eq!(shell_row_style(false).fg, Some(USER_LABEL_BLUE));
 
     let hovered = footer_shell_todo_metadata_line(
@@ -7593,7 +7598,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
         },
     ];
 
-    let rows = team_roster_table_lines(&entries, 90, None, None, UiLanguage::English)
+    let rows = team_roster_table_lines(&entries, 90, None, None, None, UiLanguage::English)
         .into_iter()
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
@@ -7608,7 +7613,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
     assert!(rows[1].contains("~$133.11 (sub eq.)"));
     assert!(rows.iter().all(|row| row.width() <= 90));
 
-    let narrow = team_roster_table_lines(&entries, 28, None, None, UiLanguage::English)
+    let narrow = team_roster_table_lines(&entries, 28, None, None, None, UiLanguage::English)
         .into_iter()
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
@@ -7885,6 +7890,19 @@ fn agent_roster_lists_working_children_then_resumable_stopped_ones() {
     assert_eq!(rows[5].name, "oldest");
     assert_eq!(rows[5].state, "failed · click to resume");
     assert!(!rows.iter().any(|row| row.name == "idle"));
+
+    let (collapsed, header) = visible_team_roster(&rows, false);
+    assert_eq!(header, Some(4));
+    assert_eq!(collapsed.len(), 5);
+    assert_eq!(collapsed[4].name, "▸ Inactive · 2");
+    assert!(collapsed.iter().all(|row| row.name != "older"));
+    let (expanded, header) = visible_team_roster(&rows, true);
+    assert_eq!(header, Some(4));
+    assert_eq!(expanded.len(), 7);
+    assert_eq!(expanded[4].name, "▾ Inactive · 2");
+    assert_eq!(expanded[5].child_id, rows[4].child_id);
+    assert_eq!(expanded[6].child_id, rows[5].child_id);
+    assert_eq!(visible_team_roster(&rows[..4], false).1, None);
 }
 
 #[test]
@@ -12298,11 +12316,7 @@ fn peer_reports_and_errors_keep_one_continuous_neutral_actions_gutter() {
     assert_eq!(
         lines
             .iter()
-            .filter(|line| {
-                line.spans
-                    .first()
-                    .is_some_and(|span| span.content == TOOL_WINDOW_HEADER_INDENT)
-            })
+            .filter(|line| { is_open_action_group_header(line) })
             .count(),
         1
     );
@@ -12844,7 +12858,7 @@ fn agent_lifecycle_rows_keep_one_continuous_actions_accordion() {
         .collect::<Vec<_>>()
         .join("\n");
     assert_eq!(rendered.matches(" actions").count(), 1);
-    assert!(rendered.contains("    19:38 · 11 actions"), "{rendered}");
+    assert!(rendered.contains("  19:38 · 11 actions"), "{rendered}");
     assert!(
         rendered.contains("\n  19:38  agent · /root/v391_scaling_audit · started"),
         "{rendered}"
@@ -14259,7 +14273,7 @@ fn selecting_a_markdown_quote_excludes_its_visual_gutter() {
 fn composer_selection_highlights_text_without_the_prompt_marker() {
     let value = "hello\nworld";
     let ranges = display_ranges(value, 40, true);
-    let mut lines = styled_plain_composer_lines(value, &ranges, " > ");
+    let mut lines = styled_plain_composer_lines(value, &ranges, " › ");
 
     apply_composer_selection(&mut lines, value, &ranges, 3, 1, 8);
 
@@ -14799,12 +14813,7 @@ fn mixed_actions_window_selection_ranges_match_the_visible_rows() {
         .expect("agent activity is visible");
     let activity_anchor = selection_point_for_row_in_lines(&render.6, &render.0, activity_row, 16);
     for (row, line) in render.0.iter().enumerate() {
-        if line
-            .spans
-            .first()
-            .is_some_and(|span| span.content == TOOL_WINDOW_HEADER_INDENT)
-            || line.to_string().trim().is_empty()
-        {
+        if is_open_action_group_header(line) || line.to_string().trim().is_empty() {
             continue;
         }
         let point = selection_point_for_row_in_lines(&render.6, &render.0, row, 8);
@@ -15105,8 +15114,8 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
         .lines(120)
         .into_iter()
         .flat_map(|line| line.spans)
-        .find(|span| span.content == "Running…")
-        .expect("running lifecycle verb");
+        .find(|span| span.content == "Waiting")
+        .expect("waiting poll lifecycle verb");
     assert_eq!(running_verb.style.fg, Some(BACKGROUND_RUNNING_TEXT));
 
     transcript.apply(&SessionEvent::new(
@@ -16940,4 +16949,61 @@ fn resumed_opus_and_fable_history_keeps_effort_switches_warm() {
         apply(&mut transcript, configured("xhigh"));
         assert_eq!(transcript.cache_status(Utc::now()), None, "{model:?}");
     }
+}
+
+#[test]
+fn team_broadcast_timeline_updates_one_durable_row_across_replay_and_insertion() {
+    let session = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let recipient_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
+    let update = |sequence, acknowledged| {
+        SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::TeamBroadcastUpdated {
+                message_id,
+                text: "Please report status".into(),
+                recipient_ids: recipient_ids.clone(),
+                acknowledged,
+            },
+        )
+    };
+    let message = |sequence, actor, text: &str| {
+        SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        )
+    };
+    let mut transcript = Transcript::default();
+    transcript.apply(&message(1, EventActor::User, "First prompt"));
+    transcript.apply(&message(2, EventActor::Assistant, "First reply"));
+    transcript.apply(&update(3, 0));
+    assert!(matches!(&transcript.order[2], TranscriptEntry::Action {
+        label, detail, state: TranscriptActionState::Waiting, body: Some(body), ..
+    } if label == "Team" && detail == "sent · 0/2 acknowledged" && body == "Please report status"));
+    // A late user prompt is inserted ahead of the assistant and team rows.
+    transcript.apply(&message(4, EventActor::User, "Second prompt"));
+    assert_eq!(transcript.team_broadcast_entries[&message_id], 3);
+    transcript.apply(&update(5, 1));
+    transcript.apply(&update(6, 2));
+    assert_eq!(transcript.order.len(), 4);
+    assert!(matches!(&transcript.order[3], TranscriptEntry::Action {
+        detail, state: TranscriptActionState::Complete, ..
+    } if detail == "sent · 2/2 acknowledged"));
+    let mut replay = Transcript::default();
+    for n in 1..=3 {
+        replay.apply_history(&update(n, (n - 1) as u32));
+    }
+    assert_eq!(replay.order.len(), 1);
+    assert!(matches!(&replay.order[0], TranscriptEntry::Action {
+        detail, state: TranscriptActionState::Complete, ..
+    } if detail == "sent · 2/2 acknowledged"));
 }

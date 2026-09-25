@@ -477,7 +477,10 @@ impl SessionEventKind {
     }
 
     pub fn is_subagent_relevant(&self) -> bool {
-        matches!(self, Self::SubagentActivity { .. })
+        matches!(
+            self,
+            Self::SubagentActivity { .. } | Self::TeamBroadcastUpdated { .. }
+        )
     }
 
     /// Whether this event should advance the session's user-visible activity

@@ -43,8 +43,8 @@ use borg_remote::{
 use borg_remote::{tool_call_summary, tool_code_view};
 use borg_ui::localization::{UiLanguage, text as ui_text};
 use borg_ui::preferences::{
-    CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy, ResponseStreaming,
-    ToolClickBehavior, TranscriptPreferences, parse_hex_color,
+    CompletionAlertPolicy, ComposerCursorStyle, DictationIconStyle, DiffExpansionPolicy,
+    ResponseStreaming, ToolClickBehavior, TranscriptPreferences, parse_hex_color,
 };
 use borg_ui::timeline::tool_lifecycle_label;
 use chrono::{DateTime, Local, NaiveDate, Utc};
@@ -89,6 +89,8 @@ const BORG_ORANGE: Color = Color::Rgb(255, 142, 36);
 const BORG_ORANGE_HOVER: Color = Color::Rgb(255, 184, 92);
 const RUNNING_STATUS_PEACH: Color = Color::Rgb(255, 132, 112);
 const SUBAGENT_PINK: Color = Color::Rgb(255, 105, 180);
+const GOAL_WATCH_PURPLE: Color = Color::Rgb(213, 126, 177);
+const TODO_ORANGE: Color = Color::Rgb(255, 177, 76);
 const USER_LABEL_BLUE: Color = Color::Rgb(74, 163, 255);
 const USER_TEXT: Color = Color::Rgb(198, 228, 255);
 const BACKGROUND_RUNNING_TEXT: Color = Color::Rgb(142, 199, 255);
@@ -883,6 +885,7 @@ pub enum UiAction {
     SetActionDescriptors(bool),
     SetWrapActionRows(bool),
     SetRunningSweeps(bool),
+    SetComposerCursorStyle(ComposerCursorStyle),
     SetCompletionNotifications(CompletionAlertPolicy),
     SetCompletionSound(CompletionAlertPolicy),
     SetAutoCopySelection(bool),
@@ -1571,7 +1574,8 @@ pub struct BorgTerminal {
     tool_return_follow_tail: bool,
     sidecar_focus_request: Option<String>,
     team_switcher_open: bool,
-    team_roster_hit_areas: Vec<(Rect, Option<Uuid>)>,
+    inactive_team_expanded: bool,
+    team_roster_hit_areas: Vec<(Rect, TeamRosterTarget)>,
     hovered_team_roster: Option<usize>,
     back_to_director_area: Option<Rect>,
     back_to_director_hovered: bool,
@@ -1632,6 +1636,7 @@ pub struct BorgTerminal {
     dictation_state: DictationState,
     dictation_icon: DictationIconStyle,
     running_sweeps: bool,
+    composer_cursor_style: ComposerCursorStyle,
     action_descriptors: bool,
     tool_click_behavior: ToolClickBehavior,
     response_streaming: ResponseStreaming,
@@ -1914,6 +1919,7 @@ enum PickerKind {
     ActionDescriptors,
     WrapActionRows,
     RunningSweeps,
+    ComposerCursorStyle,
     CompletionNotifications,
     CompletionSound,
     AutoCopySelection,
@@ -2748,7 +2754,7 @@ impl BorgTerminal {
             stdout,
             EnableMouseCapture,
             EnableFocusChange,
-            SetCursorStyle::BlinkingBar
+            SetCursorStyle::BlinkingUnderScore
         ) {
             let _ = execute!(stdout, DisableBracketedPaste);
             if mode == ScreenMode::Alternate {
@@ -2818,6 +2824,7 @@ impl BorgTerminal {
             tool_return_follow_tail: true,
             sidecar_focus_request: None,
             team_switcher_open: false,
+            inactive_team_expanded: false,
             team_roster_hit_areas: Vec::new(),
             hovered_team_roster: None,
             back_to_director_area: None,
@@ -2873,6 +2880,7 @@ impl BorgTerminal {
             dictation_state: DictationState::Idle,
             dictation_icon: dictation_icon_style_for_preference(None),
             running_sweeps: true,
+            composer_cursor_style: ComposerCursorStyle::Underline,
             action_descriptors: true,
             tool_click_behavior: ToolClickBehavior::Fullscreen,
             response_streaming: ResponseStreaming::Paragraph,
@@ -4857,6 +4865,7 @@ impl BorgTerminal {
             "Response streaming".to_string(),
             "Action descriptors".to_string(),
             "Running sweep animations".to_string(),
+            "Composer cursor".to_string(),
             "Wrap action rows".to_string(),
             "Completion notifications".to_string(),
             "Completion sound".to_string(),
@@ -4885,6 +4894,7 @@ impl BorgTerminal {
             "/streaming",
             "/action-descriptors",
             "/animations",
+            "cursor-style",
             "/wrap-actions",
             "/notifications",
             "/sound",
@@ -5274,6 +5284,29 @@ impl BorgTerminal {
             self.transcript.wrap_action_rows = enabled;
             self.invalidate_transcript_render_cache();
         }
+    }
+
+    pub fn open_composer_cursor_style_picker(&mut self) {
+        self.picker = Some(Picker::new(
+            PickerKind::ComposerCursorStyle,
+            "Composer cursor",
+            ["Underline", "Bar", "Block"],
+            Some(match self.composer_cursor_style {
+                ComposerCursorStyle::Underline => "Underline",
+                ComposerCursorStyle::Bar => "Bar",
+                ComposerCursorStyle::Block => "Block",
+            }),
+        ));
+    }
+
+    pub fn set_composer_cursor_style(&mut self, style: ComposerCursorStyle) {
+        self.composer_cursor_style = style;
+        let terminal_style = match style {
+            ComposerCursorStyle::Underline => SetCursorStyle::BlinkingUnderScore,
+            ComposerCursorStyle::Bar => SetCursorStyle::BlinkingBar,
+            ComposerCursorStyle::Block => SetCursorStyle::BlinkingBlock,
+        };
+        let _ = execute!(io::stdout(), terminal_style);
     }
 
     pub fn open_running_sweeps_picker(&mut self) {
@@ -5833,13 +5866,17 @@ impl BorgTerminal {
                     }
                     if self.picker.is_none()
                         && !self.keybindings_open
-                        && let Some((_, child_id)) =
+                        && let Some((_, target)) =
                             team_roster_target_at(&self.team_roster_hit_areas, pointer)
                     {
-                        if let Some(child_id) = child_id {
-                            self.focus_child_transcript(child_id);
-                        } else {
-                            self.focus_director_transcript();
+                        match target {
+                            TeamRosterTarget::Child(child_id) => {
+                                self.focus_child_transcript(child_id)
+                            }
+                            TeamRosterTarget::Director => self.focus_director_transcript(),
+                            TeamRosterTarget::Inactive => {
+                                self.inactive_team_expanded = !self.inactive_team_expanded;
+                            }
                         }
                         return Ok(UiAction::None);
                     }
@@ -5879,6 +5916,9 @@ impl BorgTerminal {
                             .is_some_and(|area| area.contains(pointer))
                         {
                             self.team_switcher_open = !self.team_switcher_open;
+                            if !self.team_switcher_open {
+                                self.inactive_team_expanded = false;
+                            }
                             return Ok(UiAction::None);
                         }
                         if self
@@ -5991,6 +6031,7 @@ impl BorgTerminal {
                     }
                     if self.team_switcher_open {
                         self.team_switcher_open = false;
+                        self.inactive_team_expanded = false;
                         self.hovered_team_roster = None;
                     }
                 }
@@ -7065,6 +7106,10 @@ impl BorgTerminal {
                 self.open_luna_titles_for_all_providers_picker();
                 UiAction::None
             }
+            PickerKind::Settings if picker.options[picker.selected].value == "cursor-style" => {
+                self.open_composer_cursor_style_picker();
+                UiAction::None
+            }
             PickerKind::Settings if picker.options[picker.selected].value == "auto-copy" => {
                 self.open_auto_copy_selection_picker();
                 UiAction::None
@@ -7190,6 +7235,13 @@ impl BorgTerminal {
             }
             PickerKind::RunningSweeps => {
                 UiAction::SetRunningSweeps(picker.selected_value() == "On")
+            }
+            PickerKind::ComposerCursorStyle => {
+                UiAction::SetComposerCursorStyle(match picker.selected_value().as_str() {
+                    "Bar" => ComposerCursorStyle::Bar,
+                    "Block" => ComposerCursorStyle::Block,
+                    _ => ComposerCursorStyle::Underline,
+                })
             }
             PickerKind::CompletionNotifications => UiAction::SetCompletionNotifications(
                 completion_alert_policy_from_picker(&picker.selected_value()),
@@ -7768,7 +7820,7 @@ impl BorgTerminal {
         let prompt_marker = if pending_approval || pending_provider_interaction {
             " ! "
         } else {
-            " > "
+            " › "
         };
         let ui_language = self.ui_language;
         let mut composer_render_lines = if self.picker.as_ref().is_some_and(|_| !modal_picker_open)
@@ -8787,7 +8839,7 @@ impl BorgTerminal {
                         .fg(if highlight {
                             Color::White
                         } else {
-                            Color::Yellow
+                            GOAL_WATCH_PURPLE
                         })
                         .add_modifier(if highlight {
                             Modifier::BOLD | Modifier::UNDERLINED
@@ -8945,10 +8997,12 @@ impl BorgTerminal {
                 || self.hovered_team_roster.is_some())
                 && total_subagents > 0
             {
-                let tooltip_width = team_roster_table_width(&agent_roster_entries)
+                let (visible_roster, inactive_header_index) =
+                    visible_team_roster(&agent_roster_entries, self.inactive_team_expanded);
+                let tooltip_width = team_roster_table_width(&visible_roster)
                     .saturating_add(2)
                     .clamp(30, status_area.width.min(96));
-                let tooltip_height = (agent_roster_entries.len() as u16)
+                let tooltip_height = (visible_roster.len() as u16)
                     .saturating_add(3)
                     .min(status_area.y.saturating_sub(area.y).max(1));
                 let tooltip = Rect {
@@ -8962,10 +9016,11 @@ impl BorgTerminal {
                 };
                 frame.render_widget(Clear, tooltip);
                 let roster_lines = team_roster_table_lines(
-                    &agent_roster_entries,
+                    &visible_roster,
                     tooltip.width.saturating_sub(2) as usize,
                     self.focused_child,
                     self.hovered_team_roster,
+                    inactive_header_index,
                     ui_language,
                 );
                 frame.render_widget(
@@ -8984,7 +9039,14 @@ impl BorgTerminal {
                         ),
                     tooltip,
                 );
-                for (index, entry) in agent_roster_entries.iter().enumerate() {
+                for (index, entry) in visible_roster.iter().enumerate() {
+                    let target = if inactive_header_index == Some(index) {
+                        TeamRosterTarget::Inactive
+                    } else if let Some(child_id) = entry.child_id {
+                        TeamRosterTarget::Child(child_id)
+                    } else {
+                        TeamRosterTarget::Director
+                    };
                     next_team_roster_hit_areas.push((
                         Rect {
                             x: tooltip.x.saturating_add(1),
@@ -8992,7 +9054,7 @@ impl BorgTerminal {
                             width: tooltip.width.saturating_sub(2),
                             height: 1,
                         },
-                        entry.child_id,
+                        target,
                     ));
                 }
             }
@@ -9098,7 +9160,7 @@ impl BorgTerminal {
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
-                                .border_style(Style::default().fg(Color::Yellow))
+                                .border_style(Style::default().fg(GOAL_WATCH_PURPLE))
                                 .title(goal_tooltip_title(goal)),
                         ),
                     tooltip,
@@ -9258,8 +9320,10 @@ impl BorgTerminal {
                     .iter()
                     .enumerate()
                     .map(|(index, (row, _))| {
-                        Line::from(format!("  {row}"))
-                            .style(shell_row_style(self.hovered_watch_row == Some(index)))
+                        Line::from(format!("  {row}")).style(palette_row_style(
+                            self.hovered_watch_row == Some(index),
+                            GOAL_WATCH_PURPLE,
+                        ))
                     })
                     .collect::<Vec<_>>();
                 frame.render_widget(
@@ -9268,7 +9332,7 @@ impl BorgTerminal {
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
-                                .border_style(Style::default().fg(Color::Yellow))
+                                .border_style(Style::default().fg(GOAL_WATCH_PURPLE))
                                 .title(" Watchers · click to stop "),
                         ),
                     tooltip,
@@ -9330,7 +9394,7 @@ impl BorgTerminal {
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::LightGreen))
+                            .border_style(Style::default().fg(TODO_ORANGE))
                             .title(" Plan "),
                     ),
                     tooltip,
@@ -11178,6 +11242,7 @@ fn team_roster_table_lines(
     width: usize,
     focused_child: Option<Uuid>,
     hovered_row: Option<usize>,
+    inactive_header_index: Option<usize>,
     language: UiLanguage,
 ) -> Vec<Line<'static>> {
     let columns = team_roster_table_columns(entries, width);
@@ -11198,6 +11263,10 @@ fn team_roster_table_lines(
             .add_modifier(Modifier::BOLD),
     )))
     .chain(entries.iter().enumerate().map(|(index, entry)| {
+        if inactive_header_index == Some(index) {
+            return Line::from(format!("  {}", entry.name))
+                .style(team_roster_row_style(false, hovered_row == Some(index)));
+        }
         let focused = entry.child_id == focused_child;
         let row = roster_table_row(
             if focused { "› " } else { "  " },
@@ -11314,14 +11383,52 @@ fn team_roster_row_style(focused: bool, hovered: bool) -> Style {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TeamRosterTarget {
+    Director,
+    Child(Uuid),
+    Inactive,
+}
+
+fn visible_team_roster(
+    entries: &[AgentRosterEntry],
+    inactive_expanded: bool,
+) -> (Vec<AgentRosterEntry>, Option<usize>) {
+    let inactive_start = entries.iter().position(|entry| {
+        entry.child_id.is_some()
+            && (entry.state.starts_with("stopped") || entry.state.starts_with("failed"))
+    });
+    let Some(inactive_start) = inactive_start else {
+        return (entries.to_vec(), None);
+    };
+    let count = entries.len() - inactive_start;
+    let mut visible = entries[..inactive_start].to_vec();
+    let header_index = visible.len();
+    visible.push(AgentRosterEntry {
+        name: format!(
+            "{} Inactive · {count}",
+            if inactive_expanded { "▾" } else { "▸" }
+        ),
+        model: String::new(),
+        effort: String::new(),
+        state: String::new(),
+        usage: String::new(),
+        child_id: None,
+    });
+    if inactive_expanded {
+        visible.extend_from_slice(&entries[inactive_start..]);
+    }
+    (visible, Some(header_index))
+}
+
 fn team_roster_target_at(
-    hit_areas: &[(Rect, Option<Uuid>)],
+    hit_areas: &[(Rect, TeamRosterTarget)],
     pointer: Position,
-) -> Option<(usize, Option<Uuid>)> {
+) -> Option<(usize, TeamRosterTarget)> {
     hit_areas
         .iter()
         .enumerate()
-        .find_map(|(index, (area, child_id))| area.contains(pointer).then_some((index, *child_id)))
+        .find_map(|(index, (area, target))| area.contains(pointer).then_some((index, *target)))
 }
 
 #[derive(Default)]
@@ -12306,6 +12413,7 @@ fn transcript_action_color(kind: TranscriptActionKind, state: TranscriptActionSt
     }
     match kind {
         TranscriptActionKind::Agent => SUBAGENT_PINK,
+        TranscriptActionKind::Watch => GOAL_WATCH_PURPLE,
         TranscriptActionKind::Approval | TranscriptActionKind::ProviderInteraction => Color::Yellow,
         TranscriptActionKind::Error => Color::LightRed,
     }
@@ -12369,6 +12477,7 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
             event,
         } => subagent_activity_summary(*activity, agent, event.as_deref()).is_some(),
         SessionEventKind::AgentMessageReceived { .. }
+        | SessionEventKind::TeamBroadcastUpdated { .. }
         | SessionEventKind::Message { .. }
         | SessionEventKind::MessageDelta { .. }
         | SessionEventKind::ReasoningDelta { .. }
@@ -13599,14 +13708,22 @@ fn selection_content_columns(line: &Line<'static>) -> usize {
     content_end
 }
 
+// The open group header now shares the two-space indent with action rows.
+// Its two grey spans (indent + summary) distinguish chrome from selectable work.
+fn is_open_action_group_header(line: &Line<'_>) -> bool {
+    line.spans.len() == 2
+        && line.spans[0].content == TOOL_WINDOW_HEADER_INDENT
+        && line.spans[0].style.fg == Some(Color::DarkGray)
+        && line.spans[1].style.fg == Some(Color::DarkGray)
+        && line.spans[1].content.contains(" action")
+}
+
 fn selection_line_ranges(line: &Line<'static>) -> Vec<(usize, usize)> {
     let width = line.width();
     if width == 0 || line.spans.iter().all(|span| span.content.trim().is_empty()) {
         return Vec::new();
     }
-    if line.spans.first().is_some_and(|span| {
-        span.content == TOOL_WINDOW_HEADER_INDENT && span.style.fg == Some(Color::DarkGray)
-    }) {
+    if is_open_action_group_header(line) {
         return Vec::new();
     }
     let rendered = line.to_string();
@@ -15154,11 +15271,7 @@ fn footer_todo_metadata_line(
 ) -> Line<'static> {
     let metadata = footer_metadata_text(todo_status, cwd_status, max_width);
     let todo_style = Style::default()
-        .fg(if hovered {
-            Color::White
-        } else {
-            Color::LightGreen
-        })
+        .fg(if hovered { Color::White } else { TODO_ORANGE })
         .add_modifier(if hovered {
             Modifier::BOLD | Modifier::UNDERLINED
         } else {
@@ -15207,8 +15320,8 @@ fn footer_shell_todo_metadata_line(
     let parts = [
         billing_status.map(|billing| (billing, Style::default().fg(billing_status_color(billing)))),
         shell_status.map(|shell| (shell, interactive_style(shell_hovered, USER_LABEL_BLUE))),
-        watch_status.map(|watch| (watch, interactive_style(watch_hovered, Color::Yellow))),
-        todo_status.map(|todo| (todo, interactive_style(todo_hovered, Color::LightGreen))),
+        watch_status.map(|watch| (watch, interactive_style(watch_hovered, GOAL_WATCH_PURPLE))),
+        todo_status.map(|todo| (todo, interactive_style(todo_hovered, TODO_ORANGE))),
     ];
     let mut spans = Vec::new();
     for (text, style) in parts.into_iter().flatten() {
@@ -15228,12 +15341,12 @@ fn footer_shell_todo_metadata_line(
 }
 
 fn shell_row_style(hovered: bool) -> Style {
+    palette_row_style(hovered, USER_LABEL_BLUE)
+}
+
+fn palette_row_style(hovered: bool, accent: Color) -> Style {
     Style::default()
-        .fg(if hovered {
-            Color::White
-        } else {
-            USER_LABEL_BLUE
-        })
+        .fg(if hovered { Color::White } else { accent })
         .bg(if hovered {
             MESSAGE_HOVER_BG
         } else {
