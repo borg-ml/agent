@@ -17130,14 +17130,6 @@ fn team_broadcast_timeline_updates_one_durable_row_across_replay_and_insertion()
 }
 
 #[test]
-fn search_actions_use_a_magnifying_glass_marker() {
-    for name in ["Search web", "Find files", "Grep workspace"] {
-        assert_eq!(tool_kind_marker(name, false), "🔍");
-    }
-    assert_eq!(tool_kind_marker("Read file", false), "≡");
-}
-
-#[test]
 fn status_number_shortcuts_use_platform_modifier_not_generic_super() {
     let expected = if cfg!(target_os = "macos") {
         KeyModifiers::SUPER

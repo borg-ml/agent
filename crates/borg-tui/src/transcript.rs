@@ -800,7 +800,7 @@ fn tool_kind_marker(name: &str, is_reasoning: bool) -> &'static str {
     }
     match name.split(' ').next().unwrap_or(name) {
         "Read" | "List" | "View" | "Open" | "Inspect" => "≡",
-        "Search" | "Find" | "Grep" => "🔍",
+        "Search" | "Find" | "Grep" => "⌕",
         "Write" | "Edit" | "Update" | "Create" | "Delete" | "Apply" | "Rename" | "Move" => "◈",
         "Run" | "Wait" | "Send" | "Stop" | "Build" | "Test" => "›",
         _ => "✓",
