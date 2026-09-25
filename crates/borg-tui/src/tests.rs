@@ -2526,7 +2526,7 @@ fn tool_hover_hint_names_the_copy_target() {
     });
     assert_eq!(
         transcript.tool_copy_hint(0),
-        Some("left click inspect · right click copy output")
+        Some("click inspect · right-click copy output")
     );
 
     if let Some(TranscriptEntry::Tool {
@@ -2540,7 +2540,7 @@ fn tool_hover_hint_names_the_copy_target() {
     }
     assert_eq!(
         transcript.tool_copy_hint(0),
-        Some("left click inspect · right click copy diff")
+        Some("click inspect · right-click copy diff")
     );
 }
 
@@ -7810,23 +7810,23 @@ fn actionable_status_segments_show_bottom_interaction_hints() {
 
     assert_eq!(
         hint(false, true, false, false, false),
-        Some("left click to open subagents menu")
+        Some("click to open subagents menu")
     );
     assert_eq!(
         hint(false, false, true, false, false),
-        Some("left click change model")
+        Some("click change model")
     );
     assert_eq!(
         hint(false, false, false, true, false),
-        Some("left click change effort")
+        Some("click change effort")
     );
     assert_eq!(
         hint(false, false, false, false, true),
-        Some("left click change permissions")
+        Some("click change permissions")
     );
     assert_eq!(
         hint(true, false, false, false, false),
-        Some("left click to open shells menu")
+        Some("click to open shells menu")
     );
     assert_eq!(hint(false, false, false, false, false), None);
 }
@@ -8540,11 +8540,11 @@ fn message_hover_shows_copy_hint_for_user_and_assistant() {
 
     assert_eq!(
         message_interaction_hint(&entries, Some(0)),
-        Some("left click copy message")
+        Some("click copy message")
     );
     assert_eq!(
         message_interaction_hint(&entries, Some(1)),
-        Some("left click copy message")
+        Some("click copy message")
     );
     assert_eq!(message_interaction_hint(&entries, Some(2)), None);
 }
