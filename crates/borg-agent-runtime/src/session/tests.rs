@@ -2013,6 +2013,8 @@ struct HoldingSteerExecutor {
     turn_started: Arc<Notify>,
     steer_seen: Arc<Notify>,
     native: bool,
+    /// Stream model output before holding, so the turn has acted on its prompt.
+    emit_output: bool,
 }
 
 struct CommittingSteerExecutor {
@@ -2351,13 +2353,21 @@ impl AgentTurnExecutor for HoldingSteerExecutor {
     async fn execute(
         &self,
         turn: AgentTurn,
-        _events: mpsc::Sender<SessionEventKind>,
+        events: mpsc::Sender<SessionEventKind>,
         controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
         self.turns
             .lock()
             .unwrap()
             .push((turn.prompt.clone(), turn.attachments));
+        if self.emit_output {
+            let _ = events
+                .send(SessionEventKind::MessageDelta {
+                    message_id: Uuid::new_v4(),
+                    delta: "working on it".to_string(),
+                })
+                .await;
+        }
         self.turn_started.notify_one();
         // A native turn carries the raw prompt; a subscription turn frames it.
         if subscription_prompt_ends_with(&turn.prompt, "first")
@@ -6935,6 +6945,7 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
         turn_started: Arc::clone(&turn_started),
         steer_seen: Arc::clone(&steer_seen),
         native: false,
+        emit_output: false,
     });
     let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
@@ -7080,6 +7091,7 @@ async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
             turn_started: Arc::clone(&turn_started),
             steer_seen: Arc::clone(&steer_seen),
             native,
+            emit_output: false,
         });
         let actor_store = Arc::clone(&store);
         let actor = tokio::spawn(async move {
@@ -19592,4 +19604,119 @@ async fn resume_from_interrupt_lets_the_parents_follow_up_start_a_turn() {
         .unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(30), actor).await;
     scratch.discard().await;
+}
+
+#[tokio::test]
+async fn escape_keeps_a_prompt_the_model_already_acted_on_delivered() {
+    // Escape ending a long turn must not re-mark its opening prompt failed once
+    // the model has acted on it: that resurfaced hours-old delivered messages
+    // as if they had never been sent. Before any output, failed still means
+    // the prompt can be sent again.
+    for (emit_output, expected) in [
+        (true, MessageStatus::Complete),
+        (false, MessageStatus::Failed),
+    ] {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.lock");
+        let session_id = Uuid::new_v4();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        store.create_session(session_id).await.unwrap();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let turn_started = Arc::new(Notify::new());
+        let executor = Arc::new(HoldingSteerExecutor {
+            turns: Arc::new(Mutex::new(Vec::new())),
+            turn_started: Arc::clone(&turn_started),
+            steer_seen: Arc::new(Notify::new()),
+            native: true,
+            emit_output,
+        });
+        let actor_store = Arc::clone(&store);
+        let actor = tokio::spawn(async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd: root.path().to_path_buf(),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                actor_store,
+            )
+            .await
+        });
+        let prompt_id = Uuid::new_v4();
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: prompt_id,
+                text: "first".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), turn_started.notified())
+            .await
+            .expect("turn starts");
+        if emit_output {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(event) = event_rx.recv().await {
+                    if matches!(event.kind, SessionEventKind::MessageDelta { .. }) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("model output is recorded before Escape");
+        }
+        command_tx
+            .send(HostCommand::Interrupt { session_id })
+            .await
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut status = None;
+            while let Some(event) = event_rx.recv().await {
+                match event.kind {
+                    SessionEventKind::Message {
+                        message_id,
+                        status: next,
+                        ..
+                    } if message_id == prompt_id => status = Some(next),
+                    SessionEventKind::TurnCompleted { message_id, .. }
+                        if message_id == prompt_id =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            status
+        })
+        .await
+        .expect("interrupted turn completes");
+        assert_eq!(status, Some(expected), "emit_output={emit_output}");
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(10), actor).await;
+        scratch.discard().await;
+    }
 }

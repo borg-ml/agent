@@ -5035,7 +5035,11 @@ async fn run_agent_session_store_kernel_inner(
                                         actor: entry.actor,
                                         text: entry.text,
                                         attachments: entry.attachments,
-                                        status: if interrupted {
+                                        // A prompt the model already acted on was
+                                        // delivered, even if Escape later ended the
+                                        // turn: marking it failed hours on resurfaces
+                                        // it as if it had never been sent.
+                                        status: if interrupted && !turn_had_side_effects {
                                             MessageStatus::Failed
                                         } else {
                                             MessageStatus::Complete
