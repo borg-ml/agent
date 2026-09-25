@@ -3533,6 +3533,7 @@ async fn run_agent_session_store_kernel_inner(
                                             .state(session_id)
                                             .await?
                                             .context_generation,
+                                        prior_native_context_tokens: None,
                                         provider: launch.provider,
                                         provider_session_id: Some(provider_session_id.to_string()),
                                         provider_fork_turn_id: None,
@@ -4711,6 +4712,11 @@ async fn run_agent_session_store_kernel_inner(
             prompt_cache_session_id: Some(journal.store.prompt_cache_session_id(session_id).await?),
             message_id: prompt.message_id,
             context_generation: journal.state(session_id).await?.context_generation,
+            prior_native_context_tokens: if native_provider && provider_context_usage_valid {
+                journal.state(session_id).await?.usage.context_tokens
+            } else {
+                None
+            },
             provider: launch.provider,
             provider_session_id: (native_provider || reuse_subscription_context)
                 .then(|| provider_session_id.clone())
@@ -8251,6 +8257,7 @@ async fn run_retained_compaction(
             prompt_cache_session_id: None,
             message_id: Uuid::new_v4(),
             context_generation: 0,
+            prior_native_context_tokens: None,
             provider: launch.provider,
             provider_session_id: None,
             provider_fork_turn_id: None,

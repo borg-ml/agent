@@ -6222,6 +6222,7 @@ async fn forwarded_image_reaches_the_recipient_model_as_pixels() {
         prompt_cache_session_id: None,
         message_id: inbox.message_id,
         context_generation: 0,
+        prior_native_context_tokens: None,
         provider: CodingProvider::Claude,
         provider_session_id: None,
         provider_fork_turn_id: None,

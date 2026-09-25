@@ -156,6 +156,9 @@ pub struct AgentTurn {
     /// It changes only at an explicit context boundary, not on reconnect or
     /// ordinary tool rounds.
     pub context_generation: u64,
+    /// Last valid provider-observed context usage for a matching native request prefix.
+    /// None on a cold replay or after a model/provider change.
+    pub(crate) prior_native_context_tokens: Option<u64>,
     pub provider: CodingProvider,
     pub provider_session_id: Option<String>,
     /// Completed provider turn to fork through when recovering an uncertain
@@ -2729,6 +2732,7 @@ mod tests {
             prompt_cache_session_id: None,
             message_id: uuid::Uuid::new_v4(),
             context_generation: 0,
+            prior_native_context_tokens: None,
             provider: crate::CodingProvider::Claude,
             provider_session_id: None,
             provider_fork_turn_id: None,
