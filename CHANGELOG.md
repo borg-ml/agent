@@ -7,6 +7,10 @@ Git comparison.
 
 ### Agents
 
+- An agent that sent a `followup_task` and went idle wakes on the next team
+  message instead of filing it as a queued report, and `wait_agent` with no
+  working children blocks until that reply arrives rather than returning
+  `no_active_children`.
 - Project guidance loads from `CLAUDE.md` as well as `AGENTS.md` (an identical
   pair is read once), for the main thread and every subagent. As an agent
   works in or names a subdirectory, that subtree's `AGENTS.md`/`CLAUDE.md`

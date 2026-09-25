@@ -150,7 +150,15 @@ impl SubagentCoordinator {
         if input_waiting(&input) && !reported.swap(true, Ordering::AcqRel) {
             return self.report(actor, "input_pending", unseen, started).await;
         }
-        let idle_at_start = !self.children(actor).await.iter().any(working);
+        // With no child working there is nothing to wait for, unless a
+        // followup_task this agent sent is still unanswered: then the wait
+        // blocks until that reply arrives as input.
+        let awaiting_reply = self
+            .awaiting_reply
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&actor);
+        let idle_at_start = !awaiting_reply && !self.children(actor).await.iter().any(working);
         let mut until = if idle_at_start {
             deadline.min(started + IDLE_GRACE)
         } else {
@@ -169,6 +177,7 @@ impl SubagentCoordinator {
                     return self.report(actor, reason, unseen, started).await;
                 }
                 () = input_arrives(&mut input, &reported) => {
+                    self.take_awaiting_reply(actor);
                     let unseen = self.unseen(actor, &woken).await;
                     return self.report(actor, "input_pending", unseen, started).await;
                 }
