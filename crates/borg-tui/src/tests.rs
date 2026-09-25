@@ -13,14 +13,14 @@ fn inline_diff_preview_stops_early_but_inspector_keeps_every_line() {
             .last()
             .unwrap()
             .to_string()
-            .contains("more lines · inspect for full diff")
+            .contains("more lines · click to expand")
     );
     let full = rendering::tool_detail_lines("diff", &diff, 80, "  │ ");
     assert!(full.len() > 50);
     assert!(
         !full
             .iter()
-            .any(|line| line.to_string().contains("inspect for full diff"))
+            .any(|line| line.to_string().contains("more lines · click to expand"))
     );
     let short = rendering::tool_body_lines("diff", "+one line\n", 80, "  │ ");
     assert_eq!(short.len(), 1);
@@ -16478,4 +16478,63 @@ fn a_sent_message_waiting_behind_a_tool_is_clickable() {
         "{:?}",
         rendered.3
     );
+}
+
+#[test]
+fn watch_rows_sit_in_the_action_run_without_extra_spacing() {
+    // A Watch row between tool rows is one uniform run: no blank line before
+    // or after it, exactly like the Ran and Reasoned rows around it.
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    let tool = |transcript: &mut Transcript, id: &str, sequence: u64| {
+        for (offset, kind) in [
+            SessionEventKind::ToolStarted {
+                tool_call_id: id.to_string(),
+                name: "shell".to_string(),
+                input: serde_json::json!({"command": format!("echo {id}")}),
+                input_ref: None,
+            },
+            SessionEventKind::ToolCompleted {
+                tool_call_id: id.to_string(),
+                output: "ok".to_string(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            transcript.apply(&SessionEvent::new(
+                session_id,
+                sequence + offset as u64,
+                kind,
+            ));
+        }
+    };
+    tool(&mut transcript, "first", 1);
+    transcript.order.push(TranscriptEntry::Action {
+        kind: TranscriptActionKind::Agent,
+        label: "Watch".to_string(),
+        detail: "agent events".to_string(),
+        body: None,
+        time: "2026-09-25 13:40".to_string(),
+        state: TranscriptActionState::Complete,
+        expanded: false,
+    });
+    tool(&mut transcript, "second", 3);
+    let lines = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    let row = |needle: &str| {
+        lines
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} row in {lines:#?}"))
+    };
+    let (first, watch, second) = (row("echo first"), row("Watch"), row("echo second"));
+    assert_eq!((watch - first, second - watch), (1, 1), "{lines:#?}");
 }

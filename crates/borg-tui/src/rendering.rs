@@ -113,7 +113,7 @@ pub(super) fn tool_body_lines(
         lines.push(Line::from(vec![
             Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("… {hidden} more lines · inspect for full diff"),
+                format!("… {hidden} more lines · click to expand"),
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
