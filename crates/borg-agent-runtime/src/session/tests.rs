@@ -19720,3 +19720,112 @@ async fn escape_keeps_a_prompt_the_model_already_acted_on_delivered() {
         scratch.discard().await;
     }
 }
+
+/// Hits an hour-long usage limit on one provider and succeeds on any other.
+struct LimitedProviderExecutor {
+    limited: CodingProvider,
+    runs: Arc<Mutex<Vec<CodingProvider>>>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for LimitedProviderExecutor {
+    async fn execute(
+        &self,
+        turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        self.runs.lock().unwrap().push(turn.provider);
+        if turn.provider == self.limited {
+            return Err(anyhow::anyhow!(
+                "You've hit your usage limit. Provider-reported retry delay: 3600 seconds."
+            ));
+        }
+        Ok(AgentTurnResult {
+            provider_session_id: Some("provider-session".to_string()),
+            final_text: "finished on the fallback route".to_string(),
+        })
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_usage_limit_continues_the_turn_on_the_next_fallback_route() {
+    // With a chain configured, an hour-long limit on the first route must not
+    // stop the session: the same turn continues on the next route at once.
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let executor = Arc::new(LimitedProviderExecutor {
+        limited: CodingProvider::Codex,
+        runs: Arc::clone(&runs),
+    });
+    let capabilities = crate::SessionCapabilities {
+        model_fallback: vec![
+            crate::ModelRoute::parse("codex").unwrap(),
+            crate::ModelRoute::parse("claude").unwrap(),
+        ],
+        ..Default::default()
+    };
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        let store = Arc::clone(&store);
+        async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: Some("finish this task".to_string()),
+                    capabilities,
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                store,
+            )
+            .await
+        }
+    });
+    let mut fell_back = false;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(event) = event_rx.recv().await {
+            match event.kind {
+                SessionEventKind::ProviderEvent { kind, .. } if kind == "model_fallback" => {
+                    fell_back = true;
+                }
+                SessionEventKind::TurnCompleted { error: None, .. } => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the turn finishes on the fallback route without waiting for the reset");
+    assert!(fell_back, "the switch is journaled");
+    assert_eq!(
+        *runs.lock().unwrap(),
+        vec![CodingProvider::Codex, CodingProvider::Claude]
+    );
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+    scratch.discard().await;
+}

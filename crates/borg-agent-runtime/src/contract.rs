@@ -995,6 +995,21 @@ impl RuntimeMcpContext {
     }
 }
 
+/// One entry of an ordered model fallback chain: the provider lane, model and
+/// effort a turn runs on while this route has quota.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ModelRoute {
+    pub provider: CodingProvider,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// A route never spends pay-as-you-go API credit unless this is set.
+    #[serde(default)]
+    pub allow_api_billing: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct SessionCapabilities {
@@ -1013,6 +1028,12 @@ pub struct SessionCapabilities {
     /// Permit a goal to yield until a running watcher reports progress.
     #[serde(default = "default_true")]
     pub watcher_yield: bool,
+    /// Ordered model routes. When the active route reaches a usage limit the
+    /// session continues the same turn on the next route with quota, and
+    /// returns to an earlier route once its limit resets. Empty keeps the
+    /// single-route behaviour: wait for the limit to reset.
+    #[serde(default)]
+    pub model_fallback: Vec<ModelRoute>,
     /// Providers or model ids whose mid-turn human messages are framed with an
     /// instruction to address them in the next visible response. Those models
     /// otherwise fold the bare text silently into the running task; Codex
@@ -1075,6 +1096,7 @@ impl Default for SessionCapabilities {
             telemetry: false,
             auto_resume_usage_limits: true,
             watcher_yield: true,
+            model_fallback: Vec::new(),
             steer_reply_prompt: SteerReplyPrompt::default(),
             provider_capabilities: Vec::new(),
             luna_titles_for_all_providers: false,
