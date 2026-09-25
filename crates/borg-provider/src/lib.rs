@@ -1,4 +1,5 @@
 pub mod credentials;
+pub mod image_tiles;
 pub mod local;
 pub mod mcp;
 pub mod openai_subscription;

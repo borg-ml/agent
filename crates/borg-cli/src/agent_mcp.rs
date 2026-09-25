@@ -574,13 +574,14 @@ fn modern_result(mut result: Value) -> Value {
 
 /// Images a result may carry as MCP content items. Beyond this they are
 /// dropped with a note rather than growing one tool result without bound.
-const MAX_RESULT_IMAGES: usize = 8;
+const MAX_RESULT_IMAGES: usize = 18;
 /// Count of images lifted out of the metadata, matching the native harness.
 const ATTACHED_IMAGES_KEY: &str = "attached_images";
 const DROPPED_ATTACHMENTS_KEY: &str = "dropped_attachments";
 /// Original and sent size of each lifted image, with the exact scale.
 const SENT_IMAGES_KEY: &str = "sent_images";
 const IMAGE_COORDINATES_KEY: &str = "image_coordinates";
+const IMAGE_TILES_KEY: &str = "image_tiles";
 /// Providers downscale larger images themselves (Anthropic above a 1568 px
 /// edge or about 1.15 megapixels), silently changing the coordinate space the
 /// model sees. Fitting them here instead makes the scale known and reported.
@@ -683,6 +684,7 @@ fn lift_result_images(value: &mut Value, images: &mut Vec<Value>, depth: usize) 
         let mut dropped = Vec::new();
         let mut sizes = Vec::new();
         let mut scaled = false;
+        let mut tiled = false;
         for (index, attachment) in attachments.into_iter().enumerate() {
             let media_type = attachment.get("media_type").and_then(Value::as_str);
             let data = attachment.get("data_base64").and_then(Value::as_str);
@@ -694,6 +696,28 @@ fn lift_result_images(value: &mut Value, images: &mut Vec<Value>, depth: usize) 
                         dropped.push(format!(
                             "#{index}: more than {MAX_RESULT_IMAGES} images per result"
                         ));
+                        continue;
+                    }
+                    // Much larger than one model image: an overview plus
+                    // full-resolution tiles, when they fit the result.
+                    let pieces =
+                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
+                            .ok()
+                            .and_then(|bytes| borg_provider::image_tiles::tile(&bytes))
+                            .filter(|pieces| images.len() + pieces.len() <= MAX_RESULT_IMAGES);
+                    if let Some(pieces) = pieces {
+                        let mut labels = Vec::new();
+                        for piece in pieces {
+                            images.push(json!({
+                                "type": "image",
+                                "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &piece.bytes),
+                                "mimeType": piece.media_type,
+                            }));
+                            labels.push(piece.label);
+                        }
+                        sizes.push(json!({ "tiles": labels }));
+                        tiled = true;
+                        lifted += 1;
                         continue;
                     }
                     let sent = fit_image_for_model(media_type, data);
@@ -722,6 +746,12 @@ fn lift_result_images(value: &mut Value, images: &mut Vec<Value>, depth: usize) 
             object.insert(
                 IMAGE_COORDINATES_KEY.to_string(),
                 json!("the image was downscaled to fit the model; a point (x, y) on it is (x * width / sent_width, y * height / sent_height) in the tool's coordinates"),
+            );
+        }
+        if tiled {
+            object.insert(
+                IMAGE_TILES_KEY.to_string(),
+                json!("a large image is sent as an overview and then full-resolution tiles, in the order of sent_images[].tiles; each tile names the region of the original it covers"),
             );
         }
         if !dropped.is_empty() {
