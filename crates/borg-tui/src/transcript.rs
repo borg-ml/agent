@@ -3501,8 +3501,17 @@ impl Transcript {
         let display_name = presentation.label;
         // A follow-up names only a process handle; show the command it started.
         let detail = tool_process_followup_handle(name, Some(input))
-            .and_then(|handle| self.provider_backgrounds.get(&handle))
-            .map(|process| process.command.clone())
+            .and_then(|handle| {
+                Uuid::parse_str(&handle)
+                    .ok()
+                    .and_then(|id| self.runtime_processes.get(&id))
+                    .map(|process| process.command.clone())
+                    .or_else(|| {
+                        self.provider_backgrounds
+                            .get(&handle)
+                            .map(|process| process.command.clone())
+                    })
+            })
             .unwrap_or(presentation.detail);
         let code_view = presentation.input.map(|body| (body.language, body.text));
         let is_edit_diff = matches!(
