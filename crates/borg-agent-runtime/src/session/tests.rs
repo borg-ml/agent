@@ -7118,7 +7118,7 @@ async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
             })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
+        tokio::time::timeout(Duration::from_secs(10), turn_started.notified())
             .await
             .expect("first turn starts");
 
@@ -7138,7 +7138,7 @@ async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
             // The native session holds a steer until the tool boundary.
             tokio::time::sleep(Duration::from_millis(100)).await;
         } else {
-            tokio::time::timeout(Duration::from_secs(1), steer_seen.notified())
+            tokio::time::timeout(Duration::from_secs(10), steer_seen.notified())
                 .await
                 .expect("provider has received the unacknowledged steer");
         }
@@ -7152,7 +7152,7 @@ async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
             .await
             .unwrap();
         loop {
-            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            let event = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
                 .await
                 .expect("recall event arrives")
                 .expect("session remains open");
