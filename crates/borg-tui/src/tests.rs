@@ -15987,12 +15987,30 @@ fn paragraph_streaming_holds_the_unfinished_block_across_snapshots() {
         Some(TranscriptEntry::Message { text, .. }) => text.clone(),
         _ => panic!("expected one assistant message"),
     };
-    for delta in ["First para", "graph.\n\nSec"] {
-        transcript.apply(&event(SessionEventKind::MessageDelta {
-            message_id,
-            delta: delta.into(),
-        }));
-    }
+    let rendered = |transcript: &Transcript| {
+        transcript
+            .lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    transcript.apply(&event(SessionEventKind::MessageDelta {
+        message_id,
+        delta: "First para".into(),
+    }));
+    assert!(
+        !rendered(&transcript).contains("borg"),
+        "no empty reply header before the first block: {}",
+        rendered(&transcript)
+    );
+    transcript.apply(&event(SessionEventKind::MessageDelta {
+        message_id,
+        delta: "graph.\n\nSec".into(),
+    }));
+    assert_eq!(shown(&transcript), "First paragraph.\n\n");
+    // Preference reloads repeat the same mode; that must not reveal the tail.
+    transcript.set_response_streaming(borg_ui::preferences::ResponseStreaming::Paragraph);
     assert_eq!(shown(&transcript), "First paragraph.\n\n");
     let snapshot = |text: &str, status| {
         event(SessionEventKind::Message {

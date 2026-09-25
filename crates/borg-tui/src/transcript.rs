@@ -912,6 +912,17 @@ fn tool_has_expandable_body(
             .any(|(_, body)| !body.trim().is_empty())
 }
 
+/// Queued prompts and a reply whose first block is still held have no row.
+fn message_row_hidden(entry: &TranscriptEntry) -> bool {
+    matches!(entry, TranscriptEntry::Message { status: MessageStatus::Queued, .. })
+        || matches!(entry, TranscriptEntry::Message {
+            actor: EventActor::Assistant,
+            status: MessageStatus::InProgress,
+            text,
+            ..
+        } if text.is_empty())
+}
+
 fn transcript_entry_is_turn_output(entry: &TranscriptEntry) -> bool {
     matches!(
         entry,
@@ -3366,8 +3377,18 @@ impl Transcript {
         &mut self,
         streaming: borg_ui::preferences::ResponseStreaming,
     ) {
+        if self.response_streaming == streaming {
+            return;
+        }
         self.response_streaming = streaming;
-        self.flush_streaming_tails();
+        if streaming == borg_ui::preferences::ResponseStreaming::Token {
+            self.flush_streaming_tails();
+        } else {
+            let live: Vec<Uuid> = self.messages.keys().copied().collect();
+            for message_id in live {
+                self.hold_back_unfinished(message_id);
+            }
+        }
     }
 
     fn append_reasoning_text_delta(
@@ -5073,10 +5094,8 @@ impl Transcript {
                     (row, tool_rows.len(), entry_rows.len(), selection_rows.len()),
                 );
             }
-            let visible_message = matches!(
-                entry,
-                TranscriptEntry::Message { status, .. } if *status != MessageStatus::Queued
-            );
+            let visible_message =
+                matches!(entry, TranscriptEntry::Message { .. }) && !message_row_hidden(entry);
             let starts_labeled_group = visible_message
                 || matches!(
                     entry,
@@ -5089,10 +5108,9 @@ impl Transcript {
                 entry,
                 TranscriptEntry::Message {
                     actor: EventActor::User | EventActor::Assistant,
-                    status,
                     ..
-                } if *status != MessageStatus::Queued
-            );
+                }
+            ) && !message_row_hidden(entry);
             let entry_start = if is_chat_message {
                 if !lines.is_empty()
                     && lines
@@ -5121,12 +5139,12 @@ impl Transcript {
                     model,
                     effort,
                     time,
-                    status,
+                    status: _,
                     complete,
                     user_interrupted,
                     redirected,
                 } => {
-                    if *status == MessageStatus::Queued {
+                    if message_row_hidden(entry) {
                         continue;
                     }
                     let from_director = director_prompt_row == Some(index);
