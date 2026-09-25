@@ -481,7 +481,7 @@ impl NativeHarness {
         let mut system_prompt = super::agent::CODING_SYSTEM_PROMPT.to_string();
         match self.harness {
             HarnessMode::Borg => system_prompt.push_str(concat!(
-                "\n\nBorg provides one shell-first execution surface through `exec`. ",
+                "\n\nBorg runs commands through `exec`, and code whose variables should survive between calls through `runtime_exec` (a persistent Python or Bun namespace with `borg` preloaded). ",
                 "Include a short `action` summary first in every tool call so the live UI can display it while the remaining arguments stream. ",
                 "Use shell commands for orchestration and invoke the language or installed runtime that best fits the problem, such as TypeScript/JavaScript for web and JSON work or Python for data and scientific work. ",
                 "This is trusted user-authority execution, not a security sandbox. ",
@@ -2677,7 +2677,11 @@ impl NativeToolRuntime {
 
     fn tool_definitions(&self) -> Result<Vec<ModelToolDefinition>> {
         let mut definitions = match self.harness {
-            HarnessMode::Borg => vec![exec_tool_definition()?],
+            HarnessMode::Borg => vec![
+                exec_tool_definition()?,
+                ModelToolDefinition::from_mcp_spec(&crate::subagents::runtime_exec_spec())
+                    .map_err(anyhow::Error::msg)?,
+            ],
             HarnessMode::Native => self.native_tool_catalog()?,
         };
         for definition in &mut definitions {
@@ -2696,6 +2700,7 @@ impl NativeToolRuntime {
         let mut definitions = specs
             .into_iter()
             .chain(self.agent_tools.specs())
+            .chain([crate::subagents::runtime_exec_spec()])
             .map(|spec| ModelToolDefinition::from_mcp_spec(&spec).map_err(anyhow::Error::msg))
             .collect::<Result<Vec<_>>>()?;
         definitions.extend_from_slice(self.mcp.definitions());

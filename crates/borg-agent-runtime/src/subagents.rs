@@ -1252,6 +1252,7 @@ impl AgentToolDispatcher {
         if self.autonomy.is_some() {
             specs.extend(autonomy_tool_specs());
         }
+        specs.push(harness_tool_spec());
         let extension_api = self.extension_api_snapshot();
         specs.extend(extension_api.tool_specs());
         specs.extend(extension_api.command_specs());
@@ -2132,6 +2133,18 @@ impl AgentToolDispatcher {
                 }
                 Ok(result)
             }
+            "harness" => {
+                crate::harness::call(
+                    arguments,
+                    self.actor_session_id,
+                    &self.runtime_root,
+                    self.session_store().as_deref(),
+                    &self.harness_lock,
+                    workflow_approved
+                        || self.runtime_permission == crate::PermissionMode::FullAccess,
+                )
+                .await
+            }
             "runtime_exec" => {
                 let args: PersistentRuntimeArgs = serde_json::from_value(arguments)?;
                 self.run_persistent_runtime(args, workflow_approved, workflow_cancel)
@@ -2514,6 +2527,7 @@ impl AgentToolDispatcher {
         };
         let cancellation = cancellation.unwrap_or_default().child_token();
         let host: Arc<dyn RuntimeHost> = Arc::new(DispatcherRuntimeHost {
+            parent_tool_call_id: Uuid::new_v4().to_string(),
             session_id: self.actor_session_id,
             root: self.runtime_root.clone(),
             allow_effects: self.runtime_permission == crate::PermissionMode::FullAccess
@@ -2540,6 +2554,8 @@ impl AgentToolDispatcher {
 
 #[derive(Clone)]
 struct DispatcherRuntimeHost {
+    /// This `runtime_exec` call: Borg calls its code makes are its steps.
+    parent_tool_call_id: String,
     session_id: Uuid,
     root: PathBuf,
     allow_effects: bool,
@@ -2662,13 +2678,25 @@ impl RuntimeHost for DispatcherRuntimeHost {
                     self.ensure_effects()?;
                 }
                 self.dispatcher
-                    .call_with_workflow_control(
+                    .call_from_command(
+                        self.parent_tool_call_id.clone(),
                         &args.name,
                         args.arguments,
                         self.allow_effects,
                         None,
                     )
                     .await
+            }
+            "capabilities" => {
+                let specs = self.dispatcher.mcp_specs(false);
+                Ok(match arguments.get("query").and_then(Value::as_str) {
+                    Some(query) => Value::Array(crate::capability_catalog::search(
+                        &specs,
+                        query,
+                        arguments.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize,
+                    )),
+                    None => Value::Array(specs),
+                })
             }
             "mcp_tools" => self.dispatcher.runtime_mcp_tools().await,
             "mcp_call" => {
@@ -2727,15 +2755,15 @@ impl RuntimeHost for DispatcherRuntimeHost {
                     .await
             }
             "harness" => {
-                crate::harness::call(
-                    arguments,
-                    self.session_id,
-                    &self.root,
-                    self.session_store.as_deref(),
-                    &self.dispatcher.harness_lock,
-                    self.allow_effects,
-                )
-                .await
+                self.dispatcher
+                    .call_from_command(
+                        self.parent_tool_call_id.clone(),
+                        "harness",
+                        arguments,
+                        self.allow_effects,
+                        None,
+                    )
+                    .await
             }
             "runtime_status" => {
                 let store = self
@@ -8588,6 +8616,64 @@ struct SaveRuntimeCheckpointArgs {
     kind: String,
     state: Value,
     evidence: Value,
+}
+
+/// Self-improvement: entries Borg adds to later turns, refined from evidence.
+fn harness_tool_spec() -> Value {
+    tool(
+        "harness",
+        "Improve how you work in this project: prompt, memory, skill and subagent entries that Borg adds to your later turns. Read with op list|overview|get; change with create|update|delete; record why with refine (trigger, changes, evidence, outcome); undo recent local changes with rollback. Keep each change small and backed by evidence from this session.",
+        json!({
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["list", "overview", "get", "create", "update", "delete", "refine", "rollback", "plan_refinement"]},
+                "kind": {"type": "string", "enum": ["prompt", "memory", "skill", "subagent"]},
+                "scope": {"type": "string", "enum": ["local", "global"], "default": "local"},
+                "id": {"type": "string"},
+                "title": {"type": "string"},
+                "content": {"type": "string"},
+                "trigger": {"type": "string"},
+                "changes": {"type": "array", "items": {"type": "string"}},
+                "evidence": {"type": "string"},
+                "outcome": {"type": "string"},
+                "steps": {"type": "integer", "minimum": 1},
+                "limit": {"type": "integer", "minimum": 1},
+                "path": {"type": "string"},
+                "source": {"type": "string"},
+                "reference": {"type": "object"},
+                "arguments": {"type": "object"},
+                "metadata": {"type": "object"}
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+/// The persistent code runtime, offered to the model beside `exec`.
+pub(crate) fn runtime_exec_spec() -> Value {
+    tool(
+        "runtime_exec",
+        "Run code in the session's persistent Python (or Bun JavaScript/TypeScript) runtime: variables, imports, helpers and parsed data survive across calls and turns. `borg` is preloaded: every Borg capability as a call (`borg.send_message(...)`, `borg.tools(\"query\")` to find one), plus `borg.checkpoint(key, state)` / `borg.restore(key)` for durable state, `borg.exec`, `borg.read`, `borg.rlm` subagents and `borg.harness` for evidence-backed refinements of your own prompts, memory and skills with rollback. Trusted user-authority execution, not a sandbox.",
+        json!({
+            "type": "object",
+            "properties": {
+                "runtime": {
+                    "type": "string",
+                    "enum": ["python", "javascript", "typescript"],
+                    "default": "python"
+                },
+                "code": {"type": "string", "minLength": 1, "maxLength": 524288},
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": RUNTIME_MAX_COMMAND_TIMEOUT_MS
+                }
+            },
+            "required": ["code"],
+            "additionalProperties": false
+        }),
+    )
 }
 
 fn is_autonomy_tool(name: &str) -> bool {

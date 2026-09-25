@@ -694,7 +694,13 @@ def _restore_namespace(state):
             NAMESPACE[name] = value
 
 
+class BorgError(RuntimeError):
+    """A Borg capability refused or failed the call."""
+
+
 class Borg:
+    BorgError = BorgError
+
     def __init__(self):
         self.rlm = Rlm(self)
         self.harness = Harness(self)
@@ -717,7 +723,7 @@ class Borg:
                 continue
             if message.get("ok"):
                 return message.get("result")
-            raise RuntimeError(message.get("error", "Borg host call failed"))
+            raise BorgError(message.get("error", "Borg host call failed"))
 
     def exec(self, command, **kwargs):
         arguments = {"cmd": command}
@@ -819,6 +825,16 @@ class Borg:
 
     def tool(self, name, arguments=None):
         return self.call("borg_tool", {"name": name, "arguments": {} if arguments is None else arguments})
+
+    def tools(self, query=None, limit=10):
+        """Every Borg capability, or those ranked for `query` with signatures."""
+        return self.call("capabilities", {} if query is None else {"query": query, "limit": limit})
+
+    def __getattr__(self, name):
+        # Any other attribute is a Borg capability, as with `import borg` in exec.
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return lambda arguments=None, /, **fields: self.tool(name, {**(arguments or {}), **fields})
 
     def mcp_tools(self):
         return self.call("mcp_tools", {})
@@ -1245,6 +1261,7 @@ const borg = {
   write: (path, content, options = {}) => hostCall("write_file", {path, content, ...options}),
   edit: (path, oldText, newText, options = {}) => hostCall("edit_file", {path, old_text: oldText, new_text: newText, ...options}),
   tool: (name, arguments_ = {}) => hostCall("borg_tool", {name, arguments: arguments_}),
+  tools: (query = undefined, limit = 10) => hostCall("capabilities", query === undefined ? {} : {query, limit}),
   mcp_tools: () => hostCall("mcp_tools", {}),
   mcp: (name, arguments_ = {}) => hostCall("mcp_call", {name, arguments: arguments_}),
 };
@@ -1348,7 +1365,10 @@ rlm.list = async (pathPrefix = undefined) => (await borg.tool("list_agents", pat
 rlm.run = rlm;
 rlm.list_subagents = rlm.list;
 borg.rlm = rlm;
-context.borg = borg;
+// Any other property is a Borg capability, as with `import borg from "borg"` in exec.
+context.borg = new Proxy(borg, {
+  get: (target, name) => (name in target || typeof name !== "string" || name === "then" ? target[name] : (arguments_ = {}) => target.tool(name, arguments_)),
+});
 const cua = (op, arguments_ = {}) => borg.tool("computer_use", {...arguments_, op});
 cua.capabilities = () => cua("capabilities");
 cua.list_windows = (display) => cua("list_windows", display ? {display} : {});
