@@ -17,8 +17,8 @@ Git comparison.
 
 ### Terminal
 
-- Footer hover hints say click and right-click, with the action in white and
-  what it does in grey.
+- Footer hover hints say click and right-click, and they and the Pending Input
+  controls use the footer's style: keys in white, the rest in dark grey.
 - Stopped and failed subagents stay on the team roster, after the working ones,
   marked "click to resume"; the status line shows "N stopped" when none are
   working so the roster stays reachable.

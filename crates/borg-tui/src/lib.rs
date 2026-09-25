@@ -13158,7 +13158,8 @@ fn pending_input_title(
     }
 }
 
-/// Accent the heading and count; controls are grey with their keys in white.
+/// Accent the heading and count; controls are dark grey with their keys in
+/// white, like the footer's command and palette hints.
 fn pending_input_title_line(title: &str, accent: Color) -> Line<'static> {
     let (head, controls) = match title.match_indices(" · ").nth(1) {
         Some((at, _)) => title.split_at(at),
@@ -13175,7 +13176,7 @@ fn pending_input_title_line(title: &str, accent: Color) -> Line<'static> {
         let color = if matches!(word, "click" | "esc" | "↑") {
             Color::White
         } else {
-            Color::Gray
+            Color::DarkGray
         };
         spans.push(Span::styled(word.to_string(), Style::default().fg(color)));
     }
@@ -16048,7 +16049,7 @@ fn hint_spans(hint: &'static str) -> Vec<Span<'static>> {
         if !key.is_empty() {
             spans.push(Span::styled(key, Style::default().fg(Color::White)));
         }
-        spans.push(Span::styled(rest, Style::default().fg(Color::Gray)));
+        spans.push(Span::styled(rest, Style::default().fg(Color::DarkGray)));
     }
     spans
 }
