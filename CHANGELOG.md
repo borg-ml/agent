@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.12.1)
+## Unreleased (since 0.12.2)
+
+## 0.12.2 (2026-09-26)
 
 ### Sessions
 
