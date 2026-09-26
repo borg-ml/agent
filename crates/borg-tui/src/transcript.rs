@@ -1348,6 +1348,47 @@ impl Transcript {
     /// Return the footer affordance for a tool while the pointer is over its
     /// rendered row. Edit tools expose their diff as the call body, while
     /// other tools expose their completed response as the output body.
+    /// Footer hint for a clickable non-tool row; rows carry no inline hint.
+    fn entry_click_hint(&self, index: usize) -> Option<&'static str> {
+        match self.order.get(index)? {
+            TranscriptEntry::Action { body, expanded, .. }
+                if body.as_deref().is_some_and(|body| !body.trim().is_empty()) =>
+            {
+                Some(if self.tool_click_behavior == ToolClickBehavior::Fullscreen {
+                    "click open full screen"
+                } else if *expanded {
+                    "click collapse"
+                } else {
+                    "click expand"
+                })
+            }
+            TranscriptEntry::Compaction {
+                summary,
+                expanded,
+                complete: true,
+                ..
+            } if compaction_has_expandable_detail(summary) => Some(if *expanded {
+                "click collapse · right-click actions"
+            } else {
+                "click expand · right-click actions"
+            }),
+            TranscriptEntry::Plan { items, expanded, .. }
+                if items.len() > MAX_COLLAPSED_PLAN_ITEMS =>
+            {
+                Some(if *expanded { "click collapse" } else { "click expand" })
+            }
+            _ => None,
+        }
+    }
+
+    fn tool_run_header_hint(&self, start: usize) -> &'static str {
+        if self.tool_run_expanded(start) {
+            "click collapse"
+        } else {
+            "click expand"
+        }
+    }
+
     fn tool_copy_hint(&self, index: usize) -> Option<&'static str> {
         let TranscriptEntry::Tool {
             code_view,
@@ -5484,19 +5525,6 @@ impl Transcript {
                         summary.push_str(" · ");
                         summary.push_str(first.trim());
                     }
-                    if focused_tool.is_none()
-                        && body.as_deref().is_some_and(|body| !body.trim().is_empty())
-                    {
-                        summary.push_str(
-                            if self.tool_click_behavior == ToolClickBehavior::Fullscreen {
-                                " · click to open full screen"
-                            } else if *expanded {
-                                " · click to collapse"
-                            } else {
-                                " · click to expand"
-                            },
-                        );
-                    }
                     let action_start = lines.len();
                     for line in tool_summary_lines(
                         &summary,
@@ -5642,7 +5670,7 @@ impl Transcript {
                     }
                     if collapsed && hidden > 0 {
                         lines.push(Line::from(Span::styled(
-                            format!("    + {hidden} more · click to expand"),
+                            format!("    + {hidden} more"),
                             Style::default().fg(Color::DarkGray),
                         )));
                     } else if *expanded && items.len() > MAX_COLLAPSED_PLAN_ITEMS {
@@ -5755,15 +5783,7 @@ impl Transcript {
                 } => {
                     let time = display_local_time(time, &today_prefix);
                     let expandable = *complete && compaction_has_expandable_detail(summary);
-                    let action_hint = if expandable && focused_tool.is_none() {
-                        if *expanded {
-                            " · click to collapse · right-click for actions"
-                        } else {
-                            " · click to expand · right-click for actions"
-                        }
-                    } else {
-                        ""
-                    };
+                    let action_hint = "";
                     lines.push(Line::from(vec![
                         Span::styled(
                             if focused_tool == Some(index) {
@@ -6189,20 +6209,10 @@ impl Transcript {
 
                         lines.truncate(content_start);
                         lines.extend(visible_lines);
-                        let action_hint = if folded {
-                            " · click to expand"
-                        } else if !expandable {
-                            ""
-                        } else if expanded {
-                            if offset > 0 {
-                                " · click to collapse · ↑ scroll"
-                            } else {
-                                " · click to collapse"
-                            }
-                        } else if offset > 0 {
-                            " · click to expand · ↑ scroll"
+                        let action_hint = if !folded && expandable && offset > 0 {
+                            " · ↑ scroll"
                         } else {
-                            " · click to expand"
+                            ""
                         };
                         lines[header_row] = tool_window_header(
                             if folded { "▸ " } else { TOOL_WINDOW_HEADER_INDENT },

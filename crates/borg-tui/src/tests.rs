@@ -8,19 +8,13 @@ fn inline_diff_preview_stops_early_but_inspector_keeps_every_line() {
     );
     let inline = rendering::tool_body_lines("diff", &diff, 80, "  │ ");
     assert_eq!(inline.len(), 19);
-    assert!(
-        inline
-            .last()
-            .unwrap()
-            .to_string()
-            .contains("more lines · click to expand")
-    );
+    assert!(inline.last().unwrap().to_string().contains("more lines"));
     let full = rendering::tool_detail_lines("diff", &diff, 80, "  │ ");
     assert!(full.len() > 50);
     assert!(
         !full
             .iter()
-            .any(|line| line.to_string().contains("more lines · click to expand"))
+            .any(|line| line.to_string().contains("more lines"))
     );
     let short = rendering::tool_body_lines("diff", "+one line\n", 80, "  │ ");
     assert_eq!(short.len(), 1);
@@ -11570,7 +11564,16 @@ fn compaction_completion_updates_the_live_card_and_can_expand() {
         .join("\n");
     assert!(rendered.contains("Compacted context:"));
     assert!(rendered.contains("Retained the durable conversation"));
-    assert!(rendered.contains("right-click for actions"));
+    assert!(!rendered.contains("right-click for actions"));
+    let compaction = transcript
+        .order
+        .iter()
+        .position(|entry| matches!(entry, TranscriptEntry::Compaction { .. }))
+        .expect("compaction card");
+    assert_eq!(
+        transcript.entry_click_hint(compaction),
+        Some("click collapse · right-click actions")
+    );
 }
 
 #[test]
@@ -12663,7 +12666,7 @@ fn long_tool_runs_show_eight_lines_and_scroll_independently() {
     assert!(!rendered.contains("call-11"));
     assert!(rendered.contains("call-12"));
     assert!(rendered.contains("call-19"));
-    assert!(rendered.contains("20 actions · click to expand · ↑ scroll"));
+    assert!(rendered.contains("20 actions · ↑ scroll"));
     assert!(!rendered.contains("scroll for older/newer"));
 
     transcript.scroll_tool_run(0, 12, -3);
@@ -12764,7 +12767,8 @@ fn a_finished_action_group_folds_to_its_summary_until_clicked() {
 
     let folded = render(&transcript);
     assert!(
-        folded.contains("▸ 12:00 · 4 actions · /srv/ore-cues · click to expand"),
+        folded.contains("▸ 12:00 · 4 actions · /srv/ore-cues")
+            && !folded.contains("click to expand"),
         "{folded}"
     );
     assert_eq!(
@@ -12821,9 +12825,10 @@ fn expanded_tool_run_shows_every_action_and_collapses_again() {
     assert!(expanded.contains("call-0"), "{expanded}");
     assert!(expanded.contains("call-19"), "{expanded}");
     assert!(
-        expanded.contains("20 actions · click to collapse"),
+        expanded.contains("20 actions") && !expanded.contains("click to"),
         "{expanded}"
     );
+    assert_eq!(transcript.tool_run_header_hint(0), "click collapse");
     assert!(!expanded.contains("↑ more"), "{expanded}");
     assert!(!expanded.contains("↓ more"), "{expanded}");
 
@@ -12831,10 +12836,7 @@ fn expanded_tool_run_shows_every_action_and_collapses_again() {
     let collapsed = render(&transcript);
     assert!(!collapsed.contains("call-11"), "{collapsed}");
     assert!(collapsed.contains("call-12"), "{collapsed}");
-    assert!(
-        collapsed.contains("20 actions · click to expand · ↑ scroll"),
-        "{collapsed}"
-    );
+    assert!(collapsed.contains("20 actions · ↑ scroll"), "{collapsed}");
 }
 
 #[test]
@@ -13730,7 +13732,8 @@ fn long_plans_clip_with_a_hint_and_expand_on_toggle() {
     assert!(clipped.contains("Step 0"), "{clipped}");
     assert!(clipped.contains("Step 4"), "{clipped}");
     assert!(!clipped.contains("Step 5"), "{clipped}");
-    assert!(clipped.contains("+ 3 more · click to expand"), "{clipped}");
+    assert!(clipped.contains("+ 3 more"), "{clipped}");
+    assert_eq!(transcript.entry_click_hint(0), Some("click expand"));
 
     transcript.toggle_plan_expansion(0);
     let expanded = render(&transcript);
@@ -13767,7 +13770,7 @@ fn a_collapsed_plan_card_shows_the_update_not_the_first_rows() {
     // plan: the leading steps, clipped.
     let initial = render(&transcript);
     assert!(initial.contains("Step 0"), "{initial}");
-    assert!(initial.contains("+ 19 more · click to expand"), "{initial}");
+    assert!(initial.contains("+ 19 more"), "{initial}");
 
     // Appending the release step is the whole point of the update, so the
     // collapsed card must show it instead of 23 unchanged rows.
@@ -13781,10 +13784,7 @@ fn a_collapsed_plan_card_shows_the_update_not_the_first_rows() {
     assert!(appended.contains("FINAL release"), "{appended}");
     assert!(!appended.contains("Step 0"), "{appended}");
     assert!(appended.contains("24/25 completed"), "{appended}");
-    assert!(
-        appended.contains("+ 24 more · click to expand"),
-        "{appended}"
-    );
+    assert!(appended.contains("+ 24 more"), "{appended}");
 
     // Expanding still shows the entire plan.
     let index = transcript.order.len() - 1;
@@ -13813,10 +13813,7 @@ fn a_collapsed_plan_card_shows_the_update_not_the_first_rows() {
     transcript.upsert_plan(items, "12:10".to_string());
     let replayed = render(&transcript);
     assert!(replayed.contains("Step 2"), "{replayed}");
-    assert!(
-        replayed.contains("+ 19 more · click to expand"),
-        "{replayed}"
-    );
+    assert!(replayed.contains("+ 19 more"), "{replayed}");
 
     // The reported card: one step finishes while seven are still open. The
     // change log alone showed the finished step and a count, so a plan with
@@ -13847,10 +13844,7 @@ fn a_collapsed_plan_card_shows_the_update_not_the_first_rows() {
         );
     }
     assert!(!progressed.contains("Task 14"), "{progressed}");
-    assert!(
-        progressed.contains("+ 14 more · click to expand"),
-        "{progressed}"
-    );
+    assert!(progressed.contains("+ 14 more"), "{progressed}");
 
     // When the changed step is itself open it leads and is not repeated among
     // the open rows that follow it.
@@ -13862,7 +13856,7 @@ fn a_collapsed_plan_card_shows_the_update_not_the_first_rows() {
         assert!(started.contains(open), "{open} missing from {started}");
     }
     assert!(!started.contains("Task 15"), "{started}");
-    assert!(started.contains("+ 14 more · click to expand"), "{started}");
+    assert!(started.contains("+ 14 more"), "{started}");
 }
 
 #[test]
@@ -16495,7 +16489,14 @@ fn peer_agent_message_is_visible_without_subagent_opt_in() {
     assert!(rendered.contains("Peer"), "{rendered}");
     assert!(rendered.contains("steer orphaning confirmed"), "{rendered}");
     assert!(!rendered.contains("REPORT_END"), "{rendered}");
-    assert!(rendered.contains("click to open full screen"), "{rendered}");
+    assert!(
+        !rendered.contains("click to open full screen"),
+        "{rendered}"
+    );
+    assert_eq!(
+        transcript.entry_click_hint(0),
+        Some("click open full screen")
+    );
     assert!(
         transcript.order[0]
             .copy_text_owned()
@@ -16511,14 +16512,17 @@ fn peer_agent_message_is_visible_without_subagent_opt_in() {
             .collect::<Vec<_>>()
             .join(" ")
     };
-    assert!(render(&transcript).contains("click to expand"));
+    assert_eq!(transcript.entry_click_hint(0), Some("click expand"));
     transcript.toggle_action_expansion(0);
     let expanded = render(&transcript);
     assert!(expanded.contains("REPORT_END"));
-    assert!(expanded.contains("click to collapse"));
+    assert!(!expanded.contains("click to"), "{expanded}");
+    assert_eq!(transcript.entry_click_hint(0), Some("click collapse"));
     transcript.tool_click_behavior = ToolClickBehavior::Fullscreen;
-    assert!(render(&transcript).contains("click to open full screen"));
-    assert!(!render(&transcript).contains("click to collapse"));
+    assert_eq!(
+        transcript.entry_click_hint(0),
+        Some("click open full screen")
+    );
     transcript.toggle_action_expansion(0);
     let focused = transcript
         .render_tool_for_cache(0, 100, 40)
