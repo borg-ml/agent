@@ -1024,10 +1024,10 @@ fn a_child_badges_its_director_assignment_and_leaves_later_prompts_alone() {
     // The prompt that opens the child came from the director agent, so it
     // carries the team identity rather than the operator's.
     let header = row_color(&transcript, "▌ director ▐");
-    assert!(header.contains(&SUBAGENT_PINK), "{header:?}");
+    assert!(header.contains(&SUBAGENT_PURPLE), "{header:?}");
     assert!(!header.contains(&transcript.user_label_color), "{header:?}");
     assert!(
-        row_color(&transcript, "director assignment").contains(&SUBAGENT_PINK),
+        row_color(&transcript, "director assignment").contains(&SUBAGENT_PURPLE),
         "the assignment body shares the director identity"
     );
 
@@ -1038,9 +1038,12 @@ fn a_child_badges_its_director_assignment_and_leaves_later_prompts_alone() {
         followup_body.contains(&transcript.user_message_color),
         "{followup_body:?}"
     );
-    assert!(!followup_body.contains(&SUBAGENT_PINK), "{followup_body:?}");
     assert!(
-        row_color(&transcript, "director assignment").contains(&SUBAGENT_PINK),
+        !followup_body.contains(&SUBAGENT_PURPLE),
+        "{followup_body:?}"
+    );
+    assert!(
+        row_color(&transcript, "director assignment").contains(&SUBAGENT_PURPLE),
         "the earlier assignment keeps its badge"
     );
 
@@ -1052,8 +1055,8 @@ fn a_child_badges_its_director_assignment_and_leaves_later_prompts_alone() {
         prompt(followup, 4, "human follow-up"),
     ]);
     assert_eq!(replayed.director_prompt, DirectorPrompt::Row(assignment));
-    assert!(row_color(&replayed, "director assignment").contains(&SUBAGENT_PINK));
-    assert!(!row_color(&replayed, "human follow-up").contains(&SUBAGENT_PINK));
+    assert!(row_color(&replayed, "director assignment").contains(&SUBAGENT_PURPLE));
+    assert!(!row_color(&replayed, "human follow-up").contains(&SUBAGENT_PURPLE));
     transcript.apply(&prompt(assignment, 5, "director assignment"));
     assert_eq!(transcript.director_prompt, DirectorPrompt::Row(assignment));
 
@@ -1067,7 +1070,7 @@ fn a_child_badges_its_director_assignment_and_leaves_later_prompts_alone() {
     assert_eq!(tail.director_prompt, DirectorPrompt::Unknown);
     let oldest = row_color(&tail, "human follow-up");
     assert!(oldest.contains(&tail.user_message_color), "{oldest:?}");
-    assert!(!oldest.contains(&SUBAGENT_PINK), "{oldest:?}");
+    assert!(!oldest.contains(&SUBAGENT_PURPLE), "{oldest:?}");
     assert!(
         !tail
             .render(100, None, None, None)
@@ -1095,7 +1098,7 @@ fn a_child_badges_its_director_assignment_and_leaves_later_prompts_alone() {
         after_clear.contains(&cleared.user_message_color),
         "{after_clear:?}"
     );
-    assert!(!after_clear.contains(&SUBAGENT_PINK), "{after_clear:?}");
+    assert!(!after_clear.contains(&SUBAGENT_PURPLE), "{after_clear:?}");
 
     // A root transcript is never a child, so its own session start arms
     // nothing and every prompt stays the operator's.
@@ -1108,7 +1111,7 @@ fn a_child_badges_its_director_assignment_and_leaves_later_prompts_alone() {
         root_prompt.contains(&root.user_message_color),
         "{root_prompt:?}"
     );
-    assert!(!root_prompt.contains(&SUBAGENT_PINK), "{root_prompt:?}");
+    assert!(!root_prompt.contains(&SUBAGENT_PURPLE), "{root_prompt:?}");
 }
 
 #[test]
@@ -1169,7 +1172,7 @@ fn a_long_child_transcript_keeps_the_assignment_body_pink_under_the_markdown_cac
     assert!(
         body.spans
             .iter()
-            .any(|span| span.style.fg == Some(SUBAGENT_PINK)),
+            .any(|span| span.style.fg == Some(SUBAGENT_PURPLE)),
         "the cached assignment body lost the director identity"
     );
     let human = rendered
@@ -1180,7 +1183,7 @@ fn a_long_child_transcript_keeps_the_assignment_body_pink_under_the_markdown_cac
         human
             .spans
             .iter()
-            .all(|span| span.style.fg != Some(SUBAGENT_PINK)),
+            .all(|span| span.style.fg != Some(SUBAGENT_PURPLE)),
         "a human prompt must not be pink"
     );
 }
@@ -1240,10 +1243,10 @@ fn team_roster_hover_is_visually_distinct_from_focus_and_idle() {
     let idle_subagent = team_roster_row_style(false, false);
     let idle_director = team_roster_row_style(false, false);
 
-    assert_eq!(hovered.bg, Some(SUBAGENT_PINK));
+    assert_eq!(hovered.bg, Some(SUBAGENT_PURPLE));
     assert_eq!(hovered.fg, Some(Color::Black));
     assert!(hovered.add_modifier.contains(Modifier::BOLD));
-    assert_eq!(focused.fg, Some(SUBAGENT_PINK));
+    assert_eq!(focused.fg, Some(SUBAGENT_PURPLE));
     assert_eq!(idle_subagent.fg, Some(Color::White));
     assert_eq!(idle_director.fg, Some(Color::White));
     assert_ne!(hovered, focused);
@@ -1347,18 +1350,18 @@ fn subagent_activity_rows_use_the_shared_hot_pink_identity_colour() {
         .find(|line| line.to_string().contains("/root/worker"))
         .expect("subagent activity row");
 
-    assert_eq!(line.spans.last().unwrap().style.fg, Some(SUBAGENT_PINK));
+    assert_eq!(line.spans.last().unwrap().style.fg, Some(SUBAGENT_PURPLE));
 }
 
 #[test]
 fn focused_subagent_status_preserves_semantic_failures_and_uses_pink_for_work() {
     assert_eq!(
         focused_subagent_status_color(SessionStatus::Running, true),
-        SUBAGENT_PINK
+        SUBAGENT_PURPLE
     );
     assert_eq!(
         focused_subagent_status_color(SessionStatus::Ready, true),
-        SUBAGENT_PINK
+        SUBAGENT_PURPLE
     );
     assert_eq!(
         focused_subagent_status_color(SessionStatus::Failed, true),

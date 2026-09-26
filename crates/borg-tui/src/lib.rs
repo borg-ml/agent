@@ -88,8 +88,8 @@ const HORIZONTAL_MARGIN: u16 = 0;
 const BORG_ORANGE: Color = Color::Rgb(255, 142, 36);
 const BORG_ORANGE_HOVER: Color = Color::Rgb(255, 184, 92);
 const RUNNING_STATUS_PEACH: Color = Color::Rgb(255, 132, 112);
-const SUBAGENT_PINK: Color = Color::Rgb(255, 160, 190);
-const GOAL_WATCH_PURPLE: Color = Color::Rgb(213, 126, 177);
+const SUBAGENT_PURPLE: Color = Color::Rgb(213, 126, 177);
+const WATCH_PURPLE: Color = Color::Rgb(213, 126, 177);
 const TODO_ORANGE: Color = Color::Rgb(255, 177, 76);
 const USER_LABEL_BLUE: Color = Color::Rgb(74, 163, 255);
 const USER_TEXT: Color = Color::Rgb(198, 228, 255);
@@ -8845,7 +8845,7 @@ impl BorgTerminal {
                         queued_prompt_lines(
                             queued_prompts.as_slice(),
                             chunks[1].width,
-                            self.focused_child.is_some().then_some(SUBAGENT_PINK),
+                            self.focused_child.is_some().then_some(SUBAGENT_PURPLE),
                         )
                     } else {
                         Vec::new()
@@ -8862,7 +8862,7 @@ impl BorgTerminal {
                                     chunks[1].width,
                                 ),
                                 if self.focused_child.is_some() {
-                                    SUBAGENT_PINK
+                                    SUBAGENT_PURPLE
                                 } else {
                                     BORG_ORANGE
                                 },
@@ -9070,11 +9070,7 @@ impl BorgTerminal {
                 status_spans.push(Span::styled(
                     goal_status,
                     Style::default()
-                        .fg(if highlight {
-                            Color::White
-                        } else {
-                            GOAL_WATCH_PURPLE
-                        })
+                        .fg(if highlight { Color::White } else { TODO_ORANGE })
                         .add_modifier(if highlight {
                             Modifier::BOLD | Modifier::UNDERLINED
                         } else {
@@ -9163,7 +9159,7 @@ impl BorgTerminal {
                 status_spans.push(Span::styled(
                     format!("{STATUS_SEPARATOR}to {name}"),
                     Style::default()
-                        .fg(SUBAGENT_PINK)
+                        .fg(SUBAGENT_PURPLE)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -9267,7 +9263,7 @@ impl BorgTerminal {
                                 .title(Span::styled(
                                     format!(" Team · {active_subagents} working "),
                                     Style::default()
-                                        .fg(SUBAGENT_PINK)
+                                        .fg(SUBAGENT_PURPLE)
                                         .add_modifier(Modifier::BOLD),
                                 )),
                         ),
@@ -9298,7 +9294,7 @@ impl BorgTerminal {
                 let (label, idle_color, idle_background) = if self.focused_tool.is_some() {
                     (" ← Back to thread ", BACKGROUND_RUNNING_TEXT, Color::Reset)
                 } else {
-                    (" ↩ Return ", SUBAGENT_PINK, COMMAND_PANEL_BG)
+                    (" ↩ Return ", SUBAGENT_PURPLE, COMMAND_PANEL_BG)
                 };
                 // Beside Jump to bottom on the status row, where every other
                 // control is.
@@ -9394,7 +9390,7 @@ impl BorgTerminal {
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
-                                .border_style(Style::default().fg(GOAL_WATCH_PURPLE))
+                                .border_style(Style::default().fg(TODO_ORANGE))
                                 .title(goal_tooltip_title(goal)),
                         ),
                     tooltip,
@@ -9556,7 +9552,7 @@ impl BorgTerminal {
                     .map(|(index, (row, _))| {
                         Line::from(format!("  {row}")).style(palette_row_style(
                             self.hovered_watch_row == Some(index),
-                            GOAL_WATCH_PURPLE,
+                            WATCH_PURPLE,
                         ))
                     })
                     .collect::<Vec<_>>();
@@ -9566,7 +9562,7 @@ impl BorgTerminal {
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
-                                .border_style(Style::default().fg(GOAL_WATCH_PURPLE))
+                                .border_style(Style::default().fg(WATCH_PURPLE))
                                 .title(" Watchers · click to stop "),
                         ),
                     tooltip,
@@ -9889,11 +9885,19 @@ impl BorgTerminal {
                     Block::default()
                         .style(Style::default().bg(Color::Rgb(20, 20, 22)))
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::DarkGray))
+                        .border_style(Style::default().fg(if picker.kind == PickerKind::Goal {
+                            TODO_ORANGE
+                        } else {
+                            Color::DarkGray
+                        }))
                         .title(Span::styled(
                             format!(" {} ", picker.title),
                             Style::default()
-                                .fg(Color::White)
+                                .fg(if picker.kind == PickerKind::Goal {
+                                    TODO_ORANGE
+                                } else {
+                                    Color::White
+                                })
                                 .add_modifier(Modifier::BOLD),
                         )),
                     popup,
@@ -9930,7 +9934,11 @@ impl BorgTerminal {
                         .style(if selected {
                             Style::default()
                                 .fg(Color::Rgb(0, 0, 0))
-                                .bg(BORG_ORANGE)
+                                .bg(if picker.kind == PickerKind::Goal {
+                                    TODO_ORANGE
+                                } else {
+                                    BORG_ORANGE
+                                })
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(Color::Gray)
@@ -11625,11 +11633,11 @@ fn team_roster_row_style(focused: bool, hovered: bool) -> Style {
     if hovered {
         Style::default()
             .fg(Color::Black)
-            .bg(SUBAGENT_PINK)
+            .bg(SUBAGENT_PURPLE)
             .add_modifier(Modifier::BOLD)
     } else if focused {
         Style::default()
-            .fg(SUBAGENT_PINK)
+            .fg(SUBAGENT_PURPLE)
             .bg(COMMAND_PANEL_BG)
             .add_modifier(Modifier::BOLD)
     } else {
@@ -12642,7 +12650,7 @@ fn focused_subagent_status_color(status: SessionStatus, focused_subagent: bool) 
             SessionStatus::WaitingForApproval | SessionStatus::Failed | SessionStatus::Stopped
         )
     {
-        SUBAGENT_PINK
+        SUBAGENT_PURPLE
     } else {
         session_status_color(status)
     }
@@ -12666,8 +12674,8 @@ fn transcript_action_color(kind: TranscriptActionKind, state: TranscriptActionSt
         return Color::Yellow;
     }
     match kind {
-        TranscriptActionKind::Agent => SUBAGENT_PINK,
-        TranscriptActionKind::Watch => GOAL_WATCH_PURPLE,
+        TranscriptActionKind::Agent => SUBAGENT_PURPLE,
+        TranscriptActionKind::Watch => WATCH_PURPLE,
         TranscriptActionKind::Approval | TranscriptActionKind::ProviderInteraction => Color::Yellow,
         TranscriptActionKind::Error => Color::LightRed,
     }
@@ -15574,7 +15582,7 @@ fn footer_shell_todo_metadata_line(
     let parts = [
         billing_status.map(|billing| (billing, Style::default().fg(billing_status_color(billing)))),
         shell_status.map(|shell| (shell, interactive_style(shell_hovered, USER_LABEL_BLUE))),
-        watch_status.map(|watch| (watch, interactive_style(watch_hovered, GOAL_WATCH_PURPLE))),
+        watch_status.map(|watch| (watch, interactive_style(watch_hovered, WATCH_PURPLE))),
         todo_status.map(|todo| (todo, interactive_style(todo_hovered, TODO_ORANGE))),
     ];
     let mut spans = Vec::new();
@@ -16951,13 +16959,21 @@ fn subagent_is_working(status: SubagentStatus) -> bool {
 
 fn agents_status_spinner_style(hovered: bool) -> Style {
     Style::default()
-        .fg(if hovered { Color::White } else { SUBAGENT_PINK })
+        .fg(if hovered {
+            Color::White
+        } else {
+            SUBAGENT_PURPLE
+        })
         .add_modifier(Modifier::BOLD)
 }
 
 fn agents_status_text_style(hovered: bool) -> Style {
     Style::default()
-        .fg(if hovered { Color::White } else { SUBAGENT_PINK })
+        .fg(if hovered {
+            Color::White
+        } else {
+            SUBAGENT_PURPLE
+        })
         .add_modifier(if hovered {
             Modifier::BOLD | Modifier::UNDERLINED
         } else {
