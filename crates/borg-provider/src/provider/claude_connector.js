@@ -183,10 +183,17 @@ async function infer(request, response, value) {
     for (let attempt = 0; attempt < 2; attempt++) {
       const client = await clientForCall();
       try {
-        const stream = await client.beta.messages.create(wire, {
+        const { data: stream, response: upstream } = await client.beta.messages.create(wire, {
           signal: controller.signal,
           headers: { 'X-Claude-Code-Session-Id': session_id, 'x-client-request-id': id },
+        }).withResponse();
+        const grace = ['5h', '7d'].map(window => {
+          const value = Number(upstream.headers.get(`anthropic-ratelimit-unified-grace-${window}-utilization`) ?? 0);
+          return Number.isFinite(value) && value > 0 ? value : 0;
         });
+        if (grace.some(value => value > 0)) {
+          await emit(response, { type: 'grace', id, five_hour: grace[0], weekly: grace[1] });
+        }
         for await (const event of stream) {
           receivedEvent = true;
           await emit(response, { type: 'event', id, event });

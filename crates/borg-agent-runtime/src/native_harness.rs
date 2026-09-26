@@ -706,6 +706,8 @@ impl NativeHarness {
                 payload: serde_json::to_value(&prefix)?,
             }).await.context("record model request prefix")?;
         }
+        let grace_wrapup = std::sync::atomic::AtomicBool::new(false);
+        let mut grace_prompted = false;
         let mut assistant_message_id = Uuid::new_v4();
         let mut model_round = 0_usize;
         let mut tool_round = 0_usize;
@@ -718,6 +720,10 @@ impl NativeHarness {
         let mut queued_steer: Vec<CapturedSteer> = Vec::new();
         loop {
             model_round += 1;
+            if grace_wrapup.load(std::sync::atomic::Ordering::Relaxed) && !grace_prompted {
+                messages.push(ModelMessage::user("Claude's 5-hour subscription limit has entered its server-reported wrap-up allowance. Finish only the work already in progress, save a recoverable checkpoint if needed, and report what remains. Do not start new tasks or spawn agents."));
+                grace_prompted = true;
+            }
             if model_round == 1
                 && let Some(window) = route_window_tokens
             {
@@ -766,6 +772,7 @@ impl NativeHarness {
                         events: &events,
                         controls: &mut controls,
                         queued_steer: &mut queued_steer,
+                        grace_wrapup: Some(&grace_wrapup),
                     },
                 )
                 .await
@@ -2846,6 +2853,7 @@ struct ModelStreamContext<'a> {
     /// here keeps the request alive so the tool call the model is still writing
     /// reaches execution; the caller admits and folds it at a safe boundary.
     queued_steer: &'a mut Vec<CapturedSteer>,
+    grace_wrapup: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 /// Close every tool-call row this stream opened but will not execute.
@@ -3140,6 +3148,12 @@ async fn call_model_streaming(
                     }
                 }
                 Some(ProviderProgress::ProviderEvent { kind, payload, .. }) => {
+                    if kind == "claude_usage_grace"
+                        && payload.get("five_hour").and_then(Value::as_f64).is_some_and(|v| v > 0.0)
+                        && let Some(flag) = context.grace_wrapup
+                    {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     send(context.events, SessionEventKind::ProviderEvent {
                         provider: context.coding_provider,
                         kind,
@@ -6227,6 +6241,7 @@ mod tests {
                     events: &events_tx,
                     controls: &mut controls,
                     queued_steer: &mut queued_steer,
+                    grace_wrapup: None,
                 },
             );
             tokio::pin!(call);
@@ -6359,6 +6374,7 @@ mod tests {
                 events: &events_tx,
                 controls: &mut controls,
                 queued_steer: &mut queued_steer,
+                grace_wrapup: None,
             },
         );
         tokio::pin!(call);
@@ -6400,6 +6416,7 @@ mod tests {
                 events: &events_tx,
                 controls: &mut controls,
                 queued_steer: &mut queued_steer,
+                grace_wrapup: None,
             },
         );
         let observe = async {
@@ -6538,6 +6555,7 @@ mod tests {
                 events: &events_tx,
                 controls: &mut controls,
                 queued_steer: &mut queued_steer,
+                grace_wrapup: None,
             },
         );
         tokio::pin!(call);
@@ -6630,6 +6648,7 @@ mod tests {
                 events: &events_tx,
                 controls: &mut controls,
                 queued_steer: &mut queued_steer,
+                grace_wrapup: None,
             },
         );
         tokio::pin!(call);
@@ -6649,6 +6668,66 @@ mod tests {
                 result.expect("quiet reasoning tail must flush without a later provider event");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn server_grace_signal_marks_only_an_active_claude_turn() {
+        let grace = std::sync::atomic::AtomicBool::new(false);
+        let client = CommentaryTailClient {
+            follow_up: Some(ProviderProgress::ProviderEvent {
+                kind: "claude_usage_grace".into(),
+                payload: json!({"five_hour": 0.2, "weekly": 0}),
+                raw_payload: Box::new(None),
+                stream_channel: None,
+                content_text: None,
+                provider_item_id: None,
+                tool_use_id: None,
+                tool_name: None,
+                model: None,
+                effort: None,
+            }),
+        };
+        let (events, mut receiver) = mpsc::channel(16);
+        let mut controls = None;
+        let mut queued_steer = Vec::new();
+        let call = call_model_streaming(
+            &client,
+            crate::CodingProvider::Claude,
+            "test-model",
+            None,
+            ModelTurnRequest {
+                fast: false,
+                request_id: None,
+                session_id: None,
+                prompt_cache_key: None,
+                turn_routing: Default::default(),
+                messages: vec![ModelMessage::user("finish")],
+                tools: Vec::new(),
+                output_schema: None,
+            },
+            ModelStreamContext {
+                coding_provider: crate::CodingProvider::Claude,
+                assistant_message_id: Uuid::new_v4(),
+                events: &events,
+                controls: &mut controls,
+                queued_steer: &mut queued_steer,
+                grace_wrapup: Some(&grace),
+            },
+        );
+        tokio::pin!(call);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                tokio::select! {
+                    _ = &mut call => panic!("model unexpectedly ended"),
+                    event = receiver.recv() => {
+                        if matches!(event, Some(SessionEventKind::ProviderEvent { kind, .. }) if kind == "claude_usage_grace") {
+                            break;
+                        }
+                    }
+                }
+            }
+        }).await.unwrap();
+        assert!(grace.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[derive(Clone)]
@@ -6746,6 +6825,7 @@ mod tests {
                     events: &events_tx,
                     controls: &mut controls,
                     queued_steer: &mut queued_steer,
+                    grace_wrapup: None,
                 },
             )
             .await
@@ -9094,6 +9174,7 @@ mod tests {
                 events: &events_tx,
                 controls: &mut controls,
                 queued_steer: &mut queued_steer,
+                grace_wrapup: None,
             },
         );
         let steer = async {
@@ -9197,6 +9278,7 @@ mod tests {
                 events: &events_tx,
                 controls: &mut controls,
                 queued_steer: &mut queued_steer,
+                grace_wrapup: None,
             },
         );
         let interrupt = async {
