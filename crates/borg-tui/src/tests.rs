@@ -11725,6 +11725,48 @@ fn projected_session_state_restores_status_config_outside_the_history_tail() {
 }
 
 #[test]
+fn assistant_message_header_reflects_its_turn_fast_mode() {
+    for (fast, expected) in [(true, "gpt-6-astra high fast"), (false, "gpt-6-astra high")] {
+        let session_id = Uuid::new_v4();
+        let mut transcript = Transcript::default();
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::TurnStarted {
+                message_id: Uuid::new_v4(),
+                provider: CodingProvider::Codex,
+                model: Some("gpt-6-astra".to_string()),
+                effort: Some("high".to_string()),
+                fast,
+            },
+        ));
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: "answer".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ));
+        assert!(
+            transcript
+                .render(100, None, None, None)
+                .0
+                .iter()
+                .any(|line| {
+                    line.spans
+                        .iter()
+                        .any(|span| span.content == format!("  {expected}"))
+                })
+        );
+    }
+}
+
+#[test]
 fn fast_mode_gets_its_own_status_segment_only_when_enabled() {
     let mut transcript = Transcript::default();
     transcript.seed_session_state(&SessionState {
@@ -13017,6 +13059,7 @@ fn active_turn_action_group_closes_after_completed_reply() {
         provider: CodingProvider::Claude,
         model: None,
         effort: None,
+        fast: false,
     });
     for _ in 0..4 {
         transcript.order.push(TranscriptEntry::Tool {
