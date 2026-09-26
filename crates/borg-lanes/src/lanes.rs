@@ -5553,6 +5553,13 @@ mod tests {
         // Grants per side. With the barrier's check and grant split over two
         // lock acquisitions this failed 10/10 runs (3/10 at 10 rounds).
         const ROUNDS: usize = 40;
+        // Losing the key is the normal outcome of the race, and the barrier
+        // side costs more per attempt than a build, so a fixed attempt budget
+        // is no liveness guarantee: on a loaded runner one side can be
+        // unscheduled for all of it and report zero. Bound each side by
+        // consecutive misses instead, which still trips when the other side
+        // genuinely wedges the key, and yield so a loser keeps its turn.
+        const MAX_CONSECUTIVE_MISSES: usize = 10_000;
         let dir = tempfile::tempdir().unwrap();
         let store = LaneStore::new(dir.path()).unwrap();
         let overlap = |store: &LaneStore| {
@@ -5568,8 +5575,9 @@ mod tests {
             let store = store.clone();
             std::thread::spawn(move || {
                 let mut held = 0;
-                for _ in 0..20 * ROUNDS {
-                    if held == ROUNDS {
+                let mut misses = 0;
+                while held < ROUNDS {
+                    if misses >= MAX_CONSECUTIVE_MISSES {
                         break;
                     }
                     if let RestartBarrier::Held(lease) = store
@@ -5577,19 +5585,24 @@ mod tests {
                         .unwrap()
                     {
                         held += 1;
+                        misses = 0;
                         // Release before asserting, so a failure cannot
                         // leave the other thread spinning behind a barrier.
                         let clash = overlap(&store);
                         store.release_lease(&lease).unwrap();
                         assert!(!clash, "a build was granted beside the barrier");
+                    } else {
+                        misses += 1;
+                        std::thread::yield_now();
                     }
                 }
                 held
             })
         };
         let mut builds = 0;
-        for _ in 0..20 * ROUNDS {
-            if builds == ROUNDS {
+        let mut misses = 0;
+        while builds < ROUNDS {
+            if misses >= MAX_CONSECUTIVE_MISSES {
                 break;
             }
             let ticket = store
@@ -5599,7 +5612,13 @@ mod tests {
             let clash = granted && overlap(&store);
             store.finish(ticket.id, 0, "test").unwrap();
             assert!(!clash, "the barrier was granted beside a build");
-            builds += usize::from(granted);
+            if granted {
+                builds += 1;
+                misses = 0;
+            } else {
+                misses += 1;
+                std::thread::yield_now();
+            }
         }
         let held = restarts.join().unwrap();
         assert_eq!(

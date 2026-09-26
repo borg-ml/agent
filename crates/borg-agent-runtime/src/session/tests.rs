@@ -13927,6 +13927,11 @@ async fn resumed_provider_turn_receives_team_messages_settled_while_idle() {
 
 #[tokio::test]
 async fn same_provider_model_switch_does_not_compact_reusable_context() {
+    // Each turn replays hundreds of kilobytes of prompt and reply through
+    // the journal and the session store, so a 5 s per-event wait is only a
+    // thin margin over a loaded debug-build runner. What this test asserts is
+    // compaction behaviour, not latency.
+    const EVENT_WAIT: Duration = Duration::from_secs(30);
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
@@ -13983,11 +13988,11 @@ async fn same_provider_model_switch_does_not_compact_reusable_context() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_WAIT, called.notified())
         .await
         .expect("first pooled turn completes");
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_WAIT, event_rx.recv())
             .await
             .expect("first model-switch turn remains live")
             .expect("session remains open");
@@ -14027,7 +14032,7 @@ async fn same_provider_model_switch_does_not_compact_reusable_context() {
     let mut observed_model_switch = false;
     let mut provider_input_compacted = false;
     let second_error = loop {
-        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_WAIT, event_rx.recv())
             .await
             .expect("model-switch turn remains live")
             .expect("session remains open");
