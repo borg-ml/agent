@@ -483,6 +483,7 @@ fn cache_window(provider: CodingProvider) -> Option<Duration> {
         | CodingProvider::Glm
         | CodingProvider::Qwen
         | CodingProvider::OpenRouter
+        | CodingProvider::Vercel
         | CodingProvider::OpenAiCompatible => None,
     }
 }

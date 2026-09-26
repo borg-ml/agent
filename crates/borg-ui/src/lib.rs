@@ -258,6 +258,16 @@ pub fn model_options(provider: CodingProvider, current: Option<&str>) -> Vec<Mod
         label: model.label,
         detail: model.detail,
     }));
+    options.extend(
+        borg_provider::vercel_model_entries()
+            .into_iter()
+            .map(|model| ModelOption {
+                provider: CodingProvider::Vercel,
+                id: model.id,
+                label: model.label,
+                detail: model.detail,
+            }),
+    );
     if provider == CodingProvider::Kimi {
         let id = borg_provider::kimi_product_model().to_string();
         options.push(ModelOption {

@@ -2271,9 +2271,10 @@ async fn run_local_agent_session(
                     CodingProvider::Codex => {
                         Some(borg_provider::codex_default_effort().to_string())
                     }
-                    // OpenRouter spans reasoning and non-reasoning models. Only send its
-                    // optional reasoning parameter after an explicit user selection.
-                    CodingProvider::OpenRouter => None,
+                    // OpenRouter and the Vercel gateway both span reasoning and
+                    // non-reasoning models. Only send the optional reasoning
+                    // parameter after an explicit user selection.
+                    CodingProvider::OpenRouter | CodingProvider::Vercel => None,
                     CodingProvider::OpenAiCompatible => None,
                     CodingProvider::Claude => {
                         Some(borg_provider::claude_default_effort().to_string())
@@ -2405,6 +2406,11 @@ async fn run_local_agent_session(
         tokio::spawn(async {
             if let Err(error) = borg_provider::refresh_openrouter_model_catalog().await {
                 tracing::debug!(%error, "OpenRouter model catalog unavailable; keeping current/manual model fallback");
+            }
+        });
+        tokio::spawn(async {
+            if let Err(error) = borg_provider::refresh_vercel_model_catalog().await {
+                tracing::debug!(%error, "Vercel AI Gateway model catalog unavailable; keeping current/manual model fallback");
             }
         });
     }
@@ -7992,6 +7998,7 @@ pub(crate) async fn login_command(
             CodingProvider::Grok,
             CodingProvider::Muse,
             CodingProvider::OpenRouter,
+            CodingProvider::Vercel,
             CodingProvider::Kimi,
             CodingProvider::Glm,
             CodingProvider::Qwen,
@@ -8019,7 +8026,7 @@ pub(crate) async fn login_command(
                 authenticate_provider(provider, ProviderAuthChoice::ReplaceApiKey).await?
             );
         }
-        CodingProvider::Anthropic | CodingProvider::OpenRouter => {
+        CodingProvider::Anthropic | CodingProvider::OpenRouter | CodingProvider::Vercel => {
             let path = prompt_and_store_api_key(provider)?;
             println!("{} API key saved to {}.", provider.label(), path.display());
         }
@@ -8105,6 +8112,9 @@ fn credential_guidance(provider: CodingProvider) -> &'static str {
             "`borg login anthropic` stores an Anthropic API key for the API lane"
         }
         CodingProvider::OpenRouter => "`borg login openrouter` stores an OpenRouter API key",
+        CodingProvider::Vercel => {
+            "`borg login vercel` stores a Vercel AI Gateway key (VERCEL_AI_GATEWAY_API_KEY)"
+        }
         CodingProvider::Kimi => "`borg login kimi` selects the Kimi Code plan and stores its key",
         CodingProvider::Glm => "`borg login glm` selects the GLM Coding Plan and stores its key",
         CodingProvider::Qwen => {
@@ -8125,6 +8135,7 @@ fn prompt_and_store_api_key(provider: CodingProvider) -> Result<PathBuf> {
         CodingProvider::Qwen => borg_provider::credentials::ApiKeyCredential::Qwen,
         CodingProvider::Claude => borg_provider::credentials::ApiKeyCredential::Anthropic,
         CodingProvider::OpenRouter => borg_provider::credentials::ApiKeyCredential::OpenRouter,
+        CodingProvider::Vercel => borg_provider::credentials::ApiKeyCredential::Vercel,
         other => anyhow::bail!("{} does not use a borg-managed API key", other.label()),
     };
     let key_label = if provider == CodingProvider::OpenCode {
@@ -8506,6 +8517,9 @@ fn default_model_for_provider(provider: CodingProvider) -> Option<String> {
         CodingProvider::Grok => Some(borg_provider::grok_product_model().to_string()),
         CodingProvider::Muse => Some(borg_provider::muse_product_model().to_string()),
         CodingProvider::OpenRouter => Some(borg_provider::openrouter_product_model().to_string()),
+        // No pinned default: the gateway fronts every vendor on it, and a
+        // guessed id would fail the first call instead of asking.
+        CodingProvider::Vercel => None,
         CodingProvider::OpenAiCompatible => std::env::var("BORG_OPENAI_COMPATIBLE_MODEL")
             .ok()
             .filter(|model| !model.trim().is_empty()),
@@ -10449,6 +10463,7 @@ fn provider_name(provider: CodingProvider) -> &'static str {
         CodingProvider::Glm => "glm",
         CodingProvider::Qwen => "qwen",
         CodingProvider::OpenRouter => "openrouter",
+        CodingProvider::Vercel => "vercel",
         CodingProvider::OpenAiCompatible => "openai-compatible",
     }
 }

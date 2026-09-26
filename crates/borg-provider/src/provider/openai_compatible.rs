@@ -81,6 +81,9 @@ pub enum OpenAiCompatibleProfile {
     /// OpenAI-compatible wire format.
     Qwen,
     OpenRouter,
+    /// Vercel AI Gateway: one OpenAI-compatible endpoint in front of every
+    /// vendor on the gateway.
+    Vercel,
     Generic,
 }
 
@@ -91,6 +94,7 @@ impl OpenAiCompatibleProfile {
             Self::Glm => "glm",
             Self::Qwen => "qwen",
             Self::OpenRouter => "openrouter",
+            Self::Vercel => "vercel",
             Self::Generic => "openai-compatible",
         }
     }
@@ -101,6 +105,7 @@ impl OpenAiCompatibleProfile {
             Self::Glm => glm_chat_completions_endpoint(),
             Self::Qwen => qwen_chat_completions_endpoint(),
             Self::OpenRouter => openrouter_chat_completions_endpoint(),
+            Self::Vercel => vercel_chat_completions_endpoint(),
             Self::Generic => chat_completions_endpoint(),
         }
     }
@@ -126,6 +131,9 @@ impl OpenAiCompatibleProfile {
             }
             Self::OpenRouter => {
                 crate::credentials::api_key(crate::credentials::ApiKeyCredential::OpenRouter)
+            }
+            Self::Vercel => {
+                crate::credentials::api_key(crate::credentials::ApiKeyCredential::Vercel)
             }
             Self::Generic => nonempty_env("BORG_OPENAI_COMPATIBLE_API_KEY")
                 .or_else(|| nonempty_env("BORG_OPENAI_API_KEY"))
@@ -329,6 +337,11 @@ impl OpenAiCompatibleProvider {
                     OpenAiCompatibleProfile::OpenRouter => {
                         "OPENROUTER_API_KEY is not set".to_string()
                     }
+                    OpenAiCompatibleProfile::Vercel => {
+                        "no Vercel AI Gateway key: run `borg login vercel` or set \
+                         VERCEL_AI_GATEWAY_API_KEY"
+                            .to_string()
+                    }
                     OpenAiCompatibleProfile::Generic => unreachable!(),
                 },
                 trace: Box::new(trace),
@@ -401,6 +414,11 @@ impl OpenAiCompatibleProvider {
                     body["max_tokens"] = json!(max_tokens);
                 }
             }
+            OpenAiCompatibleProfile::Vercel => {
+                if let Some(reasoning) = compatible_reasoning(self.effort.as_deref()) {
+                    body["reasoning"] = reasoning;
+                }
+            }
             OpenAiCompatibleProfile::Generic => {
                 if let Some(max_tokens) = openai_compatible_max_tokens() {
                     body["max_tokens"] = json!(max_tokens);
@@ -453,6 +471,8 @@ impl OpenAiCompatibleProvider {
                     nonempty_env("BORG_OPENROUTER_RESPONSE_FORMAT")
                         .or_else(|| Some("json_schema".to_string()))
                 }
+                OpenAiCompatibleProfile::Vercel => nonempty_env("BORG_VERCEL_RESPONSE_FORMAT")
+                    .or_else(|| Some("json_schema".to_string())),
                 OpenAiCompatibleProfile::Generic => {
                     nonempty_env("BORG_OPENAI_COMPATIBLE_RESPONSE_FORMAT")
                 }
@@ -671,6 +691,9 @@ request: {shape}"
                 duration_ms,
                 openrouter_cost_microusd(&streamed.raw),
             ),
+            OpenAiCompatibleProfile::Vercel => {
+                extract_chat_completions_usage(&streamed.raw, duration_ms, None)
+            }
             OpenAiCompatibleProfile::Generic => {
                 extract_chat_completions_usage(&streamed.raw, duration_ms, None)
             }
@@ -1306,6 +1329,17 @@ fn model_message_wire_value(message: &ModelMessage, deepseek_model: bool) -> Val
 fn chat_completions_endpoint() -> String {
     let base = nonempty_env("BORG_OPENAI_COMPATIBLE_BASE_URL")
         .unwrap_or_else(|| "http://127.0.0.1:8000/v1".to_string());
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
+}
+
+fn vercel_chat_completions_endpoint() -> String {
+    let base = nonempty_env("BORG_VERCEL_BASE_URL")
+        .unwrap_or_else(|| crate::runtime::VERCEL_GATEWAY_BASE_URL.to_string());
     let trimmed = base.trim_end_matches('/');
     if trimmed.ends_with("/chat/completions") {
         trimmed.to_string()

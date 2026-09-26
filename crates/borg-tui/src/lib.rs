@@ -2607,6 +2607,19 @@ fn model_picker_options_with_configured(
                 options.push(option);
             }
         }
+        Some(CodingProvider::Vercel) => {
+            for (index, model) in borg_provider::vercel_model_entries()
+                .into_iter()
+                .enumerate()
+            {
+                let mut option = PickerOption::new(model.label, model.id);
+                option.preview = model.detail;
+                if index == 0 {
+                    option.section = Some(CodingProvider::Vercel.label().to_string());
+                }
+                options.push(option);
+            }
+        }
         Some(CodingProvider::Kimi) => {
             options.push(PickerOption::new(
                 borg_provider::kimi_product_model(),
@@ -2731,6 +2744,24 @@ fn model_picker_options_with_configured(
             option.preview = model.detail;
             if index == 0 {
                 option.section = Some(CodingProvider::OpenRouter.label().to_string());
+            }
+            options.push(option);
+        }
+    }
+    // The gateway is open-ended rather than a compile-time catalog, and it is
+    // a first-class destination from every provider, so its cached catalog
+    // rides in the same picker. There is no single default model: the gateway
+    // fronts 260-odd vendors and pinning one would be a product decision the
+    // catalog does not make for us.
+    if provider != Some(CodingProvider::Vercel) {
+        for (index, model) in borg_provider::vercel_model_entries()
+            .into_iter()
+            .enumerate()
+        {
+            let mut option = PickerOption::new(model.label, model.id);
+            option.preview = model.detail;
+            if index == 0 {
+                option.section = Some(CodingProvider::Vercel.label().to_string());
             }
             options.push(option);
         }
