@@ -5737,7 +5737,7 @@ fn actionable_inactive_goals_remain_in_the_status_line() {
     ));
     assert_eq!(
         transcript.goal_status().as_deref(),
-        Some("⏸ paused /goal 2m")
+        Some("▮▮ paused /goal 2m")
     );
 
     goal.status = GoalStatus::Blocked;
@@ -5748,7 +5748,7 @@ fn actionable_inactive_goals_remain_in_the_status_line() {
     ));
     assert_eq!(
         transcript.goal_status().as_deref(),
-        Some("⏸ blocked /goal 2m")
+        Some("▮▮ blocked /goal 2m")
     );
 
     goal.status = GoalStatus::Complete;
@@ -5777,7 +5777,7 @@ fn goal_toggle_updates_the_visible_status_before_the_durable_event() {
         transcript.goal.as_ref().map(|goal| goal.status),
         Some(GoalStatus::Paused)
     );
-    assert_eq!(transcript.goal_status().as_deref(), Some("⏸ paused /goal"));
+    assert_eq!(transcript.goal_status().as_deref(), Some("▮▮ paused /goal"));
 
     assert!(transcript.optimistically_apply_goal_action(&GoalAction::Resume));
     assert_eq!(
