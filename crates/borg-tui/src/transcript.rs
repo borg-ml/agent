@@ -2808,6 +2808,27 @@ impl Transcript {
                     } else {
                         "Compacting context…"
                     };
+                    let progress_summary = if started
+                        && payload
+                            .get("context_source")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("estimated")
+                        && let (Some(tokens), Some(window)) = (
+                            payload
+                                .get("context_tokens_before")
+                                .and_then(serde_json::Value::as_u64),
+                            payload
+                                .get("effective_context_window_tokens")
+                                .and_then(serde_json::Value::as_u64),
+                        ) {
+                        format!(
+                            "{progress_summary} · local estimate {} / {} window",
+                            format_context_tokens(tokens),
+                            format_context_tokens(window)
+                        )
+                    } else {
+                        progress_summary.to_string()
+                    };
                     if let Some(TranscriptEntry::Compaction {
                         summary,
                         time,

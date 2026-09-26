@@ -11462,6 +11462,45 @@ fn mcp_resource_readiness_failures_are_static_and_compact() {
 }
 
 #[test]
+fn estimated_compaction_explains_trigger_without_replacing_measured_footer() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ContextWindowUpdated {
+            context_tokens: 189_910,
+            context_window_tokens: 258_400,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({
+                "status": "started",
+                "context_source": "estimated",
+                "context_tokens_before": 342857,
+                "effective_context_window_tokens": 258400
+            }),
+        },
+    ));
+    assert_eq!(transcript.context_remaining_percent, 28);
+    let rendered = transcript
+        .lines(120)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("local estimate 342.9k / 258.4k window"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn automatic_compaction_event_reports_work_in_progress() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
