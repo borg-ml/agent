@@ -45,3 +45,8 @@
 - Follow host-local disk guidance in `~/AGENTS.md` when present. Check headroom before large builds or copies; do not exhaust the space needed for durable journals.
 - Prefer reusable build directories, temporary Git worktrees/local clones, and APFS copy-on-write copies over recursively copying repositories with `.git`, build outputs, and saved work.
 - Keep delivery patches and evidence separate from disposable verification checkouts. Retire owned scratch only after verifying delivery is retained and no active process or pending workflow needs its paths. Never delete work owned by another worker, project saves, or session history as cache cleanup.
+
+## Performance diagnosis
+
+- Distinguish event creation time from delivery time: coalesced reasoning snapshots retain the reasoning block's start timestamp. Count the receiver backlog, not only replay queues, when diagnosing stream lag.
+- On Linux, an attach failure is not proof of a sandbox or seccomp filter. Check the exact error, Yama `ptrace_scope`, process ancestry and `/proc/self/status` first. Prefer launching an owned test process under the debugger/profiler, or in-process timing; do not weaken host ptrace policy to profile Borg.
