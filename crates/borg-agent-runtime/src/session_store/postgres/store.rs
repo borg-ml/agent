@@ -803,12 +803,10 @@ impl SessionStore for PostgresSessionStore {
         sequence: u64,
         limit: usize,
     ) -> Result<Vec<SessionEvent>> {
-        if self
-            .session_row(session_id)
-            .await?
-            .parent_session_id
-            .is_none()
-        {
+        // A fork's own rows keep their composed sequence numbers, so a cursor
+        // past the inherited prefix is a bounded query, not a full composition.
+        let session = self.session_row(session_id).await?;
+        if session.parent_session_id.is_none() || sequence >= session.inherited_event_count {
             return self
                 .events_query(
                     session_id,

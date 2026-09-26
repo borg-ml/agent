@@ -12971,6 +12971,55 @@ fn agent_lifecycle_rows_keep_one_continuous_actions_accordion() {
 }
 
 #[test]
+fn active_turn_action_group_closes_after_completed_reply() {
+    let mut transcript = Transcript::default();
+    transcript.active_turn = Some(ActiveTurnDisplayConfig {
+        message_id: Uuid::new_v4(),
+        provider: CodingProvider::Claude,
+        model: None,
+        effort: None,
+    });
+    for _ in 0..4 {
+        transcript.order.push(TranscriptEntry::Tool {
+            source_name: "Run".into(),
+            name: "Run".into(),
+            detail: "task".into(),
+            code_view: None,
+            output_view: None,
+            payload_refs: Vec::new(),
+            time: "19:38".into(),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            complete: true,
+            error: false,
+            user_interrupted: false,
+            backgrounded: false,
+            expanded: false,
+            outcome: None,
+            cwd: None,
+        });
+    }
+    transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::Assistant,
+        text: "reply".into(),
+        attachments: Vec::new(),
+        model: None,
+        effort: None,
+        time: "19:38".into(),
+        status: MessageStatus::InProgress,
+        complete: false,
+        user_interrupted: false,
+        redirected: false,
+    });
+    let windows = transcript.tool_run_windows();
+    assert_eq!(transcript.open_tool_run(&windows), Some(0));
+    if let TranscriptEntry::Message { complete, .. } = transcript.order.last_mut().unwrap() {
+        *complete = true;
+    }
+    assert_eq!(transcript.open_tool_run(&windows), None);
+}
+
+#[test]
 fn tool_run_scroll_only_consumes_wheel_events_while_it_can_move() {
     let mut transcript = Transcript::default();
     for index in 0..20 {

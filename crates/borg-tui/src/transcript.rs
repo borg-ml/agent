@@ -4893,13 +4893,23 @@ impl Transcript {
     /// The first entry whose rows may differ from `resume`'s render.
     /// The action group still being worked in. It stays open; finished groups
     /// fold to their summary header until clicked. The last group is open
-    /// while a turn runs or while nothing follows it.
+    /// until the next assistant message completes, or while nothing follows it.
     fn open_tool_run(&self, windows: &[Option<ToolRunWindow>]) -> Option<usize> {
         windows
             .iter()
             .flatten()
             .max_by_key(|window| window.start)
-            .filter(|window| self.active_turn.is_some() || window.end >= self.order.len())
+            .filter(|window| {
+                window.end >= self.order.len()
+                    || (self.active_turn.is_some()
+                        && !self.order[window.end..].iter().any(|entry| {
+                            matches!(entry, TranscriptEntry::Message {
+                                actor: EventActor::Assistant | EventActor::User,
+                                complete: true,
+                                ..
+                            })
+                        }))
+            })
             .map(|window| window.start)
     }
 
