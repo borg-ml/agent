@@ -583,11 +583,20 @@ struct ActiveTurnDisplayConfig {
     provider: CodingProvider,
     model: Option<String>,
     effort: Option<String>,
+    fast: bool,
 }
 
 impl ActiveTurnDisplayConfig {
     fn cache_signature(&self) -> CacheSignature {
         CacheSignature::for_session(self.provider, self.model.as_deref(), self.effort.as_deref())
+    }
+}
+
+fn display_message_effort(effort: Option<String>, fast: bool) -> Option<String> {
+    if fast {
+        Some(effort.map_or_else(|| "fast".to_string(), |effort| format!("{effort} fast")))
+    } else {
+        effort
     }
 }
 
@@ -1000,6 +1009,7 @@ impl Transcript {
                 provider: config.provider,
                 model: config.model.clone(),
                 effort: config.effort.clone(),
+                fast: config.fast,
             });
         }
     }
@@ -1783,13 +1793,14 @@ impl Transcript {
                 provider,
                 model,
                 effort,
-                ..
+                fast,
             } => {
                 self.active_turn = Some(ActiveTurnDisplayConfig {
                     message_id: *message_id,
                     provider: *provider,
                     model: model.clone(),
                     effort: effort.clone(),
+                    fast: *fast,
                 });
             }
             SessionEventKind::UsageUpdated {
@@ -2070,18 +2081,18 @@ impl Transcript {
                 } else {
                     let attachments =
                         number_message_attachments(text, attachments, &mut self.next_image_number);
-                    let (model, effort) = if *actor == EventActor::Assistant {
+                    let (model, effort, fast) = if *actor == EventActor::Assistant {
                         self.active_turn
                             .as_ref()
-                            .map(|turn| (turn.model.clone(), turn.effort.clone()))
+                            .map(|turn| (turn.model.clone(), turn.effort.clone(), turn.fast))
                             .or_else(|| {
                                 self.config
                                     .as_ref()
-                                    .map(|config| (config.model.clone(), config.effort.clone()))
+                                    .map(|config| (config.model.clone(), config.effort.clone(), config.fast))
                             })
                             .unwrap_or_default()
                     } else {
-                        (None, None)
+                        (None, None, false)
                     };
                     if *status != MessageStatus::Queued
                         && matches!(actor, EventActor::User | EventActor::Assistant)
@@ -2124,7 +2135,7 @@ impl Transcript {
                             text: text.clone(),
                             attachments,
                             model,
-                            effort,
+                            effort: display_message_effort(effort, fast),
                             time: event_time,
                             status: *status,
                             complete: matches!(
@@ -3313,14 +3324,14 @@ impl Transcript {
         }
         self.finish_reasoning(event.created_at);
         self.collapse_previous_edit();
-        let (model, effort) = self
+        let (model, effort, fast) = self
             .active_turn
             .as_ref()
-            .map(|turn| (turn.model.clone(), turn.effort.clone()))
+            .map(|turn| (turn.model.clone(), turn.effort.clone(), turn.fast))
             .or_else(|| {
                 self.config
                     .as_ref()
-                    .map(|config| (config.model.clone(), config.effort.clone()))
+                    .map(|config| (config.model.clone(), config.effort.clone(), config.fast))
             })
             .unwrap_or_default();
         let time = self.message_event_time(event);
@@ -3330,7 +3341,7 @@ impl Transcript {
             text: String::new(),
             attachments: Vec::new(),
             model,
-            effort,
+            effort: display_message_effort(effort, fast),
             time,
             status: MessageStatus::InProgress,
             complete: false,
