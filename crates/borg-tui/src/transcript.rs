@@ -512,12 +512,19 @@ fn render_clock_key(entry: &TranscriptEntry, now: DateTime<Utc>) -> (Option<Stri
         TranscriptEntry::Tool {
             started_at,
             completed_at,
+            code_view,
             ..
         } => (
             format_tool_elapsed_at(*started_at, *completed_at, now),
-            completed_at.map_or(0, |completed_at| {
-                reasoning_summary_rotation_phase(completed_at, now)
-            }),
+            completed_at
+                .zip(code_view.as_ref())
+                .filter(|(_, (language, _))| language == "reasoning")
+                .and_then(|(completed_at, (_, source))| {
+                    rotating_reasoning_summary_lines(source).map(|lines| {
+                        reasoning_summary_rotation_phase(lines.len(), completed_at, now)
+                    })
+                })
+                .unwrap_or(0),
         ),
         TranscriptEntry::Goal { goal, .. } => {
             (format_elapsed_duration(goal_live_seconds(goal, now)), 0)
@@ -902,11 +909,17 @@ fn rotating_reasoning_summary_lines(source: &str) -> Option<Vec<&str>> {
     (lines.len() > 1).then_some(lines)
 }
 
-fn reasoning_summary_rotation_phase(completed_at: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
+/// Steps through the summary titles once, then rests on the last one.
+fn reasoning_summary_rotation_phase(
+    lines: usize,
+    completed_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> i64 {
     now.signed_duration_since(completed_at)
         .num_milliseconds()
         .max(0)
         .div_euclid(REASONING_SUMMARY_ROTATION_MILLIS)
+        .min(lines.saturating_sub(1) as i64)
 }
 
 fn tool_has_expandable_body(
@@ -4676,7 +4689,7 @@ impl Transcript {
         (language == "reasoning")
             .then(|| rotating_reasoning_summary_lines(source))
             .flatten()
-            .map(|_| reasoning_summary_rotation_phase(*completed_at, now))
+            .map(|lines| reasoning_summary_rotation_phase(lines.len(), *completed_at, now))
     }
 
     fn running_tool_timer_tick_at(&self, now: DateTime<Utc>) -> Option<i64> {
@@ -5955,9 +5968,12 @@ impl Transcript {
                         code_view.as_ref().and_then(|(_, source)| {
                             rotating_reasoning_summary_lines(source).and_then(|lines| {
                                 completed_at.map(|completed_at| {
-                                    let phase =
-                                        reasoning_summary_rotation_phase(completed_at, render_time);
-                                    reasoning_preview(lines[phase as usize % lines.len()])
+                                    let phase = reasoning_summary_rotation_phase(
+                                        lines.len(),
+                                        completed_at,
+                                        render_time,
+                                    );
+                                    reasoning_preview(lines[phase as usize])
                                 })
                             })
                         })
@@ -6556,7 +6572,7 @@ mod parallel_preparation_tests {
     use super::*;
 
     #[test]
-    fn completed_reasoning_cycles_distinct_summary_lines_without_changing_expanded_source() {
+    fn completed_reasoning_steps_through_summary_lines_once_and_rests_on_the_last() {
         let session_id = Uuid::new_v4();
         let completed_at = Utc::now();
         let source = "**Waiting on external session.**\n**Awaiting session expiry.**\n**Awaiting session expiry.**\n**Running candidate tests.**";
@@ -6576,7 +6592,8 @@ mod parallel_preparation_tests {
             (0, "Waiting on external session."),
             (2, "Awaiting session expiry."),
             (4, "Running candidate tests."),
-            (6, "Waiting on external session."),
+            (6, "Running candidate tests."),
+            (60, "Running candidate tests."),
         ] {
             let rendered = transcript
                 .render_for_cache_at(100, 30, completed_at + chrono::Duration::seconds(seconds))
