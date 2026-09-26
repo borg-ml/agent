@@ -4960,8 +4960,7 @@ impl Transcript {
         {
             start = start.min(*run);
         }
-        // Running tools and cycling reasoning summaries can tick anywhere in
-        // history, not only in the changed tail.
+        // Running tools can tick anywhere in history, not only in the changed tail.
         if let Some(row) = resume
             .trace
             .clock_rows
