@@ -6024,6 +6024,14 @@ impl BorgTerminal {
                 } else {
                     None
                 };
+                // A popup over a terminal-protocol image can leave stale cells in
+                // the image placement after the popup closes. Repaint that frame.
+                if previous_hover.todo_status_hovered
+                    && !self.todo_status_hovered
+                    && !self.image_protocols.is_empty()
+                {
+                    self.terminal.clear()?;
+                }
                 self.event_redraw_needed |= hover_state_changed(previous_hover, self.hover_state());
                 if !background_hover_suppressed
                     && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
