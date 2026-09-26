@@ -1674,7 +1674,13 @@ impl NativeHarness {
         };
         let result = match self
             .model_client
-            .model_turn(provider, model, effort, request, None)
+            .model_turn(
+                provider,
+                model,
+                internal_compaction_effort(provider, effort),
+                request,
+                None,
+            )
             .await
         {
             Ok(result) => result,
@@ -1959,9 +1965,13 @@ fn internal_compaction_effort(
     provider: crate::CodingProvider,
     effort: Option<&str>,
 ) -> Option<&str> {
-    if provider == crate::CodingProvider::Codex && matches!(effort, Some("max" | "xhigh" | "ultra"))
-    {
-        Some("high")
+    if provider == crate::CodingProvider::Codex {
+        // Checkpoint serialization is not another planning turn. Inheriting
+        // xhigh made a cache-hit compaction spend nearly ten minutes generating.
+        match effort {
+            Some("none" | "off" | "minimal" | "low") => effort,
+            _ => Some("low"),
+        }
     } else {
         effort
     }
@@ -5047,7 +5057,7 @@ mod tests {
                 request: ModelTurnRequest,
                 _: Option<mpsc::UnboundedSender<ProviderProgress>>,
             ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
-                assert_eq!(effort, Some("high"));
+                assert_eq!(effort, Some("low"));
                 assert_eq!(request.prompt_cache_key.as_deref(), Some("lineage-key"));
                 assert_eq!(request.tools.len(), 1);
                 assert_eq!(
@@ -5325,7 +5335,7 @@ mod tests {
                 request: ModelTurnRequest,
                 _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
             ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
-                assert_eq!(effort, Some("high"));
+                assert_eq!(effort, Some("low"));
                 assert_eq!(request.messages.len(), 2);
                 assert!(request.tools.is_empty());
                 assert!(request.messages.iter().all(|message| matches!(
@@ -7972,7 +7982,10 @@ mod tests {
         };
         let (events_tx, mut events_rx) = mpsc::channel(256);
         let task = tokio::spawn(async move {
-            if provider == crate::CodingProvider::Claude {
+            if matches!(
+                provider,
+                crate::CodingProvider::Claude | crate::CodingProvider::Codex
+            ) {
                 harness.run_bound(turn, events_tx, None, Vec::new()).await
             } else {
                 harness.run(turn, events_tx, None).await
@@ -8169,11 +8182,18 @@ mod tests {
                 &self,
                 _provider: crate::CodingProvider,
                 _model: &str,
-                _effort: Option<&str>,
+                effort: Option<&str>,
                 request: ModelTurnRequest,
                 _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
             ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
                 let id = request.request_id.clone().unwrap_or_default();
+                if id.starts_with("compact:") {
+                    assert_eq!(
+                        effort,
+                        Some("low"),
+                        "compaction must not inherit the work effort"
+                    );
+                }
                 self.requests.lock().unwrap().push(request);
                 let (content, tool_calls) = if id.ends_with(":1") {
                     let call = ModelToolCall::function(
@@ -8210,7 +8230,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (events, completed) = run_turn_events(
             client.clone(),
-            crate::CodingProvider::OpenRouter,
+            crate::CodingProvider::Codex,
             root.path().to_path_buf(),
             Uuid::new_v4(),
             Vec::new(),
