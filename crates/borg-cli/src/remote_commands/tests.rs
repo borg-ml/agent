@@ -3669,3 +3669,17 @@ fn detached_host_tracks_session_switch_and_revert_without_replaying_launch_promp
     );
     assert_eq!(detached_host_target(None, Some(resumed), true), None);
 }
+
+#[test]
+fn explicit_provider_model_choice_preserves_unlisted_model_ids() {
+    assert_eq!(
+        super::provider_model_choice("codex gpt-5.6-terra"),
+        Some((CodingProvider::Codex, "gpt-5.6-terra".to_string()))
+    );
+    assert_eq!(
+        super::provider_model_choice("claude experimental-model"),
+        Some((CodingProvider::Claude, "experimental-model".to_string()))
+    );
+    assert_eq!(super::provider_model_choice("codex "), None);
+    assert_eq!(super::provider_model_choice("unknown model"), None);
+}
