@@ -49,14 +49,17 @@ with default parallelism to catch races hidden by the serial workspace gate.
 - Build and smoke-test every supported platform archive.
 - Test fresh install, upgrade, interrupted update, and next-launch recovery.
 - Verify the Borg binary and bundled native provider together.
-- Install the draft archive on a canary host and exercise one real provider
-  session before publishing the draft.
+- Install the candidate archive on a canary host and exercise one real provider
+  session before tagging the release.
 
 ## Publication
 
 - Create the version tag only after the release candidate and notes are
-  approved. The tag workflow builds a draft release; inspect its assets and
-  checksums, then publish that draft only with explicit approval.
+  approved. The tag workflow attaches every platform archive and its checksum
+  to a draft release, then publishes that draft in the same run once the upload
+  completes, so a release never appears without its assets. A workflow run that
+  fails leaves the release a draft; re-run it for the same tag to finish, and
+  the run refuses to touch a release that is already published.
 
 ## Rollback
 

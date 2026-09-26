@@ -226,7 +226,7 @@ jobs:
           path: |
             borg-${{ matrix.target }}.*
 
-  stage_draft:
+  publish_release:
     needs: [validate, build]
     runs-on: ubuntu-latest
     permissions:
@@ -263,3 +263,12 @@ jobs:
           files: artifacts/*
           body_path: release-notes.md
           draft: true
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The release is staged as a draft so it never becomes public
+          # before every platform archive is attached.
+          gh release edit "$RELEASE_TAG" --draft=false
+          echo "Published $RELEASE_TAG"

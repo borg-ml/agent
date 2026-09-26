@@ -69,11 +69,11 @@ verify:
 gui-check:
     cargo check -p borg-gui --locked
 
-# Bump, verify, commit, tag, and stage a draft release. Defaults to the next patch.
+# Bump, verify, commit, tag, and publish the release. Defaults to the next patch.
 release version="":
     ./scripts/release.sh {{ quote(version) }}
 
-# Bump the minor component, reset the patch component, and stage a draft release.
+# Bump the minor component, reset the patch component, and publish the release.
 release-minor version="":
     ./scripts/release.sh --minor {{ quote(version) }}
 
