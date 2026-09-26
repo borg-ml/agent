@@ -13053,14 +13053,16 @@ fn agent_lifecycle_rows_keep_one_continuous_actions_accordion() {
 
 #[test]
 fn active_turn_action_group_closes_after_completed_reply() {
-    let mut transcript = Transcript::default();
-    transcript.active_turn = Some(ActiveTurnDisplayConfig {
-        message_id: Uuid::new_v4(),
-        provider: CodingProvider::Claude,
-        model: None,
-        effort: None,
-        fast: false,
-    });
+    let mut transcript = Transcript {
+        active_turn: Some(ActiveTurnDisplayConfig {
+            message_id: Uuid::new_v4(),
+            provider: CodingProvider::Claude,
+            model: None,
+            effort: None,
+            fast: false,
+        }),
+        ..Transcript::default()
+    };
     for _ in 0..4 {
         transcript.order.push(TranscriptEntry::Tool {
             source_name: "Run".into(),
