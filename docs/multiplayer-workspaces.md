@@ -131,6 +131,24 @@ delivery remains pending. Read cursors are per participant and thread.
 
 ## Shared work
 
+Plans and shared todos use one underlying work record. The shared backlog contains
+workspace work; an agent's plan is its ordered assigned subset. Selecting an agent
+shows that agent's plan, not a second checklist. Goals remain objectives above the
+work rather than another copy of the todos.
+
+Create and assign a todo in one operation. An intentionally omitted assignee leaves
+it in the unassigned backlog; agents can claim backlog work and a coordinating
+agent can reassign it. Assignment is distinct from execution: assigned work may be
+pending, in progress, blocked, awaiting review, or completed. Dependencies and
+parent/subtask relationships remain attached to the same work IDs.
+
+`get_plan` reads the assigned view; `update_plan` edits those shared work records
+and their order. Removing an item from the plan unassigns it without deleting its
+history or dependencies. Updates check the observed revision so a stale plan cannot
+silently discard a newer assignment. Only one item per assignee may be in progress.
+Session plan events and UI state are rebuildable read projections, not independent
+sources of task ownership or status.
+
 Messages carry discussion; typed events carry coordination:
 
 - work item created, claimed, released, blocked, completed, or reviewed;
@@ -326,11 +344,13 @@ assumptions. `multiplayer`, `subagents`, `autonomous_team`, `shared_work`,
 `agent.toml`. Disabling a parent capability cascades to its dependents:
 
 - `subagents = false` also makes autonomous teams inactive;
-- `multiplayer = false` also makes shared work and presence inactive;
+- `multiplayer = false` disables shared-work collaboration and presence; private
+  todo storage remains part of the core agent;
 - `cloud_sync = false` also makes the web relay inactive.
 
 The core local agent, journal, goal/plan tools, replay, authorization, and
-provider adapters continue to work. A disabled capability must not initialize
+provider adapters continue to work. Private plans use the same work model without
+starting discovery, broadcasts, or a second task store. A disabled capability must not initialize
 its database, coordinator, network client, background task, tool catalog, or UI
 queries. `borg capabilities` reports the effective state and dependency reason
 for every capability; `borg capabilities --json` exposes the same

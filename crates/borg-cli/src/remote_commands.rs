@@ -4203,8 +4203,8 @@ async fn run_local_agent_session(
                         SessionEventKind::GoalCleared { .. } => {
                             current_goal = None;
                         }
-                        SessionEventKind::PlanUpdated { items } => {
-                            current_todos = items.clone();
+                        SessionEventKind::PlanUpdated { .. } | SessionEventKind::PlanProjected { .. } => {
+                            current_todos = delivered_projection.state().todos.clone();
                         }
                         SessionEventKind::SessionConfigured {
                             provider: configured_provider,
@@ -7181,18 +7181,19 @@ async fn run_local_agent_session(
                         } else if matches!(line, "/todo" | "/todos" | "/todo view" | "/todos view")
                             && attachments.is_empty()
                         {
-                            terminal
-                                .as_mut()
-                                .expect("terminal")
-                                .show_plan(&current_todos);
+                            let terminal = terminal.as_mut().expect("terminal");
+                            let items = terminal.selected_plan().to_vec();
+                            terminal.show_plan(&items);
                         } else if (line.starts_with("/todo ") || line.starts_with("/todos "))
                             && attachments.is_empty()
                         {
-                            match parse_todo_action(line, &current_todos) {
+                            let selected = terminal.as_ref().expect("terminal");
+                            let target_session_id = selected.focused_child().unwrap_or(session_id);
+                            match parse_todo_action(line, selected.selected_plan()) {
                                 Ok(action) => {
                                     dispatch_ui_command(
                                         &ui_interaction_tx,
-                                        HostCommand::Todo { session_id, action },
+                                        borg_ui::todo_host_command(session_id, target_session_id, action),
                                     );
                                 }
                                 Err(error) => terminal.as_mut().expect("terminal").set_notice(error.to_string()),
@@ -10437,6 +10438,8 @@ fn print_todos(items: &[PlanItem]) {
     for item in items {
         let marker = match item.status {
             PlanItemStatus::Pending => "○",
+            PlanItemStatus::Blocked => "⊘ blocked ·",
+            PlanItemStatus::AwaitingReview => "◇ awaiting review ·",
             PlanItemStatus::InProgress => "◉",
             PlanItemStatus::Completed => "●",
         };
@@ -10766,7 +10769,7 @@ fn render_event(
             println!("  Conversation context cleared");
             io::stdout().flush()?;
         }
-        SessionEventKind::PlanUpdated { items } => {
+        SessionEventKind::PlanUpdated { items } | SessionEventKind::PlanProjected { items, .. } => {
             let completed = items
                 .iter()
                 .filter(|item| item.status == PlanItemStatus::Completed)
@@ -10811,6 +10814,7 @@ fn remote_command_name(command: &HostCommand) -> &'static str {
         HostCommand::RespondToProviderInteraction { .. } => "provider interaction response",
         HostCommand::Goal { .. } => "goal",
         HostCommand::Todo { .. } => "todo",
+        HostCommand::AgentTodo { .. } => "agent_todo",
         HostCommand::ExtensionCommand { .. } => "extension command",
         HostCommand::Subagent { .. } => "subagent",
         HostCommand::Interrupt { .. } => "interrupt",

@@ -5930,8 +5930,8 @@ fn todo_status_counts_open_items_and_tooltip_matches_plan_order_and_clipping() {
     assert_eq!(rows.len(), MAX_COLLAPSED_PLAN_ITEMS + 1);
     assert!(rows[0].starts_with("●  "));
     assert!(rows[0].contains("Ship the hover affordance"));
-    assert!(rows[1].starts_with("○  "));
-    assert!(rows[1].contains("Run the regression tests"));
+    assert!(rows[1].starts_with("✓  "));
+    assert!(rows[1].contains("Keep the completed item visible"));
     assert!(
         rows.last()
             .is_some_and(|row| row.contains("click to expand"))
@@ -13825,7 +13825,7 @@ fn reasoning_completion_freezes_thinking_duration_before_a_delayed_tool() {
 }
 
 #[test]
-fn rich_plan_orders_active_work_first_and_mutes_completed_work() {
+fn rich_plan_preserves_authoritative_order_and_mutes_completed_work() {
     let mut transcript = Transcript::default();
     transcript.order.push(TranscriptEntry::Plan {
         items: vec![
@@ -13860,7 +13860,7 @@ fn rich_plan_orders_active_work_first_and_mutes_completed_work() {
     let in_progress = find("Working now");
     let pending = find("Still to do");
     let completed = find("Already done");
-    assert!(in_progress < pending && pending < completed);
+    assert!(completed < pending && pending < in_progress);
     let in_progress_marker = lines[in_progress]
         .spans
         .iter()
@@ -17386,4 +17386,182 @@ fn status_number_shortcuts_use_platform_modifier_not_generic_super() {
         status_focus_shortcut(&KeyEvent::new(KeyCode::Char('x'), expected)),
         None
     );
+}
+
+#[test]
+fn projected_plan_preserves_order_and_statuses_and_rejects_legacy_replay() {
+    let session = Uuid::new_v4();
+    let participant_id = Uuid::new_v4();
+    let items: Vec<_> = [
+        ("Finished first", PlanItemStatus::Completed),
+        ("Blocked second", PlanItemStatus::Blocked),
+        ("Review third", PlanItemStatus::AwaitingReview),
+        ("Pending fourth", PlanItemStatus::Pending),
+        ("Active fifth", PlanItemStatus::InProgress),
+    ]
+    .into_iter()
+    .map(|(content, status)| PlanItem {
+        id: Uuid::new_v4(),
+        content: content.into(),
+        status,
+    })
+    .collect();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::PlanProjected {
+            participant_id,
+            items: items.clone(),
+            workspace_revision: 10,
+        },
+    ));
+    let text = transcript
+        .lines(120)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("blocked") && text.contains("awaiting review"),
+        "{text}"
+    );
+    let positions: Vec<_> = items
+        .iter()
+        .map(|item| text.find(&item.content).unwrap())
+        .collect();
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
+    transcript.apply(&SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::PlanUpdated { items: Vec::new() },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session,
+        3,
+        SessionEventKind::PlanProjected {
+            participant_id,
+            items: Vec::new(),
+            workspace_revision: 9,
+        },
+    ));
+    assert_eq!(transcript.todos, items);
+    assert_eq!(transcript.plan_workspace_revision, Some(10));
+    let mut director = None;
+    replace_root_transcript_history(
+        &mut transcript,
+        &mut director,
+        false,
+        &[SessionEvent::new(
+            session,
+            1,
+            SessionEventKind::PlanUpdated { items: Vec::new() },
+        )],
+    );
+    assert_eq!(transcript.todos, items);
+    assert_eq!(transcript.plan_workspace_revision, Some(10));
+}
+
+#[test]
+fn projected_stopped_child_plan_targets_only_the_selected_agent() {
+    let child = Uuid::new_v4();
+    let participant_id = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let items = vec![PlanItem {
+        id: Uuid::new_v4(),
+        content: "Assigned while stopped".into(),
+        status: PlanItemStatus::Blocked,
+    }];
+    let mut displayed = Transcript::default();
+    let mut children = HashMap::new();
+    assert!(!apply_child_plan_projection(
+        &mut displayed,
+        &mut children,
+        None,
+        child,
+        &borg_remote::AgentPlanProjection {
+            participant_id,
+            items: items.clone(),
+            workspace_revision: 5
+        },
+        String::new()
+    ));
+    assert!(displayed.todos.is_empty());
+    assert_eq!(children[&child].todos, items);
+    let mut director = None;
+    switch_to_child_transcript(&mut displayed, &mut director, &mut children, child);
+    let mut newer = items.clone();
+    newer[0].status = PlanItemStatus::AwaitingReview;
+    assert!(apply_child_plan_projection(
+        &mut displayed,
+        &mut children,
+        Some(child),
+        child,
+        &borg_remote::AgentPlanProjection {
+            participant_id,
+            items: newer.clone(),
+            workspace_revision: 6
+        },
+        String::new()
+    ));
+    assert!(!apply_child_plan_projection(
+        &mut displayed,
+        &mut children,
+        Some(child),
+        other,
+        &borg_remote::AgentPlanProjection {
+            participant_id,
+            items: Vec::new(),
+            workspace_revision: 7
+        },
+        String::new()
+    ));
+    assert_eq!(displayed.todos, newer);
+    assert_eq!(displayed.plan_workspace_revision, Some(6));
+    assert!(director.as_ref().unwrap().todos.is_empty());
+    assert!(!apply_child_plan_projection(
+        &mut displayed,
+        &mut children,
+        Some(child),
+        child,
+        &borg_remote::AgentPlanProjection {
+            participant_id,
+            items: items.clone(),
+            workspace_revision: 5
+        },
+        String::new()
+    ));
+    assert_eq!(displayed.todos, newer);
+}
+
+#[test]
+fn authoritative_plan_identity_change_accepts_lower_revision_but_not_old_history() {
+    let session = Uuid::new_v4();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    let event = |participant_id, workspace_revision, sequence, content: &str| {
+        SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::PlanProjected {
+                participant_id,
+                workspace_revision,
+                items: vec![PlanItem {
+                    id: Uuid::new_v4(),
+                    content: content.into(),
+                    status: PlanItemStatus::Pending,
+                }],
+            },
+        )
+    };
+    let old = event(a, 9, 1, "old participant");
+    transcript.apply(&old);
+    transcript.apply(&event(b, 2, 2, "new participant"));
+    assert_eq!(transcript.plan_participant_id, Some(b));
+    assert_eq!(transcript.plan_workspace_revision, Some(2));
+    let mut director = None;
+    replace_root_transcript_history(&mut transcript, &mut director, false, &[old]);
+    assert_eq!(transcript.plan_participant_id, Some(b));
+    assert_eq!(transcript.todos[0].content, "new participant");
 }

@@ -18,9 +18,10 @@ use std::path::Path;
 
 use crate::workspace::{
     AgentInstance, Audience, DeliveryAttempt, DeliveryMode, DeliveryState, DirectoryInstance,
-    Participant, ParticipantKind, PresenceLease, RecipientDelivery, Thread, Workspace,
-    WorkspaceEvent, WorkspaceEventKind, WorkspaceMembership, WorkspaceMessage, WorkspaceRole,
-    WorkspaceRosterEntry, WorkspaceStore, canonical_event, resolve_recipients,
+    Participant, ParticipantKind, PresenceLease, RecipientDelivery, Thread, WorkItem, WorkPatch,
+    WorkPlanUpdate, WorkSnapshot, WorkStatus, Workspace, WorkspaceEvent, WorkspaceEventKind,
+    WorkspaceMembership, WorkspaceMessage, WorkspaceRole, WorkspaceRosterEntry, WorkspaceStore,
+    canonical_event, resolve_recipients,
 };
 
 /// The durable workspace projection, backed by PostgreSQL.
@@ -67,6 +68,134 @@ impl PostgresWorkspaceStore {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    async fn apply_work_event(
+        transaction: &mut Transaction<'_, Postgres>,
+        snapshot: &mut WorkSnapshot,
+        event: &WorkspaceEvent,
+    ) -> Result<()> {
+        let previous: std::collections::HashMap<_, _> = snapshot
+            .items
+            .iter()
+            .map(|item| (item.work.id, item.work.assignee_id))
+            .collect();
+        snapshot.apply(event)?;
+        let mut assignees = std::collections::HashSet::new();
+        for item in snapshot
+            .items
+            .iter()
+            .filter(|item| item.updated_sequence == event.sequence)
+        {
+            if let Some(assignee) = item.work.assignee_id {
+                assignees.insert(assignee);
+            }
+            if let Some(Some(assignee)) = previous.get(&item.work.id) {
+                assignees.insert(*assignee);
+            }
+        }
+        if let WorkspaceEventKind::WorkPlanUpdated { assignee_id, .. }
+        | WorkspaceEventKind::WorkPlanMigrated { assignee_id, .. } = &event.kind
+        {
+            assignees.insert(*assignee_id);
+        }
+        for assignee in assignees {
+            sqlx::query("insert into workspace_work_plan_revisions(workspace_id,assignee_id,revision) values($1,$2,$3) on conflict(workspace_id,assignee_id) do update set revision=greatest(workspace_work_plan_revisions.revision,excluded.revision)")
+                .bind(event.workspace_id.to_string()).bind(assignee.to_string()).bind(i64::try_from(event.sequence)?).execute(&mut **transaction).await?;
+        }
+        Ok(())
+    }
+    async fn plan_revision(
+        transaction: &mut Transaction<'_, Postgres>,
+        workspace_id: Uuid,
+        assignee_id: Uuid,
+    ) -> Result<u64> {
+        let revision: Option<i64> = sqlx::query_scalar("select revision from workspace_work_plan_revisions where workspace_id=$1 and assignee_id=$2")
+            .bind(workspace_id.to_string()).bind(assignee_id.to_string()).fetch_optional(&mut **transaction).await?;
+        Ok(u64::try_from(revision.unwrap_or(0))?)
+    }
+    async fn work_snapshot(
+        transaction: &mut Transaction<'_, Postgres>,
+        workspace_id: Uuid,
+    ) -> Result<WorkSnapshot> {
+        let row = sqlx::query(
+            "select work_projection_version, work_revision from workspaces where id=$1",
+        )
+        .bind(workspace_id.to_string())
+        .fetch_one(&mut **transaction)
+        .await?;
+        let mut snapshot = WorkSnapshot::default();
+        if row.try_get::<i32, _>("work_projection_version")? < 2 {
+            let rows = sqlx::query("select event_json from workspace_events where workspace_id=$1 and event_json::jsonb #>> '{kind,type}' in ('work_created','work_claimed','work_assigned','work_updated','work_plan_updated','work_plan_migrated','dependency_declared','review_requested','review_recorded') order by sequence")
+                .bind(workspace_id.to_string()).fetch_all(&mut **transaction).await?;
+            for row in rows {
+                let event: WorkspaceEvent = serde_json::from_str(row.try_get("event_json")?)?;
+                Self::apply_work_event(transaction, &mut snapshot, &event).await?;
+                if let WorkspaceEventKind::WorkPlanMigrated {
+                    source_session_id, ..
+                } = &event.kind
+                {
+                    sqlx::query("insert into workspace_plan_migrations(workspace_id,source_session_id,event_id) values($1,$2,$3) on conflict(workspace_id,source_session_id) do nothing")
+                        .bind(workspace_id.to_string()).bind(source_session_id.to_string()).bind(event.id.to_string()).execute(&mut **transaction).await?;
+                }
+            }
+            Self::persist_work_snapshot(transaction, workspace_id, &snapshot, 0).await?;
+            sqlx::query("update workspaces set work_projection_version=2 where id=$1")
+                .bind(workspace_id.to_string())
+                .execute(&mut **transaction)
+                .await?;
+        } else {
+            snapshot.revision = u64::try_from(row.try_get::<i64, _>("work_revision")?)?;
+            let rows = sqlx::query("select item_json from workspace_work_items where workspace_id=$1 and item_json is not null order by created_sequence, work_id")
+                .bind(workspace_id.to_string()).fetch_all(&mut **transaction).await?;
+            for row in rows {
+                snapshot
+                    .items
+                    .push(serde_json::from_str(row.try_get("item_json")?)?);
+            }
+        }
+        snapshot
+            .items
+            .sort_by_key(|item| (item.work.position, item.created_sequence, item.work.id));
+        Ok(snapshot)
+    }
+
+    async fn persist_work_snapshot(
+        transaction: &mut Transaction<'_, Postgres>,
+        workspace_id: Uuid,
+        snapshot: &WorkSnapshot,
+        after: u64,
+    ) -> Result<()> {
+        for item in snapshot
+            .items
+            .iter()
+            .filter(|item| item.updated_sequence > after)
+        {
+            sqlx::query("insert into workspace_work_items(workspace_id,work_id,created_sequence,item_json,updated_sequence) values($1,$2,$3,$4,$5) on conflict(workspace_id,work_id) do update set item_json=excluded.item_json, updated_sequence=excluded.updated_sequence")
+                .bind(workspace_id.to_string()).bind(item.work.id.to_string()).bind(i64::try_from(item.created_sequence)?)
+                .bind(serde_json::to_string(item)?).bind(i64::try_from(item.updated_sequence)?)
+                .execute(&mut **transaction).await?;
+            if let (Some(assignee), Some(assignment)) = (item.work.assignee_id, item.assignment_id)
+            {
+                sqlx::query("insert into workspace_work_claims(workspace_id,work_id,claim_id,claimant_id,sequence) values($1,$2,$3,$4,$5) on conflict(workspace_id,work_id) do update set claim_id=excluded.claim_id,claimant_id=excluded.claimant_id,sequence=excluded.sequence")
+                    .bind(workspace_id.to_string()).bind(item.work.id.to_string()).bind(assignment.to_string()).bind(assignee.to_string()).bind(i64::try_from(item.updated_sequence)?)
+                    .execute(&mut **transaction).await?;
+            } else {
+                sqlx::query(
+                    "delete from workspace_work_claims where workspace_id=$1 and work_id=$2",
+                )
+                .bind(workspace_id.to_string())
+                .bind(item.work.id.to_string())
+                .execute(&mut **transaction)
+                .await?;
+            }
+        }
+        sqlx::query("update workspaces set work_revision=$2 where id=$1")
+            .bind(workspace_id.to_string())
+            .bind(i64::try_from(snapshot.revision)?)
+            .execute(&mut **transaction)
+            .await?;
+        Ok(())
     }
 
     async fn members(
@@ -235,15 +364,50 @@ impl PostgresWorkspaceStore {
             .bind(event.workspace_id.to_string())
             .fetch_one(&mut *transaction)
             .await?;
-        if let Some(existing) = Self::existing_event(&mut transaction, &event, &canonical).await? {
-            transaction.commit().await?;
-            return Ok(existing);
-        }
         let members = self.members(&mut transaction, event.workspace_id).await?;
         ensure!(
             members.iter().any(|(id, _)| *id == event.author_id),
             "author is not a workspace member"
         );
+        if let WorkspaceEventKind::WorkPlanMigrated {
+            source_session_id,
+            assignee_id,
+            ..
+        } = &event.kind
+        {
+            let role = members
+                .iter()
+                .find(|(id, _)| *id == event.author_id)
+                .map(|(_, role)| *role)
+                .context("author is not a workspace member")?;
+            ensure!(
+                matches!(
+                    role,
+                    WorkspaceRole::Owner | WorkspaceRole::Admin | WorkspaceRole::Editor
+                ) || (role == WorkspaceRole::Contributor && *assignee_id == event.author_id),
+                "only assignee or director may migrate plan"
+            );
+            ensure!(
+                members.iter().any(|(id, _)| id == assignee_id),
+                "assignee is not a workspace member"
+            );
+            Self::work_snapshot(&mut transaction, event.workspace_id).await?;
+            let existing: Option<String> = sqlx::query_scalar("select e.event_json from workspace_plan_migrations m join workspace_events e on e.id=m.event_id and e.workspace_id=m.workspace_id where m.workspace_id=$1 and m.source_session_id=$2")
+                .bind(event.workspace_id.to_string()).bind(source_session_id.to_string()).fetch_optional(&mut *transaction).await?;
+            if let Some(existing) = existing {
+                let existing: WorkspaceEvent = serde_json::from_str(&existing)?;
+                ensure!(
+                    matches!(&existing.kind, WorkspaceEventKind::WorkPlanMigrated { assignee_id: target, .. } if target == assignee_id),
+                    "legacy plan belongs to another assignee"
+                );
+                transaction.commit().await?;
+                return Ok(existing);
+            }
+        }
+        if let Some(existing) = Self::existing_event(&mut transaction, &event, &canonical).await? {
+            transaction.commit().await?;
+            return Ok(existing);
+        }
         Self::validate(&mut transaction, &event, &members, validate_references).await?;
 
         // The mode is what a delivery records; the audience only decides who
@@ -252,6 +416,10 @@ impl PostgresWorkspaceStore {
             WorkspaceEventKind::Message { message, mode } => (*mode, message.audience.clone()),
             WorkspaceEventKind::SessionEvent { mode, .. }
             | WorkspaceEventKind::WorkCreated { mode, .. }
+            | WorkspaceEventKind::WorkAssigned { mode, .. }
+            | WorkspaceEventKind::WorkUpdated { mode, .. }
+            | WorkspaceEventKind::WorkPlanUpdated { mode, .. }
+            | WorkspaceEventKind::WorkPlanMigrated { mode, .. }
             | WorkspaceEventKind::ArtifactPublished { mode, .. }
             | WorkspaceEventKind::DecisionRecorded { mode, .. }
             | WorkspaceEventKind::WorkClaimed { mode, .. }
@@ -267,6 +435,20 @@ impl PostgresWorkspaceStore {
         event.sequence = u64::try_from(sequence)?;
         Self::insert_event(&mut transaction, &event, &canonical).await?;
         Self::apply_side_effects(&mut transaction, &event, sequence).await?;
+        if is_work_event(&event.kind) {
+            let mut snapshot = Self::work_snapshot(&mut transaction, event.workspace_id).await?;
+            let previous = snapshot.revision;
+            Self::apply_work_event(&mut transaction, &mut snapshot, &event).await?;
+            Self::persist_work_snapshot(&mut transaction, event.workspace_id, &snapshot, previous)
+                .await?;
+            if let WorkspaceEventKind::WorkPlanMigrated {
+                source_session_id, ..
+            } = &event.kind
+            {
+                sqlx::query("insert into workspace_plan_migrations(workspace_id,source_session_id,event_id) values($1,$2,$3)")
+                    .bind(event.workspace_id.to_string()).bind(source_session_id.to_string()).bind(event.id.to_string()).execute(&mut *transaction).await?;
+            }
+        }
         let is_message = matches!(&event.kind, WorkspaceEventKind::Message { .. });
         // The author is a member but not a recipient of their own event.
         let recipients: Vec<Uuid> = recipients
@@ -286,6 +468,197 @@ impl PostgresWorkspaceStore {
         Ok(event)
     }
 
+    async fn validate_work(
+        transaction: &mut Transaction<'_, Postgres>,
+        event: &WorkspaceEvent,
+        members: &[(Uuid, WorkspaceRole)],
+    ) -> Result<()> {
+        if !is_work_event(&event.kind) {
+            return Ok(());
+        }
+        let role = members
+            .iter()
+            .find(|(id, _)| *id == event.author_id)
+            .map(|(_, role)| *role)
+            .context("author is not a workspace member")?;
+        ensure!(role != WorkspaceRole::Viewer, "viewer cannot change work");
+        let director = matches!(
+            role,
+            WorkspaceRole::Owner | WorkspaceRole::Admin | WorkspaceRole::Editor
+        );
+        let snapshot = Self::work_snapshot(transaction, event.workspace_id).await?;
+        let item = |id| {
+            snapshot
+                .items
+                .iter()
+                .find(|item| item.work.id == id)
+                .context("work item is not in workspace")
+        };
+        let member = |id| -> Result<()> {
+            ensure!(
+                members.iter().any(|(member, _)| *member == id),
+                "assignee is not a workspace member"
+            );
+            Ok(())
+        };
+        let edit = |id| -> Result<()> {
+            ensure!(
+                director || item(id)?.work.assignee_id == Some(event.author_id),
+                "only assignee or director may edit work"
+            );
+            Ok(())
+        };
+        match &event.kind {
+            WorkspaceEventKind::WorkCreated { work, .. } => {
+                if let Some(assignee) = work.assignee_id {
+                    member(assignee)?;
+                    ensure!(
+                        director || assignee == event.author_id,
+                        "only director may assign another participant"
+                    );
+                }
+            }
+            WorkspaceEventKind::WorkAssigned {
+                work_id,
+                assignee_id,
+                expected_assignment_id,
+                ..
+            } => {
+                let current = item(*work_id)?;
+                ensure!(
+                    current.assignment_id == *expected_assignment_id,
+                    "atomic claim conflict"
+                );
+                if let Some(assignee) = assignee_id {
+                    member(*assignee)?;
+                }
+                ensure!(
+                    director
+                        || (current.work.assignee_id == Some(event.author_id)
+                            && (assignee_id.is_none() || *assignee_id == Some(event.author_id)))
+                        || (current.work.assignee_id.is_none()
+                            && *assignee_id == Some(event.author_id)),
+                    "only director may reassign another participant's work"
+                );
+            }
+            WorkspaceEventKind::WorkClaimed { claim, .. } => {
+                let current = item(claim.work_id)?;
+                ensure!(
+                    current.assignment_id == claim.expected_claim_id,
+                    "atomic claim conflict"
+                );
+                ensure!(
+                    director
+                        || (claim.claimant_id == event.author_id
+                            && (current.work.assignee_id.is_none()
+                                || current.work.assignee_id == Some(event.author_id))),
+                    "only director may reassign another participant's work"
+                );
+            }
+            WorkspaceEventKind::WorkUpdated {
+                work_id,
+                expected_revision,
+                ..
+            } => {
+                edit(*work_id)?;
+                ensure!(
+                    item(*work_id)?.revision == *expected_revision,
+                    "work revision conflict"
+                );
+            }
+            WorkspaceEventKind::WorkPlanUpdated {
+                assignee_id,
+                expected_revision,
+                items,
+                ..
+            } => {
+                ensure!(
+                    director || *assignee_id == event.author_id,
+                    "only director may edit another participant plan"
+                );
+                member(*assignee_id)?;
+                ensure!(
+                    Self::plan_revision(transaction, event.workspace_id, *assignee_id).await?
+                        == *expected_revision,
+                    "work revision conflict"
+                );
+                let mut ids = std::collections::HashSet::new();
+                for update in items {
+                    ensure!(
+                        !update.content.trim().is_empty() && update.content.chars().count() <= 500,
+                        "plan content must contain 1-500 characters"
+                    );
+                    if let Some(id) = update.id {
+                        ensure!(ids.insert(id), "duplicate plan work id");
+                        ensure!(
+                            item(id)?.work.assignee_id == Some(*assignee_id),
+                            "plan item is not assigned to author"
+                        );
+                    }
+                }
+            }
+            WorkspaceEventKind::WorkPlanMigrated {
+                assignee_id, items, ..
+            } => {
+                ensure!(
+                    director || *assignee_id == event.author_id,
+                    "only director may migrate another participant plan"
+                );
+                member(*assignee_id)?;
+                let mut ids = std::collections::HashSet::new();
+                for update in items {
+                    if let Some(id) = update.id {
+                        ensure!(ids.insert(id), "duplicate legacy work id");
+                    }
+                }
+            }
+            WorkspaceEventKind::DependencyDeclared { dependency, .. } => {
+                edit(dependency.work_id)?;
+                let cyclic: bool = sqlx::query_scalar("with recursive edges(id) as (select depends_on_work_id from workspace_work_dependencies where workspace_id=$1 and work_id=$2 union select d.depends_on_work_id from workspace_work_dependencies d join edges e on d.work_id=e.id where d.workspace_id=$1) select exists(select 1 from edges where id=$3)")
+                    .bind(event.workspace_id.to_string()).bind(dependency.depends_on_work_id.to_string()).bind(dependency.work_id.to_string()).fetch_one(&mut **transaction).await?;
+                ensure!(!cyclic, "work dependency cycle");
+            }
+            WorkspaceEventKind::ReviewRequested { request, .. } => edit(request.work_id)?,
+            WorkspaceEventKind::ReviewRecorded { review, .. } => ensure!(
+                director || review.reviewer_id == event.author_id,
+                "reviewer must be author"
+            ),
+            _ => {}
+        }
+        let mut candidate = snapshot;
+        candidate.apply(event)?;
+        let mut active = std::collections::HashSet::new();
+        for item in &candidate.items {
+            ensure!(
+                !item.work.title.trim().is_empty(),
+                "work title must not be empty"
+            );
+            if item.work.status == WorkStatus::InProgress {
+                let assignee = item
+                    .work
+                    .assignee_id
+                    .context("in-progress work requires an assignee")?;
+                ensure!(
+                    active.insert(assignee),
+                    "only one in-progress item per assignee"
+                );
+            }
+            let mut seen = std::collections::HashSet::from([item.work.id]);
+            let mut parent = item.work.parent_id;
+            while let Some(id) = parent {
+                ensure!(seen.insert(id), "work parent cycle");
+                parent = candidate
+                    .items
+                    .iter()
+                    .find(|item| item.work.id == id)
+                    .context("parent work is not in workspace")?
+                    .work
+                    .parent_id;
+            }
+        }
+        Ok(())
+    }
+
     /// Validate an event against the workspace's current state.
     ///
     /// The workspace conformance suite asserts these checks; anywhere this
@@ -297,6 +670,7 @@ impl PostgresWorkspaceStore {
         validate_references: bool,
     ) -> Result<()> {
         let workspace_id = event.workspace_id;
+        Self::validate_work(transaction, event, members).await?;
         match &event.kind {
             WorkspaceEventKind::WorkCreated { work, .. } => {
                 ensure!(
@@ -366,25 +740,6 @@ impl PostgresWorkspaceStore {
                 ensure!(
                     members.iter().any(|(id, _)| *id == claim.claimant_id),
                     "claimant is not a workspace member"
-                );
-                // Compare-and-set: the caller states which claim it believes is
-                // current, so two claimants cannot both win.
-                let current: Option<String> = sqlx::query_scalar(
-                    "select claim_id from workspace_work_claims \
-                     where workspace_id = $1 and work_id = $2",
-                )
-                .bind(workspace_id.to_string())
-                .bind(claim.work_id.to_string())
-                .fetch_optional(&mut **transaction)
-                .await?;
-                ensure!(
-                    current.as_deref()
-                        == claim
-                            .expected_claim_id
-                            .as_ref()
-                            .map(Uuid::to_string)
-                            .as_deref(),
-                    "atomic claim conflict"
                 );
             }
             WorkspaceEventKind::DependencyDeclared { dependency, .. } => {
@@ -492,6 +847,155 @@ impl PostgresWorkspaceStore {
 
 #[async_trait::async_trait]
 impl WorkspaceStore for PostgresWorkspaceStore {
+    async fn work_items(
+        &self,
+        workspace_id: Uuid,
+        viewer_id: Uuid,
+        assignee_id: Option<Uuid>,
+    ) -> Result<WorkSnapshot> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("select id from workspaces where id=$1 for update")
+            .bind(workspace_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+        let members = self.members(&mut tx, workspace_id).await?;
+        ensure!(
+            members.iter().any(|(id, _)| *id == viewer_id),
+            "viewer is not a workspace member"
+        );
+        let mut snapshot = Self::work_snapshot(&mut tx, workspace_id).await?;
+        if let Some(assignee) = assignee_id {
+            snapshot.revision = Self::plan_revision(&mut tx, workspace_id, assignee).await?;
+        }
+        tx.commit().await?;
+        if let Some(assignee) = assignee_id {
+            snapshot
+                .items
+                .retain(|item| item.work.assignee_id == Some(assignee));
+        }
+        Ok(snapshot)
+    }
+    async fn update_work_plan(
+        &self,
+        workspace_id: Uuid,
+        actor_id: Uuid,
+        assignee_id: Uuid,
+        idempotency_key: String,
+        expected_revision: u64,
+        items: Vec<WorkPlanUpdate>,
+    ) -> Result<WorkSnapshot> {
+        self.append(work_event(
+            workspace_id,
+            actor_id,
+            idempotency_key,
+            WorkspaceEventKind::WorkPlanUpdated {
+                assignee_id,
+                expected_revision,
+                items,
+                mode: DeliveryMode::Notify,
+            },
+        ))
+        .await?;
+        self.work_items(workspace_id, actor_id, Some(assignee_id))
+            .await
+    }
+    async fn assign_work(
+        &self,
+        workspace_id: Uuid,
+        actor_id: Uuid,
+        work_id: Uuid,
+        assignee_id: Option<Uuid>,
+        expected_assignment_id: Option<Uuid>,
+        idempotency_key: String,
+    ) -> Result<WorkItem> {
+        self.append(work_event(
+            workspace_id,
+            actor_id,
+            idempotency_key,
+            WorkspaceEventKind::WorkAssigned {
+                work_id,
+                assignee_id,
+                expected_assignment_id,
+                mode: DeliveryMode::Notify,
+            },
+        ))
+        .await?;
+        self.work_items(workspace_id, actor_id, None)
+            .await?
+            .items
+            .into_iter()
+            .find(|item| item.work.id == work_id)
+            .context("assigned work missing")
+    }
+    async fn update_work(
+        &self,
+        workspace_id: Uuid,
+        actor_id: Uuid,
+        work_id: Uuid,
+        expected_revision: Uuid,
+        patch: WorkPatch,
+        idempotency_key: String,
+    ) -> Result<WorkItem> {
+        self.append(work_event(
+            workspace_id,
+            actor_id,
+            idempotency_key,
+            WorkspaceEventKind::WorkUpdated {
+                work_id,
+                expected_revision,
+                patch,
+                mode: DeliveryMode::Notify,
+            },
+        ))
+        .await?;
+        self.work_items(workspace_id, actor_id, None)
+            .await?
+            .items
+            .into_iter()
+            .find(|item| item.work.id == work_id)
+            .context("updated work missing")
+    }
+    async fn legacy_plan_migrated(
+        &self,
+        workspace_id: Uuid,
+        viewer_id: Uuid,
+        source_session_id: Uuid,
+    ) -> Result<bool> {
+        let migrated: Option<bool> = sqlx::query_scalar("select exists(select 1 from workspace_plan_migrations where workspace_id=$1 and source_session_id=$3) from workspace_members where workspace_id=$1 and participant_id=$2")
+            .bind(workspace_id.to_string()).bind(viewer_id.to_string()).bind(source_session_id.to_string()).fetch_optional(&self.pool).await?;
+        migrated.context("viewer is not a workspace member")
+    }
+    async fn ensure_legacy_plan_migrated(
+        &self,
+        workspace_id: Uuid,
+        actor_id: Uuid,
+        assignee_id: Uuid,
+        source_session_id: Uuid,
+        items: Vec<crate::PlanItem>,
+    ) -> Result<WorkSnapshot> {
+        let items = items
+            .into_iter()
+            .map(|item| WorkPlanUpdate {
+                id: Some(item.id),
+                content: item.content,
+                status: item.status,
+            })
+            .collect();
+        self.append(work_event(
+            workspace_id,
+            actor_id,
+            format!("legacy-plan:{source_session_id}"),
+            WorkspaceEventKind::WorkPlanMigrated {
+                source_session_id,
+                assignee_id,
+                items,
+                mode: DeliveryMode::Notify,
+            },
+        ))
+        .await?;
+        self.work_items(workspace_id, actor_id, Some(assignee_id))
+            .await
+    }
     async fn create_participant(&self, participant: Participant) -> Result<()> {
         sqlx::query(
             "insert into workspace_participants (id, display_name, kind, created_at) \
@@ -842,7 +1346,7 @@ impl WorkspaceStore for PostgresWorkspaceStore {
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let mut transaction = self.pool.begin().await?;
-        // The workspace itself is never overwritten; participants and roles are
+        // The workspace itself is never overwritten; participant names are
         // refreshed, so relaunching a session updates display names without
         // duplicating membership.
         sqlx::query(
@@ -885,7 +1389,7 @@ impl WorkspaceStore for PostgresWorkspaceStore {
             sqlx::query(
                 "insert into workspace_members (workspace_id, participant_id, role, joined_at) \
                  values ($1, $2, $3, $4) \
-                 on conflict (workspace_id, participant_id) do update set role = excluded.role",
+                 on conflict (workspace_id, participant_id) do nothing",
             )
             .bind(workspace_id.to_string())
             .bind(participant_id.to_string())
@@ -1524,5 +2028,41 @@ impl WorkspaceStore for PostgresWorkspaceStore {
                 })
             })
             .collect()
+    }
+}
+
+fn is_work_event(kind: &WorkspaceEventKind) -> bool {
+    matches!(
+        kind,
+        WorkspaceEventKind::WorkCreated { .. }
+            | WorkspaceEventKind::WorkClaimed { .. }
+            | WorkspaceEventKind::WorkAssigned { .. }
+            | WorkspaceEventKind::WorkUpdated { .. }
+            | WorkspaceEventKind::WorkPlanUpdated { .. }
+            | WorkspaceEventKind::WorkPlanMigrated { .. }
+            | WorkspaceEventKind::DependencyDeclared { .. }
+            | WorkspaceEventKind::ReviewRequested { .. }
+            | WorkspaceEventKind::ReviewRecorded { .. }
+    )
+}
+
+fn work_event(
+    workspace_id: Uuid,
+    author_id: Uuid,
+    idempotency_key: String,
+    kind: WorkspaceEventKind,
+) -> WorkspaceEvent {
+    let id = Uuid::new_v5(
+        &workspace_id,
+        format!("work:{author_id}:{idempotency_key}").as_bytes(),
+    );
+    WorkspaceEvent {
+        id,
+        workspace_id,
+        sequence: 0,
+        author_id,
+        idempotency_key,
+        created_at: Utc::now(),
+        kind,
     }
 }

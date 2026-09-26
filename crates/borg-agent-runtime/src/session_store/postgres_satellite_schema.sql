@@ -298,3 +298,21 @@ create table if not exists host_operation_queue (
 create index if not exists idx_host_operation_queue_host_live
     on host_operation_queue (host_id, sequence)
     where quarantine_reason is null;
+
+-- Rebuildable current work view; workspace events remain the authority.
+alter table workspaces add column if not exists work_projection_version integer not null default 0;
+alter table workspaces add column if not exists work_revision bigint not null default 0;
+alter table workspace_work_items add column if not exists item_json text;
+alter table workspace_work_items add column if not exists updated_sequence bigint not null default 0;
+create table if not exists workspace_plan_migrations (
+    workspace_id text not null references workspaces(id) on delete cascade,
+    source_session_id text not null,
+    event_id text not null,
+    primary key(workspace_id, source_session_id)
+);
+create table if not exists workspace_work_plan_revisions (
+    workspace_id text not null references workspaces(id) on delete cascade,
+    assignee_id text not null references workspace_participants(id),
+    revision bigint not null,
+    primary key(workspace_id, assignee_id)
+);

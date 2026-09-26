@@ -7654,25 +7654,37 @@ async fn fresh_idle_session_has_one_durable_lifecycle() {
     while let Some(event) = event_rx.recv().await {
         observed.push(event);
     }
-    assert_eq!(observed.len(), 5);
-    assert!(matches!(observed[0].kind, SessionEventKind::SessionStarted));
+    assert!(
+        observed
+            .iter()
+            .any(|event| matches!(event.kind, SessionEventKind::PlanProjected { .. }))
+    );
+    let lifecycle: Vec<_> = observed
+        .iter()
+        .filter(|event| !matches!(event.kind, SessionEventKind::PlanProjected { .. }))
+        .collect();
+    assert_eq!(lifecycle.len(), 5);
     assert!(matches!(
-        observed[1].kind,
+        lifecycle[0].kind,
+        SessionEventKind::SessionStarted
+    ));
+    assert!(matches!(
+        lifecycle[1].kind,
         SessionEventKind::SessionConfigured { .. }
     ));
     assert!(matches!(
-        observed[2].kind,
+        lifecycle[2].kind,
         SessionEventKind::EffectiveCapabilitiesUpdated { .. }
     ));
     assert!(matches!(
-        observed[3].kind,
+        lifecycle[3].kind,
         SessionEventKind::StatusChanged {
             status: SessionStatus::Ready,
             ..
         }
     ));
     assert!(matches!(
-        observed[4].kind,
+        lifecycle[4].kind,
         SessionEventKind::StatusChanged {
             status: SessionStatus::Stopped,
             ..
@@ -7889,7 +7901,12 @@ async fn the_session_store_runs_the_canonical_session_actor() {
         observed.push(event);
     }
     let stored = store.read(session_id).await.unwrap();
-    assert_eq!(stored.len(), 5);
+    assert_eq!(stored.len(), 6);
+    assert!(
+        stored
+            .iter()
+            .any(|event| matches!(event.kind, SessionEventKind::PlanProjected { .. }))
+    );
     assert_eq!(
         stored
             .iter()
@@ -20196,5 +20213,906 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
     actor.await.unwrap().unwrap();
 
     assert_eq!(*seen.lock().unwrap(), vec![Some(expected)]);
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn workspace_plan_rejects_stale_replacement_and_unassigns_without_deleting() {
+    let session_id = Uuid::new_v4();
+    let (scratch, store, mut journal) = runtime_store(session_id).await;
+    let binding = store.workspace_binding(session_id).await.unwrap().unwrap();
+    let work_store = store.workspace_store().await.unwrap().unwrap();
+    let actor = Uuid::new_v4();
+    work_store
+        .ensure_execution_workspace(
+            binding.workspace_id,
+            "test",
+            Uuid::new_v4(),
+            "human",
+            actor,
+            "custom agent",
+        )
+        .await
+        .unwrap();
+    let mut plan = SessionWorkPlan {
+        session_id,
+        actor_id: actor,
+        store: Arc::clone(&work_store),
+        workspace_id: binding.workspace_id,
+        participant_id: actor,
+        observed_revision: None,
+    };
+    let (events, mut received) = mpsc::channel(32);
+    let first = apply_model_todo_request(
+        &mut journal,
+        &events,
+        session_id,
+        &mut plan,
+        SessionTodoToolRequest::Update {
+            items: vec![TodoItemUpdate {
+                id: None,
+                content: "first".into(),
+                status: PlanItemStatus::Pending,
+            }],
+            expected_revision: None,
+        },
+    )
+    .await
+    .unwrap();
+    let director = Uuid::new_v4();
+    work_store
+        .ensure_execution_workspace(
+            binding.workspace_id,
+            "test",
+            Uuid::new_v4(),
+            "human",
+            director,
+            "director",
+        )
+        .await
+        .unwrap();
+    let director_snapshot = work_store
+        .work_items(binding.workspace_id, director, Some(director))
+        .await
+        .unwrap();
+    work_store
+        .update_work_plan(
+            binding.workspace_id,
+            director,
+            director,
+            "unrelated-director-work".into(),
+            director_snapshot.revision,
+            vec![crate::WorkPlanUpdate {
+                id: None,
+                content: "director only".into(),
+                status: crate::WorkStatus::Pending,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(plan.snapshot().await.unwrap().revision, first.revision);
+    let before_refresh = store.state(session_id).await.unwrap().latest_sequence;
+    refresh_work_plans(&mut journal, &events, session_id, &plan, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.state(session_id).await.unwrap().latest_sequence,
+        before_refresh
+    );
+    let assigned = work_store
+        .update_work_plan(
+            binding.workspace_id,
+            director,
+            actor,
+            "director-add".into(),
+            first.revision,
+            vec![
+                crate::WorkPlanUpdate {
+                    id: Some(first.items[0].id),
+                    content: "first".into(),
+                    status: crate::WorkStatus::Pending,
+                },
+                crate::WorkPlanUpdate {
+                    id: None,
+                    content: "first".into(),
+                    status: crate::WorkStatus::Blocked,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(
+        apply_model_todo_request(
+            &mut journal,
+            &events,
+            session_id,
+            &mut plan,
+            SessionTodoToolRequest::Update {
+                items: Vec::new(),
+                expected_revision: None
+            }
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(plan.snapshot().await.unwrap().items.len(), 2);
+    let refreshed = apply_model_todo_request(
+        &mut journal,
+        &events,
+        session_id,
+        &mut plan,
+        SessionTodoToolRequest::Get,
+    )
+    .await
+    .unwrap();
+    assert_eq!(refreshed.revision, assigned.revision);
+    assert_eq!(refreshed.items[0].content, refreshed.items[1].content);
+    assert_ne!(refreshed.items[0].id, refreshed.items[1].id);
+    let same_titles = refreshed
+        .items
+        .iter()
+        .map(|item| TodoItemUpdate {
+            id: Some(item.id),
+            content: item.content.clone(),
+            status: item.status,
+        })
+        .collect();
+    let retained = apply_model_todo_request(
+        &mut journal,
+        &events,
+        session_id,
+        &mut plan,
+        SessionTodoToolRequest::Update {
+            items: same_titles,
+            expected_revision: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(retained.items.len(), 2);
+
+    apply_model_todo_request(
+        &mut journal,
+        &events,
+        session_id,
+        &mut plan,
+        SessionTodoToolRequest::Update {
+            items: Vec::new(),
+            expected_revision: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(plan.snapshot().await.unwrap().items.is_empty());
+    let all = work_store
+        .work_items(binding.workspace_id, actor, None)
+        .await
+        .unwrap();
+    assert_eq!(all.items.len(), 3);
+    assert_eq!(
+        all.items
+            .iter()
+            .filter(|item| item.work.assignee_id.is_none())
+            .count(),
+        2
+    );
+    assert_eq!(
+        all.items
+            .iter()
+            .filter(|item| item.work.assignee_id == Some(director))
+            .count(),
+        1
+    );
+    let state = store.state(session_id).await.unwrap();
+    assert_eq!(state.plan_participant_id, Some(actor));
+    assert!(state.todos.is_empty());
+    while let Ok(event) = received.try_recv() {
+        assert!(!matches!(event.kind, SessionEventKind::PlanUpdated { .. }));
+        assert!(store.action(session_id, event.id).await.unwrap().is_none());
+    }
+    scratch.discard().await;
+}
+
+#[test]
+fn projected_plans_survive_context_clear_and_reject_legacy_or_stale_replay() {
+    let session_id = Uuid::new_v4();
+    let participant_id = Uuid::new_v4();
+    let item = PlanItem {
+        id: Uuid::new_v4(),
+        content: "shared".into(),
+        status: PlanItemStatus::AwaitingReview,
+    };
+    let event = |sequence, kind| SessionEvent::new(session_id, sequence, kind);
+    let mut state = SessionState::reduce(&[
+        event(
+            1,
+            SessionEventKind::PlanProjected {
+                participant_id,
+                items: vec![item.clone()],
+                workspace_revision: 10,
+            },
+        ),
+        event(2, SessionEventKind::ContextCleared),
+        event(3, SessionEventKind::PlanUpdated { items: Vec::new() }),
+        event(
+            4,
+            SessionEventKind::PlanProjected {
+                participant_id,
+                items: Vec::new(),
+                workspace_revision: 9,
+            },
+        ),
+    ])
+    .unwrap();
+    assert_eq!(state.todos, vec![item]);
+    assert_eq!(state.plan_participant_id, Some(participant_id));
+    assert_eq!(state.plan_workspace_revision, Some(10));
+    let replacement = Uuid::new_v4();
+    state
+        .apply(&event(
+            5,
+            SessionEventKind::PlanProjected {
+                participant_id: replacement,
+                items: Vec::new(),
+                workspace_revision: 2,
+            },
+        ))
+        .unwrap();
+    assert_eq!(state.plan_participant_id, Some(replacement));
+    assert_eq!(state.plan_workspace_revision, Some(2));
+    assert!(state.todos.is_empty());
+    let child = Uuid::new_v4();
+    state
+        .apply(&event(
+            6,
+            SessionEventKind::AgentPlanProjected {
+                session_id: child,
+                participant_id,
+                items: Vec::new(),
+                workspace_revision: 9,
+            },
+        ))
+        .unwrap();
+    state
+        .apply(&event(
+            7,
+            SessionEventKind::AgentPlanProjected {
+                session_id: child,
+                participant_id: replacement,
+                items: Vec::new(),
+                workspace_revision: 2,
+            },
+        ))
+        .unwrap();
+    assert_eq!(state.agent_plans[&child].participant_id, replacement);
+    assert_eq!(state.agent_plans[&child].workspace_revision, 2);
+    assert!(
+        !SessionEventKind::PlanProjected {
+            participant_id,
+            items: Vec::new(),
+            workspace_revision: 10
+        }
+        .is_fork_inheritable()
+    );
+}
+
+#[tokio::test]
+async fn private_workspace_plan_migrates_once_and_refreshes_while_idle_across_restart() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let participant_id = Uuid::new_v4();
+    let (scratch, store, _) = runtime_store(session_id).await;
+    let item = PlanItem {
+        id: Uuid::new_v4(),
+        content: "legacy task".into(),
+        status: PlanItemStatus::Pending,
+    };
+    for kind in [
+        SessionEventKind::SessionStarted,
+        SessionEventKind::SessionConfigured {
+            cwd: root.path().into(),
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::Manual,
+        },
+        SessionEventKind::PlanUpdated { items: vec![item] },
+        SessionEventKind::ContextCleared,
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    let binding = store.workspace_binding(session_id).await.unwrap().unwrap();
+    assert_ne!(participant_id, binding.participant_id);
+    for first in [true, false] {
+        let (commands, command_rx) = mpsc::channel(8);
+        let (events, mut event_rx) = mpsc::channel(64);
+        let mut capabilities = crate::SessionCapabilities::default();
+        capabilities.multiplayer = false;
+        capabilities.shared_work = false;
+        if first {
+            capabilities.runtime_workspace_identity = Some(crate::RuntimeWorkspaceIdentity {
+                human_participant_id: Uuid::new_v4(),
+                human_display_name: "human".into(),
+                agent_participant_id: Some(participant_id),
+                agent_display_name: None,
+                workspace_name: None,
+            });
+        }
+        let launch = LaunchSession {
+            request_id: Uuid::new_v4(),
+            cwd: root.path().into(),
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: Some(false),
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::Manual,
+            name: None,
+            initial_prompt: None,
+            capabilities,
+            subagent_concurrency_limit: None,
+            extension_skill_roots: Vec::new(),
+            team_policy: None,
+        };
+        let actor_store = Arc::clone(&store);
+        let lock = root.path().join("session.lock");
+        let actor = tokio::spawn(async move {
+            run_session_actor(
+                &lock,
+                session_id,
+                launch,
+                command_rx,
+                events,
+                Arc::new(LocalAgentTurnExecutor::default()),
+                actor_store,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = event_rx.recv().await.expect("actor ready event");
+                if matches!(
+                    event.kind,
+                    SessionEventKind::StatusChanged {
+                        status: SessionStatus::Ready,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let state = store.state(session_id).await.unwrap();
+        assert_eq!(state.plan_participant_id, Some(participant_id));
+        assert_eq!(state.todos.len(), 1);
+        let work_store = store.workspace_store().await.unwrap().unwrap();
+        let snapshot = work_store
+            .work_items(binding.workspace_id, participant_id, Some(participant_id))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.items.len(), 1);
+        let status = if first {
+            crate::WorkStatus::Blocked
+        } else {
+            crate::WorkStatus::AwaitingReview
+        };
+        work_store
+            .update_work_plan(
+                binding.workspace_id,
+                participant_id,
+                participant_id,
+                Uuid::new_v4().to_string(),
+                snapshot.revision,
+                vec![crate::WorkPlanUpdate {
+                    id: Some(snapshot.items[0].work.id),
+                    content: "legacy task".into(),
+                    status,
+                }],
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = event_rx.recv().await.expect("idle projection refresh");
+                if matches!(&event.kind, SessionEventKind::PlanProjected { items, .. } if items.len()==1 && items[0].status==status) { break; }
+            }
+        }).await.unwrap();
+        commands
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
+        let all = work_store
+            .work_items(binding.workspace_id, participant_id, None)
+            .await
+            .unwrap();
+        assert_eq!(all.items.len(), 1);
+    }
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn stopped_child_todo_edits_use_saved_participant_and_leave_director_plan_unchanged() {
+    let session_id = Uuid::new_v4();
+    let (scratch, store, mut journal) = runtime_store(session_id).await;
+    let binding = store.workspace_binding(session_id).await.unwrap().unwrap();
+    let work_store = store.workspace_store().await.unwrap().unwrap();
+    work_store
+        .ensure_execution_workspace(
+            binding.workspace_id,
+            "team",
+            Uuid::new_v4(),
+            "human",
+            binding.participant_id,
+            "director",
+        )
+        .await
+        .unwrap();
+    let child = Uuid::new_v4();
+    let bound_child = Uuid::new_v4();
+    let actual_child = Uuid::new_v4();
+    store
+        .create_session_in_workspace_as(child, binding.workspace_id, bound_child)
+        .await
+        .unwrap();
+    work_store
+        .ensure_execution_workspace(
+            binding.workspace_id,
+            "team",
+            Uuid::new_v4(),
+            "human",
+            actual_child,
+            "child",
+        )
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::PlanProjected {
+                participant_id: actual_child,
+                items: Vec::new(),
+                workspace_revision: 0,
+            },
+        ))
+        .await
+        .unwrap();
+    let mut plan = SessionWorkPlan {
+        session_id,
+        actor_id: binding.participant_id,
+        store: Arc::clone(&work_store),
+        workspace_id: binding.workspace_id,
+        participant_id: binding.participant_id,
+        observed_revision: None,
+    };
+    let (events, _received) = mpsc::channel(32);
+    apply_todo_action(
+        &mut journal,
+        &events,
+        session_id,
+        &mut plan,
+        TodoAction::Add {
+            content: "director work".into(),
+        },
+    )
+    .await
+    .unwrap();
+    apply_agent_todo_action(
+        &mut journal,
+        &events,
+        session_id,
+        &plan,
+        child,
+        TodoAction::Add {
+            content: "child work".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let state = store.state(session_id).await.unwrap();
+    assert_eq!(state.todos.len(), 1);
+    assert_eq!(state.todos[0].content, "director work");
+    let child_projection = &state.agent_plans[&child];
+    assert_eq!(child_projection.participant_id, actual_child);
+    assert_eq!(child_projection.items.len(), 1);
+    assert!(
+        work_store
+            .work_items(
+                binding.workspace_id,
+                binding.participant_id,
+                Some(bound_child)
+            )
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    let recovered = SessionState::reduce(&store.read(session_id).await.unwrap()).unwrap();
+    assert_eq!(recovered.agent_plans, state.agent_plans);
+    let fork = Uuid::new_v4();
+    store
+        .fork_before(session_id, fork, state.latest_sequence + 1)
+        .await
+        .unwrap();
+    let fork_state = store.state(fork).await.unwrap();
+    assert!(fork_state.plan_participant_id.is_none());
+    assert!(fork_state.plan_workspace_revision.is_none());
+    assert!(fork_state.agent_plans.is_empty());
+    assert!(fork_state.todos.is_empty());
+    let fork_binding = store.workspace_binding(fork).await.unwrap().unwrap();
+    assert_ne!(fork_binding.participant_id, binding.participant_id);
+    assert!(
+        work_store
+            .work_items(
+                binding.workspace_id,
+                binding.participant_id,
+                Some(fork_binding.participant_id)
+            )
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert_eq!(plan.snapshot().await.unwrap().items.len(), 1);
+    assert_eq!(store.state(session_id).await.unwrap().todos, state.todos);
+
+    apply_agent_todo_action(
+        &mut journal,
+        &events,
+        session_id,
+        &plan,
+        child,
+        TodoAction::Clear,
+    )
+    .await
+    .unwrap();
+    let all = work_store
+        .work_items(binding.workspace_id, binding.participant_id, None)
+        .await
+        .unwrap();
+    assert_eq!(all.items.len(), 2);
+    assert_eq!(
+        all.items
+            .iter()
+            .filter(|item| item.work.assignee_id == Some(binding.participant_id))
+            .count(),
+        1
+    );
+    assert_eq!(
+        all.items
+            .iter()
+            .filter(|item| item.work.assignee_id.is_none())
+            .count(),
+        1
+    );
+    let foreign = Uuid::new_v4();
+    store.create_session(foreign).await.unwrap();
+    assert!(
+        apply_agent_todo_action(
+            &mut journal,
+            &events,
+            session_id,
+            &plan,
+            foreign,
+            TodoAction::Clear
+        )
+        .await
+        .is_err()
+    );
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn stopped_legacy_child_plan_migrates_before_director_edit_without_fork_copy() {
+    let root_id = Uuid::new_v4();
+    let (scratch, store, mut journal) = runtime_store(root_id).await;
+    let binding = store.workspace_binding(root_id).await.unwrap().unwrap();
+    let child = Uuid::new_v4();
+    let participant = Uuid::new_v4();
+    store
+        .create_session_in_workspace_as(child, binding.workspace_id, participant)
+        .await
+        .unwrap();
+    let work_store = store.workspace_store().await.unwrap().unwrap();
+    for (id, name) in [(binding.participant_id, "director"), (participant, "child")] {
+        work_store
+            .ensure_execution_workspace(
+                binding.workspace_id,
+                "team",
+                Uuid::new_v4(),
+                "human",
+                id,
+                name,
+            )
+            .await
+            .unwrap();
+    }
+    let legacy_id = Uuid::new_v4();
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::PlanUpdated {
+                items: vec![PlanItem {
+                    id: legacy_id,
+                    content: "legacy child".into(),
+                    status: PlanItemStatus::Pending,
+                }],
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::ContextCleared,
+        ))
+        .await
+        .unwrap();
+    let fork = Uuid::new_v4();
+    store.fork_before(child, fork, 3).await.unwrap();
+    assert!(
+        local_legacy_plan(store.as_ref(), fork)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let plan = SessionWorkPlan {
+        session_id: root_id,
+        actor_id: binding.participant_id,
+        store: Arc::clone(&work_store),
+        workspace_id: binding.workspace_id,
+        participant_id: binding.participant_id,
+        observed_revision: None,
+    };
+    let (events, _received) = mpsc::channel(16);
+    apply_agent_todo_action(
+        &mut journal,
+        &events,
+        root_id,
+        &plan,
+        child,
+        TodoAction::SetStatus {
+            id: legacy_id,
+            status: PlanItemStatus::AwaitingReview,
+        },
+    )
+    .await
+    .unwrap();
+    let state = store.state(root_id).await.unwrap();
+    assert_eq!(state.agent_plans[&child].participant_id, participant);
+    assert_eq!(
+        state.agent_plans[&child].items[0].status,
+        PlanItemStatus::AwaitingReview
+    );
+    let retried = work_store
+        .ensure_legacy_plan_migrated(
+            binding.workspace_id,
+            participant,
+            participant,
+            child,
+            local_legacy_plan(store.as_ref(), child).await.unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.items.len(), 1);
+    assert_eq!(
+        retried.items[0].work.status,
+        crate::WorkStatus::AwaitingReview
+    );
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn viewer_resume_projects_work_without_granting_write_or_losing_deferred_legacy_plan() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (scratch, store, _) = runtime_store(session_id).await;
+    let binding = store.workspace_binding(session_id).await.unwrap().unwrap();
+    let work_store = store.workspace_store().await.unwrap().unwrap();
+    work_store
+        .ensure_execution_workspace(
+            binding.workspace_id,
+            "read only",
+            Uuid::new_v4(),
+            "human",
+            binding.participant_id,
+            "viewer",
+        )
+        .await
+        .unwrap();
+    let initial = work_store
+        .work_items(
+            binding.workspace_id,
+            binding.participant_id,
+            Some(binding.participant_id),
+        )
+        .await
+        .unwrap();
+    work_store
+        .update_work_plan(
+            binding.workspace_id,
+            binding.participant_id,
+            binding.participant_id,
+            "canonical".into(),
+            initial.revision,
+            vec![crate::WorkPlanUpdate {
+                id: None,
+                content: "canonical assigned task".into(),
+                status: crate::WorkStatus::Pending,
+            }],
+        )
+        .await
+        .unwrap();
+    let legacy = PlanItem {
+        id: Uuid::new_v4(),
+        content: "unmigrated legacy task".into(),
+        status: PlanItemStatus::Pending,
+    };
+    for kind in [
+        SessionEventKind::SessionStarted,
+        SessionEventKind::SessionConfigured {
+            cwd: root.path().into(),
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::Manual,
+        },
+        SessionEventKind::PlanUpdated {
+            items: vec![legacy.clone()],
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    work_store
+        .upsert_relay_roster_entry(
+            binding.workspace_id,
+            work_store
+                .participant(binding.participant_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            crate::WorkspaceRole::Viewer,
+        )
+        .await
+        .unwrap();
+    let (commands, command_rx) = mpsc::channel(8);
+    let (events, mut event_rx) = mpsc::channel(64);
+    let mut capabilities = crate::SessionCapabilities::default();
+    capabilities.multiplayer = false;
+    capabilities.shared_work = false;
+    let launch = LaunchSession {
+        request_id: Uuid::new_v4(),
+        cwd: root.path().into(),
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        fast: Some(false),
+        response_language: crate::ResponseLanguage::Auto,
+        permission_mode: PermissionMode::Manual,
+        name: None,
+        initial_prompt: None,
+        capabilities,
+        subagent_concurrency_limit: None,
+        extension_skill_roots: Vec::new(),
+        team_policy: None,
+    };
+    let actor_store = Arc::clone(&store);
+    let lock = root.path().join("viewer.lock");
+    let actor = tokio::spawn(async move {
+        run_session_actor(
+            &lock,
+            session_id,
+            launch,
+            command_rx,
+            events,
+            Arc::new(LocalAgentTurnExecutor::default()),
+            actor_store,
+        )
+        .await
+    });
+    let notice = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut notice = false;
+        loop {
+            let event = event_rx.recv().await.expect("viewer actor remains available");
+            if matches!(&event.kind, SessionEventKind::Error { message } if message.contains("read-only")) { notice = true; }
+            if matches!(event.kind, SessionEventKind::StatusChanged { status: SessionStatus::Ready, .. }) { return notice; }
+        }
+    }).await.unwrap();
+    assert!(notice);
+    assert_eq!(
+        store.state(session_id).await.unwrap().todos[0].content,
+        "canonical assigned task"
+    );
+    commands
+        .send(HostCommand::Todo {
+            session_id,
+            action: TodoAction::Add {
+                content: "forbidden".into(),
+            },
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = event_rx.recv().await.expect("rejected command does not stop actor");
+            if matches!(&event.kind, SessionEventKind::Error { message } if message.contains("Todo update rejected")) { break; }
+        }
+    }).await.unwrap();
+    let roster = work_store
+        .workspace_roster(binding.workspace_id, binding.participant_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        roster
+            .iter()
+            .find(|entry| entry.participant.id == binding.participant_id)
+            .unwrap()
+            .role,
+        crate::WorkspaceRole::Viewer
+    );
+    assert!(
+        !work_store
+            .legacy_plan_migrated(binding.workspace_id, binding.participant_id, session_id)
+            .await
+            .unwrap()
+    );
+    commands
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+    assert_eq!(
+        local_legacy_plan(store.as_ref(), session_id).await.unwrap(),
+        vec![legacy]
+    );
+    let director = Uuid::new_v4();
+    work_store
+        .ensure_execution_workspace(
+            binding.workspace_id,
+            "read only",
+            Uuid::new_v4(),
+            "human",
+            director,
+            "director",
+        )
+        .await
+        .unwrap();
+    let migrated = work_store
+        .ensure_legacy_plan_migrated(
+            binding.workspace_id,
+            director,
+            binding.participant_id,
+            session_id,
+            local_legacy_plan(store.as_ref(), session_id).await.unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        migrated
+            .items
+            .iter()
+            .any(|item| item.work.title == "unmigrated legacy task")
+    );
+    assert!(
+        migrated
+            .items
+            .iter()
+            .any(|item| item.work.title == "canonical assigned task")
+    );
     scratch.discard().await;
 }

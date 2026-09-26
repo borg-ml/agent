@@ -615,6 +615,59 @@ async fn workspace_provisioning_is_idempotent_and_direction_independent() {
             "[{name}] a relaunch refreshes display names"
         );
         assert_eq!(human_entry.role, WorkspaceRole::Owner, "[{name}]");
+        for (id, role) in [
+            (human, WorkspaceRole::Contributor),
+            (agent, WorkspaceRole::Viewer),
+        ] {
+            store
+                .upsert_relay_roster_entry(
+                    workspace_id,
+                    store.participant(id).await.unwrap().unwrap(),
+                    role,
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .ensure_execution_workspace(workspace_id, "project", human, "Human", agent, "Agent")
+            .await
+            .unwrap();
+        let roles = store.workspace_roster(workspace_id, human).await.unwrap();
+        assert_eq!(
+            roles
+                .iter()
+                .find(|r| r.participant.id == human)
+                .unwrap()
+                .role,
+            WorkspaceRole::Contributor
+        );
+        assert_eq!(
+            roles
+                .iter()
+                .find(|r| r.participant.id == agent)
+                .unwrap()
+                .role,
+            WorkspaceRole::Viewer
+        );
+        assert!(
+            store
+                .update_work_plan(workspace_id, agent, agent, "viewer-write".into(), 0, vec![])
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .update_work_plan(
+                    workspace_id,
+                    human,
+                    agent,
+                    "contributor-directs".into(),
+                    0,
+                    vec![]
+                )
+                .await
+                .is_err()
+        );
 
         // A direct workspace is derived from the sorted participant pair, so
         // both directions must land on the same workspace rather than two.
@@ -1347,6 +1400,7 @@ async fn concurrent_work_claims_have_exactly_one_winner() {
                         id: work_id,
                         title: "exclusive assignment".into(),
                         detail: None,
+                        ..SharedWork::default()
                     },
                     mode: DeliveryMode::Notify,
                 },
@@ -1387,6 +1441,529 @@ async fn concurrent_work_claims_have_exactly_one_winner() {
         }
         let replay = store.replay(workspace_id, author, 0, 50).await.unwrap();
         assert_eq!(replay.len(), 9, "losing claims must not be journaled");
+        harness.discard().await;
+    }
+}
+
+// A stale whole-plan write must not discard a director's intervening assignment;
+// omission at a current revision moves work to backlog without deleting history.
+#[tokio::test]
+async fn work_plan_is_a_revision_checked_assignment_projection() {
+    use crate::workspace::{WorkPlanUpdate, WorkStatus};
+    for harness in harnesses().await {
+        let store = harness.store.as_ref();
+        let (workspace, actor, director, _) = workspace_with_members(store).await;
+        let updates = vec![WorkPlanUpdate {
+            id: None,
+            content: "kept work".into(),
+            status: WorkStatus::Completed,
+        }];
+        let first = store
+            .update_work_plan(
+                workspace,
+                actor,
+                actor,
+                "plan-create".into(),
+                0,
+                updates.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(
+            store
+                .update_work_plan(workspace, actor, actor, "plan-create".into(), 0, updates)
+                .await
+                .unwrap(),
+            first
+        );
+        store
+            .append(message_event(
+                workspace,
+                actor,
+                "not a work mutation",
+                Audience::Workspace,
+                "chat",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .work_items(workspace, actor, Some(actor))
+                .await
+                .unwrap()
+                .revision,
+            first.revision
+        );
+        let other = store
+            .update_work_plan(
+                workspace,
+                director,
+                director,
+                "director-plan".into(),
+                0,
+                vec![WorkPlanUpdate {
+                    id: None,
+                    content: "new assignment".into(),
+                    status: WorkStatus::InProgress,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .work_items(workspace, actor, Some(actor))
+                .await
+                .unwrap()
+                .revision,
+            first.revision,
+            "another agent plan does not invalidate this plan"
+        );
+        let task = &other.items[0];
+        store
+            .assign_work(
+                workspace,
+                director,
+                task.work.id,
+                Some(actor),
+                task.assignment_id,
+                "assign".into(),
+            )
+            .await
+            .unwrap();
+        let empty_director = store
+            .work_items(workspace, director, Some(director))
+            .await
+            .unwrap();
+        assert!(empty_director.items.is_empty());
+        assert!(
+            empty_director.revision > other.revision,
+            "reassignment advances the now-empty old owner plan"
+        );
+        assert!(
+            store
+                .update_work_plan(
+                    workspace,
+                    actor,
+                    actor,
+                    "stale".into(),
+                    first.revision,
+                    vec![]
+                )
+                .await
+                .is_err()
+        );
+        let current = store
+            .work_items(workspace, actor, Some(actor))
+            .await
+            .unwrap();
+        assert_eq!(current.items.len(), 2);
+        let cleared = store
+            .update_work_plan(
+                workspace,
+                actor,
+                actor,
+                "clear".into(),
+                current.revision,
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(cleared.items.is_empty());
+        assert!(
+            cleared.revision > current.revision,
+            "empty plan retains unassignment revision"
+        );
+        let all = store.work_items(workspace, actor, None).await.unwrap();
+        assert_eq!(all.items.len(), 2);
+        assert!(all.items.iter().all(|item| item.work.assignee_id.is_none()));
+        assert_eq!(
+            all.items
+                .iter()
+                .find(|item| item.work.id == first.items[0].work.id)
+                .unwrap()
+                .work
+                .status,
+            WorkStatus::Completed
+        );
+        assert_eq!(
+            all.items
+                .iter()
+                .find(|item| item.work.id == task.work.id)
+                .unwrap()
+                .work
+                .status,
+            WorkStatus::Pending
+        );
+        harness.discard().await;
+    }
+}
+
+// Import is once-only even for an empty plan, and a restart cannot resurrect
+// legacy content after authoritative work has been reassigned or removed.
+#[tokio::test]
+async fn legacy_plans_migrate_once_and_preserve_work_identity() {
+    use crate::workspace::WorkStatus;
+    for harness in harnesses().await {
+        let store = harness.store.as_ref();
+        let (workspace, actor, director, viewer) = workspace_with_members(store).await;
+        let source = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let legacy = vec![crate::PlanItem {
+            id,
+            content: "old plan".into(),
+            status: WorkStatus::Blocked,
+        }];
+        let first = store
+            .ensure_legacy_plan_migrated(workspace, director, actor, source, legacy.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.items[0].work.id, id);
+        store
+            .upsert_relay_roster_entry(
+                workspace,
+                store.participant(viewer).await.unwrap().unwrap(),
+                WorkspaceRole::Viewer,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .legacy_plan_migrated(workspace, viewer, source)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .legacy_plan_migrated(workspace, viewer, Uuid::new_v4())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .work_items(workspace, viewer, Some(actor))
+                .await
+                .unwrap(),
+            first
+        );
+        assert!(
+            store
+                .legacy_plan_migrated(workspace, Uuid::new_v4(), source)
+                .await
+                .is_err()
+        );
+
+        store
+            .update_work_plan(
+                workspace,
+                actor,
+                actor,
+                "clear-import".into(),
+                first.revision,
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .ensure_legacy_plan_migrated(workspace, actor, actor, source, legacy.clone())
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let empty_source = Uuid::new_v4();
+        store
+            .ensure_legacy_plan_migrated(workspace, actor, actor, empty_source, vec![])
+            .await
+            .unwrap();
+        assert!(
+            store
+                .ensure_legacy_plan_migrated(workspace, actor, actor, empty_source, legacy)
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let all = store.work_items(workspace, actor, None).await.unwrap();
+        assert_eq!(all.items.len(), 1);
+        harness.discard().await;
+    }
+}
+
+#[tokio::test]
+async fn work_assignment_permissions_and_parent_cycles_are_enforced_by_store() {
+    use crate::workspace::{SharedWork, WorkPatch, WorkStatus};
+    for harness in harnesses().await {
+        let store = harness.store.as_ref();
+        let (workspace, director, contributor, viewer) = workspace_with_members(store).await;
+        for (participant_id, role) in [
+            (contributor, WorkspaceRole::Contributor),
+            (viewer, WorkspaceRole::Viewer),
+        ] {
+            store
+                .upsert_relay_roster_entry(
+                    workspace,
+                    participant(participant_id, "role test"),
+                    role,
+                )
+                .await
+                .unwrap();
+        }
+        let id = Uuid::new_v4();
+        let created = WorkspaceEvent {
+            id: Uuid::new_v4(),
+            workspace_id: workspace,
+            sequence: 0,
+            author_id: director,
+            idempotency_key: "backlog".into(),
+            created_at: Utc::now(),
+            kind: WorkspaceEventKind::WorkCreated {
+                work: SharedWork {
+                    id,
+                    title: "backlog".into(),
+                    ..SharedWork::default()
+                },
+                mode: DeliveryMode::Notify,
+            },
+        };
+        store.append(created).await.unwrap();
+        let backlog = store
+            .work_items(workspace, contributor, None)
+            .await
+            .unwrap()
+            .items
+            .remove(0);
+        assert!(backlog.work.assignee_id.is_none());
+        assert!(
+            store
+                .assign_work(
+                    workspace,
+                    viewer,
+                    id,
+                    Some(viewer),
+                    None,
+                    "viewer-claim".into()
+                )
+                .await
+                .is_err()
+        );
+        let claimed = store
+            .assign_work(
+                workspace,
+                contributor,
+                id,
+                Some(contributor),
+                None,
+                "self-claim".into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .assign_work(
+                    workspace,
+                    contributor,
+                    id,
+                    Some(director),
+                    claimed.assignment_id,
+                    "foreign-assign".into()
+                )
+                .await
+                .is_err()
+        );
+        let edited = store
+            .update_work(
+                workspace,
+                contributor,
+                id,
+                claimed.revision,
+                WorkPatch {
+                    status: Some(WorkStatus::AwaitingReview),
+                    blocked_reason: Some(Some("review needed".into())),
+                    ..WorkPatch::default()
+                },
+                "review-state".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(edited.work.status, WorkStatus::AwaitingReview);
+        assert!(
+            store
+                .update_work(
+                    workspace,
+                    contributor,
+                    id,
+                    edited.revision,
+                    WorkPatch {
+                        parent_id: Some(Some(id)),
+                        ..WorkPatch::default()
+                    },
+                    "cycle".into()
+                )
+                .await
+                .is_err()
+        );
+        let moved = store
+            .assign_work(
+                workspace,
+                director,
+                id,
+                Some(director),
+                edited.assignment_id,
+                "director-reassign".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved.work.assignee_id, Some(director));
+        assert!(
+            store
+                .update_work(
+                    workspace,
+                    contributor,
+                    id,
+                    moved.revision,
+                    WorkPatch {
+                        title: Some("stolen".into()),
+                        ..WorkPatch::default()
+                    },
+                    "not-owned".into()
+                )
+                .await
+                .is_err()
+        );
+        harness.discard().await;
+    }
+}
+
+#[tokio::test]
+async fn legacy_work_backfill_preserves_canonical_retries_and_claim_tokens() {
+    use crate::workspace::{AtomicWorkClaim, SharedWork};
+    for harness in harnesses().await {
+        let store = harness.store.as_ref();
+        let (workspace, actor, _, _) = workspace_with_members(store).await;
+        let work_id = Uuid::new_v4();
+        let old_work = serde_json::json!({"id": work_id, "title": "legacy work", "detail": null});
+        let work: SharedWork = serde_json::from_value(old_work.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&work).unwrap(), old_work);
+        let event = WorkspaceEvent {
+            id: Uuid::new_v4(),
+            workspace_id: workspace,
+            sequence: 0,
+            author_id: actor,
+            idempotency_key: "legacy-create".into(),
+            created_at: Utc::now(),
+            kind: WorkspaceEventKind::WorkCreated {
+                work,
+                mode: DeliveryMode::Notify,
+            },
+        };
+        let admitted = store.append(event.clone()).await.unwrap();
+        let claim = store
+            .append(WorkspaceEvent {
+                id: Uuid::new_v4(),
+                workspace_id: workspace,
+                sequence: 0,
+                author_id: actor,
+                idempotency_key: "legacy-claim".into(),
+                created_at: Utc::now(),
+                kind: WorkspaceEventKind::WorkClaimed {
+                    claim: AtomicWorkClaim {
+                        work_id,
+                        claimant_id: actor,
+                        expected_claim_id: None,
+                    },
+                    mode: DeliveryMode::Notify,
+                },
+            })
+            .await
+            .unwrap();
+        // Simulate pre-projection rows, leaving immutable legacy events intact.
+        let pool = sqlx::PgPool::connect(&harness.scratch.url).await.unwrap();
+        sqlx::query("update workspaces set work_projection_version=0,work_revision=0 where id=$1")
+            .bind(workspace.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("update workspace_work_items set item_json=null,updated_sequence=0 where workspace_id=$1").bind(workspace.to_string()).execute(&pool).await.unwrap();
+        let restored = store.work_items(workspace, actor, None).await.unwrap();
+        assert_eq!(restored.items.len(), 1);
+        assert_eq!(restored.items[0].assignment_id, Some(claim.id));
+        assert_eq!(restored.items[0].work.assignee_id, Some(actor));
+        assert_eq!(store.append(event).await.unwrap(), admitted);
+        let dependency_id = Uuid::new_v4();
+        store
+            .append(WorkspaceEvent {
+                id: Uuid::new_v4(),
+                workspace_id: workspace,
+                sequence: 0,
+                author_id: actor,
+                idempotency_key: "legacy-dependency".into(),
+                created_at: Utc::now(),
+                kind: WorkspaceEventKind::WorkCreated {
+                    work: SharedWork {
+                        id: dependency_id,
+                        title: "dependency".into(),
+                        ..SharedWork::default()
+                    },
+                    mode: DeliveryMode::Notify,
+                },
+            })
+            .await
+            .unwrap();
+        store
+            .append(WorkspaceEvent {
+                id: Uuid::new_v4(),
+                workspace_id: workspace,
+                sequence: 0,
+                author_id: actor,
+                idempotency_key: "legacy-edge".into(),
+                created_at: Utc::now(),
+                kind: WorkspaceEventKind::DependencyDeclared {
+                    dependency: crate::WorkDependency {
+                        work_id,
+                        depends_on_work_id: dependency_id,
+                    },
+                    mode: DeliveryMode::Notify,
+                },
+            })
+            .await
+            .unwrap();
+        let before_import = store
+            .work_items(workspace, actor, Some(actor))
+            .await
+            .unwrap();
+        let migrated = store
+            .ensure_legacy_plan_migrated(
+                workspace,
+                actor,
+                actor,
+                Uuid::new_v4(),
+                vec![crate::PlanItem {
+                    id: work_id,
+                    content: "stale legacy title".into(),
+                    status: crate::WorkStatus::Completed,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            migrated.items, before_import.items,
+            "same-owner legacy reference keeps canonical metadata and claim token"
+        );
+        assert_eq!(
+            store
+                .work_items(workspace, actor, None)
+                .await
+                .unwrap()
+                .items
+                .len(),
+            2,
+            "migration must not duplicate shared work"
+        );
+        let edge_count: i64 = sqlx::query_scalar("select count(*) from workspace_work_dependencies where workspace_id=$1 and work_id=$2 and depends_on_work_id=$3").bind(workspace.to_string()).bind(work_id.to_string()).bind(dependency_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(edge_count, 1);
+        pool.close().await;
         harness.discard().await;
     }
 }

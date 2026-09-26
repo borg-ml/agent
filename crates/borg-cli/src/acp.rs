@@ -16,7 +16,7 @@ use agent_client_protocol::{Agent, ConnectionTo, Error, Responder, Stdio};
 use anyhow::{Context, Result};
 use borg_remote::{
     ApprovalDecision, EventActor, HostCommand, LaunchSession, LocalAgentTurnExecutor,
-    MessageStatus, PlanItemStatus, PromptDelivery, ResponseLanguage, SessionCapabilities,
+    MessageStatus, PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage, SessionCapabilities,
     SessionConfiguration, SessionEvent, SessionEventKind, SessionStore, SessionWriterLease,
     default_host_config_path, probe_provider_admission_capabilities,
     run_agent_session_with_store_and_writer,
@@ -176,8 +176,15 @@ async fn respond_load_session(
     if configuration.cwd != cwd {
         return Err(Error::invalid_params());
     }
+    let expected_participant = state.plan_participant_id;
+    let mut plan_revision = state.plan_participant_id.zip(state.plan_workspace_revision);
     for event in runtime.store.read(id).await.map_err(internal_error)? {
-        if let Some(update) = replay_update(event.kind) {
+        if let SessionEventKind::PlanProjected { participant_id, .. } = &event.kind
+            && expected_participant.is_some_and(|current| current != *participant_id)
+        {
+            continue;
+        }
+        if let Some(update) = replay_update(event.kind, &mut plan_revision) {
             connection
                 .send_notification(SessionNotification::new(request.session_id.clone(), update))?;
         }
@@ -189,7 +196,57 @@ async fn respond_load_session(
     responder.respond(LoadSessionResponse::new())
 }
 
-fn replay_update(kind: SessionEventKind) -> Option<SessionUpdate> {
+fn accept_plan_event(kind: &SessionEventKind, revision: &mut Option<(Uuid, u64)>) -> bool {
+    match kind {
+        SessionEventKind::PlanUpdated { .. } => revision.is_none(),
+        SessionEventKind::PlanProjected {
+            participant_id,
+            workspace_revision,
+            ..
+        } => {
+            if revision
+                .is_some_and(|(id, current)| id == *participant_id && *workspace_revision < current)
+            {
+                return false;
+            }
+            *revision = Some((*participant_id, *workspace_revision));
+            true
+        }
+        _ => true,
+    }
+}
+
+fn acp_plan(items: Vec<PlanItem>) -> AcpPlan {
+    AcpPlan::new(
+        items
+            .into_iter()
+            .map(|item| {
+                let (content, status) = match item.status {
+                    PlanItemStatus::Pending => (item.content, PlanEntryStatus::Pending),
+                    PlanItemStatus::InProgress => (item.content, PlanEntryStatus::InProgress),
+                    PlanItemStatus::Completed => (item.content, PlanEntryStatus::Completed),
+                    PlanItemStatus::Blocked => (
+                        format!("[blocked] {}", item.content),
+                        PlanEntryStatus::Pending,
+                    ),
+                    PlanItemStatus::AwaitingReview => (
+                        format!("[awaiting review] {}", item.content),
+                        PlanEntryStatus::Pending,
+                    ),
+                };
+                PlanEntry::new(content, PlanEntryPriority::Medium, status)
+            })
+            .collect(),
+    )
+}
+
+fn replay_update(
+    kind: SessionEventKind,
+    plan_revision: &mut Option<(Uuid, u64)>,
+) -> Option<SessionUpdate> {
+    if !accept_plan_event(&kind, plan_revision) {
+        return None;
+    }
     match kind {
         SessionEventKind::Message {
             actor,
@@ -238,22 +295,9 @@ fn replay_update(kind: SessionEventKind) -> Option<SessionUpdate> {
                 })
                 .raw_output(serde_json::Value::String(output)),
         ))),
-        SessionEventKind::PlanUpdated { items } => Some(SessionUpdate::Plan(AcpPlan::new(
-            items
-                .into_iter()
-                .map(|item| {
-                    PlanEntry::new(
-                        item.content,
-                        PlanEntryPriority::Medium,
-                        match item.status {
-                            PlanItemStatus::Pending => PlanEntryStatus::Pending,
-                            PlanItemStatus::InProgress => PlanEntryStatus::InProgress,
-                            PlanItemStatus::Completed => PlanEntryStatus::Completed,
-                        },
-                    )
-                })
-                .collect(),
-        ))),
+        SessionEventKind::PlanUpdated { items } | SessionEventKind::PlanProjected { items, .. } => {
+            Some(SessionUpdate::Plan(acp_plan(items)))
+        }
         SessionEventKind::UsageUpdated {
             context_tokens: Some(used),
             context_window_tokens: Some(size),
@@ -296,8 +340,19 @@ async fn respond_prompt(
         .await
         .map_err(|_| Error::internal_error())?;
 
+    let plan_state = runtime
+        .store
+        .state(session.id)
+        .await
+        .map_err(internal_error)?;
+    let mut plan_revision = plan_state
+        .plan_participant_id
+        .zip(plan_state.plan_workspace_revision);
     loop {
         let event = events.recv().await.map_err(|_| Error::internal_error())?;
+        if !accept_plan_event(&event.kind, &mut plan_revision) {
+            continue;
+        }
         match event.kind {
             SessionEventKind::Message {
                 actor: EventActor::Assistant,
@@ -424,24 +479,11 @@ async fn respond_prompt(
                     .await
                     .map_err(|_| Error::internal_error())?;
             }
-            SessionEventKind::PlanUpdated { items } => {
-                let entries = items
-                    .into_iter()
-                    .map(|item| {
-                        PlanEntry::new(
-                            item.content,
-                            PlanEntryPriority::Medium,
-                            match item.status {
-                                PlanItemStatus::Pending => PlanEntryStatus::Pending,
-                                PlanItemStatus::InProgress => PlanEntryStatus::InProgress,
-                                PlanItemStatus::Completed => PlanEntryStatus::Completed,
-                            },
-                        )
-                    })
-                    .collect();
+            SessionEventKind::PlanUpdated { items }
+            | SessionEventKind::PlanProjected { items, .. } => {
                 connection.send_notification(SessionNotification::new(
                     request.session_id.clone(),
-                    SessionUpdate::Plan(AcpPlan::new(entries)),
+                    SessionUpdate::Plan(acp_plan(items)),
                 ))?;
             }
             SessionEventKind::UsageUpdated {
@@ -705,6 +747,58 @@ mod tests {
     use agent_client_protocol::schema::v1::{
         EmbeddedResource, EmbeddedResourceResource, ResourceLink, TextResourceContents,
     };
+
+    #[test]
+    fn projected_plan_acp_preserves_order_labels_and_rejects_legacy() {
+        let mut revision = None;
+        let participant_id = Uuid::new_v4();
+        let items = [
+            PlanItemStatus::Completed,
+            PlanItemStatus::Blocked,
+            PlanItemStatus::AwaitingReview,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, status)| PlanItem {
+            id: Uuid::new_v4(),
+            content: format!("step {i}"),
+            status,
+        })
+        .collect();
+        let update = replay_update(
+            SessionEventKind::PlanProjected {
+                participant_id,
+                items,
+                workspace_revision: 10,
+            },
+            &mut revision,
+        )
+        .unwrap();
+        let value = serde_json::to_value(update).unwrap();
+        let entries = value["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["content"], "step 0");
+        assert_eq!(entries[1]["content"], "[blocked] step 1");
+        assert_eq!(entries[2]["content"], "[awaiting review] step 2");
+        assert_eq!(entries[1]["status"], "pending");
+        assert!(
+            replay_update(
+                SessionEventKind::PlanUpdated { items: Vec::new() },
+                &mut revision
+            )
+            .is_none()
+        );
+        assert!(
+            replay_update(
+                SessionEventKind::PlanProjected {
+                    participant_id,
+                    items: Vec::new(),
+                    workspace_revision: 9,
+                },
+                &mut revision
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn prompt_conversion_preserves_text_links_and_embedded_context() {

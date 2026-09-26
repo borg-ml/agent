@@ -9,6 +9,7 @@ use anyhow::{Result, bail, ensure};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 use uuid::Uuid;
 
 /// Stable identity for the local OS user across all personal workspaces in one
@@ -283,11 +284,117 @@ pub struct WorkspaceEvent {
     pub created_at: DateTime<Utc>,
     pub kind: WorkspaceEventKind,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedWork {
     pub id: Uuid,
     pub title: String,
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "WorkStatus::is_pending")]
+    pub status: WorkStatus,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub position: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+}
+fn is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum WorkStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Blocked,
+    AwaitingReview,
+    Completed,
+}
+impl<'de> Deserialize<'de> for WorkStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "pending" | "todo" | "not_started" | "not-started" => Ok(Self::Pending),
+            "in_progress" | "in-progress" | "in progress" | "inprogress" | "active" | "working" => {
+                Ok(Self::InProgress)
+            }
+            "blocked" => Ok(Self::Blocked),
+            "awaiting_review" | "awaiting-review" => Ok(Self::AwaitingReview),
+            "completed" | "complete" | "done" | "finished" => Ok(Self::Completed),
+            _ => Err(serde::de::Error::unknown_variant(
+                &value,
+                &[
+                    "pending",
+                    "in_progress",
+                    "blocked",
+                    "awaiting_review",
+                    "completed",
+                ],
+            )),
+        }
+    }
+}
+impl WorkStatus {
+    fn is_pending(&self) -> bool {
+        *self == Self::Pending
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkItem {
+    pub work: SharedWork,
+    pub revision: Uuid,
+    pub assignment_id: Option<Uuid>,
+    pub created_sequence: u64,
+    pub updated_sequence: u64,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkSnapshot {
+    pub items: Vec<WorkItem>,
+    pub revision: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkPlanUpdate {
+    pub id: Option<Uuid>,
+    pub content: String,
+    pub status: WorkStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkPatch {
+    pub title: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub detail: Option<Option<String>>,
+    pub status: Option<WorkStatus>,
+    #[serde(
+        default,
+        deserialize_with = "present_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub parent_id: Option<Option<Uuid>>,
+    #[serde(
+        default,
+        deserialize_with = "present_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub blocked_reason: Option<Option<String>>,
+}
+fn present_optional<'de, D, T>(deserializer: D) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceArtifact {
@@ -361,6 +468,30 @@ pub enum WorkspaceEventKind {
         work: SharedWork,
         mode: DeliveryMode,
     },
+    WorkAssigned {
+        work_id: Uuid,
+        assignee_id: Option<Uuid>,
+        expected_assignment_id: Option<Uuid>,
+        mode: DeliveryMode,
+    },
+    WorkUpdated {
+        work_id: Uuid,
+        expected_revision: Uuid,
+        patch: WorkPatch,
+        mode: DeliveryMode,
+    },
+    WorkPlanUpdated {
+        assignee_id: Uuid,
+        expected_revision: u64,
+        items: Vec<WorkPlanUpdate>,
+        mode: DeliveryMode,
+    },
+    WorkPlanMigrated {
+        source_session_id: Uuid,
+        assignee_id: Uuid,
+        items: Vec<WorkPlanUpdate>,
+        mode: DeliveryMode,
+    },
     ArtifactPublished {
         artifact: WorkspaceArtifact,
         mode: DeliveryMode,
@@ -397,6 +528,53 @@ pub enum WorkspaceEventKind {
 
 #[async_trait]
 pub trait WorkspaceStore: Send + Sync {
+    async fn work_items(
+        &self,
+        workspace_id: Uuid,
+        viewer_id: Uuid,
+        assignee_id: Option<Uuid>,
+    ) -> Result<WorkSnapshot>;
+    async fn update_work_plan(
+        &self,
+        workspace_id: Uuid,
+        actor_id: Uuid,
+        assignee_id: Uuid,
+        idempotency_key: String,
+        expected_revision: u64,
+        items: Vec<WorkPlanUpdate>,
+    ) -> Result<WorkSnapshot>;
+    async fn assign_work(
+        &self,
+        workspace_id: Uuid,
+        actor_id: Uuid,
+        work_id: Uuid,
+        assignee_id: Option<Uuid>,
+        expected_assignment_id: Option<Uuid>,
+        idempotency_key: String,
+    ) -> Result<WorkItem>;
+    async fn update_work(
+        &self,
+        workspace_id: Uuid,
+        actor_id: Uuid,
+        work_id: Uuid,
+        expected_revision: Uuid,
+        patch: WorkPatch,
+        idempotency_key: String,
+    ) -> Result<WorkItem>;
+    async fn legacy_plan_migrated(
+        &self,
+        workspace_id: Uuid,
+        viewer_id: Uuid,
+        source_session_id: Uuid,
+    ) -> Result<bool>;
+    async fn ensure_legacy_plan_migrated(
+        &self,
+        workspace_id: Uuid,
+        actor_id: Uuid,
+        assignee_id: Uuid,
+        source_session_id: Uuid,
+        items: Vec<crate::PlanItem>,
+    ) -> Result<WorkSnapshot>;
     async fn create_participant(&self, participant: Participant) -> Result<()>;
     async fn create_workspace(&self, workspace: Workspace) -> Result<()>;
     async fn add_member(&self, membership: WorkspaceMembership) -> Result<()>;
@@ -802,4 +980,145 @@ pub(crate) fn resolve_recipients(
         "audience contains a non-member"
     );
     Ok(ids)
+}
+
+impl WorkSnapshot {
+    pub(crate) fn apply(&mut self, event: &WorkspaceEvent) -> Result<()> {
+        let mut touched = Vec::new();
+        match &event.kind {
+            WorkspaceEventKind::WorkCreated { work, .. } => {
+                self.items.push(WorkItem {
+                    work: work.clone(),
+                    revision: event.id,
+                    assignment_id: work.assignee_id.map(|_| event.id),
+                    created_sequence: event.sequence,
+                    updated_sequence: event.sequence,
+                });
+            }
+            WorkspaceEventKind::WorkClaimed { claim, .. } => {
+                let item = self.item_mut(claim.work_id)?;
+                item.work.assignee_id = Some(claim.claimant_id);
+                item.assignment_id = Some(event.id);
+                touched.push(claim.work_id);
+            }
+            WorkspaceEventKind::WorkAssigned {
+                work_id,
+                assignee_id,
+                ..
+            } => {
+                let item = self.item_mut(*work_id)?;
+                item.work.assignee_id = *assignee_id;
+                if assignee_id.is_none() && item.work.status == WorkStatus::InProgress {
+                    item.work.status = WorkStatus::Pending;
+                }
+                item.assignment_id = Some(event.id);
+                touched.push(*work_id);
+            }
+            WorkspaceEventKind::WorkUpdated { work_id, patch, .. } => {
+                let item = self.item_mut(*work_id)?;
+                if let Some(title) = &patch.title {
+                    item.work.title = title.clone();
+                }
+                if let Some(detail) = &patch.detail {
+                    item.work.detail = detail.clone();
+                }
+                if let Some(status) = patch.status {
+                    item.work.status = status;
+                }
+                if let Some(parent) = patch.parent_id {
+                    item.work.parent_id = parent;
+                }
+                if let Some(reason) = &patch.blocked_reason {
+                    item.work.blocked_reason = reason.clone();
+                }
+                touched.push(*work_id);
+            }
+            WorkspaceEventKind::WorkPlanUpdated {
+                assignee_id, items, ..
+            }
+            | WorkspaceEventKind::WorkPlanMigrated {
+                assignee_id, items, ..
+            } => {
+                let migration = matches!(event.kind, WorkspaceEventKind::WorkPlanMigrated { .. });
+                let mut kept = Vec::new();
+                for (position, update) in items.iter().enumerate() {
+                    let mut id = update.id.unwrap_or_else(|| {
+                        Uuid::new_v5(&event.id, position.to_string().as_bytes())
+                    });
+                    if migration
+                        && let Some(existing) = self.items.iter().find(|item| item.work.id == id)
+                    {
+                        // A legacy plan may already reference the same canonical task.
+                        // Do not replace its newer status, ownership token, or links.
+                        if existing.work.assignee_id == Some(*assignee_id) {
+                            continue;
+                        }
+                        id = Uuid::new_v5(&event.id, id.as_bytes());
+                        ensure!(
+                            !self.items.iter().any(|item| item.work.id == id),
+                            "legacy mapped work id conflicts"
+                        );
+                    }
+                    kept.push(id);
+                    if let Some(item) = self.items.iter_mut().find(|item| item.work.id == id) {
+                        item.work.title = update.content.clone();
+                        item.work.status = update.status;
+                        item.work.position = position as i64;
+                        touched.push(id);
+                    } else {
+                        self.items.push(WorkItem {
+                            work: SharedWork {
+                                id,
+                                title: update.content.clone(),
+                                status: update.status,
+                                assignee_id: Some(*assignee_id),
+                                position: position as i64,
+                                ..SharedWork::default()
+                            },
+                            revision: event.id,
+                            assignment_id: Some(event.id),
+                            created_sequence: event.sequence,
+                            updated_sequence: event.sequence,
+                        });
+                    }
+                }
+                if !migration {
+                    for item in &mut self.items {
+                        if item.work.assignee_id == Some(*assignee_id)
+                            && !kept.contains(&item.work.id)
+                        {
+                            item.work.assignee_id = None;
+                            if item.work.status == WorkStatus::InProgress {
+                                item.work.status = WorkStatus::Pending;
+                            }
+                            item.assignment_id = Some(event.id);
+                            touched.push(item.work.id);
+                        }
+                    }
+                }
+            }
+            WorkspaceEventKind::DependencyDeclared { dependency, .. } => {
+                touched.push(dependency.work_id)
+            }
+            WorkspaceEventKind::ReviewRequested { request, .. } => touched.push(request.work_id),
+            WorkspaceEventKind::ReviewRecorded { review, .. } => touched.push(review.work_id),
+            _ => return Ok(()),
+        }
+        for id in touched {
+            let item = self.item_mut(id)?;
+            item.revision = event.id;
+            item.updated_sequence = event.sequence;
+        }
+        self.revision = event.sequence;
+        self.items
+            .sort_by_key(|item| (item.work.position, item.created_sequence, item.work.id));
+        Ok(())
+    }
+
+    fn item_mut(&mut self, id: Uuid) -> Result<&mut WorkItem> {
+        self.items
+            .iter_mut()
+            .find(|item| item.work.id == id)
+            .ok_or_else(|| anyhow::anyhow!("work item is not in workspace"))
+    }
 }

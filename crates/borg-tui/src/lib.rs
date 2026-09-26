@@ -2439,17 +2439,9 @@ fn resume_left_width(width: usize) -> usize {
     (width * 2 / 5).clamp(28, 44)
 }
 
-/// Keep plan presentation consistent across the transcript and the statusline
-/// tooltip: actionable items first, completed history last.
+/// Workspace projection order is authoritative, including completed items.
 fn ordered_plan_items(items: &[PlanItem]) -> Vec<&PlanItem> {
-    [
-        PlanItemStatus::InProgress,
-        PlanItemStatus::Pending,
-        PlanItemStatus::Completed,
-    ]
-    .into_iter()
-    .flat_map(|status| items.iter().filter(move |item| item.status == status))
-    .collect()
+    items.iter().collect()
 }
 
 /// The items an update actually changed: added, reworded, or moved to a new
@@ -3400,6 +3392,24 @@ impl BorgTerminal {
             .unwrap_or(&mut self.transcript);
         root_transcript.seed_session_state(state);
         root_transcript.reconcile_session_status(state);
+        let agent_plans = root_transcript.agent_plans.clone();
+        for (child_id, plan) in agent_plans {
+            apply_child_plan_projection(
+                &mut self.transcript,
+                &mut self.child_transcripts,
+                self.focused_child,
+                child_id,
+                &plan,
+                state
+                    .activity_at
+                    .map(|time| {
+                        time.with_timezone(&Local)
+                            .format("%Y-%m-%d %H:%M")
+                            .to_string()
+                    })
+                    .unwrap_or_default(),
+            );
+        }
         if let Some(status) = state.status {
             self.status = status;
             self.activity_clock.observe(status, Utc::now());
@@ -3414,6 +3424,7 @@ impl BorgTerminal {
             .pending_provider_interaction_payload
             .as_ref()
             .is_some_and(provider_interaction_contains_secret);
+        self.invalidate_transcript_render_cache();
     }
 
     pub fn restore_composer(&mut self, text: String, attachments: Vec<PathBuf>) {
@@ -4026,6 +4037,37 @@ impl BorgTerminal {
     }
 
     fn record_child_event(&mut self, event: &SessionEvent) -> bool {
+        if let SessionEventKind::AgentPlanProjected {
+            session_id,
+            participant_id,
+            items,
+            workspace_revision,
+            ..
+        } = &event.kind
+        {
+            let root = self
+                .director_transcript
+                .as_deref()
+                .unwrap_or(&self.transcript);
+            if root.agent_plans.get(session_id).is_some_and(|current| {
+                current.participant_id == *participant_id
+                    && current.workspace_revision > *workspace_revision
+            }) {
+                return false;
+            }
+            return apply_child_plan_projection(
+                &mut self.transcript,
+                &mut self.child_transcripts,
+                self.focused_child,
+                *session_id,
+                &borg_remote::AgentPlanProjection {
+                    participant_id: *participant_id,
+                    items: items.clone(),
+                    workspace_revision: *workspace_revision,
+                },
+                local_event_time(event),
+            );
+        }
         let SessionEventKind::SubagentActivity {
             activity,
             agent,
@@ -4058,6 +4100,17 @@ impl BorgTerminal {
         let Some(child_event) = child_event else {
             return false;
         };
+        if let SessionEventKind::PlanProjected { participant_id, .. } = &child_event.kind
+            && self
+                .director_transcript
+                .as_deref()
+                .unwrap_or(&self.transcript)
+                .agent_plans
+                .get(&child_id)
+                .is_some_and(|assigned| assigned.participant_id != *participant_id)
+        {
+            return false;
+        }
         if !self.hydrated_children.contains(&child_id)
             && !matches!(
                 child_event.kind,
@@ -4241,6 +4294,30 @@ impl BorgTerminal {
             .remove(&child_id)
             .unwrap_or_default();
         let events = merge_child_history(events, buffered);
+        let previous_plan = if self.focused_child == Some(child_id) {
+            Some(&self.transcript)
+        } else {
+            self.child_transcripts.get(&child_id)
+        }
+        .and_then(|child| {
+            child
+                .plan_participant_id
+                .zip(child.plan_workspace_revision)
+                .map(
+                    |(participant_id, workspace_revision)| borg_remote::AgentPlanProjection {
+                        participant_id,
+                        workspace_revision,
+                        items: child.todos.clone(),
+                    },
+                )
+        });
+        let assigned_plan = self
+            .director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript)
+            .agent_plans
+            .get(&child_id)
+            .cloned();
         let previous = if self.focused_child == Some(child_id) {
             &self.transcript
         } else {
@@ -4258,6 +4335,24 @@ impl BorgTerminal {
         let mut transcript = fresh_transcript_like(previous);
         transcript.show_director_context_boundary();
         transcript.reserve_history(events.len());
+        // Root assignment controls identity; per-participant revisions cannot order identity changes.
+        let authoritative_plan = match (assigned_plan, previous_plan) {
+            (Some(assigned), Some(previous))
+                if assigned.participant_id == previous.participant_id
+                    && previous.workspace_revision > assigned.workspace_revision =>
+            {
+                Some(previous)
+            }
+            (assigned, previous) => assigned.or(previous),
+        };
+        if let Some(plan) = &authoritative_plan {
+            transcript.apply_projected_plan(
+                &plan.items,
+                plan.participant_id,
+                plan.workspace_revision,
+                String::new(),
+            );
+        }
         let optimistic_pending = self
             .child_queued_prompts
             .remove(&child_id)
@@ -4292,7 +4387,9 @@ impl BorgTerminal {
                 }
                 _ => {}
             }
-            transcript.apply(event);
+            if transcript.accepts_plan_history(&event.kind) {
+                transcript.apply_history(event);
+            }
         }
         restore_optimistic_pending_prompts(
             self.child_queued_prompts.entry(child_id).or_default(),
@@ -4869,6 +4966,10 @@ impl BorgTerminal {
             self.event_redraw_needed = true;
         }
         changed
+    }
+
+    pub fn selected_plan(&self) -> &[PlanItem] {
+        &self.transcript.todos
     }
 
     pub fn show_plan(&mut self, items: &[PlanItem]) {
@@ -11348,6 +11449,30 @@ fn rewind_targets_from_history(events: &[SessionEvent]) -> Vec<RewindTarget> {
         .collect()
 }
 
+fn apply_child_plan_projection(
+    displayed: &mut Transcript,
+    children: &mut HashMap<Uuid, Transcript>,
+    focused_child: Option<Uuid>,
+    child_id: Uuid,
+    plan: &borg_remote::AgentPlanProjection,
+    time: String,
+) -> bool {
+    let target = if focused_child == Some(child_id) {
+        displayed
+    } else {
+        children
+            .entry(child_id)
+            .or_insert_with(new_child_transcript)
+    };
+    let changed = target.apply_projected_plan(
+        &plan.items,
+        plan.participant_id,
+        plan.workspace_revision,
+        time,
+    );
+    changed && focused_child == Some(child_id)
+}
+
 fn replace_root_transcript_history(
     transcript: &mut Transcript,
     director_transcript: &mut Option<Box<Transcript>>,
@@ -11367,12 +11492,21 @@ fn replace_root_transcript_history(
     let reconciled_usage = previous.session_usage.clone();
     let display_events = transcript_history_in_display_order(events);
     let mut replacement = fresh_transcript_like(previous);
+    if let (Some(participant_id), Some(revision)) = (
+        previous.plan_participant_id,
+        previous.plan_workspace_revision,
+    ) {
+        replacement.apply_projected_plan(&previous.todos, participant_id, revision, String::new());
+    }
+    replacement.agent_plans = previous.agent_plans.clone();
     replacement.reserve_history(display_events.len());
     for agent in &reconciled_subagents {
         replacement.upsert_subagent_snapshot(agent);
     }
     for event in &display_events {
-        replacement.apply_history(event);
+        if previous.accepts_plan_history(&event.kind) {
+            replacement.apply_history(event);
+        }
     }
     replacement.session_usage = reconciled_usage;
     // Older-page hydration rebuilds the root transcript. It may contain the
@@ -12886,6 +13020,8 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::ApprovalRequested { .. }
         | SessionEventKind::ProviderInteractionRequested { .. }
         | SessionEventKind::PlanUpdated { .. }
+        | SessionEventKind::PlanProjected { .. }
+        | SessionEventKind::AgentPlanProjected { .. }
         | SessionEventKind::GoalUpdated { .. }
         | SessionEventKind::GoalCleared { .. }
         | SessionEventKind::ContextCleared
@@ -13873,6 +14009,8 @@ impl TranscriptEntry {
                             PlanItemStatus::Completed => "✓",
                             PlanItemStatus::InProgress => "●",
                             PlanItemStatus::Pending => "○",
+                            PlanItemStatus::Blocked => "⊘ blocked ·",
+                            PlanItemStatus::AwaitingReview => "◇ awaiting review ·",
                         };
                         format!("{marker} {}", item.content)
                     })

@@ -454,6 +454,20 @@ impl BorgGui {
     }
 
     fn send(&mut self, command: FrontendCommand) {
+        let command = match command {
+            FrontendCommand::ApplyTodo(action)
+                if self
+                    .view
+                    .as_ref()
+                    .is_some_and(|view| Some(view.session_id) != self.root_session_id) =>
+            {
+                FrontendCommand::ApplyAgentTodo {
+                    target_session_id: self.view.as_ref().expect("selected view").session_id,
+                    action,
+                }
+            }
+            command => command,
+        };
         if let Some(worker) = &self.worker
             && let Err(error) = worker.send(command)
         {
@@ -1485,12 +1499,17 @@ impl Render for BorgGui {
                                             )
                                             .children(todos.into_iter().map(|item| {
                                                 let item_id = item.id;
+                                                let plan_session_id = self.view.as_ref().map(|view| view.session_id);
                                                 let next_status = match item.status {
                                                     borg_ui::PlanItemStatus::Pending => borg_ui::PlanItemStatus::InProgress,
                                                     borg_ui::PlanItemStatus::InProgress => borg_ui::PlanItemStatus::Completed,
+                                                    borg_ui::PlanItemStatus::Blocked => borg_ui::PlanItemStatus::Pending,
+                                                    borg_ui::PlanItemStatus::AwaitingReview => borg_ui::PlanItemStatus::Completed,
                                                     borg_ui::PlanItemStatus::Completed => borg_ui::PlanItemStatus::Pending,
                                                 };
                                                 let (marker, color) = match item.status {
+                                                    borg_ui::PlanItemStatus::Blocked => ("⊘ blocked", palette::PEACH),
+                                                    borg_ui::PlanItemStatus::AwaitingReview => ("◇ awaiting review", palette::TEXT_MUTED),
                                                     borg_ui::PlanItemStatus::Pending => {
                                                         ("○", palette::TEXT_MUTED)
                                                     }
@@ -1509,7 +1528,10 @@ impl Render for BorgGui {
                                                     .cursor_pointer()
                                                     .hover(|style| style.bg(rgb(palette::SURFACE_RAISED)))
                                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.send(FrontendCommand::ApplyTodo(borg_ui::TodoAction::SetStatus { id: item_id, status: next_status }));
+                                                        let action = borg_ui::TodoAction::SetStatus { id: item_id, status: next_status };
+                                                        if let Some(target_session_id) = plan_session_id {
+                                                            this.send(FrontendCommand::ApplyAgentTodo { target_session_id, action });
+                                                        }
                                                         cx.notify();
                                                     }))
                                                     .child(

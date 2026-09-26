@@ -342,6 +342,26 @@ pub(crate) struct SharedWorkToolContext {
 }
 
 impl SharedWorkToolContext {
+    async fn resolve_work_assignee(&self, target: Option<&str>) -> Result<Option<Uuid>> {
+        let Some(target) = target else {
+            return Ok(None);
+        };
+        let id = if target == "self" {
+            self.participant_id
+        } else {
+            Uuid::parse_str(target).context("assignee must be self or a participant UUID")?
+        };
+        anyhow::ensure!(
+            self.store
+                .workspace_roster(self.workspace_id, self.participant_id)
+                .await?
+                .iter()
+                .any(|entry| entry.participant.id == id),
+            "assignee is not a workspace participant"
+        );
+        Ok(Some(id))
+    }
+
     pub(crate) fn new(
         store: Arc<dyn WorkspaceStore>,
         workspace_id: Uuid,
@@ -2359,7 +2379,10 @@ impl AgentToolDispatcher {
                 let args: UpdatePlanArgs = serde_json::from_value(arguments)?;
                 todo_response(
                     self.todos
-                        .call(SessionTodoToolRequest::Update { items: args.plan })
+                        .call(SessionTodoToolRequest::Update {
+                            items: args.plan,
+                            expected_revision: args.expected_revision,
+                        })
                         .await,
                 )
             }
@@ -2989,7 +3012,28 @@ impl SharedWorkToolContext {
                     .into_iter()
                     .filter(|event| is_shared_work_event(&event.kind))
                     .collect::<Vec<_>>();
-                Ok(json!({ "events": events }))
+                let snapshot = self
+                    .store
+                    .work_items(self.workspace_id, self.participant_id, None)
+                    .await?;
+                anyhow::ensure!(
+                    args.expected_revision
+                        .is_none_or(|revision| revision == snapshot.revision),
+                    "shared work changed during pagination; restart from offset 0"
+                );
+                let total = snapshot.items.len();
+                let offset = args.offset.unwrap_or(0).min(total);
+                let next = offset.saturating_add(limit).min(total);
+                let items: Vec<_> = snapshot
+                    .items
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .collect();
+                Ok(
+                    json!({ "items": items, "revision": snapshot.revision, "offset": offset,
+                    "next_offset": (next < total).then_some(next), "total": total, "events": events }),
+                )
             }
             "create_shared_work" => {
                 let args: CreateSharedWorkArgs = serde_json::from_value(arguments)?;
@@ -2998,6 +3042,11 @@ impl SharedWorkToolContext {
                     id: self.stable_object_id("work", &key),
                     title: required_tool_text("title", &args.title)?,
                     detail: optional_tool_text(args.detail),
+                    assignee_id: self.resolve_work_assignee(args.assignee.as_deref()).await?,
+                    status: args.status.unwrap_or_default(),
+                    position: args.position.unwrap_or_default(),
+                    parent_id: args.parent_id,
+                    blocked_reason: optional_tool_text(args.blocked_reason),
                 };
                 self.append(
                     key,
@@ -3007,6 +3056,36 @@ impl SharedWorkToolContext {
                     },
                 )
                 .await
+            }
+            "assign_shared_work" => {
+                let args: AssignSharedWorkArgs = serde_json::from_value(arguments)?;
+                Ok(serde_json::to_value(
+                    self.store
+                        .assign_work(
+                            self.workspace_id,
+                            self.participant_id,
+                            args.work_id,
+                            self.resolve_work_assignee(args.assignee.as_deref()).await?,
+                            args.expected_assignment_id,
+                            required_idempotency_key(&args.idempotency_key)?,
+                        )
+                        .await?,
+                )?)
+            }
+            "update_shared_work" => {
+                let args: UpdateSharedWorkArgs = serde_json::from_value(arguments)?;
+                Ok(serde_json::to_value(
+                    self.store
+                        .update_work(
+                            self.workspace_id,
+                            self.participant_id,
+                            args.work_id,
+                            args.expected_revision,
+                            args.patch,
+                            required_idempotency_key(&args.idempotency_key)?,
+                        )
+                        .await?,
+                )?)
             }
             "claim_shared_work" => {
                 let args: ClaimSharedWorkArgs = serde_json::from_value(arguments)?;
@@ -3177,6 +3256,8 @@ fn is_shared_work_tool(name: &str) -> bool {
         name,
         "list_shared_work"
             | "create_shared_work"
+            | "assign_shared_work"
+            | "update_shared_work"
             | "claim_shared_work"
             | "declare_work_dependency"
             | "publish_workspace_artifact"
@@ -3192,6 +3273,10 @@ fn is_shared_work_event(kind: &WorkspaceEventKind) -> bool {
     matches!(
         kind,
         WorkspaceEventKind::WorkCreated { .. }
+            | WorkspaceEventKind::WorkAssigned { .. }
+            | WorkspaceEventKind::WorkUpdated { .. }
+            | WorkspaceEventKind::WorkPlanUpdated { .. }
+            | WorkspaceEventKind::WorkPlanMigrated { .. }
             | WorkspaceEventKind::ArtifactPublished { .. }
             | WorkspaceEventKind::DecisionRecorded { .. }
             | WorkspaceEventKind::WorkClaimed { .. }
@@ -7474,7 +7559,7 @@ pub fn agent_tool_specs_for_surface(
             },
             "status": {
                 "type": "string",
-                "enum": ["pending", "in_progress", "completed"]
+                "enum": ["pending", "in_progress", "blocked", "awaiting_review", "completed"]
             }
         },
         "required": ["content", "status"],
@@ -7489,7 +7574,8 @@ pub fn agent_tool_specs_for_surface(
         "type": "object",
         "properties": {
             "explanation": { "type": "string" },
-            "plan": update_plan_items_schema
+            "plan": update_plan_items_schema,
+            "expected_revision": { "type": "integer", "minimum": 0 }
         },
         "required": ["plan"],
         "additionalProperties": false
@@ -7831,7 +7917,7 @@ pub fn agent_tool_specs_for_surface(
         ),
         tool(
             "update_plan",
-            "Replace the durable task plan. Exact call: {\"explanation\":\"optional\",\"plan\":[{\"id\":\"UUID from get_plan\",\"content\":\"concise step\",\"status\":\"pending\"}]}. Call get_plan first, reuse exact UUIDs for existing items, and omit id for new items. Use at most 100 items, 500 characters per content, and one in_progress item.",
+            "Replace your ordered assigned todo projection with revision checking. Omitted items become unassigned, not deleted. Refresh with get_plan after a conflict. Exact call: {\"explanation\":\"optional\",\"plan\":[{\"id\":\"UUID from get_plan\",\"content\":\"concise step\",\"status\":\"pending\"}]}. Call get_plan first, reuse exact UUIDs for existing items, and omit id for new items. Use at most 100 items, 500 characters per content, and one in_progress item.",
             update_plan_schema,
         ),
         tool(
@@ -8086,10 +8172,12 @@ fn shared_work_tool_specs() -> Vec<Value> {
     vec![
         tool(
             "list_shared_work",
-            "Replay durable shared-work, artifact, decision, review, reference, and provenance events visible to this workspace participant.",
+            "Read current shared todos with item revisions and assignments, plus compatible durable work/review events.",
             json!({
                 "type": "object",
                 "properties": {
+                    "offset": { "type": "integer", "minimum": 0 },
+                    "expected_revision": { "type": "integer", "minimum": 0 },
                     "after_sequence": { "type": "integer", "minimum": 0 },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
                 },
@@ -8098,16 +8186,45 @@ fn shared_work_tool_specs() -> Vec<Value> {
         ),
         tool(
             "create_shared_work",
-            "Create one durable shared work item in the current workspace.",
+            "Create one shared todo. Set assignee to self or a participant UUID; omit only for intentionally unassigned work.",
             json!({
                 "type": "object",
                 "properties": {
                     "title": { "type": "string", "minLength": 1 },
                     "detail": { "type": "string" },
+                    "assignee": { "type": ["string", "null"] },
+                    "status": { "type": "string", "enum": ["pending","in_progress","blocked","awaiting_review","completed"] },
+                    "position": { "type": "integer" },
+                    "parent_id": { "type": "string", "format": "uuid" },
+                    "blocked_reason": { "type": "string" },
                     "idempotency_key": idempotency_key()
                 },
                 "required": ["title", "idempotency_key"],
                 "additionalProperties": false
+            }),
+        ),
+        tool(
+            "assign_shared_work",
+            "Assign or intentionally unassign a shared todo using its observed assignment ID.",
+            json!({
+                "type":"object", "properties": {
+                    "work_id":{"type":"string","format":"uuid"}, "assignee":{"type":["string","null"]},
+                    "expected_assignment_id":{"type":["string","null"],"format":"uuid"}, "idempotency_key":idempotency_key()
+                }, "required":["work_id","assignee","expected_assignment_id","idempotency_key"], "additionalProperties":false
+            }),
+        ),
+        tool(
+            "update_shared_work",
+            "Update shared todo metadata/status with its observed item revision. Assignment uses assign_shared_work.",
+            json!({
+                "type":"object", "properties": {
+                    "work_id":{"type":"string","format":"uuid"}, "expected_revision":{"type":"string","format":"uuid"},
+                    "patch":{"type":"object","properties":{
+                        "title":{"type":"string"}, "detail":{"type":["string","null"]},
+                        "status":{"type":"string","enum":["pending","in_progress","blocked","awaiting_review","completed"]},
+                        "parent_id":{"type":["string","null"],"format":"uuid"},"blocked_reason":{"type":["string","null"]}
+                    },"additionalProperties":false}, "idempotency_key":idempotency_key()
+                }, "required":["work_id","expected_revision","patch","idempotency_key"], "additionalProperties":false
             }),
         ),
         tool(
@@ -8530,6 +8647,8 @@ struct UpdatePlanArgs {
     explanation: Option<String>,
     #[serde(alias = "steps", alias = "items", alias = "todos", alias = "todo_list")]
     plan: Vec<TodoItemUpdate>,
+    #[serde(default)]
+    expected_revision: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -8564,6 +8683,8 @@ struct LspWorkspaceSymbolArgs {
 struct ListSharedWorkArgs {
     after_sequence: Option<u64>,
     limit: Option<usize>,
+    offset: Option<usize>,
+    expected_revision: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -8572,6 +8693,11 @@ struct CreateSharedWorkArgs {
     title: String,
     detail: Option<String>,
     idempotency_key: String,
+    assignee: Option<String>,
+    status: Option<crate::WorkStatus>,
+    position: Option<i64>,
+    parent_id: Option<Uuid>,
+    blocked_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -8579,6 +8705,24 @@ struct CreateSharedWorkArgs {
 struct ClaimSharedWorkArgs {
     work_id: Uuid,
     expected_claim_id: Option<Uuid>,
+    idempotency_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssignSharedWorkArgs {
+    work_id: Uuid,
+    assignee: Option<String>,
+    expected_assignment_id: Option<Uuid>,
+    idempotency_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateSharedWorkArgs {
+    work_id: Uuid,
+    expected_revision: Uuid,
+    patch: crate::WorkPatch,
     idempotency_key: String,
 }
 

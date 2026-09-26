@@ -228,6 +228,9 @@ struct Transcript {
     unkeyed_preparing_tools: Vec<String>,
     goal: Option<SessionGoal>,
     todos: Vec<PlanItem>,
+    plan_workspace_revision: Option<u64>,
+    plan_participant_id: Option<Uuid>,
+    agent_plans: std::collections::BTreeMap<Uuid, borg_remote::AgentPlanProjection>,
     config: Option<SessionDisplayConfig>,
     provider_capabilities: Vec<borg_remote::ProviderCapability>,
     active_turn: Option<ActiveTurnDisplayConfig>,
@@ -368,6 +371,9 @@ impl Default for Transcript {
             unkeyed_preparing_tools: Vec::new(),
             goal: None,
             todos: Vec::new(),
+            plan_workspace_revision: None,
+            plan_participant_id: None,
+            agent_plans: Default::default(),
             config: None,
             active_turn: None,
             live_turn_closed: false,
@@ -1014,9 +1020,99 @@ impl Transcript {
         time
     }
 
+    fn seed_plan(
+        &mut self,
+        items: &[PlanItem],
+        participant_id: Option<Uuid>,
+        revision: Option<u64>,
+    ) -> bool {
+        if self.plan_workspace_revision.is_some()
+            && (revision.is_none()
+                || (self.plan_participant_id == participant_id
+                    && self
+                        .plan_workspace_revision
+                        .is_some_and(|current| revision.is_some_and(|new| new < current))))
+        {
+            return false;
+        }
+        let changed = self.todos != items
+            || self.plan_participant_id != participant_id
+            || (self.plan_workspace_revision.is_none() && revision.is_some());
+        self.todos = items.to_vec();
+        self.plan_workspace_revision = revision;
+        self.plan_participant_id = participant_id;
+        changed
+    }
+
+    fn apply_projected_plan(
+        &mut self,
+        items: &[PlanItem],
+        participant_id: Uuid,
+        revision: u64,
+        time: String,
+    ) -> bool {
+        if !self.seed_plan(items, Some(participant_id), Some(revision)) {
+            return false;
+        }
+        // A workspace snapshot updates the existing card without shifting tool/message indices.
+        if let Some(TranscriptEntry::Plan {
+            items: current,
+            previous,
+            time: current_time,
+            ..
+        }) = self
+            .order
+            .iter_mut()
+            .rev()
+            .find(|entry| matches!(entry, TranscriptEntry::Plan { .. }))
+        {
+            *previous = std::mem::replace(current, items.to_vec());
+            *current_time = time;
+        } else {
+            self.order.push(TranscriptEntry::Plan {
+                items: items.to_vec(),
+                previous: Vec::new(),
+                time,
+                expanded: false,
+            });
+        }
+        true
+    }
+
+    fn accepts_plan_history(&self, kind: &SessionEventKind) -> bool {
+        match kind {
+            SessionEventKind::PlanProjected { participant_id, .. } => self
+                .plan_participant_id
+                .is_none_or(|current| current == *participant_id),
+            SessionEventKind::AgentPlanProjected {
+                session_id,
+                participant_id,
+                ..
+            } => self
+                .agent_plans
+                .get(session_id)
+                .is_none_or(|current| current.participant_id == *participant_id),
+            _ => true,
+        }
+    }
+
     fn seed_session_state(&mut self, state: &SessionState) {
         self.goal = state.goal.clone();
-        self.todos = state.todos.clone();
+        if let (Some(participant_id), Some(revision)) =
+            (state.plan_participant_id, state.plan_workspace_revision)
+        {
+            self.apply_projected_plan(&state.todos, participant_id, revision, String::new());
+        } else {
+            self.seed_plan(&state.todos, None, None);
+        }
+        for (id, plan) in &state.agent_plans {
+            if self.agent_plans.get(id).is_none_or(|old| {
+                plan.participant_id != old.participant_id
+                    || plan.workspace_revision >= old.workspace_revision
+            }) {
+                self.agent_plans.insert(*id, plan.clone());
+            }
+        }
         self.watches = state.watches.clone();
         self.provider_capabilities = state.provider_capabilities.clone();
         self.config = state
@@ -1340,13 +1436,15 @@ impl Transcript {
             TranscriptEntry::Action { body, expanded, .. }
                 if body.as_deref().is_some_and(|body| !body.trim().is_empty()) =>
             {
-                Some(if self.tool_click_behavior == ToolClickBehavior::Fullscreen {
-                    "click open full screen"
-                } else if *expanded {
-                    "click collapse"
-                } else {
-                    "click expand"
-                })
+                Some(
+                    if self.tool_click_behavior == ToolClickBehavior::Fullscreen {
+                        "click open full screen"
+                    } else if *expanded {
+                        "click collapse"
+                    } else {
+                        "click expand"
+                    },
+                )
             }
             TranscriptEntry::Compaction {
                 summary,
@@ -2608,8 +2706,46 @@ impl Transcript {
                 });
             }
             SessionEventKind::PlanUpdated { items } => {
+                if self.plan_workspace_revision.is_some() {
+                    return None;
+                }
                 self.todos = items.clone();
                 return self.upsert_plan(items.clone(), local_event_time(event));
+            }
+            SessionEventKind::PlanProjected {
+                participant_id,
+                items,
+                workspace_revision,
+                ..
+            } => {
+                self.apply_projected_plan(
+                    items,
+                    *participant_id,
+                    *workspace_revision,
+                    local_event_time(event),
+                );
+                return None;
+            }
+            SessionEventKind::AgentPlanProjected {
+                session_id,
+                participant_id,
+                items,
+                workspace_revision,
+            } => {
+                if self.agent_plans.get(session_id).is_none_or(|old| {
+                    *participant_id != old.participant_id
+                        || *workspace_revision >= old.workspace_revision
+                }) {
+                    self.agent_plans.insert(
+                        *session_id,
+                        borg_remote::AgentPlanProjection {
+                            participant_id: *participant_id,
+                            items: items.clone(),
+                            workspace_revision: *workspace_revision,
+                        },
+                    );
+                }
+                return None;
             }
             SessionEventKind::RuntimeProcessStarted {
                 process_id,
@@ -4644,6 +4780,8 @@ impl Transcript {
                     PlanItemStatus::Completed => "✓",
                     PlanItemStatus::InProgress => "●",
                     PlanItemStatus::Pending => "○",
+                    PlanItemStatus::Blocked => "⊘ blocked ·",
+                    PlanItemStatus::AwaitingReview => "◇ awaiting review ·",
                 };
                 (
                     format!("{glyph}  {}", item.content),
@@ -5649,6 +5787,11 @@ impl Transcript {
                     // newest row is its most important one must not hide that
                     // row behind unchanged leading steps.
                     let collapsed = !*expanded && focused_tool != Some(index);
+                    let previous = if self.plan_workspace_revision.is_some() {
+                        &[][..]
+                    } else {
+                        previous.as_slice()
+                    };
                     let (display_items, hidden) = plan_card_rows(items, previous, collapsed);
                     for item in display_items {
                         let (glyph, marker_style, text_style) = match item.status {
@@ -5667,6 +5810,16 @@ impl Transcript {
                                 Style::default()
                                     .fg(TODO_ORANGE)
                                     .add_modifier(Modifier::BOLD),
+                            ),
+                            PlanItemStatus::Blocked => (
+                                "⊘ blocked ·",
+                                Style::default().fg(Color::Yellow),
+                                Style::default().fg(Color::Gray),
+                            ),
+                            PlanItemStatus::AwaitingReview => (
+                                "◇ awaiting review ·",
+                                Style::default().fg(SUBAGENT_PURPLE),
+                                Style::default().fg(Color::Gray),
                             ),
                             PlanItemStatus::Pending => (
                                 "○",
@@ -6223,14 +6376,15 @@ impl Transcript {
                         lines[header_row] = tool_window_header(
                             if folded { "▸ " } else { TOOL_WINDOW_HEADER_INDENT },
                             format!(
-                            "{}{}",
-                            tool_window_summary(
-                                &self.order[window.start..window.end],
-                                window.total,
-                                &today_prefix,
+                                "{}{}",
+                                tool_window_summary(
+                                    &self.order[window.start..window.end],
+                                    window.total,
+                                    &today_prefix,
+                                ),
+                                action_hint
                             ),
-                            action_hint
-                        ));
+                        );
                         if !folded {
                             lines.push(Line::from(Span::styled(
                                 if visible_end < total_lines {

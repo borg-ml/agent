@@ -523,6 +523,9 @@ impl LocalSessionClient {
             agents: Vec::new(),
             cwd,
         };
+        if session_id != root_session_id {
+            view.overlay_agent_plan(&store.state(root_session_id).await?);
+        }
         rebuild_agents(&mut view);
         let durable_history = view.history.as_ref().clone();
         let timeline = TimelineProjector::from_events(&durable_history);
@@ -607,6 +610,11 @@ impl LocalSessionClient {
             self.timeline = TimelineProjector::from_events(&self.durable_history);
         }
         changed |= self.refresh_live().await?;
+        if self.view.session_id != self.root_session_id {
+            changed |= self
+                .view
+                .overlay_agent_plan(&self.store.state(self.root_session_id).await?);
+        }
         if !changed {
             return Ok(false);
         }
@@ -699,7 +707,18 @@ impl LocalSessionClient {
     }
 
     pub async fn dispatch(&self, command: FrontendCommand) -> Result<()> {
-        if self.view.session_id != self.root_session_id {
+        let command = match command {
+            FrontendCommand::ApplyTodo(action) if self.view.session_id != self.root_session_id => {
+                FrontendCommand::ApplyAgentTodo {
+                    target_session_id: self.view.session_id,
+                    action,
+                }
+            }
+            command => command,
+        };
+        if self.view.session_id != self.root_session_id
+            && !matches!(&command, FrontendCommand::ApplyAgentTodo { .. })
+        {
             return self.dispatch_to_child(command).await;
         }
         let session_id = self.root_session_id;
@@ -789,6 +808,10 @@ impl LocalSessionClient {
             }
             FrontendCommand::ApplyGoal(action) => HostCommand::Goal { session_id, action },
             FrontendCommand::ApplyTodo(action) => HostCommand::Todo { session_id, action },
+            FrontendCommand::ApplyAgentTodo {
+                target_session_id,
+                action,
+            } => super::todo_host_command(session_id, target_session_id, action),
             FrontendCommand::RunExtension { command, arguments } => HostCommand::ExtensionCommand {
                 session_id,
                 invocation_id: Uuid::new_v4(),

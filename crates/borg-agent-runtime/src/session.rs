@@ -1908,6 +1908,7 @@ async fn run_agent_session_store_kernel_inner(
         let agent_participant_id = identity
             .as_ref()
             .and_then(|identity| identity.agent_participant_id)
+            .or(initial_state.plan_participant_id)
             .unwrap_or(binding.participant_id);
         let agent_display_name = identity
             .as_ref()
@@ -2140,7 +2141,81 @@ async fn run_agent_session_store_kernel_inner(
     let mut title_result_rx: Option<oneshot::Receiver<Option<(String, u64)>>> = None;
     let mut title_task: Option<AbortTask> = None;
     let mut goal = state.goal;
-    let mut todos = state.todos;
+    let binding = store
+        .workspace_binding(session_id)
+        .await?
+        .context("session has no work workspace binding")?;
+    let work_store = store
+        .workspace_store()
+        .await?
+        .context("session requires canonical work storage")?;
+    let participant_id = launch
+        .capabilities
+        .runtime_workspace_identity
+        .as_ref()
+        .and_then(|identity| identity.agent_participant_id)
+        .or(state.plan_participant_id)
+        .unwrap_or(binding.participant_id);
+    if workspace_projection.is_none() {
+        let name = std::env::var("USER").unwrap_or_else(|_| "Local user".into());
+        work_store
+            .ensure_execution_workspace(
+                binding.workspace_id,
+                "Private session",
+                crate::local_human_participant_id(&name),
+                &name,
+                participant_id,
+                "Agent",
+            )
+            .await?;
+    }
+    if !work_store
+        .legacy_plan_migrated(binding.workspace_id, participant_id, session_id)
+        .await?
+    {
+        let legacy_items = local_legacy_plan(store.as_ref(), session_id).await?;
+        let roster = work_store
+            .workspace_roster(binding.workspace_id, participant_id)
+            .await?;
+        let role = roster
+            .iter()
+            .find(|entry| entry.participant.id == participant_id)
+            .context("plan participant is not a workspace member")?
+            .role;
+        if role != crate::WorkspaceRole::Viewer {
+            work_store
+                .ensure_legacy_plan_migrated(
+                    binding.workspace_id,
+                    participant_id,
+                    participant_id,
+                    session_id,
+                    legacy_items,
+                )
+                .await?;
+        } else if !legacy_items.is_empty() {
+            record(&mut journal, &events, session_id, SessionEventKind::Error {
+                message: "Workspace is read-only: legacy todos remain in the session journal and require migration by an authorized coordinator. Showing the canonical assigned plan.".into(),
+            }).await?;
+        }
+    }
+    let mut work_plan = SessionWorkPlan {
+        session_id,
+        actor_id: participant_id,
+        store: work_store,
+        workspace_id: binding.workspace_id,
+        participant_id,
+        observed_revision: None,
+    };
+    project_work_plan(
+        &mut journal,
+        &events,
+        session_id,
+        &work_plan.snapshot().await?,
+        work_plan.participant_id,
+    )
+    .await?;
+    let mut work_plan_tick = tokio::time::interval(Duration::from_secs(2));
+    work_plan_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Explicit user-stop gate. A human Escape engages it; only an explicit
     // human prompt or goal resume clears it. While engaged, no background
     // input (team Steer/Queue prompts, queued internal prompts, watch
@@ -2449,6 +2524,14 @@ async fn run_agent_session_store_kernel_inner(
             batch: Vec::new(),
         });
     }
+    refresh_work_plans(
+        &mut journal,
+        &events,
+        session_id,
+        &work_plan,
+        subagents.as_ref(),
+    )
+    .await?;
     'session: loop {
         if let Some(receiver) = title_result_rx.as_mut() {
             match receiver.try_recv() {
@@ -2700,7 +2783,8 @@ async fn run_agent_session_store_kernel_inner(
                     .silence_remaining(crate::watch::YIELD_SILENCE_BOUND)
                     .await;
                 let command = tokio::select! {
-                                    biased;
+                    biased;
+
                                     result = async { title_result_rx.as_mut().expect("guarded title receiver").await }, if title_result_rx.is_some() => {
                                         title_result_rx = None;
                                         drop(title_task.take());
@@ -2968,6 +3052,10 @@ async fn run_agent_session_store_kernel_inner(
                                         .await?;
                                         continue 'session;
                                     }
+                    _ = work_plan_tick.tick() => {
+                        refresh_work_plans(&mut journal, &events, session_id, &work_plan, subagents.as_ref()).await?;
+                        continue;
+                    }
                                 };
                 match command {
                     Some(HostCommand::TeamPrompt {
@@ -3371,12 +3459,55 @@ async fn run_agent_session_store_kernel_inner(
                             });
                         }
                     }
+                    Some(HostCommand::AgentTodo {
+                        session_id: command_session_id,
+                        target_session_id,
+                        action,
+                    }) if command_session_id == session_id => {
+                        if let Err(error) = apply_agent_todo_action(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            &work_plan,
+                            target_session_id,
+                            action,
+                        )
+                        .await
+                        {
+                            record(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                SessionEventKind::Error {
+                                    message: format!("Todo update rejected: {error:#}"),
+                                },
+                            )
+                            .await?;
+                        }
+                    }
                     Some(HostCommand::Todo {
                         session_id: command_session_id,
                         action,
                     }) if command_session_id == session_id => {
-                        apply_todo_action(&mut journal, &events, session_id, &mut todos, action)
+                        if let Err(error) = apply_todo_action(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            &mut work_plan,
+                            action,
+                        )
+                        .await
+                        {
+                            record(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                SessionEventKind::Error {
+                                    message: format!("Todo update rejected: {error:#}"),
+                                },
+                            )
                             .await?;
+                        }
                     }
                     Some(HostCommand::Subagent {
                         session_id: command_session_id,
@@ -6151,15 +6282,22 @@ async fn run_agent_session_store_kernel_inner(
                                 }
                             }
                         }
+                        HostCommand::AgentTodo { target_session_id, action, .. } => {
+                            if let Err(error) = apply_agent_todo_action(&mut journal, &events, session_id, &work_plan, target_session_id, action).await {
+                            record(&mut journal, &events, session_id, SessionEventKind::Error { message: format!("Todo update rejected: {error:#}") }).await?;
+                        }
+                        }
                         HostCommand::Todo { action, .. } => {
-                            apply_todo_action(
+                            if let Err(error) = apply_todo_action(
                                 &mut journal,
                                 &events,
                                 session_id,
-                                &mut todos,
+                                &mut work_plan,
                                 action,
                             )
-                            .await?;
+                            .await {
+                            record(&mut journal, &events, session_id, SessionEventKind::Error { message: format!("Todo update rejected: {error:#}") }).await?;
+                        }
                         }
                         HostCommand::Subagent { action, .. } => {
                             apply_subagent_action(
@@ -6547,7 +6685,7 @@ async fn run_agent_session_store_kernel_inner(
                         &mut journal,
                         &events,
                         session_id,
-                        &mut todos,
+                        &mut work_plan,
                         request.request,
                     )
                     .await
@@ -6774,6 +6912,9 @@ async fn run_agent_session_store_kernel_inner(
                         .await?;
                     }
                     }
+                }
+                _ = work_plan_tick.tick() => {
+                    refresh_work_plans(&mut journal, &events, session_id, &work_plan, subagents.as_ref()).await?;
                 }
             }
         }
@@ -11340,106 +11481,387 @@ async fn apply_session_config(
     Ok(provider_switched)
 }
 
-async fn apply_model_todo_request(
+async fn local_legacy_plan(store: &dyn SessionStore, session_id: Uuid) -> Result<Vec<PlanItem>> {
+    let mut after = store.inherited_event_count(session_id).await?;
+    let mut items = Vec::new();
+    loop {
+        let page = store.events_after(session_id, after, 512).await?;
+        if page.is_empty() {
+            break;
+        }
+        for event in page {
+            after = event.sequence;
+            if let SessionEventKind::PlanUpdated { items: latest } = event.kind {
+                items = latest;
+            }
+        }
+    }
+    Ok(items)
+}
+
+async fn migrate_child_plan(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
-    todos: &mut Vec<PlanItem>,
-    request: SessionTodoToolRequest,
-) -> Result<SessionTodoToolResponse> {
-    match request {
-        SessionTodoToolRequest::Get => {}
-        SessionTodoToolRequest::Update { items } => {
-            apply_todo_action(
+    plan: &SessionWorkPlan,
+    child_id: Uuid,
+    participant_id: Uuid,
+) -> Result<()> {
+    if plan
+        .store
+        .legacy_plan_migrated(plan.workspace_id, plan.actor_id, child_id)
+        .await?
+    {
+        return Ok(());
+    }
+    let roster = plan
+        .store
+        .workspace_roster(plan.workspace_id, plan.actor_id)
+        .await?;
+    let role = roster
+        .iter()
+        .find(|entry| entry.participant.id == plan.actor_id)
+        .context("plan author is not a workspace member")?
+        .role;
+    let can_migrate = matches!(
+        role,
+        crate::WorkspaceRole::Owner | crate::WorkspaceRole::Admin | crate::WorkspaceRole::Editor
+    ) || (role == crate::WorkspaceRole::Contributor
+        && plan.actor_id == participant_id);
+    if !can_migrate
+        && journal
+            .state(session_id)
+            .await?
+            .agent_plans
+            .contains_key(&child_id)
+    {
+        return Ok(());
+    }
+    let items = local_legacy_plan(journal.store.as_ref(), child_id).await?;
+    if can_migrate {
+        plan.store
+            .ensure_legacy_plan_migrated(
+                plan.workspace_id,
+                plan.actor_id,
+                participant_id,
+                child_id,
+                items,
+            )
+            .await?;
+    } else if !items.is_empty() {
+        record(journal, events, session_id, SessionEventKind::Error {
+            message: format!("Legacy todos for session {child_id} remain in its journal: migration requires an authorized coordinator. Showing the canonical assigned plan."),
+        }).await?;
+    }
+    Ok(())
+}
+
+struct SessionWorkPlan {
+    session_id: Uuid,
+    actor_id: Uuid,
+    store: Arc<dyn crate::WorkspaceStore>,
+    workspace_id: Uuid,
+    participant_id: Uuid,
+    observed_revision: Option<u64>,
+}
+
+impl SessionWorkPlan {
+    async fn snapshot(&self) -> Result<crate::WorkSnapshot> {
+        self.store
+            .work_items(self.workspace_id, self.actor_id, Some(self.participant_id))
+            .await
+    }
+
+    async fn replace(
+        &self,
+        revision: u64,
+        items: Vec<TodoItemUpdate>,
+    ) -> Result<crate::WorkSnapshot> {
+        validate_todos(
+            items
+                .iter()
+                .map(|item| PlanItem {
+                    id: item.id.unwrap_or_else(Uuid::new_v4),
+                    content: item.content.clone(),
+                    status: item.status,
+                })
+                .collect(),
+        )?;
+        self.store
+            .update_work_plan(
+                self.workspace_id,
+                self.actor_id,
+                self.participant_id,
+                Uuid::new_v4().to_string(),
+                revision,
+                items
+                    .into_iter()
+                    .map(|item| crate::WorkPlanUpdate {
+                        id: item.id,
+                        content: item.content,
+                        status: item.status,
+                    })
+                    .collect(),
+            )
+            .await
+    }
+}
+
+fn assigned_plan(snapshot: &crate::WorkSnapshot) -> Vec<PlanItem> {
+    snapshot
+        .items
+        .iter()
+        .map(|item| PlanItem {
+            id: item.work.id,
+            content: item.work.title.clone(),
+            status: item.work.status,
+        })
+        .collect()
+}
+
+async fn project_work_plan(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    snapshot: &crate::WorkSnapshot,
+    participant_id: Uuid,
+) -> Result<()> {
+    let state = journal.state(session_id).await?;
+    let items = assigned_plan(snapshot);
+    if state.plan_workspace_revision != Some(snapshot.revision)
+        || state.plan_participant_id != Some(participant_id)
+    {
+        record(
+            journal,
+            events,
+            session_id,
+            SessionEventKind::PlanProjected {
+                participant_id,
+                items,
+                workspace_revision: snapshot.revision,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn refresh_work_plans(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    plan: &SessionWorkPlan,
+    subagents: Option<&SubagentCoordinator>,
+) -> Result<()> {
+    project_work_plan(
+        journal,
+        events,
+        session_id,
+        &plan.snapshot().await?,
+        plan.participant_id,
+    )
+    .await?;
+    if let Some(subagents) = subagents {
+        let roster = plan
+            .store
+            .workspace_roster(plan.workspace_id, plan.actor_id)
+            .await?;
+        for child in subagents.list(None).await {
+            if child.session_id == session_id {
+                continue;
+            }
+            let Some(binding) = journal.store.workspace_binding(child.session_id).await? else {
+                continue;
+            };
+            if binding.workspace_id != plan.workspace_id {
+                continue;
+            }
+            let child_participant_id = journal
+                .store
+                .state(child.session_id)
+                .await?
+                .plan_participant_id
+                .unwrap_or(binding.participant_id);
+            if !roster
+                .iter()
+                .any(|entry| entry.participant.id == child_participant_id)
+            {
+                continue;
+            }
+            migrate_child_plan(
                 journal,
                 events,
                 session_id,
-                todos,
-                TodoAction::Replace { items },
+                plan,
+                child.session_id,
+                child_participant_id,
+            )
+            .await?;
+            let snapshot = plan
+                .store
+                .work_items(
+                    binding.workspace_id,
+                    plan.participant_id,
+                    Some(child_participant_id),
+                )
+                .await?;
+            let state = journal.state(session_id).await?;
+            if state
+                .agent_plans
+                .get(&child.session_id)
+                .is_some_and(|current| {
+                    current.participant_id == child_participant_id
+                        && current.workspace_revision >= snapshot.revision
+                })
+            {
+                continue;
+            }
+            record(
+                journal,
+                events,
+                session_id,
+                SessionEventKind::AgentPlanProjected {
+                    session_id: child.session_id,
+                    participant_id: child_participant_id,
+                    items: assigned_plan(&snapshot),
+                    workspace_revision: snapshot.revision,
+                },
             )
             .await?;
         }
     }
+    Ok(())
+}
+
+async fn apply_model_todo_request(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    plan: &mut SessionWorkPlan,
+    request: SessionTodoToolRequest,
+) -> Result<SessionTodoToolResponse> {
+    let snapshot = match request {
+        SessionTodoToolRequest::Get => plan.snapshot().await?,
+        SessionTodoToolRequest::Update {
+            items,
+            expected_revision,
+        } => {
+            let revision = match expected_revision.or(plan.observed_revision) {
+                Some(revision) => revision,
+                None => {
+                    let current = plan.snapshot().await?;
+                    anyhow::ensure!(
+                        current.items.is_empty(),
+                        "call get_plan before replacing an existing plan"
+                    );
+                    current.revision
+                }
+            };
+            plan.replace(revision, items).await?
+        }
+    };
+    project_work_plan(journal, events, session_id, &snapshot, plan.participant_id).await?;
+    plan.observed_revision = Some(snapshot.revision);
     Ok(SessionTodoToolResponse {
-        items: todos.clone(),
+        items: assigned_plan(&snapshot),
+        revision: snapshot.revision,
     })
+}
+
+async fn apply_agent_todo_action(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    plan: &SessionWorkPlan,
+    target_session_id: Uuid,
+    action: TodoAction,
+) -> Result<()> {
+    let binding = journal
+        .store
+        .workspace_binding(target_session_id)
+        .await?
+        .context("target session has no workspace binding")?;
+    anyhow::ensure!(
+        binding.workspace_id == plan.workspace_id,
+        "target session belongs to another workspace"
+    );
+    let target = journal
+        .store
+        .state(target_session_id)
+        .await?
+        .plan_participant_id
+        .unwrap_or(binding.participant_id);
+    migrate_child_plan(journal, events, session_id, plan, target_session_id, target).await?;
+    let mut target_plan = SessionWorkPlan {
+        session_id: target_session_id,
+        actor_id: plan.actor_id,
+        store: Arc::clone(&plan.store),
+        workspace_id: plan.workspace_id,
+        participant_id: target,
+        observed_revision: None,
+    };
+    apply_todo_action(journal, events, session_id, &mut target_plan, action).await
 }
 
 async fn apply_todo_action(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
-    todos: &mut Vec<PlanItem>,
+    plan: &mut SessionWorkPlan,
     action: TodoAction,
 ) -> Result<()> {
-    let candidate = match action {
-        TodoAction::Replace { items } => reconcile_todos(todos, items)?,
-        TodoAction::Add { content } => {
-            let mut candidate = todos.clone();
-            candidate.push(PlanItem {
-                id: Uuid::new_v4(),
-                content,
-                status: PlanItemStatus::Pending,
-            });
-            validate_todos(candidate)?
+    let snapshot = plan.snapshot().await?;
+    let mut items: Vec<TodoItemUpdate> = assigned_plan(&snapshot)
+        .into_iter()
+        .map(|item| TodoItemUpdate {
+            id: Some(item.id),
+            content: item.content,
+            status: item.status,
+        })
+        .collect();
+    match action {
+        TodoAction::Replace { .. } => {
+            anyhow::bail!("use get_plan and update_plan for revision-checked plan replacement")
         }
+        TodoAction::Add { content } => items.push(TodoItemUpdate {
+            id: None,
+            content,
+            status: PlanItemStatus::Pending,
+        }),
         TodoAction::SetStatus { id, status } => {
-            let mut candidate = todos.clone();
-            let item = candidate
+            let item = items
                 .iter_mut()
-                .find(|item| item.id == id)
-                .with_context(|| format!("todo item {id} does not exist"))?;
+                .find(|item| item.id == Some(id))
+                .with_context(|| format!("todo item {id} is not assigned to this agent"))?;
             item.status = status;
-            validate_todos(candidate)?
         }
         TodoAction::Remove { id } => {
-            let mut candidate = todos.clone();
-            let prior_len = candidate.len();
-            candidate.retain(|item| item.id != id);
+            let before = items.len();
+            items.retain(|item| item.id != Some(id));
             anyhow::ensure!(
-                candidate.len() != prior_len,
-                "todo item {id} does not exist"
+                before != items.len(),
+                "todo item {id} is not assigned to this agent"
             );
-            candidate
         }
-        TodoAction::Clear => Vec::new(),
-    };
-    *todos = candidate;
-    record(
-        journal,
-        events,
-        session_id,
-        SessionEventKind::PlanUpdated {
-            items: todos.clone(),
-        },
-    )
-    .await
-}
-
-fn reconcile_todos(current: &[PlanItem], updates: Vec<TodoItemUpdate>) -> Result<Vec<PlanItem>> {
-    let mut items = Vec::with_capacity(updates.len());
-    for update in updates {
-        let content = update.content.trim().to_string();
-        let id = match update.id {
-            Some(id) => {
-                anyhow::ensure!(
-                    current.iter().any(|item| item.id == id),
-                    "todo item {id} does not exist"
-                );
-                id
-            }
-            None => current
-                .iter()
-                .find(|item| item.content == content)
-                .map_or_else(Uuid::new_v4, |item| item.id),
-        };
-        items.push(PlanItem {
-            id,
-            content,
-            status: update.status,
-        });
+        TodoAction::Clear => items.clear(),
     }
-    validate_todos(items)
+    let updated = plan.replace(snapshot.revision, items).await?;
+    if plan.session_id == session_id {
+        project_work_plan(journal, events, session_id, &updated, plan.participant_id).await
+    } else {
+        record(
+            journal,
+            events,
+            session_id,
+            SessionEventKind::AgentPlanProjected {
+                session_id: plan.session_id,
+                participant_id: plan.participant_id,
+                items: assigned_plan(&updated),
+                workspace_revision: updated.revision,
+            },
+        )
+        .await
+    }
 }
 
 pub(crate) const MAX_PLAN_ITEMS: usize = 100;
@@ -11451,7 +11873,6 @@ fn validate_todos(mut items: Vec<PlanItem>) -> Result<Vec<PlanItem>> {
         "todo list may contain at most {MAX_PLAN_ITEMS} items"
     );
     let mut ids = std::collections::HashSet::with_capacity(items.len());
-    let mut contents = std::collections::HashSet::with_capacity(items.len());
     let mut in_progress = 0;
     for item in &mut items {
         item.content = item.content.trim().to_string();
@@ -11461,10 +11882,6 @@ fn validate_todos(mut items: Vec<PlanItem>) -> Result<Vec<PlanItem>> {
             "todo content may contain at most {MAX_PLAN_ITEM_CONTENT_CHARS} characters"
         );
         anyhow::ensure!(ids.insert(item.id), "todo item IDs must be unique");
-        anyhow::ensure!(
-            contents.insert(item.content.clone()),
-            "todo item content must be unique"
-        );
         if item.status == PlanItemStatus::InProgress {
             in_progress += 1;
         }

@@ -4642,7 +4642,9 @@ fn authorize_workspace_command(
             crate::ParticipantCommandKind::RespondToProviderInteraction
         }
         HostCommand::Goal { .. } => crate::ParticipantCommandKind::Goal,
-        HostCommand::Todo { .. } => crate::ParticipantCommandKind::Todo,
+        HostCommand::Todo { .. } | HostCommand::AgentTodo { .. } => {
+            crate::ParticipantCommandKind::Todo
+        }
         HostCommand::ExtensionCommand { .. } => crate::ParticipantCommandKind::ExtensionCommand,
         HostCommand::Subagent { .. } => crate::ParticipantCommandKind::Subagent,
         HostCommand::Interrupt { .. } => crate::ParticipantCommandKind::Interrupt,

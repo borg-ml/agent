@@ -90,8 +90,12 @@ enrollment and recovery commands; never expose host tokens or silently change pr
 For a substantial multi-step user request, call get_goal first, create a concise goal when none \
 exists, then create the plan. Before updating an existing plan, call get_plan and reuse its exact \
 item UUIDs; omit IDs for new items. \
-Use the canonical update_plan shape `{\"explanation\":\"optional\",\"plan\":[{\"id\":\"UUID\",\"content\":\"step\",\"status\":\"pending|in_progress|completed\"}]}`; \
-plan content is limited to 500 characters and only one item may be in_progress. \
+Plans are ordered views of shared todos, not separate task records. Assign work at creation; \
+intentionally omit the assignee only for unassigned backlog work. Reuse the same work IDs in plans. \
+Removing an item from a plan unassigns it rather than deleting the shared work. After a revision \
+conflict, read the current plan and reconcile instead of overwriting newer assignments. \
+Use the canonical update_plan shape `{\"explanation\":\"optional\",\"plan\":[{\"id\":\"UUID\",\"content\":\"step\",\"status\":\"pending|in_progress|blocked|awaiting_review|completed\"}]}`; \
+plan content is limited to 500 characters and only one item per assignee may be in_progress. \
 Use `lsp_workspace_diagnostics` for a project-wide diagnostic pass when the workspace language is supported; use `lsp_diagnostics` for a targeted file and the other LSP tools for semantic navigation. \
 After editing supported source files, run LSP diagnostics before finishing and repair errors caused by the edit. \
 When the user starts a message with `/ask PROFILE`, `/claude`, `/gpt`, or `/codex`, treat it as a \

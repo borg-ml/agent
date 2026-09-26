@@ -185,6 +185,10 @@ pub enum FrontendCommand {
     RespondToProviderInteraction(serde_json::Value),
     ApplyGoal(GoalAction),
     ApplyTodo(TodoAction),
+    ApplyAgentTodo {
+        target_session_id: Uuid,
+        action: TodoAction,
+    },
     RunExtension {
         command: String,
         arguments: serde_json::Value,
@@ -611,20 +615,39 @@ pub fn normalize_consultation_command(line: &str) -> String {
     line.to_string()
 }
 
+pub fn todo_host_command(
+    root_session_id: Uuid,
+    selected_session_id: Uuid,
+    action: TodoAction,
+) -> borg_remote::HostCommand {
+    if selected_session_id == root_session_id {
+        borg_remote::HostCommand::Todo {
+            session_id: root_session_id,
+            action,
+        }
+    } else {
+        borg_remote::HostCommand::AgentTodo {
+            session_id: root_session_id,
+            target_session_id: selected_session_id,
+            action,
+        }
+    }
+}
+
 pub fn parse_todo_action(line: &str, items: &[PlanItem]) -> anyhow::Result<TodoAction> {
     use anyhow::Context as _;
 
     let value = line
         .strip_prefix("/todo ")
         .or_else(|| line.strip_prefix("/todos "))
-        .context("usage: /todo [add|start|done|pending|remove|clear]")?
+        .context("usage: /todo [add|start|done|pending|blocked|review|remove|clear]")?
         .trim();
     if value == "clear" {
         return Ok(TodoAction::Clear);
     }
-    let (command, argument) = value
-        .split_once(char::is_whitespace)
-        .context("usage: /todo [add TEXT|start ID|done ID|pending ID|remove ID|clear]")?;
+    let (command, argument) = value.split_once(char::is_whitespace).context(
+        "usage: /todo [add TEXT|start ID|done ID|pending ID|blocked ID|review ID|remove ID|clear]",
+    )?;
     let argument = argument.trim();
     anyhow::ensure!(!argument.is_empty(), "todo command requires a value");
     let resolve_id = || {
@@ -652,12 +675,22 @@ pub fn parse_todo_action(line: &str, items: &[PlanItem]) -> anyhow::Result<TodoA
             id: resolve_id()?,
             status: PlanItemStatus::Completed,
         }),
+        "blocked" => Ok(TodoAction::SetStatus {
+            id: resolve_id()?,
+            status: PlanItemStatus::Blocked,
+        }),
+        "review" | "awaiting_review" => Ok(TodoAction::SetStatus {
+            id: resolve_id()?,
+            status: PlanItemStatus::AwaitingReview,
+        }),
         "pending" | "reset" => Ok(TodoAction::SetStatus {
             id: resolve_id()?,
             status: PlanItemStatus::Pending,
         }),
         "remove" | "rm" => Ok(TodoAction::Remove { id: resolve_id()? }),
-        _ => anyhow::bail!("usage: /todo [add TEXT|start ID|done ID|pending ID|remove ID|clear]"),
+        _ => anyhow::bail!(
+            "usage: /todo [add TEXT|start ID|done ID|pending ID|blocked ID|review ID|remove ID|clear]"
+        ),
     }
 }
 
@@ -796,6 +829,27 @@ impl SessionPresentation {
 }
 
 impl SessionView {
+    pub(crate) fn overlay_agent_plan(&mut self, root: &SessionState) -> bool {
+        let Some(plan) = root.agent_plans.get(&self.session_id) else {
+            return false;
+        };
+        if self.state.plan_participant_id == Some(plan.participant_id)
+            && self
+                .state
+                .plan_workspace_revision
+                .is_some_and(|current| current > plan.workspace_revision)
+        {
+            return false;
+        }
+        let changed = self.state.todos != plan.items
+            || self.state.plan_participant_id != Some(plan.participant_id)
+            || self.state.plan_workspace_revision != Some(plan.workspace_revision);
+        self.state.todos = plan.items.clone();
+        self.state.plan_workspace_revision = Some(plan.workspace_revision);
+        self.state.plan_participant_id = Some(plan.participant_id);
+        changed
+    }
+
     pub fn empty(session_id: Uuid, cwd: PathBuf) -> Self {
         Self {
             session_id,
@@ -907,6 +961,94 @@ pub fn parse_goal_action(line: &str) -> anyhow::Result<GoalAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_child_todo_command_keeps_owner_and_target_distinct() {
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        assert!(matches!(todo_host_command(root, child, TodoAction::Clear),
+            borg_remote::HostCommand::AgentTodo { session_id, target_session_id, action: TodoAction::Clear }
+            if session_id == root && target_session_id == child));
+        assert!(matches!(todo_host_command(root, root, TodoAction::Clear),
+            borg_remote::HostCommand::Todo { session_id, action: TodoAction::Clear } if session_id == root));
+    }
+
+    #[test]
+    fn selected_child_plan_overlay_preserves_scope_order_and_revision() {
+        let child = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let items: Vec<_> = [
+            PlanItemStatus::Completed,
+            PlanItemStatus::Blocked,
+            PlanItemStatus::AwaitingReview,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, status)| PlanItem {
+            id: Uuid::new_v4(),
+            content: format!("work {i}"),
+            status,
+        })
+        .collect();
+        let mut root = SessionState::default();
+        root.agent_plans.insert(
+            child,
+            borg_remote::AgentPlanProjection {
+                participant_id: Uuid::new_v4(),
+                items: items.clone(),
+                workspace_revision: 9,
+            },
+        );
+        let mut view = SessionView::empty(child, PathBuf::from("."));
+        view.state.latest_sequence = 42;
+        assert!(view.overlay_agent_plan(&root));
+        assert_eq!(view.state.todos, items);
+        assert_eq!(
+            view.state.latest_sequence, 42,
+            "root projection must not move child journal cursor"
+        );
+        let mut unrelated = SessionView::empty(other, PathBuf::from("."));
+        assert!(!unrelated.overlay_agent_plan(&root));
+        assert!(unrelated.state.todos.is_empty());
+        view.state
+            .apply(&SessionEvent::new(
+                child,
+                43,
+                borg_remote::SessionEventKind::PlanUpdated { items: Vec::new() },
+            ))
+            .unwrap();
+        assert_eq!(view.state.todos, items);
+        root.agent_plans.get_mut(&child).unwrap().workspace_revision = 8;
+        root.agent_plans.get_mut(&child).unwrap().items.clear();
+        assert!(!view.overlay_agent_plan(&root));
+        assert_eq!(view.state.todos, items);
+        let b = Uuid::new_v4();
+        let assigned = root.agent_plans.get_mut(&child).unwrap();
+        assigned.participant_id = b;
+        assigned.workspace_revision = 2;
+        assert!(view.overlay_agent_plan(&root));
+        assert_eq!(view.state.plan_participant_id, Some(b));
+        assert_eq!(view.state.plan_workspace_revision, Some(2));
+        assert!(view.state.todos.is_empty());
+    }
+
+    #[test]
+    fn todo_commands_support_blocked_and_review_by_visible_id() {
+        let item = PlanItem {
+            id: Uuid::new_v4(),
+            content: "visible work".into(),
+            status: PlanItemStatus::Pending,
+        };
+        for (command, expected) in [
+            ("blocked", PlanItemStatus::Blocked),
+            ("review", PlanItemStatus::AwaitingReview),
+        ] {
+            assert!(
+                matches!(parse_todo_action(&format!("/todo {command} {}", item.id), std::slice::from_ref(&item)).unwrap(),
+                TodoAction::SetStatus { id, status } if id == item.id && status == expected)
+            );
+        }
+    }
 
     #[test]
     fn command_modifier_is_valid_in_custom_keybindings() {

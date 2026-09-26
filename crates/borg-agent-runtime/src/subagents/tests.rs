@@ -7211,3 +7211,98 @@ fn only_a_blind_sleep_earns_the_wait_agent_hint() {
     assert_eq!(bare_sleep_seconds("sleep 60; echo x; rm -rf build"), None);
     assert_eq!(bare_sleep_seconds("make && sleep 300"), None);
 }
+
+#[tokio::test]
+async fn shared_work_pages_bound_batch_items_without_sequence_cursor_gaps() {
+    let workspace_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let (scratch, session) = crate::session_store::postgres::testing::session_store().await;
+    let store = session.workspace_store().await.unwrap().unwrap();
+    store
+        .ensure_execution_workspace(
+            workspace_id,
+            "pages",
+            Uuid::new_v4(),
+            "Human",
+            agent_id,
+            "Agent",
+        )
+        .await
+        .unwrap();
+    let initial = store
+        .work_items(workspace_id, agent_id, Some(agent_id))
+        .await
+        .unwrap();
+    let batch = store
+        .update_work_plan(
+            workspace_id,
+            agent_id,
+            agent_id,
+            "three-items".into(),
+            initial.revision,
+            (0..3)
+                .map(|index| crate::WorkPlanUpdate {
+                    id: None,
+                    content: format!("item {index}"),
+                    status: crate::WorkStatus::Pending,
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        batch
+            .items
+            .iter()
+            .all(|item| item.created_sequence == batch.items[0].created_sequence)
+    );
+    let tools = SharedWorkToolContext::new(store, workspace_id, agent_id);
+    let mut ids = std::collections::HashSet::new();
+    for offset in 0..3 {
+        let page = tools
+            .call(
+                "list_shared_work",
+                json!({"limit":1,"offset":offset,"expected_revision":batch.revision}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page["total"], 3);
+        assert_eq!(page["revision"], batch.revision);
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(ids.insert(items[0]["work"]["id"].as_str().unwrap().to_owned()));
+        assert_eq!(
+            page["next_offset"],
+            if offset < 2 {
+                json!(offset + 1)
+            } else {
+                Value::Null
+            }
+        );
+    }
+    assert_eq!(
+        ids,
+        batch
+            .items
+            .iter()
+            .map(|item| item.work.id.to_string())
+            .collect()
+    );
+    tools
+        .call(
+            "create_shared_work",
+            json!({"title":"new item","idempotency_key":"new-page-revision"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        tools
+            .call(
+                "list_shared_work",
+                json!({"limit":1,"offset":1,"expected_revision":batch.revision})
+            )
+            .await
+            .is_err()
+    );
+    scratch.discard().await;
+}

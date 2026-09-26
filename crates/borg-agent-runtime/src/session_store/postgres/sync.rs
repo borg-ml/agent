@@ -587,6 +587,7 @@ pub(super) async fn sync_session_action(
             )
             .await?;
         }
+        SessionEventKind::PlanProjected { .. } | SessionEventKind::AgentPlanProjected { .. } => {}
         SessionEventKind::ContextCleared
         | SessionEventKind::GoalUpdated { .. }
         | SessionEventKind::GoalCleared { .. }

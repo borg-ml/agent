@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -369,6 +369,8 @@ impl SessionEventKind {
         !matches!(
             self,
             Self::ProviderSessionLinked { .. }
+                | Self::PlanProjected { .. }
+                | Self::AgentPlanProjected { .. }
                 | Self::ProviderCapabilitiesUpdated { .. }
                 | Self::EffectiveCapabilitiesUpdated { .. }
                 | Self::SessionTitled { .. }
@@ -423,6 +425,8 @@ impl SessionEventKind {
             | Self::ProviderInteractionRequested { .. }
             | Self::ProviderInteractionResolved { .. }
             | Self::PlanUpdated { .. }
+            | Self::PlanProjected { .. }
+            | Self::AgentPlanProjected { .. }
             | Self::GoalUpdated { .. }
             | Self::GoalCleared { .. } => true,
             // TurnStarted is not itself model content, but it is the durable
@@ -503,7 +507,9 @@ impl SessionEventKind {
             | Self::EffectiveCapabilitiesUpdated { .. }
             | Self::ContextWindowUpdated { .. }
             | Self::UsageUpdated { .. }
-            | Self::SessionTitled { .. } => false,
+            | Self::SessionTitled { .. }
+            | Self::PlanProjected { .. }
+            | Self::AgentPlanProjected { .. } => false,
             // Entering an active state is the user starting work; a terminal
             // mark is the host tidying up, and any real work that preceded it
             // already moved the clock moments earlier.
@@ -784,6 +790,12 @@ pub struct SessionState {
     pub pending_provider_interaction_payload: Option<serde_json::Value>,
     pub goal: Option<SessionGoal>,
     pub todos: Vec<PlanItem>,
+    #[serde(default)]
+    pub plan_workspace_revision: Option<u64>,
+    #[serde(default)]
+    pub plan_participant_id: Option<Uuid>,
+    #[serde(default)]
+    pub agent_plans: BTreeMap<Uuid, crate::AgentPlanProjection>,
     /// Watches armed by the agent; the last `WatchesChanged` snapshot.
     #[serde(default)]
     pub watches: Vec<crate::WatchSummary>,
@@ -1050,7 +1062,46 @@ impl SessionState {
                 self.usage_limit_retry = None;
                 self.goal = None;
             }
-            SessionEventKind::PlanUpdated { items } => self.todos = items.clone(),
+            SessionEventKind::PlanUpdated { items } => {
+                if self.plan_workspace_revision.is_none() {
+                    self.todos = items.clone();
+                }
+            }
+            SessionEventKind::PlanProjected {
+                participant_id,
+                items,
+                workspace_revision,
+            } => {
+                if self.plan_participant_id != Some(*participant_id)
+                    || self
+                        .plan_workspace_revision
+                        .is_none_or(|revision| *workspace_revision >= revision)
+                {
+                    self.todos = items.clone();
+                    self.plan_workspace_revision = Some(*workspace_revision);
+                    self.plan_participant_id = Some(*participant_id);
+                }
+            }
+            SessionEventKind::AgentPlanProjected {
+                session_id,
+                participant_id,
+                items,
+                workspace_revision,
+            } => {
+                if self.agent_plans.get(session_id).is_none_or(|plan| {
+                    plan.participant_id != *participant_id
+                        || *workspace_revision >= plan.workspace_revision
+                }) {
+                    self.agent_plans.insert(
+                        *session_id,
+                        crate::AgentPlanProjection {
+                            participant_id: *participant_id,
+                            items: items.clone(),
+                            workspace_revision: *workspace_revision,
+                        },
+                    );
+                }
+            }
             SessionEventKind::UsageUpdated {
                 provider_duration_ms,
                 input_tokens,
@@ -1184,6 +1235,11 @@ impl SessionState {
         // parent's user-stop gate.
         state.user_stopped = false;
         state.usage_limit_retry = None;
+        // A conversation fork is not an assignment or identity transfer.
+        state.todos.clear();
+        state.plan_workspace_revision = None;
+        state.plan_participant_id = None;
+        state.agent_plans.clear();
         state.provider_session_id = None;
         state.provider_turn_id = None;
         state.pending_provider_turn_id = None;

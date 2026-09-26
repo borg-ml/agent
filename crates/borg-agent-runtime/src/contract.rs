@@ -1502,6 +1502,11 @@ pub enum HostCommand {
         session_id: Uuid,
         action: TodoAction,
     },
+    AgentTodo {
+        session_id: Uuid,
+        target_session_id: Uuid,
+        action: TodoAction,
+    },
     /// Execute a validated workflow-backed extension command from the
     /// user-facing command path. Arguments stay structured and host-local;
     /// the session actor applies the active immutable extension snapshot.
@@ -1581,6 +1586,7 @@ impl HostCommand {
             | Self::RespondToProviderInteraction { session_id, .. }
             | Self::Goal { session_id, .. }
             | Self::Todo { session_id, .. }
+            | Self::AgentTodo { session_id, .. }
             | Self::ExtensionCommand { session_id, .. }
             | Self::Subagent { session_id, .. }
             | Self::Interrupt { session_id }
@@ -2219,12 +2225,17 @@ pub enum TodoAction {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionTodoToolRequest {
     Get,
-    Update { items: Vec<TodoItemUpdate> },
+    Update {
+        items: Vec<TodoItemUpdate>,
+        #[serde(default)]
+        expected_revision: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTodoToolResponse {
     pub items: Vec<PlanItem>,
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -2628,6 +2639,18 @@ pub enum SessionEventKind {
     PlanUpdated {
         items: Vec<PlanItem>,
     },
+    /// Read-only projection of the workspace's assigned ordered todo list.
+    PlanProjected {
+        participant_id: Uuid,
+        items: Vec<PlanItem>,
+        workspace_revision: u64,
+    },
+    AgentPlanProjected {
+        session_id: Uuid,
+        participant_id: Uuid,
+        items: Vec<PlanItem>,
+        workspace_revision: u64,
+    },
     UsageUpdated {
         #[serde(default)]
         provider_duration_ms: u64,
@@ -2747,6 +2770,14 @@ pub struct PlanItem {
     pub status: PlanItemStatus,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AgentPlanProjection {
+    pub participant_id: Uuid,
+    pub items: Vec<PlanItem>,
+    pub workspace_revision: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[ts(export)]
 pub struct TodoItemUpdate {
@@ -2785,47 +2816,7 @@ impl<'de> Deserialize<'de> for TodoItemUpdate {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum PlanItemStatus {
-    Pending,
-    InProgress,
-    Completed,
-}
-
-impl<'de> Deserialize<'de> for PlanItemStatus {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        match value.trim().to_ascii_lowercase().as_str() {
-            "pending" | "todo" | "not_started" | "not-started" => Ok(Self::Pending),
-            "in_progress" | "in-progress" | "in progress" | "inprogress" | "active" | "working" => {
-                Ok(Self::InProgress)
-            }
-            "completed" | "complete" | "done" | "finished" => Ok(Self::Completed),
-            _ => Err(serde::de::Error::unknown_variant(
-                &value,
-                &[
-                    "pending",
-                    "in_progress",
-                    "completed",
-                    "todo",
-                    "not_started",
-                    "in-progress",
-                    "in progress",
-                    "active",
-                    "working",
-                    "complete",
-                    "done",
-                    "finished",
-                ],
-            )),
-        }
-    }
-}
+pub type PlanItemStatus = crate::WorkStatus;
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
