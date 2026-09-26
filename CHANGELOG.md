@@ -29,6 +29,8 @@ Git comparison.
   Watchers keep their purple accent.
 - Action groups stay open while work continues and fold once the next assistant
   message completes, rather than staying open throughout a long-running turn.
+- Action text truncates before the right-aligned result and timer, and keeps
+  that column clear even when a sub-0.1-second action has no visible timer.
 
 ## 0.12.1 (2026-09-26)
 
