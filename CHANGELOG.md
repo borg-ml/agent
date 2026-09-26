@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.12.3)
 
+### Terminal UI
+
+- A completed reasoning row is marked `◦` instead of `✦`.
+
 ### Sessions
 
 - Sending a message no longer resumes a goal that a stop or a block left
