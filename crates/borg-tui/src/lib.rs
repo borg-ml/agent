@@ -7879,6 +7879,14 @@ impl BorgTerminal {
         let transcript_interaction_hint = self
             .hovered_tool
             .and_then(|index| self.transcript.tool_copy_hint(index))
+            .or_else(|| {
+                self.hovered_tool_run_header
+                    .map(|start| self.transcript.tool_run_header_hint(start))
+            })
+            .or_else(|| {
+                self.hovered_entry
+                    .and_then(|index| self.transcript.entry_click_hint(index))
+            })
             .or_else(|| message_interaction_hint(&self.transcript.order, self.hovered_message));
         let showing_transcript_interaction_hint =
             showing_primary_controls && transcript_interaction_hint.is_some();

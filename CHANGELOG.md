@@ -37,6 +37,9 @@ Git comparison.
   underline`, `/cursor bar` and `/cursor block` select a persisted style.
   Finished command rows use the same slim chevron, edits use `◈`, and pending
   or agent actions keep diamond markers.
+- Transcript rows drop their inline "click to expand", "click to collapse"
+  and "click to open full screen" labels; hovering a row shows its click
+  action in the bottom-left hint, as messages already did.
 - The inactive agent roster is collapsed by default. Goal and watcher accents
   are rose-purple; todos use orange.
 - A waiting command row names its command, and its poll rows stop showing
