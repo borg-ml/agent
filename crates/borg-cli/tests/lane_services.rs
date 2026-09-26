@@ -716,13 +716,15 @@ fn front_port_survives_lease_restart_and_yield() {
 /// whose replacement takes a minute to load (so the restart barrier on
 /// `defer` is held), and SIGKILL the supervisor, as an OOM kill would; its
 /// unit then kills the backends. Returns the spec, the file that sets the
-/// backend's start delay, and the barrier's ticket.
+/// backend's start delay, the barrier's ticket, and the last serving port.
 fn kill_supervisor_mid_restart(
     f: &Fixture,
     id: &str,
     defer: &ResourceKey,
-) -> (ServiceSpec, PathBuf, String) {
+    occupy_first_port: bool,
+) -> (ServiceSpec, PathBuf, String, u16) {
     let ports = free_ports(3);
+    let occupied = occupy_first_port.then(|| TcpListener::bind(("127.0.0.1", ports[1])).unwrap());
     let slot = unique(&format!("{id}-slot"));
     f.capacity(&slot, 1);
     let slow = f.root().join(format!("{id}-start-delay"));
@@ -735,7 +737,19 @@ fn kill_supervisor_mid_restart(
     );
     spec.restart.defer_while = vec![defer.clone()];
     f.start(&spec, &[]);
-    f.resumed(id);
+    let serving = match f.resumed(id).state {
+        ServiceState::Healthy {
+            backend: Some(port),
+        } => port,
+        state => panic!("expected a serving backend, got {state:?}"),
+    };
+    if occupied.is_some() {
+        assert_eq!(
+            serving, ports[2],
+            "startup must retry on the free backend port"
+        );
+    }
+    drop(occupied);
     std::fs::write(&slow, "60").unwrap();
     f.run(&["restart", id]);
     // Restarting is published only once the replacement is spawned, so its
@@ -762,7 +776,7 @@ fn kill_supervisor_mid_restart(
     until(Duration::from_secs(20), || {
         matches!(f.status(id).state, ServiceState::Stopped).then_some(())
     });
-    (spec, slow, barrier)
+    (spec, slow, barrier, serving)
 }
 
 /// The barrier ended normally: Finished, not quarantined, released because
@@ -790,7 +804,7 @@ fn a_build_runs_after_recover_frees_a_killed_restart() {
     let mut build = f.lane.spec("after-kill", "true");
     build.timeout_ms = 30_000;
     let defer = build.lease.resources[0].key.clone();
-    let (_, _, barrier) = kill_supervisor_mid_restart(&f, "killed-editor", &defer);
+    let (_, _, barrier, _) = kill_supervisor_mid_restart(&f, "killed-editor", &defer, false);
     let out = f.lane.cli(&["job", "recover"], None);
     assert!(out.status.success(), "{}", describe(&out));
     let job = f.submit(&build, &[]);
@@ -808,7 +822,8 @@ fn a_restarted_supervisor_frees_what_its_killed_predecessor_held() {
     let mut build = f.lane.spec("after-restart", "true");
     build.timeout_ms = 30_000;
     let defer = build.lease.resources[0].key.clone();
-    let (spec, slow, barrier) = kill_supervisor_mid_restart(&f, "restarted-editor", &defer);
+    let (spec, slow, barrier, _) =
+        kill_supervisor_mid_restart(&f, "restarted-editor", &defer, false);
     std::fs::write(&slow, "0").unwrap();
     // No `lane recover`: the new supervisor's own claims free them.
     f.start(&spec, &[]);
@@ -829,8 +844,18 @@ fn a_killed_restart_uses_the_other_backend_port_before_the_first_is_quiet() {
     let defer = f.lane.spec("port-after-kill", "true").lease.resources[0]
         .key
         .clone();
-    let (mut spec, slow, barrier) = kill_supervisor_mid_restart(&f, "port-editor", &defer);
-    let [previous, alternate] = spec.endpoint.as_ref().unwrap().backend_ports;
+    let (mut spec, slow, barrier, previous) =
+        kill_supervisor_mid_restart(&f, "port-editor", &defer, true);
+    // Startup can retry on the second port. Rotate away from the backend
+    // that actually served clients, not the first configured port.
+    let alternate = spec
+        .endpoint
+        .as_ref()
+        .unwrap()
+        .backend_ports
+        .into_iter()
+        .find(|port| *port != previous)
+        .unwrap();
     let recently_used = f.root().join("recently-used-backend-port");
     std::fs::write(&recently_used, previous.to_string()).unwrap();
     spec.env
