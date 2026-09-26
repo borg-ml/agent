@@ -191,7 +191,11 @@ async function infer(request, response, value) {
           const value = Number(upstream.headers.get(`anthropic-ratelimit-unified-grace-${window}-utilization`) ?? 0);
           return Number.isFinite(value) && value > 0 ? value : 0;
         });
-        if (grace.some(value => value > 0)) {
+        const overage = upstream.headers.get('anthropic-ratelimit-unified-overage-status');
+        if (upstream.headers.has('anthropic-ratelimit-unified-grace-status') &&
+            grace.some(value => value > 0) &&
+            upstream.headers.get('anthropic-ratelimit-unified-overage-in-use') !== 'true' &&
+            overage !== 'allowed' && overage !== 'allowed_warning') {
           await emit(response, { type: 'grace', id, five_hour: grace[0], weekly: grace[1] });
         }
         for await (const event of stream) {
