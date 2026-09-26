@@ -4500,6 +4500,16 @@ async fn run_local_agent_session(
                     );
                     continue;
                 }
+                if let Some(choice) = line.strip_prefix("/model-for ") {
+                    if let Some((target, model)) = provider_model_choice(choice) {
+                        session_command_tx.send(model_selection_command(
+                            session_id, provider, target, model,
+                        )).await.ok();
+                    } else {
+                        println!("  Use /model-for PROVIDER MODEL_ID.");
+                    }
+                    continue;
+                }
                 if let Some(model) = line.strip_prefix("/model ") {
                     let model = model.trim().to_string();
                     let target = CodingProvider::for_model(&model).unwrap_or(provider);
@@ -6587,6 +6597,23 @@ async fn run_local_agent_session(
                                 &ui_interaction_tx,
                                 HostCommand::Compact { session_id },
                             );
+                        } else if let Some(choice) = line.strip_prefix("/model-for ")
+                            && attachments.is_empty()
+                        {
+                            if let Some((target, model)) = provider_model_choice(choice) {
+                                let active = terminal
+                                    .as_ref()
+                                    .and_then(BorgTerminal::session_provider)
+                                    .unwrap_or(provider);
+                                dispatch_ui_command(
+                                    &ui_interaction_tx,
+                                    model_selection_command(session_id, active, target, model),
+                                );
+                            } else {
+                                terminal.as_mut().expect("terminal").set_notice(
+                                    "Use /model-for PROVIDER MODEL_ID.".to_string(),
+                                );
+                            }
                         } else if let Some(model) = line.strip_prefix("/model ")
                             && attachments.is_empty()
                         {
@@ -7865,9 +7892,17 @@ async fn start_collaboration_host(session_id: Uuid) -> Result<(Child, String, St
     Ok((child, view, control))
 }
 
-/// Applies a model choice, switching the session's provider first when the
-/// model belongs to a different one. The switch is live: the session keeps
-/// running and the next turn goes to the new provider.
+/// Parse an explicit provider route without guessing from the model ID.
+fn provider_model_choice(input: &str) -> Option<(CodingProvider, String)> {
+    let (alias, model) = input.split_once(' ')?;
+    let provider = CodingProvider::ALL
+        .into_iter()
+        .find(|provider| provider.config_alias() == alias)?;
+    let model = model.trim();
+    (!model.is_empty()).then(|| (provider, model.to_string()))
+}
+
+/// Switch the live session's provider before applying its model when needed.
 fn model_selection_command(
     session_id: Uuid,
     active: CodingProvider,

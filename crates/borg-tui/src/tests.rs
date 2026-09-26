@@ -1805,6 +1805,11 @@ fn model_and_effort_pickers_use_the_provider_catalog() {
         catalog.effort_levels
     );
     assert!(values.contains(&"gpt-6-luna"));
+    assert!(values.contains(&"gpt-5.6-sol"));
+    assert!(!values.contains(&"gpt-5.6-terra"));
+    for provider in CodingProvider::ALL {
+        assert!(values.contains(&format!("/model-for:{}", provider.config_alias()).as_str()));
+    }
     for (model, _) in borg_provider::CLAUDE_SELECTABLE_MODELS {
         assert!(values.contains(&model), "{model} missing from picker");
     }

@@ -2735,6 +2735,16 @@ fn model_picker_options_with_configured(
             options.push(option);
         }
     }
+    for target in CodingProvider::ALL {
+        let mut option = PickerOption::new(
+            format!("Other {} model ID…", target.label()),
+            format!("/model-for:{}", target.config_alias()),
+        );
+        if target == CodingProvider::Codex {
+            option.section = Some("Other model IDs".to_string());
+        }
+        options.push(option);
+    }
     options
 }
 
@@ -7343,6 +7353,13 @@ impl BorgTerminal {
                 },
                 "/model-custom" => {
                     self.composer.replace_text("/model ".to_string());
+                    UiAction::None
+                }
+                choice if choice.starts_with("/model-for:") => {
+                    self.composer.replace_text(format!(
+                        "/model-for {} ",
+                        choice.trim_start_matches("/model-for:")
+                    ));
                     UiAction::None
                 }
                 model => UiAction::SetModel(model.to_string()),
