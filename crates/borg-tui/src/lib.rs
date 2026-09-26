@@ -15947,9 +15947,7 @@ fn tool_summary_lines(
     // one click away) and the timer keeps a fixed right-aligned column.
     const ELAPSED_COLUMN_WIDTH: usize = 8;
     let content_width = width.saturating_sub(UnicodeWidthStr::width(prefix)).max(1);
-    let reserved_width = elapsed.map_or(0, |value| {
-        ELAPSED_COLUMN_WIDTH.max(UnicodeWidthStr::width(value)) + 2
-    });
+    let reserved_width = ELAPSED_COLUMN_WIDTH.max(elapsed.map_or(0, UnicodeWidthStr::width)) + 2;
     let text_width = content_width.saturating_sub(reserved_width).max(1);
     let summary = summary.replace(['\n', '\r', '\t'], " ");
     let mut line = String::new();
@@ -15987,16 +15985,19 @@ fn wrapped_tool_summary_lines(
     width: usize,
 ) -> Vec<String> {
     let content_width = width.saturating_sub(UnicodeWidthStr::width(prefix));
-    let Some(elapsed) = elapsed else {
-        return wrap_display(summary, content_width.max(1));
-    };
     // Keep action text at one stable width while the timer changes from
     // tenths to seconds, minutes, hours, or days.
     const ELAPSED_COLUMN_WIDTH: usize = 8;
-    let elapsed_width = UnicodeWidthStr::width(elapsed);
+    let elapsed_width = elapsed.map_or(0, UnicodeWidthStr::width);
     let reserved_width = ELAPSED_COLUMN_WIDTH.max(elapsed_width).saturating_add(2);
     if content_width <= reserved_width {
-        return wrap_display(&format!("{summary} · {elapsed}"), content_width.max(1));
+        return wrap_display(
+            &elapsed.map_or_else(
+                || summary.to_string(),
+                |value| format!("{summary} · {value}"),
+            ),
+            content_width.max(1),
+        );
     }
 
     let first_width = content_width - reserved_width;
@@ -16004,14 +16005,14 @@ fn wrapped_tool_summary_lines(
         .into_iter()
         .next()
     else {
-        return vec![format!("{:>content_width$}", elapsed)];
+        return vec![elapsed.unwrap_or_default().to_string()];
     };
     let mut lines = vec![summary[first_start..first_end].to_string()];
     let remaining = summary[first_end..].trim_start();
     if !remaining.is_empty() {
-        lines.extend(wrap_display(remaining, content_width));
+        lines.extend(wrap_display(remaining, first_width));
     }
-    if let Some(first) = lines.first_mut() {
+    if let (Some(first), Some(elapsed)) = (lines.first_mut(), elapsed) {
         let padding = content_width
             .saturating_sub(UnicodeWidthStr::width(first.as_str()))
             .saturating_sub(elapsed_width);

@@ -3642,6 +3642,18 @@ fn action_result_and_timer_fit_after_truncating_long_text() {
 }
 
 #[test]
+fn hidden_timer_still_reserves_the_action_column() {
+    let summary = "◇ Ran Python  python3 Scripts/test_homestead_trade_terminal_contract.py";
+    for wrap in [false, true] {
+        let lines = tool_summary_lines(summary, None, "  ", 48, wrap);
+        assert!(lines.iter().all(|line| line.width() + 2 <= 38), "{lines:?}");
+        if !wrap {
+            assert!(lines[0].ends_with('…'), "{lines:?}");
+        }
+    }
+}
+
+#[test]
 fn marker_only_retired_action_messages_are_not_transcript_entries() {
     assert!(assistant_message_is_retired_action_leak(
         "BORG_ACTION:web search"
