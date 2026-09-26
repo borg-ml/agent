@@ -3629,6 +3629,19 @@ fn running_tool_timing_column_never_rewraps_action_text() {
 }
 
 #[test]
+fn action_result_and_timer_fit_after_truncating_long_text() {
+    let summary = "◇ Ran Python  python3 Scripts/test_homestead_trade_terminal_contract.py";
+    for wrap in [false, true] {
+        let lines = tool_summary_lines(summary, Some("exit 1 1.2s"), "  ", 48, wrap);
+        assert!(lines[0].ends_with("exit 1 1.2s"), "{lines:?}");
+        assert!(lines.iter().all(|line| line.width() + 2 <= 48), "{lines:?}");
+        if !wrap {
+            assert!(lines[0].contains('…'), "{lines:?}");
+        }
+    }
+}
+
+#[test]
 fn marker_only_retired_action_messages_are_not_transcript_entries() {
     assert!(assistant_message_is_retired_action_leak(
         "BORG_ACTION:web search"

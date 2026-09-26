@@ -15947,7 +15947,9 @@ fn tool_summary_lines(
     // one click away) and the timer keeps a fixed right-aligned column.
     const ELAPSED_COLUMN_WIDTH: usize = 8;
     let content_width = width.saturating_sub(UnicodeWidthStr::width(prefix)).max(1);
-    let reserved_width = elapsed.map_or(0, |_| ELAPSED_COLUMN_WIDTH + 2);
+    let reserved_width = elapsed.map_or(0, |value| {
+        ELAPSED_COLUMN_WIDTH.max(UnicodeWidthStr::width(value)) + 2
+    });
     let text_width = content_width.saturating_sub(reserved_width).max(1);
     let summary = summary.replace(['\n', '\r', '\t'], " ");
     let mut line = String::new();
@@ -15992,7 +15994,7 @@ fn wrapped_tool_summary_lines(
     // tenths to seconds, minutes, hours, or days.
     const ELAPSED_COLUMN_WIDTH: usize = 8;
     let elapsed_width = UnicodeWidthStr::width(elapsed);
-    let reserved_width = ELAPSED_COLUMN_WIDTH.saturating_add(2);
+    let reserved_width = ELAPSED_COLUMN_WIDTH.max(elapsed_width).saturating_add(2);
     if content_width <= reserved_width {
         return wrap_display(&format!("{summary} · {elapsed}"), content_width.max(1));
     }
@@ -16012,8 +16014,7 @@ fn wrapped_tool_summary_lines(
     if let Some(first) = lines.first_mut() {
         let padding = content_width
             .saturating_sub(UnicodeWidthStr::width(first.as_str()))
-            .saturating_sub(ELAPSED_COLUMN_WIDTH)
-            .saturating_add(ELAPSED_COLUMN_WIDTH.saturating_sub(elapsed_width));
+            .saturating_sub(elapsed_width);
         first.push_str(&" ".repeat(padding));
         first.push_str(elapsed);
     }
