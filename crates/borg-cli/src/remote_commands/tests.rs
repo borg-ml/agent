@@ -3693,3 +3693,68 @@ fn explicit_provider_model_choice_preserves_unlisted_model_ids() {
     assert_eq!(super::provider_model_choice("codex "), None);
     assert_eq!(super::provider_model_choice("unknown model"), None);
 }
+
+#[tokio::test]
+async fn stream_drain_preserves_burst_order_and_yields_without_losing_events() {
+    let session_id = Uuid::new_v4();
+    let (tx, mut rx) = mpsc::channel(4_096);
+    let make = |sequence| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ReasoningTextDelta {
+                delta: format!("{sequence} "),
+            },
+        )
+    };
+    let mut repaired = VecDeque::from([make(1), make(2)]);
+    for sequence in 3..=4_098 {
+        tx.try_send(make(sequence)).unwrap();
+    }
+    drop(tx);
+    let started = Instant::now();
+    let mut seen = Vec::new();
+    let mut bursts = 0;
+    loop {
+        let first = if let Some(event) = repaired.pop_front() {
+            Some(event)
+        } else {
+            rx.recv().await
+        };
+        let Some(first) = first else { break };
+        let burst_started = Instant::now();
+        seen.push(first.sequence);
+        let mut drained = 1;
+        while let Some(event) =
+            next_ready_session_event(&mut repaired, &mut rx, burst_started, drained)
+        {
+            seen.push(event.sequence);
+            drained += 1;
+        }
+        assert!(drained <= 256, "a flood must yield to input and paint");
+        bursts += 1;
+    }
+    assert_eq!(seen, (1..=4_098).collect::<Vec<_>>());
+    assert!(bursts >= 17);
+    eprintln!(
+        "drained {} ordered events in {:?} across {bursts} bursts",
+        seen.len(),
+        started.elapsed()
+    );
+
+    let mut repaired = VecDeque::from([make(1)]);
+    assert!(
+        next_ready_session_event(
+            &mut repaired,
+            &mut rx,
+            Instant::now() - Duration::from_millis(3),
+            1
+        )
+        .is_none()
+    );
+    assert_eq!(
+        repaired.front().unwrap().sequence,
+        1,
+        "time budget must not consume the next event"
+    );
+}

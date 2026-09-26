@@ -1824,6 +1824,22 @@ impl DeliveredSessionProjection {
     }
 }
 
+// Drain ready events independently of painting, but yield to keys and timers
+// after a bounded burst. Repairs retain priority over the live channel.
+fn next_ready_session_event(
+    queued: &mut VecDeque<SessionEvent>,
+    events: &mut mpsc::Receiver<SessionEvent>,
+    started: std::time::Instant,
+    drained: usize,
+) -> Option<SessionEvent> {
+    if drained >= 256 || started.elapsed() >= std::time::Duration::from_millis(2) {
+        return None;
+    }
+    queued
+        .pop_front()
+        .or_else(|| events.recv().now_or_never().flatten())
+}
+
 async fn load_projection_gap(
     store: Arc<dyn SessionStore>,
     mut after: u64,
@@ -3007,7 +3023,10 @@ async fn run_local_agent_session(
     let mut render_frame_interval = tui_frame_interval(tui_fps);
     let mut render_tick = tui_render_interval(render_frame_interval);
     let mut interaction_tick = tui_render_interval(tui_frame_interval(tui_fps));
-    let mut tui_timing = TuiTiming::default();
+    let mut tui_timing = TuiTiming {
+        session_id,
+        ..TuiTiming::default()
+    };
     let mut activity_tick = tokio::time::interval(ACTIVITY_FRAME_INTERVAL);
     activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tool_timer_tick = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -3084,7 +3103,7 @@ async fn run_local_agent_session(
             _ => {}
         }
     }
-    loop {
+    'session: loop {
         tokio::select! {
             result = async {
                 lid_sleep_auth_task
@@ -4027,411 +4046,429 @@ async fn run_local_agent_session(
                 }
             }, if projection_gap_repair_task.is_none()
                 && (session_event_stream_open || !queued_session_events.is_empty()) => {
-                let Some(event) = event else {
-                    session_event_stream_open = false;
-                    if revert_fork_task.is_none()
-                        && let Some(sequence) = take_revert_ready_to_fork(
-                            &mut pending_revert_sequence,
-                            status,
-                            true,
-                        )
-                    {
-                        // A closed event stream means the actor cannot append
-                        // more events. Fork the immutable historical prefix
-                        // even if its final Stopped projection was not seen.
-                        revert_fork_task = Some(spawn_revert_fork(
-                            Arc::clone(&store),
-                            session_id,
-                            sequence,
-                        ));
-                    }
-                    if revert_fork_task.is_none() {
-                        break;
-                    }
-                    continue;
-                };
-                if event.sequence > delivered_projection.state().latest_sequence.saturating_add(1) {
-                    projection_gap_repair_task = Some(tokio::spawn(load_projection_gap(
-                        Arc::clone(&store),
-                        delivered_projection.state().latest_sequence,
-                        event,
-                    )));
-                    continue;
-                }
-                let event_age_ms = chrono::Utc::now()
-                    .signed_duration_since(event.created_at)
-                    .num_milliseconds()
-                    .max(0) as u64;
-                let queued_events = queued_session_events.len();
-                let schema_rejected = local_owner_rejected_newer_schema(&event);
-                let handoff_stale_owner = stale_local_owner
-                    && stale_owner_handoff_task.is_none()
-                    && (schema_rejected
-                        || matches!(
-                            event.kind,
-                            SessionEventKind::StatusChanged {
-                                status: SessionStatus::Ready,
-                                ..
-                            }
-                        ));
-                if let Some(server) = control_server.as_ref() {
-                    server.publish_live_event(&event);
-                }
-                delivered_projection.observe(&event)?;
-                if let Some(timing) = prompt_timing.as_mut() {
-                    match &event.kind {
-                        SessionEventKind::Message { message_id, .. }
-                            if *message_id == timing.message_id && timing.host.is_none() =>
+                let drain_started = std::time::Instant::now();
+                let mut drained = 0;
+                let mut incoming_event = event;
+                loop {
+                    let Some(event) = incoming_event.take() else {
+                        session_event_stream_open = false;
+                        if revert_fork_task.is_none()
+                            && let Some(sequence) = take_revert_ready_to_fork(
+                                &mut pending_revert_sequence,
+                                status,
+                                true,
+                            )
                         {
-                            timing.host = Some(std::time::Instant::now());
-                            if !timing.idle {
-                                timing.log(None);
+                            // A closed event stream means the actor cannot append
+                            // more events. Fork the immutable historical prefix
+                            // even if its final Stopped projection was not seen.
+                            revert_fork_task = Some(spawn_revert_fork(
+                                Arc::clone(&store),
+                                session_id,
+                                sequence,
+                            ));
+                        }
+                        if revert_fork_task.is_none() {
+                            break 'session;
+                        }
+                        continue 'session;
+                    };
+                    if event.sequence > delivered_projection.state().latest_sequence.saturating_add(1) {
+                        projection_gap_repair_task = Some(tokio::spawn(load_projection_gap(
+                            Arc::clone(&store),
+                            delivered_projection.state().latest_sequence,
+                            event,
+                        )));
+                        continue 'session;
+                    }
+                    let event_age_ms = chrono::Utc::now()
+                        .signed_duration_since(event.created_at)
+                        .num_milliseconds()
+                        .max(0) as u64;
+                    let queued_events = queued_session_events.len() + session_events.len();
+                    let schema_rejected = local_owner_rejected_newer_schema(&event);
+                    let handoff_stale_owner = stale_local_owner
+                        && stale_owner_handoff_task.is_none()
+                        && (schema_rejected
+                            || matches!(
+                                event.kind,
+                                SessionEventKind::StatusChanged {
+                                    status: SessionStatus::Ready,
+                                    ..
+                                }
+                            ));
+                    if let Some(server) = control_server.as_ref() {
+                        server.publish_live_event(&event);
+                    }
+                    delivered_projection.observe(&event)?;
+                    if let Some(timing) = prompt_timing.as_mut() {
+                        match &event.kind {
+                            SessionEventKind::Message { message_id, .. }
+                                if *message_id == timing.message_id && timing.host.is_none() =>
+                            {
+                                timing.host = Some(std::time::Instant::now());
+                                if !timing.idle {
+                                    timing.log(None);
+                                    prompt_timing = None;
+                                }
+                            }
+                            SessionEventKind::StatusChanged {
+                                status: SessionStatus::Running,
+                                ..
+                            } if timing.host.is_some() => {
+                                timing.log(Some(std::time::Instant::now()));
                                 prompt_timing = None;
                             }
+                            _ => {}
                         }
-                        SessionEventKind::StatusChanged {
-                            status: SessionStatus::Running,
-                            ..
-                        } if timing.host.is_some() => {
-                            timing.log(Some(std::time::Instant::now()));
-                            prompt_timing = None;
-                        }
-                        _ => {}
                     }
-                }
-                if let Some(message_id) = committed_prompt_id(&event.kind) {
-                    pending_prompt_ids.remove(&message_id);
-                    local_prompt_admissions
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&message_id);
-                } else if let SessionEventKind::PromptRecalled { message_id, .. } = &event.kind {
-                    pending_prompt_ids.remove(message_id);
-                    local_prompt_admissions
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(message_id);
-                }
-                if let SessionEventKind::StatusChanged { status: next, .. } = &event.kind {
-                    status = *next;
-                    saw_running |= *next == SessionStatus::Running;
-                    sleep_inhibitor.set_turn_active(matches!(
-                        next,
-                        SessionStatus::Starting
-                            | SessionStatus::Running
-                            | SessionStatus::WaitingForApproval
-                    ));
-                    if revert_fork_task.is_none()
-                        && let Some(sequence) = take_revert_ready_to_fork(
-                            &mut pending_revert_sequence,
-                            *next,
-                            false,
-                        )
-                    {
-                        revert_fork_task = Some(spawn_revert_fork(
-                            Arc::clone(&store),
-                            session_id,
-                            sequence,
+                    if let Some(message_id) = committed_prompt_id(&event.kind) {
+                        pending_prompt_ids.remove(&message_id);
+                        local_prompt_admissions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&message_id);
+                    } else if let SessionEventKind::PromptRecalled { message_id, .. } = &event.kind {
+                        pending_prompt_ids.remove(message_id);
+                        local_prompt_admissions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(message_id);
+                    }
+                    if let SessionEventKind::StatusChanged { status: next, .. } = &event.kind {
+                        status = *next;
+                        saw_running |= *next == SessionStatus::Running;
+                        sleep_inhibitor.set_turn_active(matches!(
+                            next,
+                            SessionStatus::Starting
+                                | SessionStatus::Running
+                                | SessionStatus::WaitingForApproval
                         ));
-                        if let Some(terminal) = terminal.as_mut() {
-                            terminal.set_notice("Session stopped · creating reverted session…");
-                            terminal_dirty = true;
-                        }
-                    }
-                }
-                // Sits outside the match below because status-only activity
-                // carries no child event, and those are the transitions here.
-                if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind {
-                    if subagent_is_working(agent.status) {
-                        working_subagents.insert(agent.session_id);
-                    } else {
-                        working_subagents.remove(&agent.session_id);
-                    }
-                    sleep_inhibitor.set_children_active(!working_subagents.is_empty());
-                }
-                match &event.kind {
-                    SessionEventKind::ApprovalRequested { approval_id, .. } => {
-                        pending_approval = Some(approval_id.clone());
-                    }
-                    SessionEventKind::ApprovalResolved { approval_id, .. }
-                        if pending_approval.as_deref() == Some(approval_id.as_str()) =>
-                    {
-                        pending_approval = None;
-                    }
-                    SessionEventKind::ProviderInteractionRequested {
-                        interaction_id,
-                        kind,
-                        payload,
-                        ..
-                    } => {
-                        pending_provider_interaction =
-                            Some((interaction_id.clone(), kind.clone(), payload.clone()));
-                    }
-                    SessionEventKind::ProviderInteractionResolved { interaction_id, .. }
-                        if pending_provider_interaction
-                            .as_ref()
-                            .is_some_and(|(pending_id, _, _)| pending_id == interaction_id) =>
-                    {
-                        pending_provider_interaction = None;
-                    }
-                    SessionEventKind::GoalUpdated { goal } => {
-                        current_goal = Some(goal.clone());
-                    }
-                    SessionEventKind::GoalCleared { .. } => {
-                        current_goal = None;
-                    }
-                    SessionEventKind::PlanUpdated { items } => {
-                        current_todos = items.clone();
-                    }
-                    SessionEventKind::SessionConfigured {
-                        provider: configured_provider,
-                        model,
-                        effort,
-                        fast,
-                        response_language,
-                        ..
-                    } => {
-                        provider = *configured_provider;
-                        if can_prompt || args.gui_owner {
-                            let last_model = borg_remote::ModelRoute {
-                                provider,
-                                model: model.clone(),
-                                effort: effort.clone(),
-                                allow_api_billing: false,
-                            };
-                            if editor_preferences.interaction.last_model.as_ref()
-                                != Some(&last_model)
-                            {
-                                editor_preferences.interaction.last_model = Some(last_model);
-                                dispatch_editor_preferences_save(
-                                    &editor_preferences_tx,
-                                    &editor_preferences,
-                                );
+                        if revert_fork_task.is_none()
+                            && let Some(sequence) = take_revert_ready_to_fork(
+                                &mut pending_revert_sequence,
+                                *next,
+                                false,
+                            )
+                        {
+                            revert_fork_task = Some(spawn_revert_fork(
+                                Arc::clone(&store),
+                                session_id,
+                                sequence,
+                            ));
+                            if let Some(terminal) = terminal.as_mut() {
+                                terminal.set_notice("Session stopped · creating reverted session…");
+                                terminal_dirty = true;
                             }
                         }
-                        current_model = model.clone();
-                        current_effort = effort.clone();
-                        current_fast = *fast;
-                        current_response_language = *response_language;
                     }
-                    SessionEventKind::UsageUpdated {
-                        input_tokens,
-                        output_tokens,
-                        cached_input_tokens,
-                        cache_creation_input_tokens,
-                        total_tokens,
-                        cost_usd,
-                        ..
-                    } => session_usage.add(
-                        *input_tokens,
-                        *output_tokens,
-                        *cached_input_tokens,
-                        *cache_creation_input_tokens,
-                        *total_tokens,
-                        *cost_usd,
-                    ),
-                    SessionEventKind::SubagentActivity {
-                        agent,
-                        event: Some(child_event),
-                        ..
-                    } => match &child_event.kind {
+                    // Sits outside the match below because status-only activity
+                    // carries no child event, and those are the transitions here.
+                    if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind {
+                        if subagent_is_working(agent.status) {
+                            working_subagents.insert(agent.session_id);
+                        } else {
+                            working_subagents.remove(&agent.session_id);
+                        }
+                        sleep_inhibitor.set_children_active(!working_subagents.is_empty());
+                    }
+                    match &event.kind {
                         SessionEventKind::ApprovalRequested { approval_id, .. } => {
-                            child_pending_approvals
-                                .insert(agent.session_id, approval_id.clone());
+                            pending_approval = Some(approval_id.clone());
                         }
                         SessionEventKind::ApprovalResolved { approval_id, .. }
-                            if child_pending_approvals
-                                .get(&agent.session_id)
-                                .is_some_and(|pending| pending == approval_id) =>
+                            if pending_approval.as_deref() == Some(approval_id.as_str()) =>
                         {
-                            child_pending_approvals.remove(&agent.session_id);
+                            pending_approval = None;
                         }
-                        _ => {}
-                    },
-                    _ => {}
-                }
-                if schema_rejected && stale_local_owner {
-                    tracing::info!(%session_id, "recovering obsolete owner after schema rejection");
-                } else if let Some(terminal) = terminal.as_mut() {
-                    let stream_text = session_event_contains_stream_text(&event.kind);
-                    let stream_burst_started = stream_text && {
-                        let now = tokio::time::Instant::now();
-                        let started = should_wake_stream_burst(last_stream_text_at, now);
-                        last_stream_text_at = Some(now);
-                        started
-                    };
-                    if stream_text {
-                        tool_started_frame_hold_until = None;
-                        streaming_frame_pending = true;
-                    }
-                    let apply_started = std::time::Instant::now();
-                    terminal_dirty |= terminal.apply_session_event(&event);
-                    tui_timing.observe("event_apply", apply_started.elapsed(), queued_events);
-                    if stream_text && event_age_ms < 600_000 {
-                        tui_timing.observe("stream_age", std::time::Duration::from_millis(event_age_ms), queued_events);
-                    }
-                    if stream_burst_started && terminal_dirty {
-                        render_frame_interval = tui_frame_interval(tui_streaming_fps);
-                        render_tick = tui_render_interval(render_frame_interval);
-                    }
-                    if event.sequence == 0 && coalesced_transcript_event(&event.kind) {
-                        transcript_live_tail = true;
-                    }
-                    if event.sequence > 0
-                        && history
-                            .last()
-                            .is_none_or(|loaded| loaded.sequence < event.sequence)
-                    {
-                        history.push(event.clone());
-                    }
-                    if matches!(&event.kind, SessionEventKind::TurnCompleted { .. }) {
-                        // The store retires coalesced live state at every
-                        // terminal turn boundary, including interruption.
-                        if history_has_coalesced_events {
-                            history.retain(|event| event.sequence > 0);
-                            history_has_coalesced_events = false;
+                        SessionEventKind::ProviderInteractionRequested {
+                            interaction_id,
+                            kind,
+                            payload,
+                            ..
+                        } => {
+                            pending_provider_interaction =
+                                Some((interaction_id.clone(), kind.clone(), payload.clone()));
                         }
-                        transcript_live_tail = false;
-                    }
-                    if transcript_rebuild_pending && !transcript_live_tail {
-                        terminal.replace_history(&history);
-                        terminal.seed_session_state(delivered_projection.state());
-                        transcript_rebuild_pending = false;
-                        terminal_dirty = true;
-                    }
-                    if terminal_dirty && session_event_needs_immediate_frame(&event.kind) {
-                        if render_frame_interval <= ACTIVITY_FRAME_INTERVAL {
-                            let draw_started = std::time::Instant::now();
-                            terminal.draw()?;
-                            tui_timing.observe("immediate_draw", draw_started.elapsed(), queued_events);
-                            let next_interval = responsive_tui_frame_interval(
-                                tui_fps,
-                                tui_streaming_fps,
-                                draw_started.elapsed(),
-                                false,
-                                false,
-                            );
-                            streaming_frame_pending = false;
-                            if next_interval != render_frame_interval {
-                                render_frame_interval = next_interval;
-                                render_tick = tui_render_interval(render_frame_interval);
+                        SessionEventKind::ProviderInteractionResolved { interaction_id, .. }
+                            if pending_provider_interaction
+                                .as_ref()
+                                .is_some_and(|(pending_id, _, _)| pending_id == interaction_id) =>
+                        {
+                            pending_provider_interaction = None;
+                        }
+                        SessionEventKind::GoalUpdated { goal } => {
+                            current_goal = Some(goal.clone());
+                        }
+                        SessionEventKind::GoalCleared { .. } => {
+                            current_goal = None;
+                        }
+                        SessionEventKind::PlanUpdated { items } => {
+                            current_todos = items.clone();
+                        }
+                        SessionEventKind::SessionConfigured {
+                            provider: configured_provider,
+                            model,
+                            effort,
+                            fast,
+                            response_language,
+                            ..
+                        } => {
+                            provider = *configured_provider;
+                            if can_prompt || args.gui_owner {
+                                let last_model = borg_remote::ModelRoute {
+                                    provider,
+                                    model: model.clone(),
+                                    effort: effort.clone(),
+                                    allow_api_billing: false,
+                                };
+                                if editor_preferences.interaction.last_model.as_ref()
+                                    != Some(&last_model)
+                                {
+                                    editor_preferences.interaction.last_model = Some(last_model);
+                                    dispatch_editor_preferences_save(
+                                        &editor_preferences_tx,
+                                        &editor_preferences,
+                                    );
+                                }
                             }
-                            terminal_dirty = terminal.has_pending_scroll_frame();
-                            tool_started_frame_hold_until = Some(
-                                tokio::time::Instant::now() + TOOL_STARTED_FRAME_MIN_DURATION,
-                            );
-                        } else {
-                            terminal.draw_for_activity()?;
+                            current_model = model.clone();
+                            current_effort = effort.clone();
+                            current_fast = *fast;
+                            current_response_language = *response_language;
                         }
+                        SessionEventKind::UsageUpdated {
+                            input_tokens,
+                            output_tokens,
+                            cached_input_tokens,
+                            cache_creation_input_tokens,
+                            total_tokens,
+                            cost_usd,
+                            ..
+                        } => session_usage.add(
+                            *input_tokens,
+                            *output_tokens,
+                            *cached_input_tokens,
+                            *cache_creation_input_tokens,
+                            *total_tokens,
+                            *cost_usd,
+                        ),
+                        SessionEventKind::SubagentActivity {
+                            agent,
+                            event: Some(child_event),
+                            ..
+                        } => match &child_event.kind {
+                            SessionEventKind::ApprovalRequested { approval_id, .. } => {
+                                child_pending_approvals
+                                    .insert(agent.session_id, approval_id.clone());
+                            }
+                            SessionEventKind::ApprovalResolved { approval_id, .. }
+                                if child_pending_approvals
+                                    .get(&agent.session_id)
+                                    .is_some_and(|pending| pending == approval_id) =>
+                            {
+                                child_pending_approvals.remove(&agent.session_id);
+                            }
+                            _ => {}
+                        },
+                        _ => {}
                     }
-                } else if !detached_from_terminal {
-                    render_event(&event, args.json, args.print, &mut rendered)?;
-                }
-                if handoff_stale_owner {
-                    let socket_path = control_socket_path.clone();
-                    let lock_path = lock_path.clone();
-                    let sessions_dir = sessions_dir.clone();
-                    let store = Arc::clone(&store);
-                    if let Some(terminal) = terminal.as_mut() {
-                        terminal.set_notice("Upgrading the older session owner; queued prompts will resume.");
-                        terminal_dirty = true;
-                    }
-                    stale_owner_handoff_task = Some(tokio::spawn(async move {
-                        if local_session_owner_uses_current_binary(&sessions_dir, session_id)?
-                            || (!schema_rejected
-                                && !stale_local_owner_can_handoff(store.state(session_id).await?.status))
+                    if schema_rejected && stale_local_owner {
+                        tracing::info!(%session_id, "recovering obsolete owner after schema rejection");
+                    } else if let Some(terminal) = terminal.as_mut() {
+                        let stream_text = session_event_contains_stream_text(&event.kind);
+                        let stream_burst_started = stream_text && {
+                            let now = tokio::time::Instant::now();
+                            let started = should_wake_stream_burst(last_stream_text_at, now);
+                            last_stream_text_at = Some(now);
+                            started
+                        };
+                        if stream_text {
+                            tool_started_frame_hold_until = None;
+                            streaming_frame_pending = true;
+                        }
+                        let apply_started = std::time::Instant::now();
+                        terminal_dirty |= terminal.apply_session_event(&event);
+                        tui_timing.observe("event_apply", apply_started.elapsed(), queued_events);
+                        if stream_text
+                            && session_event_has_fresh_timestamp(&event.kind)
+                            && event_age_ms < 600_000
                         {
-                            return Ok(false);
+                            tui_timing.observe("stream_age", std::time::Duration::from_millis(event_age_ms), queued_events);
                         }
-                        let _writer = stop_stale_local_owner_and_acquire(
-                            &lock_path, &socket_path, session_id,
-                        ).await?;
-                        Ok(true)
-                    }));
-                }
-                if pending_approval.is_some() && !can_prompt {
-                    let approval_id = pending_approval.take().expect("pending approval");
-                    dispatch_ui_command(
-                        &ui_interaction_tx,
-                        HostCommand::Approve {
-                            session_id,
-                            approval_id,
-                            decision: ApprovalDecision::Deny,
-                        },
-                    );
-                } else if !detached_from_terminal
-                    && pending_provider_interaction
-                    .as_ref()
-                    .is_some_and(|(_, _, payload)| {
-                        terminal.is_none() && provider_interaction_payload_contains_secret(payload)
-                    })
-                {
-                    let (interaction_id, kind, _) = pending_provider_interaction
-                        .take()
-                        .expect("pending secret provider interaction");
-                    eprintln!(
-                        "\n  Secret provider input requires Borg's rich terminal; request cancelled.\n"
-                    );
-                    dispatch_ui_command(
-                        &ui_interaction_tx,
-                        HostCommand::RespondToProviderInteraction {
-                            session_id,
-                            interaction_id,
-                            response: cancelled_provider_interaction_response(&kind),
-                        },
-                    );
-                } else if pending_provider_interaction.is_some() && !can_prompt {
-                    let (interaction_id, kind, _) = pending_provider_interaction
-                        .take()
-                        .expect("pending provider interaction");
-                    dispatch_ui_command(
-                        &ui_interaction_tx,
-                        HostCommand::RespondToProviderInteraction {
-                            session_id,
-                            interaction_id,
-                            response: cancelled_provider_interaction_response(&kind),
-                        },
-                    );
-                } else if !detached_from_terminal
-                    && pending_approval.is_some()
-                    && !args.json
-                    && terminal.is_none()
-                {
-                    print!("\n  Allow · y   Deny · n › ");
-                    io::stdout().flush()?;
-                } else if !detached_from_terminal
-                    && interactive
-                    && status == SessionStatus::Ready
-                    && !args.json
-                    && terminal.is_none()
-                {
-                    print!("› ");
-                    io::stdout().flush()?;
-                }
-                if !interactive
-                    && status == SessionStatus::Ready
-                    && (saw_running || !has_initial_prompt)
-                    && !stop_sent
-                {
-                    stop_sent = true;
-                    dispatch_host_command_without_blocking(
-                        &session_command_tx,
-                        HostCommand::Stop { session_id },
-                    );
-                }
-                if handoff_on_safe_boundary
-                    && status == SessionStatus::Ready
-                    && !stop_sent
-                {
-                    // The owner has been asked to leave, but a viewer is
-                    // attached. Let the in-flight turn finish before closing
-                    // this actor so the viewer can acquire the writer lease
-                    // without observing an interrupted turn.
-                    stop_sent = true;
-                    dispatch_host_command_without_blocking(
-                        &session_command_tx,
-                        HostCommand::Stop { session_id },
-                    );
+                        if stream_burst_started && terminal_dirty {
+                            render_frame_interval = tui_frame_interval(tui_streaming_fps);
+                            render_tick = tui_render_interval(render_frame_interval);
+                        }
+                        if event.sequence == 0 && coalesced_transcript_event(&event.kind) {
+                            transcript_live_tail = true;
+                        }
+                        if event.sequence > 0
+                            && history
+                                .last()
+                                .is_none_or(|loaded| loaded.sequence < event.sequence)
+                        {
+                            history.push(event.clone());
+                        }
+                        if matches!(&event.kind, SessionEventKind::TurnCompleted { .. }) {
+                            // The store retires coalesced live state at every
+                            // terminal turn boundary, including interruption.
+                            if history_has_coalesced_events {
+                                history.retain(|event| event.sequence > 0);
+                                history_has_coalesced_events = false;
+                            }
+                            transcript_live_tail = false;
+                        }
+                        if transcript_rebuild_pending && !transcript_live_tail {
+                            terminal.replace_history(&history);
+                            terminal.seed_session_state(delivered_projection.state());
+                            transcript_rebuild_pending = false;
+                            terminal_dirty = true;
+                        }
+                        if terminal_dirty && session_event_needs_immediate_frame(&event.kind) {
+                            if render_frame_interval <= ACTIVITY_FRAME_INTERVAL {
+                                let draw_started = std::time::Instant::now();
+                                terminal.draw()?;
+                                tui_timing.observe("immediate_draw", draw_started.elapsed(), queued_events);
+                                let next_interval = responsive_tui_frame_interval(
+                                    tui_fps,
+                                    tui_streaming_fps,
+                                    draw_started.elapsed(),
+                                    false,
+                                    false,
+                                );
+                                streaming_frame_pending = false;
+                                if next_interval != render_frame_interval {
+                                    render_frame_interval = next_interval;
+                                    render_tick = tui_render_interval(render_frame_interval);
+                                }
+                                terminal_dirty = terminal.has_pending_scroll_frame();
+                                tool_started_frame_hold_until = Some(
+                                    tokio::time::Instant::now() + TOOL_STARTED_FRAME_MIN_DURATION,
+                                );
+                            } else {
+                                terminal.draw_for_activity()?;
+                            }
+                        }
+                    } else if !detached_from_terminal {
+                        render_event(&event, args.json, args.print, &mut rendered)?;
+                    }
+                    if handoff_stale_owner {
+                        let socket_path = control_socket_path.clone();
+                        let lock_path = lock_path.clone();
+                        let sessions_dir = sessions_dir.clone();
+                        let store = Arc::clone(&store);
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.set_notice("Upgrading the older session owner; queued prompts will resume.");
+                            terminal_dirty = true;
+                        }
+                        stale_owner_handoff_task = Some(tokio::spawn(async move {
+                            if local_session_owner_uses_current_binary(&sessions_dir, session_id)?
+                                || (!schema_rejected
+                                    && !stale_local_owner_can_handoff(store.state(session_id).await?.status))
+                            {
+                                return Ok(false);
+                            }
+                            let _writer = stop_stale_local_owner_and_acquire(
+                                &lock_path, &socket_path, session_id,
+                            ).await?;
+                            Ok(true)
+                        }));
+                    }
+                    if pending_approval.is_some() && !can_prompt {
+                        let approval_id = pending_approval.take().expect("pending approval");
+                        dispatch_ui_command(
+                            &ui_interaction_tx,
+                            HostCommand::Approve {
+                                session_id,
+                                approval_id,
+                                decision: ApprovalDecision::Deny,
+                            },
+                        );
+                    } else if !detached_from_terminal
+                        && pending_provider_interaction
+                        .as_ref()
+                        .is_some_and(|(_, _, payload)| {
+                            terminal.is_none() && provider_interaction_payload_contains_secret(payload)
+                        })
+                    {
+                        let (interaction_id, kind, _) = pending_provider_interaction
+                            .take()
+                            .expect("pending secret provider interaction");
+                        eprintln!(
+                            "\n  Secret provider input requires Borg's rich terminal; request cancelled.\n"
+                        );
+                        dispatch_ui_command(
+                            &ui_interaction_tx,
+                            HostCommand::RespondToProviderInteraction {
+                                session_id,
+                                interaction_id,
+                                response: cancelled_provider_interaction_response(&kind),
+                            },
+                        );
+                    } else if pending_provider_interaction.is_some() && !can_prompt {
+                        let (interaction_id, kind, _) = pending_provider_interaction
+                            .take()
+                            .expect("pending provider interaction");
+                        dispatch_ui_command(
+                            &ui_interaction_tx,
+                            HostCommand::RespondToProviderInteraction {
+                                session_id,
+                                interaction_id,
+                                response: cancelled_provider_interaction_response(&kind),
+                            },
+                        );
+                    } else if !detached_from_terminal
+                        && pending_approval.is_some()
+                        && !args.json
+                        && terminal.is_none()
+                    {
+                        print!("\n  Allow · y   Deny · n › ");
+                        io::stdout().flush()?;
+                    } else if !detached_from_terminal
+                        && interactive
+                        && status == SessionStatus::Ready
+                        && !args.json
+                        && terminal.is_none()
+                    {
+                        print!("› ");
+                        io::stdout().flush()?;
+                    }
+                    if !interactive
+                        && status == SessionStatus::Ready
+                        && (saw_running || !has_initial_prompt)
+                        && !stop_sent
+                    {
+                        stop_sent = true;
+                        dispatch_host_command_without_blocking(
+                            &session_command_tx,
+                            HostCommand::Stop { session_id },
+                        );
+                    }
+                    if handoff_on_safe_boundary
+                        && status == SessionStatus::Ready
+                        && !stop_sent
+                    {
+                        // The owner has been asked to leave, but a viewer is
+                        // attached. Let the in-flight turn finish before closing
+                        // this actor so the viewer can acquire the writer lease
+                        // without observing an interrupted turn.
+                        stop_sent = true;
+                        dispatch_host_command_without_blocking(
+                            &session_command_tx,
+                            HostCommand::Stop { session_id },
+                        );
+                    }
+                    drained += 1;
+                    let Some(next) = next_ready_session_event(
+                        &mut queued_session_events,
+                        &mut session_events,
+                        drain_started,
+                        drained,
+                    ) else {
+                        break;
+                    };
+                    incoming_event = Some(next);
                 }
             }
             line = recv_terminal_line(&mut input), if input_open => {
@@ -9585,6 +9622,18 @@ fn session_event_contains_stream_text(kind: &SessionEventKind) -> bool {
     }
 }
 
+// Reasoning snapshots retain the start time of the whole block, including
+// mirrored child snapshots. Their age is not delivery latency.
+fn session_event_has_fresh_timestamp(kind: &SessionEventKind) -> bool {
+    match kind {
+        SessionEventKind::ReasoningDelta { .. } => false,
+        SessionEventKind::SubagentActivity {
+            event: Some(child), ..
+        } => session_event_has_fresh_timestamp(&child.kind),
+        _ => true,
+    }
+}
+
 fn should_schedule_interaction_frame(
     input_is_interaction: bool,
     event_redraw_needed: bool,
@@ -10043,6 +10092,7 @@ pub(crate) fn parse_goal_action(line: &str) -> Result<GoalAction> {
 // Aggregated timing keeps heavy streams observable without logging every token.
 #[derive(Default)]
 struct TuiTiming {
+    session_id: Uuid,
     started: Option<std::time::Instant>,
     samples: [u64; 7],
     maxima_ms: [u128; 7],
@@ -10066,15 +10116,26 @@ impl TuiTiming {
         self.maxima_ms[index] = self.maxima_ms[index].max(elapsed.as_millis());
         self.queue_max = self.queue_max.max(queued);
         if started.elapsed() >= std::time::Duration::from_secs(5) {
+            tracing::debug!(
+                session_id = %self.session_id,
+                samples = ?self.samples,
+                max_ms = ?self.maxima_ms,
+                max_queued_events = self.queue_max,
+                "tui stream timing"
+            );
             if self.maxima_ms.iter().any(|&ms| ms >= 100) || self.queue_max >= 100 {
                 tracing::warn!(
+                    session_id = %self.session_id,
                     samples = ?self.samples,
                     max_ms = ?self.maxima_ms,
                     max_queued_events = self.queue_max,
                     "tui latency (event_apply, stream_age, frame_wait, frame_draw, immediate_draw, input_wait_or_handle, interaction_draw)"
                 );
             }
-            *self = Self::default();
+            *self = Self {
+                session_id: self.session_id,
+                ..Self::default()
+            };
         }
     }
 }
