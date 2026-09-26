@@ -77,10 +77,10 @@ use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use self::cache_diagnostics::{CacheDiagnostics, CacheSignature, CacheStatus, CacheUsage};
+use self::key_hints::KeyHints;
 use self::markdown::{
     markdown_lines, markdown_link_ranges, markdown_plain_text, open_link, truncate_table_cell,
 };
-use self::key_hints::KeyHints;
 use self::terminal_input::TerminalInput;
 pub use self::terminal_input::{TerminalInputEvent, take_last_enter_read, take_last_escape_read};
 use borg_ui::KeybindingConfig;
@@ -8281,7 +8281,10 @@ impl BorgTerminal {
         let mut frame_cursor = None;
         let hint_status_actionable = status_control_is_actionable(self.active_status());
         let hint_goal_identity = self.key_hints.active.as_ref().map(|_| {
-            format!("goal:{:?}", self.active_goal().map(|goal| (goal.id, goal.status)))
+            format!(
+                "goal:{:?}",
+                self.active_goal().map(|goal| (goal.id, goal.status))
+            )
         });
         self.terminal.draw(|frame| {
             let area = centered_content_area_with_margin(frame.area(), self.horizontal_margin);
@@ -10026,7 +10029,10 @@ impl BorgTerminal {
                     if !background_hover_suppressed {
                         for (area, id) in &next_shell_row_hit_areas {
                             if let Some(index) = id {
-                                hint_candidates.push((*area, format!("shell:{}", self.transcript.key_hint_identity(*index))));
+                                hint_candidates.push((
+                                    *area,
+                                    format!("shell:{}", self.transcript.key_hint_identity(*index)),
+                                ));
                             }
                         }
                         for (area, id) in &next_watch_row_hit_areas {
@@ -10035,9 +10041,15 @@ impl BorgTerminal {
                         for (name, area) in [
                             ("dictation", next_dictation_button_area),
                             ("pending", next_pending_input_header_area),
-                            ("status", next_status_area.filter(|_| hint_status_actionable)),
+                            (
+                                "status",
+                                next_status_area.filter(|_| hint_status_actionable),
+                            ),
                             ("goal", next_goal_status_area),
-                            ("todos", next_todo_status_area.filter(|_| !self.transcript.todos.is_empty())),
+                            (
+                                "todos",
+                                next_todo_status_area.filter(|_| !self.transcript.todos.is_empty()),
+                            ),
                             ("shell", next_shell_status_area),
                             ("agents", next_agents_status_area),
                             ("model", next_model_status_area),
@@ -10056,7 +10068,9 @@ impl BorgTerminal {
                             if let Some(area) = area {
                                 let identity = if name == "goal" {
                                     hint_goal_identity.clone().unwrap_or_default()
-                                } else { name.to_string() };
+                                } else {
+                                    name.to_string()
+                                };
                                 hint_candidates.push((area, identity));
                             }
                         }
