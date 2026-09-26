@@ -16701,7 +16701,7 @@ fn peer_agent_message_is_visible_without_subagent_opt_in() {
     assert!(
         single
             .iter()
-            .any(|line| line.contains("Peer") && line.contains("steer orphaning")),
+            .any(|line| line.contains("↙ Peer") && line.contains("steer orphaning")),
         "{single:?}"
     );
     transcript.wrap_action_rows = true;

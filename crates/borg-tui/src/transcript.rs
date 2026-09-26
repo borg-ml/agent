@@ -727,6 +727,7 @@ enum TranscriptActionState {
     Running,
     Waiting,
     Complete,
+    Received,
     Stopped,
     Failed,
 }
@@ -2945,7 +2946,7 @@ impl Transcript {
                             },
                             body: Some(text.clone()),
                             time: local_event_time(event),
-                            state: TranscriptActionState::Complete,
+                            state: TranscriptActionState::Received,
                             expanded: !from_peer,
                         });
                     }

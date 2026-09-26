@@ -12665,6 +12665,7 @@ fn transcript_action_glyph(state: TranscriptActionState) -> &'static str {
         TranscriptActionState::Running => "◇",
         TranscriptActionState::Waiting => "?",
         TranscriptActionState::Complete => "✓",
+        TranscriptActionState::Received => "↙",
         TranscriptActionState::Stopped => "■",
         TranscriptActionState::Failed => "!",
     }
@@ -14136,7 +14137,7 @@ fn selection_content_start(value: &str) -> usize {
     if let Some(gutter_end) = selection_code_gutter_end(leading) {
         return leading_cells.saturating_add(gutter_end);
     }
-    let lifecycle_glyphs = "✓◇⠋⠙⠹⠸⠼⠴⠦⠧!■↗?";
+    let lifecycle_glyphs = "✓↙◇⠋⠙⠹⠸⠼⠴⠦⠧!■↗?";
     if let Some((byte, glyph)) = leading
         .char_indices()
         .find(|(_, character)| lifecycle_glyphs.contains(*character))
