@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.12.3)
 
+### Sessions
+
+- Sending a message no longer resumes a goal that a stop or a block left
+  parked. The message is still answered and an Escape stop is still released,
+  but the goal waits for an explicit `/goal resume`. Set
+  `[capabilities] resume_paused_goal_on_message = true` for the previous
+  behavior.
+
 ## 0.12.3 (2026-09-26)
 
 ### Providers

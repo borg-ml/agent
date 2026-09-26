@@ -3966,6 +3966,7 @@ async fn run_agent_session_store_kernel_inner(
                     &mut goal,
                     &mut goal_active_since,
                     &mut user_stop,
+                    launch.capabilities.resume_paused_goal_on_message,
                 )
                 .await?;
                 stale_user_prompts.clear();
@@ -5738,6 +5739,7 @@ async fn run_agent_session_store_kernel_inner(
                                     resume_interrupted_goal_on_human_input(
                                         &mut journal, &events, session_id, &mut goal,
                                         &mut goal_active_since, &mut user_stop,
+                                        launch.capabilities.resume_paused_goal_on_message,
                                     ).await?;
                                     stale_user_prompts.clear();
                                 }
@@ -5867,6 +5869,7 @@ async fn run_agent_session_store_kernel_inner(
                                 resume_interrupted_goal_on_human_input(
                                     &mut journal, &events, session_id, &mut goal,
                                     &mut goal_active_since, &mut user_stop,
+                                    launch.capabilities.resume_paused_goal_on_message,
                                 ).await?;
                                 stale_user_prompts.clear();
                             }
@@ -11956,9 +11959,11 @@ async fn pause_active_goal(
     Ok(())
 }
 
-/// Fresh human input releases an Escape stop and the goal it paused, and
-/// reopens a blocked goal: new direction is what a blocked goal waits for.
-/// A standalone /goal pause leaves the stop latch clear and stays paused.
+/// Fresh human input releases an Escape stop so the session answers again,
+/// and with `resume_paused_goal_on_message` also picks a goal back up: new
+/// direction is what a blocked goal waits for. That resume is off by default,
+/// so a message never silently restarts goal work and `/goal resume` stays the
+/// explicit way back. A standalone /goal pause always stays paused.
 async fn resume_interrupted_goal_on_human_input(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
@@ -11966,10 +11971,13 @@ async fn resume_interrupted_goal_on_human_input(
     goal: &mut Option<SessionGoal>,
     active_since: &mut Option<Instant>,
     user_stop: &mut bool,
+    resume_goal: bool,
 ) -> Result<()> {
-    if goal.as_ref().is_some_and(|goal| {
-        goal.status == GoalStatus::Blocked || (*user_stop && goal.status == GoalStatus::Paused)
-    }) {
+    if resume_goal
+        && goal.as_ref().is_some_and(|goal| {
+            goal.status == GoalStatus::Blocked || (*user_stop && goal.status == GoalStatus::Paused)
+        })
+    {
         apply_goal_action(
             journal,
             events,

@@ -2165,6 +2165,7 @@ fn validate_settings_shape(root: &toml::Value) -> Result<()> {
                 "telemetry",
                 "auto_resume_usage_limits",
                 "watcher_yield",
+                "resume_paused_goal_on_message",
                 "steer_reply_prompt",
             ],
             "capabilities",

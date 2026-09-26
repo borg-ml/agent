@@ -1028,6 +1028,11 @@ pub struct SessionCapabilities {
     /// Permit a goal to yield until a running watcher reports progress.
     #[serde(default = "default_true")]
     pub watcher_yield: bool,
+    /// Let a human message resume a goal that a stop or a block left parked.
+    /// Off by default: a message answers the human without silently putting
+    /// the goal back to work, so resuming stays an explicit `/goal resume`.
+    #[serde(default)]
+    pub resume_paused_goal_on_message: bool,
     /// Ordered model routes. When the active route reaches a usage limit the
     /// session continues the same turn on the next route with quota, and
     /// returns to an earlier route once its limit resets. Empty keeps the
@@ -1096,6 +1101,7 @@ impl Default for SessionCapabilities {
             telemetry: false,
             auto_resume_usage_limits: true,
             watcher_yield: true,
+            resume_paused_goal_on_message: false,
             model_fallback: Vec::new(),
             steer_reply_prompt: SteerReplyPrompt::default(),
             provider_capabilities: Vec::new(),
