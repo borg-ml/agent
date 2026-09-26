@@ -2100,6 +2100,10 @@ async fn run_agent_session_store_kernel_inner(
     let state = journal.state(session_id).await?;
     validate_session_state(session_id, &state)?;
     let mut provider_context_usage_valid = fresh;
+    let mut resumed_native_context_tokens =
+        restored_native_context_tokens(journal.context_events(), launch.provider);
+    let resumed_context_generation = state.context_generation;
+
     let mut provider_session_id = provider_checkpoint_contract_current
         .then_some(state.provider_session_id)
         .flatten();
@@ -3271,6 +3275,7 @@ async fn run_agent_session_store_kernel_inner(
                             Ok(provider_switched) => {
                                 if retry_selection {
                                     provider_context_usage_valid = false;
+                                    resumed_native_context_tokens = None;
                                 }
                                 if provider_switched {
                                     executor
@@ -4045,6 +4050,7 @@ async fn run_agent_session_store_kernel_inner(
         {
             subscription_context_reusable = false;
             provider_context_usage_valid = false;
+            resumed_native_context_tokens = None;
             retained_context = None;
         }
 
@@ -4729,6 +4735,10 @@ async fn run_agent_session_store_kernel_inner(
             context_generation: journal.state(session_id).await?.context_generation,
             prior_native_context_tokens: if native_provider && provider_context_usage_valid {
                 journal.state(session_id).await?.usage.context_tokens
+            } else if native_provider
+                && journal.state(session_id).await?.context_generation == resumed_context_generation
+            {
+                resumed_native_context_tokens.take()
             } else {
                 None
             },
@@ -6004,6 +6014,7 @@ async fn run_agent_session_store_kernel_inner(
                                 Ok(provider_switched) => {
                                     if context_selection_changed {
                                         provider_context_usage_valid = false;
+                                        resumed_native_context_tokens = None;
                                     }
                                     provider_switch_pending |= provider_switched;
                                 }
@@ -6797,6 +6808,7 @@ async fn run_agent_session_store_kernel_inner(
         at_turn_boundary = true;
         if active_provider != launch.provider || active_model != launch.model {
             provider_context_usage_valid = false;
+            resumed_native_context_tokens = None;
         }
         if std::mem::take(&mut provider_switch_pending) {
             executor
@@ -7735,6 +7747,45 @@ fn compaction_restarts_replay(payload: &Value) -> bool {
 /// carries no declarations and leaves none, so the next turn records a fresh
 /// base rather than inheriting one from a generation that has ended.
 const COMPACTION_RETAINED_DECLARATIONS_FIELD: &str = "retained_declarations";
+
+fn restored_native_context_tokens(
+    events: &[SessionEvent],
+    provider: CodingProvider,
+) -> Option<u64> {
+    let prefix = native_request_prefix(events)?;
+    for event in events.iter().rev() {
+        match &event.kind {
+            SessionEventKind::ContextCleared => return None,
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "native_context_checkpoint" =>
+            {
+                if payload.get("prefix_digest")?.as_str()?
+                    != crate::native_harness::prefix_digest(&prefix).ok()?
+                {
+                    return None;
+                }
+                let mut conversation = native_conversation(events, provider).ok()?;
+                crate::native_harness::canonicalize_native_messages(&mut conversation);
+                let count = usize::try_from(payload.get("message_count")?.as_u64()?).ok()?;
+                let measured = conversation.get(..count)?;
+                let digest = crate::native_harness::conversation_digest(measured).ok()?;
+                if payload.get("conversation_digest")?.as_str()? != digest {
+                    return None;
+                }
+                return Some(payload.get("context_tokens")?.as_u64()?.saturating_add(
+                    crate::native_harness::estimated_messages_tokens(&conversation[count..]),
+                ));
+            }
+            SessionEventKind::ProviderEvent { kind, .. }
+                if kind == "context_compaction" || kind == "context_microcompaction" =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
 pub(crate) fn native_request_prefix(events: &[SessionEvent]) -> Option<crate::NativeRequestPrefix> {
     for event in events.iter().rev() {

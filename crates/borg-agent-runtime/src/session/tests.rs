@@ -19921,3 +19921,280 @@ fn team_ack_count_excludes_queued_historical_members_and_admitted_recipients() {
         1
     );
 }
+
+#[tokio::test]
+async fn native_context_checkpoint_requires_exact_replay() {
+    use borg_provider::provider::ModelMessage;
+    let provider = CodingProvider::OpenRouter;
+    let prefix = crate::NativeRequestPrefix {
+        provider,
+        model: "test".into(),
+        system_prompt: "system".into(),
+        tools: Vec::new(),
+        prompt_cache_key: "cache".into(),
+    };
+    let message = ModelMessage::assistant(Some("settled".into()), None, None, Vec::new());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    crate::native_harness::record_context_checkpoint(
+        &tx,
+        provider,
+        &prefix,
+        &[
+            ModelMessage::System {
+                content: "system".into(),
+            },
+            message.clone(),
+        ],
+        Some(189_910),
+    )
+    .await
+    .unwrap();
+    let id = Uuid::new_v4();
+    let mut events = vec![
+        SessionEvent::new(
+            id,
+            1,
+            SessionEventKind::ProviderEvent {
+                provider,
+                kind: "native_request_prefix".into(),
+                payload: serde_json::to_value(&prefix).unwrap(),
+            },
+        ),
+        SessionEvent::new(
+            id,
+            2,
+            SessionEventKind::ProviderEvent {
+                provider,
+                kind: "native_model_message".into(),
+                payload: serde_json::to_value(&message).unwrap(),
+            },
+        ),
+        SessionEvent::new(id, 3, rx.recv().await.unwrap()),
+    ];
+    assert_eq!(
+        events[2].kind.persistence(),
+        crate::session_store::EventPersistence::Durable
+    );
+    assert!(events[2].kind.is_context_relevant());
+    assert_eq!(
+        restored_native_context_tokens(&events, provider),
+        Some(189_910)
+    );
+    events.push(SessionEvent::new(
+        id,
+        4,
+        SessionEventKind::ProviderEvent {
+            provider,
+            kind: "native_model_message".into(),
+            payload: serde_json::to_value(ModelMessage::user("changed replay")).unwrap(),
+        },
+    ));
+    assert!(restored_native_context_tokens(&events, provider).unwrap() > 189_910);
+    events[1].kind = SessionEventKind::ProviderEvent {
+        provider,
+        kind: "native_model_message".into(),
+        payload: serde_json::to_value(ModelMessage::assistant(
+            Some("rewritten".into()),
+            None,
+            None,
+            Vec::new(),
+        ))
+        .unwrap(),
+    };
+    assert_eq!(restored_native_context_tokens(&events, provider), None);
+    events.pop();
+    events.push(SessionEvent::new(id, 4, SessionEventKind::ContextCleared));
+    assert_eq!(restored_native_context_tokens(&events, provider), None);
+    events.truncate(2);
+    assert_eq!(restored_native_context_tokens(&events, provider), None);
+}
+
+#[tokio::test]
+async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let previous_id = Uuid::new_v4();
+    let next_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let prefix = crate::NativeRequestPrefix {
+        provider: CodingProvider::OpenRouter,
+        model: "test".into(),
+        system_prompt: "system".into(),
+        tools: Vec::new(),
+        prompt_cache_key: "cache".into(),
+    };
+    use borg_provider::provider::ModelMessage;
+    let body = ModelMessage::assistant(
+        None,
+        None,
+        None,
+        vec![borg_provider::provider::ModelToolCall::function(
+            "call".into(),
+            "read_file".into(),
+            "{}".into(),
+        )],
+    );
+    let suffix = ModelMessage::Tool {
+        tool_call_id: "call".into(),
+        content: "trailing result".repeat(100),
+        attachments: Vec::new(),
+    };
+    let suffix_tokens = crate::native_harness::estimated_messages_tokens(&[suffix.clone()]);
+    let (tx, mut rx) = mpsc::channel(2);
+    crate::native_harness::record_context_checkpoint(
+        &tx,
+        CodingProvider::OpenRouter,
+        &prefix,
+        &[
+            ModelMessage::System {
+                content: "system".into(),
+            },
+            body.clone(),
+        ],
+        Some(189_910),
+    )
+    .await
+    .unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        SessionEventKind::SessionConfigured {
+            cwd: root.path().to_path_buf(),
+            provider: CodingProvider::OpenRouter,
+            model: Some("test".into()),
+            effort: Some("max".into()),
+            fast: false,
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::Manual,
+        },
+        SessionEventKind::TurnStarted {
+            message_id: previous_id,
+            provider: CodingProvider::OpenRouter,
+            model: Some("test".into()),
+            effort: None,
+            fast: false,
+        },
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::OpenRouter,
+            kind: "native_request_prefix".into(),
+            payload: serde_json::to_value(prefix).unwrap(),
+        },
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::OpenRouter,
+            kind: "native_model_message".into(),
+            payload: serde_json::to_value(body).unwrap(),
+        },
+        rx.recv().await.unwrap(),
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::OpenRouter,
+            kind: "native_model_message".into(),
+            payload: serde_json::to_value(suffix).unwrap(),
+        },
+        SessionEventKind::TurnCompleted {
+            message_id: previous_id,
+            provider_session_id: None,
+            final_text: String::new(),
+            error: Some("turn interrupted".into()),
+        },
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: None,
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    let expected = restored_native_context_tokens(
+        &store.recovery(session_id).await.unwrap().context_events,
+        CodingProvider::OpenRouter,
+    )
+    .unwrap();
+    assert_eq!(expected, 189_910 + suffix_tokens);
+    struct Capture {
+        seen: Arc<Mutex<Vec<Option<u64>>>>,
+        called: Arc<Notify>,
+    }
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for Capture {
+        async fn execute(
+            &self,
+            turn: AgentTurn,
+            _events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(turn.prior_native_context_tokens);
+            self.called.notify_one();
+            Ok(AgentTurnResult {
+                provider_session_id: None,
+                final_text: "done".into(),
+            })
+        }
+    }
+
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, _event_rx) = mpsc::channel(64);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let called = Arc::new(Notify::new());
+    let executor = Arc::new(Capture {
+        seen: Arc::clone(&seen),
+        called: Arc::clone(&called),
+    });
+    let actor_store = Arc::clone(&store);
+    let actor = tokio::spawn(async move {
+        run_session_actor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::OpenRouter,
+                model: Some("test".to_string()),
+                effort: Some("max".to_string()),
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+            actor_store,
+        )
+        .await
+    });
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: next_id,
+            text: "continue after restart".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
+        .await
+        .expect("resumed turn starts without compaction");
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    assert_eq!(*seen.lock().unwrap(), vec![Some(expected)]);
+    scratch.discard().await;
+}

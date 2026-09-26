@@ -238,6 +238,7 @@ impl SessionEventKind {
                         | "native_tool_round_completed"
                         | "context_microcompaction"
                         | "native_request_prefix"
+                        | "native_context_checkpoint"
                         | "network_retry"
                         | "usage_limit_retry"
                         | "usage_limit_retry_cancelled"
@@ -456,6 +457,7 @@ impl SessionEventKind {
                         | "native_declaration_delta"
                         | "context_microcompaction"
                         | "native_request_prefix"
+                        | "native_context_checkpoint"
                 )
             }
             _ => false,

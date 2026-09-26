@@ -884,6 +884,19 @@ impl NativeHarness {
             };
             record_native_message(&events, turn.provider, &result.message).await?;
             messages.push(result.message.clone());
+            // Bind measured input/output to this exact prefix. Unsent tool results
+            // are estimated only as a suffix on restart, including interrupted turns.
+            let measured_tokens = result.usage.input_tokens
+                .saturating_add(result.usage.cached_input_tokens)
+                .saturating_add(result.usage.cache_creation_input_tokens);
+            record_context_checkpoint(
+                &events,
+                turn.provider,
+                &prefix,
+                &messages,
+                (measured_tokens > 0)
+                    .then(|| measured_tokens.saturating_add(result.usage.output_tokens)),
+            ).await?;
 
             if result.finish_reason == "length" {
                 // Truncated tool-call arguments cannot be resumed, and an
@@ -3352,7 +3365,7 @@ fn normalize_reasoning_delta(accumulated: &mut String, incoming: &str) -> Option
 /// Match ZCode's provider-side canonicalization without rewriting the durable
 /// journal. Adjacent ordinary user messages otherwise serialize as different
 /// message boundaries even though they are one logical prompt prefix.
-fn canonicalize_native_messages(messages: &mut Vec<ModelMessage>) {
+pub(crate) fn canonicalize_native_messages(messages: &mut Vec<ModelMessage>) {
     let mut canonical = Vec::with_capacity(messages.len());
     for message in std::mem::take(messages) {
         match message {
@@ -4047,6 +4060,49 @@ async fn send(events: &mpsc::Sender<SessionEventKind>, event: SessionEventKind) 
     let _ = events.send(event).await;
 }
 
+pub(crate) fn conversation_digest(messages: &[ModelMessage]) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut messages = messages.to_vec();
+    canonicalize_native_messages(&mut messages);
+    Ok(Sha256::digest(serde_json::to_vec(&messages)?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+pub(crate) fn prefix_digest(prefix: &crate::NativeRequestPrefix) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    Ok(Sha256::digest(serde_json::to_vec(prefix)?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+pub(crate) async fn record_context_checkpoint(
+    events: &mpsc::Sender<SessionEventKind>,
+    provider: crate::CodingProvider,
+    prefix: &crate::NativeRequestPrefix,
+    messages: &[ModelMessage],
+    tokens: Option<u64>,
+) -> Result<()> {
+    if let Some(tokens) = tokens {
+        events
+            .send(SessionEventKind::ProviderEvent {
+                provider,
+                kind: "native_context_checkpoint".into(),
+                payload: serde_json::json!({
+                    "prefix_digest": prefix_digest(prefix)?,
+                    "conversation_digest": conversation_digest(&messages[1..])?,
+                    "context_tokens": tokens,
+                    "message_count": messages.len() - 1,
+                }),
+            })
+            .await
+            .context("record native context checkpoint")?;
+    }
+    Ok(())
+}
+
 async fn send_usage(
     events: &mpsc::Sender<SessionEventKind>,
     usage: &ProviderCallUsage,
@@ -4181,7 +4237,7 @@ fn native_context_budget(
     }
 }
 
-fn estimated_messages_tokens(messages: &[ModelMessage]) -> u64 {
+pub(crate) fn estimated_messages_tokens(messages: &[ModelMessage]) -> u64 {
     messages
         .iter()
         .map(estimated_message_tokens)
