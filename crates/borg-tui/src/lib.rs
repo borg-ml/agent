@@ -16040,14 +16040,17 @@ fn format_tool_elapsed_at(
         .signed_duration_since(started_at)
         .num_milliseconds()
         .max(0) as u64;
-    if elapsed_ms < 100 {
-        return completed_at.is_none().then(|| "0.0s".to_string());
+    // Whole seconds, and nothing at all under one: a tenth-second readout
+    // jitters faster than anyone can read it, and a timer that first appears
+    // already counting is noise on a fast action.
+    let total_seconds = elapsed_ms / 1_000;
+    if total_seconds == 0 {
+        return None;
     }
-    if elapsed_ms < 60_000 {
-        return Some(format!("{:.1}s", elapsed_ms as f64 / 1_000.0));
+    if total_seconds < 60 {
+        return Some(format!("{total_seconds}s"));
     }
 
-    let total_seconds = elapsed_ms / 1_000;
     let seconds = total_seconds % 60;
     let total_minutes = total_seconds / 60;
     if total_minutes < 60 {

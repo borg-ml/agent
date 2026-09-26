@@ -1,12 +1,12 @@
 const USER_INTERRUPT_ACTIVITY: &str = "agent interrupted by user";
-const TOOL_ELAPSED_REFRESH_MILLIS: i64 = 100;
-const LONG_TOOL_ELAPSED_REFRESH_MILLIS: i64 = 1_000;
+/// The readout counts whole seconds, so the timer is repainted once per
+/// second rather than ten times for a digit nobody can read.
+const TOOL_ELAPSED_REFRESH_MILLIS: i64 = 1_000;
 const REASONING_SUMMARY_ROTATION_MILLIS: i64 = 2_000;
 /// Blocks that finish within this window after the last release stay held
 /// and land together on the next one, so a fast model cannot make a reply
 /// repaint several times a second, while the first block still shows at once.
 const PARAGRAPH_DELIVERY_INTERVAL: Duration = Duration::from_millis(400);
-const LONG_TOOL_ELAPSED_THRESHOLD_MILLIS: i64 = 60_000;
 
 fn assistant_message_is_retired_action_leak(text: &str) -> bool {
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
@@ -4737,27 +4737,12 @@ impl Transcript {
             .map(|lines| reasoning_summary_rotation_phase(lines.len(), *completed_at, now))
     }
 
+    /// A running tool repaints on whole-second boundaries, so a long action
+    /// costs the same as a short one: one repaint a second, which is exactly
+    /// when its readout changes.
     fn running_tool_timer_tick_at(&self, now: DateTime<Utc>) -> Option<i64> {
-        let mut indices = self.tools.values().copied().collect::<Vec<_>>();
-        indices.extend(self.active_reasoning);
-        let has_recent_tool = indices.into_iter().any(|index| {
-            matches!(
-                self.order.get(index),
-                Some(TranscriptEntry::Tool {
-                    started_at,
-                    complete: false,
-                    ..
-                }) if now.signed_duration_since(*started_at).num_milliseconds()
-                    < LONG_TOOL_ELAPSED_THRESHOLD_MILLIS
-            )
-        });
-        self.has_running_tool().then(|| {
-            now.timestamp_millis().div_euclid(if has_recent_tool {
-                TOOL_ELAPSED_REFRESH_MILLIS
-            } else {
-                LONG_TOOL_ELAPSED_REFRESH_MILLIS
-            })
-        })
+        self.has_running_tool()
+            .then(|| now.timestamp_millis().div_euclid(TOOL_ELAPSED_REFRESH_MILLIS))
     }
 
     fn running_tool_elapsed_labels_at(&self, now: DateTime<Utc>) -> Vec<(usize, Option<String>)> {
