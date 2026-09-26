@@ -2,6 +2,10 @@ const USER_INTERRUPT_ACTIVITY: &str = "agent interrupted by user";
 const TOOL_ELAPSED_REFRESH_MILLIS: i64 = 100;
 const LONG_TOOL_ELAPSED_REFRESH_MILLIS: i64 = 1_000;
 const REASONING_SUMMARY_ROTATION_MILLIS: i64 = 2_000;
+/// Blocks that finish within this window after the last release stay held
+/// and land together on the next one, so a fast model cannot make a reply
+/// repaint several times a second, while the first block still shows at once.
+const PARAGRAPH_DELIVERY_INTERVAL: Duration = Duration::from_millis(400);
 const LONG_TOOL_ELAPSED_THRESHOLD_MILLIS: i64 = 60_000;
 
 fn assistant_message_is_retired_action_leak(text: &str) -> bool {
@@ -258,6 +262,9 @@ struct Transcript {
     /// Paragraph streaming: the unfinished end of each in-progress reply,
     /// shown once it completes a block or the reply ends.
     streaming_tails: HashMap<Uuid, String>,
+    /// When a held block was last released per message. Blocks that finish
+    /// inside this window wait and land together on the next one.
+    streaming_last_release: HashMap<Uuid, Instant>,
     show_subagent_messages: bool,
     tool_click_behavior: ToolClickBehavior,
     user_label: String,
@@ -393,6 +400,7 @@ impl Default for Transcript {
             // the user's streaming preference to every transcript it shows.
             response_streaming: borg_ui::preferences::ResponseStreaming::Token,
             streaming_tails: HashMap::new(),
+            streaming_last_release: HashMap::new(),
             show_subagent_messages: false,
             tool_click_behavior: ToolClickBehavior::Fullscreen,
             user_label: "user".to_string(),
@@ -2044,6 +2052,7 @@ impl Transcript {
                         .get_mut()
                         .messages
                         .retain(|(entry_index, _), _| *entry_index != index);
+                    let mut finished = false;
                     let numbered_attachments = matches!(
                         &self.order[index],
                         TranscriptEntry::Message {
@@ -2087,8 +2096,17 @@ impl Transcript {
                         if let Some(attachments) = numbered_attachments {
                             *stored_attachments = attachments;
                         }
+                        finished = matches!(
+                            stored_status,
+                            MessageStatus::Complete | MessageStatus::Failed
+                        );
                     }
-                    if replaced_text && !self.streaming_tails.contains_key(message_id) {
+                    if finished {
+                        // The reply is over, so whatever the paced floor was
+                        // still holding lands now as one block rather than
+                        // trailing in behind a finished row.
+                        self.release_streaming_tail(*message_id);
+                    } else if replaced_text && !self.streaming_tails.contains_key(message_id) {
                         self.hold_back_unfinished(*message_id);
                     }
                 } else {
@@ -3381,15 +3399,21 @@ impl Transcript {
             return;
         };
         if self.response_streaming == borg_ui::preferences::ResponseStreaming::Paragraph {
+            let now = Instant::now();
+            let paced = self
+                .streaming_last_release
+                .get(&message_id)
+                .is_some_and(|last| now.duration_since(*last) < PARAGRAPH_DELIVERY_INTERVAL);
             let tail = self.streaming_tails.entry(message_id).or_default();
             tail.push_str(delta);
             let release = crate::markdown::paragraph_release(&format!("{text}{tail}"));
-            if release <= text.len() {
+            if release <= text.len() || paced {
                 return;
             }
             let rest = tail.split_off(release - text.len());
             text.push_str(tail);
             *tail = rest;
+            self.streaming_last_release.insert(message_id, now);
         } else {
             text.push_str(delta);
         }
@@ -3422,9 +3446,30 @@ impl Transcript {
         }
     }
 
+    /// Show one message's held tail. A finished reply has no later block to
+    /// wait for, so its held text lands whole instead of trailing in as
+    /// token-by-token text behind a row that already reads as complete.
+    fn release_streaming_tail(&mut self, message_id: Uuid) {
+        self.streaming_last_release.remove(&message_id);
+        let Some(tail) = self.streaming_tails.remove(&message_id) else {
+            return;
+        };
+        let Some(index) = self.messages.get(&message_id).copied() else {
+            return;
+        };
+        if let Some(TranscriptEntry::Message { text, .. }) = self.order.get_mut(index) {
+            text.push_str(&tail);
+            self.message_markdown_cache
+                .get_mut()
+                .messages
+                .retain(|(entry_index, _), _| *entry_index != index);
+        }
+    }
+
     /// Show every held reply tail: the turn ended or streaming became
     /// token-by-token, so there is no later block to wait for.
     fn flush_streaming_tails(&mut self) {
+        self.streaming_last_release.clear();
         for (message_id, tail) in std::mem::take(&mut self.streaming_tails) {
             if let Some(index) = self.messages.get(&message_id).copied()
                 && let Some(TranscriptEntry::Message { text, .. }) = self.order.get_mut(index)
