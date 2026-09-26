@@ -5201,7 +5201,7 @@ impl Transcript {
                     let from_director = director_prompt_row == Some(index);
                     let (label, color) = match actor {
                         EventActor::User if from_director => {
-                            ("director".to_string(), SUBAGENT_PINK)
+                            ("director".to_string(), SUBAGENT_PURPLE)
                         }
                         EventActor::User => (self.user_label.clone(), self.user_label_color),
                         EventActor::Assistant => {
@@ -5257,7 +5257,7 @@ impl Transcript {
                     ));
                     lines.push(Line::from(header));
                     let text_color = match actor {
-                        EventActor::User if from_director => Some(SUBAGENT_PINK),
+                        EventActor::User if from_director => Some(SUBAGENT_PURPLE),
                         EventActor::User => Some(self.user_message_color),
                         EventActor::Assistant => Some(self.assistant_message_color),
                         _ => None,
@@ -5485,7 +5485,7 @@ impl Transcript {
                     let activity_color = if text == USER_INTERRUPT_ACTIVITY {
                         Color::LightRed
                     } else if is_subagent_activity_text(text) {
-                        SUBAGENT_PINK
+                        SUBAGENT_PURPLE
                     } else {
                         Color::DarkGray
                     };
@@ -5712,7 +5712,7 @@ impl Transcript {
                         Span::styled(
                             "▌ Goal",
                             Style::default()
-                                .fg(GOAL_WATCH_PURPLE)
+                                .fg(TODO_ORANGE)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
@@ -5910,7 +5910,7 @@ impl Transcript {
                             .add_modifier(Modifier::BOLD)
                     } else if is_subagent_tool(name) {
                         Style::default()
-                            .fg(SUBAGENT_PINK)
+                            .fg(SUBAGENT_PURPLE)
                             .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
@@ -6399,7 +6399,7 @@ impl Transcript {
                                 }
                                 let text_color = match actor {
                                     EventActor::User if Some(index) == director_prompt_row => {
-                                        Some(SUBAGENT_PINK)
+                                        Some(SUBAGENT_PURPLE)
                                     }
                                     EventActor::User => Some(user_message_color),
                                     EventActor::Assistant => Some(assistant_message_color),

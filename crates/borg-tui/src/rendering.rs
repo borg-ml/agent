@@ -73,7 +73,7 @@ pub(super) fn code_block_lines(language: &str, source: &str, width: usize) -> Ve
         "diagnostic" | "diagnostics" | "lsp" => diagnostic_lines(source, width),
         "reasoning" => reasoning_lines(source, width),
         "command" => plain_lines(source, width),
-        "subagent" => colored_plain_lines(source, width, super::SUBAGENT_PINK),
+        "subagent" => colored_plain_lines(source, width, super::SUBAGENT_PURPLE),
         // Code blocks wrap rather than clip. A clipped row replaces the rest
         // of the line with an ellipsis, and that ellipsis is all any copy can
         // ever recover: neither this TUI's selection nor the terminal's own
@@ -141,7 +141,7 @@ pub(super) fn tool_detail_lines(
             .into_iter()
             .map(|mut line| {
                 for span in &mut line.spans {
-                    span.style = span.style.fg(super::SUBAGENT_PINK);
+                    span.style = span.style.fg(super::SUBAGENT_PURPLE);
                 }
                 line
             })
@@ -1239,7 +1239,7 @@ mod tests {
 
         assert_eq!(
             lines[0].spans[0].style.fg,
-            Some(super::super::SUBAGENT_PINK)
+            Some(super::super::SUBAGENT_PURPLE)
         );
     }
 
