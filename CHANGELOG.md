@@ -5,6 +5,22 @@ Git comparison.
 
 ## Unreleased (since 0.12.2)
 
+### Providers
+
+- When a Claude subscription's 5-hour or weekly window enters Anthropic's
+  server-reported grace allowance, the running turn is told to finish only the
+  work already in progress, leave a recoverable checkpoint, and report what
+  remains instead of starting new tasks or agents. Turns on an active overage
+  allowance keep their normal behavior.
+
+### Terminal UI
+
+- A completed reasoning summary steps through its summary lines once and then
+  rests on the last one, rather than cycling back to the first.
+- Assistant message headers show `fast`, or the effort level followed by
+  `fast`, for a turn that ran in fast mode.
+- The composer background is darker.
+
 ## 0.12.2 (2026-09-26)
 
 ### Sessions
