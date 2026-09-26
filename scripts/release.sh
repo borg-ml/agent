@@ -457,9 +457,9 @@ echo "Targets: Linux, macOS, and Windows on x86-64 and ARM64"
 if [[ "$mode" == "check" ]]; then
   run_release_checks
   if [[ "$recovered" -eq 1 ]]; then
-    echo "Release checks passed. Run 'just release' to stage v$target_version as a draft."
+    echo "Release checks passed. Run 'just release' to publish v$target_version."
   else
-    echo "Release checks passed. Run 'just release${requested_version:+ $requested_version}' to stage a draft."
+    echo "Release checks passed. Run 'just release${requested_version:+ $requested_version}' to publish."
   fi
   exit 0
 fi
@@ -469,9 +469,10 @@ if [[ "$recovered" -eq 1 ]]; then
   if ! git rev-parse --quiet --verify "refs/tags/$tag^{commit}" >/dev/null; then
     git tag -a "$tag" -m "Borg Agent $target_version"
   fi
-  echo "Pushing $tag atomically to $remote to stage a draft..."
+  echo "Pushing $tag atomically to $remote to publish $tag..."
   git push --atomic "$remote" "HEAD:refs/heads/$branch" "refs/tags/$tag"
   echo "Release workflow started: $REPOSITORY_URL/actions/workflows/release.yml"
+  echo "It publishes $tag once every platform archive is attached."
   exit 0
 fi
 
@@ -526,7 +527,8 @@ git commit --only Cargo.toml Cargo.lock CHANGELOG.md -m "Release Borg Agent $tar
 committed=1
 git tag -a "$tag" -m "Borg Agent $target_version"
 
-echo "Pushing $tag atomically to $remote to stage a draft..."
+echo "Pushing $tag atomically to $remote to publish $tag..."
 git push --atomic "$remote" "HEAD:refs/heads/$branch" "refs/tags/$tag"
 
 echo "Release workflow started: $REPOSITORY_URL/actions/workflows/release.yml"
+echo "It publishes $tag once every platform archive is attached."

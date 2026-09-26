@@ -41,7 +41,13 @@ if [[ -f "$repo_root/.github/workflows/release.yml" ]]; then
   grep -Fq 'body_path: release-notes.md' "$release_workflow" ||
     fail "release body does not use the curated changelog"
   grep -Fq 'draft: true' "$release_workflow" ||
-    fail "tag workflow can publish without manual approval"
+    fail "tag workflow can publish a release before its assets are attached"
+  grep -Fq -- '--draft=false' "$release_workflow" ||
+    fail "tag workflow leaves the release as a draft instead of publishing it"
+  upload_step="$(grep -n 'softprops/action-gh-release' "$release_workflow" | cut -d: -f1)"
+  publish_step="$(grep -n -- '--draft=false' "$release_workflow" | cut -d: -f1)"
+  (( publish_step > upload_step )) ||
+    fail "tag workflow publishes the release before its assets are attached"
   if grep -Fq 'generate_release_notes: true' "$release_workflow"; then
     fail "release body still depends on pull request generated notes"
   fi
