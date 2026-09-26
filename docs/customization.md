@@ -74,6 +74,7 @@ persisted to `editor.toml`.
 | Desktop completion notification | `/notifications` | `interaction.completion_notifications = "off"`, `"unfocused"`, or `"always"` |
 | Completion sound | `/sound` | `interaction.completion_sound = "off"`, `"unfocused"`, or `"always"` |
 | Refresh rate | `/refresh` | `presentation.refresh_rate_fps = 15..240` |
+| Streaming refresh rate | `/refresh streaming` | `presentation.streaming_refresh_rate_fps = 15..240` (default 120) |
 | Edit diff display | `/expand-edits` | `presentation.diff_expansion = "expanded"`, `"collapsed"`, or `"until_next_action"` |
 | Expand tool details | `/expand-tools` | `presentation.auto_expand_tools = true` or `false` |
 | Expand thinking while it streams | `/expand-thinking` | `presentation.auto_expand_thinking = true` or `false` |

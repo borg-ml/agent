@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::localization::UiLanguage;
 
 const DEFAULT_REFRESH_RATE_FPS: u16 = 60;
+/// Streaming text is the one frame rate a low setting is visible in as lag,
+/// so it carries its own preference instead of borrowing the idle rate.
+const DEFAULT_STREAMING_REFRESH_RATE_FPS: u16 = 120;
 const MIN_REFRESH_RATE_FPS: u16 = 15;
 const MAX_REFRESH_RATE_FPS: u16 = 240;
 const MAX_TRANSCRIPT_LABEL_CHARS: usize = 32;
@@ -182,6 +185,9 @@ impl Default for InteractionPreferences {
 pub struct PresentationPreferences {
     pub ui_language: UiLanguage,
     pub refresh_rate_fps: u16,
+    /// Frame rate used while tokens stream in, independent of
+    /// [`Self::refresh_rate_fps`].
+    pub streaming_refresh_rate_fps: u16,
     pub diff_expansion: Option<DiffExpansionPolicy>,
     /// Legacy compatibility for editor.toml files written before diff_expansion.
     pub auto_expand_edits: bool,
@@ -208,6 +214,7 @@ impl Default for PresentationPreferences {
         Self {
             ui_language: UiLanguage::Auto,
             refresh_rate_fps: DEFAULT_REFRESH_RATE_FPS,
+            streaming_refresh_rate_fps: DEFAULT_STREAMING_REFRESH_RATE_FPS,
             diff_expansion: None,
             auto_expand_edits: true,
             auto_expand_tools: false,
@@ -352,6 +359,11 @@ impl EditorPreferences {
             (MIN_REFRESH_RATE_FPS..=MAX_REFRESH_RATE_FPS)
                 .contains(&self.presentation.refresh_rate_fps),
             "refresh rate must be between {MIN_REFRESH_RATE_FPS} and {MAX_REFRESH_RATE_FPS} FPS"
+        );
+        anyhow::ensure!(
+            (MIN_REFRESH_RATE_FPS..=MAX_REFRESH_RATE_FPS)
+                .contains(&self.presentation.streaming_refresh_rate_fps),
+            "streaming refresh rate must be between {MIN_REFRESH_RATE_FPS} and {MAX_REFRESH_RATE_FPS} FPS"
         );
         anyhow::ensure!(
             self.layout.horizontal_margin <= 40,
@@ -597,6 +609,7 @@ keep = true
             presentation: PresentationPreferences {
                 ui_language: UiLanguage::SimplifiedChinese,
                 refresh_rate_fps: 144,
+                streaming_refresh_rate_fps: 144,
                 diff_expansion: Some(DiffExpansionPolicy::UntilNextAction),
                 auto_expand_edits: false,
                 auto_expand_tools: true,

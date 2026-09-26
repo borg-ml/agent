@@ -2624,48 +2624,58 @@ fn tui_frame_interval_preserves_supported_high_refresh_and_caps_extremes() {
 #[test]
 fn expensive_draws_leave_time_for_input_and_animation_events() {
     assert_eq!(
-        responsive_tui_frame_interval(165, std::time::Duration::from_millis(5), false, false),
+        responsive_tui_frame_interval(165, 120, std::time::Duration::from_millis(5), false, false),
         std::time::Duration::from_millis(15)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), false, false),
+        responsive_tui_frame_interval(60, 120, std::time::Duration::from_millis(40), false, false),
         std::time::Duration::from_millis(120)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::ZERO, false, false),
+        responsive_tui_frame_interval(60, 120, std::time::Duration::ZERO, false, false),
         tui_frame_interval(60)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), true, false),
+        responsive_tui_frame_interval(60, 120, std::time::Duration::from_millis(40), true, false),
         std::time::Duration::from_millis(40)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false, false),
+        responsive_tui_frame_interval(60, 120, std::time::Duration::from_millis(500), false, false),
         MAX_RENDER_BACKOFF_INTERVAL
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false, false),
+        responsive_tui_frame_interval(60, 120, std::time::Duration::from_millis(500), false, false),
         MAX_RENDER_BACKOFF_INTERVAL
     );
 }
 
 #[test]
-fn streamed_text_uses_120_hz_when_cheap_and_keeps_the_draw_cost_budget() {
+fn streamed_text_paints_at_the_configured_rate_and_keeps_the_draw_cost_budget() {
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(1), false, true),
-        tui_frame_interval(STREAMING_TUI_FPS)
+        responsive_tui_frame_interval(60, 120, std::time::Duration::from_millis(1), false, true),
+        tui_frame_interval(120)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(10), false, true),
+        responsive_tui_frame_interval(60, 120, std::time::Duration::from_millis(10), false, true),
         std::time::Duration::from_millis(20)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(3), false, true),
-        tui_frame_interval(STREAMING_TUI_FPS)
+        responsive_tui_frame_interval(60, 120, std::time::Duration::from_millis(3), false, true),
+        tui_frame_interval(120)
     );
     assert_eq!(
-        responsive_tui_frame_interval(165, std::time::Duration::ZERO, false, true),
+        responsive_tui_frame_interval(165, 165, std::time::Duration::ZERO, false, true),
         tui_frame_interval(165)
+    );
+    // The configured rate governs in both directions. A reader who lowers it
+    // below the idle rate is no longer silently raised to a hardcoded floor.
+    assert_eq!(
+        responsive_tui_frame_interval(30, 30, std::time::Duration::ZERO, false, true),
+        tui_frame_interval(30)
+    );
+    assert_eq!(
+        responsive_tui_frame_interval(165, 30, std::time::Duration::ZERO, false, true),
+        tui_frame_interval(30)
     );
     assert!(session_event_contains_stream_text(
         &SessionEventKind::MessageDelta {

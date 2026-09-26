@@ -27,6 +27,9 @@ luna_titles_for_all_providers = false
 # by /language. Valid values: auto, en, zh-Hans, es, ru.
 ui_language = "auto"
 refresh_rate_fps = 60
+# Frame rate while model tokens stream in. Defaults to 120; Borg paints no
+# faster than the work costs on this machine.
+streaming_refresh_rate_fps = 120
 diff_expansion = "expanded" # expanded | collapsed | until_next_action
 auto_expand_tools = false
 auto_expand_thinking = false
