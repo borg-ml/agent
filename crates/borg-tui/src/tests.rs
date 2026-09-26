@@ -7425,7 +7425,7 @@ fn tool_call_summaries_cover_cli_display_contract() {
             "mcp__borg_agent__update_plan",
             &serde_json::json!({"plan": [{"content": "Inspect"}, {"content": "Verify"}]})
         ),
-        ("Update plan".to_string(), "2 steps".to_string())
+        ("Update plan".to_string(), "2 to-dos".to_string())
     );
     assert_eq!(
         tool_call_summary(
@@ -7497,7 +7497,7 @@ fn borg_control_results_render_compact_roster_plan_goal_and_follow_up() {
         r#"{"plan":[{"status":"in_progress","step":"Render team activity"}]}"#,
     )
     .expect("structured plan");
-    assert!(plan.contains("PLAN · 1 step"));
+    assert!(plan.contains("PLAN · 1 to-do"));
     assert!(plan.contains("in_progress  Render team activity"));
 
     let goal = borg_control_tool_output_view(
