@@ -6893,7 +6893,9 @@ fn default_model_for_cross_provider_peer(provider: CodingProvider) -> Option<Str
         CodingProvider::Glm => Some(borg_provider::glm_product_model().to_string()),
         CodingProvider::Qwen => Some(borg_provider::qwen_product_model().to_string()),
         CodingProvider::OpenRouter => Some(borg_provider::openrouter_product_model().to_string()),
-        CodingProvider::Anthropic | CodingProvider::OpenAiCompatible => None,
+        CodingProvider::Anthropic | CodingProvider::Vercel | CodingProvider::OpenAiCompatible => {
+            None
+        }
     }
 }
 
@@ -6909,6 +6911,7 @@ fn default_effort_for_cross_provider_peer(provider: CodingProvider) -> Option<St
         | CodingProvider::Grok
         | CodingProvider::Muse
         | CodingProvider::OpenRouter
+        | CodingProvider::Vercel
         | CodingProvider::OpenAiCompatible => None,
     }
 }

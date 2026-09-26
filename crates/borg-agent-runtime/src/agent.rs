@@ -1259,6 +1259,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             | CodingProvider::Glm
             | CodingProvider::Qwen
             | CodingProvider::OpenRouter
+            | CodingProvider::Vercel
             | CodingProvider::OpenAiCompatible => unreachable!("native provider handled above"),
         };
         #[cfg(feature = "profiling")]

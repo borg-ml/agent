@@ -41,6 +41,9 @@ pub enum CodingProvider {
     /// format — no vendor CLI is involved.
     Qwen,
     OpenRouter,
+    /// Vercel AI Gateway, reached over its OpenAI-compatible
+    /// endpoint at one base URL.
+    Vercel,
     OpenAiCompatible,
 }
 
@@ -206,6 +209,7 @@ impl CodingProvider {
             Self::Glm => "glm",
             Self::Qwen => "qwen",
             Self::OpenRouter => "openrouter",
+            Self::Vercel => "vercel",
             Self::OpenAiCompatible => "openai-compatible",
         }
     }
@@ -226,6 +230,7 @@ impl CodingProvider {
             Self::Glm => "GLM",
             Self::Qwen => "Qwen",
             Self::OpenRouter => "OpenRouter",
+            Self::Vercel => "Vercel AI Gateway",
             Self::OpenAiCompatible => "OpenAI-compatible",
         }
     }
@@ -236,7 +241,7 @@ impl CodingProvider {
     /// One place, so a tool schema or an admission list cannot quietly disagree
     /// with the enum by listing fewer routes than exist. `config_alias` is the
     /// serialized spelling, which is what those surfaces take.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Codex,
         Self::Claude,
         Self::Anthropic,
@@ -247,6 +252,7 @@ impl CodingProvider {
         Self::Glm,
         Self::Qwen,
         Self::OpenRouter,
+        Self::Vercel,
         Self::OpenAiCompatible,
     ];
 
@@ -285,6 +291,12 @@ impl CodingProvider {
                         .any(|entry| entry.id == model))
                 .then_some(Self::OpenRouter)
             })
+            .or_else(|| {
+                borg_provider::vercel_model_entries()
+                    .iter()
+                    .any(|entry| entry.id == model)
+                    .then_some(Self::Vercel)
+            })
     }
 
     /// The provider half of the `provider/model` alias an operator writes in
@@ -303,6 +315,7 @@ impl CodingProvider {
             Self::Glm => "glm",
             Self::Qwen => "qwen",
             Self::OpenRouter => "open_router",
+            Self::Vercel => "vercel",
             Self::OpenAiCompatible => "open_ai_compatible",
         }
     }
@@ -319,6 +332,7 @@ impl CodingProvider {
             | Self::Glm
             | Self::Qwen
             | Self::OpenRouter
+            | Self::Vercel
             | Self::OpenAiCompatible => "borg",
         }
     }
@@ -335,6 +349,7 @@ impl CodingProvider {
                 | Self::Glm
                 | Self::Qwen
                 | Self::OpenRouter
+                | Self::Vercel
                 | Self::OpenAiCompatible
         )
     }

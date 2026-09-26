@@ -2106,6 +2106,7 @@ impl ProviderModelClient {
             crate::CodingProvider::Glm => OpenAiCompatibleProfile::Glm,
             crate::CodingProvider::Qwen => OpenAiCompatibleProfile::Qwen,
             crate::CodingProvider::OpenRouter => OpenAiCompatibleProfile::OpenRouter,
+            crate::CodingProvider::Vercel => OpenAiCompatibleProfile::Vercel,
             crate::CodingProvider::OpenAiCompatible => OpenAiCompatibleProfile::Generic,
             // OpenCode reaches the native client only through the Go access
             // gateway. Without it the CLI still owns the conversation, so the

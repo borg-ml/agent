@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.12.3)
 
+### Providers
+
+- Vercel AI Gateway is a provider. `borg login vercel` stores a gateway key, or
+  set `VERCEL_AI_GATEWAY_API_KEY`, and `/model` lists every language model the
+  gateway serves — 264 today, including `stealth/pixel-canary` — from a session
+  on any provider. Embedding, reranking, image, video, realtime, speech and
+  transcription models are left out: they cannot answer a chat completion.
+
 ### Terminal UI
 
 - A completed reasoning row is marked `◦` instead of `✦`.

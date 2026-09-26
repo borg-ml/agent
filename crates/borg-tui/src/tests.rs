@@ -1924,6 +1924,38 @@ fn model_picker_openrouter_keeps_manual_current_when_catalog_is_unavailable() {
 }
 
 #[test]
+fn model_picker_lists_vercel_models_from_any_provider() {
+    borg_provider::set_vercel_model_entries(vec![borg_provider::DynamicModelEntry {
+        id: "stealth/pixel-canary".to_string(),
+        label: "Pixel Canary".to_string(),
+        detail: Some("262144 context".to_string()),
+    }]);
+
+    // A Codex session lists the gateway's models alongside the fixed catalogs.
+    let options = model_picker_options(Some(CodingProvider::Codex), None);
+    let pixel = options
+        .iter()
+        .find(|option| option.value == "stealth/pixel-canary")
+        .expect("Vercel model in the picker from another provider");
+    assert_eq!(pixel.section.as_deref(), Some("Vercel AI Gateway"));
+    assert_eq!(pixel.preview.as_deref(), Some("262144 context"));
+
+    // The gateway section leads when the session already runs on it, and the
+    // cross-provider block does not duplicate it.
+    let on_gateway = model_picker_options(Some(CodingProvider::Vercel), None);
+    assert_eq!(
+        on_gateway
+            .iter()
+            .filter(|option| option.value == "stealth/pixel-canary")
+            .count(),
+        1
+    );
+    assert_eq!(on_gateway[0].value, "stealth/pixel-canary");
+
+    borg_provider::set_vercel_model_entries(Vec::new());
+}
+
+#[test]
 fn model_picker_none_yields_no_open_ended_placeholder() {
     let options = model_picker_options(None::<CodingProvider>, None);
     // With None and no current, the dynamic arm returns empty; only catalogs render.

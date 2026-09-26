@@ -29,6 +29,8 @@ pub enum ApiKeyCredential {
     OpenCodeGo,
     Anthropic,
     OpenRouter,
+    /// Vercel AI Gateway key, for the Vercel gateway lane.
+    Vercel,
     /// Z.ai key, for the GLM Coding Plan.
     Zai,
     /// Moonshot key, for Kimi Code.
@@ -44,6 +46,8 @@ impl ApiKeyCredential {
             Self::OpenCodeGo => "OPENCODE_GO_API_KEY",
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::OpenRouter => "OPENROUTER_API_KEY",
+            // What `vercel ai-gateway api-keys create` prints.
+            Self::Vercel => "VERCEL_AI_GATEWAY_API_KEY",
             // The user-facing variable for their own key. The plan overlay maps
             // it onto whichever token header the hosting CLI expects.
             Self::Zai => "ZAI_API_KEY",
@@ -61,6 +65,7 @@ impl ApiKeyCredential {
             Self::OpenCodeGo => "opencode_go_api_key",
             Self::Anthropic => "anthropic_api_key",
             Self::OpenRouter => "openrouter_api_key",
+            Self::Vercel => "vercel_ai_gateway_api_key",
             Self::Zai => "zai_api_key",
             Self::Kimi => "kimi_api_key",
             Self::Qwen => "qwen_api_key",

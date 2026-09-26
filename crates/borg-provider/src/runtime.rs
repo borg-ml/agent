@@ -284,6 +284,116 @@ fn openrouter_model_entries_from_response(payload: &serde_json::Value) -> Vec<Dy
     entries
 }
 
+static VERCEL_MODEL_ENTRIES: OnceLock<RwLock<Vec<DynamicModelEntry>>> = OnceLock::new();
+
+/// Vercel's one base URL serves the whole gateway, so the lane needs no
+/// per-vendor configuration.
+pub const VERCEL_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
+
+fn vercel_model_entries_store() -> &'static RwLock<Vec<DynamicModelEntry>> {
+    VERCEL_MODEL_ENTRIES.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Return the last successfully fetched Vercel catalog for synchronous UI
+/// callers. Empty means unfetched or failed, exactly as for OpenRouter.
+pub fn vercel_model_entries() -> Vec<DynamicModelEntry> {
+    vercel_model_entries_store()
+        .read()
+        .map(|entries| entries.clone())
+        .unwrap_or_default()
+}
+
+pub fn set_vercel_model_entries(entries: Vec<DynamicModelEntry>) {
+    if let Ok(mut current) = vercel_model_entries_store().write() {
+        *current = entries;
+    }
+}
+
+/// Fetch the Vercel AI Gateway catalog when a key is configured. Failure is
+/// returned so startup can keep the manual/current model path usable.
+pub async fn refresh_vercel_model_catalog() -> anyhow::Result<Vec<DynamicModelEntry>> {
+    let Some(api_key) = crate::credentials::api_key(crate::credentials::ApiKeyCredential::Vercel)
+    else {
+        set_vercel_model_entries(Vec::new());
+        return Ok(Vec::new());
+    };
+    let base = std::env::var("BORG_VERCEL_BASE_URL")
+        .unwrap_or_else(|_| VERCEL_GATEWAY_BASE_URL.to_string());
+    let endpoint = format!("{}/models", base.trim_end_matches('/'));
+    let response = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?
+        .get(endpoint)
+        .bearer_auth(api_key)
+        .send()
+        .await?;
+    let status = response.status();
+    anyhow::ensure!(
+        status.is_success(),
+        "Vercel AI Gateway model catalog returned HTTP {status}"
+    );
+    let payload: serde_json::Value = response.json().await?;
+    let entries = vercel_model_entries_from_response(&payload);
+    set_vercel_model_entries(entries.clone());
+    Ok(entries)
+}
+
+/// Vercel publishes every gateway model on one endpoint, not just the chat
+/// ones: of 390 entries only 264 are `language`, the rest being embedding,
+/// reranking, image, video, realtime, speech and transcription models that
+/// cannot answer a chat completion. Those must not reach the picker.
+fn vercel_model_entries_from_response(payload: &serde_json::Value) -> Vec<DynamicModelEntry> {
+    let mut entries = payload
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|model| {
+            !matches!(
+                model.get("type").and_then(serde_json::Value::as_str),
+                Some(kind) if kind != "language"
+            )
+        })
+        .filter_map(|model| {
+            let id = model.get("id")?.as_str()?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let label = model
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(id)
+                .to_string();
+            let mut details = Vec::new();
+            if let Some(context) = model
+                .get("context_window")
+                .and_then(serde_json::Value::as_u64)
+            {
+                details.push(format!("{context} context"));
+            }
+            if let Some(description) = model
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+            {
+                details.push(description.to_string());
+            }
+            Some(DynamicModelEntry {
+                id: id.to_string(),
+                label,
+                detail: (!details.is_empty()).then(|| details.join(" · ")),
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_cached_key(|entry| entry.label.to_lowercase());
+    entries.dedup_by(|left, right| left.id == right.id);
+    entries
+}
+
 /// Return dynamic model entries for `backend` given a set of discovered models.
 ///
 /// Returns an empty vec for any backend that has a compile-time const catalog,
@@ -316,6 +426,9 @@ pub fn dynamic_models_for_backend(
             | "openrouter"
             | "open-router"
             | "OpenRouter"
+            | "vercel"
+            | "Vercel"
+            | "vercel-ai-gateway"
     );
     if !open_ended {
         return Vec::new();
@@ -495,5 +608,63 @@ mod tests {
     fn dynamic_models_unknown_backend_returns_empty() {
         let result = dynamic_models_for_backend("unknown-backend", Some("foo"), &[]);
         assert!(result.is_empty());
+    }
+
+    /// Vercel publishes embedding, reranking, image, video, realtime, speech
+    /// and transcription models on the same endpoint as chat. Offering any of
+    /// them in the picker would fail on the first call, so the `language` type
+    /// is the filter that keeps the picker usable.
+    #[test]
+    fn vercel_catalog_keeps_only_language_models() {
+        let entries = vercel_model_entries_from_response(&serde_json::json!({
+            "data": [
+                {
+                    "id": "stealth/pixel-canary",
+                    "name": "Pixel Canary",
+                    "type": "language",
+                    "context_window": 262144,
+                    "description": "Anonymous coding model."
+                },
+                {
+                    "id": "alibaba/qwen3-embedding-0.6b",
+                    "name": "Qwen3 Embedding",
+                    "type": "embedding"
+                },
+                { "id": "openai/sora-2", "name": "Sora 2", "type": "video" },
+                { "id": "openai/gpt-6-astra", "type": "language" }
+            ]
+        }));
+        let ids = entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["openai/gpt-6-astra", "stealth/pixel-canary"]);
+        let pixel = entries
+            .iter()
+            .find(|entry| entry.id == "stealth/pixel-canary")
+            .expect("Pixel Canary");
+        assert_eq!(pixel.label, "Pixel Canary");
+        assert_eq!(
+            pixel.detail.as_deref(),
+            Some("262144 context · Anonymous coding model.")
+        );
+        // A model with no `name` still lists, under its id.
+        let unnamed = entries
+            .iter()
+            .find(|entry| entry.id == "openai/gpt-6-astra")
+            .expect("unnamed model");
+        assert_eq!(unnamed.label, "openai/gpt-6-astra");
+    }
+
+    #[test]
+    fn vercel_backend_lists_discovered_models() {
+        let entries = vec![DynamicModelEntry {
+            id: "stealth/pixel-canary".to_string(),
+            label: "Pixel Canary".to_string(),
+            detail: None,
+        }];
+        let result = dynamic_models_for_backend("vercel", None, &entries);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "stealth/pixel-canary");
     }
 }

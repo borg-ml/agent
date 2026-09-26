@@ -1322,6 +1322,7 @@ async fn probe_provider(
                             | CodingProvider::Glm
                             | CodingProvider::Qwen
                             | CodingProvider::OpenRouter
+                            | CodingProvider::Vercel
                             | CodingProvider::OpenAiCompatible => None,
                         }
                     }
@@ -1346,6 +1347,7 @@ async fn probe_provider(
                     | CodingProvider::Glm
                     | CodingProvider::Qwen
                     | CodingProvider::OpenRouter
+                    | CodingProvider::Vercel
                     | CodingProvider::OpenAiCompatible => false,
                 };
                 (version, authenticated)
@@ -1527,6 +1529,19 @@ async fn probe_provider(
                 None
             }
         }
+        CodingProvider::Vercel => {
+            if borg_provider::credentials::api_key(
+                borg_provider::credentials::ApiKeyCredential::Vercel,
+            )
+            .is_some()
+            {
+                auth_methods.push(ProviderAuthMethod::ApiKey);
+                detail.push("Vercel AI Gateway key configured");
+                Some(BillingLane::ApiKey)
+            } else {
+                None
+            }
+        }
         CodingProvider::Anthropic => {
             // This lane is API-key only. It never reports a subscription lane,
             // because it has no way to spend one.
@@ -1585,6 +1600,7 @@ async fn probe_provider(
         | CodingProvider::Glm
         | CodingProvider::Qwen
         | CodingProvider::OpenRouter
+        | CodingProvider::Vercel
         | CodingProvider::OpenAiCompatible => true,
         CodingProvider::OpenCode if native_go => true,
         CodingProvider::Claude
@@ -1635,6 +1651,7 @@ pub fn provider_subscription_credentials_present(provider: CodingProvider) -> bo
         | CodingProvider::Glm
         | CodingProvider::Qwen
         | CodingProvider::OpenRouter
+        | CodingProvider::Vercel
         | CodingProvider::OpenAiCompatible => false,
     }
 }
@@ -1960,6 +1977,10 @@ pub fn provider_credentials_present(provider: CodingProvider) -> bool {
             borg_provider::credentials::ApiKeyCredential::OpenRouter,
         )
         .is_some(),
+        CodingProvider::Vercel => borg_provider::credentials::api_key(
+            borg_provider::credentials::ApiKeyCredential::Vercel,
+        )
+        .is_some(),
         CodingProvider::OpenAiCompatible => {
             nonempty_env("BORG_OPENAI_COMPATIBLE_BASE_URL").is_some()
                 || nonempty_env("BORG_OPENAI_COMPATIBLE_MODEL").is_some()
@@ -1992,6 +2013,7 @@ fn provider_login_command(provider: CodingProvider, mut command: Command) -> Res
         | CodingProvider::Glm
         | CodingProvider::Qwen
         | CodingProvider::OpenRouter
+        | CodingProvider::Vercel
         | CodingProvider::OpenAiCompatible => {
             unreachable!("handled above")
         }
@@ -4337,6 +4359,7 @@ fn provider_arg(provider: CodingProvider) -> &'static str {
         CodingProvider::Glm => "glm",
         CodingProvider::Qwen => "qwen",
         CodingProvider::OpenRouter => "open-router",
+        CodingProvider::Vercel => "vercel",
         CodingProvider::OpenAiCompatible => "open-ai-compatible",
     }
 }

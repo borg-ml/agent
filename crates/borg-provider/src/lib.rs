@@ -29,7 +29,8 @@ pub use runtime::{
     kimi_default_effort, kimi_product_model, model_catalog_for_backend, muse_product_model,
     opencode_go_model_entries, openrouter_model_entries, openrouter_product_model,
     qwen_default_effort, qwen_product_model, refresh_opencode_go_model_catalog,
-    refresh_openrouter_model_catalog, set_openrouter_model_entries,
+    refresh_openrouter_model_catalog, refresh_vercel_model_catalog, set_openrouter_model_entries,
+    set_vercel_model_entries, vercel_model_entries,
 };
 pub use subscription::Plan;
 
