@@ -40,11 +40,11 @@ fn structured_user_message_lines(
 
 fn goal_status_label(status: GoalStatus) -> &'static str {
     match status {
-        GoalStatus::Active => "◇ active",
-        GoalStatus::Paused => "▮▮ paused",
-        GoalStatus::Blocked => "■ blocked",
-        GoalStatus::UsageLimited => "■ usage limit reached",
-        GoalStatus::BudgetLimited => "■ token budget reached",
+        GoalStatus::Active => "▶ active",
+        GoalStatus::Paused => "⏸ paused",
+        GoalStatus::Blocked => "⏸ blocked",
+        GoalStatus::UsageLimited => "⏸ usage limit reached",
+        GoalStatus::BudgetLimited => "⏸ token budget reached",
         GoalStatus::Complete => "complete",
     }
 }
@@ -4427,11 +4427,11 @@ impl Transcript {
     fn goal_status(&self) -> Option<String> {
         let goal = self.goal.as_ref()?;
         let label = match goal.status {
-            GoalStatus::Active => "active",
-            GoalStatus::Paused => "paused",
-            GoalStatus::Blocked => "blocked",
-            GoalStatus::UsageLimited => "usage limit reached",
-            GoalStatus::BudgetLimited => "token budget reached",
+            GoalStatus::Active => "▶ active",
+            GoalStatus::Paused => "⏸ paused",
+            GoalStatus::Blocked => "⏸ blocked",
+            GoalStatus::UsageLimited => "⏸ usage limit reached",
+            GoalStatus::BudgetLimited => "⏸ token budget reached",
             GoalStatus::Complete => return None,
         };
         let live_time = goal

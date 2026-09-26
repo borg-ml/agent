@@ -9005,7 +9005,7 @@ impl BorgTerminal {
             }
             let status_width = status_spans.iter().map(|span| span.width()).sum::<usize>();
             let agents_status = agents_status_label(active_subagents).or_else(|| {
-                (stopped_subagents > 0).then(|| format!("{stopped_subagents} stopped"))
+                (stopped_subagents > 0).then(|| format!("{stopped_subagents} inactive"))
             });
             let agents_status_width = agents_status
                 .as_ref()
