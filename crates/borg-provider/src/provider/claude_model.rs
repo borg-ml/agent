@@ -198,6 +198,15 @@ impl ClaudeModelProvider {
                         );
                         trace.invocation.args = vec![format!("pid={}", info.pid)];
                     }
+                    Some("grace") => {
+                        publish(
+                            &progress,
+                            "claude_usage_grace",
+                            json!({
+                                "five_hour": frame["five_hour"], "weekly": frame["weekly"],
+                            }),
+                        );
+                    }
                     Some("event") => {
                         let event = &frame["event"];
                         let kind = event["type"]
