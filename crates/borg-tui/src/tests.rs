@@ -3542,11 +3542,11 @@ fn completed_tool_duration_is_frozen_at_the_right_edge() {
         .expect("tool summary");
 
     assert_eq!(line.width(), 80);
-    assert!(line.to_string().ends_with("12.3s"));
+    assert!(line.to_string().ends_with("12s"), "{line:?}");
 }
 
 #[test]
-fn tool_duration_appears_only_from_one_tenth_of_a_second() {
+fn tool_duration_appears_only_from_one_whole_second() {
     let started_at = DateTime::parse_from_rfc3339("2026-07-29T10:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
@@ -3555,21 +3555,36 @@ fn tool_duration_appears_only_from_one_tenth_of_a_second() {
     assert_eq!(
         format_tool_elapsed(
             started_at,
-            Some(started_at + chrono::Duration::milliseconds(99))
+            Some(started_at + chrono::Duration::milliseconds(999))
         ),
         None
     );
     assert_eq!(
         format_tool_elapsed(
             started_at,
-            Some(started_at + chrono::Duration::milliseconds(100))
+            Some(started_at + chrono::Duration::milliseconds(1_000))
         ),
-        Some("0.1s".to_string())
+        Some("1s".to_string())
+    );
+    // Whole seconds only: the readout never carries a decimal point.
+    assert_eq!(
+        format_tool_elapsed(
+            started_at,
+            Some(started_at + chrono::Duration::milliseconds(1_999))
+        ),
+        Some("1s".to_string())
+    );
+    assert_eq!(
+        format_tool_elapsed(
+            started_at,
+            Some(started_at + chrono::Duration::milliseconds(12_300))
+        ),
+        Some("12s".to_string())
     );
 }
 
 #[test]
-fn running_tool_timer_switches_to_one_second_ticks_after_one_minute() {
+fn a_running_tool_timer_ticks_once_per_second_at_any_age() {
     let session_id = Uuid::new_v4();
     let started_at = DateTime::parse_from_rfc3339("2026-07-29T10:00:00Z")
         .unwrap()
@@ -3589,13 +3604,21 @@ fn running_tool_timer_switches_to_one_second_ticks_after_one_minute() {
     let mut transcript = Transcript::default();
     transcript.apply(&started);
 
-    assert_ne!(
-        transcript.running_tool_timer_tick_at(started_at + chrono::Duration::milliseconds(100)),
-        transcript.running_tool_timer_tick_at(started_at + chrono::Duration::milliseconds(200))
-    );
+    // The readout moves in whole seconds, so the timer repaints once a second
+    // rather than ten times for a digit nobody can read.
     assert_eq!(
+        transcript.running_tool_timer_tick_at(started_at + chrono::Duration::milliseconds(100)),
+        transcript.running_tool_timer_tick_at(started_at + chrono::Duration::milliseconds(900))
+    );
+    assert_ne!(
+        transcript.running_tool_timer_tick_at(started_at),
+        transcript.running_tool_timer_tick_at(started_at + chrono::Duration::seconds(1))
+    );
+    // A long-running tool is not cheaper than a short one; both advance once
+    // a second, which is exactly when the label changes.
+    assert_ne!(
         transcript.running_tool_timer_tick_at(started_at + chrono::Duration::seconds(61)),
-        transcript.running_tool_timer_tick_at(started_at + chrono::Duration::milliseconds(61_900))
+        transcript.running_tool_timer_tick_at(started_at + chrono::Duration::seconds(62))
     );
 }
 
@@ -3618,7 +3641,7 @@ fn thread_find_advances_and_wraps_through_regex_matches() {
 #[test]
 fn running_tool_timing_column_never_rewraps_action_text() {
     let summary = "12:10  ↗ Generating tool call · wait for corrected full editor build · Running in background";
-    let short = tool_summary_lines(summary, Some("0.1s"), "  ", 88, false);
+    let short = tool_summary_lines(summary, Some("1s"), "  ", 88, false);
     let long = tool_summary_lines(summary, Some("1m 00s"), "  ", 88, false);
 
     assert_eq!((short.len(), long.len()), (1, 1));
@@ -3632,8 +3655,8 @@ fn running_tool_timing_column_never_rewraps_action_text() {
 fn action_result_and_timer_fit_after_truncating_long_text() {
     let summary = "◇ Ran Python  python3 Scripts/test_homestead_trade_terminal_contract.py";
     for wrap in [false, true] {
-        let lines = tool_summary_lines(summary, Some("exit 1 1.2s"), "  ", 48, wrap);
-        assert!(lines[0].ends_with("exit 1 1.2s"), "{lines:?}");
+        let lines = tool_summary_lines(summary, Some("exit 1 2s"), "  ", 48, wrap);
+        assert!(lines[0].ends_with("exit 1 2s"), "{lines:?}");
         assert!(lines.iter().all(|line| line.width() + 2 <= 48), "{lines:?}");
         if !wrap {
             assert!(lines[0].contains('…'), "{lines:?}");
@@ -3667,7 +3690,7 @@ fn marker_only_retired_action_messages_are_not_transcript_entries() {
 }
 
 #[test]
-fn running_tool_elapsed_cache_tick_changes_each_tenth() {
+fn running_tool_elapsed_cache_tick_changes_each_second() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
     transcript.apply(&SessionEvent::new(
@@ -3686,17 +3709,17 @@ fn running_tool_elapsed_cache_tick_changes_each_tenth() {
         .with_timezone(&Utc);
 
     assert_eq!(
-        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::milliseconds(99)),
+        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::milliseconds(900)),
         transcript.tool_elapsed_cache_tick_at(started_at)
     );
     assert_ne!(
         transcript.tool_elapsed_cache_tick_at(started_at),
-        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::milliseconds(100))
+        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::seconds(1))
     );
 }
 
 #[test]
-fn large_transcript_keeps_running_tool_elapsed_at_tenth_second_cadence() {
+fn large_transcript_keeps_running_tool_elapsed_at_one_second_cadence() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
     transcript.apply(&SessionEvent::new(
@@ -3722,7 +3745,7 @@ fn large_transcript_keeps_running_tool_elapsed_at_tenth_second_cadence() {
 
     assert_ne!(
         transcript.tool_elapsed_cache_tick_at(started_at),
-        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::milliseconds(100))
+        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::seconds(1))
     );
 }
 
@@ -3764,7 +3787,7 @@ fn cached_transcript_reuses_history_for_same_width_timer_updates() {
         .1
         .as_mut()
         .expect("running tool has an elapsed label");
-    let replacement = if elapsed == "0.1s" { "0.2s" } else { "0.1s" };
+    let replacement = if elapsed == "1s" { "2s" } else { "1s" };
     assert_eq!(elapsed.width(), replacement.width());
     *elapsed = replacement.to_string();
 
@@ -3785,7 +3808,7 @@ fn cached_transcript_reuses_history_for_same_width_timer_updates() {
     assert!(visible_row.to_string().ends_with(replacement));
 
     let mut wider = same_width;
-    wider[0].1 = Some("10.0s".to_string());
+    wider[0].1 = Some("10s".to_string());
     let reflowed = cached_transcript_render(
         &transcript,
         &mut cache,
@@ -3827,8 +3850,8 @@ fn committed_viewport_snapshot_is_dropped_when_the_timer_label_widens() {
 
     // Commit, a same-width tick, then the widening label, at every boundary.
     for (commit_ms, commit, tick_ms, tick, widen_ms, widened) in [
-        (9_800, "9.8s", 9_900, "9.9s", 10_000, "10.0s"),
-        (59_800, "59.8s", 59_900, "59.9s", 60_000, "1m 00s"),
+        (8_400, "8s", 9_400, "9s", 10_000, "10s"),
+        (59_400, "59s", 59_900, "59s", 60_000, "1m 00s"),
         (598_000, "9m 58s", 599_000, "9m 59s", 600_000, "10m 00s"),
     ] {
         let commit_labels = transcript.running_tool_elapsed_labels_at(at(commit_ms));
@@ -3921,7 +3944,7 @@ fn committed_snapshot_freezes_the_timer_after_an_order_shift() {
 
     // Commit the viewport snapshot while the goal still sits ahead of the tool.
     let committed_labels = transcript.running_tool_elapsed_labels_at(at(3_000));
-    assert_eq!(committed_labels[0].1.as_deref(), Some("3.0s"));
+    assert_eq!(committed_labels[0].1.as_deref(), Some("3s"));
     let mut cache = None;
     let render = cached_transcript_render(
         &transcript,
@@ -3954,7 +3977,7 @@ fn committed_snapshot_freezes_the_timer_after_an_order_shift() {
 
     // Repeated same-width ticks after the shift: the live index has moved, so
     // the in-place patch can never rewrite the committed row again.
-    for (tick_ms, tick) in [(3_100, "3.1s"), (3_200, "3.2s"), (3_300, "3.3s")] {
+    for (tick_ms, tick) in [(3_100, "3s"), (3_200, "3s"), (3_300, "3s")] {
         let live = transcript.running_tool_elapsed_labels_at(at(tick_ms));
         assert_eq!(live[0].1.as_deref(), Some(tick));
         assert_eq!(
@@ -3970,7 +3993,7 @@ fn committed_snapshot_freezes_the_timer_after_an_order_shift() {
         let mut row = render.0[snapshot_row].clone();
         refresh_tool_elapsed_line(&mut row, snapshot_tool_index, &render.7, &live);
         assert!(
-            row.to_string().ends_with("3.0s"),
+            row.to_string().ends_with("3s"),
             "the in-place patch cannot reach the renumbered tool, so the row stays frozen"
         );
 
@@ -4143,7 +4166,7 @@ fn action_status_updates_refresh_cached_transcript_text() {
 }
 
 #[test]
-fn background_tool_elapsed_cache_tick_also_changes_each_tenth() {
+fn background_tool_elapsed_cache_tick_also_changes_each_second() {
     let started_at = DateTime::parse_from_rfc3339("2026-07-29T10:00:00.000Z")
         .unwrap()
         .with_timezone(&Utc);
@@ -4170,7 +4193,7 @@ fn background_tool_elapsed_cache_tick_also_changes_each_tenth() {
 
     assert_ne!(
         transcript.tool_elapsed_cache_tick_at(started_at),
-        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::milliseconds(100))
+        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::seconds(1))
     );
 }
 
@@ -13726,8 +13749,8 @@ fn reasoning_completion_freezes_thinking_duration_before_a_delayed_tool() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("2.0s"));
-    assert!(!rendered.contains("9.0s"));
+    assert!(rendered.contains("2s"));
+    assert!(!rendered.contains("9s"));
 }
 
 #[test]
@@ -14365,7 +14388,7 @@ fn transcript_selection_omits_visual_chrome_and_normalizes_diff_copy() {
     let mut lines = vec![
         Line::from("┌─ actions · 9 · click to expand"),
         Line::from("│"),
-        Line::from("│ 02:40  ◇ Read plan  0.3s"),
+        Line::from("│ 02:40  ◇ Read plan"),
     ];
     lines.extend(rendering::tool_body_lines(
         "diff:rs",
