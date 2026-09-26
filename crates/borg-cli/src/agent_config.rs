@@ -356,6 +356,9 @@ pub(crate) struct CapabilityConfig {
     pub(crate) telemetry: bool,
     pub(crate) auto_resume_usage_limits: bool,
     pub(crate) watcher_yield: bool,
+    /// Resume a goal that a stop or a block left parked when the human sends
+    /// another message. Off by default; `/goal resume` is the explicit way.
+    pub(crate) resume_paused_goal_on_message: bool,
     /// Providers whose mid-turn human messages are framed with an instruction
     /// to address them next: `true` (default set), `false`, or a list.
     pub(crate) steer_reply_prompt: borg_remote::SteerReplyPrompt,
@@ -381,6 +384,7 @@ impl Default for CapabilityConfig {
             telemetry: false,
             auto_resume_usage_limits: true,
             watcher_yield: true,
+            resume_paused_goal_on_message: false,
             steer_reply_prompt: borg_remote::SteerReplyPrompt::default(),
             harness: borg_remote::HarnessMode::Borg,
             model_fallback: Vec::new(),
@@ -401,6 +405,7 @@ impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
             telemetry: value.telemetry,
             auto_resume_usage_limits: value.auto_resume_usage_limits,
             watcher_yield: value.watcher_yield,
+            resume_paused_goal_on_message: value.resume_paused_goal_on_message,
             model_fallback: value.model_fallback.clone(),
             steer_reply_prompt: value.steer_reply_prompt.clone(),
             provider_capabilities: Vec::new(),
@@ -1921,6 +1926,23 @@ reasoning_format = "deepseek"
         assert!(!config.capabilities.auto_resume_usage_limits);
         assert!(
             !borg_remote::SessionCapabilities::from(&config.capabilities).auto_resume_usage_limits
+        );
+    }
+
+    #[test]
+    fn paused_goal_resume_on_message_is_opt_in() {
+        let config: AgentConfig = toml::from_str("[capabilities]\n").unwrap();
+        assert!(!config.capabilities.resume_paused_goal_on_message);
+        assert!(
+            !borg_remote::SessionCapabilities::from(&config.capabilities)
+                .resume_paused_goal_on_message
+        );
+        let opted_in: AgentConfig =
+            toml::from_str("[capabilities]\nresume_paused_goal_on_message = true\n").unwrap();
+        assert!(opted_in.capabilities.resume_paused_goal_on_message);
+        assert!(
+            borg_remote::SessionCapabilities::from(&opted_in.capabilities)
+                .resume_paused_goal_on_message
         );
     }
 
