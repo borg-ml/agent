@@ -15,6 +15,7 @@ Git comparison.
 
 ### Terminal UI
 
+- A completed reasoning row is marked `✦` instead of `∴`.
 - A completed reasoning summary steps through its summary lines once and then
   rests on the last one, rather than cycling back to the first.
 - Assistant message headers show `fast`, or the effort level followed by
