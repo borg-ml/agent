@@ -762,8 +762,9 @@ impl CodexModelProvider {
             let summary = capabilities
                 .default_reasoning_summary
                 .as_deref()
+                .filter(|summary| *summary != "none")
                 .unwrap_or("auto");
-            if capabilities.supports_reasoning_summary_parameter && summary != "none" {
+            if capabilities.supports_reasoning_summary_parameter {
                 body["reasoning"]["summary"] = json!(summary);
             } else {
                 body["reasoning"].as_object_mut().unwrap().remove("summary");
@@ -1553,7 +1554,7 @@ mod tests {
         );
         assert_eq!(
             first["reasoning"],
-            json!({"effort":"low", "context":"all_turns"})
+            json!({"effort":"low", "context":"all_turns", "summary":"auto"})
         );
         assert_eq!(first["text"]["verbosity"], "low");
         assert_eq!(first["text"]["format"]["type"], "json_schema");
