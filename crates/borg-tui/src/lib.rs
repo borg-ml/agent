@@ -6015,10 +6015,10 @@ impl BorgTerminal {
             &event,
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved)
         );
-        if let Event::Key(key) = &event {
-            if let Some(action) = self.handle_key_hint(*key)? {
-                return Ok(action);
-            }
+        if let Event::Key(key) = &event
+            && let Some(action) = self.handle_key_hint(*key)?
+        {
+            return Ok(action);
         }
         self.key_hints.observe_event(&event);
         match event {

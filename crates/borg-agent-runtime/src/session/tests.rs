@@ -20059,7 +20059,8 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
         content: "trailing result".repeat(100),
         attachments: Vec::new(),
     };
-    let suffix_tokens = crate::native_harness::estimated_messages_tokens(&[suffix.clone()]);
+    let suffix_tokens =
+        crate::native_harness::estimated_messages_tokens(std::slice::from_ref(&suffix));
     let (tx, mut rx) = mpsc::channel(2);
     crate::native_harness::record_context_checkpoint(
         &tx,
@@ -20531,9 +20532,11 @@ async fn private_workspace_plan_migrates_once_and_refreshes_while_idle_across_re
     for first in [true, false] {
         let (commands, command_rx) = mpsc::channel(8);
         let (events, mut event_rx) = mpsc::channel(64);
-        let mut capabilities = crate::SessionCapabilities::default();
-        capabilities.multiplayer = false;
-        capabilities.shared_work = false;
+        let mut capabilities = crate::SessionCapabilities {
+            multiplayer: false,
+            shared_work: false,
+            ..Default::default()
+        };
         if first {
             capabilities.runtime_workspace_identity = Some(crate::RuntimeWorkspaceIdentity {
                 human_participant_id: Uuid::new_v4(),
@@ -20992,9 +20995,11 @@ async fn viewer_resume_projects_work_without_granting_write_or_losing_deferred_l
         .unwrap();
     let (commands, command_rx) = mpsc::channel(8);
     let (events, mut event_rx) = mpsc::channel(64);
-    let mut capabilities = crate::SessionCapabilities::default();
-    capabilities.multiplayer = false;
-    capabilities.shared_work = false;
+    let capabilities = crate::SessionCapabilities {
+        multiplayer: false,
+        shared_work: false,
+        ..Default::default()
+    };
     let launch = LaunchSession {
         request_id: Uuid::new_v4(),
         cwd: root.path().into(),
