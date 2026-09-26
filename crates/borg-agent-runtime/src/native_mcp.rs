@@ -404,32 +404,53 @@ impl NativeMcpClient {
     }
 
     async fn list_tools(&mut self) -> Result<Vec<ListedTool>> {
-        let result = self.request("tools/list", json!({}), None).await?;
-        result
-            .get("tools")
-            .and_then(Value::as_array)
-            .context("MCP tools/list response is missing tools")?
-            .iter()
-            .map(|tool| {
-                let name = tool
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .filter(|name| !name.trim().is_empty())
-                    .context("MCP tool is missing a nonempty name")?;
-                Ok(ListedTool {
-                    name: name.to_string(),
-                    description: tool
-                        .get("description")
+        let mut tools = Vec::new();
+        let mut params = json!({});
+        let mut cursors = std::collections::HashSet::new();
+        let deadline = tokio::time::Instant::now() + MCP_REQUEST_TIMEOUT;
+        for _ in 0..100 {
+            let result =
+                tokio::time::timeout_at(deadline, self.request("tools/list", params, None))
+                    .await
+                    .context("MCP tool discovery timed out")??;
+            let page = result
+                .get("tools")
+                .and_then(Value::as_array)
+                .context("MCP tools/list response is missing tools")?
+                .iter()
+                .map(|tool| {
+                    let name = tool
+                        .get("name")
                         .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    input_schema: tool
-                        .get("inputSchema")
-                        .cloned()
-                        .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+                        .filter(|name| !name.trim().is_empty())
+                        .context("MCP tool is missing a nonempty name")?;
+                    Ok(ListedTool {
+                        name: name.to_string(),
+                        description: tool
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        input_schema: tool
+                            .get("inputSchema")
+                            .cloned()
+                            .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+                    })
                 })
-            })
-            .collect()
+                .collect::<Result<Vec<_>>>()?;
+            tools.extend(page);
+            match result.get("nextCursor") {
+                None | Some(Value::Null) => return Ok(tools),
+                Some(Value::String(cursor)) if !cursor.is_empty() => {
+                    if !cursors.insert(cursor.clone()) {
+                        bail!("MCP tools/list repeated a pagination cursor");
+                    }
+                    params = json!({ "cursor": cursor });
+                }
+                _ => bail!("MCP tools/list returned an invalid pagination cursor"),
+            }
+        }
+        bail!("MCP tools/list exceeded 100 pages")
     }
 
     async fn call_tool(
@@ -438,15 +459,28 @@ impl NativeMcpClient {
         arguments: Value,
         cancel: Option<&CancellationToken>,
     ) -> Result<Value> {
-        self.request(
-            "tools/call",
-            json!({
-                "name": name,
-                "arguments": arguments,
-            }),
-            cancel,
-        )
-        .await
+        let result = self
+            .request(
+                "tools/call",
+                json!({
+                    "name": name,
+                    "arguments": arguments,
+                }),
+                cancel,
+            )
+            .await?;
+        if result.get("isError").and_then(Value::as_bool) == Some(true) {
+            let message = result
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!("MCP tool `{name}` failed: {}", truncate(&message, 4096));
+        }
+        Ok(result)
     }
 
     async fn request(
@@ -855,9 +889,14 @@ read _initialize
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}'
 read _initialized
 read _list
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"map.generate","description":"Generate a map","inputSchema":{"type":"object"}},{"name":"hidden","inputSchema":{"type":"object"}}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"hidden","inputSchema":{"type":"object"}}],"nextCursor":"page2"}}'
+read _list_page
+case "$_list_page" in *'"cursor":"page2"'*) ;; *) exit 1 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"map.generate","description":"Generate a map","inputSchema":{"type":"object"}}]}}'
 read _call
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"ok"}]}}'
+read _call_error
+printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"isError":true,"content":[{"type":"text","text":"permission denied"}]}}'
 "#;
         let runtime = NativeMcpRuntime::start(
             uuid::Uuid::new_v4(),
@@ -893,6 +932,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
             .await
             .unwrap();
         assert_eq!(result["content"][0]["text"], "ok");
+        let error = runtime
+            .call("mcp__fake_server__map_generate", json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission denied"));
     }
 
     #[tokio::test]
