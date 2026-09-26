@@ -1321,3 +1321,72 @@ async fn postgres_coverage_follows_its_configuration() {
         harness.discard().await;
     }
 }
+
+// Claim CAS must hold across concurrent transactions, not just sequential callers.
+#[tokio::test]
+async fn concurrent_work_claims_have_exactly_one_winner() {
+    use crate::workspace::{AtomicWorkClaim, SharedWork};
+    for harness in harnesses().await {
+        let store = harness.store.as_ref();
+        let (workspace_id, author, second, third) = workspace_with_members(store).await;
+        let work_id = Uuid::new_v4();
+        let event = |author_id, kind| WorkspaceEvent {
+            id: Uuid::new_v4(),
+            workspace_id,
+            sequence: 0,
+            author_id,
+            idempotency_key: Uuid::new_v4().to_string(),
+            created_at: Utc::now(),
+            kind,
+        };
+        store
+            .append(event(
+                author,
+                WorkspaceEventKind::WorkCreated {
+                    work: SharedWork {
+                        id: work_id,
+                        title: "exclusive assignment".into(),
+                        detail: None,
+                    },
+                    mode: DeliveryMode::Notify,
+                },
+            ))
+            .await
+            .unwrap();
+        let mut expected_claim_id = None;
+        for _ in 0..8 {
+            let claim = |claimant_id| {
+                event(
+                    claimant_id,
+                    WorkspaceEventKind::WorkClaimed {
+                        claim: AtomicWorkClaim {
+                            work_id,
+                            claimant_id,
+                            expected_claim_id,
+                        },
+                        mode: DeliveryMode::Notify,
+                    },
+                )
+            };
+            let (a, b, c) = tokio::join!(
+                store.append(claim(author)),
+                store.append(claim(second)),
+                store.append(claim(third)),
+            );
+            let results = [a, b, c];
+            assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+            for result in results {
+                match result {
+                    Ok(winner) => expected_claim_id = Some(winner.id),
+                    Err(error) => assert!(
+                        error.to_string().contains("atomic claim conflict"),
+                        "{error:#}"
+                    ),
+                }
+            }
+        }
+        let replay = store.replay(workspace_id, author, 0, 50).await.unwrap();
+        assert_eq!(replay.len(), 9, "losing claims must not be journaled");
+        harness.discard().await;
+    }
+}

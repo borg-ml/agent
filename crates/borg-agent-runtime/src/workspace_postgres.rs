@@ -229,6 +229,12 @@ impl PostgresWorkspaceStore {
         );
         let canonical = canonical_event(event.clone())?;
         let mut transaction = self.pool.begin().await?;
+        // Serialize before reading the current claim or idempotency record, not
+        // only when allocating a sequence after those decisions have been made.
+        sqlx::query("select id from workspaces where id = $1 for update")
+            .bind(event.workspace_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
         if let Some(existing) = Self::existing_event(&mut transaction, &event, &canonical).await? {
             transaction.commit().await?;
             return Ok(existing);
@@ -558,6 +564,10 @@ impl WorkspaceStore for PostgresWorkspaceStore {
         // events the session journal already accepted, so a partial batch would
         // leave the projection describing a history that never happened.
         let mut transaction = self.pool.begin().await?;
+        sqlx::query("select id from workspaces where id = $1 for update")
+            .bind(workspace_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
         let members = self.members(&mut transaction, workspace_id).await?;
         let member_ids: Vec<Uuid> = members.into_iter().map(|(id, _)| id).collect();
 
