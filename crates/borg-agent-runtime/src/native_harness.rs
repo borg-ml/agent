@@ -5542,6 +5542,7 @@ mod tests {
             Arc::new(FailsSecondFold {
                 calls: Mutex::new(0),
             }),
+            crate::CodingProvider::OpenRouter,
             root.path().to_path_buf(),
             Uuid::new_v4(),
             conversation,
@@ -7696,6 +7697,105 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn claude_grace_wraps_the_existing_tool_turn_once() {
+        struct GraceClient {
+            calls: Mutex<Vec<Vec<ModelMessage>>>,
+            file: String,
+        }
+        #[async_trait]
+        impl NativeModelClient for GraceClient {
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                request: ModelTurnRequest,
+                progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(request.messages);
+                let first = calls.len() == 1;
+                drop(calls);
+                if first {
+                    progress
+                        .unwrap()
+                        .send(ProviderProgress::ProviderEvent {
+                            kind: "claude_usage_grace".into(),
+                            payload: json!({"five_hour": 0.1, "weekly": 0}),
+                            raw_payload: Box::new(None),
+                            stream_channel: None,
+                            content_text: None,
+                            provider_item_id: None,
+                            tool_use_id: None,
+                            tool_name: None,
+                            model: None,
+                            effort: None,
+                        })
+                        .unwrap();
+                }
+                Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(
+                        (!first).then(|| "checkpoint complete".into()),
+                        None,
+                        None,
+                        if first {
+                            vec![ModelToolCall::function(
+                                "grace-call".into(),
+                                "read_file".into(),
+                                json!({"path": self.file}).to_string(),
+                            )]
+                        } else {
+                            Vec::new()
+                        },
+                    ),
+                    finish_reason: if first { "tool_calls" } else { "stop" }.into(),
+                    usage: ProviderCallUsage::default(),
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("existing-work.txt");
+        std::fs::write(&file, "unfinished work").unwrap();
+        let client = Arc::new(GraceClient {
+            calls: Mutex::new(Vec::new()),
+            file: "existing-work.txt".to_string(),
+        });
+        let (events, completed) = run_turn_events(
+            client.clone(),
+            crate::CodingProvider::Claude,
+            root.path().to_path_buf(),
+            Uuid::new_v4(),
+            Vec::new(),
+            HashMap::new(),
+            "finish the current task",
+            "",
+            "",
+        )
+        .await;
+        assert!(completed, "events: {events:?}");
+        let calls = client.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[1].iter().any(|message| matches!(message,
+            ModelMessage::Tool { content, .. } if content.contains("unfinished work"))),
+            "tool results: {:?}",
+            calls[1]
+                .iter()
+                .filter_map(|message| match message {
+                    ModelMessage::Tool { content, .. } => Some(content),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(!calls[0].iter().any(|message| matches!(message,
+            ModelMessage::User { content, .. } if content.to_string().contains("wrap-up allowance"))));
+        assert!(calls[1].iter().any(|message| matches!(message,
+            ModelMessage::User { content, .. } if content.to_string().contains("wrap-up allowance"))));
+    }
+
     struct PrefixClient {
         rounds: Mutex<Vec<Vec<ModelMessage>>>,
         truncate_forever: bool,
@@ -7741,6 +7841,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     async fn run_turn_events(
         model_client: Arc<dyn NativeModelClient>,
+        provider: crate::CodingProvider,
         cwd: PathBuf,
         session_id: Uuid,
         conversation: Vec<ModelMessage>,
@@ -7760,7 +7861,7 @@ mod tests {
             message_id: Uuid::new_v4(),
             context_generation: 0,
             prior_native_context_tokens: None,
-            provider: crate::CodingProvider::OpenRouter,
+            provider,
             provider_session_id: None,
             provider_fork_turn_id: None,
             cwd: cwd.clone(),
@@ -7786,7 +7887,7 @@ mod tests {
                 crate::session::SessionTodoTools::disconnected(),
                 None,
                 crate::LspService::new(&cwd),
-                crate::CodingProvider::OpenRouter,
+                provider,
                 session_id,
                 false,
                 None,
@@ -7813,7 +7914,13 @@ mod tests {
             volatile_system_prompt_appendix: volatile.to_string(),
         };
         let (events_tx, mut events_rx) = mpsc::channel(256);
-        let task = tokio::spawn(async move { harness.run(turn, events_tx, None).await });
+        let task = tokio::spawn(async move {
+            if provider == crate::CodingProvider::Claude {
+                harness.run_bound(turn, events_tx, None, Vec::new()).await
+            } else {
+                harness.run(turn, events_tx, None).await
+            }
+        });
         // The timeout has to enclose the drain as well as the join, or a harness
         // that never finishes hangs the test instead of failing it.
         tokio::time::timeout(Duration::from_secs(30), async {
@@ -7846,6 +7953,7 @@ mod tests {
         });
         let (events, completed) = run_turn_events(
             client.clone(),
+            crate::CodingProvider::OpenRouter,
             cwd,
             session_id,
             crate::session::native_conversation(&journal, provider).unwrap(),
@@ -7955,6 +8063,7 @@ mod tests {
         let conversation = vec![ModelMessage::user("x".repeat(40_000))];
         let (events, completed) = run_turn_events(
             client.clone(),
+            crate::CodingProvider::OpenRouter,
             cwd,
             Uuid::new_v4(),
             conversation,
@@ -8044,6 +8153,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (events, completed) = run_turn_events(
             client.clone(),
+            crate::CodingProvider::OpenRouter,
             root.path().to_path_buf(),
             Uuid::new_v4(),
             Vec::new(),
@@ -8163,6 +8273,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let (events, completed) = run_turn_events(
                 client.clone(),
+                crate::CodingProvider::OpenRouter,
                 root.path().to_path_buf(),
                 session_id,
                 Vec::new(),
@@ -8290,6 +8401,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (events, completed) = run_turn_events(
             Arc::new(RejectCompaction),
+            crate::CodingProvider::OpenRouter,
             root.path().to_path_buf(),
             Uuid::new_v4(),
             vec![ModelMessage::user("x".repeat(40_000))],
@@ -8363,6 +8475,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (events, completed) = run_turn_events(
             Arc::new(FailsAfterToolCall),
+            crate::CodingProvider::OpenRouter,
             root.path().to_path_buf(),
             Uuid::new_v4(),
             Vec::new(),
@@ -8477,6 +8590,7 @@ mod tests {
         });
         let (events, completed) = run_turn_events(
             client.clone(),
+            crate::CodingProvider::OpenRouter,
             cwd,
             Uuid::new_v4(),
             vec![ModelMessage::user("x".repeat(200_000))],
