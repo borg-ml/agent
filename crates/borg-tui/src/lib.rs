@@ -1,6 +1,7 @@
 mod attachments;
 mod cache_diagnostics;
 mod clipboard;
+mod key_hints;
 mod markdown;
 mod rendering;
 mod terminal_input;
@@ -79,6 +80,7 @@ use self::cache_diagnostics::{CacheDiagnostics, CacheSignature, CacheStatus, Cac
 use self::markdown::{
     markdown_lines, markdown_link_ranges, markdown_plain_text, open_link, truncate_table_cell,
 };
+use self::key_hints::KeyHints;
 use self::terminal_input::TerminalInput;
 pub use self::terminal_input::{TerminalInputEvent, take_last_enter_read, take_last_escape_read};
 use borg_ui::KeybindingConfig;
@@ -1685,6 +1687,7 @@ pub struct BorgTerminal {
     composer_max_height: u16,
     show_footer: bool,
     window_focused: bool,
+    key_hints: KeyHints,
     tool_hit_areas: Vec<(Rect, usize)>,
     tool_run_hit_areas: Vec<(Rect, usize, usize)>,
     tool_run_header_hit_areas: Vec<(Rect, usize)>,
@@ -2866,7 +2869,11 @@ impl BorgTerminal {
         };
         let keyboard_enhanced = execute!(
             terminal.backend_mut(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
         )
         .is_ok();
         // Query before the input thread takes stdin: the probe reads the
@@ -2971,6 +2978,7 @@ impl BorgTerminal {
             composer_max_height: 8,
             show_footer: true,
             window_focused: true,
+            key_hints: KeyHints::default(),
             tool_hit_areas: Vec::new(),
             tool_run_hit_areas: Vec::new(),
             tool_run_header_hit_areas: Vec::new(),
@@ -3099,6 +3107,7 @@ impl BorgTerminal {
         self.tool_return_follow_tail = true;
         self.sidecar_focus_request = None;
         self.team_switcher_open = false;
+        self.key_hints = KeyHints::default();
         self.team_roster_hit_areas.clear();
         self.hovered_team_roster = None;
         self.back_to_director_area = None;
@@ -5905,6 +5914,12 @@ impl BorgTerminal {
             &event,
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved)
         );
+        if let Event::Key(key) = &event {
+            if let Some(action) = self.handle_key_hint(*key)? {
+                return Ok(action);
+            }
+        }
+        self.key_hints.observe_event(&event);
         match event {
             Event::FocusGained => {
                 self.window_focused = true;
@@ -8264,6 +8279,10 @@ impl BorgTerminal {
         // a caret through action rows.
         self.terminal.hide_cursor()?;
         let mut frame_cursor = None;
+        let hint_status_actionable = status_control_is_actionable(self.active_status());
+        let hint_goal_identity = self.key_hints.active.as_ref().map(|_| {
+            format!("goal:{:?}", self.active_goal().map(|goal| (goal.id, goal.status)))
+        });
         self.terminal.draw(|frame| {
             let area = centered_content_area_with_margin(frame.area(), self.horizontal_margin);
             let chunks = terminal_vertical_chunks(
@@ -9981,6 +10000,103 @@ impl BorgTerminal {
                         .style(Style::default().bg(Color::Reset)),
                     copy_area,
                 );
+            }
+            if self.key_hints.active.is_some() {
+                let mut hint_candidates = Vec::new();
+                if picker_open {
+                    for (area, index) in &next_picker_hit_areas {
+                        if let Some(picker) = &self.picker
+                            && let Some(option) = picker.options.get(*index)
+                            && !option.disabled
+                        {
+                            hint_candidates.push((
+                                *area,
+                                format!(
+                                    "picker:{:?}:{index}:{}",
+                                    std::mem::discriminant(&picker.kind),
+                                    option.value
+                                ),
+                            ));
+                        }
+                    }
+                } else if !self.keybindings_open {
+                    for (area, target) in &next_team_roster_hit_areas {
+                        hint_candidates.push((*area, format!("team:{target:?}")));
+                    }
+                    if !background_hover_suppressed {
+                        for (area, id) in &next_shell_row_hit_areas {
+                            if let Some(index) = id {
+                                hint_candidates.push((*area, format!("shell:{}", self.transcript.key_hint_identity(*index))));
+                            }
+                        }
+                        for (area, id) in &next_watch_row_hit_areas {
+                            hint_candidates.push((*area, format!("watch:{id}")));
+                        }
+                        for (name, area) in [
+                            ("dictation", next_dictation_button_area),
+                            ("pending", next_pending_input_header_area),
+                            ("status", next_status_area.filter(|_| hint_status_actionable)),
+                            ("goal", next_goal_status_area),
+                            ("todos", next_todo_status_area.filter(|_| !self.transcript.todos.is_empty())),
+                            ("shell", next_shell_status_area),
+                            ("agents", next_agents_status_area),
+                            ("model", next_model_status_area),
+                            ("effort", next_effort_status_area),
+                            ("context", next_context_status_area),
+                            ("fast", next_fast_status_area),
+                            ("permission", next_permission_status_area),
+                            ("watch", next_watch_status_area),
+                            ("director", next_back_to_director_area),
+                            ("bottom", next_jump_to_bottom_area),
+                            ("keys", next_keybindings_hint_area),
+                            ("commit", self.git_commit_area),
+                            ("push", self.git_status_area),
+                            ("pull", self.git_pull_area),
+                        ] {
+                            if let Some(area) = area {
+                                let identity = if name == "goal" {
+                                    hint_goal_identity.clone().unwrap_or_default()
+                                } else { name.to_string() };
+                                hint_candidates.push((area, identity));
+                            }
+                        }
+                        for (area, url) in &next_link_hit_areas {
+                            hint_candidates.push((*area, format!("link:{url}")));
+                        }
+                        for (area, index) in &next_tool_run_header_hit_areas {
+                            hint_candidates.push((
+                                *area,
+                                format!(
+                                    "run:{}:{}",
+                                    self.transcript.key_hint_identity(*index),
+                                    self.transcript.tool_run_expanded(*index)
+                                ),
+                            ));
+                        }
+                        for (area, index) in &next_tool_hit_areas {
+                            hint_candidates
+                                .push((*area, self.transcript.key_hint_identity(*index)));
+                        }
+                        for (area, index) in &next_message_hit_areas {
+                            hint_candidates
+                                .push((*area, self.transcript.key_hint_identity(*index)));
+                        }
+                        for (area, index) in &next_entry_hit_areas {
+                            if !next_tool_hit_areas.iter().any(|(_, other)| other == index)
+                                && !next_message_hit_areas
+                                    .iter()
+                                    .any(|(_, other)| other == index)
+                            {
+                                hint_candidates
+                                    .push((*area, self.transcript.key_hint_identity(*index)));
+                            }
+                        }
+                    }
+                }
+                for (_, identity) in &mut hint_candidates {
+                    *identity = format!("{:?}:{identity}", self.focused_child);
+                }
+                self.key_hints.render(frame, hint_candidates);
             }
         })?;
         if let Some(cursor) = frame_cursor {
@@ -15070,6 +15186,7 @@ fn inset_control_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
 /// the two can never drift.
 fn keybinding_reference(keymap: &KeyMap) -> Vec<(&'static str, String)> {
     vec![
+        ("click targets (1–9/0)", "hold Ctrl/Cmd or F12".to_string()),
         ("send", keymap.label(KeyAction::Send)),
         ("send after current turn", keymap.label(KeyAction::Queue)),
         ("newline", keymap.label(KeyAction::Newline)),
