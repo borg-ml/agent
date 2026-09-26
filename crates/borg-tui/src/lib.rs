@@ -1791,7 +1791,6 @@ pub struct BorgTerminal {
     transcript_full_render_cache: Option<CachedTranscriptRender>,
     active_transcript_render: Option<Arc<TranscriptRender>>,
     last_committed_viewport_render: Option<CachedTranscriptRender>,
-    last_reasoning_summary_phases: Vec<(usize, i64)>,
     rendered_transcript_height: usize,
     pending_scroll_anchor_height: Option<usize>,
     pending_transcript_anchor: Option<TranscriptViewportAnchor>,
@@ -3057,7 +3056,6 @@ impl BorgTerminal {
             transcript_full_render_cache: None,
             active_transcript_render: None,
             last_committed_viewport_render: None,
-            last_reasoning_summary_phases: Vec::new(),
             rendered_transcript_height: 0,
             pending_scroll_anchor_height: None,
             pending_transcript_anchor: None,
@@ -3625,20 +3623,6 @@ impl BorgTerminal {
         let due = tick.is_some() && tick != self.last_tool_timer_refresh_tick;
         self.last_tool_timer_refresh_tick = tick;
         due
-    }
-
-    fn visible_reasoning_summary_phases_at(&self, now: DateTime<Utc>) -> Vec<(usize, i64)> {
-        if self.focused_tool.is_some() {
-            return Vec::new();
-        }
-        self.tool_hit_areas
-            .iter()
-            .filter_map(|(_, index)| {
-                self.transcript
-                    .reasoning_summary_rotation_phase_at(*index, now)
-                    .map(|phase| (*index, phase))
-            })
-            .collect()
     }
 
     pub fn has_active_subagents(&self) -> bool {
@@ -7682,17 +7666,6 @@ impl BorgTerminal {
         let goal_tick = self.transcript.active_goal_cache_tick();
         let tool_elapsed_tick = self.transcript.tool_elapsed_cache_tick();
         let render_time = Utc::now();
-        let refresh_reasoning_summary = if input_fast_path {
-            let phases = self.visible_reasoning_summary_phases_at(render_time);
-            let changed = !phases.is_empty() && phases != self.last_reasoning_summary_phases;
-            self.last_reasoning_summary_phases = phases;
-            changed
-        } else {
-            false
-        };
-        if refresh_reasoning_summary {
-            self.invalidate_transcript_render_cache();
-        }
         let current_tool_elapsed = self.transcript.running_tool_elapsed_labels_at(render_time);
         let local_date = Local::now().date_naive();
         let committed_viewport_render = if input_fast_path {
@@ -10014,7 +9987,7 @@ impl BorgTerminal {
             self.terminal.set_cursor_position(cursor)?;
             self.terminal.show_cursor()?;
         }
-        if !input_fast_path || refresh_reasoning_summary {
+        if !input_fast_path {
             self.last_committed_viewport_render = Some((
                 transcript_width,
                 tool_run_viewport_height,
