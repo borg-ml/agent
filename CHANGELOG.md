@@ -5,6 +5,31 @@ Git comparison.
 
 ## Unreleased (since 0.12.1)
 
+### Sessions
+
+- Resuming a fork after its inherited history now reads only new events, rather
+  than recomposing the whole parent history for every update.
+
+### Models
+
+- Codex requests reasoning summaries when a model supports them, even when its
+  catalog default is `none`, so the terminal can show its reasoning actions.
+- The Codex model picker lists `gpt-5.6-sol` instead of `gpt-5.6-terra`.
+  An “Other [provider] model ID…” choice lets you enter an unlisted model for
+  a specific provider without routing it through the current provider.
+
+### Terminal UI
+
+- A Plan tooltip closing over an inline image forces a repaint instead of
+  leaving its outline or text over the image.
+- Goal rows and the status line show `▶` for active goals and the original
+  `▮▮` mark for paused or blocked goals. The subagent count says “inactive”
+  instead of “stopped” when no agents are working.
+- Subagent accents use purple; goal rows, status and menus use the todo orange.
+  Watchers keep their purple accent.
+- Action groups stay open while work continues and fold once the next assistant
+  message completes, rather than staying open throughout a long-running turn.
+
 ## 0.12.1 (2026-09-26)
 
 ### Context
