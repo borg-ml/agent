@@ -2,7 +2,6 @@ const USER_INTERRUPT_ACTIVITY: &str = "agent interrupted by user";
 /// The readout counts whole seconds, so the timer is repainted once per
 /// second rather than ten times for a digit nobody can read.
 const TOOL_ELAPSED_REFRESH_MILLIS: i64 = 1_000;
-const REASONING_SUMMARY_ROTATION_MILLIS: i64 = 2_000;
 /// Blocks that finish within this window after the last release stay held
 /// and land together on the next one, so a fast model cannot make a reply
 /// repaint several times a second, while the first block still shows at once.
@@ -515,29 +514,15 @@ struct RenderResume {
 }
 
 /// The part of an entry's rows that follows the render clock.
-fn render_clock_key(entry: &TranscriptEntry, now: DateTime<Utc>) -> (Option<String>, i64) {
+fn render_clock_key(entry: &TranscriptEntry, now: DateTime<Utc>) -> Option<String> {
     match entry {
         TranscriptEntry::Tool {
             started_at,
             completed_at,
-            code_view,
             ..
-        } => (
-            format_tool_elapsed_at(*started_at, *completed_at, now),
-            completed_at
-                .zip(code_view.as_ref())
-                .filter(|(_, (language, _))| language == "reasoning")
-                .and_then(|(completed_at, (_, source))| {
-                    rotating_reasoning_summary_lines(source).map(|lines| {
-                        reasoning_summary_rotation_phase(lines.len(), completed_at, now)
-                    })
-                })
-                .unwrap_or(0),
-        ),
-        TranscriptEntry::Goal { goal, .. } => {
-            (format_elapsed_duration(goal_live_seconds(goal, now)), 0)
-        }
-        _ => (None, 0),
+        } => format_tool_elapsed_at(*started_at, *completed_at, now),
+        TranscriptEntry::Goal { goal, .. } => format_elapsed_duration(goal_live_seconds(goal, now)),
+        _ => None,
     }
 }
 
@@ -897,37 +882,6 @@ fn reasoning_preview(source: &str) -> String {
         last
     };
     chosen.chars().take(MAX_CHARS).collect()
-}
-
-fn rotating_reasoning_summary_lines(source: &str) -> Option<Vec<&str>> {
-    let mut lines = Vec::new();
-    for line in source
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        let line = line.strip_prefix("**")?.strip_suffix("**")?.trim();
-        if line.is_empty() {
-            return None;
-        }
-        if lines.last().copied() != Some(line) {
-            lines.push(line);
-        }
-    }
-    (lines.len() > 1).then_some(lines)
-}
-
-/// Steps through the summary titles once, then rests on the last one.
-fn reasoning_summary_rotation_phase(
-    lines: usize,
-    completed_at: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> i64 {
-    now.signed_duration_since(completed_at)
-        .num_milliseconds()
-        .max(0)
-        .div_euclid(REASONING_SUMMARY_ROTATION_MILLIS)
-        .min(lines.saturating_sub(1) as i64)
 }
 
 fn tool_has_expandable_body(
@@ -1403,11 +1357,13 @@ impl Transcript {
             } else {
                 "click expand · right-click actions"
             }),
-            TranscriptEntry::Plan { items, expanded, .. }
-                if items.len() > MAX_COLLAPSED_PLAN_ITEMS =>
-            {
-                Some(if *expanded { "click collapse" } else { "click expand" })
-            }
+            TranscriptEntry::Plan {
+                items, expanded, ..
+            } if items.len() > MAX_COLLAPSED_PLAN_ITEMS => Some(if *expanded {
+                "click collapse"
+            } else {
+                "click expand"
+            }),
             _ => None,
         }
     }
@@ -2117,9 +2073,9 @@ impl Transcript {
                             .as_ref()
                             .map(|turn| (turn.model.clone(), turn.effort.clone(), turn.fast))
                             .or_else(|| {
-                                self.config
-                                    .as_ref()
-                                    .map(|config| (config.model.clone(), config.effort.clone(), config.fast))
+                                self.config.as_ref().map(|config| {
+                                    (config.model.clone(), config.effort.clone(), config.fast)
+                                })
                             })
                             .unwrap_or_default()
                     } else {
@@ -4716,33 +4672,14 @@ impl Transcript {
         })
     }
 
-    pub(crate) fn reasoning_summary_rotation_phase_at(
-        &self,
-        index: usize,
-        now: DateTime<Utc>,
-    ) -> Option<i64> {
-        let Some(TranscriptEntry::Tool {
-            code_view: Some((language, source)),
-            completed_at: Some(completed_at),
-            complete: true,
-            expanded: false,
-            ..
-        }) = self.order.get(index)
-        else {
-            return None;
-        };
-        (language == "reasoning")
-            .then(|| rotating_reasoning_summary_lines(source))
-            .flatten()
-            .map(|lines| reasoning_summary_rotation_phase(lines.len(), *completed_at, now))
-    }
-
     /// A running tool repaints on whole-second boundaries, so a long action
     /// costs the same as a short one: one repaint a second, which is exactly
     /// when its readout changes.
     fn running_tool_timer_tick_at(&self, now: DateTime<Utc>) -> Option<i64> {
-        self.has_running_tool()
-            .then(|| now.timestamp_millis().div_euclid(TOOL_ELAPSED_REFRESH_MILLIS))
+        self.has_running_tool().then(|| {
+            now.timestamp_millis()
+                .div_euclid(TOOL_ELAPSED_REFRESH_MILLIS)
+        })
     }
 
     fn running_tool_elapsed_labels_at(&self, now: DateTime<Utc>) -> Vec<(usize, Option<String>)> {
@@ -5990,26 +5927,7 @@ impl Transcript {
                         || code_view
                             .as_ref()
                             .is_some_and(|(language, _)| is_diff_language(language));
-                    let rotating_detail = (is_reasoning
-                        && *complete
-                        && !*expanded
-                        && focused_tool.is_none())
-                    .then(|| {
-                        code_view.as_ref().and_then(|(_, source)| {
-                            rotating_reasoning_summary_lines(source).and_then(|lines| {
-                                completed_at.map(|completed_at| {
-                                    let phase = reasoning_summary_rotation_phase(
-                                        lines.len(),
-                                        completed_at,
-                                        render_time,
-                                    );
-                                    reasoning_preview(lines[phase as usize])
-                                })
-                            })
-                        })
-                    })
-                    .flatten();
-                    let display_detail = rotating_detail.as_deref().unwrap_or(detail);
+                    let display_detail = detail;
                     // Inside a group the header carries the time.
                     let time = if tool_window.is_some() {
                         String::new()
@@ -6031,7 +5949,7 @@ impl Transcript {
                         (Some(outcome), None) => Some(outcome.to_string()),
                         (None, elapsed) => elapsed.map(str::to_string),
                     };
-                    if completed_at.is_none() || rotating_detail.is_some() {
+                    if completed_at.is_none() {
                         trace.clock_rows.push(index);
                     }
                     if !*complete {
@@ -6602,7 +6520,7 @@ mod parallel_preparation_tests {
     use super::*;
 
     #[test]
-    fn completed_reasoning_steps_through_summary_lines_once_and_rests_on_the_last() {
+    fn completed_reasoning_summary_is_static_and_keeps_full_expandable_text() {
         let session_id = Uuid::new_v4();
         let completed_at = Utc::now();
         let source = "**Waiting on external session.**\n**Awaiting session expiry.**\n**Awaiting session expiry.**\n**Running candidate tests.**";
@@ -6618,13 +6536,8 @@ mod parallel_preparation_tests {
         completed.created_at = completed_at;
         transcript.apply(&completed);
 
-        for (seconds, expected) in [
-            (0, "Waiting on external session."),
-            (2, "Awaiting session expiry."),
-            (4, "Running candidate tests."),
-            (6, "Running candidate tests."),
-            (60, "Running candidate tests."),
-        ] {
+        let mut first_render = None;
+        for seconds in [0, 2, 4, 6, 60] {
             let rendered = transcript
                 .render_for_cache_at(100, 30, completed_at + chrono::Duration::seconds(seconds))
                 .0
@@ -6632,11 +6545,13 @@ mod parallel_preparation_tests {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join("\n");
-            assert!(rendered.contains(expected), "{rendered}");
-            assert_eq!(
-                rendered.matches("Awaiting session expiry.").count(),
-                usize::from(seconds == 2)
-            );
+            assert!(rendered.contains("Running candidate tests."), "{rendered}");
+            assert!(!rendered.contains("Awaiting session expiry."));
+            if let Some(first) = &first_render {
+                assert_eq!(&rendered, first, "completed reasoning must not animate");
+            } else {
+                first_render = Some(rendered);
+            }
         }
 
         transcript.toggle_tool(0);
