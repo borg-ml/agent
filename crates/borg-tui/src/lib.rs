@@ -15872,7 +15872,7 @@ fn borg_control_tool_output_view(
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         rows.push(format!(
-            "PLAN · {} step{}",
+            "PLAN · {} to-do{}",
             steps.len(),
             if steps.len() == 1 { "" } else { "s" }
         ));

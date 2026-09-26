@@ -603,7 +603,7 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
             .and_then(Value::as_array)
             .map(Vec::len);
         let detail = count
-            .map(|count| format!("{count} {}", if count == 1 { "step" } else { "steps" }))
+            .map(|count| format!("{count} {}", if count == 1 { "to-do" } else { "to-dos" }))
             .unwrap_or_else(|| "session plan".to_string());
         return ("Update plan".to_string(), detail);
     }
