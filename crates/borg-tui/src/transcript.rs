@@ -817,7 +817,7 @@ fn outcome_is_failure(outcome: &str) -> bool {
 /// A finished row's marker: what kind of work it was, at a glance.
 fn tool_kind_marker(name: &str, is_reasoning: bool) -> &'static str {
     if is_reasoning {
-        return "✦";
+        return "◦";
     }
     if is_subagent_tool(name) {
         return "◆";

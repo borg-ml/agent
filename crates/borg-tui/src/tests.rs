@@ -13667,7 +13667,7 @@ fn reasoning_lifecycle_events_show_reasoning_without_a_text_delta() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("✦ Reasoned"));
+    assert!(rendered.contains("◦ Reasoned"));
     assert!(!rendered.contains("◇ Thinking"));
 }
 
