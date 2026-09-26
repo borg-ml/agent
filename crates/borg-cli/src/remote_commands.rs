@@ -60,7 +60,6 @@ mod local_server;
 
 const MIN_TUI_FPS: u64 = 15;
 const MAX_TUI_FPS: u64 = 240;
-const STREAMING_TUI_FPS: u64 = 120;
 /// Streaming frames may spend up to half the loop drawing: enough headroom for
 /// input and event draining without throttling live text to a crawl.
 const STREAMING_DRAW_COST_MULTIPLIER: u32 = 2;
@@ -2969,6 +2968,9 @@ async fn run_local_agent_session(
     let mut last_stream_text_at: Option<tokio::time::Instant> = None;
     let mut tool_started_frame_hold_until = None;
     let mut tui_fps = tui_refresh_rate(u64::from(editor_preferences.presentation.refresh_rate_fps));
+    let mut tui_streaming_fps = tui_streaming_refresh_rate(u64::from(
+        editor_preferences.presentation.streaming_refresh_rate_fps,
+    ));
     let mut prevent_sleep = editor_preferences.interaction.prevent_sleep;
     let mut prevent_lid_sleep = editor_preferences.interaction.prevent_lid_sleep;
     let mut steer_active_turn =
@@ -3739,6 +3741,7 @@ async fn run_local_agent_session(
                 interaction_dirty = false;
                 let next_interval = responsive_tui_frame_interval(
                     tui_fps,
+                    tui_streaming_fps,
                     draw_started.elapsed(),
                     interaction_frame,
                     streaming_frame_pending,
@@ -3882,6 +3885,9 @@ async fn run_local_agent_session(
                             editor_preferences = next_editor_preferences;
                             tui_fps = tui_refresh_rate(u64::from(
                                 editor_preferences.presentation.refresh_rate_fps,
+                            ));
+                            tui_streaming_fps = tui_streaming_refresh_rate(u64::from(
+                                editor_preferences.presentation.streaming_refresh_rate_fps,
                             ));
                             prevent_sleep = editor_preferences.interaction.prevent_sleep;
                             prevent_lid_sleep = editor_preferences.interaction.prevent_lid_sleep;
@@ -4259,7 +4265,7 @@ async fn run_local_agent_session(
                         tui_timing.observe("stream_age", std::time::Duration::from_millis(event_age_ms), queued_events);
                     }
                     if stream_burst_started && terminal_dirty {
-                        render_frame_interval = tui_frame_interval(tui_fps.max(STREAMING_TUI_FPS));
+                        render_frame_interval = tui_frame_interval(tui_streaming_fps);
                         render_tick = tui_render_interval(render_frame_interval);
                     }
                     if event.sequence == 0 && coalesced_transcript_event(&event.kind) {
@@ -4294,6 +4300,7 @@ async fn run_local_agent_session(
                             tui_timing.observe("immediate_draw", draw_started.elapsed(), queued_events);
                             let next_interval = responsive_tui_frame_interval(
                                 tui_fps,
+                                tui_streaming_fps,
                                 draw_started.elapsed(),
                                 false,
                                 false,
@@ -4700,6 +4707,21 @@ async fn run_local_agent_session(
                             "send after the current turn finishes"
                         }
                     );
+                    continue;
+                }
+                if let Some(value) = line.strip_prefix("/refresh streaming ") {
+                    match value.trim().parse::<u64>() {
+                        Ok(rate @ MIN_TUI_FPS..=MAX_TUI_FPS) => {
+                            tui_streaming_fps = rate;
+                            editor_preferences.presentation.streaming_refresh_rate_fps =
+                                u16::try_from(rate).expect("bounded refresh rate fits u16");
+                            editor_preferences.save_changes(&previous_preferences)?;
+                            println!("\n  Streaming refresh rate set to {rate} FPS.\n");
+                        }
+                        _ => eprintln!(
+                            "\n  Streaming refresh rate must be between {MIN_TUI_FPS} and {MAX_TUI_FPS} FPS.\n"
+                        ),
+                    }
                     continue;
                 }
                 if let Some(fps) = line.strip_prefix("/refresh ") {
@@ -6769,6 +6791,26 @@ async fn run_local_agent_session(
                                     .as_mut()
                                     .expect("terminal")
                                     .set_notice(error.to_string()),
+                            }
+                        } else if let Some(value) = line.strip_prefix("/refresh streaming ")
+                            && attachments.is_empty()
+                        {
+                            match value.trim().parse::<u64>() {
+                                Ok(rate @ MIN_TUI_FPS..=MAX_TUI_FPS) => {
+                                    tui_streaming_fps = rate;
+                                    editor_preferences.presentation.streaming_refresh_rate_fps =
+                                        u16::try_from(rate).expect("bounded refresh rate fits u16");
+                                    dispatch_editor_preferences_save(
+                                        &editor_preferences_tx,
+                                        &editor_preferences,
+                                    );
+                                    terminal.as_mut().expect("terminal").set_notice(format!(
+                                        "Streaming refresh rate set to {rate} FPS"
+                                    ));
+                                }
+                                _ => terminal.as_mut().expect("terminal").set_notice(format!(
+                                    "Streaming refresh rate must be between {MIN_TUI_FPS} and {MAX_TUI_FPS} FPS"
+                                )),
                             }
                         } else if let Some(value) = line.strip_prefix("/refresh ")
                             && attachments.is_empty()
@@ -9279,7 +9321,15 @@ async fn print_recent_sessions(
 }
 
 fn tui_refresh_rate(default: u64) -> u64 {
-    std::env::var("BORG_TUI_FPS")
+    refresh_rate_from_env("BORG_TUI_FPS", default)
+}
+
+fn tui_streaming_refresh_rate(default: u64) -> u64 {
+    refresh_rate_from_env("BORG_TUI_STREAMING_FPS", default)
+}
+
+fn refresh_rate_from_env(variable: &str, default: u64) -> u64 {
+    std::env::var(variable)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(default)
@@ -9292,15 +9342,12 @@ fn tui_frame_interval(fps: u64) -> std::time::Duration {
 
 fn responsive_tui_frame_interval(
     fps: u64,
+    streaming_fps: u64,
     last_draw: std::time::Duration,
     interaction_frame: bool,
     streaming_frame: bool,
 ) -> std::time::Duration {
-    let base = if streaming_frame {
-        tui_frame_interval(fps.max(STREAMING_TUI_FPS))
-    } else {
-        tui_frame_interval(fps)
-    };
+    let base = tui_frame_interval(if streaming_frame { streaming_fps } else { fps });
     base.max(if interaction_frame {
         last_draw
     } else {
