@@ -609,9 +609,20 @@ impl Watches {
             .get_mut(&watch_id)
             .context("watcher not found in this session")?;
         entry.cancel.cancel();
+        let command_running = entry.agent.is_none() && entry.info.running;
         let stopped = entry.stopped.clone();
         let mut info = entry.info.clone();
         drop(entries);
+        if command_running {
+            // Cancel the detached process as well as its notification task.
+            if let Ok(snapshot) = self
+                .processes
+                .write_stdin(self.session_id, watch_id, None, true, Some(0), Some(1024))
+                .await
+            {
+                ensure!(!snapshot.running, "watcher command did not stop");
+            }
+        }
         stopped.cancelled().await;
         // An agent watch has no task to clear this, and a command watch's task
         // has already done so by the time its stop token resolves.
@@ -835,11 +846,60 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn stopping_a_watch_reaps_a_job_control_child() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(8);
+        let watches = Watches::new(ProcessManager::default(), tx, session_id);
+        let info = watches
+            .start(
+                session_id,
+                root.path(),
+                WatchArgs {
+                    command: "set -m; sleep 30 & echo $! > job.pid; wait".into(),
+                    label: "Build job".into(),
+                    notify_on: Some(NotifyOn::Exit),
+                    ..Default::default()
+                },
+                None,
+                60_000,
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        let job = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(root.path().join("job.pid")) {
+                    break pid.trim().parse::<i32>().unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let stopped = watches.stop(info.watch_id).await;
+        let alive = std::fs::read_to_string(format!("/proc/{job}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(") ")
+                    .map(|(_, rest)| rest.starts_with('Z'))
+            })
+            == Some(false);
+        if alive {
+            unsafe { libc::kill(job, libc::SIGKILL) };
+        }
+        stopped.unwrap();
+        assert!(!alive, "stopped watcher left its job-control child running");
+    }
+
+    #[tokio::test]
     async fn exit_only_stays_quiet_but_stop_still_notifies() {
         let root = tempfile::tempdir().unwrap();
         let session_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::channel(8);
-        let watches = Watches::new(ProcessManager::default(), tx, session_id);
+        let processes = ProcessManager::default();
+        let watches = Watches::new(processes.clone(), tx, session_id);
         let info = watches
             .start(
                 session_id,
@@ -864,6 +924,15 @@ mod tests {
                 .is_err()
         );
         watches.stop(info.watch_id).await.unwrap();
+        if let Ok(snapshot) = processes
+            .write_stdin(session_id, info.watch_id, None, false, Some(0), None)
+            .await
+        {
+            assert!(
+                !snapshot.running,
+                "stopped watcher left its command running"
+            );
+        }
         let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
             .unwrap()

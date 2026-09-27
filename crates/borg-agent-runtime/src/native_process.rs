@@ -1625,15 +1625,20 @@ pub(crate) async fn terminate_process_tree(pid: u32) {
     if pid == 0 || pid > i32::MAX as u32 {
         return;
     }
+    #[cfg(target_os = "linux")]
+    let descendants = process_descendants(pid);
     terminate_process_tree_now(pid);
+    #[cfg(target_os = "linux")]
+    signal_descendants(&descendants, libc::SIGTERM);
     let deadline = Instant::now() + Duration::from_millis(750);
     while process_group_is_alive(pid) && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    if !process_group_is_alive(pid) {
-        return;
+    #[cfg(target_os = "linux")]
+    signal_descendants(&descendants, libc::SIGKILL);
+    if process_group_is_alive(pid) {
+        force_kill_process_tree_now(pid);
     }
-    force_kill_process_tree_now(pid);
 }
 
 #[cfg(unix)]
@@ -1674,9 +1679,42 @@ pub(crate) fn force_kill_process_tree_now(pid: u32) {
     if pid == 0 || pid > i32::MAX as u32 {
         return;
     }
+    #[cfg(target_os = "linux")]
+    let descendants = process_descendants(pid);
     // SAFETY: the caller retains the id of a child spawned as its own group leader.
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    #[cfg(target_os = "linux")]
+    signal_descendants(&descendants, libc::SIGKILL);
+}
+
+#[cfg(target_os = "linux")]
+fn process_descendants(pid: u32) -> Vec<u32> {
+    let mut pending = vec![pid];
+    let mut descendants = Vec::new();
+    while let Some(parent) = pending.pop() {
+        let path = format!("/proc/{parent}/task/{parent}/children");
+        if let Ok(children) = std::fs::read_to_string(path) {
+            for child in children
+                .split_whitespace()
+                .filter_map(|pid| pid.parse::<u32>().ok())
+            {
+                descendants.push(child);
+                pending.push(child);
+            }
+        }
+    }
+    descendants
+}
+
+#[cfg(target_os = "linux")]
+fn signal_descendants(descendants: &[u32], signal: i32) {
+    for &pid in descendants {
+        if pid <= i32::MAX as u32 {
+            // SAFETY: these PIDs were descendants of the process we own.
+            unsafe { libc::kill(pid as i32, signal) };
+        }
     }
 }
 

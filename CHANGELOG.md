@@ -13,6 +13,8 @@ Git comparison.
 - Running command follow-ups use the shorter “Read output” action label.
 - Enhanced terminal input requests shifted key characters so uppercase and punctuation
   reach the composer on terminals that report alternate key codes.
+- Stopping a background command watcher also stops job-control child processes
+  instead of leaving builds running after the watcher exits.
 
 ## 0.12.7 (2026-09-27)
 
