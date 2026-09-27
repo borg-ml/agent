@@ -53,6 +53,19 @@ pub(crate) struct PersistentRuntimeResult {
     pub stderr: String,
 }
 
+// A normal, protocol-complete user-code exception leaves the worker usable.
+// Treating it as a transport failure discards the live namespace on every typo
+// or failed Borg call, even though Python/Bun have returned to their read loop.
+#[derive(Debug)]
+struct RuntimeExecutionError(String);
+
+impl std::fmt::Display for RuntimeExecutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for RuntimeExecutionError {}
+
 /// Registry of runtimes owned by one Borg agent executor.
 ///
 /// The registry is deliberately keyed by durable session id.  A native turn
@@ -313,7 +326,7 @@ impl PersistentRuntimeWorker {
             _ = cancellation.cancelled() => bail!("persistent runtime was cancelled"),
             process = self.process.lock() => process,
         };
-        let result = {
+        let (result, worker_failed) = {
             let process_exited = if let Some(process) = process.as_mut() {
                 process.child.try_wait()?.is_some()
             } else {
@@ -359,21 +372,23 @@ impl PersistentRuntimeWorker {
                     host,
                 ) => result,
             };
-            if result.is_err()
-                && let Some(mut process) = process.take()
-            {
+            let worker_failed = result
+                .as_ref()
+                .err()
+                .is_some_and(|error| !error.is::<RuntimeExecutionError>());
+            if worker_failed && let Some(mut process) = process.take() {
                 cancellation.cancel();
                 process.stop().await;
             }
             {
                 let mut metadata = self.metadata.lock().await;
-                if result.is_err() {
+                if worker_failed {
                     metadata.namespace_recovery_pending = true;
                 } else if should_recover_namespace {
                     metadata.namespace_recovery_pending = false;
                 }
             }
-            result
+            (result, worker_failed)
         };
 
         let code_hash = format!("sha256:{}", hex::encode(Sha256::digest(code.as_bytes())));
@@ -384,7 +399,7 @@ impl PersistentRuntimeWorker {
                     self.session_id,
                     self.worker_id,
                     &code_hash,
-                    result.is_err(),
+                    worker_failed,
                     execution_error.as_deref(),
                 )
                 .await?;
@@ -545,14 +560,20 @@ async fn execute_request(
                     message.get("id").and_then(Value::as_str) == Some(request_id),
                     "persistent runtime response id did not match request"
                 );
-                ensure!(
-                    message.get("ok").and_then(Value::as_bool).unwrap_or(false),
-                    "{}",
-                    message
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("persistent runtime execution failed")
-                );
+                let ok = message
+                    .get("ok")
+                    .and_then(Value::as_bool)
+                    .context("persistent runtime response has no execution status")?;
+                if !ok {
+                    return Err(RuntimeExecutionError(
+                        message
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("persistent runtime execution failed")
+                            .to_string(),
+                    )
+                    .into());
+                }
                 let result = PersistentRuntimeResult {
                     runtime,
                     persistent: true,
@@ -1624,6 +1645,61 @@ mod tests {
         assert!(!environment.iter().any(|(name, _)| *name == "HOME"));
     }
 
+    // An uncaught Python or host-call error must not erase imported modules,
+    // functions or partial updates. Check the next call, not merely the error
+    // text: compilation and worker-only tests cannot detect host-side teardown.
+    #[tokio::test]
+    async fn execution_errors_preserve_the_live_python_namespace() {
+        if !python_available().await {
+            return;
+        }
+        let root = tempdir().unwrap();
+        let runtime =
+            PersistentRuntimeWorker::for_python(Uuid::new_v4(), root.path().to_path_buf(), None);
+        runtime
+            .execute(
+                "import math\nvalues = [40]\ndef answer(): return math.floor(values[0]) + 2",
+                None,
+                Arc::new(TestHost),
+            )
+            .await
+            .unwrap();
+        for code in [
+            "values[0] += 1; raise ValueError('example')",
+            "borg.call('missing', {})",
+        ] {
+            let error = runtime
+                .execute(code, None, Arc::new(TestHost))
+                .await
+                .unwrap_err();
+            assert!(error.is::<RuntimeExecutionError>(), "{error:#}");
+            assert_eq!(
+                runtime
+                    .execute("answer()", None, Arc::new(TestHost))
+                    .await
+                    .unwrap()
+                    .value,
+                43
+            );
+        }
+        // Syntax errors do not invalidate an otherwise usable worker either.
+        assert!(
+            runtime
+                .execute("def broken(", None, Arc::new(TestHost))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            runtime
+                .execute("answer()", None, Arc::new(TestHost))
+                .await
+                .unwrap()
+                .value,
+            43
+        );
+        runtime.stop().await;
+    }
+
     #[tokio::test]
     async fn cancelling_runtime_calls_does_not_kill_other_requests() {
         use crate::SessionStore;
@@ -1944,6 +2020,14 @@ mod tests {
                 .is_err()
         );
         assert_eq!(effects.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime
+                .execute("answer", None, Arc::new(TestHost))
+                .await
+                .unwrap()
+                .value,
+            43
+        );
         runtime.stop().await;
     }
 
