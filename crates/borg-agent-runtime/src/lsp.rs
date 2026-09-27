@@ -889,6 +889,15 @@ impl LspClient {
         uri: &str,
         language_id: &str,
     ) -> Result<Value> {
+        // didOpen triggers the first parse/preamble build independently of
+        // initialize. Large C++ units can need more than the warm 15-second
+        // budget even after initialize has answered. Workspace callers still
+        // impose their outer whole-pass deadline.
+        let publish_timeout = if self.opened_versions.contains_key(path) {
+            PUBLISHED_DIAGNOSTICS_TIMEOUT
+        } else {
+            INITIALIZE_TIMEOUT
+        };
         self.open_document(path, uri, language_id).await?;
         match self
             .request(
@@ -899,7 +908,7 @@ impl LspClient {
         {
             Ok(result) => Ok(result),
             Err(pull_error) => self
-                .wait_for_published_diagnostics(uri)
+                .wait_for_published_diagnostics(uri, publish_timeout)
                 .await
                 .with_context(|| format!("pull diagnostics failed ({pull_error:#})")),
         }
@@ -1059,11 +1068,15 @@ impl LspClient {
             .insert(uri.to_string(), diagnostics);
     }
 
-    async fn wait_for_published_diagnostics(&mut self, uri: &str) -> Result<Value> {
+    async fn wait_for_published_diagnostics(
+        &mut self,
+        uri: &str,
+        publish_timeout: Duration,
+    ) -> Result<Value> {
         if let Some(items) = self.published_diagnostics.remove(uri) {
             return Ok(json!({ "kind": "full", "items": items }));
         }
-        timeout(PUBLISHED_DIAGNOSTICS_TIMEOUT, async {
+        timeout(publish_timeout, async {
             loop {
                 let message = self.read_message().await?;
                 self.capture_diagnostics(&message);
