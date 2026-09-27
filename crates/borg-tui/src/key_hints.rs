@@ -149,7 +149,12 @@ impl KeyHints {
                     .map(|target| target.area.x)
                     .min()
                     .unwrap_or(viewport.right());
-                let area = Rect::new(viewport.x, y, end.saturating_sub(viewport.x), 1);
+                let area = Rect::new(
+                    viewport.x,
+                    y,
+                    end.saturating_sub(viewport.x).min(label.width() as u16),
+                    1,
+                );
                 if area.width > 0 {
                     frame.render_widget(
                         Paragraph::new(label).style(Style::default().fg(Color::Yellow)),
@@ -311,6 +316,25 @@ mod tests {
         terminal
             .draw(|frame| hints.render(frame, candidates, &[]))
             .unwrap();
+    }
+
+    #[test]
+    fn key_hint_instruction_does_not_recolor_footer_metadata() {
+        let mut hints = KeyHints::default();
+        hints.start(None);
+        let mut terminal = Terminal::new(TestBackend::new(100, 3)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new("pro sub").style(Style::default().fg(Color::Magenta)),
+                    Rect::new(65, 2, 7, 1),
+                );
+                hints.render(frame, vec![(Rect::new(80, 2, 5, 1), "footer".into())], &[]);
+            })
+            .unwrap();
+        let cell = &terminal.backend().buffer()[(65, 2)];
+        assert_eq!(cell.symbol(), "p");
+        assert_eq!(cell.fg, Color::Magenta);
     }
 
     #[test]
