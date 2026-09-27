@@ -446,7 +446,17 @@ fn spawn_worker(root: &Path, command: &str, source: &str, runtime: &str) -> Resu
         process.arg("-u").arg("-c").arg(source);
     }
     #[cfg(unix)]
-    process.process_group(0);
+    // A process group alone still shares the TUI's controlling terminal: Git
+    // and other descendants can print prompts over it, then stop on SIGTTIN.
+    // SAFETY: setsid is async-signal-safe and runs only in the child.
+    unsafe {
+        process.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     #[cfg(windows)]
     process.creation_flags(0x0000_0200);
     let mut child = process
