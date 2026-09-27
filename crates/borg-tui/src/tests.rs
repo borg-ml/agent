@@ -5932,11 +5932,8 @@ fn todo_status_counts_open_items_and_tooltip_matches_plan_order_and_clipping() {
     assert!(rows[0].contains("Ship the hover affordance"));
     assert!(rows[1].starts_with("○  "));
     assert!(rows[1].contains("Run the regression tests"));
-    assert!(
-        rows[..MAX_COLLAPSED_PLAN_ITEMS]
-            .iter()
-            .all(|row| !row.starts_with("✓  "))
-    );
+    assert!(rows[..4].iter().all(|row| !row.starts_with("✓  ")));
+    assert!(rows[4].starts_with("✓  "));
     assert!(
         rows.last()
             .is_some_and(|row| row.contains("click to expand"))
@@ -15496,8 +15493,8 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
         .lines(120)
         .into_iter()
         .flat_map(|line| line.spans)
-        .find(|span| span.content == "Waiting")
-        .expect("waiting poll lifecycle verb");
+        .find(|span| span.content == "Reading")
+        .expect("reading poll lifecycle verb");
     assert_eq!(running_verb.style.fg, Some(BACKGROUND_RUNNING_TEXT));
 
     transcript.apply(&SessionEvent::new(
