@@ -14127,12 +14127,11 @@ fn a_collapsed_plan_card_shows_the_update_not_the_first_rows() {
     assert!(!progressed.contains("Task 14"), "{progressed}");
     assert!(progressed.contains("+ 14 more"), "{progressed}");
 
-    // When the changed step is itself open it leads and is not repeated among
-    // the open rows that follow it.
+    // The changed step shows its old and new status before the open rows.
     mixed[11].status = PlanItemStatus::InProgress;
     transcript.upsert_plan(mixed, "12:13".to_string());
     let started = render(&transcript);
-    assert_eq!(started.matches("Task 11").count(), 1, "{started}");
+    assert_eq!(started.matches("Task 11").count(), 2, "{started}");
     for open in ["Task 12", "Task 13", "Task 14"] {
         assert!(started.contains(open), "{open} missing from {started}");
     }

@@ -293,71 +293,6 @@ impl BorgTerminal {
     }
 }
 
-impl Transcript {
-    pub(super) fn key_hint_identity(&self, index: usize) -> String {
-        if let Some(id) = self.message_id_at(index) {
-            return format!("message:{id}");
-        }
-        let mut tools: Vec<_> = self
-            .tools
-            .iter()
-            .filter_map(|(id, row)| (*row == index).then_some(id.as_str()))
-            .collect();
-        tools.sort_unstable();
-        if !tools.is_empty() {
-            return format!(
-                "tool:{tools:?}:{}:{:?}",
-                self.tool_is_expanded(index),
-                self.tool_click_behavior
-            );
-        }
-        use std::hash::{Hash, Hasher};
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        match self.order.get(index) {
-            Some(TranscriptEntry::Action {
-                kind,
-                label,
-                detail,
-                body,
-                time,
-                state,
-                expanded,
-            }) => {
-                format!("{kind:?}:{state:?}:{expanded}").hash(&mut hash);
-                (label, detail, body, time).hash(&mut hash);
-            }
-            Some(TranscriptEntry::Plan {
-                items,
-                previous,
-                time,
-                expanded,
-            }) => {
-                format!("{items:?}:{previous:?}:{time}:{expanded}").hash(&mut hash);
-            }
-            Some(TranscriptEntry::Goal { goal, .. }) => {
-                goal.id.hash(&mut hash);
-            }
-            Some(TranscriptEntry::Compaction {
-                sequence,
-                expanded,
-                complete,
-                summary,
-                ..
-            }) => {
-                (sequence, expanded, complete, summary).hash(&mut hash);
-            }
-            Some(TranscriptEntry::Info { title, text, time }) => {
-                (title, text, time).hash(&mut hash);
-            }
-            Some(TranscriptEntry::Activity { text, time }) => {
-                (text, time).hash(&mut hash);
-            }
-            _ => {}
-        }
-        format!("entry:{}", hash.finish())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,7 +407,7 @@ mod tests {
                 &mut hints,
                 (0..count)
                     .rev()
-                    .map(|i| (Rect::new(29, i, 1, 1), format!("row{i}")))
+                    .map(|i| (Rect::new(29, i + 2, 1, 1), format!("row{i}")))
                     .collect(),
             );
             assert_eq!(hints.frame.len(), usize::from(count.min(10)));
@@ -488,10 +423,10 @@ mod tests {
                 assert!(hints.active.as_ref().unwrap().invalid_code);
                 assert!(matches!(
                     hints.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
-                    HintKey::Click(Position { x: 29, y: 0 })
+                    HintKey::Click(Position { x: 29, y: 2 })
                 ));
             } else {
-                assert!(matches!(result, HintKey::Click(Position { x: 29, y: 9 })));
+                assert!(matches!(result, HintKey::Click(Position { x: 29, y: 11 })));
             }
             assert!(hints.active.is_none());
         }
@@ -574,15 +509,5 @@ mod tests {
         assert_eq!(hints.frame[0].identity, "link");
         assert_eq!(hints.frame[1].point, Position::new(3, 0));
         assert!(!hints.frame[0].badge.intersects(hints.frame[1].badge));
-    }
-
-    #[test]
-    fn key_hints_tool_replacement_changes_identity_at_same_index() {
-        let mut transcript = Transcript::default();
-        transcript.tools.insert("original-call".into(), 0);
-        let original = transcript.key_hint_identity(0);
-        transcript.tools.clear();
-        transcript.tools.insert("replacement-call".into(), 0);
-        assert_ne!(original, transcript.key_hint_identity(0));
     }
 }
