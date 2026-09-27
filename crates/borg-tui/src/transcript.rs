@@ -1054,6 +1054,10 @@ impl Transcript {
         if !self.seed_plan(items, Some(participant_id), Some(revision)) {
             return false;
         }
+        // An empty workspace plan is still authoritative, but not a card on a new chat.
+        if items.is_empty() && !self.order.iter().any(|entry| matches!(entry, TranscriptEntry::Plan { .. })) {
+            return true;
+        }
         // A workspace snapshot updates the existing card without shifting tool/message indices.
         if let Some(TranscriptEntry::Plan {
             items: current,
@@ -2710,6 +2714,9 @@ impl Transcript {
                     return None;
                 }
                 self.todos = items.clone();
+                if items.is_empty() && !self.order.iter().any(|entry| matches!(entry, TranscriptEntry::Plan { .. })) {
+                    return None;
+                }
                 return self.upsert_plan(items.clone(), local_event_time(event));
             }
             SessionEventKind::PlanProjected {
@@ -5787,13 +5794,23 @@ impl Transcript {
                     // newest row is its most important one must not hide that
                     // row behind unchanged leading steps.
                     let collapsed = !*expanded && focused_tool != Some(index);
-                    let previous = if self.plan_workspace_revision.is_some() {
-                        &[][..]
-                    } else {
-                        previous.as_slice()
-                    };
                     let (display_items, hidden) = plan_card_rows(items, previous, collapsed);
+                    let mut rows: Vec<(&PlanItem, Option<Color>, bool)> = Vec::new();
                     for item in display_items {
+                        if let Some(old) = previous.iter().find(|old| old.id == item.id)
+                            && (old.content != item.content || old.status != item.status)
+                        {
+                            rows.push((old, Some(crate::rendering::DIFF_REMOVED_BG), true));
+                        }
+                        let added = !previous.is_empty() && previous.iter().all(|old| old.id != item.id);
+                        let changed = previous.iter().any(|old| old.id == item.id && (old.content != item.content || old.status != item.status));
+                        rows.push((item, (added || changed).then_some(crate::rendering::DIFF_ADDED_BG), false));
+                    }
+                    if !previous.is_empty() {
+                        rows.extend(previous.iter().filter(|old| items.iter().all(|item| item.id != old.id))
+                            .map(|old| (old, Some(crate::rendering::DIFF_REMOVED_BG), true)));
+                    }
+                    for (item, background, removed) in rows {
                         let (glyph, marker_style, text_style) = match item.status {
                             PlanItemStatus::Completed => (
                                 "✓",
@@ -5836,11 +5853,17 @@ impl Transcript {
                                 .into_iter()
                                 .enumerate()
                         {
-                            let marker = if line_index == 0 { glyph } else { " " };
-                            lines.push(Line::from(vec![
+                            let marker = if line_index == 0 {
+                                if removed { "−" } else { glyph }
+                            } else { " " };
+                            let mut row = Line::from(vec![
                                 Span::styled(format!("  {marker}  "), marker_style),
                                 Span::styled(line, text_style),
-                            ]));
+                            ]);
+                            if let Some(background) = background {
+                                apply_line_background(&mut row, width, background);
+                            }
+                            lines.push(row);
                         }
                     }
                     if collapsed && hidden > 0 {
@@ -5856,7 +5879,9 @@ impl Transcript {
                     }
                     if hovered_entry == Some(index) {
                         for line in &mut lines[entry_start..] {
-                            apply_line_background(line, width, MESSAGE_HOVER_BG);
+                            if !line.spans.iter().any(|span| matches!(span.style.bg, Some(crate::rendering::DIFF_ADDED_BG | crate::rendering::DIFF_REMOVED_BG))) {
+                                apply_line_background(line, width, MESSAGE_HOVER_BG);
+                            }
                         }
                     }
                     entry_rows.push((index, entry_start, lines.len()));

@@ -17437,6 +17437,70 @@ fn status_number_shortcuts_use_platform_modifier_not_generic_super() {
 }
 
 #[test]
+fn empty_projected_plan_stays_invisible_until_there_is_work() {
+    let session = Uuid::new_v4();
+    let participant_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::PlanProjected {
+            participant_id,
+            items: Vec::new(),
+            workspace_revision: 1,
+        },
+    ));
+    assert_eq!(transcript.plan_workspace_revision, Some(1));
+    assert!(
+        !transcript
+            .lines(80)
+            .iter()
+            .any(|line| line.to_string().contains("Plan"))
+    );
+
+    let item = PlanItem {
+        id: Uuid::new_v4(),
+        content: "Old step".into(),
+        status: PlanItemStatus::Pending,
+    };
+    transcript.apply(&SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::PlanProjected {
+            participant_id,
+            items: vec![item.clone()],
+            workspace_revision: 2,
+        },
+    ));
+    let mut updated = item.clone();
+    updated.content = "New step".into();
+    transcript.apply(&SessionEvent::new(
+        session,
+        3,
+        SessionEventKind::PlanProjected {
+            participant_id,
+            items: vec![updated],
+            workspace_revision: 3,
+        },
+    ));
+    let lines = transcript.lines(80);
+    for (content, background) in [
+        ("Old step", rendering::DIFF_REMOVED_BG),
+        ("New step", rendering::DIFF_ADDED_BG),
+    ] {
+        let line = lines
+            .iter()
+            .find(|line| line.to_string().contains(content))
+            .unwrap();
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.style.bg == Some(background))
+        );
+    }
+}
+
+#[test]
 fn projected_plan_preserves_order_and_statuses_and_rejects_legacy_replay() {
     let session = Uuid::new_v4();
     let participant_id = Uuid::new_v4();
