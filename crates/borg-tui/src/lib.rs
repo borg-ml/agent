@@ -8375,6 +8375,7 @@ impl BorgTerminal {
         self.terminal.hide_cursor()?;
         let mut frame_cursor = None;
         self.terminal.draw(|frame| {
+            let mut hint_occlusions = Vec::new();
             let area = centered_content_area_with_margin(frame.area(), self.horizontal_margin);
             let chunks = terminal_vertical_chunks(
                 area,
@@ -9368,6 +9369,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
+                hint_occlusions.push(tooltip);
                 frame.render_widget(Clear, tooltip);
                 let roster_lines = team_roster_table_lines(
                     &visible_roster,
@@ -9480,6 +9482,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
+                hint_occlusions.push(tooltip);
                 frame.render_widget(Clear, tooltip);
                 frame.render_widget(
                     Paragraph::new(goal.objective.as_str())
@@ -9555,6 +9558,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
+                hint_occlusions.push(tooltip);
                 frame.render_widget(Clear, tooltip);
                 frame.render_widget(
                     Paragraph::new(text)
@@ -9590,6 +9594,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
+                hint_occlusions.push(tooltip);
                 frame.render_widget(Clear, tooltip);
                 let lines = shell_rows
                     .iter()
@@ -9643,6 +9648,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
+                hint_occlusions.push(tooltip);
                 frame.render_widget(Clear, tooltip);
                 let lines = watch_rows
                     .iter()
@@ -9710,6 +9716,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
+                hint_occlusions.push(tooltip);
                 frame.render_widget(Clear, tooltip);
                 frame.render_widget(
                     Paragraph::new(
@@ -9751,6 +9758,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
+                hint_occlusions.push(tooltip);
                 frame.render_widget(Clear, tooltip);
                 frame.render_widget(
                     Paragraph::new(
@@ -9895,6 +9903,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
+                hint_occlusions.push(tooltip);
                 frame.render_widget(Clear, tooltip);
                 frame.render_widget(
                     Paragraph::new(tooltip_lines)
@@ -9937,6 +9946,7 @@ impl BorgTerminal {
                 );
                 let content_height = popup.height.saturating_sub(2) as usize;
                 let scroll = picker.scroll_offset(content_height, lines.len());
+                hint_occlusions.push(popup);
                 frame.render_widget(Clear, popup);
                 frame.render_widget(
                     Paragraph::new(lines)
@@ -9978,6 +9988,7 @@ impl BorgTerminal {
                     52,
                     (picker.options.len() as u16).saturating_add(3).max(6),
                 );
+                hint_occlusions.push(popup);
                 frame.render_widget(Clear, popup);
                 frame.render_widget(
                     Block::default()
@@ -10101,7 +10112,7 @@ impl BorgTerminal {
                 for (_, identity) in &mut hint_candidates {
                     *identity = format!("{:?}:{identity}", self.focused_child);
                 }
-                self.key_hints.render(frame, hint_candidates);
+                self.key_hints.render(frame, hint_candidates, &hint_occlusions);
             }
         })?;
         if let Some(cursor) = frame_cursor {
@@ -16313,7 +16324,7 @@ fn splash_logo_line(elapsed: Duration, seed: u64) -> Line<'static> {
             cells[index] = GLYPHS[index][(random % GLYPHS[index].len() as u64) as usize];
         }
     }
-    let colors = [Color::Cyan, BORG_ORANGE, Color::Red, Color::White];
+    let colors = [Color::Cyan, Color::White, Color::Red, BORG_ORANGE];
     let mut spans = Vec::with_capacity(4);
     for (index, glyph) in cells.into_iter().enumerate() {
         let mut cell = glyph.to_string();
@@ -16329,7 +16340,7 @@ fn splash_logo_line(elapsed: Duration, seed: u64) -> Line<'static> {
                     random = splitmix64(random);
                     colors[(random % colors.len() as u64) as usize]
                 } else {
-                    Color::White
+                    BORG_ORANGE
                 })
                 .add_modifier(bold),
         ));
@@ -16338,7 +16349,7 @@ fn splash_logo_line(elapsed: Duration, seed: u64) -> Line<'static> {
 }
 
 fn splash_alpha_line() -> Line<'static> {
-    Line::from(Span::styled("αlphα", Style::default().fg(BORG_ORANGE)))
+    Line::from(Span::styled("αlphα", Style::default().fg(Color::White)))
 }
 
 fn splitmix64(mut value: u64) -> u64 {

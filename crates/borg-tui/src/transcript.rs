@@ -4773,7 +4773,10 @@ impl Transcript {
         if self.todos.is_empty() {
             return vec![("No to-dos in the current plan".to_string(), false)];
         }
-        let ordered = ordered_plan_items(&self.todos);
+        let mut ordered = ordered_plan_items(&self.todos);
+        if !expanded {
+            ordered.sort_by_key(|item| item.status == PlanItemStatus::Completed);
+        }
         let clipped = !expanded && ordered.len() > MAX_COLLAPSED_PLAN_ITEMS;
         let mut rows = ordered
             .iter()

@@ -54,7 +54,12 @@ impl KeyHints {
         });
     }
 
-    pub(super) fn render(&mut self, frame: &mut ratatui::Frame, candidates: Vec<(Rect, String)>) {
+    pub(super) fn render(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        candidates: Vec<(Rect, String)>,
+        occlusions: &[Rect],
+    ) {
         let viewport = frame.area();
         let mut targets: Vec<KeyHintTarget> = Vec::new();
         let badge_width = 1;
@@ -82,6 +87,10 @@ impl KeyHints {
                         badge_width,
                         1,
                     );
+                    if occlusions.iter().any(|overlay| overlay.intersects(badge)) {
+                        x = x.saturating_add(1);
+                        continue;
+                    }
                     if let Some(blocker) =
                         targets.iter().find(|target| target.badge.intersects(badge))
                     {
@@ -142,10 +151,8 @@ impl KeyHints {
                     .unwrap_or(viewport.right());
                 let area = Rect::new(viewport.x, y, end.saturating_sub(viewport.x), 1);
                 if area.width > 0 {
-                    frame.render_widget(Clear, area);
                     frame.render_widget(
-                        Paragraph::new(label)
-                            .style(Style::default().fg(Color::Yellow).bg(Color::Black)),
+                        Paragraph::new(label).style(Style::default().fg(Color::Yellow)),
                         area,
                     );
                 }
@@ -302,7 +309,7 @@ mod tests {
     fn render(hints: &mut KeyHints, candidates: Vec<(Rect, String)>) {
         let mut terminal = Terminal::new(TestBackend::new(30, 20)).unwrap();
         terminal
-            .draw(|frame| hints.render(frame, candidates))
+            .draw(|frame| hints.render(frame, candidates, &[]))
             .unwrap();
     }
 
@@ -491,6 +498,23 @@ mod tests {
             ));
             assert!(hints.active.as_ref().unwrap().stale);
         }
+    }
+
+    #[test]
+    fn key_hints_do_not_cover_popups() {
+        let mut hints = KeyHints::default();
+        hints.start(None);
+        let mut terminal = Terminal::new(TestBackend::new(30, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                hints.render(
+                    frame,
+                    vec![(Rect::new(2, 15, 5, 1), "status".into())],
+                    &[Rect::new(0, 10, 10, 5)],
+                );
+            })
+            .unwrap();
+        assert!(hints.frame.is_empty());
     }
 
     #[test]

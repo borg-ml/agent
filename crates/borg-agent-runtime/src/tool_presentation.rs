@@ -566,7 +566,7 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
         {
             "Send input to"
         } else {
-            "Wait on"
+            return ("Read".to_string(), "output".to_string());
         };
         return (label.to_string(), "command".to_string());
     }
