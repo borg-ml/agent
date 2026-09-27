@@ -105,11 +105,6 @@ pub(crate) enum Ineligible {
     /// Borg knows no prices for this model and the last real call reported no
     /// cost, so a refresh cannot be shown to be worth sending.
     EconomicsUnavailable,
-    /// The route bills a subscription. A refresh consumes quota, and the
-    /// API prices Borg knows are not what the user pays, so the saving a
-    /// decision would be justified by is not a real number here.
-    #[cfg(feature = "subscription-adapters")]
-    SubscriptionQuota,
     /// Extended thinking is enabled on this route with a thinking budget the
     /// provider keys the cached prefix on. A refresh replays the request under
     /// a minimal output cap, which cannot reproduce that budget, so the replay
@@ -131,11 +126,6 @@ impl Ineligible {
             }
             Self::EconomicsUnavailable => {
                 "no price or reported cost for this model, so a refresh cannot be justified"
-                    .to_string()
-            }
-            #[cfg(feature = "subscription-adapters")]
-            Self::SubscriptionQuota => {
-                "this route spends subscription quota, which Borg cannot price against a cache miss"
                     .to_string()
             }
             Self::ThinkingBudgetNotReplayable => {
@@ -259,6 +249,7 @@ pub(crate) struct RefreshSupport {
     /// The output budget the refresh will ask for, so the cost shown to the
     /// user is the cost actually incurred.
     pub max_output_tokens: u64,
+    pub subscription: bool,
 }
 
 /// The route that can replay one request as a prompt-cache refresh.
@@ -734,6 +725,11 @@ impl WarmRun {
     /// event rather than a model message, so prompt replay never sees it.
     async fn record_decision(&self, decision: &CacheWarmingDecision, outcome: &str) {
         let mut payload = decision.payload();
+        payload["economic_basis"] = json!(if self.support.subscription {
+            "subscription_api_equivalent_estimate"
+        } else {
+            "api_estimate"
+        });
         payload["outcome"] = json!(outcome);
         payload["model"] = json!(self.request.model);
         payload["prompt_tokens"] = json!(self.request.prompt_tokens);
@@ -814,6 +810,7 @@ mod tests {
             _effort: Option<&str>,
         ) -> Result<RefreshSupport, Ineligible> {
             Ok(RefreshSupport {
+                subscription: false,
                 cache_lifetime: Duration::from_secs(100),
                 max_output_tokens: 1,
             })

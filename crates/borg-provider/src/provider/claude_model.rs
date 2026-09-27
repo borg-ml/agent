@@ -10,8 +10,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
 use super::{
-    ModelMessage, ModelTurnRequest, ModelTurnResult, ProviderAttemptTrace, ProviderCallError,
-    ProviderErrorKind, ProviderInvocation, ProviderProgress,
+    ModelMessage, ModelTurnRequest, ModelTurnResult, PromptCacheRefresh, ProviderAttemptTrace,
+    ProviderCallError, ProviderErrorKind, ProviderInvocation, ProviderProgress,
     anthropic_messages::{
         AnthropicStreamState, anthropic_error_kind, apply_stream_event, messages_request_body,
     },
@@ -65,6 +65,47 @@ impl ClaudeModelProvider {
         parent_agent_id: Option<&str>,
         expected_account: Option<&str>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        self.model_turn_capped(
+            request,
+            progress,
+            auth_directory,
+            parent_agent_id,
+            expected_account,
+            None,
+        )
+        .await
+    }
+
+    /// Refresh through the same pinned subscription connector; never execute the reply.
+    pub async fn refresh_prompt_cache_for_account(
+        &self,
+        request: ModelTurnRequest,
+        auth_directory: Option<&Path>,
+        parent_agent_id: Option<&str>,
+        expected_account: &str,
+        refresh: PromptCacheRefresh,
+    ) -> std::result::Result<crate::ProviderCallUsage, ProviderCallError> {
+        self.model_turn_capped(
+            request,
+            None,
+            auth_directory,
+            parent_agent_id,
+            Some(expected_account),
+            Some(refresh),
+        )
+        .await
+        .map(|result| result.usage)
+    }
+
+    async fn model_turn_capped(
+        &self,
+        request: ModelTurnRequest,
+        progress: Option<UnboundedSender<ProviderProgress>>,
+        auth_directory: Option<&Path>,
+        parent_agent_id: Option<&str>,
+        expected_account: Option<&str>,
+        refresh: Option<PromptCacheRefresh>,
+    ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
         let trace = ProviderAttemptTrace {
             invocation: ProviderInvocation {
                 provider_label: "claude-subscription".into(),
@@ -85,6 +126,7 @@ impl ClaudeModelProvider {
             parent_agent_id,
             expected_account,
             trace.clone(),
+            refresh,
         )
         .await
         .map_err(|error| {
@@ -112,6 +154,7 @@ impl ClaudeModelProvider {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
         request: ModelTurnRequest,
@@ -120,6 +163,7 @@ impl ClaudeModelProvider {
         parent_agent_id: Option<&str>,
         expected_account: Option<&str>,
         mut trace: ProviderAttemptTrace,
+        refresh: Option<PromptCacheRefresh>,
     ) -> Result<ModelTurnResult> {
         let started = Instant::now();
         let connector = Connector::connect(auth_directory).await?;
@@ -135,11 +179,16 @@ impl ClaudeModelProvider {
             self.effort.as_deref(),
             &request,
             &capabilities,
+            refresh,
         )?;
-        let id = request
-            .request_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let id = if refresh.is_some() {
+            Uuid::new_v4().to_string()
+        } else {
+            request
+                .request_id
+                .clone()
+                .unwrap_or_else(|| Uuid::new_v4().to_string())
+        };
         let session = request
             .session_id
             .clone()
@@ -308,6 +357,7 @@ fn subscription_request_body(
     effort: Option<&str>,
     request: &ModelTurnRequest,
     capabilities: &Capabilities,
+    refresh: Option<PromptCacheRefresh>,
 ) -> Result<Value> {
     let mut body = messages_request_body(model, None, request);
     body["model"] = json!(capabilities.model);
@@ -380,6 +430,21 @@ fn subscription_request_body(
             }
         }
     }
+    if let Some(refresh) = refresh {
+        ensure!(
+            body["thinking"]["type"] != "enabled",
+            "budget-based thinking cannot be replayed under a cache refresh output cap"
+        );
+        ensure!(
+            refresh.max_output_tokens > 0,
+            "cache refresh output cap must be positive"
+        );
+        body["max_tokens"] = json!(
+            refresh
+                .max_output_tokens
+                .min(capabilities.max_output_tokens)
+        );
+    }
     Ok(body)
 }
 
@@ -442,6 +507,78 @@ impl std::error::Error for ModelFailure {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_refresh_preserves_prefix_and_rejects_budget_thinking() {
+        let mut capabilities = Capabilities {
+            model: "claude-test".into(),
+            context_window: 200_000,
+            default_output_tokens: 8192,
+            max_output_tokens: 16384,
+            thinking: true,
+            adaptive_thinking: true,
+            thinking_required: false,
+            fast: false,
+            efforts: vec!["high".into()],
+            betas: vec![],
+        };
+        let request = ModelTurnRequest {
+            fast: false,
+            request_id: Some("real-request".into()),
+            session_id: Some("session".into()),
+            prompt_cache_key: Some("cache-key".into()),
+            turn_routing: Default::default(),
+            messages: vec![ModelMessage::user("Retain this conversation unchanged")],
+            tools: vec![
+                crate::provider::ModelToolDefinition::new(
+                    "read",
+                    "Read",
+                    json!({"type":"object","properties":{}}),
+                )
+                .unwrap(),
+            ],
+            output_schema: None,
+        };
+        let original =
+            subscription_request_body("claude-test", Some("high"), &request, &capabilities, None)
+                .unwrap();
+        let mut warmed = subscription_request_body(
+            "claude-test",
+            Some("high"),
+            &request,
+            &capabilities,
+            Some(PromptCacheRefresh::ONE_TOKEN),
+        )
+        .unwrap();
+        assert_eq!(warmed["max_tokens"], 1);
+        assert_eq!(warmed["thinking"]["type"], "adaptive");
+        warmed["max_tokens"] = original["max_tokens"].clone();
+        assert_eq!(
+            warmed, original,
+            "warming must preserve every cache-keyed request field"
+        );
+        capabilities.adaptive_thinking = false;
+        assert!(
+            subscription_request_body(
+                "claude-test",
+                Some("high"),
+                &request,
+                &capabilities,
+                Some(PromptCacheRefresh::ONE_TOKEN)
+            )
+            .is_err()
+        );
+        assert!(
+            subscription_request_body(
+                "claude-test",
+                Some("off"),
+                &request,
+                &capabilities,
+                Some(PromptCacheRefresh::ONE_TOKEN)
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn native_continuation_requires_its_original_subscription_identity() {

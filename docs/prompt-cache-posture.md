@@ -14,6 +14,31 @@ discipline is the most explicit of the harnesses available to read.
 | OpenAI-compatible family: Go gateway, Kimi, GLM, Qwen, OpenRouter, configured endpoints | Implicit prefix cache, keyed by `prompt_cache_key` for vendors that honour it | Same stable key; some profiles also send the session id |
 | Claude subscription (shared model connector) | Explicit Messages cache breakpoints with one-hour retention; the shared helper supplies native subscription authentication and required request attribution | Borg constructs stable instructions, sorted tools, breakpoint placement, lossless native history and thinking settings. All children on a credential authority share one helper; restart replays Borg's journal without a provider-owned session |
 
+## Automatic warming
+
+`[warming] mode` selects `off`, `streaming` (the default), or `idle`;
+`BORG_CACHE_WARMING` overrides it. Refreshes replay the last request without
+adding messages or executing generated tool calls. They stop on cancellation,
+route/context changes, errors, or fixed one-hour active / thirty-minute idle
+horizons. A refresh does not extend those horizons.
+
+Claude subscription refreshes use the same pinned account, credential directory,
+and shared connector as real turns, with a one-token output cap and the original
+one-hour cache markers. Adaptive thinking settings remain unchanged; budget-based
+thinking is rejected before inference because reducing its output budget cannot
+faithfully preserve the cached request. Subscription warming consumes quota, not
+API billing: decision events label catalog-price comparisons as API-equivalent
+estimates, and usage retains its subscription cost basis.
+
+Codex automatic warming remains ineligible without established cache-expiry
+semantics, matching Pi's current policy. Normal Codex prefix-cache reuse is
+unaffected. We do not invent a retention timer or fall back to API credentials.
+
+A bounded live Claude check is available through `claude_model_probe
+--cache-refresh --cache-prefix`: two one-token refreshes verify subscription
+accounting and a cached read on the second request. Run it deliberately; it uses
+subscription allowance.
+
 ## Invariants
 
 - **Append-only conversation.** Runtime context that varies between turns

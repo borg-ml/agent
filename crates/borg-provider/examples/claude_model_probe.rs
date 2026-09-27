@@ -57,6 +57,37 @@ async fn probe() -> Result<()> {
         ],
         output_schema: None,
     };
+    if args.iter().any(|arg| arg == "--cache-refresh") {
+        let account = ClaudeModelProvider::account_identity(None).await?;
+        for index in 0..2 {
+            let usage = provider
+                .refresh_prompt_cache_for_account(
+                    request.clone(),
+                    None,
+                    None,
+                    &account,
+                    borg_provider::provider::PromptCacheRefresh::ONE_TOKEN,
+                )
+                .await?;
+            ensure!(
+                usage.cost_basis == borg_provider::CostBasis::SubscriptionEquivalent,
+                "cache refresh must stay on the subscription route"
+            );
+            println!(
+                "{}",
+                json!({"refresh":index + 1,"input_tokens":usage.input_tokens,
+                "cached_input_tokens":usage.cached_input_tokens,"output_tokens":usage.output_tokens,
+                "cost_basis":usage.cost_basis.to_string()})
+            );
+            if index == 1 && !prefix.is_empty() {
+                ensure!(
+                    usage.cached_input_tokens > 0,
+                    "second refresh did not reuse the cache"
+                );
+            }
+        }
+        return Ok(());
+    }
     if args.iter().any(|arg| arg == "--cancel-pair") {
         return cancel_pair(provider, request).await;
     }

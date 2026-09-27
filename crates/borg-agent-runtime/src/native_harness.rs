@@ -2506,13 +2506,18 @@ impl PromptCacheRefreshClient for ProviderModelClient {
             .route(provider, model)
             .map_err(|NotNative| Ineligible::RouteNotNative)?
         {
-            // A ChatGPT subscription turn spends quota, not API dollars. The
-            // catalog below would price a refresh in money this user never
-            // pays, so the threshold it is compared against would be fiction.
             #[cfg(feature = "subscription-adapters")]
-            NativeRoute::CodexAccount(_) | NativeRoute::ClaudeSubscription(_) => {
-                return Err(Ineligible::SubscriptionQuota);
+            NativeRoute::ClaudeSubscription(_) => {
+                // This connector writes 1h markers. Capabilities are checked again
+                // before sending: budget-based thinking must never be replayed.
+                return Ok(RefreshSupport {
+                    cache_lifetime: Duration::from_secs(3600),
+                    max_output_tokens: 1,
+                    subscription: true,
+                });
             }
+            #[cfg(feature = "subscription-adapters")]
+            NativeRoute::CodexAccount(_) => None,
             // A real turn writes a cache entry through the system marker, so a
             // refresh has something to keep alive. Whether one is worth sending
             // is still decided below, from a documented lifetime and a real
@@ -2557,6 +2562,10 @@ impl PromptCacheRefreshClient for ProviderModelClient {
         Ok(RefreshSupport {
             cache_lifetime,
             max_output_tokens: refresh.max_output_tokens,
+            subscription: matches!(
+                provider,
+                crate::CodingProvider::Codex | crate::CodingProvider::Claude
+            ),
         })
     }
 
@@ -2601,12 +2610,25 @@ impl PromptCacheRefreshClient for ProviderModelClient {
             .map_err(|NotNative| not_native_error(provider, model, effort))?
         {
             #[cfg(feature = "subscription-adapters")]
-            NativeRoute::ClaudeSubscription(_) => Err(ProviderCallError {
-                message: "Claude subscription quota is not spent on automatic cache warming".into(),
-                trace: Box::default(),
-                session_id: None,
-                kind: borg_provider::provider::ProviderErrorKind::Fatal,
-            }),
+            NativeRoute::ClaudeSubscription(account) => {
+                let parent = self
+                    .access
+                    .as_ref()
+                    .and_then(|access| access.parent_session_id)
+                    .map(|id| id.to_string());
+                borg_provider::provider::ClaudeModelProvider {
+                    model: model.to_string(),
+                    effort: effort.map(str::to_owned),
+                }
+                .refresh_prompt_cache_for_account(
+                    request,
+                    self.claude_config_dir.as_deref(),
+                    parent.as_deref(),
+                    account,
+                    refresh,
+                )
+                .await
+            }
             #[cfg(feature = "subscription-adapters")]
             NativeRoute::CodexAccount(account) => {
                 borg_provider::provider::CodexModelProvider {
@@ -7079,6 +7101,32 @@ mod tests {
                 &[],
             )
         );
+    }
+
+    #[cfg(feature = "subscription-adapters")]
+    #[test]
+    fn subscription_cache_refresh_stays_on_the_selected_route() {
+        let client = ProviderModelClient {
+            codex_account: Some("selected-codex".into()),
+            claude_account: Some("selected-claude".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            client.route(crate::CodingProvider::Codex, "gpt-5"),
+            Ok(NativeRoute::CodexAccount("selected-codex"))
+        ));
+        assert!(matches!(
+            client.route(crate::CodingProvider::Claude, "claude-opus-5"),
+            Ok(NativeRoute::ClaudeSubscription("selected-claude"))
+        ));
+        let claude = client
+            .refresh_support(crate::CodingProvider::Claude, "claude-opus-5", Some("high"))
+            .unwrap();
+        assert!(claude.subscription);
+        assert_eq!(claude.cache_lifetime, Duration::from_secs(3600));
+        assert_eq!(claude.max_output_tokens, 1);
+        let codex = client.refresh_support(crate::CodingProvider::Codex, "gpt-5", Some("high"));
+        assert_eq!(codex.unwrap_err(), Ineligible::CacheLifetimeUnknown);
     }
 
     /// A thinking Anthropic route cannot be refreshed. Replaying it under a
