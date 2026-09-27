@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.12.6)
 
+### Context
+
+- Native automatic compaction preserves the request prefix needed to restore
+  subsequent provider-measured usage after restart. Local context estimates no
+  longer count duplicated provider output or opaque reasoning signatures as text.
+
 ## 0.12.6 (2026-09-27)
 
 ### Terminal UI

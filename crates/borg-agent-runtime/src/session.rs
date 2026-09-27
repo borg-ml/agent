@@ -7889,7 +7889,7 @@ fn compaction_restarts_replay(payload: &Value) -> bool {
 /// base rather than inheriting one from a generation that has ended.
 const COMPACTION_RETAINED_DECLARATIONS_FIELD: &str = "retained_declarations";
 
-fn restored_native_context_tokens(
+pub(crate) fn restored_native_context_tokens(
     events: &[SessionEvent],
     provider: CodingProvider,
 ) -> Option<u64> {
@@ -7935,7 +7935,11 @@ pub(crate) fn native_request_prefix(events: &[SessionEvent]) -> Option<crate::Na
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "context_compaction" && compaction_restarts_replay(payload) =>
             {
-                return None;
+                // In-turn compaction keeps the live request head. Its later usage
+                // checkpoints must validate against that same head after restart.
+                return payload
+                    .get("retained_request_prefix")
+                    .and_then(|prefix| serde_json::from_value(prefix.clone()).ok());
             }
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "native_request_prefix" =>

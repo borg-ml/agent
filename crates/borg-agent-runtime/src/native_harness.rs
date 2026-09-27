@@ -1872,6 +1872,16 @@ impl NativeHarness {
                             "keep_recent_source": compaction_budget.keep_recent_source.as_str(),
                             "budget_clamped_to_window": compaction_budget.clamped_to_window,
                             "retained_messages": retained.len(),
+                            "retained_request_prefix": crate::NativeRequestPrefix {
+                                provider: turn.provider,
+                                model: model.to_string(),
+                                system_prompt: match messages.first() {
+                                    Some(ModelMessage::System { content }) => content.clone(),
+                                    _ => String::new(),
+                                },
+                                tools: prefix.tools.clone(),
+                                prompt_cache_key: prefix.prompt_cache_key.clone().unwrap_or_default(),
+                            },
                             "provider_duration_ms": compaction_usage.duration_ms,
                             "in_place": in_place_used,
                             "input_tokens": compaction_usage.input_tokens,
@@ -4534,6 +4544,33 @@ fn estimated_message_tokens(message: &ModelMessage) -> u64 {
 }
 
 fn estimated_text_tokens(message: &ModelMessage) -> u64 {
+    // Provider state repeats text/tool calls and carries opaque signatures or
+    // encrypted reasoning. Those bytes are not additional model-visible text;
+    // hidden reasoning size is unknown here, so measured checkpoints remain
+    // authoritative and provider context-length recovery guards this fallback.
+    let text;
+    let message = if let ModelMessage::Assistant {
+        content,
+        reasoning_content,
+        reasoning_details,
+        tool_calls,
+        ..
+    } = message
+    {
+        let reasoning = reasoning_content.clone().or_else(|| {
+            reasoning_details.as_ref()?.as_array().map(|details| {
+                details
+                    .iter()
+                    .filter_map(|block| block.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        });
+        text = ModelMessage::assistant(content.clone(), reasoning, None, tool_calls.clone());
+        &text
+    } else {
+        message
+    };
     serde_json::to_string(message).map_or(u64::MAX, |serialized| {
         u64::try_from(serialized.chars().count().div_ceil(4)).unwrap_or(u64::MAX)
     })
@@ -7556,6 +7593,49 @@ mod tests {
     }
 
     #[test]
+    fn opaque_provider_state_does_not_inflate_context_estimates() {
+        let plain = ModelMessage::assistant(
+            Some("answer".repeat(100)),
+            Some("reasoning".repeat(100)),
+            None,
+            vec![ModelToolCall::function(
+                "call".into(),
+                "exec".into(),
+                r#"{"cmd":"pwd"}"#.into(),
+            )],
+        );
+        for state in [
+            json!({"protocol": "open_ai_responses", "output": [
+                {"type": "reasoning", "encrypted_content": "A".repeat(1_600_000)},
+                {"type": "message", "content": [{"type": "output_text", "text": "answer".repeat(100)}]}
+            ]}),
+            json!({"protocol": "anthropic_messages", "content": [
+                {"type": "thinking", "thinking": "reasoning".repeat(100), "signature": "A".repeat(1_600_000)},
+                {"type": "text", "text": "answer".repeat(100)}
+            ]}),
+        ] {
+            let mut replay = plain.clone();
+            let ModelMessage::Assistant {
+                provider_state,
+                reasoning_details,
+                ..
+            } = &mut replay
+            else {
+                unreachable!()
+            };
+            *provider_state = Some(serde_json::from_value(state).unwrap());
+            *reasoning_details = Some(json!([
+                {"type": "reasoning.text", "text": "reasoning".repeat(100)},
+                {"type": "reasoning.encrypted", "data": "A".repeat(1_600_000)}
+            ]));
+            assert_eq!(
+                estimated_message_tokens(&replay),
+                estimated_message_tokens(&plain)
+            );
+        }
+    }
+
+    #[test]
     fn missing_or_zero_usage_falls_back_to_a_local_estimate() {
         // Local servers report no usage (or zeros); the transcript must still
         // be counted or compaction never triggers.
@@ -8264,7 +8344,17 @@ mod tests {
                     message: ModelMessage::assistant(content, None, None, tool_calls),
                     finish_reason: finish_reason.into(),
                     usage: ProviderCallUsage {
-                        context_tokens: Some(WINDOW - 20_000),
+                        input_tokens: if id.ends_with(":1") {
+                            WINDOW - 20_000
+                        } else {
+                            10_000
+                        },
+                        output_tokens: 100,
+                        context_tokens: Some(if id.ends_with(":1") {
+                            WINDOW - 20_000
+                        } else {
+                            10_000
+                        }),
                         context_window_tokens: Some(WINDOW),
                         ..Default::default()
                     },
@@ -8322,6 +8412,33 @@ mod tests {
                 if kind == "context_compaction"
                     && payload["status"] == "completed"
                     && payload["in_place"] == true)));
+
+        // Restart from the latest boundary, not the pre-compaction prefix.
+        // The last provider measurement must survive rather than forcing a
+        // cold estimate of the serialized replay on the next turn.
+        let boundary = events
+            .iter()
+            .rposition(|event| event.is_completed_context_compaction())
+            .unwrap();
+        let session_id = Uuid::new_v4();
+        let journal = events[boundary..]
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| SessionEvent::new(session_id, index as u64 + 1, kind.clone()))
+            .collect::<Vec<_>>();
+        let restored =
+            crate::session::restored_native_context_tokens(&journal, crate::CodingProvider::Codex);
+        assert_eq!(restored, Some(10_100));
+        let mut replay =
+            crate::session::native_conversation(&journal, crate::CodingProvider::Codex).unwrap();
+        canonicalize_native_messages(&mut replay);
+        let last = requests.last().unwrap();
+        assert_eq!(&replay[..replay.len() - 1], &last.messages[1..]);
+        let next = turn_start_context_budget(&replay, WINDOW, restored, true, 500);
+        assert_eq!(next.context_tokens, 10_600);
+        assert!(
+            !next.needs_auto_compaction(&EffectiveCompactionBudget::defaults_for_window(WINDOW))
+        );
     }
 
     #[tokio::test]
