@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.12.7)
 
+### Terminal UI
+
+- The splash swaps orange and white between the logo and alpha caption, including glitches.
+- Collapsed plan previews show open items before completed items; keyboard hint badges
+  no longer overlap popups or repaint the footer background.
+- Running command follow-ups use the shorter “Read output” action label.
+
 ## 0.12.7 (2026-09-27)
 
 ### Context
