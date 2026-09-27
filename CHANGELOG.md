@@ -5,6 +5,40 @@ Git comparison.
 
 ## Unreleased (since 0.12.4)
 
+### Context
+
+- Resumed native sessions restore provider-measured context usage when the
+  saved checkpoint matches the replayed conversation and request prefix.
+  Compaction explains when it is using a local estimate instead.
+- Codex compaction uses low reasoning effort instead of inheriting the working
+  turn's high or extra-high effort, while preserving the cached request prefix.
+
+### Work coordination
+
+- Agent plans and shared work use one durable todo model. Assigned work appears
+  in ordered per-agent plans; omitting an assignee creates unassigned backlog.
+  Migration preserves existing work, dependencies, subtasks and review metadata.
+- Plans retain blocked and awaiting-review states, and selected-agent views can
+  show and edit stopped agents' work. Removing an item from a plan unassigns it
+  rather than deleting it. Concurrent claims and edits use revision checks.
+
+### Providers and tools
+
+- Claude subscription cache warming uses the same pinned account and connector,
+  with capped output and no API-billing fallback. Adaptive thinking settings are
+  preserved; budget-based thinking remains ineligible. Subscription cost
+  comparisons are labelled as API-equivalent estimates. Automatic Codex warming
+  remains disabled without established cache-retention semantics.
+- MCP discovery follows paginated tool lists within a bounded discovery timeout.
+  MCP tool errors propagate as failures, including through code mode, rather
+  than appearing as successful raw responses.
+
+### Terminal UI
+
+- Modifier-held numbered hints activate visible clickable targets with 1–9 and
+  0, with an F12 fallback for terminals that cannot report modifier holds.
+- Received agent messages use an incoming arrow.
+
 ## 0.12.4 (2026-09-26)
 
 ### Providers
