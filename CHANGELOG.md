@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.12.7)
+## Unreleased (since 0.12.8)
+
+## 0.12.8 (2026-09-27)
 
 ### Terminal UI
 
