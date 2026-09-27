@@ -11,6 +11,8 @@ Git comparison.
 - Collapsed plan previews show open items before completed items; keyboard hint badges
   no longer overlap popups or repaint the footer background.
 - Running command follow-ups use the shorter “Read output” action label.
+- Enhanced terminal input requests shifted key characters so uppercase and punctuation
+  reach the composer on terminals that report alternate key codes.
 
 ## 0.12.7 (2026-09-27)
 
