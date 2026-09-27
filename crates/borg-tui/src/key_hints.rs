@@ -76,7 +76,12 @@ impl KeyHints {
                         x = blocker.area.right();
                         continue;
                     }
-                    let badge = Rect::new(x.min(viewport.right() - badge_width), y, badge_width, 1);
+                    let badge = Rect::new(
+                        x.min(viewport.right() - badge_width),
+                        y.saturating_sub(1),
+                        badge_width,
+                        1,
+                    );
                     if let Some(blocker) =
                         targets.iter().find(|target| target.badge.intersects(badge))
                     {
@@ -165,14 +170,15 @@ impl KeyHints {
             self.activated_key = None;
         }
         use crossterm::event::ModifierKeyCode;
+        #[cfg(target_os = "macos")]
         let modifier = matches!(
             key.code,
-            KeyCode::Modifier(
-                ModifierKeyCode::LeftControl
-                    | ModifierKeyCode::RightControl
-                    | ModifierKeyCode::LeftSuper
-                    | ModifierKeyCode::RightSuper
-            )
+            KeyCode::Modifier(ModifierKeyCode::LeftSuper | ModifierKeyCode::RightSuper)
+        );
+        #[cfg(not(target_os = "macos"))]
+        let modifier = matches!(
+            key.code,
+            KeyCode::Modifier(ModifierKeyCode::LeftControl | ModifierKeyCode::RightControl)
         );
         if modifier {
             if key.kind == KeyEventKind::Release {
@@ -368,24 +374,43 @@ mod tests {
     #[test]
     fn key_hints_hold_release_and_shortcuts() {
         let mut hints = KeyHints::default();
-        let control = KeyCode::Modifier(ModifierKeyCode::LeftControl);
+        let control = if cfg!(target_os = "macos") {
+            KeyCode::Modifier(ModifierKeyCode::LeftSuper)
+        } else {
+            KeyCode::Modifier(ModifierKeyCode::LeftControl)
+        };
+        let held = if cfg!(target_os = "macos") {
+            KeyModifiers::SUPER
+        } else {
+            KeyModifiers::CONTROL
+        };
+        let other = if cfg!(target_os = "macos") {
+            KeyCode::Modifier(ModifierKeyCode::LeftControl)
+        } else {
+            KeyCode::Modifier(ModifierKeyCode::LeftSuper)
+        };
         assert!(matches!(
-            hints.key(KeyEvent::new(control, KeyModifiers::CONTROL)),
+            hints.key(KeyEvent::new(other, KeyModifiers::NONE)),
+            HintKey::Pass
+        ));
+        assert!(hints.active.is_none());
+        assert!(matches!(
+            hints.key(KeyEvent::new(control, held)),
             HintKey::Consumed
         ));
         assert!(hints.active.is_some());
         assert!(matches!(
-            hints.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            hints.key(KeyEvent::new(KeyCode::Enter, held)),
             HintKey::Pass
         ));
-        hints.key(KeyEvent::new(control, KeyModifiers::CONTROL));
+        hints.key(KeyEvent::new(control, held));
         assert!(matches!(
-            hints.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            hints.key(KeyEvent::new(KeyCode::Char('c'), held)),
             HintKey::Pass
         ));
         assert!(hints.active.is_none());
-        hints.key(KeyEvent::new(control, KeyModifiers::CONTROL));
-        hints.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL));
+        hints.key(KeyEvent::new(control, held));
+        hints.key(KeyEvent::new(KeyCode::Char('1'), held));
         // Kitty releases carry no modifier bits. Never activate on release.
         assert!(matches!(
             hints.key(KeyEvent::new_with_kind(
@@ -396,6 +421,25 @@ mod tests {
             HintKey::Consumed
         ));
         assert!(hints.active.is_none());
+    }
+
+    #[test]
+    fn number_badges_sit_above_both_status_rows_and_click_the_controls() {
+        let mut hints = KeyHints::default();
+        hints.start(None);
+        render(
+            &mut hints,
+            vec![
+                (Rect::new(2, 10, 6, 1), "upper".into()),
+                (Rect::new(3, 18, 6, 1), "lower".into()),
+            ],
+        );
+        assert_eq!(hints.frame[0].badge, Rect::new(2, 9, 1, 1));
+        assert_eq!(hints.frame[1].badge, Rect::new(3, 17, 1, 1));
+        assert!(matches!(
+            hints.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
+            HintKey::Click(Position { x: 3, y: 18 })
+        ));
     }
 
     #[test]

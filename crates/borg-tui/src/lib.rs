@@ -8374,13 +8374,6 @@ impl BorgTerminal {
         // a caret through action rows.
         self.terminal.hide_cursor()?;
         let mut frame_cursor = None;
-        let hint_status_actionable = status_control_is_actionable(self.active_status());
-        let hint_goal_identity = self.key_hints.active.as_ref().map(|_| {
-            format!(
-                "goal:{:?}",
-                self.active_goal().map(|goal| (goal.id, goal.status))
-            )
-        });
         self.terminal.draw(|frame| {
             let area = centered_content_area_with_margin(frame.area(), self.horizontal_margin);
             let chunks = terminal_vertical_chunks(
@@ -10085,104 +10078,23 @@ impl BorgTerminal {
             }
             if self.key_hints.active.is_some() {
                 let mut hint_candidates = Vec::new();
-                if picker_open {
-                    for (area, index) in &next_picker_hit_areas {
-                        if let Some(picker) = &self.picker
-                            && let Some(option) = picker.options.get(*index)
-                            && !option.disabled
-                        {
-                            hint_candidates.push((
-                                *area,
-                                format!(
-                                    "picker:{:?}:{index}:{}",
-                                    std::mem::discriminant(&picker.kind),
-                                    option.value
-                                ),
-                            ));
-                        }
-                    }
-                } else if !self.keybindings_open {
-                    for (area, target) in &next_team_roster_hit_areas {
-                        hint_candidates.push((*area, format!("team:{target:?}")));
-                    }
-                    if !background_hover_suppressed {
-                        for (area, id) in &next_shell_row_hit_areas {
-                            if let Some(index) = id {
-                                hint_candidates.push((
-                                    *area,
-                                    format!("shell:{}", self.transcript.key_hint_identity(*index)),
-                                ));
-                            }
-                        }
-                        for (area, id) in &next_watch_row_hit_areas {
-                            hint_candidates.push((*area, format!("watch:{id}")));
-                        }
-                        for (name, area) in [
-                            ("dictation", next_dictation_button_area),
-                            ("pending", next_pending_input_header_area),
-                            (
-                                "status",
-                                next_status_area.filter(|_| hint_status_actionable),
-                            ),
-                            ("goal", next_goal_status_area),
-                            (
-                                "todos",
-                                next_todo_status_area.filter(|_| !self.transcript.todos.is_empty()),
-                            ),
-                            ("shell", next_shell_status_area),
-                            ("agents", next_agents_status_area),
-                            ("model", next_model_status_area),
-                            ("effort", next_effort_status_area),
-                            ("context", next_context_status_area),
-                            ("fast", next_fast_status_area),
-                            ("permission", next_permission_status_area),
-                            ("watch", next_watch_status_area),
-                            ("director", next_back_to_director_area),
-                            ("bottom", next_jump_to_bottom_area),
-                            ("keys", next_keybindings_hint_area),
-                            ("commit", self.git_commit_area),
-                            ("push", self.git_status_area),
-                            ("pull", self.git_pull_area),
-                        ] {
-                            if let Some(area) = area {
-                                let identity = if name == "goal" {
-                                    hint_goal_identity.clone().unwrap_or_default()
-                                } else {
-                                    name.to_string()
-                                };
-                                hint_candidates.push((area, identity));
-                            }
-                        }
-                        for (area, url) in &next_link_hit_areas {
-                            hint_candidates.push((*area, format!("link:{url}")));
-                        }
-                        for (area, index) in &next_tool_run_header_hit_areas {
-                            hint_candidates.push((
-                                *area,
-                                format!(
-                                    "run:{}:{}",
-                                    self.transcript.key_hint_identity(*index),
-                                    self.transcript.tool_run_expanded(*index)
-                                ),
-                            ));
-                        }
-                        for (area, index) in &next_tool_hit_areas {
-                            hint_candidates
-                                .push((*area, self.transcript.key_hint_identity(*index)));
-                        }
-                        for (area, index) in &next_message_hit_areas {
-                            hint_candidates
-                                .push((*area, self.transcript.key_hint_identity(*index)));
-                        }
-                        for (area, index) in &next_entry_hit_areas {
-                            if !next_tool_hit_areas.iter().any(|(_, other)| other == index)
-                                && !next_message_hit_areas
-                                    .iter()
-                                    .any(|(_, other)| other == index)
-                            {
-                                hint_candidates
-                                    .push((*area, self.transcript.key_hint_identity(*index)));
-                            }
+                if !picker_open && !self.keybindings_open {
+                    // Number hints describe the status controls, not arbitrary
+                    // transcript rows. Keep their order identical to status focus.
+                    for (name, area) in [
+                        ("agents", next_agents_status_area),
+                        ("goal", next_goal_status_area),
+                        ("model", next_model_status_area),
+                        ("effort", next_effort_status_area),
+                        ("fast", next_fast_status_area),
+                        ("permission", next_permission_status_area),
+                        ("context", next_context_status_area),
+                        ("shell", next_shell_status_area),
+                        ("watch", next_watch_status_area),
+                        ("todos", next_todo_status_area),
+                    ] {
+                        if let Some(area) = area {
+                            hint_candidates.push((area, name.to_string()));
                         }
                     }
                 }
