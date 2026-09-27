@@ -897,12 +897,13 @@ pub(super) fn wrap_markdown_spans(spans: &[Span<'static>], width: usize) -> Vec<
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
+    let mut span_index = 0;
+    let mut span_start = 0usize;
     display_ranges(&source, width, false)
         .into_iter()
         .map(|(start, end)| {
             let mut line = Vec::new();
-            let mut span_start = 0usize;
-            for span in spans {
+            while let Some(span) = spans.get(span_index) {
                 let span_end = span_start.saturating_add(span.content.len());
                 let overlap_start = start.max(span_start);
                 let overlap_end = end.min(span_end);
@@ -913,8 +914,12 @@ pub(super) fn wrap_markdown_spans(spans: &[Span<'static>], width: usize) -> Vec<
                         span.style,
                     ));
                 }
+                if span_end > end {
+                    break;
+                }
                 span_start = span_end;
-                if span_start >= end {
+                span_index += 1;
+                if span_start == end {
                     break;
                 }
             }
@@ -965,6 +970,35 @@ fn quoted_lines(source: &str, width: usize, style: Style, depth: usize) -> Vec<L
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn wrapped_spans_preserve_unicode_styles_and_newlines() {
+        let red = Style::default().fg(Color::Red);
+        let blue = Style::default().fg(Color::Blue);
+        let spans = [
+            Span::styled("ab界", red),
+            Span::raw(""),
+            Span::styled("cd\n\nefgh", blue),
+            Span::styled("ij", red),
+        ];
+        let lines = wrap_markdown_spans(&spans, 4);
+        assert_eq!(
+            lines,
+            vec![
+                Line::from(Span::styled("ab界", red)),
+                Line::from(Span::styled("cd", blue)),
+                Line::default(),
+                Line::from(Span::styled("efgh", blue)),
+                Line::from(Span::styled("ij", red)),
+            ]
+        );
+        let lines = wrap_markdown_spans(&spans, 3);
+        assert_eq!(lines[0], Line::from(Span::styled("ab", red)));
+        assert_eq!(
+            lines[1],
+            Line::from(vec![Span::styled("界", red), Span::styled("c", blue)])
+        );
+    }
 
     #[test]
     #[ignore = "explicit oversized markdown table performance gate"]

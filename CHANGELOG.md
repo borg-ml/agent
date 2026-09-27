@@ -35,6 +35,9 @@ Git comparison.
 
 ### Terminal UI
 
+- Fast streamed replies avoid rescanning earlier styled spans when wrapping,
+  and code blocks reuse highlighting for completed lines instead of restarting
+  from the top on every repaint.
 - Modifier-held numbered hints activate visible clickable targets with 1–9 and
   0, with an F12 fallback for terminals that cannot report modifier holds.
 - Received agent messages use an incoming arrow.

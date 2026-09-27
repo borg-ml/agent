@@ -258,35 +258,92 @@ fn colored_plain_lines(source: &str, width: usize, color: Color) -> Vec<Line<'st
         .collect()
 }
 
-fn syntax_lines(language: &str, source: &str, width: usize, wrap: bool) -> Vec<Line<'static>> {
+struct SyntaxHighlightCache {
+    language: String,
+    prefix: String,
+    rows: Vec<Vec<Span<'static>>>,
+    state: (
+        syntect::highlighting::HighlightState,
+        syntect::parsing::ParseState,
+    ),
+}
+
+thread_local! {
+    static SYNTAX_HIGHLIGHT_CACHE: std::cell::RefCell<Option<SyntaxHighlightCache>> = const { std::cell::RefCell::new(None) };
+}
+
+fn highlighted_code_lines(language: &str, source: &str) -> Vec<Vec<Span<'static>>> {
     let (syntaxes, theme) = syntax_assets();
-    let syntax = syntax_for_language(syntaxes, language)
-        .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
-    let mut highlighter = HighlightLines::new(syntax, theme);
+    SYNTAX_HIGHLIGHT_CACHE.with_borrow_mut(|slot| {
+        if slot
+            .as_ref()
+            .is_some_and(|cache| cache.language != language || !source.starts_with(&cache.prefix))
+        {
+            *slot = None;
+        }
+        let cache = slot.get_or_insert_with(|| {
+            let syntax = syntax_for_language(syntaxes, language)
+                .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
+            SyntaxHighlightCache {
+                language: language.to_string(),
+                prefix: String::new(),
+                rows: Vec::new(),
+                state: HighlightLines::new(syntax, theme).state(),
+            }
+        });
+        let mut highlighter =
+            HighlightLines::from_state(theme, cache.state.0.clone(), cache.state.1.clone());
+        let complete = source.rfind('\n').map_or(0, |index| index + 1);
+        let spans = |highlighter: &mut HighlightLines<'_>, raw: &str| {
+            let line = format!("{raw}\n");
+            highlighter
+                .highlight_line(&line, syntaxes)
+                .unwrap_or_else(|_| vec![(syntect::highlighting::Style::default(), line.as_str())])
+                .into_iter()
+                .map(|(style, text)| (style, text.trim_end_matches('\n')))
+                .filter(|(_, text)| !text.is_empty())
+                .map(|(style, text)| {
+                    Span::styled(
+                        text.to_string(),
+                        Style::default().fg(terminal_color(style.foreground)),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for raw in source[cache.prefix.len()..complete].lines() {
+            cache.rows.push(spans(&mut highlighter, raw));
+        }
+        cache.prefix.push_str(&source[cache.prefix.len()..complete]);
+        cache.state = highlighter.state();
+        let mut rows = cache.rows.clone();
+        // The unfinished line must be reparsed when the next chunk extends it.
+        let mut highlighter =
+            HighlightLines::from_state(theme, cache.state.0.clone(), cache.state.1.clone());
+        for raw in source[complete..].lines() {
+            rows.push(spans(&mut highlighter, raw));
+        }
+        if cache.prefix.len() > 1_048_576 {
+            *slot = None;
+        }
+        rows
+    })
+}
+
+fn syntax_lines(language: &str, source: &str, width: usize, wrap: bool) -> Vec<Line<'static>> {
     let digits = source.lines().count().max(1).to_string().len();
     let gutter_width = (digits + 3).min(CODE_GUTTER_WIDTH + digits);
     let content_width = width.saturating_sub(gutter_width).max(1);
     let mut output = Vec::new();
 
-    for (index, raw) in source.lines().enumerate() {
-        let line = format!("{raw}\n");
-        let highlighted = highlighter
-            .highlight_line(&line, syntaxes)
-            .unwrap_or_else(|_| vec![(syntect::highlighting::Style::default(), line.as_str())]);
+    for (index, highlighted) in highlighted_code_lines(language, source)
+        .into_iter()
+        .enumerate()
+    {
         let mut spans = vec![Span::styled(
             format!("{:>digits$} │ ", index + 1),
             Style::default().fg(Color::DarkGray),
         )];
-        for (style, text) in highlighted {
-            let text = text.trim_end_matches('\n');
-            if text.is_empty() {
-                continue;
-            }
-            spans.push(Span::styled(
-                text.to_string(),
-                Style::default().fg(terminal_color(style.foreground)),
-            ));
-        }
+        spans.extend(highlighted);
         if wrap {
             for (row, mut line) in super::markdown::wrap_markdown_spans(&spans[1..], content_width)
                 .into_iter()
@@ -1172,6 +1229,36 @@ mod tests {
         );
         assert!(lines.iter().all(|line| !line.to_string().contains("***")));
         assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn streamed_code_matches_fresh_highlighting_across_partial_lines_and_replacements() {
+        let source = "/* multi\nline */\r\nlet text = \"界\ncontinued\";\n// tail";
+        let prefixes = source
+            .char_indices()
+            .map(|(end, _)| &source[..end])
+            .chain(std::iter::once(source))
+            .collect::<Vec<_>>();
+        let expected = prefixes
+            .iter()
+            .map(|prefix| {
+                SYNTAX_HIGHLIGHT_CACHE.with_borrow_mut(|cache| *cache = None);
+                code_block_lines("rust", prefix, 12)
+            })
+            .collect::<Vec<_>>();
+        SYNTAX_HIGHLIGHT_CACHE.with_borrow_mut(|cache| *cache = None);
+        for (prefix, expected) in prefixes.iter().zip(expected) {
+            assert_eq!(code_block_lines("rust", prefix, 12), expected, "{prefix:?}");
+        }
+        for (language, replacement) in [
+            ("rust", "let replacement = 1;\n"),
+            ("python", source),
+            ("rust", ""),
+        ] {
+            let warm = code_block_lines(language, replacement, 30);
+            SYNTAX_HIGHLIGHT_CACHE.with_borrow_mut(|cache| *cache = None);
+            assert_eq!(warm, code_block_lines(language, replacement, 30));
+        }
     }
 
     #[test]
