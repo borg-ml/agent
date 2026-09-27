@@ -26,6 +26,7 @@ pub(crate) const TRUSTED_SETTINGS_SECTIONS: &[&str] = &[
     "approvals",
     "providers",
     "capabilities",
+    "prompt",
 ];
 
 /// The trust-bearing sections an `update_agent_settings` call would write.
@@ -48,6 +49,7 @@ pub(crate) fn trusted_settings_sections(tool: &str, arguments: &Value) -> Vec<St
 
 const SETTINGS_SECTIONS: &[&str] = &[
     "capabilities",
+    "prompt",
     "extensions",
     "local",
     "team",
@@ -183,7 +185,7 @@ impl SelfServiceContext {
             "hot_reload": ["commands.aliases", "keybindings"],
             "next_turn_reload": ["extensions", "mcp"],
             "restart_required": [
-                "capabilities", "team", "approvals", "updates", "providers"
+                "capabilities", "team", "approvals", "updates", "providers", "prompt"
             ]
         }))
     }
@@ -325,9 +327,9 @@ impl SelfServiceContext {
             "hot_reloaded": ["commands.aliases", "keybindings"],
             "next_turn_reloaded": ["extensions", "mcp"],
             "restart_required": [
-                "capabilities", "team", "approvals", "updates"
+                "capabilities", "team", "approvals", "updates", "prompt"
             ],
-            "note": "Aliases and keybindings reload in the running TUI. Blu and base MCP catalogs swap at the next turn boundary; capability/team/approval/update policy changes require a new session."
+            "note": "Aliases and keybindings reload in the running TUI. Blu and base MCP catalogs swap at the next turn boundary; capability/team/approval/update/prompt changes require a new session."
         }))
     }
 
@@ -2151,6 +2153,17 @@ fn validate_settings_shape(root: &toml::Value) -> Result<()> {
             "settings section `{section}` must be a table"
         );
     }
+    if let Some(prompt) = root.get("prompt") {
+        check_keys(prompt, &["append"], "prompt")?;
+        if let Some(append) = prompt.get("append") {
+            ensure!(
+                append
+                    .as_str()
+                    .is_some_and(|text| text.len() <= 16 * 1024 && !text.contains('\0')),
+                "prompt.append must be a string of at most 16 KiB without NUL bytes"
+            );
+        }
+    }
     if let Some(capabilities) = root.get("capabilities") {
         check_keys(
             capabilities,
@@ -2783,6 +2796,11 @@ sibling_flag = "theirs"
         )
         .unwrap();
         validate_settings_shape(&valid).unwrap();
+        let prompt =
+            toml::from_str::<toml::Value>("[prompt]\nappend = 'Inspect ~/agent.'\n").unwrap();
+        validate_settings_shape(&prompt).unwrap();
+        let invalid_prompt = toml::from_str::<toml::Value>("[prompt]\nappend = 123\n").unwrap();
+        assert!(validate_settings_shape(&invalid_prompt).is_err());
 
         let invalid_local = toml::from_str::<toml::Value>(
             "[local]\nbase_url = 'http://127.0.0.1:8000/v1'\nunknown = true\n",

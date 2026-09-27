@@ -10,6 +10,12 @@
 [usage_count]
 enabled = true
 
+# Append personal instructions to Borg's coding system prompt on every local
+# turn (including turns launched on this host). Does not replace Borg's core
+# instructions. Applies to sessions started after the setting is loaded.
+# [prompt]
+# append = "When a Borg harness issue arises, inspect ~/agent and fix it."
+
 # Optional Borg subsystems. Defaults preserve the current full-featured
 # experience. Disabling a parent automatically makes dependent features
 # inactive: autonomous_team depends on subagents; shared_work and presence

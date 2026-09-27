@@ -474,6 +474,7 @@ pub trait AgentTurnExecutor: Send + Sync {
 /// Direct provider execution used by the CLI and enrolled hosts.
 #[derive(Clone)]
 pub struct LocalAgentTurnExecutor {
+    prompt_append: String,
     native_harness: NativeHarness,
     /// The durable OpenCode route resolved for this session. Only the
     /// `opencode-go` aliases have an API Borg calls directly; every other
@@ -502,6 +503,7 @@ impl Default for LocalAgentTurnExecutor {
             }
         };
         Self {
+            prompt_append: String::new(),
             native_harness: NativeHarness::default(),
             opencode_session_native: false,
             runtime_extensions: Arc::new(RwLock::new(RuntimeExtensions::default())),
@@ -846,6 +848,8 @@ pub struct LocalAgentSettings {
     pub compaction: borg_core::compaction::CompactionBudgetPolicy,
     /// `[warming] mode`. `BORG_CACHE_WARMING` still overrides it per process.
     pub warming: borg_core::warming::CacheWarmingMode,
+    /// User-scoped instructions appended to the coding prompt on local turns.
+    pub prompt_append: String,
 }
 
 impl LocalAgentTurnExecutor {
@@ -858,6 +862,7 @@ impl LocalAgentTurnExecutor {
     pub fn with_settings(settings: LocalAgentSettings) -> Self {
         Self {
             native_harness: NativeHarness::with_settings(&settings),
+            prompt_append: settings.prompt_append,
             ..Self::default()
         }
     }
@@ -872,6 +877,7 @@ impl LocalAgentTurnExecutor {
     ) -> Self {
         Self {
             native_harness: NativeHarness::with_model_gateway(gateway, &settings),
+            prompt_append: settings.prompt_append,
             ..Self::default()
         }
     }
@@ -1013,6 +1019,10 @@ impl LocalAgentTurnExecutor {
     }
 
     async fn prepare_local_turn(&self, turn: &mut AgentTurn) -> Result<()> {
+        if !self.prompt_append.is_empty() {
+            turn.system_prompt_appendix.push_str("\n\n");
+            turn.system_prompt_appendix.push_str(&self.prompt_append);
+        }
         self.refresh_runtime_extensions().await;
         let runtime_extensions = self
             .runtime_extensions

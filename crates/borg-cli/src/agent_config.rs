@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub(crate) struct AgentConfig {
     pub(crate) capabilities: CapabilityConfig,
+    pub(crate) prompt: PromptConfig,
     pub(crate) extensions: ExtensionConfig,
     pub(crate) team: TeamConfig,
     pub(crate) commands: CommandConfig,
@@ -30,6 +31,12 @@ pub(crate) struct AgentConfig {
     /// Named OpenAI-compatible routes. The durable session keeps the generic
     /// native provider kind and records the stable `provider/model` alias.
     pub(crate) providers: BTreeMap<String, ConfiguredProvider>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct PromptConfig {
+    pub(crate) append: String,
 }
 
 /// `[models]`: the ordered routes a session falls back through when a model
@@ -707,6 +714,10 @@ impl AgentConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.prompt.append.len() <= 16 * 1024 && !self.prompt.append.contains('\0'),
+            "prompt.append must be at most 16 KiB and contain no NUL bytes"
+        );
         if let Some(worker_concurrency) = self.team.worker_concurrency {
             anyhow::ensure!(
                 worker_concurrency > 0,
@@ -1065,6 +1076,7 @@ impl AgentConfig {
             harness: self.capabilities.harness,
             compaction: self.compaction_budget_policy()?,
             warming: self.warming.mode,
+            prompt_append: self.prompt.append.clone(),
         })
     }
 
@@ -1852,6 +1864,22 @@ reasoning_format = "deepseek"
         config
             .validate()
             .expect_err("zero port must not be accepted");
+    }
+
+    #[test]
+    fn personal_prompt_reaches_local_turn_settings() {
+        let config: AgentConfig =
+            toml::from_str("[prompt]\nappend = 'Inspect ~/agent for harness bugs.'\n").unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.local_agent_settings().unwrap().prompt_append,
+            "Inspect ~/agent for harness bugs."
+        );
+        assert!(
+            borg_remote::SessionCapabilities::from(&config.capabilities)
+                .system_prompt_appendix
+                .is_none()
+        );
     }
 
     #[test]

@@ -13,6 +13,21 @@ The default user configuration directory is `$XDG_CONFIG_HOME/borg`, or
 [`configs/agent.example.toml`](../configs/agent.example.toml). An explicit
 `borg agent --config PATH` replaces the default agent configuration path.
 
+## Personal agent instructions
+
+Set `prompt.append` in `agent.toml` to add instructions to Borg's coding system
+prompt without replacing its core instructions:
+
+```toml
+[prompt]
+append = "If a Borg harness issue arises during a task, inspect ~/agent and fix it."
+```
+
+The instruction applies to local turns, including turns started by an enrolled
+host on this machine, after the session/host executor is restarted with the new
+settings. It is limited to 16 KiB. Changing this setting does not rewrite the
+prompt of a running session.
+
 ## Shell language diagnostics
 
 Borg already routes shell files to `bash-language-server start`. Install the
