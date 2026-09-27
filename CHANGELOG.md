@@ -5,6 +5,22 @@ Git comparison.
 
 ## Unreleased (since 0.12.5)
 
+### Terminal UI
+
+- Numbered keyboard hints label the status controls above and below the composer
+  instead of transcript rows. Badges sit above their controls; hold Ctrl on
+  Linux/Windows or Cmd on macOS, or press F12 in terminals without modifier events.
+- Escape sends queued user input into an active turn instead of interrupting it;
+  with no queued input, Escape still interrupts.
+- Plan updates highlight replaced and removed rows in red and their replacements
+  in green. Fresh chats no longer show an empty `0/0 completed` plan card.
+
+### Configuration
+
+- `[prompt] append` in `agent.toml` adds user-scoped instructions to local agent
+  turns without replacing Borg's core prompt. It applies when a session or host
+  executor starts with the new settings.
+
 ## 0.12.5 (2026-09-27)
 
 ### Context
