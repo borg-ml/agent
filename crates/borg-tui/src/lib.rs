@@ -10112,7 +10112,8 @@ impl BorgTerminal {
                 for (_, identity) in &mut hint_candidates {
                     *identity = format!("{:?}:{identity}", self.focused_child);
                 }
-                self.key_hints.render(frame, hint_candidates, &hint_occlusions);
+                self.key_hints
+                    .render(frame, hint_candidates, &hint_occlusions);
             }
         })?;
         if let Some(cursor) = frame_cursor {

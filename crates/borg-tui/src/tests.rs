@@ -5932,9 +5932,11 @@ fn todo_status_counts_open_items_and_tooltip_matches_plan_order_and_clipping() {
     assert!(rows[0].contains("Ship the hover affordance"));
     assert!(rows[1].starts_with("○  "));
     assert!(rows[1].contains("Run the regression tests"));
-    assert!(rows[..MAX_COLLAPSED_PLAN_ITEMS]
-        .iter()
-        .all(|row| !row.starts_with("✓  ")));
+    assert!(
+        rows[..MAX_COLLAPSED_PLAN_ITEMS]
+            .iter()
+            .all(|row| !row.starts_with("✓  "))
+    );
     assert!(
         rows.last()
             .is_some_and(|row| row.contains("click to expand"))
