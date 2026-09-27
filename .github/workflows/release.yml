@@ -84,7 +84,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev
+          sudo apt-get install -y libxkbcommon-dev 7zip
           cargo build --locked --release --target ${{ matrix.target }} -p borg-display
       - uses: ./.github/actions/test-postgres
       - name: Run native Borg Agent core-flow tests
@@ -143,7 +143,16 @@ jobs:
           cp configs/ghostty-borg.conf "$package_dir/configs/"
           cp include/borg_extension.h "$package_dir/include/"
           cp LICENSE NOTICE.md README.md CHANGELOG.md "$package_dir/"
-          tar -C "$package_dir" -czf "$PWD/$asset" "${binaries[@]}" providers docs configs include LICENSE NOTICE.md README.md CHANGELOG.md
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            strip --strip-unneeded "$package_dir/borg"
+            tar -C "$package_dir" -cf "$asset.tar" "${binaries[@]}" providers docs configs include LICENSE NOTICE.md README.md CHANGELOG.md
+            7z a -tgzip -mx=9 -mfb=258 -mpass=15 "$asset" "$asset.tar"
+            rm "$asset.tar"
+          else
+            tar -C "$package_dir" -czf "$PWD/$asset" "${binaries[@]}" providers docs configs include LICENSE NOTICE.md README.md CHANGELOG.md
+          fi
+          # Old Borg clients refuse larger archives before reading their checksum.
+          test "$(wc -c < "$asset")" -le 134217728
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$asset" >"$asset.sha256"
           else
@@ -175,7 +184,15 @@ jobs:
           Copy-Item "configs/ghostty-borg.conf" "$packageDir/configs/"
           Copy-Item "include/borg_extension.h" "$packageDir/include/"
           Copy-Item LICENSE, NOTICE.md, README.md, CHANGELOG.md $packageDir
-          Compress-Archive -Path "$packageDir/*" -DestinationPath $asset
+          if ("${{ matrix.target }}" -eq "x86_64-pc-windows-msvc") {
+            $sevenZip = (Get-Command 7z -ErrorAction Stop).Source
+            & $sevenZip a -tzip -mx=9 -mfb=258 -mpass=10 -mmt=2 $asset "$packageDir/*"
+            if ($LASTEXITCODE -ne 0) { throw "7-Zip packaging failed" }
+          } else {
+            Compress-Archive -Path "$packageDir/*" -DestinationPath $asset
+          }
+          # Old Borg clients refuse larger archives before reading their checksum.
+          if ((Get-Item $asset).Length -gt 134217728) { throw "Release archive exceeds the old updater limit" }
           $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
           "$hash  $asset" | Set-Content -NoNewline "$asset.sha256"
       - name: Install-smoke the Unix archive

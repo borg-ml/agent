@@ -467,7 +467,7 @@ assert_equal "1.2.4" "$(fixture_version "$tolerant_fixture")" \
 assert_equal "generated drift" "$(<"$tolerant_fixture/generated.txt")" \
   "preserved generated drift"
 assert_equal $'CHANGELOG.md\nCargo.lock\nCargo.toml' \
-  "$(git -C "$tolerant_fixture" diff-tree --no-commit-id --name-only -r HEAD | sort)" \
+  "$(git -C "$tolerant_fixture" diff-tree --no-commit-id --name-only -r HEAD | LC_ALL=C sort)" \
   "release commit scope"
 [[ -n "$(git -C "$tolerant_fixture" status --porcelain -- generated.txt)" ]] ||
   fail "release discarded generated drift"

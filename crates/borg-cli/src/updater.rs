@@ -15,7 +15,7 @@ use crate::agent_config::UpdateConfig;
 use crate::cli::UpdateArgs;
 
 const REPOSITORY: &str = "borg-ml/agent";
-const MAX_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
+const MAX_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
 const MAX_UPDATE_ERROR_CHARS: usize = 512;
 /// The Linux private-display compositor ships beside `borg`. Older release
 /// archives and other platforms do not carry it.

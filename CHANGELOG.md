@@ -5,6 +5,17 @@ Git comparison.
 
 ## Unreleased (since 0.12.8)
 
+### Updates
+
+- Automatic updates accept larger release archives; release packaging stays within
+  the old updater's download limit so existing installations can still upgrade.
+
+### Terminal UI
+
+- Ctrl/Cmd numbered hints no longer recolour the subscription label in the footer.
+- Persistent Python workers no longer let child-process terminal prompts overwrite
+  the TUI or stall on terminal job control.
+
 ## 0.12.8 (2026-09-27)
 
 ### Terminal UI
