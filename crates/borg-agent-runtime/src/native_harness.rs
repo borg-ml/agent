@@ -9101,6 +9101,7 @@ mod tests {
                     },
                     None,
                     60_000,
+                    &std::collections::BTreeMap::new(),
                 )
                 .await
                 .expect("the watcher starts");
@@ -9336,6 +9337,7 @@ mod tests {
                     },
                     None,
                     60_000,
+                    &std::collections::BTreeMap::new(),
                 )
                 .await
                 .expect("the watcher starts");

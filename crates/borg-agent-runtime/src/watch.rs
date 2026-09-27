@@ -366,6 +366,7 @@ impl Watches {
         args: WatchArgs,
         store: Option<std::sync::Arc<dyn crate::SessionStore>>,
         timeout_ms: u64,
+        environment: &BTreeMap<String, String>,
     ) -> Result<WatchInfo> {
         // One entry, one subject kind: a command the process manager reports
         // on, or child agents whose lifecycle the session already records.
@@ -398,7 +399,7 @@ impl Watches {
         let stopped = CancellationToken::new();
         let snapshot = self
             .processes
-            .exec_with_cancel(
+            .exec_with_cancel_and_environment(
                 session_id,
                 root,
                 args.command.clone(),
@@ -408,6 +409,7 @@ impl Watches {
                 timeout_ms,
                 store,
                 cancel.clone(),
+                environment,
             )
             .await?;
         let info = WatchInfo {
@@ -771,7 +773,7 @@ mod tests {
                 session_id,
                 root.path(),
                 WatchArgs {
-                    command: "echo engine-warmup; read gate; echo ERROR-render; read gate; exit 7"
+                    command: "echo \"$BORG_WATCH_ENV_PROBE\"; echo engine-warmup; read gate; echo ERROR-render; read gate; exit 7"
                         .into(),
                     label: "Filtered build".into(),
                     workdir: None,
@@ -781,6 +783,10 @@ mod tests {
                 },
                 None,
                 30_000,
+                &BTreeMap::from([(
+                    "BORG_WATCH_ENV_PROBE".to_string(),
+                    "session-environment-forwarded".to_string(),
+                )]),
             )
             .await
             .unwrap();
@@ -801,6 +807,7 @@ mod tests {
             .await
             .unwrap();
         assert!(captured.stdout.contains("engine-warmup"));
+        assert!(captured.stdout.contains("session-environment-forwarded"));
         let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
             .unwrap()
@@ -847,6 +854,7 @@ mod tests {
                 },
                 None,
                 60_000,
+                &BTreeMap::new(),
             )
             .await
             .unwrap();
@@ -876,6 +884,7 @@ mod tests {
                 },
                 None,
                 5000,
+                &BTreeMap::new(),
             )
             .await
             .unwrap();
@@ -1126,6 +1135,7 @@ mod tests {
                 },
                 None,
                 60_000,
+                &BTreeMap::new(),
             )
             .await
             .unwrap();
@@ -1168,6 +1178,7 @@ mod tests {
                 },
                 None,
                 60_000,
+                &BTreeMap::new(),
             )
             .await
             .unwrap();
@@ -1221,6 +1232,7 @@ mod tests {
                 },
                 None,
                 5000,
+                &BTreeMap::new(),
             )
             .await
             .unwrap();
@@ -1274,6 +1286,7 @@ mod tests {
                 },
                 None,
                 60_000,
+                &BTreeMap::new(),
             )
             .await
             .unwrap();
@@ -1385,6 +1398,7 @@ mod tests {
                 },
                 None,
                 60_000,
+                &BTreeMap::new(),
             )
             .await
             .unwrap();

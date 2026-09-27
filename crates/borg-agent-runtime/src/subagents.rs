@@ -991,6 +991,17 @@ impl AgentToolDispatcher {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = environment;
     }
 
+    fn environment_for_command(&self) -> BTreeMap<String, String> {
+        let mut environment = self
+            .command_environment
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        // Names this command as the parent of any Borg call it makes.
+        environment.insert("BORG_TOOL_CALL_ID".to_string(), Uuid::new_v4().to_string());
+        environment
+    }
+
     pub(crate) fn set_turn_events(&self, events: &tokio::sync::mpsc::Sender<SessionEventKind>) {
         *self
             .turn_events
@@ -1122,13 +1133,7 @@ impl AgentToolDispatcher {
         }
         let args = command.expect("a shell call is a command or a process write");
         let sleep_seconds = bare_sleep_seconds(&args.cmd);
-        let mut environment = self
-            .command_environment
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        // Names this command as the parent of any Borg call it makes.
-        environment.insert("BORG_TOOL_CALL_ID".to_string(), Uuid::new_v4().to_string());
+        let environment = self.environment_for_command();
         let command_text = args.cmd.clone();
         let (command, shell_directory) = if args.workdir.is_some() {
             (args.cmd, None)
@@ -2034,6 +2039,7 @@ impl AgentToolDispatcher {
                             args,
                             self.session_store(),
                             timeout,
+                            &self.environment_for_command(),
                         )
                         .await?,
                 )?)
@@ -2246,6 +2252,7 @@ impl AgentToolDispatcher {
                                     args,
                                     self.session_store(),
                                     24 * 60 * 60 * 1000,
+                                    &self.environment_for_command(),
                                 )
                                 .await
                             {
