@@ -6422,6 +6422,56 @@ fn footer_metadata_highlights_only_imminent_compaction() {
 }
 
 #[test]
+fn status_row_buttons_leave_the_status_line_in_front_of_them() {
+    let narrow = Rect::new(0, 30, 70, 1);
+    let (back, jump, reserved) = status_row_buttons(
+        narrow,
+        Some(" ← Back to thread "),
+        Some(" ↓ Jump to bottom "),
+    );
+    let back = back.expect("return button is placed");
+    let jump = jump.expect("jump button is placed");
+    // Both sit at the right edge, side by side, one column in from the end.
+    assert_eq!(back.right() + 1, narrow.right());
+    assert_eq!(jump.right() + 1, back.x);
+    assert_eq!(reserved, narrow.width - jump.x);
+
+    // A status line too wide for the row stops in front of the buttons, so its
+    // tail is marked rather than sliced, and nothing clickable stays under
+    // them.
+    let line = Line::from(truncate_status_spans(
+        vec![
+            Span::raw(" · gpt-6-astra · xhigh · full access · "),
+            Span::raw("compaction imminent"),
+        ],
+        narrow.width.saturating_sub(reserved) as usize,
+    ));
+    // The truncated line ends on the button's first column, never under it.
+    assert_eq!(line.width() as u16 + narrow.x, jump.x);
+    assert!(
+        line.spans
+            .last()
+            .expect("the line keeps a tail")
+            .content
+            .ends_with('…'),
+        "the cut status segment is marked, not sliced: {line:?}"
+    );
+
+    // A line that fits is left alone, and the jump button alone still reserves
+    // its own columns.
+    let roomy = Rect::new(0, 30, 120, 1);
+    let (back, jump, reserved) = status_row_buttons(roomy, None, Some(" ↓ Jump to bottom "));
+    assert!(back.is_none());
+    assert_eq!(jump.expect("jump button is placed").x, roomy.width - 19);
+    assert_eq!(reserved, 19);
+    let line = Line::from(truncate_status_spans(
+        vec![Span::raw(" · ready · "), Span::raw("gpt-6-astra")],
+        roomy.width.saturating_sub(reserved) as usize,
+    ));
+    assert_eq!(line.width(), " · ready · gpt-6-astra".width());
+}
+
+#[test]
 fn footer_todo_metadata_keeps_the_todo_segment_interactive() {
     let line = footer_todo_metadata_line("2 to-dos", "~/borg-cli · git:main", false, usize::MAX);
 
@@ -12679,16 +12729,14 @@ fn ready_status_uses_an_open_circle_activity_glyph() {
 
 #[test]
 fn ready_status_does_not_register_an_actionable_hitbox() {
-    let footer = Rect::new(4, 20, 80, 1);
-
-    assert_eq!(
-        status_control_hit_area(SessionStatus::Ready, footer, 3, 12),
-        None
-    );
-    assert_eq!(
-        status_control_hit_area(SessionStatus::Running, footer, 3, 12),
-        Some(Rect::new(7, 20, 12, 1))
-    );
+    // The status row's first target is only kept for actionable statuses, so
+    // a click on a ready session falls through to the row instead of
+    // interrupting it.
+    assert!(!status_control_is_actionable(SessionStatus::Ready));
+    assert!(status_control_is_actionable(SessionStatus::Running));
+    assert!(status_control_is_actionable(
+        SessionStatus::WaitingForApproval
+    ));
 }
 
 #[test]

@@ -6248,6 +6248,18 @@ impl BorgTerminal {
                             }
                             return Ok(UiAction::None);
                         }
+                        if self
+                            .jump_to_bottom_area
+                            .is_some_and(|area| area.contains(pointer))
+                        {
+                            self.cancel_scroll_motion();
+                            self.scroll_from_bottom = 0;
+                            self.text_selection = None;
+                            self.composer_selection = None;
+                            self.pending_transcript_click = None;
+                            self.transcript.follow_tail = true;
+                            return Ok(UiAction::None);
+                        }
                         if self.status_area.is_some_and(|area| area.contains(pointer))
                             && status_control_is_actionable(self.active_status())
                         {
@@ -6484,18 +6496,6 @@ impl BorgTerminal {
                                 |thumb| mouse.row.saturating_sub(thumb.y),
                             );
                         self.scroll_to_scrollbar_row(mouse.row);
-                    }
-                    MouseEventKind::Down(MouseButton::Left)
-                        if self
-                            .jump_to_bottom_area
-                            .is_some_and(|area| area.contains(pointer)) =>
-                    {
-                        self.cancel_scroll_motion();
-                        self.scroll_from_bottom = 0;
-                        self.text_selection = None;
-                        self.composer_selection = None;
-                        self.pending_transcript_click = None;
-                        self.transcript.follow_tail = true;
                     }
                     MouseEventKind::Down(MouseButton::Left)
                         if self.picker.is_none()
@@ -8962,6 +8962,24 @@ impl BorgTerminal {
             }
             let jump_to_bottom_label = (!is_launch_screen && self.scroll_from_bottom > 0)
                 .then(|| format!(" ↓ {} ", ui_text(ui_language, "Jump to bottom")));
+            let back_to_thread_label =
+                (self.focused_child.is_some() || self.focused_tool.is_some()).then(|| {
+                    if self.focused_tool.is_some() {
+                        " ← Back to thread "
+                    } else {
+                        " ↩ Return "
+                    }
+                });
+            // Both buttons share the status row's right edge, so place them
+            // before the status line is laid out: the line gives up their
+            // columns instead of running underneath them, where it was cut in
+            // half and still clickable through the button.
+            let (back_to_thread_button, jump_to_bottom_button, status_row_reserved) =
+                status_row_buttons(
+                    status_area,
+                    back_to_thread_label,
+                    jump_to_bottom_label.as_deref(),
+                );
             if !queued_prompts.is_empty() {
                 next_pending_input_header_area = Some(Rect {
                     height: chunks[1].height.min(1),
@@ -9290,55 +9308,47 @@ impl BorgTerminal {
                         .add_modifier(Modifier::BOLD),
                 ));
             }
-            let status_line = Line::from(status_spans);
+            let status_line = Line::from(truncate_status_spans(
+                status_spans,
+                status_area.width.saturating_sub(status_row_reserved) as usize,
+            ));
             let alignment_offset = if is_launch_screen {
                 status_area.width.saturating_sub(status_line.width() as u16) / 2
             } else {
                 0
             };
-            next_status_area =
-                status_control_hit_area(status, status_area, alignment_offset, status_width);
-            if let Some(agents_status_width) = agents_status_width {
-                next_agents_status_area = Some(Rect {
-                    x: status_area
-                        .x
-                        .saturating_add(alignment_offset)
-                        .saturating_add(agents_status_start as u16),
-                    y: status_area.y,
-                    width: (agents_status_width as u16).min(status_area.width),
-                    height: 1,
-                });
-            }
-            if let Some(goal_status_width) = goal_status_width {
-                next_goal_status_area = Some(Rect {
-                    x: status_area
-                        .x
-                        .saturating_add(alignment_offset)
-                        .saturating_add(goal_status_start as u16),
-                    y: status_area.y,
-                    width: (goal_status_width as u16).min(status_area.width),
-                    height: 1,
-                });
-            }
-            let status_hit_area = |start: usize, width: usize| Rect {
-                x: status_area
+            // Every status-row target ends at that same edge, so a click on a
+            // button never reaches the control it covers.
+            let status_line_right = status_area.right().saturating_sub(status_row_reserved);
+            let status_hit_area = |start: usize, width: usize| {
+                let x = status_area
                     .x
                     .saturating_add(alignment_offset)
-                    .saturating_add(start as u16),
-                y: status_area.y,
-                width: (width as u16).min(status_area.width),
-                height: 1,
+                    .saturating_add(start as u16);
+                let right = x.saturating_add(width as u16).min(status_line_right);
+                (right > x).then_some(Rect {
+                    x,
+                    y: status_area.y,
+                    width: right - x,
+                    height: 1,
+                })
             };
+            next_status_area =
+                status_hit_area(0, status_width).filter(|_| status_control_is_actionable(status));
+            next_agents_status_area =
+                agents_status_width.and_then(|width| status_hit_area(agents_status_start, width));
+            next_goal_status_area =
+                goal_status_width.and_then(|width| status_hit_area(goal_status_start, width));
             next_model_status_area =
-                model_status_width.map(|width| status_hit_area(model_status_start, width));
+                model_status_width.and_then(|width| status_hit_area(model_status_start, width));
             next_effort_status_area =
-                effort_status_width.map(|width| status_hit_area(effort_status_start, width));
+                effort_status_width.and_then(|width| status_hit_area(effort_status_start, width));
             next_context_status_area =
-                context_status_width.map(|width| status_hit_area(context_status_start, width));
+                context_status_width.and_then(|width| status_hit_area(context_status_start, width));
             next_fast_status_area =
-                fast_status_width.map(|width| status_hit_area(fast_status_start, width));
+                fast_status_width.and_then(|width| status_hit_area(fast_status_start, width));
             next_permission_status_area = permission_status_width
-                .map(|width| status_hit_area(permission_status_start, width));
+                .and_then(|width| status_hit_area(permission_status_start, width));
             frame.render_widget(
                 Paragraph::new(status_line)
                     .style(Style::default().fg(Color::DarkGray).bg(Color::Reset))
@@ -9415,22 +9425,13 @@ impl BorgTerminal {
                     ));
                 }
             }
-            if self.focused_child.is_some() || self.focused_tool.is_some() {
+            if let (Some(label), Some(button)) = (back_to_thread_label, back_to_thread_button) {
                 // Over action details the button sits on the terminal's own
                 // background, like the details it returns from.
-                let (label, idle_color, idle_background) = if self.focused_tool.is_some() {
-                    (" ← Back to thread ", BACKGROUND_RUNNING_TEXT, Color::Reset)
+                let (idle_color, idle_background) = if self.focused_tool.is_some() {
+                    (BACKGROUND_RUNNING_TEXT, Color::Reset)
                 } else {
-                    (" ↩ Return ", SUBAGENT_PURPLE, COMMAND_PANEL_BG)
-                };
-                // Beside Jump to bottom on the status row, where every other
-                // control is.
-                let button_row = status_area;
-                let button = Rect {
-                    x: button_row.right().saturating_sub(label.width() as u16 + 1),
-                    y: button_row.y,
-                    width: label.width() as u16,
-                    height: 1,
+                    (SUBAGENT_PURPLE, COMMAND_PANEL_BG)
                 };
                 frame.render_widget(
                     Paragraph::new(label).style(
@@ -9451,26 +9452,9 @@ impl BorgTerminal {
                 );
                 next_back_to_director_area = Some(button);
             }
-            if let Some(label) = jump_to_bottom_label {
-                // Share the right edge and style of the return button; when
-                // both are shown they sit side by side on the status row.
-                let width = label.width() as u16;
-                let button = match next_back_to_director_area {
-                    Some(back) => Rect {
-                        x: back.x.saturating_sub(width + 1),
-                        y: back.y,
-                        width,
-                        height: 1,
-                    },
-                    // On the status row, never over the transcript's last line
-                    // where it hid the newest text and its timing column.
-                    None => Rect {
-                        x: status_area.right().saturating_sub(width + 1),
-                        y: status_area.y,
-                        width,
-                        height: 1,
-                    },
-                };
+            if let (Some(label), Some(button)) = (jump_to_bottom_label, jump_to_bottom_button) {
+                // Beside the return button on the status row, where every
+                // other control is, sharing its style.
                 frame.render_widget(
                     Paragraph::new(label).style(
                         Style::default()
@@ -16697,18 +16681,64 @@ fn status_control_spans(
     spans
 }
 
-fn status_control_hit_area(
-    status: SessionStatus,
+/// The status row's right-edge buttons — return first, then Jump to bottom
+/// beside it — and the columns they take from the status line. Both live at
+/// the row's right edge, one column in from the terminal.
+fn status_row_buttons(
     status_area: Rect,
-    alignment_offset: u16,
-    status_width: usize,
-) -> Option<Rect> {
-    (status_control_is_actionable(status) && status_width > 0).then(|| Rect {
-        x: status_area.x.saturating_add(alignment_offset),
-        y: status_area.y,
-        width: (status_width as u16).min(status_area.width),
-        height: 1,
-    })
+    back: Option<&str>,
+    jump: Option<&str>,
+) -> (Option<Rect>, Option<Rect>, u16) {
+    let button = |right_of: u16, label: &str| {
+        let width = label.width() as u16;
+        Rect {
+            x: right_of.saturating_sub(width + 1),
+            y: status_area.y,
+            width,
+            height: 1,
+        }
+    };
+    let back_button = back.map(|label| button(status_area.right(), label));
+    let jump_button = jump.map(|label| {
+        button(
+            back_button.map_or(status_area.right(), |back| back.x),
+            label,
+        )
+    });
+    // The leftmost button sets the edge the status line has to stop at.
+    let reserved = back_button
+        .iter()
+        .chain(jump_button.iter())
+        .map(|button| status_area.right().saturating_sub(button.x))
+        .max()
+        .unwrap_or(0)
+        .min(status_area.width);
+    (back_button, jump_button, reserved)
+}
+
+/// Trim styled spans to `budget` columns, marking the cut with an ellipsis so a
+/// reserved control never leaves the last word sliced in half.
+fn truncate_status_spans(spans: Vec<Span<'static>>, budget: usize) -> Vec<Span<'static>> {
+    if spans.iter().map(|span| span.width()).sum::<usize>() <= budget {
+        return spans;
+    }
+    let mut trimmed = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        if used + span.width() <= budget {
+            used += span.width();
+            trimmed.push(span);
+            continue;
+        }
+        if budget - used > 1 {
+            trimmed.push(Span::styled(
+                truncate_table_cell(&span.content, budget - used),
+                span.style,
+            ));
+        }
+        break;
+    }
+    trimmed
 }
 
 fn overlay_suppresses_background_hover(

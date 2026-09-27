@@ -38,6 +38,9 @@ Git comparison.
 - Modifier-held numbered hints activate visible clickable targets with 1–9 and
   0, with an F12 fallback for terminals that cannot report modifier holds.
 - Received agent messages use an incoming arrow.
+- The status row's scroll-back and return buttons no longer cover the status
+  line. The line gives up their columns and ends in an ellipsis in front of
+  them, and a click on a button no longer reaches the control it used to hide.
 
 ## 0.12.4 (2026-09-26)
 
