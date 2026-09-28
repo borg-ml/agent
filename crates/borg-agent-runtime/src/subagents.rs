@@ -1080,7 +1080,7 @@ impl AgentToolDispatcher {
         }
         let (command, stdin) = match name {
             "exec" => {
-                let args: RuntimeExecArgs = serde_json::from_value(arguments)?;
+                let args = parse_exec_args(arguments)?;
                 match (args.cmd, args.session_id) {
                     (Some(cmd), None) => {
                         ensure!(
@@ -8411,9 +8411,26 @@ struct RuntimeExecCommandArgs {
     timeout_ms: Option<u64>,
 }
 
-#[derive(Deserialize)]
+/// `command` is accepted as a spelling of `cmd`.
+///
+/// The schema says `cmd`, and a model that reaches for the English word
+/// instead was rejected with serde's `unknown field` message and the whole
+/// call failed, for a near-miss whose intent is unambiguous. Aliasing it keeps
+/// the call working; `deny_unknown_fields` still catches genuine typos.
+fn parse_exec_args(arguments: Value) -> Result<RuntimeExecArgs> {
+    serde_json::from_value(arguments).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid exec arguments: {error}. Accepted fields are `cmd` (or `command`), \
+             `session_id`, `chars`, `terminate`, `workdir`, `yield_time_ms`, \
+             `max_output_tokens` and `timeout_ms`."
+        )
+    })
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeExecArgs {
+    #[serde(alias = "command")]
     cmd: Option<String>,
     session_id: Option<Uuid>,
     chars: Option<String>,
@@ -8422,6 +8439,36 @@ struct RuntimeExecArgs {
     yield_time_ms: Option<u64>,
     max_output_tokens: Option<usize>,
     timeout_ms: Option<u64>,
+}
+
+#[cfg(test)]
+mod exec_args_tests {
+    use super::*;
+
+    /// A model reaching for `command` instead of `cmd` failed the whole call
+    /// with serde's `unknown field` text. The intent is unambiguous, so the
+    /// spelling is accepted instead.
+    #[test]
+    fn exec_accepts_command_as_a_spelling_of_cmd() {
+        let args = parse_exec_args(serde_json::json!({
+            "command": "echo hi",
+            "yield_time_ms": 100,
+        }))
+        .expect("`command` is a near miss for `cmd`, not a typo to reject");
+        assert_eq!(args.cmd.as_deref(), Some("echo hi"));
+        assert_eq!(args.yield_time_ms, Some(100));
+    }
+
+    /// A genuine typo must still fail, and the error must say what is
+    /// accepted rather than surfacing serde's field list verbatim.
+    #[test]
+    fn exec_rejects_an_unknown_field_with_guidance() {
+        let error = parse_exec_args(serde_json::json!({ "cmnd": "echo hi" }))
+            .expect_err("an unknown field is still an error");
+        let message = error.to_string();
+        assert!(message.contains("Accepted fields are"), "{message}");
+        assert!(message.contains("`cmd`"), "{message}");
+    }
 }
 
 #[derive(Deserialize)]

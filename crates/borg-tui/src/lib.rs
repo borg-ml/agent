@@ -2602,6 +2602,9 @@ fn model_picker_options_with_configured(
                     id: borg_provider::openrouter_product_model().to_string(),
                     label: borg_provider::openrouter_product_model().to_string(),
                     detail: None,
+                    // Nothing was discovered, so no effort vocabulary is known.
+                    supported_efforts: None,
+                    reasoning_mandatory: false,
                 });
             }
             for (index, model) in models.into_iter().enumerate() {
@@ -2745,6 +2748,9 @@ fn model_picker_options_with_configured(
                 id: borg_provider::openrouter_product_model().to_string(),
                 label: borg_provider::openrouter_product_model().to_string(),
                 detail: None,
+                // Nothing was discovered, so no effort vocabulary is known.
+                supported_efforts: None,
+                reasoning_mandatory: false,
             });
         }
         for (index, model) in models.into_iter().enumerate() {
@@ -2787,13 +2793,56 @@ fn model_picker_options_with_configured(
     options
 }
 
-/// The effort levels the configured provider actually honours. Empty means it
-/// has no effort control, and the picker must not open rather than offer
-/// levels that would collapse onto one request.
-fn effort_picker_options(provider: Option<CodingProvider>) -> &'static [&'static str] {
-    provider.map_or(&[][..], |provider| {
-        borg_provider::effort_levels_for_backend(provider.catalog_backend())
-    })
+/// The effort levels the configured model actually accepts.
+///
+/// For a gateway this is per model, never per provider: OpenRouter publishes a
+/// `reasoning.supported_efforts` list per model, and those lists disagree
+/// constantly, so a provider-wide list offers levels the model will refuse.
+/// A provider with a fixed model catalog answers from that catalog instead.
+fn effort_picker_options(
+    provider: Option<CodingProvider>,
+    model: Option<&str>,
+) -> Vec<String> {
+    let Some(provider) = provider else {
+        return Vec::new();
+    };
+    if let Some(catalog) = provider.model_catalog() {
+        return catalog
+            .effort_levels
+            .iter()
+            .map(|level| (*level).to_string())
+            .collect();
+    }
+    let entries = match provider.catalog_backend() {
+        "openrouter" => borg_provider::openrouter_model_entries(),
+        "vercel" => borg_provider::vercel_model_entries(),
+        _ => return Vec::new(),
+    };
+    // A model missing from the catalog is unknown, not unrestricted: offering
+    // a guessed ladder here is exactly the bug this replaces.
+    model
+        .and_then(|model| borg_provider::gateway_effort_levels(model, &entries))
+        .unwrap_or_default()
+}
+
+/// Whether the configured model can be asked to skip reasoning entirely.
+///
+/// A mandatory model rejects `none`, so the off switch must not be offered
+/// rather than offered and refused on send.
+fn effort_is_optional(provider: Option<CodingProvider>, model: Option<&str>) -> bool {
+    let Some(provider) = provider else {
+        return false;
+    };
+    if provider.model_catalog().is_some() {
+        return true;
+    }
+    let entries = match provider.catalog_backend() {
+        "openrouter" => borg_provider::openrouter_model_entries(),
+        "vercel" => borg_provider::vercel_model_entries(),
+        _ => return false,
+    };
+    model
+        .is_some_and(|model| borg_provider::gateway_effort_is_optional(model, &entries))
 }
 
 impl BorgTerminal {
@@ -5430,19 +5479,23 @@ impl BorgTerminal {
             .config
             .as_ref()
             .and_then(|config| config.effort.clone());
-        let options = effort_picker_options(provider);
-        // A provider with no effort control has nothing to choose between, so
-        // leave the current picker closed instead of listing phantom levels.
+        let options = effort_picker_options(provider, model);
+        // A model with no known effort support has nothing to choose between,
+        // so leave the picker closed rather than listing levels it will refuse.
         if options.is_empty() {
             return;
         }
         let mut picker = Picker::new(
             PickerKind::Effort,
             "Choose effort",
-            options.iter().copied(),
+            options.iter().map(String::as_str),
             current.as_deref(),
         );
-        if provider == Some(CodingProvider::Codex) && model == Some("gpt-6-astra") {
+        // A model that cannot skip reasoning rejects `none`, so show the rung
+        // disabled rather than offering a switch that fails on send. This
+        // generalizes the gpt-6-astra special case, which was the only model
+        // hardcoded to behave this way.
+        if !effort_is_optional(provider, model) {
             for option in &mut picker.options {
                 option.disabled = option.value == "none";
             }

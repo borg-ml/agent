@@ -73,6 +73,10 @@ impl LocalModel {
             id: self.id.clone(),
             label,
             detail: Some(details.join(" · ")),
+            // A locally served model publishes no effort vocabulary, so none
+            // is claimed rather than guessed.
+            supported_efforts: None,
+            reasoning_mandatory: false,
         }
     }
 }

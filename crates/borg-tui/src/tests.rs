@@ -1805,8 +1805,12 @@ fn model_and_effort_pickers_use_the_provider_catalog() {
         .expect("OpenRouter section");
     assert!(go < openrouter, "OpenCode Go must precede OpenRouter");
     assert_eq!(
-        effort_picker_options(Some(CodingProvider::Codex)),
-        catalog.effort_levels
+        effort_picker_options(Some(CodingProvider::Codex), None),
+        catalog
+            .effort_levels
+            .iter()
+            .map(|level| (*level).to_string())
+            .collect::<Vec<_>>()
     );
     assert!(values.contains(&"gpt-6-luna"));
     assert!(values.contains(&"gpt-5.6-sol"));
@@ -1826,8 +1830,8 @@ fn model_and_effort_pickers_use_the_provider_catalog() {
             .any(|option| option.section.as_deref() == Some("Claude"))
     );
     assert_eq!(
-        effort_picker_options(Some(CodingProvider::Claude)),
-        &["low", "medium", "high", "xhigh", "max"]
+        effort_picker_options(Some(CodingProvider::Claude), None),
+        ["low", "medium", "high", "xhigh", "max"]
     );
 }
 
@@ -1845,15 +1849,19 @@ fn model_picker_openai_compatible_with_current_yields_current_not_placeholder() 
 fn model_picker_openai_compatible_merges_discovered_models_after_current() {
     let discovered = [
         borg_provider::DynamicModelEntry {
-            id: "gguf:qwen3.6-27b-q4_k_m".to_string(),
-            label: "Qwen3.6-27B · Q4_K_M · 15.7 GiB".to_string(),
-            detail: Some("qwen35 · 42 blocks · fits in available VRAM".to_string()),
-        },
+                id: "gguf:qwen3.6-27b-q4_k_m".to_string(),
+                label: "Qwen3.6-27B · Q4_K_M · 15.7 GiB".to_string(),
+                detail: Some("qwen35 · 42 blocks · fits in available VRAM".to_string()),
+                supported_efforts: None,
+                reasoning_mandatory: false,
+            },
         borg_provider::DynamicModelEntry {
-            id: "gguf:bonsai-27b-q2_g64".to_string(),
-            label: "Bonsai-27B · Q2_g64 · 7.1 GiB".to_string(),
-            detail: Some("qwen35 · 32k ctx · may spill to system RAM".to_string()),
-        },
+                id: "gguf:bonsai-27b-q2_g64".to_string(),
+                label: "Bonsai-27B · Q2_g64 · 7.1 GiB".to_string(),
+                detail: Some("qwen35 · 32k ctx · may spill to system RAM".to_string()),
+                supported_efforts: None,
+                reasoning_mandatory: false,
+            },
     ];
     let options = model_picker_options_with_discovered(
         Some(CodingProvider::OpenAiCompatible),
@@ -1874,10 +1882,12 @@ fn model_picker_openai_compatible_merges_discovered_models_after_current() {
 #[test]
 fn model_picker_openrouter_uses_runtime_entries_and_existing_fuzzy_filter() {
     let discovered = [borg_provider::DynamicModelEntry {
-        id: "anthropic/claude-sonnet-4".to_string(),
-        label: "Claude Sonnet 4".to_string(),
-        detail: Some("200000 context · also offered through opencode-go".to_string()),
-    }];
+                id: "anthropic/claude-sonnet-4".to_string(),
+                label: "Claude Sonnet 4".to_string(),
+                detail: Some("200000 context · also offered through opencode-go".to_string()),
+                supported_efforts: None,
+                reasoning_mandatory: false,
+            }];
     let options = model_picker_options_with_discovered(
         Some(CodingProvider::OpenRouter),
         Some("openrouter/auto"),
@@ -1927,10 +1937,12 @@ fn model_picker_openrouter_keeps_manual_current_when_catalog_is_unavailable() {
 #[test]
 fn model_picker_lists_vercel_models_from_any_provider() {
     borg_provider::set_vercel_model_entries(vec![borg_provider::DynamicModelEntry {
-        id: "stealth/pixel-canary".to_string(),
-        label: "Pixel Canary".to_string(),
-        detail: Some("262144 context".to_string()),
-    }]);
+                id: "stealth/pixel-canary".to_string(),
+                label: "Pixel Canary".to_string(),
+                detail: Some("262144 context".to_string()),
+                supported_efforts: None,
+                reasoning_mandatory: false,
+            }]);
 
     // A Codex session lists the gateway's models alongside the fixed catalogs.
     let options = model_picker_options(Some(CodingProvider::Codex), None);

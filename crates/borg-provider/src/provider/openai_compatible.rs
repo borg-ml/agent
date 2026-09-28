@@ -1962,12 +1962,20 @@ fn stream_error_kind(message: &str) -> ProviderErrorKind {
     ProviderErrorKind::Fatal
 }
 
+/// Map a Borg effort onto the gateway's own `reasoning.effort` vocabulary.
+///
+/// The gateway normalizes vendor levels onto exactly these words, so a level
+/// that came from its catalog is forwarded unchanged instead of being folded
+/// through a local table. Only the two Borg-specific rungs are translated:
+/// `ultra` is a Borg step above the gateway's `max`, and `none` means the
+/// reasoning field is omitted entirely.
 fn compatible_reasoning(effort: Option<&str>) -> Option<Value> {
-    match effort.map(str::trim) {
-        Some("low") => Some(json!({ "effort": "low" })),
-        Some("medium") => Some(json!({ "effort": "medium" })),
-        Some("high") => Some(json!({ "effort": "high" })),
-        Some("xhigh") | Some("max") | Some("ultra") => Some(json!({ "effort": "max" })),
+    let effort = effort.map(str::trim)?;
+    match effort {
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => {
+            Some(json!({ "effort": effort }))
+        }
+        "ultra" => Some(json!({ "effort": "max" })),
         _ => None,
     }
 }

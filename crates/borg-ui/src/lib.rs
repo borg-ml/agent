@@ -254,6 +254,10 @@ pub fn model_options(provider: CodingProvider, current: Option<&str>) -> Vec<Mod
             id: id.clone(),
             label: id,
             detail: Some("OpenRouter model; enter another id with /model MODEL".into()),
+            // The catalog is empty here, so this fallback model has no
+            // published effort vocabulary.
+            supported_efforts: None,
+            reasoning_mandatory: false,
         });
     }
     options.extend(openrouter_models.into_iter().map(|model| ModelOption {
