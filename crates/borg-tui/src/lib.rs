@@ -16897,7 +16897,10 @@ fn truncate_status_spans(spans: Vec<Span<'static>>, budget: usize) -> Vec<Span<'
             trimmed.push(span);
             continue;
         }
-        if budget - used > 1 {
+        // Whatever is dropped, the line ends in a mark: with a single column
+        // left the mark is the whole of what fits, and a bare cut reads as text
+        // that simply ends rather than as text that ran out of room.
+        if budget > used {
             trimmed.push(Span::styled(
                 truncate_table_cell(&span.content, budget - used),
                 span.style,
