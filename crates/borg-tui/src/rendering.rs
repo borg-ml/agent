@@ -1353,6 +1353,72 @@ mod tests {
         );
     }
 
+    /// What one frame of a growing reasoning block actually costs, and where
+    /// the cost sits.
+    ///
+    /// This is a measurement rather than a test: there is no bound worth
+    /// asserting, because the number that matters is the one on the machine the
+    /// user is on. It is `#[ignore]`d so it never gates CI, and run with
+    ///
+    /// ```text
+    /// cargo test -p borg-tui --lib -- --ignored reasoning_frame_cost
+    /// ```
+    ///
+    /// The streaming loop re-renders the whole expanded block on every frame,
+    /// and it adapts its frame interval to how long the last draw took - so this
+    /// per-frame number is what sets the rate the text appears to arrive at.
+    #[test]
+    #[ignore = "a measurement, not an assertion; run it on the machine you care about"]
+    fn reasoning_frame_cost() {
+        use std::time::Instant;
+
+        // A long thinking block: a few hundred short lines, which is ordinary
+        // for a model that reasons at length.
+        let source: String = (0..400)
+            .map(|index| {
+                format!(
+                    "considering whether the {index}th approach holds up, and what \
+                     it would cost to be wrong about it"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let width = 100;
+        let rounds = 50;
+
+        // Rendered at several lengths, because the shape of the curve is the
+        // point: a per-frame cost proportional to the block shows up as a line
+        // that rises with length, and that is what caps the streaming frame
+        // rate. Measured on whatever machine runs it, so the absolute numbers
+        // are local; the ratio between them is not.
+        println!(
+            "{:>7}  {:>9}  {:>12}  {:>12}",
+            "lines", "bytes", "parse+wrap", "with prefix"
+        );
+        for count in [50usize, 100, 200, 400, 800] {
+            let source: String = (0..count)
+                .map(|index| {
+                    format!(
+                        "considering whether the {index}th approach holds up, and what \
+                         it would cost to be wrong about it"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let parse_only = Instant::now();
+            for _ in 0..rounds {
+                std::hint::black_box(super::reasoning_lines(&source, width));
+            }
+            let parse = parse_only.elapsed() / rounds;
+            let full = Instant::now();
+            for _ in 0..rounds {
+                std::hint::black_box(super::tool_detail_lines("reasoning", &source, width, "> "));
+            }
+            let full = full.elapsed() / rounds;
+            println!("{count:>7}  {:>9}  {parse:>12?}  {full:>12?}", source.len());
+        }
+    }
+
     fn reasoning_renderer_separates_codex_bold_summary_segments() {
         let lines = tool_body_lines(
             "reasoning",
