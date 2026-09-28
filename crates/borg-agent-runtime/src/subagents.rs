@@ -9546,7 +9546,7 @@ pub(crate) fn exec_tool_spec() -> Value {
 /// The schemas are the catalog's own, taken by name rather than rewritten here.
 /// A second copy of a description is a second thing to forget to update, and
 /// these are descriptions the runtime already depends on.
-pub(crate) fn promoted_capability_tools() -> [&'static str; 10] {
+pub(crate) fn promoted_capability_tools() -> [&'static str; 11] {
     [
         "get_goal",
         "create_goal",
@@ -9558,6 +9558,7 @@ pub(crate) fn promoted_capability_tools() -> [&'static str; 10] {
         "followup_task",
         "query_history",
         "search_files",
+        "computer_use",
     ]
 }
 
