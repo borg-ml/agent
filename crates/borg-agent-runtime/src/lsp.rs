@@ -161,6 +161,8 @@ struct LspClient {
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     opened_versions: HashMap<PathBuf, i32>,
+    // Retain generations after close so late publications cannot match a reopen.
+    last_versions: HashMap<PathBuf, i32>,
     published_diagnostics: HashMap<String, Value>,
 }
 
@@ -811,6 +813,7 @@ impl LspClient {
             stdout: BufReader::new(stdout),
             next_id: 1,
             opened_versions: HashMap::new(),
+            last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
         };
         let root_uri = Url::from_directory_path(root)
@@ -825,7 +828,8 @@ impl LspClient {
                     "hover": { "contentFormat": ["markdown", "plaintext"] },
                     "definition": { "linkSupport": true },
                     "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
-                    "diagnostic": {}
+                    "diagnostic": {},
+                    "publishDiagnostics": { "versionSupport": true }
                 },
                 "workspace": { "symbol": { "resolveSupport": { "properties": [] } } }
             },
@@ -845,25 +849,35 @@ impl LspClient {
         let text = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("cannot read {}", path.display()))?;
-        let version = self.opened_versions.entry(path.to_path_buf()).or_insert(0);
-        *version += 1;
-        let method = if *version == 1 {
-            "textDocument/didOpen"
-        } else {
+        let was_open = self.opened_versions.contains_key(path);
+        let version = self
+            .last_versions
+            .get(path)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("LSP document version exhausted")?;
+        self.last_versions.insert(path.to_path_buf(), version);
+        self.opened_versions.insert(path.to_path_buf(), version);
+        // Do not return a cached earlier generation after didChange/didOpen.
+        self.published_diagnostics.remove(uri);
+        let method = if was_open {
             "textDocument/didChange"
+        } else {
+            "textDocument/didOpen"
         };
-        let params = if *version == 1 {
+        let params = if !was_open {
             json!({
                 "textDocument": {
                     "uri": uri,
                     "languageId": language_id,
-                    "version": *version,
+                    "version": version,
                     "text": text.clone()
                 }
             })
         } else {
             json!({
-                "textDocument": { "uri": uri, "version": *version },
+                "textDocument": { "uri": uri, "version": version },
                 "contentChanges": [{ "text": text.clone() }]
             })
         };
@@ -1078,6 +1092,25 @@ impl LspClient {
         let Some(uri) = message.pointer("/params/uri").and_then(Value::as_str) else {
             return;
         };
+        let Some(path) = Url::parse(uri).ok().and_then(|uri| uri.to_file_path().ok()) else {
+            return;
+        };
+        let Some(current) = self.opened_versions.get(&path).copied() else {
+            // Includes didClose's empty publication: it is not a source check.
+            return;
+        };
+        let version = message.pointer("/params/version");
+        if let Some(version) = version.filter(|value| !value.is_null()) {
+            if version.as_i64() != Some(i64::from(current)) {
+                return;
+            }
+        } else if current != 1 {
+            // An unversioned publication after edit/reopen cannot establish
+            // freshness. Keep first-open compatibility, but fail closed later
+            // (pull diagnostics may still work). Version-aware servers were
+            // explicitly told to include versions in initialize.
+            return;
+        }
         let diagnostics = message
             .pointer("/params/diagnostics")
             .cloned()
@@ -2082,6 +2115,7 @@ mod tests {
                 stdout: BufReader::new(stdout),
                 next_id: 1,
                 opened_versions: HashMap::new(),
+                last_versions: HashMap::new(),
                 published_diagnostics: HashMap::new(),
             }))));
         service.leased.lock().await.insert(key.clone());
@@ -2396,6 +2430,79 @@ mod tests {
         );
     }
 
+    /// A late didClose clear used to refill the diagnostic cache and then
+    /// masquerade as a fresh, empty workspace report. Source/type checking does
+    /// not exercise this protocol ordering; test real open/change/close state
+    /// with injected publications instead of depending on clangd timing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn published_diagnostics_must_match_the_live_document_generation() {
+        let root = tempfile::tempdir().expect("workspace");
+        let path = root.path().join("unit.cpp");
+        tokio::fs::write(&path, "int value;\n")
+            .await
+            .expect("source");
+        let uri = Url::from_file_path(&path).expect("uri").to_string();
+        let mut child = Command::new("sh")
+            .args(["-c", "cat >/dev/null"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("owned silent server");
+        let mut client = LspClient {
+            stdin: child.stdin.take().expect("stdin"),
+            stdout: BufReader::new(child.stdout.take().expect("stdout")),
+            child,
+            next_id: 1,
+            opened_versions: HashMap::new(),
+            last_versions: HashMap::new(),
+            published_diagnostics: HashMap::new(),
+        };
+        let publication = |version: Value, diagnostics: Value| {
+            json!({
+                "method": "textDocument/publishDiagnostics",
+                "params": {"uri": uri, "version": version, "diagnostics": diagnostics}
+            })
+        };
+        let error = json!([{"severity": 1, "message": "fixture source error"}]);
+        client
+            .open_document(&path, &uri, "cpp")
+            .await
+            .expect("open");
+        client.capture_diagnostics(&publication(Value::Null, error.clone()));
+        assert_eq!(client.published_diagnostics.get(&uri), Some(&error));
+        client
+            .open_document(&path, &uri, "cpp")
+            .await
+            .expect("change");
+        assert!(!client.published_diagnostics.contains_key(&uri));
+        client.capture_diagnostics(&publication(json!(1), json!([])));
+        assert!(!client.published_diagnostics.contains_key(&uri));
+        client.capture_diagnostics(&publication(json!(2), error.clone()));
+        assert_eq!(client.published_diagnostics.get(&uri), Some(&error));
+        client.close_document(&path, &uri).await.expect("close");
+        client.capture_diagnostics(&publication(Value::Null, json!([])));
+        client.capture_diagnostics(&publication(json!(2), error.clone()));
+        assert!(!client.published_diagnostics.contains_key(&uri));
+        client
+            .open_document(&path, &uri, "cpp")
+            .await
+            .expect("reopen");
+        assert_eq!(client.opened_versions.get(&path), Some(&3));
+        client.capture_diagnostics(&publication(Value::Null, json!([])));
+        client.capture_diagnostics(&publication(json!(2), json!([])));
+        assert!(!client.published_diagnostics.contains_key(&uri));
+        client.capture_diagnostics(&publication(json!(3), error.clone()));
+        assert_eq!(client.published_diagnostics.get(&uri), Some(&error));
+        let report = client
+            .wait_for_published_diagnostics(&uri, Duration::ZERO)
+            .await
+            .expect("current publication");
+        assert_eq!(report["items"], error);
+        client.child.kill().await.expect("stop owned server");
+    }
+
     /// A scan with a nonzero budget must bound an in-flight diagnostic too,
     /// not just notice expiration before the NEXT file. A compiler check and
     /// the already-expired-budget test cannot catch a 120-second fallback wait.
@@ -2421,6 +2528,7 @@ mod tests {
             child,
             next_id: 1,
             opened_versions: HashMap::new(),
+            last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
         };
         let clangd = spec_for_id("clangd").expect("spec");
