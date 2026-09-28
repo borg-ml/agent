@@ -26,6 +26,9 @@ so there is no visible bottom strip. The physical remainder can still exist.
 
 ## Numbered click hints
 
+Numbered hints can be disabled under /settings → Numbered Ctrl/Cmd hints.
+They are enabled by default.
+
 Hold Ctrl (or Cmd/Super where the terminal forwards it) to show up to ten
 clickable targets. Press the displayed digit to click immediately: **1–9, then
 0 for the tenth target**. No Enter is needed. Release the modifier or press Esc

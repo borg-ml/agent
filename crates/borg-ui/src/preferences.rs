@@ -153,6 +153,7 @@ pub struct InteractionPreferences {
     pub completion_sound: CompletionAlertPolicy,
     /// Copy mouse-selected text to the clipboard when the drag ends.
     pub auto_copy_selection: bool,
+    pub key_hints: bool,
     /// Allow Codex subscription Luna to title new threads on other providers.
     pub luna_titles_for_all_providers: bool,
     /// Set once the user has completed the enable-dictation flow (which also
@@ -173,6 +174,7 @@ impl Default for InteractionPreferences {
             completion_notifications: CompletionAlertPolicy::Unfocused,
             completion_sound: CompletionAlertPolicy::Unfocused,
             auto_copy_selection: true,
+            key_hints: true,
             luna_titles_for_all_providers: false,
             dictation_enabled: false,
             last_model: None,
@@ -597,6 +599,7 @@ keep = true
                 completion_notifications: CompletionAlertPolicy::Always,
                 completion_sound: CompletionAlertPolicy::Off,
                 auto_copy_selection: false,
+                key_hints: false,
                 luna_titles_for_all_providers: true,
                 dictation_enabled: true,
                 last_model: Some(borg_remote::ModelRoute {

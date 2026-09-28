@@ -17,6 +17,8 @@ completion_notifications = "unfocused"
 completion_sound = "unfocused"
 # Automatically copy selected transcript/composer text when releasing the mouse.
 auto_copy_selection = true
+# Show numbered clickable targets while holding Ctrl/Cmd (or toggling F12).
+key_hints = true
 # Send up to 2,000 characters of a new thread's first prompt to your Codex
 # subscription for Luna titles, even when the thread uses another provider.
 # Off by default; never falls back to API-key billing.

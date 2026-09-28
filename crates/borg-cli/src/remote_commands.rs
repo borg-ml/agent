@@ -2803,6 +2803,7 @@ async fn run_local_agent_session(
             editor_preferences.interaction.completion_sound,
         );
         terminal.set_auto_copy_selection(editor_preferences.interaction.auto_copy_selection);
+        terminal.set_key_hints(editor_preferences.interaction.key_hints);
         terminal.set_luna_titles_for_all_providers(
             editor_preferences.interaction.luna_titles_for_all_providers,
         );
@@ -3960,6 +3961,7 @@ async fn run_local_agent_session(
                                 terminal.set_auto_copy_selection(
                                     editor_preferences.interaction.auto_copy_selection,
                                 );
+                                terminal.set_key_hints(editor_preferences.interaction.key_hints);
                                 terminal.set_luna_titles_for_all_providers(
                                     editor_preferences.interaction.luna_titles_for_all_providers,
                                 );
@@ -5410,7 +5412,7 @@ async fn run_local_agent_session(
                                 &ui_interaction_tx,
                                 model_selection_command(session_id, active, target, model.clone()),
                             );
-                            terminal.as_mut().expect("terminal").set_notice(format!("Selected {model}. Use /effort to adjust reasoning or /login to change billing."));
+                            terminal.as_mut().expect("terminal").open_effort_picker_for(Some(target), Some(&model));
                         }
                     }
                     UiAction::AuthenticateProvider {
@@ -5468,6 +5470,7 @@ async fn run_local_agent_session(
                                     editor_preferences.presentation.dictation_icon,
                                 ));
                                 restored.set_active_message_behavior(steer_active_turn);
+                                restored.set_key_hints(editor_preferences.interaction.key_hints);
                                 restored.set_configured_model_entries(agent_config.configured_model_entries());
                                 restored.set_extension_commands(extension_catalog.api_snapshot().commands);
                                 let composer_history = store
@@ -5501,6 +5504,7 @@ async fn run_local_agent_session(
                                         &ui_interaction_tx,
                                         model_selection_command(session_id, active, target, model.clone()),
                                     );
+                                    terminal.open_effort_picker_for(Some(target), Some(&model));
                                 }
                             }
                         }
@@ -5792,6 +5796,11 @@ async fn run_local_agent_session(
                             "Luna titles across providers: {} · applies to new threads with an available Codex subscription",
                             if enabled { "on" } else { "off" }
                         ));
+                    }
+                    UiAction::SetKeyHints(enabled) => {
+                        editor_preferences.interaction.key_hints = enabled;
+                        dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
+                        terminal.as_mut().expect("terminal").set_key_hints(enabled);
                     }
                     UiAction::SetAutoCopySelection(enabled) => {
                         editor_preferences.interaction.auto_copy_selection = enabled;
@@ -6695,9 +6704,10 @@ async fn run_local_agent_session(
                                     session_id,
                                     active_provider,
                                     target,
-                                    model,
+                                    model.clone(),
                                 ),
                             );
+                            terminal.as_mut().expect("terminal").open_effort_picker_for(Some(target), Some(&model));
                         } else if let Some(effort) = line.strip_prefix("/effort ")
                             && attachments.is_empty()
                         {

@@ -926,6 +926,7 @@ pub enum UiAction {
     SetCompletionNotifications(CompletionAlertPolicy),
     SetCompletionSound(CompletionAlertPolicy),
     SetAutoCopySelection(bool),
+    SetKeyHints(bool),
     SetLunaTitlesForAllProviders(bool),
     SetDictationIcon(DictationIconStyle),
     /// Completes the enable-dictation flow: persist model/accelerator/icon,
@@ -1688,6 +1689,7 @@ pub struct BorgTerminal {
     show_footer: bool,
     window_focused: bool,
     key_hints: KeyHints,
+    key_hints_enabled: bool,
     tool_hit_areas: Vec<(Rect, usize)>,
     tool_run_hit_areas: Vec<(Rect, usize, usize)>,
     tool_run_header_hit_areas: Vec<(Rect, usize)>,
@@ -1962,6 +1964,7 @@ enum PickerKind {
     CompletionNotifications,
     CompletionSound,
     AutoCopySelection,
+    KeyHints,
     LunaTitlesForAllProviders,
     DictationModel,
     DictationAccelerator,
@@ -2972,6 +2975,7 @@ impl BorgTerminal {
             show_footer: true,
             window_focused: true,
             key_hints: KeyHints::default(),
+            key_hints_enabled: true,
             tool_hit_areas: Vec::new(),
             tool_run_hit_areas: Vec::new(),
             tool_run_header_hit_areas: Vec::new(),
@@ -5197,6 +5201,7 @@ impl BorgTerminal {
             "Completion notifications".to_string(),
             "Completion sound".to_string(),
             "Auto-copy selections".to_string(),
+            "Numbered Ctrl/Cmd hints".to_string(),
             "Luna titles across providers".to_string(),
             "Microphone icon".to_string(),
             "Transcript colours".to_string(),
@@ -5226,6 +5231,7 @@ impl BorgTerminal {
             "/notifications",
             "/sound",
             "auto-copy",
+            "key-hints",
             "luna-titles",
             "/icons",
             "/colors",
@@ -5666,6 +5672,15 @@ impl BorgTerminal {
         ));
     }
 
+    pub fn open_key_hints_picker(&mut self) {
+        self.picker = Some(Picker::new(
+            PickerKind::KeyHints,
+            "Numbered Ctrl/Cmd hints",
+            ["On", "Off"],
+            Some(if self.key_hints_enabled { "On" } else { "Off" }),
+        ));
+    }
+
     pub fn open_auto_copy_selection_picker(&mut self) {
         self.picker = Some(Picker::new(
             PickerKind::AutoCopySelection,
@@ -6010,7 +6025,8 @@ impl BorgTerminal {
             &event,
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved)
         );
-        if let Event::Key(key) = &event
+        if self.key_hints_enabled
+            && let Event::Key(key) = &event
             && let Some(action) = self.handle_key_hint(*key)?
         {
             return Ok(action);
@@ -6717,6 +6733,13 @@ impl BorgTerminal {
 
     pub fn set_luna_titles_for_all_providers(&mut self, enabled: bool) {
         self.luna_titles_for_all_providers = enabled;
+    }
+
+    pub fn set_key_hints(&mut self, enabled: bool) {
+        self.key_hints_enabled = enabled;
+        if !enabled {
+            self.key_hints = KeyHints::default();
+        }
     }
 
     pub fn set_auto_copy_selection(&mut self, enabled: bool) {
@@ -7453,6 +7476,10 @@ impl BorgTerminal {
                 self.open_composer_cursor_style_picker();
                 UiAction::None
             }
+            PickerKind::Settings if picker.options[picker.selected].value == "key-hints" => {
+                self.open_key_hints_picker();
+                UiAction::None
+            }
             PickerKind::Settings if picker.options[picker.selected].value == "auto-copy" => {
                 self.open_auto_copy_selection_picker();
                 UiAction::None
@@ -7602,6 +7629,7 @@ impl BorgTerminal {
             PickerKind::LunaTitlesForAllProviders => {
                 UiAction::SetLunaTitlesForAllProviders(picker.selected_value() == "On")
             }
+            PickerKind::KeyHints => UiAction::SetKeyHints(picker.selected_value() == "On"),
             PickerKind::AutoCopySelection => {
                 UiAction::SetAutoCopySelection(picker.selected_value() == "On")
             }
