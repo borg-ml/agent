@@ -5,6 +5,45 @@ Git comparison.
 
 ## Unreleased (since 0.12.9)
 
+### Tools
+
+- The goal, plan, subagent and cross-agent messaging capabilities are their own
+  tools, and one `capability` tool reaches everything else by name or by search.
+  Both are on the default surface, not only on the opt-in one. A promoted name is
+  refused through the generic tool and points at its own, and an unknown name is
+  answered with the closest real capabilities rather than a bare error.
+- `query_history` is a tool, so which of its retrieval modes answers a question
+  arrives with the guidance instead of after a wrong guess.
+- `search_files` is a tool backed by ripgrep's own engine, so it needs no
+  external executable and is the thing to reach for rather than grep. A file with
+  undecodable bytes no longer costs you every match inside it.
+- Extension capabilities are advertised with descriptions read from the live
+  catalog, so a newly loaded extension is visible without restarting anything.
+
+### Reliability
+
+- An upstream that answers with an empty response is retried instead of ending
+  the turn. Only a refusal is treated as fatal now; everything else is
+  retryable, as it was before mid-stream errors were recognised at all.
+- A tool call carrying the presentation field its own schema advertises is
+  accepted. The same idea appears as `action` and as `description`, and a call
+  formed exactly as documented was being refused as malformed - the cause of most
+  of that tool's flakiness.
+
+### Terminal UI
+
+- A status line that overflows now ends in a mark. Losing its last column to
+  truncation used to drop the tail with nothing to show the text had been cut.
+- The effort and billing segments share one colour instead of being graded per
+  value, so the same colour no longer means xhigh in one place and a pro/max
+  subscription in another.
+
+### Setup
+
+- The Python library's documented usage is corrected: `borg` is already in the
+  namespace, so `import borg` is not part of it.
+- `HOME` can be set for the runtime worker as a user setting, defaulting to off.
+
 ## 0.12.9 (2026-09-27)
 
 ### Updates
