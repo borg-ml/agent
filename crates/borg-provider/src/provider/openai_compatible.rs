@@ -1077,41 +1077,31 @@ fn openrouter_model_limits_from_response(raw: &Value) -> Option<OpenRouterModelL
     })
 }
 
-/// Model ids that are established to accept Anthropic-style prompt cache
-/// markers on the OpenCode Go route, keyed by the id the wire carries.
+/// Routes that read Anthropic-style prompt cache markers, keyed by provider
+/// label. A gateway serving one vendor family speaks that vendor's dialect, so
+/// the marker belongs on every model behind it rather than on a list of model
+/// ids that stops being true the moment a vendor ships a version.
 ///
-/// This is a list and not a name pattern because the gateway *rejects* the
-/// field everywhere else instead of ignoring it: on the same body and endpoint,
-/// glm-5.3 answered 400 with "Extra inputs are not permitted ... cache_control"
-/// and kimi-k3 answered 400 with "The parameter cache_control is not supported
-/// for the requested model", while every model listed here answered 200. A
-/// wrong guess is therefore a failed turn, not a silent no-op. Verified live
-/// against the Go gateway: a repeated 6418-token prefix reported 6412 cached
-/// tokens with the markers, and no cache accounting at all without them.
-const ANTHROPIC_CACHE_MARKER_MODELS: [&str; 5] = [
-    "qwen3.6-plus",
-    "qwen3.7-plus",
-    "qwen3.7-max",
-    "qwen3.8-flash",
-    "qwen3.8-max",
-];
+/// The probe behind this: on the OpenCode Go gateway a repeated prefix reported
+/// cached tokens with the markers and none without, while the same markers
+/// answered 400 ("Extra inputs are not permitted ... cache_control") on glm and
+/// kimi, which are different families behind the same label. A wrong guess is
+/// therefore a failed turn rather than a silent no-op, which is why the
+/// selection is a declared dialect and stays overridable.
+const ANTHROPIC_CACHE_DIALECT_PROVIDERS: [&str; 1] = ["opencode-go"];
 
-/// The only route that may carry the markers: the OpenCode Go gateway these
-/// models were verified against. Every other compatible endpoint - a
-/// user-configured one, Kimi, GLM, Qwen through Alibaba Model Studio, or
-/// OpenRouter - keeps the request body it sends today, byte for byte.
-const ANTHROPIC_CACHE_MARKER_LABEL: &str = "opencode-go";
+/// Model families that speak the Anthropic cache dialect on a route declared
+/// above. Anything else behind the same gateway - a GLM or a Kimi model - is
+/// excluded by construction rather than by an exclusion list.
+const ANTHROPIC_CACHE_MODEL_FAMILIES: [&str; 1] = ["qwen"];
 
-/// Override for a model that has not been added to the list yet, and for
-/// turning the markers off if an upstream change breaks them. It can only widen
-/// or narrow the selection within ANTHROPIC_CACHE_MARKER_LABEL: no value of it
-/// makes another vendor receive the field.
+/// Override for a model family that has not been added yet, and for turning
+/// the markers off if an upstream change breaks them. It can only widen or
+/// narrow the selection within a route declared above: no value of it makes
+/// another vendor receive the field.
 const ANTHROPIC_CACHE_MARKER_ENV: &str = "BORG_ANTHROPIC_CACHE_MARKERS";
 
 /// Whether this turn may carry Anthropic-style cache_control markers.
-///
-/// Off unless an entry in the list, or the environment override, says
-/// otherwise.
 fn anthropic_cache_markers_enabled(provider_label: &str, model: &str) -> bool {
     anthropic_cache_markers_for(
         provider_label,
@@ -1127,21 +1117,21 @@ fn anthropic_cache_markers_for(
     model: &str,
     override_value: Option<&str>,
 ) -> bool {
-    if provider_label != ANTHROPIC_CACHE_MARKER_LABEL {
+    if !ANTHROPIC_CACHE_DIALECT_PROVIDERS.contains(&provider_label) {
         return false;
     }
-    match override_value {
-        Some("off") => false,
-        Some("on") => true,
-        _ => ANTHROPIC_CACHE_MARKER_MODELS.contains(&model),
+    if let Some(forced) = override_value {
+        return match forced {
+            "off" => false,
+            "on" => true,
+            _ => false,
+        };
     }
+    ANTHROPIC_CACHE_MODEL_FAMILIES
+        .iter()
+        .any(|family| model.starts_with(family))
 }
 
-/// Mark the instruction block, the end of the conversation, and the tool list
-/// boundary: the positions this upstream caches on.
-///
-/// Applied to the finished body, so no profile or configured gateway body can
-/// add a marker and nothing built afterwards can drop one.
 fn apply_anthropic_cache_markers(body: &mut Value) {
     let marker = json!({ "type": "ephemeral" });
     if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
@@ -3120,41 +3110,27 @@ mod tests {
     }
 
     /// The gateway answers 400 for cache_control on a model that does not
-    /// accept it, so a wrong selection is a failed turn. This pins the
-    /// selection: an unlisted model, another route, and another vendor all keep
-    /// the request body they send today.
+    /// accept it, so a wrong selection is a failed turn. The selection is a
+    /// declared dialect plus a model family, not a list of ids: a new version
+    /// of a known family is covered by construction, and a different family
+    /// behind the same gateway stays excluded without naming it.
     #[test]
-    fn anthropic_cache_markers_are_selected_only_where_the_gateway_accepts_them() {
-        assert!(anthropic_cache_markers_for(
-            "opencode-go",
-            "qwen3.6-plus",
-            None
-        ));
+    fn anthropic_cache_markers_follow_a_declared_dialect_and_model_family() {
+        // The family is covered whatever the version.
+        assert!(anthropic_cache_markers_for("opencode-go", "qwen3.6-plus", None));
+        assert!(anthropic_cache_markers_for("opencode-go", "qwen3.9-plus", None));
+        assert!(anthropic_cache_markers_for("opencode-go", "qwen3.7-max", None));
+        // Another family behind the same gateway keeps the body it sends today.
         assert!(!anthropic_cache_markers_for("opencode-go", "glm-5.3", None));
         assert!(!anthropic_cache_markers_for("opencode-go", "kimi-k3", None));
+        // Another route never receives the field, whatever the model.
         assert!(!anthropic_cache_markers_for("qwen", "qwen3.6-plus", None));
-        assert!(!anthropic_cache_markers_for(
-            "openai-compatible",
-            "qwen3.6-plus",
-            None
-        ));
-        // The override adds a model or disables the field, but it can never
-        // move the field onto a different vendor.
-        assert!(anthropic_cache_markers_for(
-            "opencode-go",
-            "qwen3.9-plus",
-            Some("on")
-        ));
-        assert!(!anthropic_cache_markers_for(
-            "opencode-go",
-            "qwen3.6-plus",
-            Some("off")
-        ));
-        assert!(!anthropic_cache_markers_for(
-            "openai-compatible",
-            "qwen3.9-plus",
-            Some("on")
-        ));
+        assert!(!anthropic_cache_markers_for("openai-compatible", "qwen3.6-plus", None));
+        // The override can widen within a declared route or turn it off, and
+        // can never move the field onto another vendor.
+        assert!(anthropic_cache_markers_for("opencode-go", "vendor/new", Some("on")));
+        assert!(!anthropic_cache_markers_for("opencode-go", "qwen3.6-plus", Some("off")));
+        assert!(!anthropic_cache_markers_for("openai-compatible", "qwen3.9-plus", Some("on")));
     }
 
     /// A marker on the wrong part caches nothing while still paying for the

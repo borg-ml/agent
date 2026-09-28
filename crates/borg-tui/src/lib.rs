@@ -2813,16 +2813,42 @@ fn effort_picker_options(
             .map(|level| (*level).to_string())
             .collect();
     }
-    let entries = match provider.catalog_backend() {
+    let Some(model) = model else {
+        return Vec::new();
+    };
+    // The serving gateway answers first: it knows what *it* will accept for a
+    // model it routes, which a shared catalog cannot.
+    let served = match provider.catalog_backend() {
         "openrouter" => borg_provider::openrouter_model_entries(),
         "vercel" => borg_provider::vercel_model_entries(),
-        _ => return Vec::new(),
+        _ => Vec::new(),
     };
-    // A model missing from the catalog is unknown, not unrestricted: offering
-    // a guessed ladder here is exactly the bug this replaces.
-    model
-        .and_then(|model| borg_provider::gateway_effort_levels(model, &entries))
+    if let Some(levels) = borg_provider::gateway_effort_levels(model, &served) {
+        return levels;
+    }
+    // Otherwise the vendor's own published capabilities, which also cover the
+    // direct routes that have no gateway catalog at all.
+    borg_provider::model_caps::capability(models_dev_provider(provider), model)
+        .map(|capability| capability.effort_values)
         .unwrap_or_default()
+}
+
+/// The models.dev key for a route, or `""` when it publishes nothing.
+///
+/// These are catalog identifiers, not display names, so a rename on Borg's side
+/// cannot silently point at a different vendor's data.
+fn models_dev_provider(provider: CodingProvider) -> &'static str {
+    match provider {
+        CodingProvider::Codex => "openai",
+        CodingProvider::Claude | CodingProvider::Anthropic => "anthropic",
+        CodingProvider::Qwen => "alibaba",
+        CodingProvider::Glm => "zai",
+        CodingProvider::Kimi => "moonshotai",
+        CodingProvider::OpenCode => "opencode",
+        CodingProvider::OpenRouter => "openrouter",
+        CodingProvider::Vercel => "vercel",
+        _ => "",
+    }
 }
 
 /// Whether the configured model can be asked to skip reasoning entirely.

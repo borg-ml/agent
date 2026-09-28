@@ -2429,6 +2429,17 @@ async fn run_local_agent_session(
                 tracing::debug!(%error, "Vercel AI Gateway model catalog unavailable; keeping current/manual model fallback");
             }
         });
+        // Per-vendor capabilities, including for the direct routes that have
+        // no gateway catalog of their own. Absent or stale data only means the
+        // effort picker stays closed for a model it cannot describe.
+        tokio::spawn(async {
+            match borg_provider::model_caps::refresh().await {
+                Ok(models) => tracing::debug!(models, "loaded models.dev capabilities"),
+                Err(error) => {
+                    tracing::debug!(%error, "models.dev capabilities unavailable; effort levels fall back to the served catalog");
+                }
+            }
+        });
     }
     let fallback_terminal = can_prompt && !rich_tui_allowed;
     let mut initial_prompt = if !args.prompt.is_empty() {
