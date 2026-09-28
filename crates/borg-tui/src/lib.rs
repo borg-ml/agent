@@ -8701,10 +8701,17 @@ impl BorgTerminal {
                     Paragraph::new(vec![
                         splash_logo_line(self.splash_started_at.elapsed(), self.splash_glitch_seed),
                         splash_agent_line(),
-                        Line::from(Span::styled(
-                            format!("{RELEASE_CHANNEL} {}", splash_version()),
-                            Style::default().fg(Color::DarkGray),
-                        )),
+                        // The channel is white and the number is grey, on one
+                        // line. The channel is the thing you should notice and
+                        // the version is the thing you only want when you go
+                        // looking, so they are not drawn the same.
+                        Line::from(vec![
+                            Span::styled(RELEASE_CHANNEL, Style::default().fg(Color::White)),
+                            Span::styled(
+                                format!(" {}", splash_version()),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]),
                         Line::from(""),
                         Line::from(Span::styled(
                             ui_text(ui_language, "What are we working on?"),
