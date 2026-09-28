@@ -386,7 +386,7 @@ impl OpenAiCompatibleProvider {
                 body["prompt_cache_key"] = json!(prompt_cache_key);
             }
         }
-        apply_reasoning(&mut body, profile, self.effort.as_deref());
+        apply_reasoning(&mut body, profile, request_model, self.effort.as_deref());
         match profile {
             OpenAiCompatibleProfile::Kimi => {
                 body["max_completion_tokens"] = json!(kimi_max_completion_tokens());
@@ -1949,17 +1949,32 @@ enum ReasoningField {
 
 /// How one route asks for reasoning.
 ///
-/// `vocabulary` is the set of words that route actually accepts, ascending. An
-/// empty vocabulary means the route takes the normalized effort unchanged,
-/// which is the case for every gateway that publishes a normalized vocabulary of
-/// its own. A non-empty one is a vendor with a narrower ladder than Borg's, and
-/// the requested level is clamped onto it by rank rather than translated by a
-/// per-vendor match arm.
+/// `declared` is the fallback vocabulary, used when the catalog does not
+/// describe the model. The catalog wins wherever it does, because these
+/// tables were written from one probe and are wrong where nobody noticed:
+/// GLM was clamped to low/medium/high while the catalog says glm-5.3 takes
+/// low/high/max. The table stays so a model the catalog omits still gets a
+/// safe answer instead of no picker at all.
 #[derive(Clone, Copy, Debug)]
 struct ReasoningWire {
     field: ReasoningField,
-    vocabulary: &'static [&'static str],
+    declared: &'static [&'static str],
     default: &'static str,
+}
+
+/// The models.dev key for a route, or `""` when it publishes nothing.
+///
+/// These are catalog identifiers, not display names, so a rename on Borg's side
+/// cannot silently point at a different vendor's data.
+const fn models_dev_key(profile: OpenAiCompatibleProfile) -> &'static str {
+    match profile {
+        OpenAiCompatibleProfile::Kimi => "moonshotai",
+        OpenAiCompatibleProfile::Glm => "zai",
+        OpenAiCompatibleProfile::Qwen => "alibaba",
+        OpenAiCompatibleProfile::OpenRouter => "openrouter",
+        OpenAiCompatibleProfile::Vercel => "vercel",
+        _ => "",
+    }
 }
 
 /// Borg's own effort ladder, cheapest first, plus `none` below it.
@@ -1979,29 +1994,24 @@ impl OpenAiCompatibleProfile {
     /// reasoning control and the body must stay silent.
     const fn reasoning_wire(self) -> Option<ReasoningWire> {
         match self {
-            // Kimi folds Borg's ladder onto low / high / max.
             Self::Kimi => Some(ReasoningWire {
                 field: ReasoningField::Effort,
-                vocabulary: &["low", "high", "max"],
+                declared: &["low", "high", "max"],
                 default: "high",
             }),
-            // Z.ai takes the OpenAI spelling but only low / medium / high.
             Self::Glm => Some(ReasoningWire {
                 field: ReasoningField::Effort,
-                vocabulary: &["low", "medium", "high"],
+                declared: &["low", "medium", "high"],
                 default: "medium",
             }),
-            // Alibaba gates reasoning with a boolean rather than a level.
             Self::Qwen => Some(ReasoningWire {
                 field: ReasoningField::ThinkingToggle,
-                vocabulary: &[],
+                declared: &[],
                 default: "high",
             }),
-            // Gateways normalize reasoning themselves and publish the exact
-            // words in their catalog, so the level passes straight through.
             Self::OpenRouter | Self::Vercel => Some(ReasoningWire {
                 field: ReasoningField::NestedEffort,
-                vocabulary: &[],
+                declared: &[],
                 default: "high",
             }),
             Self::Generic => None,
@@ -2009,27 +2019,51 @@ impl OpenAiCompatibleProfile {
     }
 }
 
-/// The word to send for `effort` on a route with a narrower vocabulary.
+/// The vocabulary this route accepts for `model`.
 ///
-/// Clamping is by rank, so a wider Borg ladder lands on the nearest word the
-/// vendor accepts instead of being silently downgraded by a hand-written arm.
-fn clamp_effort_to_vocabulary(effort: Option<&str>, wire: &ReasoningWire) -> &'static str {
-    let vocabulary = wire.vocabulary;
+/// The catalog answers for the model when it knows it. A model it does not
+/// describe falls back to the declared table, and a route that declares none
+/// forwards the normalized word unchanged.
+fn vocabulary_for(
+    profile: OpenAiCompatibleProfile,
+    wire: &ReasoningWire,
+    model: &str,
+) -> Vec<String> {
+    let published = crate::models_catalog::effort_values(models_dev_key(profile), model);
+    if !published.is_empty() {
+        return published;
+    }
+    wire.declared.iter().map(|level| (*level).to_string()).collect()
+}
+
+/// Clamp a requested level onto a route's vocabulary by rank.
+///
+/// Nearest rung wins, with an exact tie resolving upward: a caller asking for
+/// `xhigh` on a route offering high and max meant "at least this much", so it
+/// must not be quietly downgraded.
+fn clamp_effort_to_vocabulary(
+    effort: Option<&str>,
+    vocabulary: &[String],
+    default: &str,
+) -> String {
     if vocabulary.is_empty() {
-        return wire.default;
+        return match effort.map(str::trim) {
+            Some("ultra") => "max".to_string(),
+            Some(
+                level @ ("minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "none"),
+            ) => level.to_string(),
+            _ => default.to_string(),
+        };
     }
     let Some(requested) = effort.map(str::trim).and_then(effort_rank) else {
-        return wire.default;
+        return default.to_string();
     };
     vocabulary
         .iter()
-        .map(|level| (*level, effort_rank(level).unwrap_or(0)))
-        // Nearest rung by rank, resolving an exact tie upward: a caller asking
-        // for `xhigh` on a route offering high and max meant "at least this
-        // much", so it must not be quietly downgraded.
+        .map(|level| (level.as_str(), effort_rank(level).unwrap_or(0)))
         .min_by_key(|(_, rank)| (rank.abs_diff(requested), std::cmp::Reverse(*rank)))
-        .map(|(level, _)| level)
-        .unwrap_or(wire.default)
+        .map(|(level, _)| level.to_string())
+        .unwrap_or_else(|| default.to_string())
 }
 
 /// Write this turn's reasoning onto the request body.
@@ -2041,6 +2075,7 @@ fn clamp_effort_to_vocabulary(effort: Option<&str>, wire: &ReasoningWire) -> &'s
 fn apply_reasoning(
     body: &mut Value,
     profile: OpenAiCompatibleProfile,
+    model: &str,
     effort: Option<&str>,
 ) {
     let Some(wire) = profile.reasoning_wire() else {
@@ -2054,8 +2089,9 @@ fn apply_reasoning(
             body["enable_thinking"] = json!(!off);
         }
         ReasoningField::Effort => {
+            let vocabulary = vocabulary_for(profile, &wire, model);
             body["reasoning_effort"] =
-                json!(compatible_effort_value(effort, wire.vocabulary, wire.default));
+                json!(clamp_effort_to_vocabulary(effort, &vocabulary, wire.default));
         }
         ReasoningField::NestedEffort => {
             if let Some(value) = compatible_reasoning(effort) {
@@ -2065,37 +2101,6 @@ fn apply_reasoning(
     }
 }
 
-/// The single wire value for a route that takes OpenAI's `reasoning_effort`.
-///
-/// A route with a published vocabulary gets the level clamped onto it; a route
-/// without one takes the normalized word unchanged. `ultra` is Borg's own rung
-/// above the gateway's `max`, so it is the one level translated rather than
-/// forwarded.
-fn compatible_effort_value(
-    effort: Option<&str>,
-    vocabulary: &'static [&'static str],
-    default: &'static str,
-) -> String {
-    if !vocabulary.is_empty() {
-        return clamp_effort_to_vocabulary(
-            effort,
-            &ReasoningWire {
-                field: ReasoningField::Effort,
-                vocabulary,
-                default,
-            },
-        )
-        .to_string();
-    }
-    match effort.map(str::trim) {
-        // `ultra` is Borg's own rung above the gateway's `max`.
-        Some("ultra") => "max".to_string(),
-        Some(
-            level @ ("minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "none"),
-        ) => level.to_string(),
-        _ => default.to_string(),
-    }
-}
 
 fn compatible_openrouter_provider_preferences(require_parameters: bool) -> Option<Value> {
     let order = nonempty_env("BORG_OPENROUTER_PROVIDER_ORDER")
@@ -2366,11 +2371,41 @@ mod tests {
     /// actually accepts. Before this, each of Kimi, GLM, Qwen, OpenRouter and
     /// Vercel had its own hand-written mapping; a route whose vendor ladder
     /// changed needed a code change here.
+    /// The bug this replaces: Borg clamped GLM onto low/medium/high from one
+    /// probe, while models.dev publishes low/high/max for glm-5.3. A request
+    /// asking for `medium` was silently rewritten, and `max` was unavailable.
+    /// The catalog now answers, and the declared table is only a fallback.
+    #[test]
+    fn the_catalog_vocabulary_overrides_the_declared_table() {
+        crate::models_catalog::set_for_test(
+            crate::models_catalog::parse(&serde_json::json!({
+                "zai": { "models": { "glm-5.3": { "reasoning_options": [
+                    { "type": "effort", "values": ["max", "high", "low"] }
+                ] } } },
+            })),
+        );
+        let mut body = json!({});
+        apply_reasoning(&mut body, OpenAiCompatibleProfile::Glm, "glm-5.3", Some("medium"));
+        // `medium` does not exist on this model, so it clamps onto the nearest
+        // published rung rather than the declared `medium` it used to send.
+        assert_ne!(body["reasoning_effort"], "medium");
+
+        let mut maxed = json!({});
+        apply_reasoning(&mut maxed, OpenAiCompatibleProfile::Glm, "glm-5.3", Some("max"));
+        assert_eq!(maxed["reasoning_effort"], "max");
+
+        // A model the catalog does not describe still uses the declared table,
+        // so an unknown GLM model is not left with no reasoning at all.
+        let mut unknown = json!({});
+        apply_reasoning(&mut unknown, OpenAiCompatibleProfile::Glm, "glm-never-shipped", Some("medium"));
+        assert_eq!(unknown["reasoning_effort"], "medium");
+    }
+
     #[test]
     fn every_route_writes_reasoning_through_one_declared_wire() {
         let body_for = |profile, effort| {
             let mut body = json!({});
-            apply_reasoning(&mut body, profile, effort);
+            apply_reasoning(&mut body, profile, "test-model", effort);
             body
         };
 

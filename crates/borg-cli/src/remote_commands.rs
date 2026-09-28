@@ -2433,12 +2433,11 @@ async fn run_local_agent_session(
         // no gateway catalog of their own. Absent or stale data only means the
         // effort picker stays closed for a model it cannot describe.
         tokio::spawn(async {
-            match borg_provider::model_caps::refresh().await {
-                Ok(models) => tracing::debug!(models, "loaded models.dev capabilities"),
-                Err(error) => {
-                    tracing::debug!(%error, "models.dev capabilities unavailable; effort levels fall back to the served catalog");
-                }
-            }
+            borg_provider::models_catalog::ensure_loaded().await;
+            tracing::debug!(
+                loaded = borg_provider::models_catalog::loaded(),
+                "models.dev catalog ready"
+            );
         });
     }
     let fallback_terminal = can_prompt && !rich_tui_allowed;

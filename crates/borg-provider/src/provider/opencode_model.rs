@@ -34,8 +34,7 @@
 //! credential writes. It never falls back to another vendor's key: doing so
 //! would silently move spend onto a different account.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{OnceLock, RwLock};
+use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
 use uuid::Uuid;
@@ -131,14 +130,16 @@ pub fn gateway_with_key(model: &str, session_id: Uuid, api_key: &str) -> Result<
     Ok(gateway)
 }
 
-/// Per-process cache of the Go route's advertised context windows, keyed by the
-/// bare upstream model id. `None` means the model list has not been fetched.
-static CONTEXT_WINDOWS: OnceLock<RwLock<Option<HashMap<String, u64>>>> = OnceLock::new();
 
-fn context_windows() -> &'static RwLock<Option<HashMap<String, u64>>> {
-    CONTEXT_WINDOWS.get_or_init(|| RwLock::new(None))
-}
 
+
+
+/// The catalog price for `model`, preferring the named provider.
+///
+/// Read-only and never fetched here: the document is loaded by the first native
+/// turn that resolves a context window, so a process that has not made one
+/// reports no price rather than guessing. A model the catalog omits has no
+/// price, which keeps a cost estimate unavailable instead of invented.
 /// Price of one model in the shared models.dev catalog, in micro-USD per
 /// million tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,42 +149,13 @@ pub struct CatalogPricing {
     pub output_microusd_per_million: u64,
 }
 
-/// Catalog prices, keyed by provider and model.
-type CatalogPrices = HashMap<(String, String), CatalogPricing>;
-
-/// Prices from the same document as the windows, keyed by provider and model.
-static CATALOG_PRICING: OnceLock<RwLock<Option<CatalogPrices>>> = OnceLock::new();
-
-fn catalog_prices() -> &'static RwLock<Option<CatalogPrices>> {
-    CATALOG_PRICING.get_or_init(|| RwLock::new(None))
-}
-
-/// The catalog price for `model`, preferring the named provider.
-///
-/// Read-only and never fetched here: the document is loaded by the first native
-/// turn that resolves a context window, so a process that has not made one
-/// reports no price rather than guessing. A model the catalog omits has no
-/// price, which keeps a cost estimate unavailable instead of invented.
 pub fn catalog_pricing(provider: Option<&str>, model: &str) -> Option<CatalogPricing> {
-    let id = model.trim();
-    if id.is_empty() {
-        return None;
-    }
-    let cache = catalog_prices().read().ok()?;
-    let prices = cache.as_ref()?;
-    if let Some(provider) = provider
-        && let Some(found) = prices.get(&(provider.to_string(), id.to_string()))
-    {
-        return Some(*found);
-    }
-    // The same model id listed by another provider is normally the same list
-    // price. A provider that marks it up makes a refresh look slightly more
-    // worthwhile than it is, which the savings threshold and the warming age
-    // caps bound.
-    prices
-        .iter()
-        .find(|((_, listed), _)| listed == id)
-        .map(|(_, price)| *price)
+    let price = crate::models_catalog::pricing(provider.unwrap_or(MODELS_DEV_PROVIDER), model)?;
+    Some(CatalogPricing {
+        input_microusd_per_million: price.input,
+        cached_input_microusd_per_million: price.cached_input,
+        output_microusd_per_million: price.output,
+    })
 }
 
 /// The context window for a Go-route `model`.
@@ -198,109 +170,17 @@ pub async fn context_window_tokens(model: &str) -> Option<u64> {
     if id.is_empty() {
         return None;
     }
-    if let Ok(cache) = context_windows().read()
-        && let Some(windows) = cache.as_ref()
-    {
-        return windows.get(id).copied();
-    }
-    if let Ok((windows, prices)) = fetch_catalog().await {
-        if let Ok(mut cache) = context_windows().write() {
-            *cache = Some(windows);
-        }
-        if let Ok(mut cache) = catalog_prices().write() {
-            *cache = Some(prices);
-        }
-    }
-    context_windows()
-        .read()
-        .ok()
-        .and_then(|cache| cache.as_ref()?.get(id).copied())
+    // One catalog for the whole process: this used to be the fetch that owned
+    // the document, and pricing read from its copy of the parse.
+    crate::models_catalog::ensure_loaded().await;
+    crate::models_catalog::context_window(MODELS_DEV_PROVIDER, id)
 }
 
-const MODELS_DEV_CATALOG_URL: &str = "https://models.dev/api.json";
 const MODELS_DEV_PROVIDER: &str = "opencode-go";
 
-/// One fetch for both maps: the document carries the window and the price of
-/// every model, so a second request would only duplicate work.
-async fn fetch_catalog() -> Result<(
-    HashMap<String, u64>,
-    HashMap<(String, String), CatalogPricing>,
-)> {
-    let response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?
-        .get(MODELS_DEV_CATALOG_URL)
-        .send()
-        .await?
-        .error_for_status()?;
-    let payload: serde_json::Value = response.json().await?;
-    Ok((
-        parse_context_windows(&payload),
-        parse_catalog_pricing(&payload),
-    ))
-}
 
-/// Prices for every provider in the catalog, in micro-USD per million tokens.
-///
-/// A model whose entry states no cached-input rate is left out on purpose: both
-/// estimates built on this need the cached rate, and half a price would silently
-/// become a wrong decision about spending money.
-fn parse_catalog_pricing(payload: &serde_json::Value) -> CatalogPrices {
-    let Some(providers) = payload.as_object() else {
-        return HashMap::new();
-    };
-    let mut prices = HashMap::new();
-    for (provider, entry) in providers {
-        let Some(models) = entry.get("models").and_then(serde_json::Value::as_object) else {
-            continue;
-        };
-        for (id, model) in models {
-            let Some(cost) = model.get("cost") else {
-                continue;
-            };
-            let rate = |field: &str| {
-                cost.get(field)
-                    .and_then(serde_json::Value::as_f64)
-                    .filter(|value| *value >= 0.0)
-            };
-            let (Some(input), Some(output), Some(cached)) =
-                (rate("input"), rate("output"), rate("cache_read"))
-            else {
-                continue;
-            };
-            prices.insert(
-                (provider.clone(), id.clone()),
-                CatalogPricing {
-                    input_microusd_per_million: usd_per_million_to_microusd(input),
-                    cached_input_microusd_per_million: usd_per_million_to_microusd(cached),
-                    output_microusd_per_million: usd_per_million_to_microusd(output),
-                },
-            );
-        }
-    }
-    prices
-}
 
 /// The catalog quotes dollars per million tokens; Borg accounts in micro-USD.
-fn usd_per_million_to_microusd(usd_per_million: f64) -> u64 {
-    (usd_per_million * 1_000_000.0).round().max(0.0) as u64
-}
-
-fn parse_context_windows(payload: &serde_json::Value) -> HashMap<String, u64> {
-    payload
-        .get(MODELS_DEV_PROVIDER)
-        .and_then(|provider| provider.get("models"))
-        .and_then(serde_json::Value::as_object)
-        .into_iter()
-        .flatten()
-        .filter_map(|(id, model)| {
-            let context = model
-                .pointer("/limit/context")
-                .and_then(serde_json::Value::as_u64)?;
-            (!id.trim().is_empty() && context > 0).then(|| (id.clone(), context))
-        })
-        .collect()
-}
 
 #[cfg(test)]
 mod tests {
@@ -427,19 +307,23 @@ mod tests {
                 }
             }
         });
-        let prices = parse_catalog_pricing(&payload);
-        assert_eq!(prices.len(), 2);
-        let anthropic = prices
-            .get(&("anthropic".to_string(), "claude-opus-5".to_string()))
+        crate::models_catalog::set_for_test(crate::models_catalog::parse(&payload));
+        let anthropic = crate::models_catalog::pricing("anthropic", "claude-opus-5")
             .expect("anthropic price");
-        assert_eq!(anthropic.input_microusd_per_million, 5_000_000);
-        assert_eq!(anthropic.cached_input_microusd_per_million, 500_000);
-        assert_eq!(anthropic.output_microusd_per_million, 25_000_000);
-        let go = prices
-            .get(&("opencode-go".to_string(), "qwen3.7-max".to_string()))
+        assert_eq!(anthropic.input, 5_000_000);
+        assert_eq!(anthropic.cached_input, 500_000);
+        assert_eq!(anthropic.output, 25_000_000);
+        let go = crate::models_catalog::pricing("opencode-go", "qwen3.7-max")
             .expect("go price");
-        assert_eq!(go.cached_input_microusd_per_million, 500_000);
-        assert!(!prices.contains_key(&("anthropic".to_string(), "no-cache-rate".to_string())));
+        assert_eq!(go.cached_input, 500_000);
+        // A model with no cached-input rate has no price at all rather than a
+        // half one that would misstate what a cache hit saves.
+        assert_eq!(
+            crate::models_catalog::pricing("anthropic", "no-cache-rate"),
+            None
+        );
+        assert!(catalog_pricing(Some("anthropic"), "claude-opus-5").is_some());
+
     }
 
     /// models.dev carries the window under the Go provider's `limit.context`.
@@ -460,13 +344,21 @@ mod tests {
                 "models": {"deepseek/deepseek-v4.1-flash": {"limit": {"context": 1_048_576}}}
             }
         });
-        let windows = parse_context_windows(&payload);
-        assert_eq!(windows.len(), 2);
-        assert_eq!(windows.get("kimi-k2.7-code"), Some(&262_144));
-        assert_eq!(windows.get("glm-5.3"), Some(&1_000_000));
-        assert!(!windows.contains_key("no-window"));
-        assert!(!windows.contains_key("zero"));
+        crate::models_catalog::set_for_test(crate::models_catalog::parse(&payload));
+        assert_eq!(
+            crate::models_catalog::context_window("opencode-go", "kimi-k2.7-code"),
+            Some(262_144)
+        );
+        assert_eq!(
+            crate::models_catalog::context_window("opencode-go", "glm-5.3"),
+            Some(1_000_000)
+        );
+        assert_eq!(crate::models_catalog::context_window("opencode-go", "no-window"), None);
+        assert_eq!(crate::models_catalog::context_window("opencode-go", "zero"), None);
         // Another provider's models must not leak into the Go route.
-        assert!(!windows.contains_key("deepseek/deepseek-v4.1-flash"));
+        assert_eq!(
+            crate::models_catalog::context_window("opencode-go", "deepseek/deepseek-v4.1-flash"),
+            None
+        );
     }
 }

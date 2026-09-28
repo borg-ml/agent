@@ -2828,9 +2828,7 @@ fn effort_picker_options(
     }
     // Otherwise the vendor's own published capabilities, which also cover the
     // direct routes that have no gateway catalog at all.
-    borg_provider::model_caps::capability(models_dev_provider(provider), model)
-        .map(|capability| capability.effort_values)
-        .unwrap_or_default()
+    borg_provider::models_catalog::effort_values(models_dev_provider(provider), model)
 }
 
 /// The models.dev key for a route, or `""` when it publishes nothing.
