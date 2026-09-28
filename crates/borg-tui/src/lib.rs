@@ -105,7 +105,10 @@ const PARALLEL_MARKDOWN_RENDER_MIN_MESSAGES: usize = 512;
 const MAX_PARALLEL_MARKDOWN_RENDER_WORKERS: usize = 16;
 const COMMAND_PANEL_BG: Color = Color::Rgb(31, 24, 27);
 const COMPOSER_BG: Color = Color::Rgb(35, 27, 31);
-const COMPOSER_INPUT_BG: Color = Color::Rgb(31, 24, 27);
+/// The composer's text-entry ground: neutral and near-black, so the three rows
+/// you type in read as a well rather than another band of transcript, and the
+/// same value the pickers use for their surface.
+const COMPOSER_INPUT_BG: Color = Color::Rgb(20, 20, 22);
 /// Divider between status-line segments. It is its own span so a hovered
 /// segment underlines its own text only.
 const STATUS_SEPARATOR: &str = " · ";
