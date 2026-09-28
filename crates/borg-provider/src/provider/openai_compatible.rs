@@ -1931,15 +1931,45 @@ fn stream_error_message(error: &Value) -> String {
 /// would repeat.
 fn stream_error_kind(message: &str) -> ProviderErrorKind {
     let text = message.to_ascii_lowercase();
-    if ["context length", "context_length", "context limit", "maximum context", "max context"]
-        .iter()
-        .any(|needle| text.contains(needle))
+    if [
+        "context length",
+        "context_length",
+        "context limit",
+        "maximum context",
+        "max context",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
     {
         return ProviderErrorKind::ContextLength;
     }
-    // A provider that answered with a refusal is alive; the request is not
-    // retryable, so calling it a lost connection would invite a retry loop.
-    ProviderErrorKind::Fatal
+    // Only a refusal is fatal. Refusing means the provider understood the
+    // request and declined for a reason another attempt cannot change.
+    if [
+        "billing",
+        "credit",
+        "quota",
+        "insufficient",
+        "unauthorized",
+        "authentication",
+        "invalid api key",
+        "permission",
+        "content policy",
+        "moderation",
+        "invalid request",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+    {
+        return ProviderErrorKind::Fatal;
+    }
+    // Everything else defaults to retryable, which is what this path did before
+    // mid-stream errors were recognised at all. Treating an unrecognised
+    // provider error as fatal stops the turn instead of reissuing it, and a
+    // gateway that answers "Provider returned an empty response" has said
+    // nothing about the request being wrong: the upstream simply produced
+    // nothing, which is exactly the case a retry exists for.
+    ProviderErrorKind::ConnectionLost
 }
 
 /// Map a Borg effort onto the gateway's own `reasoning.effort` vocabulary.
@@ -2396,6 +2426,31 @@ mod tests {
         );
         assert!(message.contains("maximum context length"), "{message}");
         assert_eq!(stream_error_kind(&message), ProviderErrorKind::ContextLength);
+    }
+
+    /// The failure that stopped a turn dead instead of retrying. A gateway
+    /// reporting an empty upstream response has said nothing about the request
+    /// being wrong, so this must stay retryable - treating an unrecognised
+    /// provider error as fatal is what turned a blip into a stopped session.
+    #[test]
+    fn an_empty_upstream_response_is_retried_rather_than_fatal() {
+        assert_eq!(
+            stream_error_kind("provider rejected the request: Provider returned an empty response"),
+            ProviderErrorKind::ConnectionLost
+        );
+        for transient in [
+            "Provider returned an empty response",
+            "upstream error",
+            "overloaded",
+            "rate limit exceeded",
+            "service unavailable",
+        ] {
+            assert_eq!(
+                stream_error_kind(transient),
+                ProviderErrorKind::ConnectionLost,
+                "{transient}"
+            );
+        }
     }
 
     #[test]
