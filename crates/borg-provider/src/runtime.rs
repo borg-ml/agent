@@ -85,6 +85,32 @@ pub fn gateway_effort_levels(
     entry.supported_efforts.clone()
 }
 
+/// The effort to send when a model requires reasoning and none was requested.
+///
+/// A model the gateway marks `mandatory` refuses a request that omits
+/// reasoning, and the refusal arrives as an empty stream rather than a
+/// message. Its own `default_effort` is the level it applies in that case, so
+/// that is what goes on the wire. Returns `None` for a model that does not
+/// require reasoning, where omitting the field is correct.
+pub fn gateway_required_effort(
+    backend: &str,
+    model: &str,
+) -> Option<String> {
+    let entries = match backend {
+        "openrouter" => openrouter_model_entries(),
+        "vercel" => vercel_model_entries(),
+        _ => return None,
+    };
+    let entry = entries.iter().find(|entry| entry.id == model)?;
+    if !entry.reasoning_mandatory {
+        return None;
+    }
+    entry
+        .default_effort
+        .clone()
+        .or_else(|| entry.supported_efforts.as_ref()?.first().cloned())
+}
+
 /// Whether a model can run with reasoning turned off.
 ///
 /// A mandatory model rejects `none` and `off`, so the switch must not be
@@ -189,6 +215,8 @@ pub struct DynamicModelEntry {
     pub supported_efforts: Option<Vec<String>>,
     /// When true the model rejects `none` and reasoning cannot be turned off.
     pub reasoning_mandatory: bool,
+    /// The level the model applies when reasoning is requested without one.
+    pub default_effort: Option<String>,
 }
 
 impl DynamicModelEntry {
@@ -201,6 +229,7 @@ impl DynamicModelEntry {
             detail: None,
             supported_efforts: None,
             reasoning_mandatory: false,
+            default_effort: None,
         }
     }
 }
@@ -295,7 +324,7 @@ pub async fn refresh_openrouter_model_catalog() -> anyhow::Result<Vec<DynamicMod
     Ok(entries)
 }
 
-fn openrouter_model_entries_from_response(payload: &serde_json::Value) -> Vec<DynamicModelEntry> {
+pub(crate) fn openrouter_model_entries_from_response(payload: &serde_json::Value) -> Vec<DynamicModelEntry> {
     let mut entries = payload
         .get("data")
         .and_then(serde_json::Value::as_array)
@@ -347,6 +376,10 @@ fn openrouter_model_entries_from_response(payload: &serde_json::Value) -> Vec<Dy
                     .and_then(|reasoning| reasoning.get("mandatory"))
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                default_effort: reasoning
+                    .and_then(|reasoning| reasoning.get("default_effort"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
             })
         })
         .collect::<Vec<_>>();
@@ -533,6 +566,10 @@ fn vercel_model_entries_from_response(payload: &serde_json::Value) -> Vec<Dynami
                     .and_then(|reasoning| reasoning.get("mandatory"))
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                default_effort: reasoning
+                    .and_then(|reasoning| reasoning.get("default_effort"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
             })
         })
         .collect::<Vec<_>>();
@@ -595,6 +632,7 @@ pub fn dynamic_models_for_backend(
                 // support, so no levels are claimed for it.
                 supported_efforts: None,
                 reasoning_mandatory: false,
+                default_effort: None,
             });
         }
         seen_ids.insert(cur.to_string());

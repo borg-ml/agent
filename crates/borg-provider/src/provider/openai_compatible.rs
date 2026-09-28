@@ -2122,8 +2122,21 @@ fn apply_reasoning(
                 json!(clamp_effort_to_vocabulary(effort, &vocabulary, wire.default));
         }
         ReasoningField::NestedEffort => {
-            if let Some(value) = compatible_reasoning(effort) {
-                body["reasoning"] = value;
+            // A model the gateway marks mandatory refuses a request that omits
+            // reasoning, and it refuses by closing the stream with no content
+            // and no error - so the turn dies with an empty response. Its own
+            // default level is sent instead of leaving the field off.
+            let effort = match compatible_reasoning(effort) {
+                Some(value) => {
+                    body["reasoning"] = value;
+                    return;
+                }
+                None => crate::runtime::gateway_required_effort("openrouter", model).or_else(
+                    || crate::runtime::gateway_required_effort("vercel", model),
+                ),
+            };
+            if let Some(level) = effort {
+                body["reasoning"] = json!({ "effort": level });
             }
         }
     }
@@ -2403,6 +2416,46 @@ mod tests {
     /// probe, while models.dev publishes low/high/max for glm-5.3. A request
     /// asking for `medium` was silently rewritten, and `max` was unavailable.
     /// The catalog now answers, and the declared table is only a fallback.
+    /// The reported failure, verbatim from the gateway catalog. Space Bunny
+    /// Alpha is `mandatory`, so a request with no effort sends no `reasoning`
+    /// field and the model refuses by closing the stream with no content and no
+    /// error. The same model with an effort set works, which is why only some
+    /// turns of that thread failed.
+    #[test]
+    fn a_mandatory_model_still_gets_reasoning_when_no_effort_was_chosen() {
+        let entries = crate::runtime::openrouter_model_entries_from_response(&serde_json::json!({
+            "data": [{
+                "id": "stealth/space-bunny-alpha",
+                "name": "Stealth: Space Bunny Alpha",
+                "reasoning": {
+                    "mandatory": true,
+                    "default_effort": "max",
+                    "supported_efforts": ["max", "xhigh", "high", "medium", "low"],
+                },
+            }],
+        }));
+        crate::runtime::set_openrouter_model_entries(entries);
+        let mut body = json!({});
+        apply_reasoning(&mut body, OpenAiCompatibleProfile::OpenRouter, "stealth/space-bunny-alpha", None);
+        // The empty-stream refusal is what this prevents.
+        assert_eq!(body["reasoning"]["effort"], "max");
+
+        // An explicit choice still wins over the model's own default.
+        let mut chosen = json!({});
+        apply_reasoning(&mut chosen, OpenAiCompatibleProfile::OpenRouter, "stealth/space-bunny-alpha", Some("low"));
+        assert_eq!(chosen["reasoning"]["effort"], "low");
+
+        // A model that does not require reasoning still sends nothing.
+        let entries = crate::runtime::openrouter_model_entries_from_response(&serde_json::json!({
+            "data": [{ "id": "vendor/plain", "name": "Plain",
+                       "reasoning": { "supported_efforts": ["high"] } }],
+        }));
+        crate::runtime::set_openrouter_model_entries(entries);
+        let mut plain = json!({});
+        apply_reasoning(&mut plain, OpenAiCompatibleProfile::OpenRouter, "vendor/plain", None);
+        assert!(plain.get("reasoning").is_none());
+    }
+
     #[test]
     fn the_catalog_vocabulary_overrides_the_declared_table() {
         crate::models_catalog::set_for_test(

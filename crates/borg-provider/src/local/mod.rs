@@ -77,6 +77,7 @@ impl LocalModel {
             // is claimed rather than guessed.
             supported_efforts: None,
             reasoning_mandatory: false,
+            default_effort: None,
         }
     }
 }
