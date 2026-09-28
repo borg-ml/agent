@@ -190,19 +190,24 @@ fn reasoning_items(source: &str) -> Vec<String> {
     if let Some(thoughts) = bold_reasoning_thoughts(trimmed) {
         return thoughts.into_iter().map(str::to_string).collect();
     }
-    let cleaned = source.replace("**", "");
-    cleaned
+    // The `**` markers are stripped per line rather than by rewriting the whole
+    // source first. A streaming block is re-rendered on every frame, so
+    // `source.replace` allocated and copied the entire reasoning text again and
+    // again for every delta - the cost grew with the block and the total work
+    // over a stream grew faster than the stream itself.
+    source
         .lines()
         .filter_map(|raw_line| {
             let line = raw_line.trim();
             if line.is_empty() {
                 return None;
             }
+            let line = line.replace("**", "");
             let line = line
                 .strip_prefix("• ")
                 .or_else(|| line.strip_prefix("- "))
                 .or_else(|| line.strip_prefix("* "))
-                .unwrap_or(line);
+                .unwrap_or(line.as_str());
             Some(line.to_string())
         })
         .collect()
@@ -1331,6 +1336,23 @@ mod tests {
     }
 
     #[test]
+    /// The `**` markers are stripped per line now rather than by rewriting the
+    /// source, so the stripping still has to happen for markers in the middle of
+    /// a line, after a bullet, and on the last line of a stream that has not
+    /// been terminated yet.
+    #[test]
+    fn reasoning_renderer_strips_bold_markers_outside_the_bold_block_path() {
+        let lines = super::reasoning_lines(
+            "- **first** thought\nsome **middle** text\ntrailing **unterminated",
+            40,
+        );
+        let rendered: Vec<String> = lines.iter().map(Line::to_string).collect();
+        assert_eq!(
+            rendered,
+            vec!["first thought", "some middle text", "trailing unterminated"]
+        );
+    }
+
     fn reasoning_renderer_separates_codex_bold_summary_segments() {
         let lines = tool_body_lines(
             "reasoning",
