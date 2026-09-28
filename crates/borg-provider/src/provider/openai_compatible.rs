@@ -2048,9 +2048,16 @@ fn effort_rank(effort: &str) -> Option<usize> {
 }
 
 impl OpenAiCompatibleProfile {
-    /// The reasoning contract for this route, or `None` when the route has no
-    /// reasoning control and the body must stay silent.
-    const fn reasoning_wire(self) -> Option<ReasoningWire> {
+    /// The reasoning contract for this route and model, or `None` when the
+    /// route has no reasoning control and the body must stay silent.
+    ///
+    /// Model-specific because a route can serve two shapes of the same control.
+    /// Qwen is the case that forced it: `enable_thinking` is a boolean for
+    /// Qwen3.5/3.6/3.7, while the Qwen3.8 family takes `reasoning_effort` and
+    /// converts a level to a thinking budget on its own - so a per-profile
+    /// answer sent the wrong field to half the family, and the effort a model
+    /// advertised had no effect on the request.
+    fn reasoning_wire(self, model: &str) -> Option<ReasoningWire> {
         match self {
             Self::Kimi => Some(ReasoningWire {
                 field: ReasoningField::Effort,
@@ -2062,11 +2069,28 @@ impl OpenAiCompatibleProfile {
                 declared: &["low", "medium", "high"],
                 default: "medium",
             }),
-            Self::Qwen => Some(ReasoningWire {
-                field: ReasoningField::ThinkingToggle,
-                declared: &[],
-                default: "high",
-            }),
+            // Alibaba publishes which control each model has, and the two are
+            // not interchangeable: a model with a ladder takes
+            // `reasoning_effort`, and anything else takes the boolean. Where
+            // the catalog is silent the toggle is the safe answer, because it
+            // is the older control and the one every thinking model accepts.
+            Self::Qwen => {
+                let laddered =
+                    !crate::models_catalog::effort_values(models_dev_key(Self::Qwen), model)
+                        .is_empty();
+                Some(ReasoningWire {
+                    field: if laddered {
+                        ReasoningField::Effort
+                    } else {
+                        ReasoningField::ThinkingToggle
+                    },
+                    // The ladder comes from the catalog per model; this is only
+                    // the fallback for one the catalog does not describe.
+                    declared: &[],
+                    // Alibaba's own default for a model that takes a ladder.
+                    default: "xhigh",
+                })
+            }
             Self::OpenRouter | Self::Vercel => Some(ReasoningWire {
                 field: ReasoningField::NestedEffort,
                 declared: &[],
@@ -2136,7 +2160,7 @@ fn apply_reasoning(
     model: &str,
     effort: Option<&str>,
 ) {
-    let Some(wire) = profile.reasoning_wire() else {
+    let Some(wire) = profile.reasoning_wire(model) else {
         return;
     };
     match wire.field {
@@ -2511,13 +2535,23 @@ mod tests {
         assert!(plain.get("reasoning").is_none());
     }
 
+    /// One test owns the catalog, because `set_for_test` writes a process-wide
+    /// value: two tests installing different fixtures would race, and whichever
+    /// lost would assert against the other's models.
     #[test]
-    fn the_catalog_vocabulary_overrides_the_declared_table() {
+    fn the_catalog_decides_the_vocabulary_and_which_control_a_route_uses() {
         crate::models_catalog::set_for_test(
             crate::models_catalog::parse(&serde_json::json!({
                 "zai": { "models": { "glm-5.3": { "reasoning_options": [
                     { "type": "effort", "values": ["max", "high", "low"] }
                 ] } } },
+                "alibaba": { "models": {
+                    "qwen-ladder-fixture": { "reasoning_options": [
+                        { "type": "toggle" },
+                        { "type": "effort", "values": ["low", "medium", "xhigh"] }
+                    ]},
+                    "qwen-toggle-fixture": { "reasoning_options": [{ "type": "toggle" }] }
+                }},
             })),
         );
         let mut body = json!({});
@@ -2535,6 +2569,44 @@ mod tests {
         let mut unknown = json!({});
         apply_reasoning(&mut unknown, OpenAiCompatibleProfile::Glm, "glm-never-shipped", Some("medium"));
         assert_eq!(unknown["reasoning_effort"], "medium");
+        // Alibaba's control is not one shape. A model with a ladder takes
+        // `reasoning_effort` and converts the level into a thinking budget on
+        // its own; the rest take the boolean. Answering per profile sent the
+        // wrong field to the Qwen3.8 family, so the effort their picker offered
+        // had no effect on the request - and a field the vendor refuses is
+        // worse than one it merely ignores.
+        let mut laddered = json!({});
+        apply_reasoning(
+            &mut laddered,
+            OpenAiCompatibleProfile::Qwen,
+            "qwen-ladder-fixture",
+            Some("medium"),
+        );
+        assert_eq!(laddered["reasoning_effort"], "medium");
+        assert!(
+            laddered.get("enable_thinking").is_none(),
+            "sending both controls at once is refused outright: {laddered}"
+        );
+        // A ladder has no off rung, so a level it does not carry clamps onto
+        // the one above rather than falling off the end.
+        let mut clamped = json!({});
+        apply_reasoning(
+            &mut clamped,
+            OpenAiCompatibleProfile::Qwen,
+            "qwen-ladder-fixture",
+            Some("ultra"),
+        );
+        assert_eq!(clamped["reasoning_effort"], "xhigh");
+        // The same route, the older shape.
+        let mut toggled = json!({});
+        apply_reasoning(
+            &mut toggled,
+            OpenAiCompatibleProfile::Qwen,
+            "qwen-toggle-fixture",
+            Some("none"),
+        );
+        assert_eq!(toggled["enable_thinking"], false);
+        assert!(toggled.get("reasoning_effort").is_none());
     }
 
     #[test]
