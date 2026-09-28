@@ -152,7 +152,25 @@ pub struct SessionHistoryPage {
     pub hits: Vec<SessionHistoryHit>,
     pub backend: String,
     pub scanned_events: usize,
+    /// Something was cut. This covers BOTH "your hit list hit the limit" and
+    /// "the scan never reached the rest of the history"; use
+    /// `search_incomplete` to tell them apart.
     pub truncated: bool,
+    /// The scan did NOT cover all candidate history, so there may be further
+    /// matches outside the window that was scanned.
+    ///
+    /// An empty `hits` with this set means "not found in what I looked at",
+    /// NOT "does not exist". Reporting those two as the same thing is how a
+    /// caller comes to believe a whole body of work was never done, so the
+    /// distinction is part of the result rather than something to infer.
+    /// `scanned_from_sequence`/`scanned_to_sequence` say which window was
+    /// covered: re-query that range (or a later one) to search the rest.
+    #[serde(default)]
+    pub search_incomplete: bool,
+    #[serde(default)]
+    pub scanned_from_sequence: Option<u64>,
+    #[serde(default)]
+    pub scanned_to_sequence: Option<u64>,
 }
 
 /// Rebuildable feed record for an external lexical/vector index such as

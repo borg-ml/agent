@@ -22,6 +22,20 @@ Git comparison.
 
 ### Reliability
 
+- A history search on a resumed or forked session can no longer report "no
+  matches" while having looked at almost none of the history. Those sessions were
+  scanned oldest-first under a hard budget, so on a long thread only the oldest
+  events were ever reachable and recent work was invisible however the query was
+  phrased. The scan now covers the newest window, which is what a resumed thread
+  is asking about.
+- Search results say whether they are complete. `truncated` already conflated
+  "your hit list hit the limit" with "the scan never reached the rest of the
+  history", and the two were indistinguishable to a caller. A result now carries
+  `search_incomplete` plus the `scanned_from_sequence`..`scanned_to_sequence`
+  window it covered, so an empty result reads as "not found in what I looked at"
+  rather than "does not exist", and the rest can be paged with `start_sequence`.
+  The `query_history` description says so too.
+
 - An upstream that answers with an empty response is retried instead of ending
   the turn. Only a refusal is treated as fatal now; everything else is
   retryable, as it was before mid-stream errors were recognised at all.

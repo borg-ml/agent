@@ -7831,7 +7831,7 @@ pub fn agent_tool_specs_for_surface(
         ),
         tool(
             "query_history",
-            "Search this session's canonical, lossless event journal. Empty text performs fast exact/typed/sequence retrieval; lexical uses the local FTS5 projection; regex is bounded. Results always resolve to canonical event ids and can expand deferred tool payloads. Use this for programmatic recall instead of relying on the compacted model transcript.",
+            "Search this session's canonical, lossless event journal. Empty text performs fast exact/typed/sequence retrieval; lexical uses the local FTS5 projection; regex is bounded. Results always resolve to canonical event ids and can expand deferred tool payloads. Use this for programmatic recall instead of relying on the compacted model transcript.\n\nA zero-hit result is NOT proof that something never happened. Check `search_incomplete`: when it is true the scan only covered `scanned_from_sequence`..`scanned_to_sequence` and further matches may lie outside it, so page the rest with `start_sequence` before concluding anything is absent. `truncated` alone only means the hit list hit the requested limit.",
             json!({
                 "type": "object",
                 "properties": {

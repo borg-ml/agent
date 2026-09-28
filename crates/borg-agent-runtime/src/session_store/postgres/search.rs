@@ -358,7 +358,18 @@ impl PostgresSessionStore {
             );
         }
         let scanned_events = hits.len();
+        // The query ran in SQL over the whole filtered set, so coverage is
+        // complete; only the hit list was capped.
+        let covered = (scanned_events > 0).then(|| {
+            (
+                hits.first().map(|hit| hit.event.sequence),
+                hits.last().map(|hit| hit.event.sequence),
+            )
+        });
         Ok(SessionHistoryPage {
+            scanned_to_sequence: covered.and_then(|bounds| bounds.1),
+            scanned_from_sequence: covered.and_then(|bounds| bounds.0),
+            search_incomplete: false,
             hits,
             backend: "postgres_exact".to_string(),
             scanned_events,
@@ -432,7 +443,18 @@ impl PostgresSessionStore {
             );
         }
         let scanned_events = hits.len();
+        // tsvector matched against the whole projection, so coverage is
+        // complete however many hits came back.
+        let covered = (scanned_events > 0).then(|| {
+            (
+                hits.first().map(|hit| hit.event.sequence),
+                hits.last().map(|hit| hit.event.sequence),
+            )
+        });
         Ok(SessionHistoryPage {
+            scanned_to_sequence: covered.and_then(|bounds| bounds.1),
+            scanned_from_sequence: covered.and_then(|bounds| bounds.0),
+            search_incomplete: false,
             hits,
             backend: "postgres_tsvector".to_string(),
             scanned_events,
@@ -475,7 +497,7 @@ impl PostgresSessionStore {
         let filters = history_filter_sql(query, "s", &mut next);
         let order = if query.newest_first { "desc" } else { "asc" };
         let sql = format!(
-            "select e.event_json, e.event_body, e.dict_id, s.body from session_event_search s \
+            "select e.event_json, e.event_body, e.dict_id, s.body, s.sequence from session_event_search s \
              join session_events e \
                on e.session_id = s.session_id and e.event_id = s.event_id \
              where true{prefilter_clause}{session_clause}{filters} \
@@ -498,9 +520,15 @@ impl PostgresSessionStore {
         let candidate_overflow = rows.len() > scan_limit;
         let mut hits = Vec::new();
         let mut scanned_events = 0;
+        let mut covered: Option<(u64, u64)> = None;
         let mut payload_budget = history_payload_budget(query);
         for row in rows.iter().take(scan_limit) {
             scanned_events += 1;
+            let sequence = u64::try_from(row.try_get::<i64, _>("sequence")?).unwrap_or_default();
+            covered = Some(match covered {
+                Some((from, _)) => (from.min(sequence), sequence),
+                None => (sequence, sequence),
+            });
             let body: String = row.try_get("body")?;
             let Some(found) = expression.find(&body) else {
                 continue;
@@ -526,7 +554,13 @@ impl PostgresSessionStore {
         }
         let truncated = candidate_overflow || hits.len() > limit;
         hits.truncate(limit);
+        // The regex pass walks candidates in Rust and can run out of scan
+        // budget, so say so and report the window it covered instead of
+        // letting a short answer read as a complete one.
         Ok(SessionHistoryPage {
+            scanned_to_sequence: covered.map(|bounds| bounds.1),
+            scanned_from_sequence: covered.map(|bounds| bounds.0),
+            search_incomplete: candidate_overflow,
             hits,
             backend: if prefilter.is_some() {
                 "postgres_regex_tsquery_prefilter"
@@ -574,13 +608,25 @@ impl PostgresSessionStore {
         };
 
         let mut events = self.composed_events(session_id, None).await?;
+        // A text query has to be able to reach the events the caller is
+        // actually asking about. Scanning composed history oldest-first and
+        // stopping at the scan limit meant any session larger than the limit
+        // could only ever match its OLDEST events, so recent history was
+        // unsearchable no matter how the query was phrased — a resumed thread
+        // could not find work it had just done. Spend the budget on the newest
+        // window instead, and report the overflow rather than hiding it.
+        let mut candidate_overflow = false;
+        if text.is_some() && events.len() > scan_limit {
+            events = events.split_off(events.len() - scan_limit);
+            candidate_overflow = true;
+        }
         if query.newest_first {
             events.reverse();
         }
         let mut hits = Vec::new();
         let mut scanned_events = 0;
+        let mut covered: Option<(u64, u64)> = None;
         let mut payload_budget = history_payload_budget(query);
-        let mut candidate_overflow = false;
         for event in events {
             if !history_event_matches_filters(&event, query)? {
                 continue;
@@ -590,6 +636,10 @@ impl PostgresSessionStore {
                 break;
             }
             scanned_events += 1;
+            covered = Some(match covered {
+                Some((from, _)) => (from.min(event.sequence), event.sequence),
+                None => (event.sequence, event.sequence),
+            });
             let snippet = if let Some(expression) = &expression {
                 let body = self.history_event_body(&event).await?;
                 let Some(found) = expression.find(&body) else {
@@ -629,7 +679,13 @@ impl PostgresSessionStore {
         }
         let truncated = candidate_overflow || hits.len() > limit;
         hits.truncate(limit);
+        // Forks and resumed sessions come through here, and this path is the
+        // one that can silently cover only a slice of a long history. Report
+        // the window so a caller can page the rest with start_sequence.
         Ok(SessionHistoryPage {
+            scanned_to_sequence: covered.map(|bounds| bounds.1),
+            scanned_from_sequence: covered.map(|bounds| bounds.0),
+            search_incomplete: candidate_overflow,
             hits,
             backend: "postgres_lineage".to_string(),
             scanned_events,
@@ -1132,6 +1188,85 @@ mod tests {
             "compression must not make history unsearchable"
         );
         scratch.discard().await;
+    }
+
+    /// A fork's composed search must reach the events a caller just produced.
+    ///
+    /// Regression: the composed scan walked oldest-first and stopped at the
+    /// scan limit, so on a session larger than that limit a match anywhere in
+    /// the recent history was invisible. The newest window is what a resumed
+    /// thread is asking about, so it is the window the budget must cover.
+    #[tokio::test]
+    async fn a_fork_search_finds_matches_in_its_newest_history() {
+        let Some(url) = test_url() else {
+            eprintln!("skipping: BORG_TEST_SESSIONS_URL is not set");
+            return;
+        };
+        let scratch = ScratchDatabase::create(&url).await;
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+            .await
+            .expect("connect");
+
+        // A parent long enough that its oldest events fill any sane scan limit,
+        // then a fork that inherits all of it and says the thing we will search
+        // for only at the very end.
+        let filler = "filler ".repeat(64);
+        let mut texts: Vec<(EventActor, String)> = Vec::new();
+        for index in 0..400 {
+            texts.push((EventActor::User, format!("{filler}{index}")));
+        }
+        let borrowed: Vec<(EventActor, &str)> = texts
+            .iter()
+            .map(|(actor, text)| (*actor, text.as_str()))
+            .collect();
+        let parent = session_with(&store, &borrowed).await;
+        let fork = Uuid::new_v4();
+        store
+            .fork_session_before(parent, fork, u64::try_from(borrowed.len() + 1).unwrap())
+            .await
+            .expect("fork");
+        store
+            .append(SessionEvent::new(
+                fork,
+                0,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::User,
+                    text: "moved the simulation onto the gpu".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ))
+            .await
+            .expect("append");
+
+        let page = store
+            .query_history(
+                fork,
+                SessionHistoryQuery {
+                    text: Some("gpu".to_string()),
+                    scan_limit: Some(16),
+                    ..SessionHistoryQuery::default()
+                },
+            )
+            .await
+            .expect("query");
+        assert!(
+            hit_texts(&page).iter().any(|text| text.contains("gpu")),
+            "the newest event must be reachable: the scan budget covered only the oldest window"
+        );
+        // The caller is told the window was partial rather than being handed a
+        // quiet, incomplete answer, and is given the range to page.
+        assert!(
+            page.search_incomplete,
+            "a partial window must be reported as incomplete"
+        );
+        assert!(page.truncated);
+        assert!(
+            page.scanned_from_sequence.is_some() && page.scanned_to_sequence.is_some(),
+            "an incomplete search must say which window it covered"
+        );
     }
 
     #[tokio::test]
