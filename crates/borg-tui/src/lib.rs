@@ -8697,7 +8697,7 @@ impl BorgTerminal {
                 frame.render_widget(
                     Paragraph::new(vec![
                         splash_logo_line(self.splash_started_at.elapsed(), self.splash_glitch_seed),
-                        splash_alpha_line(),
+                        splash_channel_line(),
                         Line::from(Span::styled(
                             splash_version(),
                             Style::default().fg(Color::DarkGray),
@@ -16637,8 +16637,15 @@ fn splash_logo_line(elapsed: Duration, seed: u64) -> Line<'static> {
     Line::from(spans)
 }
 
-fn splash_alpha_line() -> Line<'static> {
-    Line::from(Span::styled("αlphα", Style::default().fg(Color::White)))
+/// The one word on the splash that says what this is.
+///
+/// It is the only place the project's maturity is shown to someone running it,
+/// so it is deliberately the one thing a launch always renders. Kept as a
+/// function rather than inlined because a test pins the exact string: a silent
+/// edit here would otherwise change what every user is told with nothing to
+/// notice the change.
+fn splash_channel_line() -> Line<'static> {
+    Line::from(Span::styled("βεtα", Style::default().fg(Color::White)))
 }
 
 fn splitmix64(mut value: u64) -> u64 {

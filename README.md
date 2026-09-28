@@ -5,6 +5,9 @@ terminal and native GPUI frontends, durable sessions, native tools, provider
 adapters, and optional remote hosts. Releases include the `borg` CLI; the
 experimental `borg-gui` frontend is developed and built separately.
 
+**Beta.** Borg Agent is pre-1.0: usable and feature-complete for everyday work,
+with rough edges expected. Please report what breaks.
+
 [简体中文](docs/zh-Hans/README.md) ·
 [Español](docs/es/README.md) ·
 [Русский](docs/ru/README.md) · 

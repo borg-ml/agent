@@ -11519,7 +11519,7 @@ fn borging_roll_selects_exactly_one_percent_of_uniform_run_ids() {
 #[test]
 fn splash_logo_randomizes_glitches_and_then_settles() {
     assert_eq!(splash_version(), format!("v{}", env!("CARGO_PKG_VERSION")));
-    assert_eq!(splash_alpha_line().to_string(), "αlphα");
+    assert_eq!(splash_channel_line().to_string(), "βεtα");
     assert_eq!(
         splash_logo_line(Duration::from_millis(1_320), 7).to_string(),
         "B O R G"
