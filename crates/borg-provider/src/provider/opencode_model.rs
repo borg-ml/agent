@@ -175,7 +175,6 @@ pub async fn context_window_tokens(model: &str) -> Option<u64> {
 const MODELS_DEV_PROVIDER: &str = "opencode-go";
 
 /// The catalog quotes dollars per million tokens; Borg accounts in micro-USD.
-
 #[cfg(test)]
 mod tests {
     use super::*;

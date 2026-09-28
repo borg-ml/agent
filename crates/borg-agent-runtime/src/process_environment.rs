@@ -10,10 +10,10 @@ pub(crate) fn configure_sanitized_child_environment(command: &mut Command) {
     }
     if let Some(home) = opted_in_home() {
         command.env("HOME", home);
-        if cfg!(windows) {
-            if let Ok(profile) = std::env::var("USERPROFILE") {
-                command.env("USERPROFILE", profile);
-            }
+        if cfg!(windows)
+            && let Ok(profile) = std::env::var("USERPROFILE")
+        {
+            command.env("USERPROFILE", profile);
         }
     }
 }
@@ -29,7 +29,6 @@ pub(crate) fn configure_sanitized_child_environment(command: &mut Command) {
 /// as logged out rather than failing with something actionable. The setting
 /// names the trade-off instead of leaving it implicit, and the child still
 /// receives nothing else from the supervisor's environment.
-
 pub(crate) fn configure_runtime_environment(command: &mut Command) {
     configure_sanitized_child_environment(command);
 }
