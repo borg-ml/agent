@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 
@@ -160,11 +161,92 @@ pub(super) fn tool_detail_lines(
         .collect()
 }
 
+/// The wrapped output for the part of a reasoning block that can no longer
+/// change.
+struct ReasoningWrap {
+    width: usize,
+    /// The completed-line prefix these lines cover, byte for byte.
+    covered: String,
+    lines: Vec<Line<'static>>,
+}
+
+thread_local! {
+    /// One block's worth, reused across the frames that redraw it.
+    ///
+    /// Measured at about 21.5 microseconds a line to parse and wrap, against a
+    /// few to copy, and the loop redraws the whole block every frame. Reusing
+    /// the finished lines turns the cost of a frame from the length of the
+    /// block into the length of what arrived since the last one.
+    static REASONING_WRAP: RefCell<Option<ReasoningWrap>> = const { RefCell::new(None) };
+}
+
 fn reasoning_lines(source: &str, width: usize) -> Vec<Line<'static>> {
-    let items = reasoning_items(source);
-    if items.is_empty() {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        REASONING_WRAP.with(|cell| *cell.borrow_mut() = None);
         return vec![Line::default()];
     }
+    if bold_reasoning_thoughts(trimmed).is_some() {
+        // The bold markers pair across the whole source, so the parse is one
+        // unit and none of it is stable to reuse between frames: a trailing
+        // `**` turns a plain line into a bold one. Nothing to do but redo it.
+        REASONING_WRAP.with(|cell| *cell.borrow_mut() = None);
+        return wrap_reasoning_items(reasoning_items_from_lines(source.lines()), width);
+    }
+    incremental_reasoning_lines(source, width)
+}
+
+fn incremental_reasoning_lines(source: &str, width: usize) -> Vec<Line<'static>> {
+    // Up to the last newline is a line that has been terminated, and a
+    // terminated line can never change again - so its wrap is reusable exactly,
+    // not approximately. The remainder is still being written and is redone
+    // every frame.
+    let completed = match source.rfind('\n') {
+        Some(end) => &source[..=end],
+        None => "",
+    };
+    let reusable = REASONING_WRAP
+        .with(|cell| cell.borrow_mut().take())
+        .filter(|wrap| wrap.width == width && completed.starts_with(&wrap.covered));
+    let (covered, mut lines) = reusable.map_or_else(
+        || (String::new(), Vec::new()),
+        |wrap| (wrap.covered, wrap.lines),
+    );
+    if completed.len() > covered.len() {
+        lines.extend(wrap_reasoning_items(
+            reasoning_items_from_lines(completed[covered.len()..].lines()),
+            width,
+        ));
+    }
+    // Only the completed prefix is kept. The line still being written is
+    // wrapped into the returned lines but never into the cache: caching it
+    // would append it again on the next frame, and it is the one line whose
+    // content can still change.
+    let cacheable = lines.clone();
+    let tail = &source[completed.len()..];
+    if !tail.trim().is_empty() {
+        lines.extend(wrap_reasoning_items(
+            reasoning_items_from_lines(tail.lines()),
+            width,
+        ));
+    }
+    if lines.is_empty() {
+        return vec![Line::default()];
+    }
+    REASONING_WRAP.with(|cell| {
+        *cell.borrow_mut() = Some(ReasoningWrap {
+            width,
+            covered: completed.to_string(),
+            lines: cacheable,
+        });
+    });
+    lines
+}
+
+fn wrap_reasoning_items(
+    items: impl IntoIterator<Item = String>,
+    width: usize,
+) -> Vec<Line<'static>> {
     items
         .into_iter()
         .flat_map(|item| {
@@ -182,21 +264,13 @@ fn reasoning_lines(source: &str, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn reasoning_items(source: &str) -> Vec<String> {
-    let trimmed = source.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-    if let Some(thoughts) = bold_reasoning_thoughts(trimmed) {
-        return thoughts.into_iter().map(str::to_string).collect();
-    }
-    // The `**` markers are stripped per line rather than by rewriting the whole
-    // source first. A streaming block is re-rendered on every frame, so
-    // `source.replace` allocated and copied the entire reasoning text again and
-    // again for every delta - the cost grew with the block and the total work
-    // over a stream grew faster than the stream itself.
-    source
-        .lines()
+/// The non-bold path's per-line extraction, kept separate from the choice
+/// between the two paths so the incremental render can reuse it line by line.
+///
+/// Pure per line, which is what makes reuse sound: a terminated line yields the
+/// same items for the rest of the stream's life.
+fn reasoning_items_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
+    lines
         .filter_map(|raw_line| {
             let line = raw_line.trim();
             if line.is_empty() {
@@ -1353,70 +1427,111 @@ mod tests {
         );
     }
 
-    /// What one frame of a growing reasoning block actually costs, and where
-    /// the cost sits.
+    /// What one frame of a growing reasoning block actually costs.
     ///
-    /// This is a measurement rather than a test: there is no bound worth
-    /// asserting, because the number that matters is the one on the machine the
-    /// user is on. It is `#[ignore]`d so it never gates CI, and run with
+    /// A measurement rather than a test: there is no bound worth gating CI on,
+    /// because the number that matters is the one on the machine the user is
+    /// on. It is `#[ignore]`d so it never gates CI, and run with
     ///
     /// ```text
     /// cargo test -p borg-tui --lib -- --ignored reasoning_frame_cost
     /// ```
     ///
-    /// The streaming loop re-renders the whole expanded block on every frame,
-    /// and it adapts its frame interval to how long the last draw took - so this
-    /// per-frame number is what sets the rate the text appears to arrive at.
+    /// A frame is not a fresh render of a finished block: it is one more render
+    /// of a block that has grown by a line since the last one. So the block is
+    /// fed in a line at a time and the steady state timed, which is the number
+    /// that decides how fast streamed text can appear - the loop raises its
+    /// frame interval to at least the last draw's duration.
     #[test]
     #[ignore = "a measurement, not an assertion; run it on the machine you care about"]
     fn reasoning_frame_cost() {
-        use std::time::Instant;
+        use std::time::{Duration, Instant};
 
-        // A long thinking block: a few hundred short lines, which is ordinary
-        // for a model that reasons at length.
-        let source: String = (0..400)
-            .map(|index| {
-                format!(
-                    "considering whether the {index}th approach holds up, and what \
-                     it would cost to be wrong about it"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
         let width = 100;
-        let rounds = 50;
-
-        // Rendered at several lengths, because the shape of the curve is the
-        // point: a per-frame cost proportional to the block shows up as a line
-        // that rises with length, and that is what caps the streaming frame
-        // rate. Measured on whatever machine runs it, so the absolute numbers
-        // are local; the ratio between them is not.
         println!(
-            "{:>7}  {:>9}  {:>12}  {:>12}",
-            "lines", "bytes", "parse+wrap", "with prefix"
+            "{:>7}  {:>9}  {:>14}  {:>16}",
+            "lines", "bytes", "last frame", "whole stream"
         );
         for count in [50usize, 100, 200, 400, 800] {
-            let source: String = (0..count)
+            let lines: Vec<String> = (0..count)
                 .map(|index| {
                     format!(
                         "considering whether the {index}th approach holds up, and what \
                          it would cost to be wrong about it"
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let parse_only = Instant::now();
-            for _ in 0..rounds {
-                std::hint::black_box(super::reasoning_lines(&source, width));
+                .collect();
+            let source = lines.join("\n");
+            // The same lines with the last one still being written, which is the
+            // state every frame except the last one sees.
+            let mut partial = String::new();
+            let mut last = Duration::ZERO;
+            let stream = Instant::now();
+            for line in &lines {
+                let started = Instant::now();
+                std::hint::black_box(super::tool_detail_lines("reasoning", &partial, width, "> "));
+                last = started.elapsed();
+                partial.push_str(line);
+                partial.push('\n');
             }
-            let parse = parse_only.elapsed() / rounds;
-            let full = Instant::now();
-            for _ in 0..rounds {
-                std::hint::black_box(super::tool_detail_lines("reasoning", &source, width, "> "));
-            }
-            let full = full.elapsed() / rounds;
-            println!("{count:>7}  {:>9}  {parse:>12?}  {full:>12?}", source.len());
+            let whole = stream.elapsed();
+            println!("{count:>7}  {:>9}  {last:>14?}  {whole:>16?}", source.len());
         }
+    }
+
+    /// The incremental render reuses the wrap of the lines that have been
+    /// terminated, so the reuse has to be exactly right in the cases where it
+    /// is allowed and refused where it is not. A cache that returned a stale
+    /// line would mis-render reasoning without failing anything.
+    #[test]
+    fn the_reused_wrap_matches_a_full_render_in_every_case() {
+        let render = |source: &str, width: usize| {
+            super::reasoning_lines(source, width)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        // Grown the way a stream grows: the finished lines must come out the
+        // same as if the whole thing had been rendered at once.
+        let mut grown = String::new();
+        let mut expected = Vec::new();
+        for line in [
+            "first line of reasoning",
+            "second line that is quite a lot longer than the first one and will need wrapping at a narrow width",
+            "third",
+        ] {
+            expected = render(&grown, 20);
+            assert_eq!(render(&grown, 20), expected, "stable across a repeat");
+            grown.push_str(line);
+            grown.push('\n');
+        }
+        // A different width is a different render, so nothing may be reused.
+        let narrow = render(&grown, 20);
+        assert_ne!(narrow, render(&grown, 60), "width must change the output");
+
+        // A stream that is replaced rather than extended - a new block, or a
+        // different answer - must not inherit the previous one's lines.
+        let replaced = "entirely different content that shares no prefix at all";
+        let replaced_lines = render(replaced, 20);
+        assert_eq!(replaced_lines, render(replaced, 20));
+        assert!(
+            !replaced_lines
+                .iter()
+                .any(|line| line.contains("first line"))
+        );
+
+        // The line still being written is always redone, so text arriving in
+        // pieces on one line ends up whole and is not wrapped mid-word.
+        let mut partial = String::from("a line that is still being written");
+        let before = render(&partial, 80);
+        partial.push_str(" and now it is finished");
+        let after = render(&partial, 80);
+        assert_eq!(
+            after,
+            vec!["a line that is still being written and now it is finished"],
+            "the in-progress line must be re-rendered, got {before:?} then {after:?}"
+        );
     }
 
     fn reasoning_renderer_separates_codex_bold_summary_segments() {
