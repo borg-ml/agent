@@ -60,6 +60,38 @@ pub fn model_catalog_for_backend(backend: &str) -> Option<ProviderModelCatalog> 
         .find(|catalog| catalog.backend == backend)
 }
 
+/// Effort levels an OpenAI-compatible route actually distinguishes.
+///
+/// Each of these adapters folds Borg's wider vocabulary onto a smaller wire
+/// vocabulary, so offering the Codex levels for them produces choices that
+/// resolve to the same request. A route whose effort is a single on/off gate
+/// (Qwen's `enable_thinking`) is left out rather than given invented levels:
+/// no picker at all beats a list that cannot be honoured.
+pub const OPENROUTER_EFFORT_LEVELS: [&str; 4] = ["low", "medium", "high", "max"];
+pub const VERCEL_EFFORT_LEVELS: [&str; 4] = ["low", "medium", "high", "max"];
+pub const GLM_EFFORT_LEVELS: [&str; 3] = ["low", "medium", "high"];
+pub const KIMI_EFFORT_LEVELS: [&str; 3] = ["low", "high", "max"];
+
+fn compatible_effort_levels(backend: &str) -> Option<&'static [&'static str]> {
+    match backend {
+        "openrouter" => Some(&OPENROUTER_EFFORT_LEVELS),
+        "vercel" => Some(&VERCEL_EFFORT_LEVELS),
+        "glm" => Some(&GLM_EFFORT_LEVELS),
+        "kimi" => Some(&KIMI_EFFORT_LEVELS),
+        _ => None,
+    }
+}
+
+/// The effort levels `backend` really supports, or an empty list when it has
+/// no effort control. A provider with a model catalog answers from that
+/// catalog; there is deliberately no cross-provider default.
+pub fn effort_levels_for_backend(backend: &str) -> &'static [&'static str] {
+    model_catalog_for_backend(backend)
+        .map(|catalog| catalog.effort_levels)
+        .or_else(|| compatible_effort_levels(backend))
+        .unwrap_or(&[])
+}
+
 pub fn elapsed_millis_u64(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }

@@ -3490,10 +3490,18 @@ fn resume_instructions_end_with_copyable_command() {
 
 #[test]
 fn ephemeral_exit_never_advertises_an_unresumable_session() {
-    assert!(!should_print_exit_resume(true, None, true));
-    assert!(should_print_exit_resume(true, None, false));
-    assert!(!should_print_exit_resume(true, Some(Uuid::new_v4()), false));
-    assert!(!should_print_exit_resume(false, None, false));
+    assert!(!should_print_exit_resume(true, None, true, false));
+    assert!(should_print_exit_resume(true, None, false, false));
+    assert!(!should_print_exit_resume(
+        true,
+        Some(Uuid::new_v4()),
+        false,
+        false
+    ));
+    assert!(!should_print_exit_resume(false, None, false, false));
+    // A session discarded as empty is gone, so advertising a resume line would
+    // hand the user a command that cannot resolve.
+    assert!(!should_print_exit_resume(true, None, false, true));
 }
 
 #[test]

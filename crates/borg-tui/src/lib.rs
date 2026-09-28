@@ -1,6 +1,7 @@
 mod attachments;
 mod cache_diagnostics;
 mod clipboard;
+mod composer_draft;
 mod key_hints;
 mod markdown;
 mod rendering;
@@ -28,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use attachments::{AttachmentStore, PasteOutcome};
+use composer_draft::{ComposerDraft, ComposerDraftStore};
 use borg_remote::{
     ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus, MessageStatus,
     PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage, SessionEvent,
@@ -484,6 +486,7 @@ enum StatusFocus {
     Fast,
     Permission,
     Context,
+    Billing,
     Shell,
     Watch,
     Todo,
@@ -1619,6 +1622,10 @@ pub struct BorgTerminal {
     back_to_director_hovered: bool,
     composer: Composer,
     attachment_store: AttachmentStore,
+    composer_draft_store: ComposerDraftStore,
+    /// Last composer state written to the sidecar, so a save only touches the
+    /// disk when the draft actually changed.
+    persisted_draft: Option<ComposerDraft>,
     keymap: KeyMap,
     ui_language: UiLanguage,
     cwd: PathBuf,
@@ -1718,6 +1725,8 @@ pub struct BorgTerminal {
     todo_status_area: Option<Rect>,
     todo_status_hovered: bool,
     todo_status_expanded: bool,
+    billing_status_area: Option<Rect>,
+    billing_status_hovered: bool,
     shell_status_area: Option<Rect>,
     shell_status_hovered: bool,
     shell_menu_open: bool,
@@ -1819,6 +1828,7 @@ struct HoverState {
     status_hovered: bool,
     goal_status_hovered: bool,
     todo_status_hovered: bool,
+    billing_status_hovered: bool,
     shell_status_hovered: bool,
     hovered_shell_row: Option<usize>,
     agents_status_hovered: bool,
@@ -1850,6 +1860,7 @@ impl BorgTerminal {
             status_hovered: self.status_hovered,
             goal_status_hovered: self.goal_status_hovered,
             todo_status_hovered: self.todo_status_hovered,
+            billing_status_hovered: self.billing_status_hovered,
             shell_status_hovered: self.shell_status_hovered,
             hovered_shell_row: self.hovered_shell_row,
             agents_status_hovered: self.agents_status_hovered,
@@ -2776,12 +2787,13 @@ fn model_picker_options_with_configured(
     options
 }
 
+/// The effort levels the configured provider actually honours. Empty means it
+/// has no effort control, and the picker must not open rather than offer
+/// levels that would collapse onto one request.
 fn effort_picker_options(provider: Option<CodingProvider>) -> &'static [&'static str] {
-    provider
-        .and_then(CodingProvider::model_catalog)
-        .map(|catalog| catalog.effort_levels)
-        .filter(|efforts| !efforts.is_empty())
-        .unwrap_or(&borg_provider::CODEX_EFFORT_LEVELS)
+    provider.map_or(&[][..], |provider| {
+        borg_provider::effort_levels_for_backend(provider.catalog_backend())
+    })
 }
 
 impl BorgTerminal {
@@ -2911,6 +2923,8 @@ impl BorgTerminal {
             back_to_director_hovered: false,
             composer: Composer::default(),
             attachment_store,
+            composer_draft_store: ComposerDraftStore::for_session(sessions_dir, session_id),
+            persisted_draft: None,
             keymap,
             ui_language: UiLanguage::Auto,
             cwd,
@@ -3001,6 +3015,8 @@ impl BorgTerminal {
             todo_status_area: None,
             todo_status_hovered: false,
             todo_status_expanded: false,
+            billing_status_area: None,
+            billing_status_hovered: false,
             shell_status_area: None,
             shell_status_hovered: false,
             shell_menu_open: false,
@@ -3084,6 +3100,8 @@ impl BorgTerminal {
         keybindings: &KeybindingConfig,
     ) -> Result<()> {
         self.attachment_store = AttachmentStore::for_session(sessions_dir, session_id)?;
+        self.composer_draft_store = ComposerDraftStore::for_session(sessions_dir, session_id);
+        self.persisted_draft = None;
         self.keymap = KeyMap::from_config(keybindings)?;
         self.transcript = root_transcript_from_environment();
         self.transcript
@@ -3167,6 +3185,8 @@ impl BorgTerminal {
         self.todo_status_area = None;
         self.todo_status_hovered = false;
         self.todo_status_expanded = false;
+        self.billing_status_area = None;
+        self.billing_status_hovered = false;
         self.shell_status_area = None;
         self.shell_status_hovered = false;
         self.shell_menu_open = false;
@@ -3467,6 +3487,39 @@ impl BorgTerminal {
 
     pub fn composer_draft(&self) -> Option<(String, Vec<PathBuf>)> {
         self.composer.draft()
+    }
+
+    /// Bring back the prompt this session was left holding, so quitting
+    /// mid-sentence and resuming does not cost the user their text.
+    pub fn restore_composer_draft(&mut self) {
+        let Some(draft) = self.composer_draft_store.load() else {
+            return;
+        };
+        self.composer.restore(draft.text.clone(), draft.attachments.clone());
+        self.persisted_draft = Some(draft);
+    }
+
+    /// Mirror the composer to the draft sidecar. Called after input, so a quit
+    /// at any point leaves a resumable prompt. Failures are logged, never
+    /// surfaced: a draft that cannot be written must not break typing.
+    pub fn persist_composer_draft(&mut self) {
+        let current = self.composer_draft().map_or_else(
+            || ComposerDraft::default(),
+            |(text, attachments)| ComposerDraft { text, attachments },
+        );
+        if self.persisted_draft.as_ref() == Some(&current) {
+            return;
+        }
+        match self.composer_draft_store.save(&current) {
+            Ok(()) => {
+                self.persisted_draft = (!current.is_empty()).then_some(current);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to persist composer draft");
+                // Do not retry the same failing write on every keystroke.
+                self.persisted_draft = Some(current);
+            }
+        }
     }
 
     pub fn project_pending_prompt(
@@ -4646,6 +4699,7 @@ impl BorgTerminal {
         self.status_hovered = false;
         self.goal_status_hovered = false;
         self.todo_status_hovered = false;
+        self.billing_status_hovered = false;
         self.shell_status_hovered = false;
         self.hovered_shell_row = None;
         self.watch_status_hovered = false;
@@ -4676,6 +4730,7 @@ impl BorgTerminal {
             (StatusFocus::Fast, self.fast_status_area),
             (StatusFocus::Permission, self.permission_status_area),
             (StatusFocus::Context, self.context_status_area),
+            (StatusFocus::Billing, self.billing_status_area),
             (StatusFocus::Shell, self.shell_status_area),
             (StatusFocus::Watch, self.watch_status_area),
             (StatusFocus::Todo, self.todo_status_area),
@@ -4714,6 +4769,7 @@ impl BorgTerminal {
             StatusFocus::Fast => self.fast_status_hovered = visible,
             StatusFocus::Permission => self.permission_status_hovered = visible,
             StatusFocus::Context => self.context_status_hovered = visible,
+            StatusFocus::Billing => self.billing_status_hovered = visible,
             StatusFocus::Shell => {
                 self.shell_status_hovered = visible;
                 self.hovered_shell_row = row;
@@ -5375,6 +5431,11 @@ impl BorgTerminal {
             .as_ref()
             .and_then(|config| config.effort.clone());
         let options = effort_picker_options(provider);
+        // A provider with no effort control has nothing to choose between, so
+        // leave the current picker closed instead of listing phantom levels.
+        if options.is_empty() {
+            return;
+        }
         let mut picker = Picker::new(
             PickerKind::Effort,
             "Choose effort",
@@ -6011,7 +6072,16 @@ impl BorgTerminal {
         )
     }
 
+    /// Handle one terminal event, then mirror the composer to its sidecar.
+    /// The draft has to survive a quit at any moment, so it is persisted here
+    /// rather than only at shutdown.
     pub fn handle_event(&mut self, input: TerminalInputEvent) -> Result<UiAction> {
+        let action = self.handle_event_inner(input);
+        self.persist_composer_draft();
+        action
+    }
+
+    fn handle_event_inner(&mut self, input: TerminalInputEvent) -> Result<UiAction> {
         let TerminalInputEvent {
             event,
             scroll_repetitions,
@@ -6106,6 +6176,9 @@ impl BorgTerminal {
                     .is_some_and(|area| area.contains(pointer));
                 self.todo_status_hovered = self
                     .todo_status_area
+                    .is_some_and(|area| area.contains(pointer));
+                self.billing_status_hovered = self
+                    .billing_status_area
                     .is_some_and(|area| area.contains(pointer));
                 self.shell_status_hovered = self
                     .shell_status_area
@@ -6300,6 +6373,25 @@ impl BorgTerminal {
                                 return Ok(UiAction::ToggleGoal { action });
                             }
                             self.open_goal_picker();
+                            return Ok(UiAction::None);
+                        }
+                        if self
+                            .billing_status_area
+                            .is_some_and(|area| area.contains(pointer))
+                        {
+                            // The billing lane decides which credentials the
+                            // next turn spends, so switching it goes through the
+                            // connection picker rather than re-authenticating
+                            // behind the user's back.
+                            if let (Some(provider), Some(model)) = (
+                                self.session_provider(),
+                                self.transcript
+                                    .config
+                                    .as_ref()
+                                    .and_then(|config| config.model.clone()),
+                            ) {
+                                self.open_provider_auth_picker(provider, model);
+                            }
                             return Ok(UiAction::None);
                         }
                         if self
@@ -8374,6 +8466,7 @@ impl BorgTerminal {
         let mut next_status_area = None;
         let mut next_goal_status_area = None;
         let mut next_todo_status_area = None;
+        let mut next_billing_status_area = None;
         let mut next_shell_status_area = None;
         let mut next_agents_status_area = None;
         let mut next_model_status_area = None;
@@ -8506,18 +8599,11 @@ impl BorgTerminal {
                     footer_metadata_text(&combined_status, &cwd_status, usize::MAX).width() as u16;
                 let visible_metadata_width = metadata_width.min(footer_area.width);
                 let metadata_x = footer_area.right().saturating_sub(visible_metadata_width);
-                // Billing leads the metadata, so the interactive shell/todo
-                // hit areas start after it.
-                let interactive_follow =
-                    shell_status.is_some() || watch_status.is_some() || todo_status.is_some();
-                let billing_prefix_width = billing_status
-                    .as_deref()
-                    .filter(|_| interactive_follow)
-                    .map(|status| status.width() + STATUS_SEPARATOR.width())
-                    .unwrap_or(0) as u16;
                 // Tokens are laid out left to right; each interactive token's
-                // hit area starts after everything before it.
-                let mut cursor_x = metadata_x.saturating_add(billing_prefix_width);
+                // hit area starts after everything before it. Billing leads and
+                // is interactive too, so the billing lane can be switched
+                // without hunting through the model picker.
+                let mut cursor_x = metadata_x;
                 let mut place = |status: Option<&str>| -> Option<Rect> {
                     let status = status?;
                     let area = Rect {
@@ -8531,6 +8617,7 @@ impl BorgTerminal {
                         .saturating_add(STATUS_SEPARATOR.width() as u16);
                     Some(area)
                 };
+                next_billing_status_area = place(billing_status.as_deref());
                 next_shell_status_area = place(shell_status.as_deref());
                 next_watch_status_area = place(watch_status.as_deref());
                 next_todo_status_area = place(todo_status.as_deref());
@@ -9854,6 +9941,7 @@ impl BorgTerminal {
                             watch_status.as_deref(),
                             todo_status.as_deref(),
                             &cwd_status,
+                            self.billing_status_hovered,
                             self.shell_status_hovered,
                             self.watch_status_hovered,
                             self.todo_status_hovered,
@@ -10129,6 +10217,7 @@ impl BorgTerminal {
                         ("fast", next_fast_status_area),
                         ("permission", next_permission_status_area),
                         ("context", next_context_status_area),
+                        ("billing", next_billing_status_area),
                         ("shell", next_shell_status_area),
                         ("watch", next_watch_status_area),
                         ("todos", next_todo_status_area),
@@ -10209,6 +10298,7 @@ impl BorgTerminal {
         self.status_area = next_status_area;
         self.goal_status_area = next_goal_status_area;
         self.todo_status_area = next_todo_status_area;
+        self.billing_status_area = next_billing_status_area;
         self.shell_status_area = next_shell_status_area;
         self.shell_row_hit_areas = next_shell_row_hit_areas;
         self.watch_status_area = next_watch_status_area;
@@ -15760,6 +15850,7 @@ fn footer_shell_todo_metadata_line(
     watch_status: Option<&str>,
     todo_status: Option<&str>,
     cwd_status: &str,
+    billing_hovered: bool,
     shell_hovered: bool,
     watch_hovered: bool,
     todo_hovered: bool,
@@ -15784,7 +15875,12 @@ fn footer_shell_todo_metadata_line(
     // away from the effort level, so a "max sub" plan never reads as "max"
     // effort. Interactive tokens (shells, watches, to-dos) follow it.
     let parts = [
-        billing_status.map(|billing| (billing, Style::default().fg(billing_status_color(billing)))),
+        billing_status.map(|billing| {
+            (
+                billing,
+                interactive_style(billing_hovered, billing_status_color(billing)),
+            )
+        }),
         shell_status.map(|shell| (shell, interactive_style(shell_hovered, USER_LABEL_BLUE))),
         watch_status.map(|watch| (watch, interactive_style(watch_hovered, WATCH_PURPLE))),
         todo_status.map(|todo| (todo, interactive_style(todo_hovered, TODO_ORANGE))),

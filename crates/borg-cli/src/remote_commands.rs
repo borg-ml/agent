@@ -2758,6 +2758,9 @@ async fn run_local_agent_session(
         terminal.seed_team_roster(&team_snapshots);
         terminal.seed_history(&history);
         terminal.seed_session_state(&display_session_state);
+        // Bring back whatever the composer was holding when this session was
+        // last closed. A fresh session has no sidecar, so this is a no-op there.
+        terminal.restore_composer_draft();
         if let Some(notice) = startup_update_notice.as_deref() {
             terminal.set_notice(notice);
         } else if let Some(notice) = retry_notice.as_deref() {
@@ -5487,6 +5490,7 @@ async fn run_local_agent_session(
                                 restored.seed_history(&latest.events);
                                 seed_terminal_subagent_threads(&mut restored, &agents, &histories);
                                 restored.seed_session_state(&latest_state);
+                                restored.restore_composer_draft();
                                 terminal = Some(restored);
                                 crash_context.tui_active.store(true, Ordering::Release);
                             }
@@ -7425,6 +7429,7 @@ async fn run_local_agent_session(
                                             &histories,
                                         );
                                         restored.seed_session_state(&latest_state);
+                                        restored.restore_composer_draft();
                                         restored.set_notice(match connected {
                                             Ok(()) => "Remote connected. This chat is now available at borg.ml/remote.".to_string(),
                                             Err(error) => format!("Remote connection failed: {error:#}"),
@@ -7928,7 +7933,12 @@ async fn run_local_agent_session(
     {
         println!("\n  {notice}");
     }
-    if should_print_exit_resume(user_requested_exit, resume_session, args.ephemeral) {
+    if should_print_exit_resume(
+        user_requested_exit,
+        resume_session,
+        args.ephemeral,
+        discarded_empty_session,
+    ) {
         if let Some(notice) = exit_notice {
             println!("\n  {notice}");
         }
@@ -8414,8 +8424,9 @@ fn should_print_exit_resume(
     user_requested_exit: bool,
     resume_session: Option<Uuid>,
     ephemeral: bool,
+    discarded_empty_session: bool,
 ) -> bool {
-    user_requested_exit && resume_session.is_none() && !ephemeral
+    user_requested_exit && resume_session.is_none() && !ephemeral && !discarded_empty_session
 }
 
 fn should_detach_on_terminal_hangup(

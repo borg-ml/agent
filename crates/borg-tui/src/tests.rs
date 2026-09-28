@@ -1686,6 +1686,7 @@ fn hover_redraw_gate_ignores_motion_inside_one_target() {
         status_hovered: false,
         goal_status_hovered: false,
         todo_status_hovered: false,
+        billing_status_hovered: false,
         shell_status_hovered: false,
         hovered_shell_row: None,
         agents_status_hovered: false,
@@ -6505,6 +6506,7 @@ fn footer_billing_leads_the_metadata_and_uses_the_billing_color() {
         false,
         false,
         false,
+        false,
         usize::MAX,
     );
     assert_eq!(line.spans[0].content, "max sub");
@@ -6524,6 +6526,7 @@ fn footer_billing_leads_the_metadata_and_uses_the_billing_color() {
         false,
         false,
         false,
+        false,
         usize::MAX,
     );
     assert_eq!(billing_only.spans[0].content, "api");
@@ -6539,6 +6542,7 @@ fn footer_watch_token_sits_between_shells_and_todos() {
         Some("2 watchers"),
         Some("1 to-do"),
         "~/borg-cli",
+        false,
         false,
         true,
         false,
@@ -6599,6 +6603,7 @@ fn footer_shell_metadata_uses_the_blue_background_action_identity() {
         false,
         false,
         false,
+        false,
         usize::MAX,
     );
 
@@ -6614,6 +6619,7 @@ fn footer_shell_metadata_uses_the_blue_background_action_identity() {
         None,
         None,
         "~/borg-cli",
+        false,
         true,
         false,
         false,

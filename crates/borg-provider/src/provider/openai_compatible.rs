@@ -1508,6 +1508,20 @@ async fn read_compatible_model_stream(
             }
             let chunk: Value = serde_json::from_str(data)
                 .map_err(|error| format!("invalid SSE JSON chunk: {error}"))?;
+            // A provider that fails mid-stream (an upstream refusal, an
+            // exhausted context window, a model that cannot serve the
+            // request) reports it as an `error` object and closes the body
+            // without a finish_reason. Without this the loop falls through to
+            // the truncation branch below and reports "stream ended before a
+            // finish_reason", which names a transport symptom and throws away
+            // the only sentence that says what actually went wrong.
+            if let Some(error) = chunk.get("error") {
+                let message = format!("provider rejected the request: {}", stream_error_message(error));
+                return Err(CompatibleStreamError {
+                    kind: stream_error_kind(&message),
+                    message,
+                });
+            }
             if let Some(delta) = chunk
                 .pointer("/choices/0/delta/content")
                 .and_then(Value::as_str)
@@ -1912,6 +1926,42 @@ fn emit_compatible_retry_event(
     });
 }
 
+/// The most specific sentence a provider error carries. OpenRouter nests the
+/// upstream text under `error.message` and the raw vendor body under
+/// `error.metadata.raw`; other gateways put a bare string at the top.
+fn stream_error_message(error: &Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let raw = error
+        .pointer("/metadata/raw")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let detail = error.as_str().map(str::to_string);
+    message
+        .or(raw)
+        .or(detail)
+        .unwrap_or_else(|| error.to_string())
+}
+
+/// Classify a mid-stream provider error. Reusing the same context-length
+/// spellings as the non-streaming path keeps a context refusal recoverable
+/// here too, instead of being reported as a dead connection that a retry
+/// would repeat.
+fn stream_error_kind(message: &str) -> ProviderErrorKind {
+    let text = message.to_ascii_lowercase();
+    if ["context length", "context_length", "context limit", "maximum context", "max context"]
+        .iter()
+        .any(|needle| text.contains(needle))
+    {
+        return ProviderErrorKind::ContextLength;
+    }
+    // A provider that answered with a refusal is alive; the request is not
+    // retryable, so calling it a lost connection would invite a retry loop.
+    ProviderErrorKind::Fatal
+}
+
 fn compatible_reasoning(effort: Option<&str>) -> Option<Value> {
     match effort.map(str::trim) {
         Some("low") => Some(json!({ "effort": "low" })),
@@ -2154,6 +2204,36 @@ mod tests {
         assert_eq!(
             compatible_reasoning(Some("ultra")),
             Some(json!({ "effort": "max" }))
+        );
+    }
+
+    #[test]
+    fn a_midstream_error_object_is_reported_instead_of_a_truncated_stream() {
+        // Failure mode: a provider refusal used to be discarded, and the turn
+        // was reported as "stream ended before a finish_reason", which names a
+        // transport symptom and leaves the user with nothing to act on.
+        let error = serde_json::json!({
+            "error": {
+                "code": 400,
+                "message": "This model's maximum context length is 200000 tokens.",
+                "metadata": { "raw": "context_length_exceeded" },
+            }
+        });
+        let message = format!(
+            "provider rejected the request: {}",
+            stream_error_message(error.get("error").expect("error object"))
+        );
+        assert!(message.contains("maximum context length"), "{message}");
+        assert_eq!(stream_error_kind(&message), ProviderErrorKind::ContextLength);
+    }
+
+    #[test]
+    fn a_midstream_refusal_is_fatal_rather_than_a_lost_connection() {
+        // A provider that answered is alive, so retrying the same request
+        // cannot help and must not look like a dropped connection.
+        assert_eq!(
+            stream_error_kind("provider rejected the request: insufficient credits"),
+            ProviderErrorKind::Fatal
         );
     }
 
