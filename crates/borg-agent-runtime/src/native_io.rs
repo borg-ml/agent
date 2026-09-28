@@ -3,8 +3,8 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use grep_matcher::Matcher;
 use ignore::WalkBuilder;
-use regex::RegexBuilder;
 use serde::Serialize;
 
 const MAX_READ_LINES: usize = 20_000;
@@ -178,10 +178,18 @@ fn search_text_blocking(
     } else {
         pattern.to_string()
     };
-    let regex = RegexBuilder::new(&expression)
+    // ripgrep's own engine, as a library: the same matcher and searcher the
+    // `rg` binary uses, so a model gets ripgrep's speed and semantics without
+    // the binary being installed, and without a second pattern dialect to
+    // explain.
+    let matcher = grep_regex::RegexMatcherBuilder::new()
+        .line_terminator(Some(b'\n'))
         .case_insensitive(!case_sensitive)
-        .build()
+        .build(&expression)
         .with_context(|| format!("invalid search pattern `{pattern}`"))?;
+    let mut searcher = grep_searcher::SearcherBuilder::new()
+        .line_number(true)
+        .build();
     let filename_needle = filename_needle(pattern, literal);
     // The walk root is canonical (macOS resolves /var to /private/var), so
     // strip the canonical workspace root or matches come back absolute.
@@ -230,33 +238,50 @@ fn search_text_blocking(
             .to_path_buf();
         let mut matches = Vec::new();
         let mut file_truncated = false;
-        for (line_index, line) in BufReader::new(file).lines().enumerate() {
-            let line = match line {
-                Ok(line) if line.len() <= MAX_SEARCH_LINE_BYTES => line,
-                Ok(_) | Err(_) => {
-                    files_skipped += 1;
-                    break;
+        let mut overlong_line = false;
+        // Errors here are the reader's, and a file that cannot be read is
+        // skipped rather than failing the whole search; the sink reports
+        // nothing back and the exit path is what matters.
+        // `Lossy` rather than a strict UTF-8 sink: a file with one bad byte
+        // should still yield its other matches instead of dropping the file.
+        // Returning false stops the search, which is how the per-file and
+        // pool caps take effect without ripgrep scanning the rest.
+        let _ = searcher.search_reader(
+            &matcher,
+            BufReader::new(file),
+            grep_searcher::sinks::Lossy(|line_number, line| {
+                if line.len() > MAX_SEARCH_LINE_BYTES {
+                    overlong_line = true;
+                    return Ok(false);
                 }
-            };
-            for found in regex.find_iter(&line) {
                 if matches.len() == MAX_SEARCH_MATCHES_PER_FILE
                     || candidates == MAX_SEARCH_CANDIDATES
                 {
                     file_truncated = true;
-                    break;
+                    return Ok(false);
                 }
+                // The column is where the line's first match starts, which is
+                // what a reader jumping to the match wants.
+                let column = matcher
+                    .find(line.as_bytes())
+                    .ok()
+                    .flatten()
+                    .map(|found| line[..found.start()].chars().count())
+                    .unwrap_or(0)
+                    + 1;
                 matches.push(SearchMatch {
                     path: relative_path.clone(),
-                    line: line_index + 1,
-                    column: line[..found.start()].chars().count() + 1,
-                    text: line.clone(),
+                    line: line_number as usize,
+                    column,
+                    text: line.to_string(),
                     score: 0,
                 });
                 candidates += 1;
-            }
-            if file_truncated {
-                break;
-            }
+                Ok(true)
+            }),
+        );
+        if overlong_line {
+            files_skipped += 1;
         }
         if !matches.is_empty() {
             let score =

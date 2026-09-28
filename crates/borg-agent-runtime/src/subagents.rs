@@ -7718,7 +7718,7 @@ pub fn agent_tool_specs_for_surface(
         ),
         tool(
             "search_files",
-            "Search workspace text without requiring external executables. Results are gitignore-aware, bounded, and resumable with next_offset.",
+            "Search workspace text, backed by the same engine ripgrep uses, so prefer this over shelling out to grep: it needs no external executable, the pattern is a regex unless `literal` is set, results are gitignore-aware, and pages are bounded and resumable with next_offset.",
             json!({
                 "type": "object",
                 "properties": {
@@ -9529,7 +9529,7 @@ pub(crate) fn exec_tool_spec() -> Value {
 /// The schemas are the catalog's own, taken by name rather than rewritten here.
 /// A second copy of a description is a second thing to forget to update, and
 /// these are descriptions the runtime already depends on.
-pub(crate) fn promoted_capability_tools() -> [&'static str; 9] {
+pub(crate) fn promoted_capability_tools() -> [&'static str; 10] {
     [
         "get_goal",
         "create_goal",
@@ -9540,6 +9540,7 @@ pub(crate) fn promoted_capability_tools() -> [&'static str; 9] {
         "send_message",
         "followup_task",
         "query_history",
+        "search_files",
     ]
 }
 
