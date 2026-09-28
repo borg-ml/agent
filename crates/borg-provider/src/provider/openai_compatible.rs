@@ -386,27 +386,12 @@ impl OpenAiCompatibleProvider {
                 body["prompt_cache_key"] = json!(prompt_cache_key);
             }
         }
+        apply_reasoning(&mut body, profile, self.effort.as_deref());
         match profile {
             OpenAiCompatibleProfile::Kimi => {
-                body["reasoning_effort"] = json!(kimi_reasoning_effort(self.effort.as_deref()));
                 body["max_completion_tokens"] = json!(kimi_max_completion_tokens());
             }
-            OpenAiCompatibleProfile::Glm => {
-                // Z.ai takes the OpenAI `reasoning_effort` spelling; it has no
-                // separate completion-token knob to set here.
-                body["reasoning_effort"] = json!(glm_reasoning_effort(self.effort.as_deref()));
-            }
-            OpenAiCompatibleProfile::Qwen => {
-                // Alibaba's OpenAI-compatible route gates reasoning with
-                // `enable_thinking` rather than the OpenAI `reasoning_effort`
-                // spelling. Thinking is on by default; a caller asking for no
-                // effort turns it off so a cheap turn stays cheap.
-                body["enable_thinking"] = json!(qwen_thinking_enabled(self.effort.as_deref()));
-            }
             OpenAiCompatibleProfile::OpenRouter => {
-                if let Some(reasoning) = compatible_reasoning(self.effort.as_deref()) {
-                    body["reasoning"] = reasoning;
-                }
                 if let Some(max_tokens) = nonempty_env("BORG_OPENROUTER_MAX_COMPLETION_TOKENS")
                     .and_then(|value| value.parse::<u64>().ok())
                     .filter(|value| *value > 0)
@@ -414,11 +399,12 @@ impl OpenAiCompatibleProvider {
                     body["max_tokens"] = json!(max_tokens);
                 }
             }
-            OpenAiCompatibleProfile::Vercel => {
-                if let Some(reasoning) = compatible_reasoning(self.effort.as_deref()) {
-                    body["reasoning"] = reasoning;
-                }
-            }
+            // Reasoning is written once for every route above, so this match
+            // carries only what a vendor does besides reasoning. GLM, Qwen and
+            // Vercel have nothing else to add.
+            OpenAiCompatibleProfile::Glm
+            | OpenAiCompatibleProfile::Qwen
+            | OpenAiCompatibleProfile::Vercel => {}
             OpenAiCompatibleProfile::Generic => {
                 if let Some(max_tokens) = openai_compatible_max_tokens() {
                     body["max_tokens"] = json!(max_tokens);
@@ -959,16 +945,6 @@ fn kimi_chat_completions_endpoint() -> String {
     chat_completions_url(base)
 }
 
-/// Z.ai accepts the OpenAI `reasoning_effort` vocabulary. Borg's own effort
-/// levels are wider, so clamp rather than pass an unknown value through.
-fn glm_reasoning_effort(effort: Option<&str>) -> &'static str {
-    match effort.map(str::trim) {
-        Some("none") | Some("low") => "low",
-        Some("max") | Some("xhigh") | Some("ultra") | Some("high") => "high",
-        _ => "medium",
-    }
-}
-
 fn glm_chat_completions_endpoint() -> String {
     let base = nonempty_env("BORG_GLM_BASE_URL")
         .or_else(|| subscription_base_url(crate::subscription::Plan::GlmCoding))
@@ -984,20 +960,6 @@ fn qwen_chat_completions_endpoint() -> String {
         .or_else(|| subscription_base_url(crate::subscription::Plan::QwenCoding))
         .unwrap_or_else(|| "https://dashscope-intl.aliyuncs.com/compatible-mode/v1".to_string());
     chat_completions_url(base)
-}
-
-/// Qwen gates reasoning with `enable_thinking`. A caller that asked for no
-/// effort gets thinking off; every other level leaves the vendor default on.
-fn qwen_thinking_enabled(effort: Option<&str>) -> bool {
-    !matches!(effort.map(str::trim), Some("none") | Some("off"))
-}
-
-fn kimi_reasoning_effort(effort: Option<&str>) -> &'static str {
-    match effort.map(str::trim) {
-        Some("low") => "low",
-        Some("max") | Some("xhigh") | Some("ultra") => "max",
-        _ => "high",
-    }
 }
 
 fn kimi_max_completion_tokens() -> u64 {
@@ -1980,6 +1942,171 @@ fn compatible_reasoning(effort: Option<&str>) -> Option<Value> {
     }
 }
 
+/// The body field a route reads reasoning from.
+///
+/// The vendor decides the *shape*; the model decides the *value*. Keeping them
+/// apart is what lets one code path serve every route, so a new vendor is a new
+/// arm on this enum rather than a new bespoke mapping function.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReasoningField {
+    /// OpenAI-style `reasoning_effort`, a single string.
+    Effort,
+    /// OpenRouter-style nested `reasoning: { effort }`.
+    NestedEffort,
+    /// Alibaba's boolean `enable_thinking`, which has no levels at all.
+    ThinkingToggle,
+}
+
+/// How one route asks for reasoning.
+///
+/// `vocabulary` is the set of words that route actually accepts, ascending. An
+/// empty vocabulary means the route takes the normalized effort unchanged,
+/// which is the case for every gateway that publishes a normalized vocabulary of
+/// its own. A non-empty one is a vendor with a narrower ladder than Borg's, and
+/// the requested level is clamped onto it by rank rather than translated by a
+/// per-vendor match arm.
+#[derive(Clone, Copy, Debug)]
+struct ReasoningWire {
+    field: ReasoningField,
+    vocabulary: &'static [&'static str],
+    default: &'static str,
+}
+
+/// Borg's own effort ladder, cheapest first, plus `none` below it.
+///
+/// This ranks a requested level against a route's narrower vocabulary. It is
+/// not a list of levels to offer: the picker reads the model's catalog.
+const EFFORT_RANKS: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+fn effort_rank(effort: &str) -> Option<usize> {
+    EFFORT_RANKS.iter().position(|rank| *rank == effort)
+}
+
+impl OpenAiCompatibleProfile {
+    /// The reasoning contract for this route, or `None` when the route has no
+    /// reasoning control and the body must stay silent.
+    const fn reasoning_wire(self) -> Option<ReasoningWire> {
+        match self {
+            // Kimi folds Borg's ladder onto low / high / max.
+            Self::Kimi => Some(ReasoningWire {
+                field: ReasoningField::Effort,
+                vocabulary: &["low", "high", "max"],
+                default: "high",
+            }),
+            // Z.ai takes the OpenAI spelling but only low / medium / high.
+            Self::Glm => Some(ReasoningWire {
+                field: ReasoningField::Effort,
+                vocabulary: &["low", "medium", "high"],
+                default: "medium",
+            }),
+            // Alibaba gates reasoning with a boolean rather than a level.
+            Self::Qwen => Some(ReasoningWire {
+                field: ReasoningField::ThinkingToggle,
+                vocabulary: &[],
+                default: "high",
+            }),
+            // Gateways normalize reasoning themselves and publish the exact
+            // words in their catalog, so the level passes straight through.
+            Self::OpenRouter | Self::Vercel => Some(ReasoningWire {
+                field: ReasoningField::NestedEffort,
+                vocabulary: &[],
+                default: "high",
+            }),
+            Self::Generic => None,
+        }
+    }
+}
+
+/// The word to send for `effort` on a route with a narrower vocabulary.
+///
+/// Clamping is by rank, so a wider Borg ladder lands on the nearest word the
+/// vendor accepts instead of being silently downgraded by a hand-written arm.
+fn clamp_effort_to_vocabulary(effort: Option<&str>, wire: &ReasoningWire) -> &'static str {
+    let vocabulary = wire.vocabulary;
+    if vocabulary.is_empty() {
+        return wire.default;
+    }
+    let Some(requested) = effort.map(str::trim).and_then(effort_rank) else {
+        return wire.default;
+    };
+    vocabulary
+        .iter()
+        .map(|level| (*level, effort_rank(level).unwrap_or(0)))
+        // Nearest rung by rank, resolving an exact tie upward: a caller asking
+        // for `xhigh` on a route offering high and max meant "at least this
+        // much", so it must not be quietly downgraded.
+        .min_by_key(|(_, rank)| (rank.abs_diff(requested), std::cmp::Reverse(*rank)))
+        .map(|(level, _)| level)
+        .unwrap_or(wire.default)
+}
+
+/// Write this turn's reasoning onto the request body.
+///
+/// One function for every route: the field comes from the wire, the value from
+/// the normalized effort. A route with no reasoning control contributes
+/// nothing, so its body is byte-identical to what it was before reasoning was
+/// factored out.
+fn apply_reasoning(
+    body: &mut Value,
+    profile: OpenAiCompatibleProfile,
+    effort: Option<&str>,
+) {
+    let Some(wire) = profile.reasoning_wire() else {
+        return;
+    };
+    match wire.field {
+        ReasoningField::ThinkingToggle => {
+            // Only an explicit "no reasoning" turns thinking off; every other
+            // level leaves the vendor default on, because the field is boolean.
+            let off = matches!(effort.map(str::trim), Some("none") | Some("off"));
+            body["enable_thinking"] = json!(!off);
+        }
+        ReasoningField::Effort => {
+            body["reasoning_effort"] =
+                json!(compatible_effort_value(effort, wire.vocabulary, wire.default));
+        }
+        ReasoningField::NestedEffort => {
+            if let Some(value) = compatible_reasoning(effort) {
+                body["reasoning"] = value;
+            }
+        }
+    }
+}
+
+/// The single wire value for a route that takes OpenAI's `reasoning_effort`.
+///
+/// A route with a published vocabulary gets the level clamped onto it; a route
+/// without one takes the normalized word unchanged. `ultra` is Borg's own rung
+/// above the gateway's `max`, so it is the one level translated rather than
+/// forwarded.
+fn compatible_effort_value(
+    effort: Option<&str>,
+    vocabulary: &'static [&'static str],
+    default: &'static str,
+) -> String {
+    if !vocabulary.is_empty() {
+        return clamp_effort_to_vocabulary(
+            effort,
+            &ReasoningWire {
+                field: ReasoningField::Effort,
+                vocabulary,
+                default,
+            },
+        )
+        .to_string();
+    }
+    match effort.map(str::trim) {
+        // `ultra` is Borg's own rung above the gateway's `max`.
+        Some("ultra") => "max".to_string(),
+        Some(
+            level @ ("minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "none"),
+        ) => level.to_string(),
+        _ => default.to_string(),
+    }
+}
+
 fn compatible_openrouter_provider_preferences(require_parameters: bool) -> Option<Value> {
     let order = nonempty_env("BORG_OPENROUTER_PROVIDER_ORDER")
         .map(|value| {
@@ -2243,6 +2370,52 @@ mod tests {
             stream_error_kind("provider rejected the request: insufficient credits"),
             ProviderErrorKind::Fatal
         );
+    }
+
+    /// One body-writing path per route, pinned against what each vendor
+    /// actually accepts. Before this, each of Kimi, GLM, Qwen, OpenRouter and
+    /// Vercel had its own hand-written mapping; a route whose vendor ladder
+    /// changed needed a code change here.
+    #[test]
+    fn every_route_writes_reasoning_through_one_declared_wire() {
+        let body_for = |profile, effort| {
+            let mut body = json!({});
+            apply_reasoning(&mut body, profile, effort);
+            body
+        };
+
+        // Kimi clamps by rank onto its own three-rung ladder.
+        assert_eq!(body_for(OpenAiCompatibleProfile::Kimi, Some("xhigh"))["reasoning_effort"], "max");
+        assert_eq!(body_for(OpenAiCompatibleProfile::Kimi, Some("low"))["reasoning_effort"], "low");
+        assert_eq!(body_for(OpenAiCompatibleProfile::Kimi, None)["reasoning_effort"], "high");
+
+        // Z.ai stops at `high`, so every rung above it lands there.
+        assert_eq!(body_for(OpenAiCompatibleProfile::Glm, Some("ultra"))["reasoning_effort"], "high");
+        assert_eq!(body_for(OpenAiCompatibleProfile::Glm, Some("xhigh"))["reasoning_effort"], "high");
+        assert_eq!(body_for(OpenAiCompatibleProfile::Glm, Some("none"))["reasoning_effort"], "low");
+        assert_eq!(body_for(OpenAiCompatibleProfile::Glm, None)["reasoning_effort"], "medium");
+
+        // Alibaba's control is boolean: any level leaves thinking on.
+        assert_eq!(body_for(OpenAiCompatibleProfile::Qwen, Some("low"))["enable_thinking"], true);
+        assert_eq!(body_for(OpenAiCompatibleProfile::Qwen, Some("none"))["enable_thinking"], false);
+        assert!(body_for(OpenAiCompatibleProfile::Qwen, Some("low")).get("reasoning_effort").is_none());
+
+        // A gateway takes the normalized word unchanged, including `minimal`,
+        // which the old table dropped entirely.
+        assert_eq!(
+            body_for(OpenAiCompatibleProfile::OpenRouter, Some("minimal"))["reasoning"]["effort"],
+            "minimal"
+        );
+        assert_eq!(
+            body_for(OpenAiCompatibleProfile::Vercel, Some("ultra"))["reasoning"]["effort"],
+            "max"
+        );
+        // No effort means no reasoning field on a gateway.
+        assert!(body_for(OpenAiCompatibleProfile::OpenRouter, None).get("reasoning").is_none());
+
+        // A route with no reasoning control writes nothing at all.
+        let generic = body_for(OpenAiCompatibleProfile::Generic, Some("high"));
+        assert!(generic.as_object().expect("object").is_empty());
     }
 
     #[test]

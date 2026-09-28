@@ -707,6 +707,10 @@ impl AgentConfig {
                         id: alias,
                         label: format!("{provider_label} · {model_label}"),
                         detail: (!details.is_empty()).then(|| details.join(" · ")),
+                        // A configured model alias declares no effort
+                        // vocabulary, so none is claimed for it.
+                        supported_efforts: None,
+                        reasoning_mandatory: false,
                     }
                 })
             })
