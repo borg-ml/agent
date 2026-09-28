@@ -5084,6 +5084,28 @@ impl Transcript {
     /// The action group still being worked in. It stays open; finished groups
     /// fold to their summary header until clicked. The last group is open
     /// until the next assistant message completes, or while nothing follows it.
+    /// Whether a group still contains work that has not finished.
+    ///
+    /// Covers a tool call that has not reported a result, and a process that
+    /// started and is still running. Folding either would hide the only place
+    /// that work is visible.
+    fn window_has_unfinished_work(&self, window: &ToolRunWindow) -> bool {
+        if self.order[window.start..window.end].iter().any(|entry| {
+            matches!(
+                entry,
+                TranscriptEntry::Tool { complete, backgrounded, .. } if !*complete || *backgrounded
+            )
+        }) {
+            return true;
+        }
+        self.runtime_processes.values().any(|process| {
+            process.running
+                && process
+                    .tool_index
+                    .is_some_and(|index| index >= window.start && index < window.end)
+        })
+    }
+
     fn open_tool_run(&self, windows: &[Option<ToolRunWindow>]) -> Option<usize> {
         windows
             .iter()
@@ -6389,7 +6411,13 @@ impl Transcript {
                         let content_start = header_row + 1;
                         let content_end = lines.len();
                         let total_lines = content_end.saturating_sub(content_start);
-                        let foldable = open_window_start != Some(window.start) && total_lines > 0;
+                        // A group with work still in flight stays unfolded. Only
+                        // the latest group is ever "open", so a long command
+                        // still running would otherwise be folded away as soon
+                        // as the next action started, taking its live row with it.
+                        let foldable = open_window_start != Some(window.start)
+                            && total_lines > 0
+                            && !self.window_has_unfinished_work(&window);
                         let folded = foldable && !self.tool_run_expanded(window.start);
                         let expandable = foldable || total_lines > tool_run_viewport_height;
                         let expanded = expandable && self.tool_run_expanded(window.start);

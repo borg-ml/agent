@@ -13130,6 +13130,73 @@ fn actions_accordion_hides_expand_hint_when_all_rows_already_fit() {
     assert!(!rendered.contains("click to expand"), "{rendered}");
 }
 
+/// A group holding a command that is still running must stay unfolded. Only
+/// the latest group is ever the "open" one, so a long command was folded away
+/// the moment the next action started, taking the only visible sign of it with
+/// it - and unlike a finished group, there is no summary to stand in for it.
+#[test]
+fn a_group_with_a_running_command_stays_unfolded() {
+    let tool = |detail: &str, name: &str, backgrounded: bool| TranscriptEntry::Tool {
+        source_name: "exec".to_string(),
+        name: name.to_string(),
+        detail: detail.to_string(),
+        code_view: None,
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:00".to_string(),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        complete: true,
+        error: false,
+        user_interrupted: false,
+        backgrounded,
+        expanded: false,
+        outcome: None,
+        cwd: Some("/srv/ore-cues".to_string()),
+    };
+    let mut transcript = Transcript::default();
+    // The long command, in a group of its own, still running.
+    transcript.order.push(tool("long-build", "Run", true));
+    transcript.order.push(tool("first-read", "Read", false));
+    transcript.order.push(tool("first-search", "Search", false));
+    transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::Assistant,
+        text: "Looking into it.".to_string(),
+        attachments: Vec::new(),
+        model: None,
+        effort: None,
+        time: "12:01".to_string(),
+        status: MessageStatus::Complete,
+        complete: true,
+        user_interrupted: false,
+        redirected: false,
+    });
+    // A later group, which is the open one.
+    transcript.order.push(tool("second-run", "Run", false));
+
+    let render = |transcript: &Transcript| {
+        transcript
+            .lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let rendered = render(&transcript);
+    assert!(
+        rendered.contains("\u{25be} 12:00"),
+        "a group with a running command must not fold: {rendered}"
+    );
+    assert!(rendered.contains("long-build"), "{rendered}");
+
+    // Once it finishes, the group is foldable again like any other.
+    transcript.order[0] = tool("long-build", "Run", false);
+    let settled = render(&transcript);
+    assert!(settled.contains("\u{25b8} 12:00"), "a finished group folds: {settled}");
+    assert!(!settled.contains("long-build"), "{settled}");
+}
+
 #[test]
 fn a_finished_action_group_folds_to_its_summary_until_clicked() {
     let tool = |detail: &str, name: &str, cwd: Option<&str>| TranscriptEntry::Tool {
