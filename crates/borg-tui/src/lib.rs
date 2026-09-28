@@ -2605,6 +2605,7 @@ fn model_picker_options_with_configured(
                     // Nothing was discovered, so no effort vocabulary is known.
                     supported_efforts: None,
                     reasoning_mandatory: false,
+                    default_effort: None,
                 });
             }
             for (index, model) in models.into_iter().enumerate() {
@@ -2751,6 +2752,7 @@ fn model_picker_options_with_configured(
                 // Nothing was discovered, so no effort vocabulary is known.
                 supported_efforts: None,
                 reasoning_mandatory: false,
+                default_effort: None,
             });
         }
         for (index, model) in models.into_iter().enumerate() {

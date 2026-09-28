@@ -711,6 +711,7 @@ impl AgentConfig {
                         // vocabulary, so none is claimed for it.
                         supported_efforts: None,
                         reasoning_mandatory: false,
+                        default_effort: None,
                     }
                 })
             })
