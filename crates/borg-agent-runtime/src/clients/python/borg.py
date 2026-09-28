@@ -1,10 +1,17 @@
 """Borg's capabilities as Python functions, for code run through `exec`.
 
-    import borg
+`borg` is already a global here: it is preloaded into this process, so
+`import borg` raises ModuleNotFoundError and the library looks absent. Use it
+directly.
+
     borg.send_message(target="/root/worker", message=report)
     plan = borg.get_plan()
     borg.tools("message")  # find capabilities
     borg.call("create_goal", objective="...")
+
+Every capability is reachable as an attribute, so this surface does not fall
+behind the ones Borg adds: `borg.<capability>(...)` calls it, or
+`borg.call("<capability>", ...)` when the name is computed.
 
 Each call goes to the running session over its tool socket, exactly like
 `borg call NAME JSON`, and shows in the transcript as a step of the command
