@@ -2848,6 +2848,19 @@ fn effort_picker_options(
     Vec::new()
 }
 
+/// A token count with a thousands separator, for display only.
+fn thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(character);
+    }
+    out
+}
+
 /// The models.dev key for a route, or `""` when it publishes nothing.
 ///
 /// These are catalog identifiers, not display names, so a rename on Borg's side
@@ -5233,6 +5246,22 @@ impl BorgTerminal {
                         ""
                     }
                 ));
+            }
+            // A model whose reasoning is metered as a token budget rather than
+            // a level says so here. The control itself cannot be offered
+            // without a verified wire field, but the ceiling is the fact a user
+            // needs to decide whether to keep reasoning on.
+            if let Some(facts) = borg_provider::models_catalog::facts(
+                models_dev_provider(target.unwrap_or(CodingProvider::Codex)),
+                &option.value,
+            ) && let Some(budget) = facts.budget_tokens_max
+            {
+                let note = format!(" · reasoning budget up to {} tokens", thousands(budget));
+                if let Some(preview) = &mut option.preview {
+                    preview.push_str(&note);
+                } else {
+                    option.preview = Some(note.trim_start_matches(" · ").to_string());
+                }
             }
             if current.as_deref() == Some(&option.value) {
                 option.label = format!("{} · current", option.label);

@@ -989,6 +989,13 @@ pub fn kimi_usage_from_response(
 /// 0.95/4/0.19, so a k2.7 turn was reported at roughly three times what it
 /// cost. `None` means the catalog does not price the model.
 pub fn kimi_cost_microusd(raw: &Value, model: &str) -> Option<u64> {
+    // A coding plan is metered against a quota, not priced per token, so the
+    // list price would describe a spend that never happened. GLM and Qwen
+    // already report no cost for that reason; Kimi now matches them instead of
+    // quoting list price for a plan the user is not billed on.
+    if crate::subscription::active_for(crate::subscription::Plan::KimiCode).is_some() {
+        return None;
+    }
     let price = crate::models_catalog::pricing(
         models_dev_key(OpenAiCompatibleProfile::Kimi),
         model,

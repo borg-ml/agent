@@ -1839,6 +1839,25 @@ fn model_and_effort_pickers_use_the_provider_catalog() {
 /// Offering it a ladder would offer levels it refuses; offering it nothing
 /// left no way to turn reasoning off at all. It gets exactly the two states
 /// the vendor distinguishes.
+/// A token budget is the ceiling a user needs before deciding to leave
+/// reasoning on, even though Borg cannot send a budget itself without a
+/// verified wire field. It reads out of the catalog rather than a local table.
+#[test]
+fn a_token_budget_model_states_its_ceiling() {
+    borg_provider::models_catalog::set_for_test(
+        borg_provider::models_catalog::parse(&serde_json::json!({
+            "alibaba": { "models": { "qwen3.7-plus": { "reasoning_options": [
+                { "type": "toggle" },
+                { "type": "budget_tokens", "max": 81920 }
+            ] } } },
+        })),
+    );
+    let facts = borg_provider::models_catalog::facts("alibaba", "qwen3.7-plus")
+        .expect("qwen3.7-plus is catalogued");
+    assert_eq!(facts.budget_tokens_max, Some(81920));
+    assert_eq!(thousands(81920), "81,920");
+}
+
 #[test]
 fn a_toggle_only_model_offers_reasoning_on_or_off() {
     borg_provider::models_catalog::set_for_test(
