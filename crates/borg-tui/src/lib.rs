@@ -16682,8 +16682,31 @@ fn splitmix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+/// The version, spelled so the splash's three lines share a width.
+///
+/// The logo and the caption are both seven columns, and all three centre
+/// together only when they are the *same* width - a line of different parity
+/// cannot be nudged onto the same centre, because the terminal has no half
+/// cell. The version is the one line whose length moves: `v0.12.9` is seven
+/// columns and `v0.12.10` is eight, so the first two-digit patch release would
+/// have knocked the whole block out by a cell.
+///
+/// So the prefix yields to the width. `v` is kept whenever the version with it
+/// is already odd; when it would be even, the bare version is one column
+/// shorter and puts the line back on the block's width. The prefix is a
+/// convenience; the three lines agreeing is what the eye actually reads.
 fn splash_version() -> String {
-    format!("v{}", env!("CARGO_PKG_VERSION"))
+    splash_version_text(env!("CARGO_PKG_VERSION"))
+}
+
+/// The `v` prefix, or its absence, decided by the width it produces.
+fn splash_version_text(version: &str) -> String {
+    let prefixed = format!("v{version}");
+    if UnicodeWidthStr::width(prefixed.as_str()) % 2 == 0 {
+        version.to_string()
+    } else {
+        prefixed
+    }
 }
 
 fn provider_interaction_options(payload: &serde_json::Value) -> String {
