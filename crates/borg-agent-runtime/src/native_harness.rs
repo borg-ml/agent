@@ -4768,6 +4768,10 @@ const CAPABILITY_LISTING_BUDGET_CHARS: usize = 8_000;
 
 fn builtin_tool_specs() -> Vec<Value> {
     let mut specs = crate::subagents::file_mutation_tool_specs();
+    // The capabilities a model is expected to reach often, plus the escape hatch
+    // for everything else. Listed first so the schema it reads leads with what
+    // it can do rather than with how to run a command.
+    specs.extend(crate::subagents::capability_tool_specs());
     specs.extend([
         tool(
             "exec_command",

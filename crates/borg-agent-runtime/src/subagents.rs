@@ -1723,6 +1723,53 @@ impl AgentToolDispatcher {
             })
     }
 
+    /// Invoke a capability the model has no dedicated tool for, or search the
+    /// catalog when it does not know what exists.
+    ///
+    /// Two behaviours earn their place. A first-class name is refused with a
+    /// pointer to its own tool, because reaching it this way drops the schema
+    /// guidance that makes the call correct. An unknown name answers with the
+    /// closest real capabilities, because not knowing the inventory is the usual
+    /// reason for a miss and a flat "unknown" leaves the model where it started.
+    async fn call_capability_by_name(
+        &self,
+        arguments: Value,
+        workflow_cancel: Option<CancellationToken>,
+    ) -> Result<Value> {
+        let specs = self.mcp_specs(false);
+        if let Some(query) = arguments.get("search").and_then(Value::as_str) {
+            let limit = arguments.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+            return Ok(Value::Array(crate::capability_catalog::search(
+                &specs, query, limit,
+            )));
+        }
+        let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+            bail!("`capability` needs either a `name` to invoke or a `search` to discover one");
+        };
+        if is_first_class_capability(name) {
+            bail!(
+                "`{name}` has its own tool - call it directly. Its schema carries the rules that \
+                 make the call correct and this path would drop them."
+            );
+        }
+        if !specs
+            .iter()
+            .any(|spec| spec.get("name").and_then(Value::as_str) == Some(name))
+        {
+            return Err(anyhow::anyhow!(crate::capability_catalog::corrective_error(
+                &specs,
+                name,
+                "no such capability on this host",
+            )));
+        }
+        let forwarded = arguments
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        self.call_with_workflow_control(name, forwarded, true, workflow_cancel)
+            .await
+    }
+
     async fn dispatch(
         &self,
         name: &str,
@@ -2467,6 +2514,15 @@ impl AgentToolDispatcher {
                     .await
             }
             name if crate::self_service::is_tool(name) => self.self_service.call(name, arguments),
+            // Boxed because reaching a capability re-enters this dispatch, and
+            // an async fn that reaches itself needs a heap-allocated future.
+            "capability" => {
+                Box::pin(self.call_capability_by_name(
+                    arguments,
+                    workflow_cancel.clone(),
+                ))
+                .await
+            }
             name if is_autonomy_tool(name) => {
                 let store = self
                     .autonomy
@@ -8453,8 +8509,10 @@ struct RuntimeExecArgs {
     /// failed outright - which is most of the flakiness this tool showed.
     /// Denying genuine typos is worth keeping, so these are absorbed rather than
     /// the strict check removed.
+    #[allow(dead_code, reason = "absorbed for compatibility, never read")]
     #[serde(default)]
     action: Option<serde_json::Value>,
+    #[allow(dead_code, reason = "absorbed for compatibility, never read")]
     #[serde(default)]
     description: Option<serde_json::Value>,
     #[serde(alias = "command")]
@@ -8489,7 +8547,31 @@ mod exec_args_tests {
     /// The schema advertises a presentation field the runtime never reads, and
     /// it arrives under both spellings. A call formed exactly as the schema
     /// describes must not fail.
+        /// A first-class capability is only useful if the generic tool can see that
+    /// it has one, and refuses to shadow it: the schema is what makes those
+    /// calls correct.
     #[test]
+    fn first_class_capabilities_are_the_ones_with_schemas_of_their_own() {
+        let specs = capability_tool_specs();
+        let names: Vec<&str> = specs
+            .iter()
+            .filter_map(|spec| spec.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        for first_class in first_class_capability_tools() {
+            assert!(names.contains(&first_class), "{first_class} has no schema");
+            assert!(is_first_class_capability(first_class), "{first_class}");
+        }
+        assert!(names.contains(&"capability"), "the escape hatch needs a schema");
+        assert!(!is_first_class_capability("query_history"));
+        assert!(!is_first_class_capability("capability"));
+        // A name may be claimed once only, or the model sees two schemas for it.
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "duplicate schema name: {names:?}");
+    }
+
+#[test]
     fn exec_absorbs_the_presentation_field_under_either_spelling() {
         for key in ["action", "description"] {
             let args = parse_exec_args(serde_json::json!({
@@ -9346,6 +9428,156 @@ pub(crate) fn exec_tool_spec() -> Value {
             "additionalProperties": false
         }),
     )
+}
+
+/// Capabilities the model gets as their own tools.
+///
+/// These are the ones whose *usage* is not self-evident from their arguments: a
+/// goal's lifecycle, a plan's item identity and status vocabulary, and the
+/// addressing rules for another agent. A schema can carry that; a name passed
+/// as a string cannot, because by then the guidance is gone. Everything else is
+/// reachable through `capability`, so this stays deliberately short - a schema is
+/// paid for on every turn.
+pub(crate) fn first_class_capability_tools() -> [&'static str; 8] {
+    [
+        "get_goal",
+        "create_goal",
+        "update_goal",
+        "get_plan",
+        "update_plan",
+        "list_agents",
+        "send_message",
+        "followup_task",
+    ]
+}
+
+/// True when `name` already has a tool of its own.
+///
+/// The generic tool refuses these rather than duplicating them: reaching a
+/// first-class capability through `capability` would quietly drop the schema
+/// guidance that makes the call correct.
+pub(crate) fn is_first_class_capability(name: &str) -> bool {
+    first_class_capability_tools().contains(&name)
+}
+
+pub(crate) fn capability_tool_specs() -> Vec<Value> {
+    vec![
+        tool(
+            "get_goal",
+            "Read this session's goal and its status. Read it before planning substantial work: the goal is what the plan is measured against.",
+            json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        ),
+        tool(
+            "create_goal",
+            "Set the session's goal when none exists. A goal states the objective being pursued; a plan states the tasks.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "objective": { "type": "string", "minLength": 1 },
+                    "token_budget": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["objective"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "update_goal",
+            "Mark the goal complete or blocked.",
+            json!({
+                "type": "object",
+                "properties": { "status": { "type": "string", "enum": ["complete", "blocked"] } },
+                "required": ["status"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "get_plan",
+            "Read the current plan. Item ids are required to update a plan, so read it before updating rather than inventing an id.",
+            json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        ),
+        tool(
+            "update_plan",
+            "Set the plan. Reuse an item's `id` to keep its identity; omit it only for a genuinely new item. Status is one of pending, in_progress, blocked, awaiting_review, completed, and at most one item per assignee may be in_progress. Content is limited to 500 characters.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "explanation": { "type": "string" },
+                    "plan": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "content": { "type": "string", "minLength": 1, "maxLength": 500 },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "blocked", "awaiting_review", "completed"]
+                                }
+                            },
+                            "required": ["content", "status"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["plan"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "list_agents",
+            "List agents in this workspace with their state. Discovery is not proof of liveness, project access or delivery: inspect and verify what you were told to rely on.",
+            json!({
+                "type": "object",
+                "properties": { "path_prefix": { "type": "string" } },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "send_message",
+            "Send a message to another agent or a participant. Address a peer as `participant:<id>`. Use this to notify; use followup_task when the agent must take a turn. Never ask a human to relay a message between agents.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "minLength": 1 },
+                    "message": { "type": "string", "minLength": 1 },
+                    "wake": { "type": "boolean" },
+                    "attachments": { "type": "array", "items": { "type": "string" } },
+                    "reply_to_message_id": { "type": "string" }
+                },
+                "required": ["target", "message"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "followup_task",
+            "Give another agent a task and ask it to act. This starts a turn; use send_message when no turn is needed.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "minLength": 1 },
+                    "message": { "type": "string", "minLength": 1 },
+                    "attachments": { "type": "array", "items": { "type": "string" } },
+                    "reply_to_message_id": { "type": "string" }
+                },
+                "required": ["target", "message"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "capability",
+            "Invoke any other Borg, Blu, plugin, history, workflow or extension capability by name, including everything no other tool covers. Pass `search` instead of `name` to see what this host provides and what each one is for - a bare list of names is not enough to choose from, so search before guessing. A name that already has its own tool is refused here, with a pointer to that tool.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "minLength": 1 },
+                    "arguments": { "type": "object" },
+                    "search": { "type": "string", "minLength": 1 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50 }
+                },
+                "additionalProperties": false
+            }),
+        ),
+    ]
 }
 
 pub(crate) fn file_mutation_tool_specs() -> Vec<Value> {
