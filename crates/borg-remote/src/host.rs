@@ -729,6 +729,25 @@ enum EventUploadOutcome {
         event_kind: String,
         event_bytes: usize,
     },
+    /// An event the relay can never store, and replay moved past it.
+    Skipped { sequence: u64 },
+}
+
+/// Whether a permanent rejection means "this relay can never store this event".
+///
+/// A relay running an older build answers a newer event envelope with a serde
+/// error - an unknown variant or field. No retry of the same bytes can ever
+/// succeed, so treating it like a durable event worth blocking on wedges the
+/// session's remote sync permanently: every later event is held behind it and
+/// the block survives a restart. Skipping just this event keeps the rest of
+/// the journal reachable.
+///
+/// A rejection that is *not* a schema error keeps blocking. There the durable
+/// event may be accepted once the fault is fixed, and dropping it would lose
+/// history that is still in the local journal.
+fn is_unstoreable_rejection(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("unknown variant") || detail.contains("unknown field")
 }
 
 async fn upload_event_page(
@@ -835,6 +854,23 @@ async fn upload_event_page(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown")
                     .to_string();
+                if is_unstoreable_rejection(&detail) {
+                    tracing::warn!(
+                        %status,
+                        %detail,
+                        session_id = %batch[0].session_id,
+                        sequence = batch[0].sequence,
+                        %event_kind,
+                        "remote relay cannot store this event shape; replaying past it so \
+                         the rest of the journal stays reachable"
+                    );
+                    // Past this one event only, so a neighbour in the same batch
+                    // is still offered rather than dropped with it.
+                    *uploaded_sequence = batch[0].sequence;
+                    return Ok(EventUploadOutcome::Skipped {
+                        sequence: batch[0].sequence,
+                    });
+                }
                 tracing::error!(
                     %status,
                     %detail,
@@ -3228,6 +3264,10 @@ pub async fn mirror_local_session(
         std::future::pending::<()>().await
     };
     let journal = async {
+        // A run of unstoreable events means the relay is rejecting the journal
+        // wholesale; past this many, blocking is safer than skipping.
+        const MAX_CONSECUTIVE_UNSTOREABLE_SKIPS: usize = 64;
+        let mut unstoreable_skips = 0usize;
         let mut event_retry_at = Instant::now();
         let mut shutdown_flush_pending = false;
         loop {
@@ -3247,6 +3287,7 @@ pub async fn mirror_local_session(
                 .await?
                 {
                     EventUploadOutcome::Complete => {
+                        unstoreable_skips = 0;
                         if upload_live_state(
                             &client,
                             &config,
@@ -3269,6 +3310,25 @@ pub async fn mirror_local_session(
                         // Keep heartbeats and remote interrupt/stop commands alive
                         // without rereading the same irreducible event in a loop.
                         event_retry_at = Instant::now() + Duration::from_secs(300);
+                    }
+                    EventUploadOutcome::Skipped { sequence } => {
+                        // One unstoreable event must not cost the session its
+                        // remote access forever. But a relay that rejects
+                        // everything means replay is silently discarding the
+                        // journal, so a run of them stops and blocks instead.
+                        unstoreable_skips += 1;
+                        if unstoreable_skips >= MAX_CONSECUTIVE_UNSTOREABLE_SKIPS {
+                            tracing::error!(
+                                session_id = %session_id,
+                                sequence,
+                                unstoreable_skips,
+                                "remote relay rejected a run of events; replay is blocked rather \
+                                 than skipping the rest of the journal"
+                            );
+                            event_retry_at = Instant::now() + Duration::from_secs(300);
+                        } else {
+                            event_retry_at = Instant::now();
+                        }
                     }
                 }
             }
@@ -6228,6 +6288,14 @@ async fn flush_pending(
                 sync.retry_at = Instant::now() + Duration::from_secs(300);
                 return Ok(());
             }
+            // The cursor already moved past the one event the relay cannot
+            // store, so the next page carries on from after it.
+            EventUploadOutcome::Skipped { .. } => {
+                if caught_up {
+                    break;
+                }
+                continue;
+            }
         }
         if caught_up {
             break;
@@ -6443,6 +6511,41 @@ fn platform() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The wedge this replaces. A relay older than the client answers a newer
+    /// event envelope with a serde error; treating that as a durable event worth
+    /// blocking on held every later event behind it, permanently and across
+    /// restarts. Schema-shaped rejections are the one case that can never
+    /// succeed on retry, so replay moves past them.
+    #[test]
+    fn a_schema_rejection_is_treated_as_unstoreable_rather_than_blocking() {
+        // Verbatim shapes from the log.
+        assert!(is_unstoreable_rejection(
+            "invalid borg.agent_runtime event envelope: unknown variant `vercel`, expected one of \
+             `claude`, `codex`, `open_router`"
+        ));
+        assert!(is_unstoreable_rejection(
+            "invalid borg.agent_runtime event envelope: unknown variant `plan_projected`"
+        ));
+        assert!(is_unstoreable_rejection("unknown field `effort`"));
+    }
+
+    /// Anything else stays a block, including an envelope that is merely
+    /// invalid. "Missing field" is a client bug a fixed build would resolve,
+    /// so skipping that event would discard one the relay would accept
+    /// afterwards. Only a server that is too old to name what it was sent is
+    /// permanent.
+    #[test]
+    fn other_permanent_rejections_still_block() {
+        for detail in [
+            "event payload exceeds the configured limit",
+            "session is not enrolled to this host",
+            "invalid borg.agent_runtime event envelope: missing field `sequence`",
+            "event kind is not allowed for this session",
+        ] {
+            assert!(!is_unstoreable_rejection(detail), "{detail}");
+        }
+    }
     use crate::session_store::postgres::PostgresSessionStore;
     use crate::session_store::postgres::testing::ScratchDatabase;
     use borg_agent_runtime::receipt_postgres::PostgresReceiptStore;
