@@ -566,7 +566,10 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
         {
             "Send input to"
         } else {
-            return ("Read output".to_string(), "command".to_string());
+            // "Read" reads like a file operation, and read_file already
+            // presents under that name. This is polling a process that is
+            // still running, so it is named as the check it is.
+            return ("Check output".to_string(), "command".to_string());
         };
         return (label.to_string(), "command".to_string());
     }
