@@ -6707,7 +6707,7 @@ fn footer_billing_leads_the_metadata_and_uses_the_billing_color() {
         usize::MAX,
     );
     assert_eq!(billing_only.spans[0].content, "api");
-    assert_eq!(billing_only.spans[0].style.fg, Some(Color::LightBlue));
+    assert_eq!(billing_only.spans[0].style.fg, Some(Color::LightMagenta));
     assert!(billing_only.spans[1].content.contains("~/borg-cli"));
 }
 
@@ -8302,7 +8302,7 @@ fn value_colored_status_segments_keep_hover_styling() {
         false,
         effort_status_color("high"),
     );
-    assert_eq!(resting[1].style.fg, Some(Color::Yellow));
+    assert_eq!(resting[1].style.fg, Some(Color::LightMagenta));
     assert!(!resting[1].style.add_modifier.contains(Modifier::UNDERLINED));
 
     let mut hovered = Vec::new();
