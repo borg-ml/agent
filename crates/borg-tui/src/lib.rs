@@ -8701,11 +8701,11 @@ impl BorgTerminal {
                     Paragraph::new(vec![
                         splash_logo_line(self.splash_started_at.elapsed(), self.splash_glitch_seed),
                         splash_agent_line(),
-                        splash_channel_line(),
                         Line::from(Span::styled(
                             splash_version(),
                             Style::default().fg(Color::DarkGray),
                         )),
+                        splash_channel_line(),
                         Line::from(""),
                         Line::from(Span::styled(
                             ui_text(ui_language, "What are we working on?"),
