@@ -9228,6 +9228,104 @@ fn input_redraw_measures_history_at_the_committed_frame_width() {
     assert_eq!(transcript_frame_width(100, true, Some(57)), 100);
 }
 
+/// What a frame of a fast reasoning stream costs end to end: the deltas applied
+/// and the terminal drawn, through a real terminal, rather than the renderer
+/// measured on its own.
+///
+/// Run it under a PTY that has a size - a bare run hangs, and a PTY with no
+/// window size fails on a zero-area buffer:
+///
+/// ```text
+/// script -qec "stty rows 50 cols 200; cargo test -p borg-tui --lib -- \
+///     --ignored streamed_reasoning_frame_cost" /dev/null
+/// ```
+///
+/// The deltas arrive far faster than any frame interval - hundreds between two
+/// draws - which is the point. The loop is meant to coalesce them, so what
+/// matters is the cost of the frame that results, not of the deltas it swallowed:
+/// that frame cost is what sets the interval, and the interval is what the text
+/// appears to arrive at.
+#[tokio::test]
+#[ignore = "requires a PTY; run under script with a sized terminal"]
+async fn streamed_reasoning_frame_cost() {
+    use std::time::{Duration, Instant};
+
+    let session_id = Uuid::new_v4();
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        session_id,
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+
+    // A model thinking at length, delivered in the small pieces a real provider
+    // delivers them.
+    let lines: Vec<String> = (0..600)
+        .map(|index| {
+            format!(
+                "weighing whether the {index}th approach holds up, and what it would \
+                 cost to be wrong about it"
+            )
+        })
+        .collect();
+    let mut deltas: Vec<String> = lines
+        .iter()
+        .flat_map(|line| {
+            line.as_bytes()
+                .chunks(24)
+                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for line in &lines {
+        deltas.push("\n".to_string());
+    }
+
+    let mut sequence = 0_u64;
+    // One frame per 40 deltas, so thousands arrive as a realistic number of
+    // frames rather than one per delta.
+    let mut slowest = Duration::ZERO;
+    let mut frames = 0_usize;
+    for chunk in deltas.chunks(40) {
+        for delta in chunk {
+            sequence += 1;
+            terminal.apply_session_event(&SessionEvent::new(
+                session_id,
+                sequence,
+                SessionEventKind::ReasoningTextDelta {
+                    delta: delta.clone(),
+                },
+            ));
+        }
+        let started = Instant::now();
+        terminal.draw().unwrap();
+        let frame = started.elapsed();
+        if frames > 0 && frame > slowest {
+            slowest = frame;
+        }
+        frames += 1;
+    }
+
+    let committed = Arc::clone(&terminal.last_committed_viewport_render.as_ref().unwrap().5);
+    let text = committed
+        .0
+        .iter()
+        .map(ratatui::text::Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("weighing whether the 599th approach"),
+        "the last line of the stream never reached the screen"
+    );
+
+    println!(
+        "streamed reasoning: {} deltas over {frames} frames, slowest frame {slowest:?}",
+        deltas.len()
+    );
+}
+
 #[tokio::test]
 // Run it under a PTY that has a size - a bare run hangs, and a PTY with no
 // window size fails on a zero-area buffer:
