@@ -3812,6 +3812,9 @@ impl Transcript {
             self.provider_followups
                 .insert(tool_call_id.to_string(), handle);
         }
+        if self.is_redundant_process_poll(name, input) {
+            return;
+        }
         let presentation = project_tool_presentation(name, input, None, false);
         let cwd = presentation.cwd.clone();
         let display_name = presentation.label;
@@ -3990,6 +3993,32 @@ impl Transcript {
         self.command_edit_rows
             .insert(tool_call_id.to_string(), index);
         self.last_edit = Some(index);
+    }
+
+    /// Whether this call only checks on a process the runtime already has a row
+    /// for, so its own row would say nothing the command's row does not.
+    ///
+    /// Polling a running command is a reflex, and each poll used to add a row
+    /// that read as a bare "Read output" over the command it was already
+    /// showing. The command's row is not a static summary: when the process
+    /// ends, `RuntimeProcessCompleted` writes the final stdout and stderr back
+    /// to exactly that row, so dropping the poll loses nothing.
+    ///
+    /// Scoped to processes this runtime owns, because only those are guaranteed
+    /// to deliver the completion to the originating row. A poll whose process is
+    /// not tracked keeps its row rather than going quiet about its own output.
+    fn is_redundant_process_poll(&self, name: &str, input: &serde_json::Value) -> bool {
+        // Sending input to or stopping a process are actions in their own
+        // right, and a terminal call is the command itself.
+        if input.get("chars").and_then(serde_json::Value::as_str).is_some_and(|c| !c.is_empty()) {
+            return false;
+        }
+        if input.get("terminate").and_then(serde_json::Value::as_bool) == Some(true) {
+            return false;
+        }
+        tool_process_followup_handle(name, Some(input))
+            .and_then(|handle| Uuid::parse_str(&handle).ok())
+            .is_some_and(|process_id| self.runtime_processes.contains_key(&process_id))
     }
 
     fn originating_tool_call_id(&self, process_id: Uuid) -> Option<String> {

@@ -1,5 +1,125 @@
 use super::*;
 
+/// A poll of a running command added a row reading "Read output" over the
+/// command it was already showing, and the rows stacked with every check. The
+/// command's row already receives the process's final output, so the poll adds
+/// nothing - while sending input and stopping a process are actions in their
+/// own right and keep their rows.
+#[test]
+fn polling_a_running_command_does_not_add_a_row_of_its_own() {
+    let session_id = Uuid::new_v4();
+    let process_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "shell-1".to_string(),
+            name: "exec".to_string(),
+            input: serde_json::json!({ "cmd": "cargo test" }),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::RuntimeProcessStarted {
+            process_id,
+            pid: 4242,
+            command: "cargo test".to_string(),
+            cwd: PathBuf::from("/workspace"),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "shell-1".to_string(),
+            output: serde_json::json!({ "session_id": process_id, "running": true }).to_string(),
+            output_ref: None,
+            is_error: false,
+            input: Some(serde_json::json!({ "cmd": "cargo test" })),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    let after_start = transcript.lines(120).len();
+
+    for (offset, tool_call_id) in ["poll-1", "poll-2", "poll-3"].iter().enumerate() {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            4 + offset as u64,
+            SessionEventKind::ToolStarted {
+                tool_call_id: (*tool_call_id).to_string(),
+                name: "exec".to_string(),
+                input: serde_json::json!({ "session_id": process_id }),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        ));
+    }
+    assert_eq!(
+        transcript.lines(120).len(),
+        after_start,
+        "polling a running command must not add rows"
+    );
+
+    // Writing to the process is a real action and still gets a row.
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        10,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "stdin-1".to_string(),
+            name: "exec".to_string(),
+            input: serde_json::json!({ "session_id": process_id, "chars": "y" }),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    assert!(
+        transcript.lines(120).len() > after_start,
+        "sending input to a process must still be shown"
+    );
+
+    // The process ending writes its output back to the command's own row.
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        11,
+        SessionEventKind::RuntimeProcessCompleted {
+            process_id,
+            pid: 4242,
+            status: borg_remote::RuntimeProcessStatus::Exited,
+            exit_code: Some(0),
+            timed_out: false,
+            stdout: "test result: ok".to_string(),
+            stderr: String::new(),
+            stdout_omitted_bytes: 0,
+            stderr_omitted_bytes: 0,
+            error: None,
+            changes: vec![],
+        },
+    ));
+    // The output belongs to the command's row, collapsed rather than printed,
+    // so it is asserted on the entry rather than on the rendered lines.
+    let origin = transcript.order.iter().find_map(|entry| match entry {
+        TranscriptEntry::Tool {
+            code_view: Some((_, command)),
+            output_view,
+            ..
+        } if command.contains("cargo test") => Some(output_view.clone()),
+        _ => None,
+    });
+    assert!(
+        origin
+            .clone()
+            .and_then(|view| view.map(|(_, text)| text))
+            .is_some_and(|text| text.contains("test result: ok")),
+        "the command's row must still receive the output: {origin:?}"
+    );
+}
+
 #[test]
 fn inline_diff_preview_stops_early_but_inspector_keeps_every_line() {
     let diff = format!(
@@ -1896,6 +2016,7 @@ fn model_picker_openai_compatible_merges_discovered_models_after_current() {
                 detail: Some("qwen35 · 42 blocks · fits in available VRAM".to_string()),
                 supported_efforts: None,
                 reasoning_mandatory: false,
+                default_effort: None,
             },
         borg_provider::DynamicModelEntry {
                 id: "gguf:bonsai-27b-q2_g64".to_string(),
@@ -1903,6 +2024,7 @@ fn model_picker_openai_compatible_merges_discovered_models_after_current() {
                 detail: Some("qwen35 · 32k ctx · may spill to system RAM".to_string()),
                 supported_efforts: None,
                 reasoning_mandatory: false,
+                default_effort: None,
             },
     ];
     let options = model_picker_options_with_discovered(
@@ -1929,6 +2051,7 @@ fn model_picker_openrouter_uses_runtime_entries_and_existing_fuzzy_filter() {
                 detail: Some("200000 context · also offered through opencode-go".to_string()),
                 supported_efforts: None,
                 reasoning_mandatory: false,
+                default_effort: None,
             }];
     let options = model_picker_options_with_discovered(
         Some(CodingProvider::OpenRouter),
@@ -1984,6 +2107,7 @@ fn model_picker_lists_vercel_models_from_any_provider() {
                 detail: Some("262144 context".to_string()),
                 supported_efforts: None,
                 reasoning_mandatory: false,
+                default_effort: None,
             }]);
 
     // A Codex session lists the gateway's models alongside the fixed catalogs.
@@ -2587,13 +2711,12 @@ fn background_process_change_and_terminal_poll_share_one_edit_action() {
             parent_tool_call_id: None,
         },
     ));
-    assert_eq!(transcript.order.len(), 3);
+    // The terminal poll repeats what RuntimeProcessCompleted already delivered,
+    // so it adds no row - and crucially its change report still merges into the
+    // single Edit row rather than becoming a second one.
+    assert_eq!(transcript.order.len(), 2);
     assert_eq!(transcript.command_edit_rows.len(), 1);
     assert_eq!(transcript.command_edit_rows.get("run"), Some(&1));
-    assert!(matches!(
-        &transcript.order[2],
-        TranscriptEntry::Tool { name, .. } if name != "Edit"
-    ));
 }
 
 #[test]
@@ -15504,6 +15627,7 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
         backgrounded.contains("Running in background"),
         "{backgrounded}"
     );
+    let rows_before_poll = transcript.order.len();
     transcript.apply(&SessionEvent::new(
         session_id,
         4,
@@ -15515,16 +15639,12 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
             parent_tool_call_id: None,
         },
     ));
-    let poll = transcript.order.iter().find(|entry| {
-        matches!(
-            entry,
-            TranscriptEntry::Tool { source_name, detail, .. }
-                if source_name == "exec" && detail == "cargo test"
-        )
-    });
-    assert!(
-        poll.is_some(),
-        "a native command poll should name its command"
+    // The command's row is already on screen showing this command, and it is
+    // the row the process's final output lands on, so the poll adds nothing.
+    assert_eq!(
+        transcript.order.len(),
+        rows_before_poll,
+        "polling a running command must not add a row"
     );
 
     transcript.apply(&SessionEvent::new(
@@ -15540,22 +15660,20 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
             parent_tool_call_id: None,
         },
     ));
+    // A completed poll still adds no row, and the command's row - the one the
+    // process's result lands on - keeps naming the command.
+    assert_eq!(
+        transcript.order.len(),
+        rows_before_poll,
+        "a completed poll must not add a row"
+    );
     assert!(
         transcript.order.iter().any(|entry| matches!(
             entry,
-            TranscriptEntry::Tool { source_name, detail, complete: true, .. }
-                if source_name == "exec" && detail == "cargo test"
+            TranscriptEntry::Tool { detail, .. } if detail == "cargo test"
         )),
-        "a completed poll should keep the command name"
+        "the command's row must still name the command"
     );
-
-    let running_verb = transcript
-        .lines(120)
-        .into_iter()
-        .flat_map(|line| line.spans)
-        .find(|span| span.content == "Reading")
-        .expect("reading poll lifecycle verb");
-    assert_eq!(running_verb.style.fg, Some(BACKGROUND_RUNNING_TEXT));
 
     transcript.apply(&SessionEvent::new(
         session_id,
