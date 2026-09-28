@@ -344,7 +344,11 @@ impl AgentToolEndpoint {
             std::env::var_os("BORG_AGENT_TOOL_SOCKET")
                 .map(PathBuf::from)
                 .map(|socket| Self::Unix { socket, provider })
-                .context("BORG_AGENT_TOOL_SOCKET is required")
+                .context(
+                    "BORG_AGENT_TOOL_SOCKET is unset. It is exported into the commands a \
+                     running Borg agent starts; `borg call` forwards over that socket and \
+                     has nowhere to send the call without it.",
+                )
         }
         #[cfg(not(unix))]
         {
@@ -835,8 +839,22 @@ fn modern_tool_error(error: &anyhow::Error) -> Value {
 }
 
 fn agent_tool_provider() -> Result<borg_remote::CodingProvider> {
-    let provider = std::env::var("BORG_AGENT_TOOL_PROVIDER")
-        .context("BORG_AGENT_TOOL_PROVIDER is required")?;
+    let provider = std::env::var("BORG_AGENT_TOOL_PROVIDER").with_context(|| {
+        // These two are exported together into the commands a Borg agent runs,
+        // so naming only the provider pointed at a variable the user cannot set
+        // on its own. The real question is usually "am I inside a session?".
+        let socket = std::env::var("BORG_AGENT_TOOL_SOCKET").is_ok();
+        if socket {
+            "BORG_AGENT_TOOL_PROVIDER is unset. Both it and BORG_AGENT_TOOL_SOCKET are \
+             exported into the commands a Borg agent runs, so run this from an agent's \
+             command rather than a bare shell."
+        } else {
+            "this shell has no Borg agent tool socket, so there is nothing to forward the \
+             call to. BORG_AGENT_TOOL_SOCKET and BORG_AGENT_TOOL_PROVIDER are exported \
+             into the commands a running Borg agent starts; run `borg call` from one of \
+             those, or use the agent tools directly."
+        }
+    })?;
     serde_json::from_value(Value::String(provider))
         .context("BORG_AGENT_TOOL_PROVIDER is not a supported provider")
 }

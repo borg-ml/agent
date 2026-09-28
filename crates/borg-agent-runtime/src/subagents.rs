@@ -2766,7 +2766,12 @@ impl RuntimeHost for DispatcherRuntimeHost {
                                 .min(timeout_limit)
                                 .clamp(1, RUNTIME_MAX_COMMAND_TIMEOUT_MS),
                             journal: self.session_store.clone(),
-                            environment: BTreeMap::new(),
+                            // The session configures this with the tool socket,
+                            // the provider and the approval marker, so a command
+                            // can reach Borg's own capabilities. Passing an empty
+                            // map here discarded all of it and left `borg call`
+                            // unusable from the agent's own shell.
+                            environment: self.dispatcher.environment_for_command(),
                             cancellation: Some(self.process_cancellation.clone()),
                         })
                         .await?,
@@ -8418,11 +8423,23 @@ struct RuntimeExecCommandArgs {
 /// call failed, for a near-miss whose intent is unambiguous. Aliasing it keeps
 /// the call working; `deny_unknown_fields` still catches genuine typos.
 fn parse_exec_args(arguments: Value) -> Result<RuntimeExecArgs> {
+    // The received keys are named because the caller cannot otherwise see what
+    // arrived: a rejected call reported only the mismatch, which left a
+    // malformed request indistinguishable from a harness that mangled a good
+    // one.
+    let received = arguments
+        .as_object()
+        .map(|fields| {
+            let mut keys: Vec<&str> = fields.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            keys.join(", ")
+        })
+        .unwrap_or_else(|| "a non-object value".to_string());
     serde_json::from_value(arguments).map_err(|error| {
         anyhow::anyhow!(
-            "invalid exec arguments: {error}. Accepted fields are `cmd` (or `command`), \
-             `session_id`, `chars`, `terminate`, `workdir`, `yield_time_ms`, \
-             `max_output_tokens` and `timeout_ms`."
+            "invalid exec arguments ({error}). Received fields: {received}. \
+             Accepted fields are `cmd` (or `command`), `session_id`, `chars`, `terminate`, \
+             `workdir`, `yield_time_ms`, `max_output_tokens` and `timeout_ms`."
         )
     })
 }
@@ -8459,15 +8476,17 @@ mod exec_args_tests {
         assert_eq!(args.yield_time_ms, Some(100));
     }
 
-    /// A genuine typo must still fail, and the error must say what is
-    /// accepted rather than surfacing serde's field list verbatim.
+    /// A genuine typo must still fail, and the error must name both what was
+    /// accepted and what actually arrived - without the received keys a
+    /// malformed call is indistinguishable from a mangled good one.
     #[test]
-    fn exec_rejects_an_unknown_field_with_guidance() {
+    fn exec_rejects_an_unknown_field_and_names_what_arrived() {
         let error = parse_exec_args(serde_json::json!({ "cmnd": "echo hi" }))
             .expect_err("an unknown field is still an error");
         let message = error.to_string();
         assert!(message.contains("Accepted fields are"), "{message}");
         assert!(message.contains("`cmd`"), "{message}");
+        assert!(message.contains("cmnd"), "must name what arrived: {message}");
     }
 }
 
