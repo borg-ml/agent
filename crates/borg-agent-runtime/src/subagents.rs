@@ -9293,7 +9293,7 @@ fn workspace_effect(name: &str, arguments: &Value) -> Option<(&'static str, Stri
 pub(crate) fn exec_tool_spec() -> Value {
     tool(
         "exec",
-        "Run a shell command, or poll, interact with, or terminate a running process. Supply exactly one of cmd (start) or session_id (interact). Shell commands may invoke any installed language runtime. Use `borg tools` and `borg call NAME JSON` inside the shell, or `import borg` from Python and Bun code, for Borg and Blu capabilities. The shell keeps its directory between commands like one terminal: after `cd DIR`, later commands run in DIR, so do not repeat `cd DIR &&`; the result's `cwd` shows where a command ran.",
+        "Run a shell command, or poll, interact with, or terminate a running process. Supply exactly one of cmd (start) or session_id (interact). Shell commands may invoke any installed language runtime. Use `borg tools` and `borg call NAME JSON` inside the shell, or the preloaded `borg` object from Python and Bun code (`borg.tools(\"query\")`, `borg.send_message(...)`), for Borg and Blu capabilities. The shell keeps its directory between commands like one terminal: after `cd DIR`, later commands run in DIR, so do not repeat `cd DIR &&`; the result's `cwd` shows where a command ran.",
         json!({
             "type": "object",
             "properties": {

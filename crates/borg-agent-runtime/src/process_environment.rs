@@ -8,7 +8,27 @@ pub(crate) fn configure_sanitized_child_environment(command: &mut Command) {
     for (name, value) in sanitized_environment() {
         command.env(name, value);
     }
+    if let Some(home) = opted_in_home() {
+        command.env("HOME", home);
+        if cfg!(windows) {
+            if let Ok(profile) = std::env::var("USERPROFILE") {
+                command.env("USERPROFILE", profile);
+            }
+        }
+    }
 }
+
+/// The home directory to give a child running model-authored code, when the
+/// user has opted in with `BORG_RUNTIME_HOME`.
+///
+/// The runtime child gets a fixed environment with no `HOME` by default, which
+/// is what keeps ambient configuration and credentials out of model-authored
+/// code. That is worth keeping as the default, but it also means a
+/// non-negotiable set of tools cannot run there at all: `gh`, `git`, `cargo`,
+/// `pip` and npm all read `~/.config`, and without `HOME` they report the user
+/// as logged out rather than failing with something actionable. The setting
+/// names the trade-off instead of leaving it implicit, and the child still
+/// receives nothing else from the supervisor's environment.
 
 pub(crate) fn configure_runtime_environment(command: &mut Command) {
     configure_sanitized_child_environment(command);
@@ -18,6 +38,28 @@ pub fn configure_host_child_environment(command: &mut Command) {
     if std::env::var("BORG_HOST_EXECUTION_PROFILE").ok().as_deref() == Some("isolated_hosted") {
         configure_sanitized_child_environment(command);
     }
+}
+
+/// The supervisor's home directory when `BORG_RUNTIME_HOME` opts in.
+///
+/// Opt-in rather than default: the child runs code the model wrote, and `HOME`
+/// is the fastest route from there to a user's dotfiles. Off by default; on for
+/// anyone whose work needs tools that read user configuration.
+pub(crate) fn opted_in_home() -> Option<String> {
+    home_for_opt_in(
+        std::env::var("BORG_RUNTIME_HOME").ok().as_deref(),
+        std::env::var("HOME").ok(),
+    )
+}
+
+/// Pure form of [`opted_in_home`], so the rule can be tested without mutating
+/// the process environment that other tests read.
+fn home_for_opt_in(setting: Option<&str>, supervisor_home: Option<String>) -> Option<String> {
+    let setting = setting?;
+    if !matches!(setting.trim(), "1" | "true" | "yes" | "on") {
+        return None;
+    }
+    supervisor_home.filter(|home| !home.is_empty())
 }
 
 pub(crate) const fn sanitized_environment() -> [(&'static str, &'static str); 5] {
@@ -137,6 +179,26 @@ mod tests {
         assert!(text.contains("PATH="));
         assert!(!text.lines().any(|line| line.starts_with("BORG_")));
         assert!(!text.lines().any(|line| line.starts_with("HOME=")));
+    }
+
+    /// The setting exists because tools that read user configuration cannot run
+    /// at all without it: `gh` reports logged-out rather than failing usefully.
+    /// Off stays off, on hands over exactly `HOME` and nothing else.
+    #[test]
+    fn home_is_given_only_when_the_user_opts_in() {
+        for off in [None, Some(""), Some("0"), Some("false"), Some("no"), Some("off")] {
+            assert_eq!(home_for_opt_in(off, Some("/home/u".into())), None, "{off:?}");
+        }
+        for on in ["1", "true", "yes", "on", " on "] {
+            assert_eq!(
+                home_for_opt_in(Some(on), Some("/home/u".into())),
+                Some("/home/u".to_string()),
+                "{on:?}"
+            );
+        }
+        // Opted in, but the supervisor has no home to give.
+        assert_eq!(home_for_opt_in(Some("1"), None), None);
+        assert_eq!(home_for_opt_in(Some("1"), Some(String::new())), None);
     }
 }
 

@@ -862,7 +862,7 @@ class Borg:
         return self.call("capabilities", {} if query is None else {"query": query, "limit": limit})
 
     def __getattr__(self, name):
-        # Any other attribute is a Borg capability, as with `import borg` in exec.
+        # Any other attribute is a Borg capability. The bootstrap above installs `borg` in the namespace; it is not an importable module.
         if name.startswith("__"):
             raise AttributeError(name)
         return lambda arguments=None, /, **fields: self.tool(name, {**(arguments or {}), **fields})
@@ -1396,7 +1396,7 @@ rlm.list = async (pathPrefix = undefined) => (await borg.tool("list_agents", pat
 rlm.run = rlm;
 rlm.list_subagents = rlm.list;
 borg.rlm = rlm;
-// Any other property is a Borg capability, as with `import borg from "borg"` in exec.
+// Any other property is a Borg capability. The bootstrap above installs `borg` on the context; it is not an importable module.
 context.borg = new Proxy(borg, {
   get: (target, name) => (name in target || typeof name !== "string" || name === "then" ? target[name] : (arguments_ = {}) => target.tool(name, arguments_)),
 });
