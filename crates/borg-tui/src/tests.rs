@@ -11632,6 +11632,15 @@ fn splash_logo_randomizes_glitches_and_then_settles() {
     // and therefore a centre. A line can only sit dead centre when its width
     // has the same parity as the area it is centred in, so three different
     // widths means one of them is always half a cell out.
+    // The product name sits between the logo and the channel, lowercase and
+    // white, and stays odd-width so it centres with the other three.
+    assert_eq!(splash_agent_line().to_string(), "agent");
+    assert_eq!(splash_agent_line().width() % 2, 1);
+    assert_eq!(
+        splash_agent_line().spans[0].style.fg,
+        Some(Color::White),
+        "the name is the white between the orange logo and the orange channel"
+    );
     assert_eq!(splash_channel_line().to_string(), "β ε τ α");
     assert_eq!(
         splash_channel_line().width(),

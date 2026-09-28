@@ -8700,6 +8700,7 @@ impl BorgTerminal {
                 frame.render_widget(
                     Paragraph::new(vec![
                         splash_logo_line(self.splash_started_at.elapsed(), self.splash_glitch_seed),
+                        splash_agent_line(),
                         splash_channel_line(),
                         Line::from(Span::styled(
                             splash_version(),
@@ -16666,11 +16667,26 @@ fn tracked_line(cells: Vec<(char, Style)>) -> Line<'static> {
 /// function rather than inlined because a test pins the exact string: a silent
 /// edit here would otherwise change what every user is told with nothing to
 /// notice the change.
+/// The product's own name, lowercase, under the logo.
+///
+/// Lowercase because the logo is already shouting: `BORG` in tracked caps and
+/// `agent` beneath it says "Borg agent" as a name rather than as two pieces of
+/// branding. Five columns, odd like the other three lines, so the block still
+/// centres as one.
+fn splash_agent_line() -> Line<'static> {
+    Line::from(Span::styled("agent", Style::default().fg(Color::White)))
+}
+
+/// The one word on the splash that says what this is.
+///
+/// Orange like the logo's resting colour, so the name and the channel read as
+/// one thing and the white between them is the product name rather than more
+/// chrome. Tracked like the logo, so the three lines share a width and a centre.
 fn splash_channel_line() -> Line<'static> {
     tracked_line(
         "βετα"
             .chars()
-            .map(|glyph| (glyph, Style::default().fg(Color::White)))
+            .map(|glyph| (glyph, Style::default().fg(BORG_ORANGE)))
             .collect(),
     )
 }
