@@ -8702,10 +8702,9 @@ impl BorgTerminal {
                         splash_logo_line(self.splash_started_at.elapsed(), self.splash_glitch_seed),
                         splash_agent_line(),
                         Line::from(Span::styled(
-                            splash_version(),
+                            format!("{} {RELEASE_CHANNEL}", splash_version()),
                             Style::default().fg(Color::DarkGray),
                         )),
-                        splash_channel_line(),
                         Line::from(""),
                         Line::from(Span::styled(
                             ui_text(ui_language, "What are we working on?"),
@@ -9579,6 +9578,7 @@ impl BorgTerminal {
                         .add_modifier(Modifier::BOLD),
                 ));
             }
+
             let status_line = Line::from(truncate_status_spans(
                 status_spans,
                 status_area.width.saturating_sub(status_row_reserved) as usize,
@@ -16667,6 +16667,14 @@ fn tracked_line(cells: Vec<(char, Style)>) -> Line<'static> {
 /// function rather than inlined because a test pins the exact string: a silent
 /// edit here would otherwise change what every user is told with nothing to
 /// notice the change.
+/// The release channel, beside the version on the splash and nowhere else.
+///
+/// A glyph rather than a word, and not orange: orange is the product's mark -
+/// the logo, the border, the caret - and a channel is a qualifier on a version,
+/// not part of the brand. It is grey for the same reason, so the two read as
+/// one line of metadata rather than three.
+const RELEASE_CHANNEL: &str = "\u{3b2}";
+
 /// The product's own name, lowercase, under the logo.
 ///
 /// Lowercase because the logo is already shouting: `BORG` in tracked caps and
@@ -16675,20 +16683,6 @@ fn tracked_line(cells: Vec<(char, Style)>) -> Line<'static> {
 /// centres as one.
 fn splash_agent_line() -> Line<'static> {
     Line::from(Span::styled("agent", Style::default().fg(Color::White)))
-}
-
-/// The one word on the splash that says what this is.
-///
-/// Orange like the logo's resting colour, so the name and the channel read as
-/// one thing and the white between them is the product name rather than more
-/// chrome. Tracked like the logo, so the three lines share a width and a centre.
-fn splash_channel_line() -> Line<'static> {
-    tracked_line(
-        "βετα"
-            .chars()
-            .map(|glyph| (glyph, Style::default().fg(BORG_ORANGE)))
-            .collect(),
-    )
 }
 
 fn splitmix64(mut value: u64) -> u64 {

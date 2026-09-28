@@ -11641,11 +11641,19 @@ fn splash_logo_randomizes_glitches_and_then_settles() {
         Some(Color::White),
         "the name is the white between the orange logo and the orange channel"
     );
-    assert_eq!(splash_channel_line().to_string(), "β ε τ α");
+    // The version and the channel are one line of metadata, in the same grey:
+    // the channel qualifies the version, so it is drawn as its qualifier rather
+    // than as a line of its own or in the logo's colour.
     assert_eq!(
-        splash_channel_line().width(),
-        splash_logo_line(Duration::ZERO, 0).width(),
-        "the channel line and the logo must be the same width to centre together"
+        format!("{} {}", splash_version(), RELEASE_CHANNEL),
+        format!("{} β", splash_version()),
+        "the channel is a glyph beside the version, not a word on its own line"
+    );
+    // Whatever the version, the line stays odd-width so it centres with the
+    // logo and the name.
+    assert_eq!(
+        format!("{} {RELEASE_CHANNEL}", splash_version()).width() % 2,
+        1
     );
     assert_eq!(
         splash_logo_line(Duration::from_millis(1_320), 7).to_string(),
