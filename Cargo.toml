@@ -44,8 +44,8 @@ async-trait = "0.1.92"
 base64 = "0.23.1"
 borg-core = { path = "crates/borg-core" }
 borg-dictation = { path = "crates/borg-dictation" }
-blu-lang = { git = "https://github.com/borg-ml/blu.git", tag = "v0.1.0" }
-claude-agents = { git = "https://github.com/borg-ml/claude-agents.git", tag = "v0.1.0" }
+blu-lang = "0.1.0"
+claude-agents = "0.1.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 borg-search = { path = "crates/borg-search" }
 borg-ui = { path = "crates/borg-ui" }
