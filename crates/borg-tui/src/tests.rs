@@ -9229,7 +9229,12 @@ fn input_redraw_measures_history_at_the_committed_frame_width() {
 }
 
 #[tokio::test]
-#[ignore = "requires a PTY; verifies input redraw under live transcript invalidation"]
+// Run it under a PTY that has a size - a bare run hangs, and a PTY with no
+// window size fails on a zero-area buffer:
+//
+//     script -qec "stty rows 50 cols 200; cargo test -p borg-tui --lib -- \
+//         --ignored streaming_input_redraw" /dev/null
+#[ignore = "requires a PTY; run under script with a sized terminal"]
 async fn streaming_input_redraw_keeps_committed_history_snapshot() {
     let session_id = Uuid::new_v4();
     let directory = tempfile::tempdir().unwrap();
