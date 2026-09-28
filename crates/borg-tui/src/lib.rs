@@ -17083,24 +17083,22 @@ fn push_interactive_status_segment(
     }
 }
 
-fn effort_status_color(effort: &str) -> Color {
-    match effort.to_ascii_lowercase().as_str() {
-        "low" => Color::LightGreen,
-        "medium" => Color::Cyan,
-        "high" => Color::Yellow,
-        "xhigh" => Color::LightMagenta,
-        "max" | "ultra" => Color::LightRed,
-        _ => Color::Gray,
-    }
+/// The one colour the effort and billing segments share.
+///
+/// Both used to be graded per value - effort from green to red up the ladder,
+/// billing blue for API and grey for an endpoint. On a status line already
+/// crowded with coloured segments a hue per level says nothing useful, and it
+/// made the same idea mean different colours in two places. xhigh on Codex is
+/// the colour the pair is read as, so that is the colour they are.
+fn effort_status_color(_effort: &str) -> Color {
+    EFFORT_AND_BILLING_COLOR
 }
 
-fn billing_status_color(billing: &str) -> Color {
-    match billing {
-        "api" => Color::LightBlue,
-        "endpoint" => Color::Gray,
-        _ => Color::LightMagenta,
-    }
+fn billing_status_color(_billing: &str) -> Color {
+    EFFORT_AND_BILLING_COLOR
 }
+
+const EFFORT_AND_BILLING_COLOR: Color = Color::LightMagenta;
 
 fn permission_status_color(permission: &str) -> Color {
     match permission {

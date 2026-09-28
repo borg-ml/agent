@@ -8275,13 +8275,14 @@ fn actionable_status_segments_show_bottom_interaction_hints() {
 
 #[test]
 fn effort_and_permission_status_colors_reflect_their_values() {
-    assert_eq!(effort_status_color("low"), Color::LightGreen);
-    assert_eq!(effort_status_color("medium"), Color::Cyan);
-    assert_eq!(effort_status_color("high"), Color::Yellow);
-    assert_eq!(effort_status_color("xhigh"), Color::LightMagenta);
-    assert_eq!(effort_status_color("max"), Color::LightRed);
-    assert_eq!(effort_status_color("ultra"), Color::LightRed);
-    assert_eq!(effort_status_color("custom"), Color::Gray);
+    // One colour for the whole ladder, and the same one billing uses: the
+    // segments are read as a pair, so they cannot mean different things.
+    for effort in ["low", "medium", "high", "xhigh", "max", "ultra", "custom"] {
+        assert_eq!(effort_status_color(effort), Color::LightMagenta, "{effort}");
+    }
+    for billing in ["api", "endpoint", "max sub", "pro sub"] {
+        assert_eq!(billing_status_color(billing), Color::LightMagenta, "{billing}");
+    }
 
     assert_eq!(
         permission_status_color("manual approvals"),
