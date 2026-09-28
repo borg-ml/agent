@@ -431,7 +431,7 @@ impl LspService {
         let mut slot = shared.lock().await;
         let client = ready_client(&mut slot, spec, &workspace_root).await?;
         let mut report = client
-            .document_diagnostics(&path, &uri, spec.language_id)
+            .document_diagnostics(&path, &uri, spec.language_id, None)
             .await?;
         drop(slot);
         if let Some(context) = compilation_context_status(&workspace_root, spec, Some(&path)).await
@@ -888,27 +888,39 @@ impl LspClient {
         path: &Path,
         uri: &str,
         language_id: &str,
+        deadline: Option<Instant>,
     ) -> Result<Value> {
         // didOpen triggers the first parse/preamble build independently of
         // initialize. Large C++ units can need more than the warm 15-second
-        // budget even after initialize has answered. Workspace callers still
-        // impose their outer whole-pass deadline.
+        // budget even after initialize has answered. Bound BOTH the pull and
+        // push fallback by the workspace's remaining budget: checking only
+        // between files allowed one cold file to add another 120 seconds.
         let publish_timeout = if self.opened_versions.contains_key(path) {
             PUBLISHED_DIAGNOSTICS_TIMEOUT
         } else {
             INITIALIZE_TIMEOUT
         };
+        let remaining = |maximum: Duration| {
+            deadline.map_or(maximum, |end| {
+                maximum.min(end.saturating_duration_since(Instant::now()))
+            })
+        };
         self.open_document(path, uri, language_id).await?;
+        let pull_timeout = remaining(REQUEST_TIMEOUT);
+        if pull_timeout.is_zero() {
+            bail!("workspace diagnostic time budget exhausted");
+        }
         match self
-            .request(
+            .request_with_timeout(
                 "textDocument/diagnostic",
                 json!({ "textDocument": { "uri": uri } }),
+                pull_timeout,
             )
             .await
         {
             Ok(result) => Ok(result),
             Err(pull_error) => self
-                .wait_for_published_diagnostics(uri, publish_timeout)
+                .wait_for_published_diagnostics(uri, remaining(publish_timeout))
                 .await
                 .with_context(|| format!("pull diagnostics failed ({pull_error:#})")),
         }
@@ -941,7 +953,7 @@ impl LspClient {
                 .await
                 .with_context(|| format!("failed to reset {}", path.display()))?;
             let report = self
-                .document_diagnostics(&path, &uri, spec.language_id)
+                .document_diagnostics(&path, &uri, spec.language_id, Some(deadline))
                 .await;
             self.close_document(&path, &uri)
                 .await
@@ -959,6 +971,12 @@ impl LspClient {
                         "error": format!("{error:#}")
                     }));
                 }
+            }
+            // The last discovered file may itself exhaust the deadline. In
+            // that case there is no next loop iteration to mark this partial.
+            if Instant::now() >= deadline {
+                exhausted = true;
+                break;
             }
         }
         let scanned = items.len();
@@ -2375,6 +2393,61 @@ mod tests {
                 .await
                 .is_none(),
             "servers that do not read a compilation database stay unannotated"
+        );
+    }
+
+    /// A scan with a nonzero budget must bound an in-flight diagnostic too,
+    /// not just notice expiration before the NEXT file. A compiler check and
+    /// the already-expired-budget test cannot catch a 120-second fallback wait.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_document_server_cannot_overrun_the_workspace_budget() {
+        let root = tempfile::tempdir().expect("workspace");
+        tokio::fs::write(root.path().join("unit.cpp"), "int value;\n")
+            .await
+            .expect("source");
+        // The shell holds stdout open while cat consumes requests without
+        // answering. No installed language server or timing its parse is needed.
+        let mut child = Command::new("sh")
+            .args(["-c", "cat >/dev/null"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("silent server");
+        let mut client = LspClient {
+            stdin: child.stdin.take().expect("stdin"),
+            stdout: BufReader::new(child.stdout.take().expect("stdout")),
+            child,
+            next_id: 1,
+            opened_versions: HashMap::new(),
+            published_diagnostics: HashMap::new(),
+        };
+        let clangd = spec_for_id("clangd").expect("spec");
+        let result = timeout(
+            Duration::from_secs(2),
+            client.document_workspace_diagnostics(
+                root.path(),
+                clangd,
+                Instant::now() + Duration::from_millis(100),
+            ),
+        )
+        .await;
+        client.child.kill().await.expect("stop owned mock server");
+        let report = result
+            .expect("the scan must not wait for the ordinary request/publish timeout")
+            .expect("budget exhaustion is a partial report");
+        assert_eq!(report["partial"], json!(true));
+        assert_eq!(report["documentsDiscovered"], json!(1));
+        let scanned = report["documentsScanned"].as_u64().expect("scanned count");
+        assert!(scanned <= 1);
+        if scanned == 1 {
+            assert_eq!(report["failedDocuments"], json!(1));
+            assert!(report["items"][0]["error"].is_string());
+        }
+        assert!(
+            client.opened_versions.is_empty(),
+            "close the timed-out document"
         );
     }
 
