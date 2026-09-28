@@ -11645,14 +11645,16 @@ fn splash_logo_randomizes_glitches_and_then_settles() {
     // the channel qualifies the version, so it is drawn as its qualifier rather
     // than as a line of its own or in the logo's colour.
     assert_eq!(
-        format!("{} {}", splash_version(), RELEASE_CHANNEL),
-        format!("{} β", splash_version()),
+        format!("{RELEASE_CHANNEL} {}", splash_version()),
+        format!("β {}", splash_version()),
         "the channel is a glyph beside the version, not a word on its own line"
     );
     // Whatever the version, the line stays odd-width so it centres with the
     // logo and the name.
+    // The glyph leads, and the version's own width is odd by construction, so
+    // the pair is too and the three splash lines keep one centre.
     assert_eq!(
-        format!("{} {RELEASE_CHANNEL}", splash_version()).width() % 2,
+        format!("{RELEASE_CHANNEL} {}", splash_version()).width() % 2,
         1
     );
     assert_eq!(

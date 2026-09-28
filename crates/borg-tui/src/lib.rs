@@ -8702,7 +8702,7 @@ impl BorgTerminal {
                         splash_logo_line(self.splash_started_at.elapsed(), self.splash_glitch_seed),
                         splash_agent_line(),
                         Line::from(Span::styled(
-                            format!("{} {RELEASE_CHANNEL}", splash_version()),
+                            format!("{RELEASE_CHANNEL} {}", splash_version()),
                             Style::default().fg(Color::DarkGray),
                         )),
                         Line::from(""),
