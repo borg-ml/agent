@@ -171,6 +171,25 @@ Explicit effort selections and team worker presets take precedence. The team
 roster shows the recorded effort level, never `default`; older sessions without
 a recorded level show `—` until their configuration is resolved.
 
+## Terminal frame rate
+
+The interface redraws on a bounded timer rather than once per streamed token, so
+a model that thinks quickly cannot make the terminal redraw faster than it can be
+painted. Two variables tune it:
+
+- `BORG_TUI_FPS` - the redraw rate for ordinary frames.
+- `BORG_TUI_STREAMING_FPS` - the rate while text is streaming. This is the one to
+  reach for if streamed reasoning or output arrives in visible steps. Raising it
+  makes text smoother and costs more CPU; lowering it is the right move on a slow
+  terminal or over SSH.
+
+Both are clamped to a supported range, so a typo cannot ask for a rate the
+terminal cannot deliver. A rate below what a frame actually costs has no effect
+either: the interval is raised to at least the time the previous draw took, so the
+loop slows itself down rather than queueing frames it cannot finish. That also
+means an expensive frame - a long expanded code or reasoning block being
+re-rendered - is felt as lag, because the next frame waits for it.
+
 ## Dictation model
 
 Borg downloads Parakeet TDT 0.6B V2 by default. To use a smaller or otherwise
