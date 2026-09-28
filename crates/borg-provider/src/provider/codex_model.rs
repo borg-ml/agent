@@ -532,7 +532,9 @@ impl CodexModelProvider {
             Ok((message, raw_response, context_window, api_key)) => {
                 trace.exit_status = Some(0);
                 let has_tools = matches!(&message, ModelMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty());
-                let finish_reason = if response_hit_output_limit(&raw_response) {
+                let finish_reason = if response_hit_output_limit(&raw_response)
+                    || response_completed_without_answer(&raw_response)
+                {
                     "length"
                 } else if has_tools {
                     "tool_calls"
@@ -1296,7 +1298,10 @@ impl ResponseState {
         // length stop, not an empty answer: keeping it lets the harness
         // continue from the preserved reasoning instead of failing the turn.
         ensure!(
-            !content.is_empty() || !calls.is_empty() || response_hit_output_limit(&response),
+            !content.is_empty()
+                || !calls.is_empty()
+                || response_hit_output_limit(&response)
+                || response_completed_without_answer_items(&response, &output),
             "Codex returned no answer or tool calls ({})",
             response_failure_detail(&response, Some(&output))
         );
@@ -1462,6 +1467,36 @@ fn response_failure_detail<'a>(response: &'a Value, output: Option<&'a [Value]>)
         }
     }
     parts.join(" ")
+}
+
+// A completed empty message after encrypted reasoning can resume from that
+// reasoning just like an output-limit stop. Keep genuinely empty completions as
+// errors; a replayable reasoning item is required.
+fn response_completed_without_answer_items(response: &Value, output: &[Value]) -> bool {
+    response["status"] == "completed"
+        && output.iter().any(|item| {
+            item["type"] == "reasoning"
+                && item["encrypted_content"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty())
+        })
+        && output.iter().any(|item| item["type"] == "message")
+        && output.iter().all(|item| match item["type"].as_str() {
+            Some("reasoning") => true,
+            Some("message") => item["content"].as_array().is_some_and(|blocks| {
+                blocks.iter().all(|block| {
+                    block["text"].as_str().unwrap_or_default().is_empty()
+                        && block["refusal"].as_str().unwrap_or_default().is_empty()
+                })
+            }),
+            _ => false,
+        })
+}
+
+fn response_completed_without_answer(response: &Value) -> bool {
+    response["output"]
+        .as_array()
+        .is_some_and(|output| response_completed_without_answer_items(response, output))
 }
 
 fn response_hit_output_limit(response: &Value) -> bool {
@@ -2357,6 +2392,68 @@ mod tests {
         );
         assert!(response_hit_output_limit(&raw));
         assert!(!response_hit_output_limit(&json!({"status": "completed"})));
+    }
+
+    #[test]
+    fn completed_empty_message_with_replayable_reasoning_requests_continuation() {
+        let mut state = ResponseState::default();
+        let expected = [
+            json!({"type":"reasoning","id":"reason","encrypted_content":"opaque","summary":[]}),
+            json!({"type":"message","content":[]}),
+        ];
+        for (index, item) in expected.iter().enumerate() {
+            state
+                .event(
+                    &json!({"type":"response.output_item.done","output_index":index,"item":item}),
+                    None,
+                    "model",
+                    "high",
+                )
+                .unwrap();
+        }
+        let (message, raw) = state
+            .finish(json!({"status":"completed","output":[],
+            "usage":{"input_tokens":120134,"output_tokens":86}}))
+            .unwrap();
+        assert!(response_completed_without_answer(&raw));
+        assert_eq!(response_usage(&raw).output_tokens, 86);
+        let (_, completed) = ResponseState::default()
+            .finish(json!({"status":"completed","output":expected}))
+            .unwrap();
+        assert!(response_completed_without_answer(&completed));
+        let ModelMessage::Assistant {
+            content,
+            tool_calls,
+            provider_state,
+            ..
+        } = message
+        else {
+            panic!("expected an assistant message");
+        };
+        assert!(content.is_none() && tool_calls.is_empty());
+        assert!(
+            matches!(provider_state, Some(ModelProviderState::OpenAiResponses { output, .. })
+            if output == expected.to_vec())
+        );
+
+        // Keep truly empty completions as errors, not continuation loops.
+        for output in [
+            json!([]),
+            json!([{"type":"reasoning"},{"type":"message","content":[]}]),
+            json!([{"type":"reasoning","encrypted_content":"opaque"}]),
+        ] {
+            assert!(
+                ResponseState::default()
+                    .finish(json!({"status":"completed","output":output}))
+                    .is_err()
+            );
+        }
+        let refusal = json!({"status":"completed","output":[
+            {"type":"reasoning","encrypted_content":"opaque"},
+            {"type":"message","content":[{"type":"refusal","refusal":"no"}]}
+        ]});
+        assert!(!response_completed_without_answer(&refusal));
+        assert!(ResponseState::default().finish(refusal).is_ok());
     }
 
     /// A `max_output_tokens` cut that lands before any text or tool call is
