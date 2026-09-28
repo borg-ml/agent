@@ -73,7 +73,8 @@ impl ComposerDraftStore {
         if draft.is_empty() {
             return self.clear();
         }
-        let raw = serde_json::to_vec(&draft.to_value()).context("failed to encode composer draft")?;
+        let raw =
+            serde_json::to_vec(&draft.to_value()).context("failed to encode composer draft")?;
         // Write-then-rename so an interrupted save cannot leave a half-written
         // sidecar that reads back as a truncated prompt.
         let temporary = self.path.with_extension("draft.json.tmp");
@@ -87,9 +88,9 @@ impl ComposerDraftStore {
         match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => {
-                Err(error).with_context(|| format!("failed to remove composer draft {}", self.path.display()))
-            }
+            Err(error) => Err(error).with_context(|| {
+                format!("failed to remove composer draft {}", self.path.display())
+            }),
         }
     }
 }

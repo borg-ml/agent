@@ -29,7 +29,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use attachments::{AttachmentStore, PasteOutcome};
-use composer_draft::{ComposerDraft, ComposerDraftStore};
 use borg_remote::{
     ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus, MessageStatus,
     PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage, SessionEvent,
@@ -51,6 +50,7 @@ use borg_ui::preferences::{
 };
 use borg_ui::timeline::tool_lifecycle_label;
 use chrono::{DateTime, Local, NaiveDate, Utc};
+use composer_draft::{ComposerDraft, ComposerDraftStore};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -2804,10 +2804,7 @@ fn model_picker_options_with_configured(
 /// `reasoning.supported_efforts` list per model, and those lists disagree
 /// constantly, so a provider-wide list offers levels the model will refuse.
 /// A provider with a fixed model catalog answers from that catalog instead.
-fn effort_picker_options(
-    provider: Option<CodingProvider>,
-    model: Option<&str>,
-) -> Vec<String> {
+fn effort_picker_options(provider: Option<CodingProvider>, model: Option<&str>) -> Vec<String> {
     let Some(provider) = provider else {
         return Vec::new();
     };
@@ -2833,7 +2830,8 @@ fn effort_picker_options(
     }
     // Otherwise the vendor's own published capabilities, which also cover the
     // direct routes that have no gateway catalog at all.
-    let published = borg_provider::models_catalog::effort_values(models_dev_provider(provider), model);
+    let published =
+        borg_provider::models_catalog::effort_values(models_dev_provider(provider), model);
     if !published.is_empty() {
         return published;
     }
@@ -2900,8 +2898,7 @@ fn effort_is_optional(provider: Option<CodingProvider>, model: Option<&str>) -> 
         "vercel" => borg_provider::vercel_model_entries(),
         _ => return false,
     };
-    model
-        .is_some_and(|model| borg_provider::gateway_effort_is_optional(model, &entries))
+    model.is_some_and(|model| borg_provider::gateway_effort_is_optional(model, &entries))
 }
 
 impl BorgTerminal {
@@ -3605,7 +3602,8 @@ impl BorgTerminal {
         let Some(draft) = self.composer_draft_store.load() else {
             return;
         };
-        self.composer.restore(draft.text.clone(), draft.attachments.clone());
+        self.composer
+            .restore(draft.text.clone(), draft.attachments.clone());
         self.persisted_draft = Some(draft);
     }
 

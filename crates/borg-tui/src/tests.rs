@@ -1964,14 +1964,14 @@ fn model_and_effort_pickers_use_the_provider_catalog() {
 /// verified wire field. It reads out of the catalog rather than a local table.
 #[test]
 fn a_token_budget_model_states_its_ceiling() {
-    borg_provider::models_catalog::set_for_test(
-        borg_provider::models_catalog::parse(&serde_json::json!({
+    borg_provider::models_catalog::set_for_test(borg_provider::models_catalog::parse(
+        &serde_json::json!({
             "alibaba": { "models": { "qwen3.7-plus": { "reasoning_options": [
                 { "type": "toggle" },
                 { "type": "budget_tokens", "max": 81920 }
             ] } } },
-        })),
-    );
+        }),
+    ));
     let facts = borg_provider::models_catalog::facts("alibaba", "qwen3.7-plus")
         .expect("qwen3.7-plus is catalogued");
     assert_eq!(facts.budget_tokens_max, Some(81920));
@@ -1980,14 +1980,14 @@ fn a_token_budget_model_states_its_ceiling() {
 
 #[test]
 fn a_toggle_only_model_offers_reasoning_on_or_off() {
-    borg_provider::models_catalog::set_for_test(
-        borg_provider::models_catalog::parse(&serde_json::json!({
+    borg_provider::models_catalog::set_for_test(borg_provider::models_catalog::parse(
+        &serde_json::json!({
             "alibaba": { "models": { "qwen3.7-plus": { "reasoning_options": [
                 { "type": "toggle" },
                 { "type": "budget_tokens", "max": 81920 }
             ] } } },
-        })),
-    );
+        }),
+    ));
     let levels = effort_picker_options(Some(CodingProvider::Qwen), Some("qwen3.7-plus"));
     assert_eq!(levels, ["medium", "none"]);
 
@@ -2011,21 +2011,21 @@ fn model_picker_openai_compatible_with_current_yields_current_not_placeholder() 
 fn model_picker_openai_compatible_merges_discovered_models_after_current() {
     let discovered = [
         borg_provider::DynamicModelEntry {
-                id: "gguf:qwen3.6-27b-q4_k_m".to_string(),
-                label: "Qwen3.6-27B · Q4_K_M · 15.7 GiB".to_string(),
-                detail: Some("qwen35 · 42 blocks · fits in available VRAM".to_string()),
-                supported_efforts: None,
-                reasoning_mandatory: false,
-                default_effort: None,
-            },
+            id: "gguf:qwen3.6-27b-q4_k_m".to_string(),
+            label: "Qwen3.6-27B · Q4_K_M · 15.7 GiB".to_string(),
+            detail: Some("qwen35 · 42 blocks · fits in available VRAM".to_string()),
+            supported_efforts: None,
+            reasoning_mandatory: false,
+            default_effort: None,
+        },
         borg_provider::DynamicModelEntry {
-                id: "gguf:bonsai-27b-q2_g64".to_string(),
-                label: "Bonsai-27B · Q2_g64 · 7.1 GiB".to_string(),
-                detail: Some("qwen35 · 32k ctx · may spill to system RAM".to_string()),
-                supported_efforts: None,
-                reasoning_mandatory: false,
-                default_effort: None,
-            },
+            id: "gguf:bonsai-27b-q2_g64".to_string(),
+            label: "Bonsai-27B · Q2_g64 · 7.1 GiB".to_string(),
+            detail: Some("qwen35 · 32k ctx · may spill to system RAM".to_string()),
+            supported_efforts: None,
+            reasoning_mandatory: false,
+            default_effort: None,
+        },
     ];
     let options = model_picker_options_with_discovered(
         Some(CodingProvider::OpenAiCompatible),
@@ -2046,13 +2046,13 @@ fn model_picker_openai_compatible_merges_discovered_models_after_current() {
 #[test]
 fn model_picker_openrouter_uses_runtime_entries_and_existing_fuzzy_filter() {
     let discovered = [borg_provider::DynamicModelEntry {
-                id: "anthropic/claude-sonnet-4".to_string(),
-                label: "Claude Sonnet 4".to_string(),
-                detail: Some("200000 context · also offered through opencode-go".to_string()),
-                supported_efforts: None,
-                reasoning_mandatory: false,
-                default_effort: None,
-            }];
+        id: "anthropic/claude-sonnet-4".to_string(),
+        label: "Claude Sonnet 4".to_string(),
+        detail: Some("200000 context · also offered through opencode-go".to_string()),
+        supported_efforts: None,
+        reasoning_mandatory: false,
+        default_effort: None,
+    }];
     let options = model_picker_options_with_discovered(
         Some(CodingProvider::OpenRouter),
         Some("openrouter/auto"),
@@ -2102,13 +2102,13 @@ fn model_picker_openrouter_keeps_manual_current_when_catalog_is_unavailable() {
 #[test]
 fn model_picker_lists_vercel_models_from_any_provider() {
     borg_provider::set_vercel_model_entries(vec![borg_provider::DynamicModelEntry {
-                id: "stealth/pixel-canary".to_string(),
-                label: "Pixel Canary".to_string(),
-                detail: Some("262144 context".to_string()),
-                supported_efforts: None,
-                reasoning_mandatory: false,
-                default_effort: None,
-            }]);
+        id: "stealth/pixel-canary".to_string(),
+        label: "Pixel Canary".to_string(),
+        detail: Some("262144 context".to_string()),
+        supported_efforts: None,
+        reasoning_mandatory: false,
+        default_effort: None,
+    }]);
 
     // A Codex session lists the gateway's models alongside the fixed catalogs.
     let options = model_picker_options(Some(CodingProvider::Codex), None);
@@ -8281,7 +8281,11 @@ fn effort_and_permission_status_colors_reflect_their_values() {
         assert_eq!(effort_status_color(effort), Color::LightMagenta, "{effort}");
     }
     for billing in ["api", "endpoint", "max sub", "pro sub"] {
-        assert_eq!(billing_status_color(billing), Color::LightMagenta, "{billing}");
+        assert_eq!(
+            billing_status_color(billing),
+            Color::LightMagenta,
+            "{billing}"
+        );
     }
 
     assert_eq!(
@@ -13194,7 +13198,10 @@ fn a_group_with_a_running_command_stays_unfolded() {
     // Once it finishes, the group is foldable again like any other.
     transcript.order[0] = tool("long-build", "Run", false);
     let settled = render(&transcript);
-    assert!(settled.contains("\u{25b8} 12:00"), "a finished group folds: {settled}");
+    assert!(
+        settled.contains("\u{25b8} 12:00"),
+        "a finished group folds: {settled}"
+    );
     assert!(!settled.contains("long-build"), "{settled}");
 }
 

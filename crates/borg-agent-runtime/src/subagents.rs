@@ -2512,11 +2512,7 @@ impl AgentToolDispatcher {
             // Boxed because reaching a capability re-enters this dispatch, and
             // an async fn that reaches itself needs a heap-allocated future.
             "capability" => {
-                Box::pin(self.call_capability_by_name(
-                    arguments,
-                    workflow_cancel.clone(),
-                ))
-                .await
+                Box::pin(self.call_capability_by_name(arguments, workflow_cancel.clone())).await
             }
             name if is_autonomy_tool(name) => {
                 let store = self
@@ -8542,10 +8538,10 @@ mod exec_args_tests {
     /// The schema advertises a presentation field the runtime never reads, and
     /// it arrives under both spellings. A call formed exactly as the schema
     /// describes must not fail.
-        /// A first-class capability is only useful if the generic tool can see that
+    /// A first-class capability is only useful if the generic tool can see that
     /// it has one, and refuses to shadow it: the schema is what makes those
     /// calls correct.
-        /// The generic tool is the only route to everything that is not first-class,
+    /// The generic tool is the only route to everything that is not first-class,
     /// so the four ways it can be called each have to land somewhere sensible.
     /// The rules are separated from execution precisely so this can be checked
     /// without standing up a session.
@@ -8565,18 +8561,27 @@ mod exec_args_tests {
         let search = json!({ "search": "history" });
         assert_eq!(
             classify_capability_call(&search, &specs),
-            CapabilityInvocation::Search { query: "history", limit: 10 }
+            CapabilityInvocation::Search {
+                query: "history",
+                limit: 10
+            }
         );
         let search = json!({ "search": "history", "limit": 3 });
         assert_eq!(
             classify_capability_call(&search, &specs),
-            CapabilityInvocation::Search { query: "history", limit: 3 }
+            CapabilityInvocation::Search {
+                query: "history",
+                limit: 3
+            }
         );
         // A limit the model made up is clamped rather than trusted.
         let search = json!({ "search": "history", "limit": 9999 });
         assert_eq!(
             classify_capability_call(&search, &specs),
-            CapabilityInvocation::Search { query: "history", limit: 50 }
+            CapabilityInvocation::Search {
+                query: "history",
+                limit: 50
+            }
         );
 
         // Neither a name nor a search is not interpretable.
@@ -8603,7 +8608,9 @@ mod exec_args_tests {
         let unknown = json!({ "name": "definitely_not_here" });
         assert_eq!(
             classify_capability_call(&unknown, &specs),
-            CapabilityInvocation::Unknown { name: "definitely_not_here" }
+            CapabilityInvocation::Unknown {
+                name: "definitely_not_here"
+            }
         );
 
         // An ordinary capability forwards, carrying its own arguments. This is
@@ -8626,7 +8633,7 @@ mod exec_args_tests {
         ));
     }
 
-#[test]
+    #[test]
     fn first_class_capabilities_are_the_ones_with_schemas_of_their_own() {
         let catalog = agent_tool_specs_with_capabilities_and_consultation(
             CodingProvider::Codex,
@@ -8649,17 +8656,24 @@ mod exec_args_tests {
             assert!(names.contains(&name), "{name} has no schema on this host");
             assert!(is_promoted_capability(name), "{name}");
         }
-        assert!(names.contains(&"capability"), "the escape hatch needs a schema");
+        assert!(
+            names.contains(&"capability"),
+            "the escape hatch needs a schema"
+        );
         assert!(!is_promoted_capability("history_index"));
         assert!(!is_promoted_capability("capability"));
         // A name may be claimed once only, or the model sees two schemas for it.
         let mut unique = names.clone();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), names.len(), "duplicate schema name: {names:?}");
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "duplicate schema name: {names:?}"
+        );
     }
 
-#[test]
+    #[test]
     fn exec_absorbs_the_presentation_field_under_either_spelling() {
         for key in ["action", "description"] {
             let args = parse_exec_args(serde_json::json!({
@@ -8681,7 +8695,10 @@ mod exec_args_tests {
         let message = error.to_string();
         assert!(message.contains("Accepted fields are"), "{message}");
         assert!(message.contains("`cmd`"), "{message}");
-        assert!(message.contains("cmnd"), "must name what arrived: {message}");
+        assert!(
+            message.contains("cmnd"),
+            "must name what arrived: {message}"
+        );
     }
 }
 
@@ -9571,22 +9588,20 @@ pub(crate) fn promoted_specs(specs: &[Value]) -> Vec<Value> {
 }
 
 pub(crate) fn capability_tool_specs() -> Vec<Value> {
-    vec![
-        tool(
-            "capability",
-            "Invoke any other Borg, Blu, plugin, history, workflow or extension capability by name, including everything no other tool covers. Pass `search` instead of `name` to see what this host provides and what each one is for - a bare list of names is not enough to choose from, so search before guessing. A name that already has its own tool is refused here, with a pointer to that tool.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "minLength": 1 },
-                    "arguments": { "type": "object" },
-                    "search": { "type": "string", "minLength": 1 },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 50 }
-                },
-                "additionalProperties": false
-            }),
-        ),
-    ]
+    vec![tool(
+        "capability",
+        "Invoke any other Borg, Blu, plugin, history, workflow or extension capability by name, including everything no other tool covers. Pass `search` instead of `name` to see what this host provides and what each one is for - a bare list of names is not enough to choose from, so search before guessing. A name that already has its own tool is refused here, with a pointer to that tool.",
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "arguments": { "type": "object" },
+                "search": { "type": "string", "minLength": 1 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 50 }
+            },
+            "additionalProperties": false
+        }),
+    )]
 }
 
 /// Decide what a `capability` call is asking for, without touching a session.
@@ -9594,10 +9609,7 @@ pub(crate) fn capability_tool_specs() -> Vec<Value> {
 /// Free-standing so the rules can be checked directly: refuse a name that has a
 /// tool of its own, clamp a limit the model invented, and treat an unknown name
 /// as a miss to correct rather than an error to shrug at.
-fn classify_capability_call<'a>(
-    arguments: &'a Value,
-    specs: &[Value],
-) -> CapabilityInvocation<'a> {
+fn classify_capability_call<'a>(arguments: &'a Value, specs: &[Value]) -> CapabilityInvocation<'a> {
     if let Some(query) = arguments.get("search").and_then(Value::as_str) {
         let limit = arguments
             .get("limit")

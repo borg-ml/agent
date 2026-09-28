@@ -72,7 +72,12 @@ fn catalog() -> &'static RwLock<Option<Facts>> {
 /// Concurrent callers join the same load rather than each issuing a request:
 /// the document is large and every consumer wants all of it.
 pub async fn ensure_loaded() {
-    if catalog().read().ok().and_then(|cache| cache.clone()).is_some() {
+    if catalog()
+        .read()
+        .ok()
+        .and_then(|cache| cache.clone())
+        .is_some()
+    {
         return;
     }
     if let Ok(parsed) = fetch().await
@@ -85,7 +90,10 @@ pub async fn ensure_loaded() {
 /// Read-only access for callers that cannot await. Returns `None` until the
 /// catalog has loaded, which callers treat as "unknown", never as a default.
 pub fn loaded() -> bool {
-    catalog().read().map(|cache| cache.is_some()).unwrap_or(false)
+    catalog()
+        .read()
+        .map(|cache| cache.is_some())
+        .unwrap_or(false)
 }
 
 /// Facts for `model` under `provider`.

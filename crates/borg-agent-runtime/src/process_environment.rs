@@ -186,8 +186,19 @@ mod tests {
     /// Off stays off, on hands over exactly `HOME` and nothing else.
     #[test]
     fn home_is_given_only_when_the_user_opts_in() {
-        for off in [None, Some(""), Some("0"), Some("false"), Some("no"), Some("off")] {
-            assert_eq!(home_for_opt_in(off, Some("/home/u".into())), None, "{off:?}");
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("off"),
+        ] {
+            assert_eq!(
+                home_for_opt_in(off, Some("/home/u".into())),
+                None,
+                "{off:?}"
+            );
         }
         for on in ["1", "true", "yes", "on", " on "] {
             assert_eq!(

@@ -130,10 +130,6 @@ pub fn gateway_with_key(model: &str, session_id: Uuid, api_key: &str) -> Result<
     Ok(gateway)
 }
 
-
-
-
-
 /// The catalog price for `model`, preferring the named provider.
 ///
 /// Read-only and never fetched here: the document is loaded by the first native
@@ -177,8 +173,6 @@ pub async fn context_window_tokens(model: &str) -> Option<u64> {
 }
 
 const MODELS_DEV_PROVIDER: &str = "opencode-go";
-
-
 
 /// The catalog quotes dollars per million tokens; Borg accounts in micro-USD.
 
@@ -308,13 +302,12 @@ mod tests {
             }
         });
         crate::models_catalog::set_for_test(crate::models_catalog::parse(&payload));
-        let anthropic = crate::models_catalog::pricing("anthropic", "claude-opus-5")
-            .expect("anthropic price");
+        let anthropic =
+            crate::models_catalog::pricing("anthropic", "claude-opus-5").expect("anthropic price");
         assert_eq!(anthropic.input, 5_000_000);
         assert_eq!(anthropic.cached_input, 500_000);
         assert_eq!(anthropic.output, 25_000_000);
-        let go = crate::models_catalog::pricing("opencode-go", "qwen3.7-max")
-            .expect("go price");
+        let go = crate::models_catalog::pricing("opencode-go", "qwen3.7-max").expect("go price");
         assert_eq!(go.cached_input, 500_000);
         // A model with no cached-input rate has no price at all rather than a
         // half one that would misstate what a cache hit saves.
@@ -323,7 +316,6 @@ mod tests {
             None
         );
         assert!(catalog_pricing(Some("anthropic"), "claude-opus-5").is_some());
-
     }
 
     /// models.dev carries the window under the Go provider's `limit.context`.
@@ -353,8 +345,14 @@ mod tests {
             crate::models_catalog::context_window("opencode-go", "glm-5.3"),
             Some(1_000_000)
         );
-        assert_eq!(crate::models_catalog::context_window("opencode-go", "no-window"), None);
-        assert_eq!(crate::models_catalog::context_window("opencode-go", "zero"), None);
+        assert_eq!(
+            crate::models_catalog::context_window("opencode-go", "no-window"),
+            None
+        );
+        assert_eq!(
+            crate::models_catalog::context_window("opencode-go", "zero"),
+            None
+        );
         // Another provider's models must not leak into the Go route.
         assert_eq!(
             crate::models_catalog::context_window("opencode-go", "deepseek/deepseek-v4.1-flash"),

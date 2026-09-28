@@ -996,10 +996,8 @@ pub fn kimi_cost_microusd(raw: &Value, model: &str) -> Option<u64> {
     if crate::subscription::active_for(crate::subscription::Plan::KimiCode).is_some() {
         return None;
     }
-    let price = crate::models_catalog::pricing(
-        models_dev_key(OpenAiCompatibleProfile::Kimi),
-        model,
-    )?;
+    let price =
+        crate::models_catalog::pricing(models_dev_key(OpenAiCompatibleProfile::Kimi), model)?;
     let input = raw
         .pointer("/usage/prompt_tokens")
         .and_then(Value::as_u64)
@@ -1496,7 +1494,10 @@ async fn read_compatible_model_stream(
             // finish_reason", which names a transport symptom and throws away
             // the only sentence that says what actually went wrong.
             if let Some(error) = chunk.get("error") {
-                let message = format!("provider rejected the request: {}", stream_error_message(error));
+                let message = format!(
+                    "provider rejected the request: {}",
+                    stream_error_message(error)
+                );
                 return Err(CompatibleStreamError {
                     kind: stream_error_kind(&message),
                     message,
@@ -2115,7 +2116,10 @@ fn vocabulary_for(
     if !published.is_empty() {
         return published;
     }
-    wire.declared.iter().map(|level| (*level).to_string()).collect()
+    wire.declared
+        .iter()
+        .map(|level| (*level).to_string())
+        .collect()
 }
 
 /// Clamp a requested level onto a route's vocabulary by rank.
@@ -2131,9 +2135,9 @@ fn clamp_effort_to_vocabulary(
     if vocabulary.is_empty() {
         return match effort.map(str::trim) {
             Some("ultra") => "max".to_string(),
-            Some(
-                level @ ("minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "none"),
-            ) => level.to_string(),
+            Some(level @ ("minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "none")) => {
+                level.to_string()
+            }
             _ => default.to_string(),
         };
     }
@@ -2172,8 +2176,11 @@ fn apply_reasoning(
         }
         ReasoningField::Effort => {
             let vocabulary = vocabulary_for(profile, &wire, model);
-            body["reasoning_effort"] =
-                json!(clamp_effort_to_vocabulary(effort, &vocabulary, wire.default));
+            body["reasoning_effort"] = json!(clamp_effort_to_vocabulary(
+                effort,
+                &vocabulary,
+                wire.default
+            ));
         }
         ReasoningField::NestedEffort => {
             // A model the gateway marks mandatory refuses a request that omits
@@ -2185,9 +2192,8 @@ fn apply_reasoning(
                     body["reasoning"] = value;
                     return;
                 }
-                None => crate::runtime::gateway_required_effort("openrouter", model).or_else(
-                    || crate::runtime::gateway_required_effort("vercel", model),
-                ),
+                None => crate::runtime::gateway_required_effort("openrouter", model)
+                    .or_else(|| crate::runtime::gateway_required_effort("vercel", model)),
             };
             if let Some(level) = effort {
                 body["reasoning"] = json!({ "effort": level });
@@ -2195,7 +2201,6 @@ fn apply_reasoning(
         }
     }
 }
-
 
 fn compatible_openrouter_provider_preferences(require_parameters: bool) -> Option<Value> {
     let order = nonempty_env("BORG_OPENROUTER_PROVIDER_ORDER")
@@ -2449,7 +2454,10 @@ mod tests {
             stream_error_message(error.get("error").expect("error object"))
         );
         assert!(message.contains("maximum context length"), "{message}");
-        assert_eq!(stream_error_kind(&message), ProviderErrorKind::ContextLength);
+        assert_eq!(
+            stream_error_kind(&message),
+            ProviderErrorKind::ContextLength
+        );
     }
 
     /// The failure that stopped a turn dead instead of retrying. A gateway
@@ -2515,13 +2523,23 @@ mod tests {
         }));
         crate::runtime::set_openrouter_model_entries(entries);
         let mut body = json!({});
-        apply_reasoning(&mut body, OpenAiCompatibleProfile::OpenRouter, "stealth/space-bunny-alpha", None);
+        apply_reasoning(
+            &mut body,
+            OpenAiCompatibleProfile::OpenRouter,
+            "stealth/space-bunny-alpha",
+            None,
+        );
         // The empty-stream refusal is what this prevents.
         assert_eq!(body["reasoning"]["effort"], "max");
 
         // An explicit choice still wins over the model's own default.
         let mut chosen = json!({});
-        apply_reasoning(&mut chosen, OpenAiCompatibleProfile::OpenRouter, "stealth/space-bunny-alpha", Some("low"));
+        apply_reasoning(
+            &mut chosen,
+            OpenAiCompatibleProfile::OpenRouter,
+            "stealth/space-bunny-alpha",
+            Some("low"),
+        );
         assert_eq!(chosen["reasoning"]["effort"], "low");
 
         // A model that does not require reasoning still sends nothing.
@@ -2531,7 +2549,12 @@ mod tests {
         }));
         crate::runtime::set_openrouter_model_entries(entries);
         let mut plain = json!({});
-        apply_reasoning(&mut plain, OpenAiCompatibleProfile::OpenRouter, "vendor/plain", None);
+        apply_reasoning(
+            &mut plain,
+            OpenAiCompatibleProfile::OpenRouter,
+            "vendor/plain",
+            None,
+        );
         assert!(plain.get("reasoning").is_none());
     }
 
@@ -2540,34 +2563,47 @@ mod tests {
     /// lost would assert against the other's models.
     #[test]
     fn the_catalog_decides_the_vocabulary_and_which_control_a_route_uses() {
-        crate::models_catalog::set_for_test(
-            crate::models_catalog::parse(&serde_json::json!({
-                "zai": { "models": { "glm-5.3": { "reasoning_options": [
-                    { "type": "effort", "values": ["max", "high", "low"] }
-                ] } } },
-                "alibaba": { "models": {
-                    "qwen-ladder-fixture": { "reasoning_options": [
-                        { "type": "toggle" },
-                        { "type": "effort", "values": ["low", "medium", "xhigh"] }
-                    ]},
-                    "qwen-toggle-fixture": { "reasoning_options": [{ "type": "toggle" }] }
-                }},
-            })),
-        );
+        crate::models_catalog::set_for_test(crate::models_catalog::parse(&serde_json::json!({
+            "zai": { "models": { "glm-5.3": { "reasoning_options": [
+                { "type": "effort", "values": ["max", "high", "low"] }
+            ] } } },
+            "alibaba": { "models": {
+                "qwen-ladder-fixture": { "reasoning_options": [
+                    { "type": "toggle" },
+                    { "type": "effort", "values": ["low", "medium", "xhigh"] }
+                ]},
+                "qwen-toggle-fixture": { "reasoning_options": [{ "type": "toggle" }] }
+            }},
+        })));
         let mut body = json!({});
-        apply_reasoning(&mut body, OpenAiCompatibleProfile::Glm, "glm-5.3", Some("medium"));
+        apply_reasoning(
+            &mut body,
+            OpenAiCompatibleProfile::Glm,
+            "glm-5.3",
+            Some("medium"),
+        );
         // `medium` does not exist on this model, so it clamps onto the nearest
         // published rung rather than the declared `medium` it used to send.
         assert_ne!(body["reasoning_effort"], "medium");
 
         let mut maxed = json!({});
-        apply_reasoning(&mut maxed, OpenAiCompatibleProfile::Glm, "glm-5.3", Some("max"));
+        apply_reasoning(
+            &mut maxed,
+            OpenAiCompatibleProfile::Glm,
+            "glm-5.3",
+            Some("max"),
+        );
         assert_eq!(maxed["reasoning_effort"], "max");
 
         // A model the catalog does not describe still uses the declared table,
         // so an unknown GLM model is not left with no reasoning at all.
         let mut unknown = json!({});
-        apply_reasoning(&mut unknown, OpenAiCompatibleProfile::Glm, "glm-never-shipped", Some("medium"));
+        apply_reasoning(
+            &mut unknown,
+            OpenAiCompatibleProfile::Glm,
+            "glm-never-shipped",
+            Some("medium"),
+        );
         assert_eq!(unknown["reasoning_effort"], "medium");
         // Alibaba's control is not one shape. A model with a ladder takes
         // `reasoning_effort` and converts the level into a thinking budget on
@@ -2618,20 +2654,51 @@ mod tests {
         };
 
         // Kimi clamps by rank onto its own three-rung ladder.
-        assert_eq!(body_for(OpenAiCompatibleProfile::Kimi, Some("xhigh"))["reasoning_effort"], "max");
-        assert_eq!(body_for(OpenAiCompatibleProfile::Kimi, Some("low"))["reasoning_effort"], "low");
-        assert_eq!(body_for(OpenAiCompatibleProfile::Kimi, None)["reasoning_effort"], "high");
+        assert_eq!(
+            body_for(OpenAiCompatibleProfile::Kimi, Some("xhigh"))["reasoning_effort"],
+            "max"
+        );
+        assert_eq!(
+            body_for(OpenAiCompatibleProfile::Kimi, Some("low"))["reasoning_effort"],
+            "low"
+        );
+        assert_eq!(
+            body_for(OpenAiCompatibleProfile::Kimi, None)["reasoning_effort"],
+            "high"
+        );
 
         // Z.ai stops at `high`, so every rung above it lands there.
-        assert_eq!(body_for(OpenAiCompatibleProfile::Glm, Some("ultra"))["reasoning_effort"], "high");
-        assert_eq!(body_for(OpenAiCompatibleProfile::Glm, Some("xhigh"))["reasoning_effort"], "high");
-        assert_eq!(body_for(OpenAiCompatibleProfile::Glm, Some("none"))["reasoning_effort"], "low");
-        assert_eq!(body_for(OpenAiCompatibleProfile::Glm, None)["reasoning_effort"], "medium");
+        assert_eq!(
+            body_for(OpenAiCompatibleProfile::Glm, Some("ultra"))["reasoning_effort"],
+            "high"
+        );
+        assert_eq!(
+            body_for(OpenAiCompatibleProfile::Glm, Some("xhigh"))["reasoning_effort"],
+            "high"
+        );
+        assert_eq!(
+            body_for(OpenAiCompatibleProfile::Glm, Some("none"))["reasoning_effort"],
+            "low"
+        );
+        assert_eq!(
+            body_for(OpenAiCompatibleProfile::Glm, None)["reasoning_effort"],
+            "medium"
+        );
 
         // Alibaba's control is boolean: any level leaves thinking on.
-        assert_eq!(body_for(OpenAiCompatibleProfile::Qwen, Some("low"))["enable_thinking"], true);
-        assert_eq!(body_for(OpenAiCompatibleProfile::Qwen, Some("none"))["enable_thinking"], false);
-        assert!(body_for(OpenAiCompatibleProfile::Qwen, Some("low")).get("reasoning_effort").is_none());
+        assert_eq!(
+            body_for(OpenAiCompatibleProfile::Qwen, Some("low"))["enable_thinking"],
+            true
+        );
+        assert_eq!(
+            body_for(OpenAiCompatibleProfile::Qwen, Some("none"))["enable_thinking"],
+            false
+        );
+        assert!(
+            body_for(OpenAiCompatibleProfile::Qwen, Some("low"))
+                .get("reasoning_effort")
+                .is_none()
+        );
 
         // A gateway takes the normalized word unchanged, including `minimal`,
         // which the old table dropped entirely.
@@ -2644,7 +2711,11 @@ mod tests {
             "max"
         );
         // No effort means no reasoning field on a gateway.
-        assert!(body_for(OpenAiCompatibleProfile::OpenRouter, None).get("reasoning").is_none());
+        assert!(
+            body_for(OpenAiCompatibleProfile::OpenRouter, None)
+                .get("reasoning")
+                .is_none()
+        );
 
         // A route with no reasoning control writes nothing at all.
         let generic = body_for(OpenAiCompatibleProfile::Generic, Some("high"));
@@ -3374,20 +3445,48 @@ mod tests {
     #[test]
     fn anthropic_cache_markers_follow_a_declared_dialect_and_model_family() {
         // The family is covered whatever the version.
-        assert!(anthropic_cache_markers_for("opencode-go", "qwen3.6-plus", None));
-        assert!(anthropic_cache_markers_for("opencode-go", "qwen3.9-plus", None));
-        assert!(anthropic_cache_markers_for("opencode-go", "qwen3.7-max", None));
+        assert!(anthropic_cache_markers_for(
+            "opencode-go",
+            "qwen3.6-plus",
+            None
+        ));
+        assert!(anthropic_cache_markers_for(
+            "opencode-go",
+            "qwen3.9-plus",
+            None
+        ));
+        assert!(anthropic_cache_markers_for(
+            "opencode-go",
+            "qwen3.7-max",
+            None
+        ));
         // Another family behind the same gateway keeps the body it sends today.
         assert!(!anthropic_cache_markers_for("opencode-go", "glm-5.3", None));
         assert!(!anthropic_cache_markers_for("opencode-go", "kimi-k3", None));
         // Another route never receives the field, whatever the model.
         assert!(!anthropic_cache_markers_for("qwen", "qwen3.6-plus", None));
-        assert!(!anthropic_cache_markers_for("openai-compatible", "qwen3.6-plus", None));
+        assert!(!anthropic_cache_markers_for(
+            "openai-compatible",
+            "qwen3.6-plus",
+            None
+        ));
         // The override can widen within a declared route or turn it off, and
         // can never move the field onto another vendor.
-        assert!(anthropic_cache_markers_for("opencode-go", "vendor/new", Some("on")));
-        assert!(!anthropic_cache_markers_for("opencode-go", "qwen3.6-plus", Some("off")));
-        assert!(!anthropic_cache_markers_for("openai-compatible", "qwen3.9-plus", Some("on")));
+        assert!(anthropic_cache_markers_for(
+            "opencode-go",
+            "vendor/new",
+            Some("on")
+        ));
+        assert!(!anthropic_cache_markers_for(
+            "opencode-go",
+            "qwen3.6-plus",
+            Some("off")
+        ));
+        assert!(!anthropic_cache_markers_for(
+            "openai-compatible",
+            "qwen3.9-plus",
+            Some("on")
+        ));
     }
 
     /// A marker on the wrong part caches nothing while still paying for the

@@ -730,7 +730,9 @@ enum EventUploadOutcome {
         event_bytes: usize,
     },
     /// An event the relay can never store, and replay moved past it.
-    Skipped { sequence: u64 },
+    Skipped {
+        sequence: u64,
+    },
 }
 
 /// Whether a permanent rejection means "this relay can never store this event".

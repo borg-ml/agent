@@ -77,10 +77,7 @@ pub fn model_catalog_for_backend(backend: &str) -> Option<ProviderModelCatalog> 
 ///
 /// `None` means the catalog says nothing about this model, which is different
 /// from a model that publishes an empty vocabulary.
-pub fn gateway_effort_levels(
-    model: &str,
-    entries: &[DynamicModelEntry],
-) -> Option<Vec<String>> {
+pub fn gateway_effort_levels(model: &str, entries: &[DynamicModelEntry]) -> Option<Vec<String>> {
     let entry = entries.iter().find(|entry| entry.id == model)?;
     entry.supported_efforts.clone()
 }
@@ -92,10 +89,7 @@ pub fn gateway_effort_levels(
 /// message. Its own `default_effort` is the level it applies in that case, so
 /// that is what goes on the wire. Returns `None` for a model that does not
 /// require reasoning, where omitting the field is correct.
-pub fn gateway_required_effort(
-    backend: &str,
-    model: &str,
-) -> Option<String> {
+pub fn gateway_required_effort(backend: &str, model: &str) -> Option<String> {
     let entries = match backend {
         "openrouter" => openrouter_model_entries(),
         "vercel" => vercel_model_entries(),
@@ -324,7 +318,9 @@ pub async fn refresh_openrouter_model_catalog() -> anyhow::Result<Vec<DynamicMod
     Ok(entries)
 }
 
-pub(crate) fn openrouter_model_entries_from_response(payload: &serde_json::Value) -> Vec<DynamicModelEntry> {
+pub(crate) fn openrouter_model_entries_from_response(
+    payload: &serde_json::Value,
+) -> Vec<DynamicModelEntry> {
     let mut entries = payload
         .get("data")
         .and_then(serde_json::Value::as_array)
@@ -388,66 +384,65 @@ pub(crate) fn openrouter_model_entries_from_response(payload: &serde_json::Value
     entries
 }
 
+/// Space Bunny Alpha's published vocabulary, verbatim from the live
+/// OpenRouter catalog. The failure mode this guards: a per-provider effort
+/// list offered `none` and `minimal`, which this model rejects, and omitted
+/// `xhigh`, which it accepts. Every level the picker shows must be one the
+/// model reports.
+#[test]
+fn gateway_effort_levels_follow_the_model_not_the_provider() {
+    let entries = openrouter_model_entries_from_response(&serde_json::json!({
+        "data": [{
+            "id": "stealth/space-bunny-alpha",
+            "name": "Stealth: Space Bunny Alpha",
+            "reasoning": {
+                "mandatory": true,
+                "supported_efforts": ["max", "xhigh", "high", "medium", "low"],
+                "default_effort": "max",
+            },
+        }],
+    }));
+    // Used verbatim, in the gateway's own descending order.
+    assert_eq!(
+        gateway_effort_levels("stealth/space-bunny-alpha", &entries),
+        Some(vec![
+            "max".to_string(),
+            "xhigh".to_string(),
+            "high".to_string(),
+            "medium".to_string(),
+            "low".to_string(),
+        ])
+    );
+    // A mandatory model rejects `none`, so the off switch stays unavailable
+    // rather than being offered and refused on send.
+    assert!(!gateway_effort_is_optional(
+        "stealth/space-bunny-alpha",
+        &entries
+    ));
+}
 
-    /// Space Bunny Alpha's published vocabulary, verbatim from the live
-    /// OpenRouter catalog. The failure mode this guards: a per-provider effort
-    /// list offered `none` and `minimal`, which this model rejects, and omitted
-    /// `xhigh`, which it accepts. Every level the picker shows must be one the
-    /// model reports.
-    #[test]
-    fn gateway_effort_levels_follow_the_model_not_the_provider() {
-        let entries = openrouter_model_entries_from_response(&serde_json::json!({
-            "data": [{
-                "id": "stealth/space-bunny-alpha",
-                "name": "Stealth: Space Bunny Alpha",
-                "reasoning": {
-                    "mandatory": true,
-                    "supported_efforts": ["max", "xhigh", "high", "medium", "low"],
-                    "default_effort": "max",
-                },
-            }],
-        }));
-        // Used verbatim, in the gateway's own descending order.
-        assert_eq!(
-            gateway_effort_levels("stealth/space-bunny-alpha", &entries),
-            Some(vec![
-                "max".to_string(),
-                "xhigh".to_string(),
-                "high".to_string(),
-                "medium".to_string(),
-                "low".to_string(),
-            ])
-        );
-        // A mandatory model rejects `none`, so the off switch stays unavailable
-        // rather than being offered and refused on send.
-        assert!(!gateway_effort_is_optional(
-            "stealth/space-bunny-alpha",
-            &entries
-        ));
-    }
+/// `ultra` is a Codex rung, not a gateway one, and is never invented for a
+/// model that did not report it. Offering it to a model that only reports
+/// `max` would reintroduce the phantom-level bug this replaced.
+#[test]
+fn ultra_is_never_synthesized_from_max() {
+    let entries = openrouter_model_entries_from_response(&serde_json::json!({
+        "data": [{
+            "id": "vendor/only-max",
+            "name": "Only Max",
+            "reasoning": { "supported_efforts": ["max", "high"] },
+        }],
+    }));
+    let levels = gateway_effort_levels("vendor/only-max", &entries).expect("levels");
+    assert!(levels.contains(&"max".to_string()));
+    assert!(!levels.contains(&"ultra".to_string()));
+}
 
-    /// `ultra` is a Codex rung, not a gateway one, and is never invented for a
-    /// model that did not report it. Offering it to a model that only reports
-    /// `max` would reintroduce the phantom-level bug this replaced.
-    #[test]
-    fn ultra_is_never_synthesized_from_max() {
-        let entries = openrouter_model_entries_from_response(&serde_json::json!({
-            "data": [{
-                "id": "vendor/only-max",
-                "name": "Only Max",
-                "reasoning": { "supported_efforts": ["max", "high"] },
-            }],
-        }));
-        let levels = gateway_effort_levels("vendor/only-max", &entries).expect("levels");
-        assert!(levels.contains(&"max".to_string()));
-        assert!(!levels.contains(&"ultra".to_string()));
-    }
-
-    /// A model the catalog never listed is unknown, not unrestricted.
-    #[test]
-    fn an_uncatalogued_model_offers_no_levels() {
-        assert_eq!(gateway_effort_levels("never/seen", &[]), None);
-    }
+/// A model the catalog never listed is unknown, not unrestricted.
+#[test]
+fn an_uncatalogued_model_offers_no_levels() {
+    assert_eq!(gateway_effort_levels("never/seen", &[]), None);
+}
 
 static VERCEL_MODEL_ENTRIES: OnceLock<RwLock<Vec<DynamicModelEntry>>> = OnceLock::new();
 
@@ -685,7 +680,10 @@ mod tests {
 
     #[test]
     fn dynamic_models_openai_compatible_no_current() {
-        let discovered = vec![DynamicModelEntry::without_effort_support("qwen3".to_string(), "Qwen 3".to_string())];
+        let discovered = vec![DynamicModelEntry::without_effort_support(
+            "qwen3".to_string(),
+            "Qwen 3".to_string(),
+        )];
         let result = dynamic_models_for_backend("openai-compatible", None, &discovered);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "qwen3");
@@ -693,7 +691,10 @@ mod tests {
 
     #[test]
     fn dynamic_models_openrouter_current_and_catalog_are_available() {
-        let entries = vec![DynamicModelEntry::without_effort_support("anthropic/claude-sonnet".to_string(), "Claude Sonnet".to_string())];
+        let entries = vec![DynamicModelEntry::without_effort_support(
+            "anthropic/claude-sonnet".to_string(),
+            "Claude Sonnet".to_string(),
+        )];
         let result = dynamic_models_for_backend("openrouter", Some("openrouter/auto"), &entries);
         assert_eq!(result[0].id, "openrouter/auto");
         assert_eq!(result[1], entries[0]);
@@ -747,9 +748,15 @@ mod tests {
     fn dynamic_models_dedup_repeated_discovered_ids_and_keeps_current_details() {
         let current = "llama4";
         let discovered = vec![
-            DynamicModelEntry::without_effort_support(current.to_string(), "Llama 4 · Q4_K_M".to_string()),
+            DynamicModelEntry::without_effort_support(
+                current.to_string(),
+                "Llama 4 · Q4_K_M".to_string(),
+            ),
             DynamicModelEntry::without_effort_support("qwen3".to_string(), "Qwen 3".to_string()),
-            DynamicModelEntry::without_effort_support("qwen3".to_string(), "Duplicate Qwen 3".to_string()),
+            DynamicModelEntry::without_effort_support(
+                "qwen3".to_string(),
+                "Duplicate Qwen 3".to_string(),
+            ),
         ];
         let result = dynamic_models_for_backend("openai-compatible", Some(current), &discovered);
         assert_eq!(result.len(), 2);
@@ -811,7 +818,10 @@ mod tests {
 
     #[test]
     fn vercel_backend_lists_discovered_models() {
-        let entries = vec![DynamicModelEntry::without_effort_support("stealth/pixel-canary".to_string(), "Pixel Canary".to_string())];
+        let entries = vec![DynamicModelEntry::without_effort_support(
+            "stealth/pixel-canary".to_string(),
+            "Pixel Canary".to_string(),
+        )];
         let result = dynamic_models_for_backend("vercel", None, &entries);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "stealth/pixel-canary");

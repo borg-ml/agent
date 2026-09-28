@@ -1,8 +1,8 @@
 pub mod credentials;
 pub mod image_tiles;
 pub mod local;
-pub mod models_catalog;
 pub mod mcp;
+pub mod models_catalog;
 pub mod openai_subscription;
 pub mod provider;
 pub mod provider_auth;
@@ -27,13 +27,12 @@ pub use runtime::{
     ProviderCallUsage, ProviderChannel, ProviderModelCatalog, claude_default_effort,
     claude_product_model, codex_default_effort, codex_effort_levels, codex_effort_supported,
     codex_product_model, dynamic_models_for_backend, gateway_effort_is_optional,
-    gateway_effort_levels,
-    glm_product_model, grok_product_model,
-    kimi_default_effort, kimi_product_model, model_catalog_for_backend, muse_product_model,
-    opencode_go_model_entries, openrouter_model_entries, openrouter_product_model,
-    qwen_default_effort, qwen_product_model, refresh_opencode_go_model_catalog,
-    refresh_openrouter_model_catalog, refresh_vercel_model_catalog, set_openrouter_model_entries,
-    set_vercel_model_entries, vercel_model_entries,
+    gateway_effort_levels, glm_product_model, grok_product_model, kimi_default_effort,
+    kimi_product_model, model_catalog_for_backend, muse_product_model, opencode_go_model_entries,
+    openrouter_model_entries, openrouter_product_model, qwen_default_effort, qwen_product_model,
+    refresh_opencode_go_model_catalog, refresh_openrouter_model_catalog,
+    refresh_vercel_model_catalog, set_openrouter_model_entries, set_vercel_model_entries,
+    vercel_model_entries,
 };
 pub use subscription::Plan;
 

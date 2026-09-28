@@ -2761,10 +2761,8 @@ impl NativeToolRuntime {
                         .map_err(anyhow::Error::msg)?,
                 );
                 definitions.push(
-                    ModelToolDefinition::from_mcp_spec(
-                        &crate::subagents::runtime_exec_spec(),
-                    )
-                    .map_err(anyhow::Error::msg)?,
+                    ModelToolDefinition::from_mcp_spec(&crate::subagents::runtime_exec_spec())
+                        .map_err(anyhow::Error::msg)?,
                 );
                 definitions
             }
