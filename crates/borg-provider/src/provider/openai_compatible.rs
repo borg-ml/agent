@@ -663,7 +663,9 @@ request: {shape}"
         trace.exit_status = Some(0);
         let duration_ms = elapsed_millis_u64(started_at);
         let mut usage = match profile {
-            OpenAiCompatibleProfile::Kimi => kimi_usage_from_response(&streamed.raw, duration_ms),
+            OpenAiCompatibleProfile::Kimi => {
+                kimi_usage_from_response(&streamed.raw, duration_ms, request_model)
+            }
             // Plan usage is quota-metered rather than priced per token, so the
             // generic extractor (which reports no cost) is the honest one.
             OpenAiCompatibleProfile::Glm => {
@@ -972,11 +974,25 @@ fn kimi_max_completion_tokens() -> u64 {
 pub fn kimi_usage_from_response(
     raw: &Value,
     duration_ms: u64,
+    model: &str,
 ) -> crate::runtime::ProviderCallUsage {
-    extract_chat_completions_usage(raw, duration_ms, Some(kimi_cost_microusd(raw)))
+    // No cost when the price is unknown. A made-up rate is worse than none:
+    // it is a number the user cannot audit and Borg cannot explain.
+    extract_chat_completions_usage(raw, duration_ms, kimi_cost_microusd(raw, model))
 }
 
-pub fn kimi_cost_microusd(raw: &Value) -> u64 {
+/// Cost of a Kimi turn, in micro-USD, at the model's own list price.
+///
+/// The rate is read from the shared catalog rather than written here. A single
+/// hardcoded table applied to the whole route billed every Kimi model at
+/// kimi-k3's price: kimi-k3 is 3/15/0.3 per million, but kimi-k2.7-code is
+/// 0.95/4/0.19, so a k2.7 turn was reported at roughly three times what it
+/// cost. `None` means the catalog does not price the model.
+pub fn kimi_cost_microusd(raw: &Value, model: &str) -> Option<u64> {
+    let price = crate::models_catalog::pricing(
+        models_dev_key(OpenAiCompatibleProfile::Kimi),
+        model,
+    )?;
     let input = raw
         .pointer("/usage/prompt_tokens")
         .and_then(Value::as_u64)
@@ -990,11 +1006,16 @@ pub fn kimi_cost_microusd(raw: &Value) -> u64 {
         .pointer("/usage/completion_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    input
-        .saturating_sub(cached)
-        .saturating_mul(3)
-        .saturating_add(cached.saturating_mul(3).div_ceil(10))
-        .saturating_add(output.saturating_mul(15))
+    // Rates are micro-USD per million tokens, so one token costs rate/1e6.
+    let bill = |tokens: u64, per_million: u64| -> u128 {
+        u128::from(tokens)
+            .saturating_mul(u128::from(per_million))
+            .div_ceil(1_000_000)
+    };
+    let total = bill(input.saturating_sub(cached), price.input)
+        .saturating_add(bill(cached, price.cached_input))
+        .saturating_add(bill(output, price.output));
+    u64::try_from(total).ok()
 }
 
 /// Declared context window for a local OpenAI-compatible server, set from the
@@ -2494,7 +2515,13 @@ mod tests {
     }
 
     #[test]
-    fn kimi_cost_accounts_for_cached_input_at_provider_list_price() {
+    fn kimi_cost_uses_each_models_own_list_price() {
+        crate::models_catalog::set_for_test(crate::models_catalog::parse(&serde_json::json!({
+            "moonshotai": { "models": {
+                "kimi-k3": { "cost": { "input": 3, "output": 15, "cache_read": 0.3 } },
+                "kimi-k2.7-code": { "cost": { "input": 0.95, "output": 4, "cache_read": 0.19 } },
+            } },
+        })));
         let raw = json!({
             "usage": {
                 "prompt_tokens": 1_000_000,
@@ -2502,7 +2529,15 @@ mod tests {
                 "completion_tokens": 100_000
             }
         });
-        assert_eq!(kimi_cost_microusd(&raw), 3_960_000);
+
+        // kimi-k3: 800k uncached at 3/M, 200k cached at 0.3/M, 100k out at 15/M.
+        assert_eq!(kimi_cost_microusd(&raw, "kimi-k3"), Some(3_960_000));
+        // The same turn on k2.7 is a third of that. A single hardcoded table
+        // billed it at the k3 rate, which is what this replaces.
+        let k27 = kimi_cost_microusd(&raw, "kimi-k2.7-code").expect("k2.7 price");
+        assert!(k27 < 1_500_000, "k2.7 billed at the k3 rate: {k27}");
+        // An unpriced model reports nothing rather than a guess.
+        assert_eq!(kimi_cost_microusd(&raw, "kimi-never-shipped"), None);
     }
 
     #[tokio::test(flavor = "current_thread")]

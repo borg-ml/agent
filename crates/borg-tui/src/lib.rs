@@ -2828,7 +2828,24 @@ fn effort_picker_options(
     }
     // Otherwise the vendor's own published capabilities, which also cover the
     // direct routes that have no gateway catalog at all.
-    borg_provider::models_catalog::effort_values(models_dev_provider(provider), model)
+    let published = borg_provider::models_catalog::effort_values(models_dev_provider(provider), model);
+    if !published.is_empty() {
+        return published;
+    }
+    // A model that publishes only a toggle has no ladder, and offering it one
+    // would be offering levels it refuses. But it does have a switch, and
+    // offering nothing at all left no way to turn reasoning off: the two
+    // options below are the only states the vendor distinguishes.
+    //
+    // `none` is the vendor's own word for off. The on state is Borg's default
+    // level rather than an invented rung, so switching later to a model with a
+    // ladder lands on a level that model actually has.
+    if borg_provider::models_catalog::facts(models_dev_provider(provider), model)
+        .is_some_and(|facts| facts.reasoning_toggle)
+    {
+        return vec!["medium".to_string(), "none".to_string()];
+    }
+    Vec::new()
 }
 
 /// The models.dev key for a route, or `""` when it publishes nothing.

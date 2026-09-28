@@ -1835,6 +1835,29 @@ fn model_and_effort_pickers_use_the_provider_catalog() {
     );
 }
 
+/// A Qwen model publishes a toggle and a token budget but no effort ladder.
+/// Offering it a ladder would offer levels it refuses; offering it nothing
+/// left no way to turn reasoning off at all. It gets exactly the two states
+/// the vendor distinguishes.
+#[test]
+fn a_toggle_only_model_offers_reasoning_on_or_off() {
+    borg_provider::models_catalog::set_for_test(
+        borg_provider::models_catalog::parse(&serde_json::json!({
+            "alibaba": { "models": { "qwen3.7-plus": { "reasoning_options": [
+                { "type": "toggle" },
+                { "type": "budget_tokens", "max": 81920 }
+            ] } } },
+        })),
+    );
+    let levels = effort_picker_options(Some(CodingProvider::Qwen), Some("qwen3.7-plus"));
+    assert_eq!(levels, ["medium", "none"]);
+
+    // A model with no reasoning control at all still gets nothing.
+    assert!(
+        effort_picker_options(Some(CodingProvider::Qwen), Some("qwen-never-shipped")).is_empty()
+    );
+}
+
 #[test]
 fn model_picker_openai_compatible_with_current_yields_current_not_placeholder() {
     let current_model = "qwen3.6:35b-a3b";
