@@ -11519,7 +11519,16 @@ fn borging_roll_selects_exactly_one_percent_of_uniform_run_ids() {
 #[test]
 fn splash_logo_randomizes_glitches_and_then_settles() {
     assert_eq!(splash_version(), format!("v{}", env!("CARGO_PKG_VERSION")));
-    assert_eq!(splash_channel_line().to_string(), "βεtα");
+    // Tracked like the logo above it, so the three splash lines share a width
+    // and therefore a centre. A line can only sit dead centre when its width
+    // has the same parity as the area it is centred in, so three different
+    // widths means one of them is always half a cell out.
+    assert_eq!(splash_channel_line().to_string(), "β ε τ α");
+    assert_eq!(
+        splash_channel_line().width(),
+        splash_logo_line(Duration::ZERO, 0).width(),
+        "the channel line and the logo must be the same width to centre together"
+    );
     assert_eq!(
         splash_logo_line(Duration::from_millis(1_320), 7).to_string(),
         "B O R G"

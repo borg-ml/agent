@@ -16617,26 +16617,45 @@ fn splash_logo_line(elapsed: Duration, seed: u64) -> Line<'static> {
         }
     }
     let colors = [Color::Cyan, Color::White, Color::Red, BORG_ORANGE];
-    let mut spans = Vec::with_capacity(4);
-    for (index, glyph) in cells.into_iter().enumerate() {
-        let mut cell = glyph.to_string();
-        if index < 3 {
-            cell.push_str(
-                &" ".repeat(2usize.saturating_sub(UnicodeWidthStr::width(cell.as_str()))),
-            );
-        }
-        spans.push(Span::styled(
-            cell,
-            Style::default()
-                .fg(if changed[index] {
-                    random = splitmix64(random);
-                    colors[(random % colors.len() as u64) as usize]
-                } else {
-                    BORG_ORANGE
-                })
-                .add_modifier(bold),
-        ));
-    }
+    let tracked = cells
+        .into_iter()
+        .enumerate()
+        .map(|(index, glyph)| {
+            let style = if changed[index] {
+                random = splitmix64(random);
+                colors[(random % colors.len() as u64) as usize]
+            } else {
+                BORG_ORANGE
+            };
+            (glyph, Style::default().fg(style).add_modifier(bold))
+        })
+        .collect();
+    tracked_line(tracked)
+}
+
+/// One glyph per two columns, except the last.
+///
+/// The padding is inside the line rather than around it, so every tracked word
+/// is exactly `2 * glyphs - 1` columns wide. That matters for centring: a line
+/// can only sit dead centre when its width has the same parity as the area it
+/// is centred in, and a splash whose three lines have three different widths
+/// cannot all agree - the even-width one lands half a cell off while the odd
+/// ones do not, which reads as the whole block being misaligned.
+fn tracked_line(cells: Vec<(char, Style)>) -> Line<'static> {
+    let last = cells.len().saturating_sub(1);
+    let spans = cells
+        .into_iter()
+        .enumerate()
+        .map(|(index, (glyph, style))| {
+            let mut cell = glyph.to_string();
+            if index < last {
+                cell.push_str(
+                    &" ".repeat(2usize.saturating_sub(UnicodeWidthStr::width(cell.as_str()))),
+                );
+            }
+            Span::styled(cell, style)
+        })
+        .collect::<Vec<Span<'static>>>();
     Line::from(spans)
 }
 
@@ -16648,7 +16667,12 @@ fn splash_logo_line(elapsed: Duration, seed: u64) -> Line<'static> {
 /// edit here would otherwise change what every user is told with nothing to
 /// notice the change.
 fn splash_channel_line() -> Line<'static> {
-    Line::from(Span::styled("βεtα", Style::default().fg(Color::White)))
+    tracked_line(
+        "βετα"
+            .chars()
+            .map(|glyph| (glyph, Style::default().fg(Color::White)))
+            .collect(),
+    )
 }
 
 fn splitmix64(mut value: u64) -> u64 {
