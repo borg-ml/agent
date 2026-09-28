@@ -19,6 +19,26 @@ Git comparison.
   undecodable bytes no longer costs you every match inside it.
 - Extension capabilities are advertised with descriptions read from the live
   catalog, so a newly loaded extension is visible without restarting anything.
+- Computer use is a tool of its own. It was always a full capability - native
+  desktop and private-display access, and the approval gate that refuses
+  consequential controls until you confirm that exact action - but a model had to
+  already know the name and invent a JSON body for it before it could take a
+  screenshot. A subagent still gets the private headless display rather than
+  yours: the spec is surface-aware, so promotion cannot widen a child's reach.
+
+### Performance
+
+- A fast reasoning model no longer makes the interface lag. Every frame was
+  re-rendering the whole expanded block, beginning with a fresh copy of every
+  byte of reasoning received so far, so a frame cost the length of the block and
+  a stream cost the square of it. At 800 lines that was 17.22ms a frame and
+  about seven seconds of CPU for one answer; it is now 0.27ms and 113ms, and a
+  frame through a real terminal measures 2.02ms with thousands of deltas
+  coalesced into it. The lines that have finished are reused, and the line still
+  being written is redone, because that is the only one that can still change.
+- `BORG_TUI_FPS` and `BORG_TUI_STREAMING_FPS` are documented. They existed and
+  were clamped, but appeared nowhere, so the one knob that changes how streamed
+  text feels could not be found.
 
 ### Reliability
 
@@ -51,6 +71,27 @@ Git comparison.
 - The effort and billing segments share one colour instead of being graded per
   value, so the same colour no longer means xhigh in one place and a pro/max
   subscription in another.
+- Dragging the scrollbar moves the transcript one line per row. A scrollbar maps
+  proportionally, so on a long thread one row of drag moved hundreds of lines and
+  the closer to the middle of the thumb you grabbed, the less each row was
+  worth. Clicking the track still jumps - that gesture means "go there" - and
+  only the drag changed.
+- The composer's text-entry ground is darker and neutral, so the three rows you
+  type in read as a well rather than another band of transcript.
+- The splash says what it is. It now reads "BORG" over "agent" over the version
+  with the channel beside it, and all three lines keep one width and one centre
+  whatever the version turns out to be - the `v` prefix yields to the width
+  rather than the layout bending around it.
+
+### Providers
+
+- Qwen models that take an effort ladder are sent one. `enable_thinking` is a
+  boolean and is right for Qwen3.5/3.6/3.7, but the Qwen3.8 family takes
+  `reasoning_effort` instead and converts a level into a thinking budget itself
+  - so a laddered model was being offered low/medium/high in the picker and then
+  having `enable_thinking` put in the body, and the effort had no effect on the
+  request. The choice is now made per model from the catalog entry that already
+  exists for it.
 
 ### Setup
 
