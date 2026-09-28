@@ -1723,51 +1723,46 @@ impl AgentToolDispatcher {
             })
     }
 
+    /// What a `capability` call resolves to. See [`classify_capability_call`].
+    fn classify_capability_call<'a>(
+        &self,
+        arguments: &'a Value,
+        specs: &[Value],
+    ) -> CapabilityInvocation<'a> {
+        classify_capability_call(arguments, specs)
+    }
+
     /// Invoke a capability the model has no dedicated tool for, or search the
     /// catalog when it does not know what exists.
-    ///
-    /// Two behaviours earn their place. A first-class name is refused with a
-    /// pointer to its own tool, because reaching it this way drops the schema
-    /// guidance that makes the call correct. An unknown name answers with the
-    /// closest real capabilities, because not knowing the inventory is the usual
-    /// reason for a miss and a flat "unknown" leaves the model where it started.
     async fn call_capability_by_name(
         &self,
         arguments: Value,
         workflow_cancel: Option<CancellationToken>,
     ) -> Result<Value> {
         let specs = self.mcp_specs(false);
-        if let Some(query) = arguments.get("search").and_then(Value::as_str) {
-            let limit = arguments.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-            return Ok(Value::Array(crate::capability_catalog::search(
-                &specs, query, limit,
-            )));
-        }
-        let Some(name) = arguments.get("name").and_then(Value::as_str) else {
-            bail!("`capability` needs either a `name` to invoke or a `search` to discover one");
-        };
-        if is_first_class_capability(name) {
-            bail!(
+        match self.classify_capability_call(&arguments, &specs) {
+            CapabilityInvocation::Search { query, limit } => Ok(Value::Array(
+                crate::capability_catalog::search(&specs, query, limit),
+            )),
+            CapabilityInvocation::MissingName => {
+                bail!("`capability` needs either a `name` to invoke or a `search` to discover one")
+            }
+            CapabilityInvocation::HasItsOwnTool(name) => bail!(
                 "`{name}` has its own tool - call it directly. Its schema carries the rules that \
                  make the call correct and this path would drop them."
-            );
+            ),
+            CapabilityInvocation::Unknown { name } => Err(anyhow::anyhow!(
+                crate::capability_catalog::corrective_error(
+                    &specs,
+                    name,
+                    "no such capability on this host",
+                )
+            )),
+            CapabilityInvocation::Forward { name, arguments } => {
+                self.call_with_workflow_control(name, arguments, true, workflow_cancel)
+                    .await
+            }
         }
-        if !specs
-            .iter()
-            .any(|spec| spec.get("name").and_then(Value::as_str) == Some(name))
-        {
-            return Err(anyhow::anyhow!(crate::capability_catalog::corrective_error(
-                &specs,
-                name,
-                "no such capability on this host",
-            )));
-        }
-        let forwarded = arguments
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        self.call_with_workflow_control(name, forwarded, true, workflow_cancel)
-            .await
     }
 
     async fn dispatch(
@@ -8550,20 +8545,113 @@ mod exec_args_tests {
         /// A first-class capability is only useful if the generic tool can see that
     /// it has one, and refuses to shadow it: the schema is what makes those
     /// calls correct.
-    #[test]
+        /// The generic tool is the only route to everything that is not first-class,
+    /// so the four ways it can be called each have to land somewhere sensible.
+    /// The rules are separated from execution precisely so this can be checked
+    /// without standing up a session.
+    #[tokio::test]
+    async fn a_capability_call_resolves_to_exactly_one_intent() {
+        let specs = agent_tool_specs_with_capabilities_and_consultation(
+            CodingProvider::Codex,
+            true,
+            false,
+            None,
+            false,
+            false,
+            false,
+        );
+
+        // A model that does not know what exists here asks.
+        let search = json!({ "search": "history" });
+        assert_eq!(
+            classify_capability_call(&search, &specs),
+            CapabilityInvocation::Search { query: "history", limit: 10 }
+        );
+        let search = json!({ "search": "history", "limit": 3 });
+        assert_eq!(
+            classify_capability_call(&search, &specs),
+            CapabilityInvocation::Search { query: "history", limit: 3 }
+        );
+        // A limit the model made up is clamped rather than trusted.
+        let search = json!({ "search": "history", "limit": 9999 });
+        assert_eq!(
+            classify_capability_call(&search, &specs),
+            CapabilityInvocation::Search { query: "history", limit: 50 }
+        );
+
+        // Neither a name nor a search is not interpretable.
+        let empty = json!({});
+        assert_eq!(
+            classify_capability_call(&empty, &specs),
+            CapabilityInvocation::MissingName
+        );
+
+        // A promoted name is refused rather than shadowed, and the caller says
+        // which tool to use instead.
+        let promoted = json!({ "name": "get_plan" });
+        assert_eq!(
+            classify_capability_call(&promoted, &specs),
+            CapabilityInvocation::HasItsOwnTool("get_plan")
+        );
+        let promoted = json!({ "name": "query_history" });
+        assert_eq!(
+            classify_capability_call(&promoted, &specs),
+            CapabilityInvocation::HasItsOwnTool("query_history")
+        );
+
+        // An unknown name is a miss to correct, not an error to shrug at.
+        let unknown = json!({ "name": "definitely_not_here" });
+        assert_eq!(
+            classify_capability_call(&unknown, &specs),
+            CapabilityInvocation::Unknown { name: "definitely_not_here" }
+        );
+
+        // An ordinary capability forwards, carrying its own arguments. This is
+        // the whole point of the tool, so it is checked against the real
+        // capability inventory rather than a stand-in.
+        let with_arguments = json!({ "name": "history_index", "arguments": { "limit": 5 } });
+        let forwarded = classify_capability_call(&with_arguments, &specs);
+        match forwarded {
+            CapabilityInvocation::Forward { name, arguments } => {
+                assert_eq!(name, "history_index");
+                assert_eq!(arguments, json!({ "limit": 5 }));
+            }
+            other => panic!("expected a forward, got {other:?}"),
+        }
+        // No arguments is a call with none, not a malformed one.
+        let bare = json!({ "name": "history_index" });
+        assert!(matches!(
+            classify_capability_call(&bare, &specs),
+            CapabilityInvocation::Forward { arguments, .. } if arguments == json!({})
+        ));
+    }
+
+#[test]
     fn first_class_capabilities_are_the_ones_with_schemas_of_their_own() {
-        let specs = capability_tool_specs();
-        let names: Vec<&str> = specs
+        let catalog = agent_tool_specs_with_capabilities_and_consultation(
+            CodingProvider::Codex,
+            true,
+            false,
+            None,
+            false,
+            false,
+            false,
+        );
+        let promoted = promoted_specs(&catalog);
+        let names: Vec<&str> = promoted
             .iter()
             .filter_map(|spec| spec.get("name").and_then(serde_json::Value::as_str))
             .collect();
-        for first_class in first_class_capability_tools() {
-            assert!(names.contains(&first_class), "{first_class} has no schema");
-            assert!(is_first_class_capability(first_class), "{first_class}");
+
+        // Every promoted name must be a real capability with its own schema, or
+        // the curated surface advertises a tool that does not exist.
+        for name in promoted_capability_tools() {
+            assert!(names.contains(&name), "{name} has no schema on this host");
+            assert!(is_promoted_capability(name), "{name}");
         }
         assert!(names.contains(&"capability"), "the escape hatch needs a schema");
-        assert!(!is_first_class_capability("query_history"));
-        assert!(!is_first_class_capability("capability"));
+        assert!(!is_promoted_capability("history_index"));
+        assert!(!is_promoted_capability("capability"));
         // A name may be claimed once only, or the model sees two schemas for it.
         let mut unique = names.clone();
         unique.sort_unstable();
@@ -9430,15 +9518,18 @@ pub(crate) fn exec_tool_spec() -> Value {
     )
 }
 
-/// Capabilities the model gets as their own tools.
+/// Capabilities promoted onto the curated surface as tools of their own.
 ///
-/// These are the ones whose *usage* is not self-evident from their arguments: a
-/// goal's lifecycle, a plan's item identity and status vocabulary, and the
-/// addressing rules for another agent. A schema can carry that; a name passed
-/// as a string cannot, because by then the guidance is gone. Everything else is
-/// reachable through `capability`, so this stays deliberately short - a schema is
-/// paid for on every turn.
-pub(crate) fn first_class_capability_tools() -> [&'static str; 8] {
+/// These are the ones whose *use* is not self-evident from their arguments: a
+/// goal's lifecycle, a plan's item identity and status vocabulary, the
+/// addressing rules for another agent, and which of history's several retrieval
+/// modes answers which question. A schema carries that; a name passed as a
+/// string cannot, because by then the guidance is gone.
+///
+/// The schemas are the catalog's own, taken by name rather than rewritten here.
+/// A second copy of a description is a second thing to forget to update, and
+/// these are descriptions the runtime already depends on.
+pub(crate) fn promoted_capability_tools() -> [&'static str; 9] {
     [
         "get_goal",
         "create_goal",
@@ -9448,121 +9539,38 @@ pub(crate) fn first_class_capability_tools() -> [&'static str; 8] {
         "list_agents",
         "send_message",
         "followup_task",
+        "query_history",
     ]
 }
 
-/// True when `name` already has a tool of its own.
+/// True when `name` is promoted onto the curated surface.
 ///
 /// The generic tool refuses these rather than duplicating them: reaching a
-/// first-class capability through `capability` would quietly drop the schema
+/// promoted capability through `capability` would quietly drop the schema
 /// guidance that makes the call correct.
-pub(crate) fn is_first_class_capability(name: &str) -> bool {
-    first_class_capability_tools().contains(&name)
+pub(crate) fn is_promoted_capability(name: &str) -> bool {
+    promoted_capability_tools().contains(&name)
+}
+
+/// The promoted capabilities' own specs, plus the escape hatch that reaches
+/// everything else. Sourced from the live catalog, so a newly configured
+/// capability appears here without a second list to keep in step.
+pub(crate) fn promoted_specs(specs: &[Value]) -> Vec<Value> {
+    let mut promoted: Vec<Value> = specs
+        .iter()
+        .filter(|spec| {
+            spec.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(is_promoted_capability)
+        })
+        .cloned()
+        .collect();
+    promoted.extend(capability_tool_specs());
+    promoted
 }
 
 pub(crate) fn capability_tool_specs() -> Vec<Value> {
     vec![
-        tool(
-            "get_goal",
-            "Read this session's goal and its status. Read it before planning substantial work: the goal is what the plan is measured against.",
-            json!({ "type": "object", "properties": {}, "additionalProperties": false }),
-        ),
-        tool(
-            "create_goal",
-            "Set the session's goal when none exists. A goal states the objective being pursued; a plan states the tasks.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "objective": { "type": "string", "minLength": 1 },
-                    "token_budget": { "type": "integer", "minimum": 1 }
-                },
-                "required": ["objective"],
-                "additionalProperties": false
-            }),
-        ),
-        tool(
-            "update_goal",
-            "Mark the goal complete or blocked.",
-            json!({
-                "type": "object",
-                "properties": { "status": { "type": "string", "enum": ["complete", "blocked"] } },
-                "required": ["status"],
-                "additionalProperties": false
-            }),
-        ),
-        tool(
-            "get_plan",
-            "Read the current plan. Item ids are required to update a plan, so read it before updating rather than inventing an id.",
-            json!({ "type": "object", "properties": {}, "additionalProperties": false }),
-        ),
-        tool(
-            "update_plan",
-            "Set the plan. Reuse an item's `id` to keep its identity; omit it only for a genuinely new item. Status is one of pending, in_progress, blocked, awaiting_review, completed, and at most one item per assignee may be in_progress. Content is limited to 500 characters.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "explanation": { "type": "string" },
-                    "plan": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": { "type": "string" },
-                                "content": { "type": "string", "minLength": 1, "maxLength": 500 },
-                                "status": {
-                                    "type": "string",
-                                    "enum": ["pending", "in_progress", "blocked", "awaiting_review", "completed"]
-                                }
-                            },
-                            "required": ["content", "status"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["plan"],
-                "additionalProperties": false
-            }),
-        ),
-        tool(
-            "list_agents",
-            "List agents in this workspace with their state. Discovery is not proof of liveness, project access or delivery: inspect and verify what you were told to rely on.",
-            json!({
-                "type": "object",
-                "properties": { "path_prefix": { "type": "string" } },
-                "additionalProperties": false
-            }),
-        ),
-        tool(
-            "send_message",
-            "Send a message to another agent or a participant. Address a peer as `participant:<id>`. Use this to notify; use followup_task when the agent must take a turn. Never ask a human to relay a message between agents.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string", "minLength": 1 },
-                    "message": { "type": "string", "minLength": 1 },
-                    "wake": { "type": "boolean" },
-                    "attachments": { "type": "array", "items": { "type": "string" } },
-                    "reply_to_message_id": { "type": "string" }
-                },
-                "required": ["target", "message"],
-                "additionalProperties": false
-            }),
-        ),
-        tool(
-            "followup_task",
-            "Give another agent a task and ask it to act. This starts a turn; use send_message when no turn is needed.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string", "minLength": 1 },
-                    "message": { "type": "string", "minLength": 1 },
-                    "attachments": { "type": "array", "items": { "type": "string" } },
-                    "reply_to_message_id": { "type": "string" }
-                },
-                "required": ["target", "message"],
-                "additionalProperties": false
-            }),
-        ),
         tool(
             "capability",
             "Invoke any other Borg, Blu, plugin, history, workflow or extension capability by name, including everything no other tool covers. Pass `search` instead of `name` to see what this host provides and what each one is for - a bare list of names is not enough to choose from, so search before guessing. A name that already has its own tool is refused here, with a pointer to that tool.",
@@ -9578,6 +9586,59 @@ pub(crate) fn capability_tool_specs() -> Vec<Value> {
             }),
         ),
     ]
+}
+
+/// Decide what a `capability` call is asking for, without touching a session.
+///
+/// Free-standing so the rules can be checked directly: refuse a name that has a
+/// tool of its own, clamp a limit the model invented, and treat an unknown name
+/// as a miss to correct rather than an error to shrug at.
+fn classify_capability_call<'a>(
+    arguments: &'a Value,
+    specs: &[Value],
+) -> CapabilityInvocation<'a> {
+    if let Some(query) = arguments.get("search").and_then(Value::as_str) {
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(10)
+            .clamp(1, 50) as usize;
+        return CapabilityInvocation::Search { query, limit };
+    }
+    let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+        return CapabilityInvocation::MissingName;
+    };
+    if is_promoted_capability(name) {
+        return CapabilityInvocation::HasItsOwnTool(name);
+    }
+    let known = specs
+        .iter()
+        .any(|spec| spec.get("name").and_then(Value::as_str) == Some(name));
+    if !known {
+        return CapabilityInvocation::Unknown { name };
+    }
+    CapabilityInvocation::Forward {
+        name,
+        arguments: arguments
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    }
+}
+
+/// What a `capability` call turns into.
+#[derive(Debug, PartialEq)]
+enum CapabilityInvocation<'a> {
+    /// The model does not know what exists here, and asked.
+    Search { query: &'a str, limit: usize },
+    /// Neither a name nor a search, so the call cannot be interpreted.
+    MissingName,
+    /// The name has a tool of its own, and this path would drop its guidance.
+    HasItsOwnTool(&'a str),
+    /// Nothing on this host answers to that name.
+    Unknown { name: &'a str },
+    /// An ordinary capability, with its own arguments.
+    Forward { name: &'a str, arguments: Value },
 }
 
 pub(crate) fn file_mutation_tool_specs() -> Vec<Value> {

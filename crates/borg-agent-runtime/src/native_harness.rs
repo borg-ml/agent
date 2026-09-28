@@ -2746,11 +2746,28 @@ impl NativeToolRuntime {
 
     fn tool_definitions(&self) -> Result<Vec<ModelToolDefinition>> {
         let mut definitions = match self.harness {
-            HarnessMode::Borg => vec![
-                exec_tool_definition()?,
-                ModelToolDefinition::from_mcp_spec(&crate::subagents::runtime_exec_spec())
+            // The curated surface is the default, so a model on defaults gets
+            // these too: the promoted capabilities it is expected to reach for,
+            // and one tool that reaches everything else. Without them the only
+            // route out is the shell, and the shell is how a model spends turns
+            // rediscovering what the catalog already knows.
+            HarnessMode::Borg => {
+                let mut definitions = vec![exec_tool_definition()?];
+                definitions.extend(
+                    crate::subagents::promoted_specs(&self.agent_tools.mcp_specs(false))
+                        .iter()
+                        .map(ModelToolDefinition::from_mcp_spec)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(anyhow::Error::msg)?,
+                );
+                definitions.push(
+                    ModelToolDefinition::from_mcp_spec(
+                        &crate::subagents::runtime_exec_spec(),
+                    )
                     .map_err(anyhow::Error::msg)?,
-            ],
+                );
+                definitions
+            }
             HarnessMode::Native => self.native_tool_catalog()?,
         };
         for definition in &mut definitions {
@@ -4768,9 +4785,9 @@ const CAPABILITY_LISTING_BUDGET_CHARS: usize = 8_000;
 
 fn builtin_tool_specs() -> Vec<Value> {
     let mut specs = crate::subagents::file_mutation_tool_specs();
-    // The capabilities a model is expected to reach often, plus the escape hatch
-    // for everything else. Listed first so the schema it reads leads with what
-    // it can do rather than with how to run a command.
+    // The escape hatch onto everything without a tool of its own. The promoted
+    // capabilities are not listed here: they are taken from the live catalog by
+    // name, so there is one description of each rather than two.
     specs.extend(crate::subagents::capability_tool_specs());
     specs.extend([
         tool(
