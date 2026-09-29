@@ -27,6 +27,9 @@ const API_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 /// Issued on a turn's first response and replayed for the rest of the turn.
 const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const MODELS_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/models";
+const CODEX_VERSION_ENDPOINT: &str = "https://registry.npmjs.org/@openai/codex/latest";
+const CATALOG_CLIENT_VERSION_FALLBACK: &str = "0.159.0";
+const CATALOG_CACHE_TTL: Duration = Duration::from_secs(300);
 const MAX_STREAM_BYTES: usize = 128 * 1024 * 1024;
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -177,6 +180,7 @@ impl ModelCapabilities {
 
 struct CachedModels {
     account: String,
+    client_version: String,
     fetched: Instant,
     models: Vec<ModelCapabilities>,
 }
@@ -189,6 +193,85 @@ struct SubscriptionAccess {
     /// this same file, so a controller-restored per-session bundle rotates in
     /// place instead of falling back to the host-local selection.
     auth_file: Option<std::path::PathBuf>,
+}
+
+// Public stable-release metadata keeps new subscription models visible without
+// depending on an installed Codex runtime. No credentials accompany this GET.
+async fn catalog_client_version(client: &reqwest::Client) -> String {
+    static CACHE: OnceLock<tokio::sync::Mutex<Option<(Instant, String)>>> = OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(|| tokio::sync::Mutex::new(None))
+        .lock()
+        .await;
+    if let Some((checked, version)) = cache.as_ref()
+        && checked.elapsed() < CATALOG_CACHE_TTL
+    {
+        return version.clone();
+    }
+    let previous = cache
+        .as_ref()
+        .map(|(_, version)| version.as_str())
+        .unwrap_or(CATALOG_CLIENT_VERSION_FALLBACK);
+    let version = match fetch_catalog_client_version(client, CODEX_VERSION_ENDPOINT).await {
+        Ok(version) if stable_version(&version) >= stable_version(previous) => version,
+        Ok(_) => previous.to_owned(),
+        Err(error) => {
+            tracing::warn!(%error, "Codex version metadata unavailable; retaining compatible catalog version");
+            previous.to_owned()
+        }
+    };
+    *cache = Some((Instant::now(), version.clone()));
+    version
+}
+
+fn stable_version(version: &str) -> Option<[u32; 3]> {
+    if !version
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+    let mut parts = version.split('.').map(|part| {
+        if part.len() > 1 && part.starts_with('0') {
+            None
+        } else {
+            part.parse().ok()
+        }
+    });
+    let parsed: [u32; 3] = [parts.next()??, parts.next()??, parts.next()??];
+    parts.next().is_none().then_some(parsed)
+}
+
+async fn fetch_catalog_client_version(client: &reqwest::Client, endpoint: &str) -> Result<String> {
+    let response = client
+        .get(endpoint)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await?
+        .error_for_status()?;
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        ensure!(
+            bytes.len().saturating_add(chunk.len()) <= 64 * 1024,
+            "Codex release metadata exceeds size limit"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    let metadata: Value = serde_json::from_slice(&bytes)?;
+    ensure!(
+        metadata["name"] == "@openai/codex",
+        "unexpected Codex release package"
+    );
+    let version = metadata["version"]
+        .as_str()
+        .context("Codex release omitted version")?;
+    ensure!(
+        stable_version(version).is_some(),
+        "Codex release is not a stable numeric version"
+    );
+    Ok(version.to_owned())
 }
 
 impl SubscriptionAccess {
@@ -269,6 +352,7 @@ impl SubscriptionAccess {
         client: &reqwest::Client,
         model: &str,
     ) -> Result<ModelCapabilities> {
+        let version = catalog_client_version(client).await;
         static CACHE: OnceLock<tokio::sync::Mutex<Option<CachedModels>>> = OnceLock::new();
         let mut cache = CACHE
             .get_or_init(|| tokio::sync::Mutex::new(None))
@@ -276,18 +360,19 @@ impl SubscriptionAccess {
             .await;
         let account = self.identity();
         if !cache.as_ref().is_some_and(|entry| {
-            entry.account == account && entry.fetched.elapsed() < Duration::from_secs(300)
+            entry.account == account
+                && entry.client_version == version
+                && entry.fetched.elapsed() < CATALOG_CACHE_TTL
         }) {
             // The catalog gates model visibility on its client protocol version, not Borg releases.
             // Keep Borg identified by originator; no installed executable is needed.
-            let version = "0.156.1";
             let rejected_token = self.token.clone();
             let auth_file = self.auth_file.clone();
             let response = self
                 .send_with_recovery(
                     client
                         .get(MODELS_ENDPOINT)
-                        .query(&[("client_version", version)])
+                        .query(&[("client_version", version.as_str())])
                         .header("originator", "borg")
                         .timeout(Duration::from_secs(30)),
                     &account,
@@ -313,6 +398,7 @@ impl SubscriptionAccess {
                 serde_json::from_slice(&bytes).context("invalid Codex model catalog")?;
             *cache = Some(CachedModels {
                 account,
+                client_version: version,
                 fetched: Instant::now(),
                 models: catalog.models,
             });
@@ -2270,6 +2356,60 @@ mod tests {
             if id == "next-call" && action == "read")
         );
         assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn catalog_version_discovery_accepts_stable_metadata_and_rejects_invalid_responses() {
+        for (body, expected) in [
+            (
+                json!({"name":"@openai/codex","version":"0.160.0"}).to_string(),
+                Some("0.160.0"),
+            ),
+            (
+                json!({"name":"other-package","version":"0.160.0"}).to_string(),
+                None,
+            ),
+            (
+                json!({"name":"@openai/codex","version":"0.160.0-beta.1"}).to_string(),
+                None,
+            ),
+            (
+                json!({"name":"@openai/codex","version":"0.0160.0"}).to_string(),
+                None,
+            ),
+            (
+                json!({"name":"@openai/codex","version":"+0.160.0"}).to_string(),
+                None,
+            ),
+            ("x".repeat(64 * 1024 + 1), None),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/latest", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut chunk = [0; 1024];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                assert!(
+                    !String::from_utf8_lossy(&request)
+                        .to_ascii_lowercase()
+                        .contains("authorization:")
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                // Oversized bodies may be refused before the write completes.
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+            let result = fetch_catalog_client_version(&reqwest::Client::new(), &endpoint).await;
+            assert_eq!(result.ok().as_deref(), expected);
+            server.await.unwrap();
+        }
     }
 
     #[test]

@@ -331,8 +331,13 @@ and restart usage events. This does not yet establish rate-limit reporting.
 
 The model adapter reads context limits and supported effort levels directly
 from the subscription model catalog before sending conversation content. The
-endpoint requires the access adapter's client version. Only the small metadata
-subset is retained, cached in memory for five minutes and scoped to the account;
+endpoint requires a current Codex client protocol version, independent of Borg's
+release version. Borg refreshes the stable `@openai/codex` release metadata from
+the public npm registry every five minutes (no credentials sent), with a
+three-second timeout and a bounded response. Failed or older metadata retains
+the last valid version within the process; offline startup uses the known-compatible bundled
+fallback. A version change invalidates the account's model catalog cache.
+Only the small metadata subset is retained, cached in memory for five minutes and scoped to the account;
 provider agent instructions and tool policies are not imported. Missing/invalid
 context limits and unavailable model/effort selections fail explicitly. Catalog
 authentication recovery checks account continuity just like model requests.

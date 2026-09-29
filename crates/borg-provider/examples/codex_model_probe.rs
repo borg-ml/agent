@@ -33,8 +33,17 @@ async fn probe() -> Result<()> {
     }
     let fast = std::env::args().any(|arg| arg == "--fast");
     let account = CodexModelProvider::account_identity().await?;
+    ensure!(
+        account.starts_with("sha256:"),
+        "probe requires a subscription account"
+    );
+    let model = std::env::args()
+        .find_map(|arg| arg.strip_prefix("--model=").map(str::to_owned))
+        .unwrap_or_else(|| borg_provider::runtime::codex_product_model().into());
+    ensure!(!model.is_empty(), "probe model cannot be empty");
+    println!("Selected subscription model: {model}");
     let provider = CodexModelProvider {
-        model: borg_provider::runtime::codex_product_model().into(),
+        model,
         effort: borg_provider::runtime::codex_default_effort().into(),
     };
     let session = uuid::Uuid::new_v4().to_string();
