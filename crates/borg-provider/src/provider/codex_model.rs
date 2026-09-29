@@ -1479,43 +1479,64 @@ fn structured_error_detail(message: Option<&str>) -> Option<String> {
     if message.is_empty() {
         return None;
     }
-    let mut out = String::with_capacity(MAX);
+    // Only a message that names a field is reported. Any other provider
+    // message can be the sensitive part: a rate-limit refusal reads
+    // "private-account private-token", and quoting it back is exactly what
+    // refusing to copy the message was for. A shape error is the one case
+    // where the text describes the request's structure rather than its
+    // contents, and the one case that is diagnosable.
+    let leading = message
+        .split('\'')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches(':')
+        .trim();
+    let mut paths = Vec::new();
     let mut quoted = false;
     let mut span = String::new();
     for character in message.chars() {
         match character {
             '\'' => {
-                if !quoted || looks_like_field_path(&span) {
-                    out.push_str(&span);
+                if quoted && looks_like_field_path(&span) {
+                    paths.push(span.clone());
                 }
                 span.clear();
                 quoted = !quoted;
             }
             _ if quoted => span.push(character),
-            _ => out.push(character),
-        }
-        if out.chars().count() >= MAX {
-            break;
+            _ => {}
         }
     }
-    if !quoted || looks_like_field_path(&span) {
-        out.push_str(&span);
+    if quoted && looks_like_field_path(&span) {
+        paths.push(span);
     }
-    let detail = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    let detail = detail.trim().trim_end_matches(',').to_string();
-    (!detail.is_empty() && detail.chars().any(char::is_alphanumeric)).then_some(detail)
+    if paths.is_empty() {
+        return None;
+    }
+    let mut detail = leading.to_string();
+    for path in paths {
+        if !detail.is_empty() {
+            detail.push(' ');
+        }
+        detail.push_str(&path);
+    }
+    Some(detail.chars().take(MAX).collect())
 }
 
 /// A quoted span that names a field, rather than one that quotes a value.
 ///
-/// OpenAI writes the diagnostic path in quotes: `at 'input[3].content[0].type'`.
+/// OpenAI writes the diagnostic path in quotes: at 'input[3].content[0].type'.
 /// That is the whole reason to report the message, and dropping it -- treating
-/// every quoted span as user content -- left `code` and `param` as the only
+/// every quoted span as user content -- left code and param as the only
 /// evidence, which is what the message was added to end. A path is an
-/// identifier: no spaces, and either indexed or dotted.
+/// identifier: letters, digits, underscores, and the index and key separators,
+/// and nothing else. A value that merely contains a dot is not a path.
 fn looks_like_field_path(span: &str) -> bool {
     !span.is_empty()
-        && !span.contains(char::is_whitespace)
+        && span
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '[' | ']'))
         && (span.contains('[') || span.contains('.'))
 }
 
@@ -1548,18 +1569,33 @@ mod structured_error_detail_tests {
     /// message with no quotes at all is kept: it cannot be quoting the
     /// user's text back, and it is the only evidence there is.
     #[test]
-    fn only_a_bare_quoted_value_is_dropped() {
+    fn only_a_message_naming_a_field_is_reported() {
+        // No field named: nothing to diagnose, and the text is exactly the
+        // part that may carry account or user detail.
         assert_eq!(
             structured_error_detail(Some("Invalid value: 'secret'.")),
+            None
+        );
+        assert_eq!(
+            structured_error_detail(Some("The model is overloaded.")),
             None,
-            "a value on its own is not a diagnosis"
+            "an unremarkable message is not worth re-quoting"
         );
         assert_eq!(structured_error_detail(Some("   ")), None);
         assert_eq!(structured_error_detail(None), None);
-        assert_eq!(
-            structured_error_detail(Some("The model is overloaded.")).as_deref(),
-            Some("The model is overloaded.")
-        );
+    }
+
+    /// A value that merely contains a dot is still a value. The first cut of
+    /// the field-path rule used a bare dot or bracket as the test, which let
+    /// exactly that through.
+    #[test]
+    fn a_dotted_value_is_still_redacted() {
+        let detail = structured_error_detail(Some(
+            "Invalid value: 'private-token' at 'input[0].content'.",
+        ))
+        .expect("a path is present");
+        assert!(detail.contains("input[0].content"), "{detail}");
+        assert!(!detail.contains("private-token"), "{detail}");
     }
 }
 
