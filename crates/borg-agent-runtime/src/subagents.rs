@@ -2765,11 +2765,27 @@ impl AgentToolDispatcher {
             (None, Some(limits)) => Some(limits.max_runtime_execution_ms),
             (requested, None) => requested,
         };
-        Ok(serde_json::to_value(
-            runtime_worker
-                .execute_as(runtime, &args.code, timeout_ms, host, Some(cancellation))
-                .await?,
-        )?)
+        let execution_cancel = cancellation.clone();
+        let execution = async move {
+            Ok(serde_json::to_value(
+                runtime_worker
+                    .execute_as(runtime, &args.code, timeout_ms, host, Some(cancellation))
+                    .await?,
+            )?)
+        };
+        match &self.watches {
+            Some(watches) => {
+                watches
+                    .run_runtime(
+                        runtime,
+                        execution,
+                        execution_cancel,
+                        Duration::from_secs(60),
+                    )
+                    .await
+            }
+            None => execution.await,
+        }
     }
 }
 
@@ -9332,7 +9348,7 @@ fn harness_tool_spec() -> Value {
 pub(crate) fn runtime_exec_spec() -> Value {
     tool(
         "runtime_exec",
-        "Run code in the session's persistent Python (or Bun JavaScript/TypeScript) runtime: variables, imports, helpers and parsed data survive across calls and turns. `borg` is preloaded: every Borg capability as a call (`borg.send_message(...)`, `borg.tools(\"query\")` to find one), plus `borg.checkpoint(key, state)` / `borg.restore(key)` for durable state, `borg.exec`, `borg.read`, `borg.rlm` subagents and `borg.harness` for evidence-backed refinements of your own prompts, memory and skills with rollback. Trusted user-authority execution, not a sandbox.",
+        "Run code in the session's persistent Python (or Bun JavaScript/TypeScript) runtime: variables, imports, helpers and parsed data survive across calls and turns. `borg` is preloaded: every Borg capability as a call (`borg.send_message(...)`, `borg.tools(\"query\")` to find one), plus `borg.checkpoint(key, state)` / `borg.restore(key)` for durable state, `borg.exec`, `borg.read`, `borg.rlm` subagents and `borg.harness` for evidence-backed refinements of your own prompts, memory and skills with rollback. Trusted user-authority execution, not a sandbox. After 60 seconds the call returns a background watch_id without cancelling execution. Completion notifies the session; retrieve output/error through list_watchers, wait with await_watchers, or cancel with stop_watcher. Do not repeat backgrounded code.",
         json!({
             "type": "object",
             "properties": {

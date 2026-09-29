@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.13.1)
 
+### Runtime responsiveness
+
+- Python and Bun actions still running after 60 seconds continue as background
+  watchers. Completion wakes the session; `list_watchers` retrieves the result
+  and `stop_watcher` cancels execution.
+
 ### Models and reasoning
 
 - New GPT sessions default to `gpt-6.1-sol` at medium reasoning effort.

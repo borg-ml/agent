@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -127,6 +128,8 @@ pub(crate) struct WatchInfo {
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub last_event_at: Option<chrono::DateTime<chrono::Utc>>,
     pub event_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
 }
 
 impl From<WatchInfo> for crate::WatchSummary {
@@ -170,6 +173,7 @@ struct WatchEntry {
     stopped: CancellationToken,
     /// `Some` watches child agents, `None` watches a command.
     agent: Option<AgentSubjects>,
+    runtime: bool,
 }
 
 #[derive(Clone)]
@@ -359,6 +363,99 @@ impl Watches {
         self.list().await.into_iter().map(Into::into).collect()
     }
 
+    pub async fn run_runtime(
+        &self,
+        runtime: &str,
+        execution: impl std::future::Future<Output = Result<Value>> + Send + 'static,
+        execution_cancel: CancellationToken,
+        foreground: Duration,
+    ) -> Result<Value> {
+        ensure!(!self.cancel.is_cancelled(), "session watchers have stopped");
+        let started_at = chrono::Utc::now();
+        let mut execution = Box::pin(execution);
+        if let Ok(result) = tokio::time::timeout(foreground, &mut execution).await {
+            return result;
+        }
+        let mut entries = self.entries.lock().await;
+        if self.cancel.is_cancelled()
+            || entries.values().filter(|entry| entry.info.running).count() >= MAX_WATCHES
+        {
+            execution_cancel.cancel();
+            drop(entries);
+            let _ = execution.await;
+            bail!(
+                "runtime could not background: session watchers stopped or watcher limit reached"
+            );
+        }
+        entries.retain(|_, entry| entry.info.running || entry.runtime);
+        let mut completed: Vec<_> = entries
+            .values()
+            .filter(|entry| entry.runtime && !entry.info.running)
+            .map(|entry| (entry.info.started_at, entry.info.watch_id))
+            .collect();
+        completed.sort_unstable();
+        for (_, id) in completed
+            .iter()
+            .take(completed.len().saturating_sub(MAX_WATCHES - 1))
+        {
+            entries.remove(id);
+        }
+        let info = WatchInfo {
+            watch_id: Uuid::new_v4(),
+            label: format!("{runtime} runtime"),
+            command: format!("runtime_exec ({runtime})"),
+            running: true,
+            started_at,
+            last_event_at: None,
+            event_count: 0,
+            result: None,
+        };
+        let cancel = self.cancel.child_token();
+        let stopped = CancellationToken::new();
+        entries.insert(
+            info.watch_id,
+            WatchEntry {
+                info: info.clone(),
+                cancel: cancel.clone(),
+                stopped: stopped.clone(),
+                agent: None,
+                runtime: true,
+            },
+        );
+        drop(entries);
+        self.changed.notify_one();
+        let watches = self.clone();
+        let watch_id = info.watch_id;
+        tokio::spawn(async move {
+            let outcome = tokio::select! {
+                result = &mut execution => result,
+                _ = cancel.cancelled() => {
+                    execution_cancel.cancel();
+                    execution.await
+                }
+            };
+            let result = match outcome {
+                Ok(value) => json!({"ok": true, "output": value}),
+                Err(error) => json!({"ok": false, "error": error.to_string()}),
+            };
+            if let Some(entry) = watches.entries.lock().await.get_mut(&watch_id) {
+                entry.info.running = false;
+                entry.info.result = Some(result);
+                entry.info.last_event_at = Some(chrono::Utc::now());
+                entry.info.event_count += 1;
+            }
+            stopped.cancel();
+            watches.changed.notify_one();
+            let _ = watches.events.send(format!(
+                "Watcher event: runtime ({watch_id}) finished. Retrieve its result with list_watchers."
+            )).await;
+        });
+        Ok(json!({
+            "running": true, "background": true, "watch_id": watch_id,
+            "message": "Runtime continues in the background. Use list_watchers to retrieve its result, await_watchers to wait, or stop_watcher to cancel. Do not repeat the code."
+        }))
+    }
+
     pub async fn start(
         &self,
         session_id: Uuid,
@@ -393,7 +490,7 @@ impl Watches {
             entries.values().filter(|entry| entry.info.running).count() < MAX_WATCHES,
             "at most {MAX_WATCHES} watchers can run; stop one first"
         );
-        entries.retain(|_, entry| entry.info.running);
+        entries.retain(|_, entry| entry.info.running || entry.runtime);
         let updates = self.processes.subscribe_output();
         let cancel = self.cancel.child_token();
         let stopped = CancellationToken::new();
@@ -420,6 +517,7 @@ impl Watches {
             started_at: chrono::Utc::now(),
             last_event_at: None,
             event_count: 0,
+            result: None,
         };
         entries.insert(
             info.watch_id,
@@ -428,6 +526,7 @@ impl Watches {
                 cancel: cancel.clone(),
                 stopped: stopped.clone(),
                 agent: None,
+                runtime: false,
             },
         );
         let terminal_snapshot = (!snapshot.running).then_some(snapshot);
@@ -495,7 +594,7 @@ impl Watches {
             entries.values().filter(|entry| entry.info.running).count() < MAX_WATCHES,
             "at most {MAX_WATCHES} watchers can run; stop one first"
         );
-        entries.retain(|_, entry| entry.info.running);
+        entries.retain(|_, entry| entry.info.running || entry.runtime);
         let info = WatchInfo {
             watch_id: Uuid::new_v4(),
             label: args.label,
@@ -504,6 +603,7 @@ impl Watches {
             started_at: chrono::Utc::now(),
             last_event_at: None,
             event_count: 0,
+            result: None,
         };
         // No background task reports this watch's end, so its stop token starts
         // cancelled and `stop` returns without waiting for one.
@@ -516,6 +616,7 @@ impl Watches {
                 cancel: self.cancel.child_token(),
                 stopped,
                 agent: Some(subjects),
+                runtime: false,
             },
         );
         drop(entries);
@@ -609,7 +710,7 @@ impl Watches {
             .get_mut(&watch_id)
             .context("watcher not found in this session")?;
         entry.cancel.cancel();
-        let command_running = entry.agent.is_none() && entry.info.running;
+        let command_running = entry.agent.is_none() && !entry.runtime && entry.info.running;
         let stopped = entry.stopped.clone();
         let mut info = entry.info.clone();
         drop(entries);
@@ -771,6 +872,139 @@ fn agent_event_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn runtime_background_preserves_result_namespace_and_can_be_stopped() {
+        use crate::persistent_runtime::{PersistentRuntimeRegistry, RuntimeHost};
+        struct Host;
+        #[async_trait::async_trait]
+        impl RuntimeHost for Host {
+            async fn call(&self, _: &str, _: Value) -> Result<Value> {
+                bail!("unexpected host call")
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let worker = PersistentRuntimeRegistry::default()
+            .python_for_session(session_id, root.path(), None)
+            .await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let watches = Watches::new(ProcessManager::default(), tx, session_id);
+        let immediate = watches
+            .run_runtime(
+                "python",
+                async { Ok(json!(7)) },
+                CancellationToken::new(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(immediate, 7);
+        assert!(watches.list().await.is_empty());
+        let cancel = CancellationToken::new();
+        let runtime = worker.clone();
+        let token = cancel.clone();
+        let background = watches
+            .run_runtime(
+                "python",
+                async move {
+                    Ok(serde_json::to_value(
+                        runtime
+                            .execute_as(
+                                "python",
+                                "import time; time.sleep(0.1); answer = 42\nanswer",
+                                None,
+                                Arc::new(Host),
+                                Some(token),
+                            )
+                            .await?,
+                    )?)
+                },
+                cancel,
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(background["background"], true);
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let entries = watches.list().await;
+        assert!(!entries[0].running);
+        assert_eq!(entries[0].result.as_ref().unwrap()["output"]["value"], 42);
+        assert_eq!(
+            worker
+                .execute("answer + 1", None, Arc::new(Host))
+                .await
+                .unwrap()
+                .value,
+            43
+        );
+
+        let command = watches
+            .start(
+                session_id,
+                root.path(),
+                WatchArgs {
+                    command: "echo done".into(),
+                    label: "unrelated command".into(),
+                    ..Default::default()
+                },
+                None,
+                5000,
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        watches.stop(command.watch_id).await.unwrap();
+        assert!(
+            watches
+                .list()
+                .await
+                .iter()
+                .any(|entry| entry.result.is_some())
+        );
+        let cancel = CancellationToken::new();
+        let runtime = worker.clone();
+        let token = cancel.clone();
+        let background = watches
+            .run_runtime(
+                "python",
+                async move {
+                    Ok(serde_json::to_value(
+                        runtime
+                            .execute_as(
+                                "python",
+                                "time.sleep(30)",
+                                None,
+                                Arc::new(Host),
+                                Some(token),
+                            )
+                            .await?,
+                    )?)
+                },
+                cancel.clone(),
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap();
+        let id = serde_json::from_value(background["watch_id"].clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), watches.stop(id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cancel.is_cancelled());
+        let entry = watches
+            .list()
+            .await
+            .into_iter()
+            .find(|entry| entry.watch_id == id)
+            .unwrap();
+        assert!(!entry.running);
+        assert_eq!(entry.result.unwrap()["ok"], false);
+        worker.stop().await;
+    }
 
     #[tokio::test]
     async fn matched_notifications_preserve_capture_and_suppress_warmup() {
