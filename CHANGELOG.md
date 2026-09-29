@@ -5,6 +5,29 @@ Git comparison.
 
 ## Unreleased (since 0.13.0)
 
+### Terminal UI
+
+- Ctrl/Cmd+1-9/0 opens a status menu you can actually drive. Focus reached the
+  control, but the arrow keys fell through to the composer, which recalled chat
+  history or scrolled the transcript behind a menu that was still open. The
+  arrows were given back whenever the focused control was no longer drawn -- so
+  it broke most on the subagents roster, which disappears from the status line
+  the moment its last agent stops -- and on the first Up, before the menu had
+  been laid out. Up and Down now belong to an open menu, and scroll the
+  transcript only when none is.
+- An action group held open by a running action stays open once that action
+  finishes. It folded the instant the work stopped, taking the finished run
+  with it at the moment you were waiting on it. A group now ends when a new
+  message ends it, not when the last running action stops.
+
+### Reliability
+
+- A turn that stops responding is cancelled instead of running forever. Once a
+  model has shown reasoning and then produces nothing at all, the stream is
+  dead rather than the model thinking, but the turn stayed open with no way out.
+  Three minutes of silence ends it and says so. A turn that keeps making
+  progress is never cut off, and a model that works silently is left alone.
+
 ## 0.13.0 (2026-09-29)
 
 ### Tools
@@ -82,7 +105,8 @@ Git comparison.
 
 - An action group that live work was holding open now folds when that work
   finishes. A group held open by a running process never collapsed, because
-  being the newest group kept it open on its own.
+  being the newest group kept it open on its own. Reverted in Unreleased: the
+  fold hid the finished run, and a group now ends when a new message ends it.
 - Pending input reads as an action group rather than a bordered panel: the
   same disclosure, the same summary, the same grey, no frame.
 - A retry no longer re-announces the goal. Every retry re-emits it, and the
