@@ -1443,7 +1443,9 @@ impl ResponseState {
             "response.failed" | "response.incomplete" | "error" => {
                 let error = event
                     .pointer("/response/error")
-                    .or_else(|| event.get("error"));
+                    .filter(|error| error.is_object())
+                    .or_else(|| event.get("error").filter(|error| error.is_object()))
+                    .or_else(|| (event["type"] == "error").then_some(event));
                 let code = error.and_then(|error| error["code"].as_str());
                 let retryable = matches!(
                     code,
@@ -2522,7 +2524,12 @@ mod tests {
     #[tokio::test]
     async fn terminal_retries_discard_partial_tools_and_stop_on_permanent_failures() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for code in ["server_error", "invalid_value"] {
+        for (code, top_level) in [
+            ("server_error", false),
+            ("server_error", true),
+            ("invalid_value", false),
+            ("invalid_value", true),
+        ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
             let retry = code == "server_error";
@@ -2565,8 +2572,13 @@ mod tests {
                             json!({"type":"response.output_item.added", "item":{
                             "type":"function_call", "id":"discard-item", "call_id":"discard-call",
                             "name":"inspect", "arguments":"{}"}}),
-                            json!({"type":"response.failed", "response":{"error":{
-                                "code":code, "message":"private-token private-account"}}}),
+                            if top_level {
+                                json!({"type":"error", "code":code, "param":"model",
+                                    "message":"private-token private-account"})
+                            } else {
+                                json!({"type":"response.failed", "response":{"error":{
+                                    "code":code, "message":"private-token private-account"}}})
+                            },
                         ]
                     } else {
                         vec![
