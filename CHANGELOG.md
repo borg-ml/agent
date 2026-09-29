@@ -5,7 +5,7 @@ Git comparison.
 
 ## Unreleased (since 0.13.0)
 
-## 0.13.0 (2026-09-28)
+## 0.13.0 (2026-09-29)
 
 ### Tools
 
@@ -44,6 +44,18 @@ Git comparison.
 
 ### Reliability
 
+- A compaction that loses its connection is retried instead of failing your turn.
+  One empty upstream response on one fold used to abort the whole sequence and
+  fail the turn, costing you the context it was there to save. Retries are
+  bounded, and a refusal no repeat can fix -- auth, billing, quota, an
+  oversized request -- still fails on the first attempt with its real cause.
+- A provider error now names the field it rejected. Only the code and the
+  parameter were reported, which say that something is wrong and never what;
+  a malformed request was undiagnosable from outside. The provider's own
+  wording comes through with the rejected value stripped.
+
+### Reliability
+
 - A history search on a resumed or forked session can no longer report "no
   matches" while having looked at almost none of the history. Those sessions were
   scanned oldest-first under a hard budget, so on a long thread only the oldest
@@ -68,6 +80,17 @@ Git comparison.
 
 ### Terminal UI
 
+- An action group that live work was holding open now folds when that work
+  finishes. A group held open by a running process never collapsed, because
+  being the newest group kept it open on its own.
+- Pending input reads as an action group rather than a bordered panel: the
+  same disclosure, the same summary, the same grey, no frame.
+- A retry no longer re-announces the goal. Every retry re-emits it, and the
+  card was taken out and pushed back, so resuming dropped it to the bottom of
+  the transcript and reprinted a goal already on screen.
+
+### Terminal UI
+
 - A status line that overflows now ends in a mark. Losing its last column to
   truncation used to drop the tail with nothing to show the text had been cut.
 - The effort and billing segments share one colour instead of being graded per
@@ -84,6 +107,17 @@ Git comparison.
   with the channel beside it, and all three lines keep one width and one centre
   whatever the version turns out to be - the `v` prefix yields to the width
   rather than the layout bending around it.
+
+### Providers
+
+- A tool result carrying an image no longer puts the image inside the tool
+  result field, which the API reads as text. A valid screenshot came back as
+  `invalid_value` on `input` -- "the image data you provided does not
+  represent a valid image" -- and broke every later turn in the session.
+- An image attachment is typed by what its bytes are, not by what the file is
+  called, on every path.
+- A pay-per-use OpenAI key is no longer sent the request shape a ChatGPT
+  subscription uses, which the public API rejects outright.
 
 ### Providers
 
