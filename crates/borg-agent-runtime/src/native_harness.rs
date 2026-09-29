@@ -8312,7 +8312,7 @@ mod tests {
                 };
                 Ok(ModelTurnResult {
                     message: ModelMessage::assistant(Some("done".into()), None, None, tools),
-                    finish_reason: "stop".into(),
+                    finish_reason: if *calls == 1 { "tool_calls" } else { "stop" }.into(),
                     // Over the old 128K fallback, comfortably inside the real
                     // route window. Responses usage itself omits the window.
                     usage: ProviderCallUsage {

@@ -450,7 +450,7 @@ impl SubscriptionAccess {
 fn api_context_window(model: &str) -> Option<u64> {
     crate::models_catalog::context_window("openai", model)
         .filter(|window| *window > 0)
-        .or_else(|| match model {
+        .or(match model {
             "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-astra" => Some(1_050_000),
             _ => None,
         })
