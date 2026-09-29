@@ -18,7 +18,7 @@
 //!   override lives in the caller, above this module.
 
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
 use serde_json::Value;
 
@@ -269,9 +269,14 @@ fn usd_per_million_to_microusd(usd_per_million: f64) -> u64 {
     (usd_per_million * 1_000_000.0).round().max(0.0) as u64
 }
 
-/// Replace the catalog without a network call, for tests.
-pub fn set_for_test(facts: Facts) {
+/// Replace the catalog for tests; retain the guard while using the fixture.
+pub fn set_for_test(facts: Facts) -> MutexGuard<'static, ()> {
+    static TEST_CATALOG: Mutex<()> = Mutex::new(());
+    let owner = TEST_CATALOG
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     if let Ok(mut guard) = catalog().write() {
         *guard = Some(facts);
     }
+    owner
 }

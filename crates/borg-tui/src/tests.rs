@@ -1966,14 +1966,14 @@ fn model_and_effort_pickers_use_the_provider_catalog() {
 /// verified wire field. It reads out of the catalog rather than a local table.
 #[test]
 fn a_token_budget_model_states_its_ceiling() {
-    borg_provider::models_catalog::set_for_test(borg_provider::models_catalog::parse(
-        &serde_json::json!({
+    let _catalog = borg_provider::models_catalog::set_for_test(
+        borg_provider::models_catalog::parse(&serde_json::json!({
             "alibaba": { "models": { "qwen3.7-plus": { "reasoning_options": [
                 { "type": "toggle" },
                 { "type": "budget_tokens", "max": 81920 }
             ] } } },
-        }),
-    ));
+        })),
+    );
     let facts = borg_provider::models_catalog::facts("alibaba", "qwen3.7-plus")
         .expect("qwen3.7-plus is catalogued");
     assert_eq!(facts.budget_tokens_max, Some(81920));
@@ -1982,14 +1982,14 @@ fn a_token_budget_model_states_its_ceiling() {
 
 #[test]
 fn a_toggle_only_model_offers_reasoning_on_or_off() {
-    borg_provider::models_catalog::set_for_test(borg_provider::models_catalog::parse(
-        &serde_json::json!({
+    let _catalog = borg_provider::models_catalog::set_for_test(
+        borg_provider::models_catalog::parse(&serde_json::json!({
             "alibaba": { "models": { "qwen3.7-plus": { "reasoning_options": [
                 { "type": "toggle" },
                 { "type": "budget_tokens", "max": 81920 }
             ] } } },
-        }),
-    ));
+        })),
+    );
     let levels = effort_picker_options(Some(CodingProvider::Qwen), Some("qwen3.7-plus"));
     assert_eq!(levels, ["medium", "none"]);
 

@@ -300,7 +300,7 @@ mod tests {
                 }
             }
         });
-        crate::models_catalog::set_for_test(crate::models_catalog::parse(&payload));
+        let _catalog = crate::models_catalog::set_for_test(crate::models_catalog::parse(&payload));
         let anthropic =
             crate::models_catalog::pricing("anthropic", "claude-opus-5").expect("anthropic price");
         assert_eq!(anthropic.input, 5_000_000);
@@ -335,7 +335,7 @@ mod tests {
                 "models": {"deepseek/deepseek-v4.1-flash": {"limit": {"context": 1_048_576}}}
             }
         });
-        crate::models_catalog::set_for_test(crate::models_catalog::parse(&payload));
+        let _catalog = crate::models_catalog::set_for_test(crate::models_catalog::parse(&payload));
         assert_eq!(
             crate::models_catalog::context_window("opencode-go", "kimi-k2.7-code"),
             Some(262_144)

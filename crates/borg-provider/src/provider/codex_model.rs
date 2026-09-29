@@ -2430,7 +2430,7 @@ mod tests {
                 if kind == "native_model_terminal_failure"
                     && payload == json!({
                         "event_type":"response.failed",
-                        "code":"rate_limit_exceeded",
+                        "code":"other",
                         "retryable":false,
                     })
                     && raw_payload.is_none()

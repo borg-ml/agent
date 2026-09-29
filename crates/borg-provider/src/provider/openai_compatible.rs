@@ -2559,23 +2559,21 @@ mod tests {
         assert!(plain.get("reasoning").is_none());
     }
 
-    /// One test owns the catalog, because `set_for_test` writes a process-wide
-    /// value: two tests installing different fixtures would race, and whichever
-    /// lost would assert against the other's models.
     #[test]
     fn the_catalog_decides_the_vocabulary_and_which_control_a_route_uses() {
-        crate::models_catalog::set_for_test(crate::models_catalog::parse(&serde_json::json!({
-            "zai": { "models": { "glm-5.3": { "reasoning_options": [
-                { "type": "effort", "values": ["max", "high", "low"] }
-            ] } } },
-            "alibaba": { "models": {
-                "qwen-ladder-fixture": { "reasoning_options": [
-                    { "type": "toggle" },
-                    { "type": "effort", "values": ["low", "medium", "xhigh"] }
-                ]},
-                "qwen-toggle-fixture": { "reasoning_options": [{ "type": "toggle" }] }
-            }},
-        })));
+        let _catalog =
+            crate::models_catalog::set_for_test(crate::models_catalog::parse(&serde_json::json!({
+                "zai": { "models": { "glm-5.3": { "reasoning_options": [
+                    { "type": "effort", "values": ["max", "high", "low"] }
+                ] } } },
+                "alibaba": { "models": {
+                    "qwen-ladder-fixture": { "reasoning_options": [
+                        { "type": "toggle" },
+                        { "type": "effort", "values": ["low", "medium", "xhigh"] }
+                    ]},
+                    "qwen-toggle-fixture": { "reasoning_options": [{ "type": "toggle" }] }
+                }},
+            })));
         let mut body = json!({});
         apply_reasoning(
             &mut body,
@@ -2775,12 +2773,14 @@ mod tests {
 
     #[test]
     fn kimi_cost_uses_each_models_own_list_price() {
-        crate::models_catalog::set_for_test(crate::models_catalog::parse(&serde_json::json!({
-            "moonshotai": { "models": {
-                "kimi-k3": { "cost": { "input": 3, "output": 15, "cache_read": 0.3 } },
-                "kimi-k2.7-code": { "cost": { "input": 0.95, "output": 4, "cache_read": 0.19 } },
-            } },
-        })));
+        let _catalog = crate::models_catalog::set_for_test(crate::models_catalog::parse(
+            &serde_json::json!({
+                "moonshotai": { "models": {
+                    "kimi-k3": { "cost": { "input": 3, "output": 15, "cache_read": 0.3 } },
+                    "kimi-k2.7-code": { "cost": { "input": 0.95, "output": 4, "cache_read": 0.19 } },
+                } },
+            }),
+        ));
         let raw = json!({
             "usage": {
                 "prompt_tokens": 1_000_000,
