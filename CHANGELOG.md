@@ -7,6 +7,14 @@ Git comparison.
 
 ## 0.13.1 (2026-09-29)
 
+### Models and CI
+
+- Added `gpt-6.1-sol` to the Codex model picker and subagent choices; removed
+  `gpt-5.6-sol` from current choices and moved GPT peer and `/codex` defaults
+  to 6.1 Sol. Existing sessions using older model IDs remain readable.
+- Fixed two Clippy warnings that blocked release validation, without changing
+  tool behavior.
+
 ### Terminal UI
 
 - Ctrl/Cmd+1-9/0 opens a status menu you can actually drive. Focus reached the

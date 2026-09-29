@@ -829,14 +829,13 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
     // A `capability` call is a container, not an action: titled by the tool it
     // names, every one of them read "Capability" and the row said nothing about
     // what was actually happening. The target is right there in the input.
-    if tool_leaf_name(name) == "capability" {
-        if let Some(target) = input
+    if tool_leaf_name(name) == "capability"
+        && let Some(target) = input
             .get("name")
             .and_then(Value::as_str)
             .filter(|target| !target.is_empty())
-        {
-            return (capability_action_title(target), concise_tool_input(input));
-        }
+    {
+        return (capability_action_title(target), concise_tool_input(input));
     }
 
     (humanize_tool_name(name), concise_tool_input(input))

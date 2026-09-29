@@ -9793,11 +9793,7 @@ fn restore_declared_types(mut arguments: Value, schema: Option<&Value>) -> Value
         // same loss, so all three are read back the same way.
         let text = match entries.get(key) {
             Some(Value::String(text)) => text.clone(),
-            Some(Value::Object(members))
-                if declared_type_names(declared)
-                    .iter()
-                    .any(|declared_type| *declared_type == "array") =>
-            {
+            Some(Value::Object(members)) if declared_type_names(declared).contains(&"array") => {
                 // Keys carry the position, so the order the list was sent in is
                 // recoverable even though the map itself is key-sorted.
                 serde_json::to_string(&Value::Array(members.values().cloned().collect::<Vec<_>>()))
