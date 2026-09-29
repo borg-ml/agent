@@ -485,7 +485,15 @@ impl CodexModelProvider {
                 Some(capabilities)
             };
             let context_window = capabilities.as_ref().map(ModelCapabilities::usable_context_window).transpose()?;
-            let mut body = self.request_body_for_account(&mut request, expected_account, capabilities.as_ref())?;
+            // Read the protocol shape from the credential actually in use.
+            // A catalogue cached by an earlier subscription login describes
+            // what that front end accepts, not what the public API accepts.
+            let mut body = self.request_body_for_account(
+                &mut request,
+                expected_account,
+                capabilities.as_ref(),
+                !access.is_api_key(),
+            )?;
             // Reasoning tokens count against `max_output_tokens` on the
             // Responses API, so this cap bounds the whole refresh, not just
             // its visible text.
@@ -585,6 +593,7 @@ impl CodexModelProvider {
         request: &mut ModelTurnRequest,
         expected_account: &str,
         capabilities: Option<&ModelCapabilities>,
+        subscription_only: bool,
     ) -> Result<Value> {
         for message in &mut request.messages {
             if let ModelMessage::Assistant { provider_state, .. } = message
@@ -596,12 +605,12 @@ impl CodexModelProvider {
                 *provider_state = None;
             }
         }
-        self.request_body_with_capabilities(request, capabilities)
+        self.request_body_with_capabilities(request, capabilities, subscription_only)
     }
 
     #[cfg(test)]
     fn request_body(&self, request: &ModelTurnRequest) -> Result<Value> {
-        self.request_body_with_capabilities(request, None)
+        self.request_body_with_capabilities(request, None, false)
     }
 
     fn wire_effort(&self) -> &str {
@@ -612,14 +621,27 @@ impl CodexModelProvider {
         }
     }
 
+    /// `subscription_only` is true when the request will be authenticated by a
+    /// ChatGPT subscription rather than a plain API key.
+    ///
+    /// The two are not the same protocol. The subscription front end accepts
+    /// extra input item types -- `configuration_update` to move reasoning
+    /// effort mid-conversation, and the `additional_tools` / developer-message
+    /// prefix -- that the public Responses API rejects outright. A cached
+    /// model catalogue left behind by an earlier subscription login would
+    /// otherwise keep enabling them on the API-key path, and the provider
+    /// answers `invalid_value` on `input`, with nothing to act on. The flag is
+    /// read from the credential actually in use, not from the catalogue.
     fn request_body_with_capabilities(
         &self,
         request: &ModelTurnRequest,
         capabilities: Option<&ModelCapabilities>,
+        subscription_only: bool,
     ) -> Result<Value> {
         let mut input = Vec::new();
         let mut instructions = Vec::new();
-        let effort_updates = capabilities.is_some_and(|c| c.supports_reasoning_effort_updates);
+        let effort_updates =
+            subscription_only && capabilities.is_some_and(|c| c.supports_reasoning_effort_updates);
         let baseline = if effort_updates {
             request
                 .messages
@@ -730,7 +752,7 @@ impl CodexModelProvider {
             })
             .collect();
         let instructions = instructions.join("\n\n");
-        if capabilities.is_some_and(|c| c.use_responses_lite) {
+        if subscription_only && capabilities.is_some_and(|c| c.use_responses_lite) {
             let namespace = uuid::Uuid::new_v5(
                 &uuid::Uuid::NAMESPACE_OID,
                 request
@@ -1577,7 +1599,7 @@ mod tests {
             output_schema: Some(json!({"type":"object"})),
         };
         let first = provider
-            .request_body_with_capabilities(&request, Some(&capabilities))
+            .request_body_with_capabilities(&request, Some(&capabilities), true)
             .unwrap();
         assert_eq!(first["instructions"], "");
         assert!(first.get("tools").is_none());
@@ -1611,7 +1633,7 @@ mod tests {
         request.messages.push(ModelMessage::user("second"));
         provider.effort = "high".into();
         let changed = provider
-            .request_body_with_capabilities(&request, Some(&capabilities))
+            .request_body_with_capabilities(&request, Some(&capabilities), true)
             .unwrap();
         let prefix = first["input"].as_array().unwrap();
         assert_eq!(
@@ -1631,7 +1653,7 @@ mod tests {
             model: "model".into(),
             effort: "high".into(),
         }
-        .request_body_with_capabilities(&request, Some(&capabilities))
+        .request_body_with_capabilities(&request, Some(&capabilities), true)
         .unwrap();
         let previous = changed["input"].as_array().unwrap();
         assert_eq!(
@@ -1642,7 +1664,7 @@ mod tests {
         assert_eq!(restarted["input"][previous.len()], output);
         request.session_id = Some("fork-session".into());
         let forked = provider
-            .request_body_with_capabilities(&request, Some(&capabilities))
+            .request_body_with_capabilities(&request, Some(&capabilities), true)
             .unwrap();
         assert_eq!(forked["input"], restarted["input"]);
         capabilities.use_responses_lite = false;
@@ -1650,7 +1672,7 @@ mod tests {
         capabilities.supports_reasoning_summary_parameter = false;
         capabilities.default_reasoning_summary = Some("detailed".into());
         let classic = provider
-            .request_body_with_capabilities(&request, Some(&capabilities))
+            .request_body_with_capabilities(&request, Some(&capabilities), true)
             .unwrap();
         assert_eq!(classic["instructions"], "stable instructions");
         assert_eq!(classic["reasoning"], json!({"effort":"high"}));
@@ -1706,7 +1728,7 @@ mod tests {
                 ],
             };
             let body = provider
-                .request_body_for_account(&mut request, "account-b", None)
+                .request_body_for_account(&mut request, "account-b", None, true)
                 .unwrap();
             let input = body["input"].as_array().unwrap();
             assert_eq!(input[0]["content"][0]["text"], "keep the task");
