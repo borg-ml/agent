@@ -630,17 +630,9 @@ impl CodexModelProvider {
                 "auth": if access.is_api_key() { "api_key" } else { "subscription_oauth" },
                 "agent_loop": "borg",
             }));
-            let response = self
-                .send(
-                    &client,
-                    endpoint,
-                    &mut access,
-                    expected_account,
-                    &request,
-                    &body,
-                )
-                .await?;
-            let (mut message, response) = self.read_stream(response, progress.as_ref(), request.request_id.as_deref()).await?;
+            let (mut message, response) = self
+                .send_with_terminal_retries(&client, &mut access, expected_account,
+                    &request, (endpoint, &body), progress.as_ref()).await?;
             if let ModelMessage::Assistant { provider_state: Some(ModelProviderState::OpenAiResponses { account_identity, request_model, request_effort, effective_effort, .. }), .. } = &mut message {
                 *account_identity = Some(expected_account.to_string());
                 *request_model = Some(self.model.clone());
@@ -1013,6 +1005,48 @@ impl CodexModelProvider {
         Ok(response)
     }
 
+    async fn send_with_terminal_retries(
+        &self,
+        client: &reqwest::Client,
+        access: &mut SubscriptionAccess,
+        expected_account: &str,
+        request: &ModelTurnRequest,
+        wire: (&str, &Value),
+        progress: Option<&UnboundedSender<ProviderProgress>>,
+    ) -> Result<(ModelMessage, Value)> {
+        for attempt in 1..=3 {
+            let response = self
+                .send(client, wire.0, access, expected_account, request, wire.1)
+                .await?;
+            // Each read owns a fresh ResponseState. Nothing from an unsuccessful
+            // attempt becomes a returned message or an executable tool call.
+            match self
+                .read_stream(response, progress, request.request_id.as_deref())
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    let retryable = error
+                        .downcast_ref::<TerminalResponseFailure>()
+                        .is_some_and(|failure| failure.retryable);
+                    publish_model_audit(
+                        progress,
+                        "native_model_attempt_failed",
+                        json!({
+                            "request_id": request.request_id, "attempt": attempt,
+                            "retryable": retryable, "will_retry": retryable && attempt < 3,
+                        }),
+                    );
+                    if !retryable || attempt == 3 {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
+                }
+            }
+        }
+        unreachable!()
+    }
+
     async fn read_stream(
         &self,
         response: reqwest::Response,
@@ -1153,6 +1187,20 @@ async fn check_subscription_response(response: reqwest::Response) -> Result<reqw
         retry_after.as_deref()
     ))
 }
+
+#[derive(Debug)]
+struct TerminalResponseFailure {
+    message: String,
+    retryable: bool,
+}
+
+impl std::fmt::Display for TerminalResponseFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TerminalResponseFailure {}
 
 fn subscription_failure_message(
     error: Option<&Value>,
@@ -1393,13 +1441,31 @@ impl ResponseState {
                 return Ok(Some(event["response"].clone()));
             }
             "response.failed" | "response.incomplete" | "error" => {
-                bail!(subscription_failure_message(
-                    event
-                        .pointer("/response/error")
-                        .or_else(|| event.get("error")),
-                    None,
-                    None
-                ))
+                let error = event
+                    .pointer("/response/error")
+                    .or_else(|| event.get("error"));
+                let code = error.and_then(|error| error["code"].as_str());
+                let retryable = matches!(
+                    code,
+                    Some("server_error" | "internal_error" | "service_unavailable")
+                ) && event
+                    .pointer("/response/incomplete_details/reason")
+                    .and_then(Value::as_str)
+                    != Some("content_filter");
+                publish_model_audit(
+                    progress,
+                    "native_model_terminal_failure",
+                    json!({
+                        "event_type": event["type"].as_str(),
+                        "code": known_or_other(code, &KNOWN_ERROR_CODES),
+                        "retryable": retryable,
+                    }),
+                );
+                return Err(TerminalResponseFailure {
+                    message: subscription_failure_message(error, None, None),
+                    retryable,
+                }
+                .into());
             }
             _ => {}
         }
@@ -1549,7 +1615,10 @@ const KNOWN_INCOMPLETE_REASONS: [&str; 2] = ["max_output_tokens", "content_filte
 /// counted as `other`, which still shows that an unsupported item arrived
 /// without repeating whatever the backend called it.
 const KNOWN_ITEM_TYPES: [&str; 3] = ["message", "function_call", "reasoning"];
-const KNOWN_ERROR_CODES: [&str; 9] = [
+const KNOWN_ERROR_CODES: [&str; 12] = [
+    "server_error",
+    "internal_error",
+    "service_unavailable",
     "invalid_api_key",
     "invalid_value",
     "invalid_type",
@@ -2446,6 +2515,137 @@ mod tests {
             });
             let result = fetch_catalog_client_version(&reqwest::Client::new(), &endpoint).await;
             assert_eq!(result.ok().as_deref(), expected);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_retries_discard_partial_tools_and_stop_on_permanent_failures() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for code in ["server_error", "invalid_value"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+            let retry = code == "server_error";
+            let server = tokio::spawn(async move {
+                let mut previous = None;
+                for attempt in 0..if retry { 2 } else { 1 } {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let end = loop {
+                        let mut chunk = [0; 4096];
+                        let n = socket.read(&mut chunk).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                    assert!(headers.contains("chatgpt-account-id: retry-account"));
+                    let len = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .trim()
+                        .parse::<usize>()
+                        .unwrap();
+                    while bytes.len() < end + len {
+                        let mut chunk = [0; 4096];
+                        let n = socket.read(&mut chunk).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&chunk[..n]);
+                    }
+                    let body: Value = serde_json::from_slice(&bytes[end..end + len]).unwrap();
+                    if let Some(previous) = previous.as_ref() {
+                        assert_eq!(&body, previous);
+                    }
+                    previous = Some(body);
+                    let events = if attempt == 0 {
+                        vec![
+                            json!({"type":"response.output_item.added", "item":{
+                            "type":"function_call", "id":"discard-item", "call_id":"discard-call",
+                            "name":"inspect", "arguments":"{}"}}),
+                            json!({"type":"response.failed", "response":{"error":{
+                                "code":code, "message":"private-token private-account"}}}),
+                        ]
+                    } else {
+                        vec![
+                            json!({"type":"response.completed", "response":{"status":"completed", "output":[{
+                            "type":"function_call", "call_id":"final-call", "name":"inspect", "arguments":"{}"}]}}),
+                        ]
+                    };
+                    let frames = events
+                        .iter()
+                        .map(|event| format!("data: {event}\n\n"))
+                        .collect::<String>();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        frames.len(),
+                        frames
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let mut access = SubscriptionAccess {
+                token: "test-token".into(),
+                account_id: "retry-account".into(),
+                auth_file: None,
+            };
+            let account = access.identity();
+            let provider = CodexModelProvider {
+                model: "test-model".into(),
+                effort: "low".into(),
+            };
+            let request = ModelTurnRequest {
+                request_id: Some("same-request".into()),
+                session_id: None,
+                prompt_cache_key: Some("same-cache".into()),
+                turn_routing: Default::default(),
+                messages: vec![],
+                tools: vec![],
+                fast: false,
+                ultrafast: false,
+                output_schema: None,
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                provider.send_with_terminal_retries(
+                    &reqwest::Client::new(),
+                    &mut access,
+                    &account,
+                    &request,
+                    (
+                        &endpoint,
+                        &json!({"model":"test-model", "prompt_cache_key":"same-cache"}),
+                    ),
+                    Some(&tx),
+                ),
+            )
+            .await
+            .unwrap();
+            if retry {
+                let (message, _) = result.unwrap();
+                match message {
+                    ModelMessage::Assistant { tool_calls, .. } => {
+                        assert_eq!(tool_calls.len(), 1);
+                        assert_eq!(tool_calls[0].id, "final-call");
+                    }
+                    _ => panic!("expected assistant tools"),
+                }
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    !error
+                        .downcast_ref::<TerminalResponseFailure>()
+                        .unwrap()
+                        .retryable
+                );
+                assert!(!error.to_string().contains("private-"));
+            }
+            while let Ok(event) = rx.try_recv() {
+                assert!(!format!("{event:?}").contains("private-"));
+            }
             server.await.unwrap();
         }
     }
