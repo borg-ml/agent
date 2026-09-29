@@ -13415,6 +13415,64 @@ fn a_finished_action_group_folds_to_its_summary_until_clicked() {
 }
 
 #[test]
+fn a_group_held_open_by_unfinished_work_folds_once_that_work_finishes() {
+    let tool = |detail: &str, complete: bool, backgrounded: bool| TranscriptEntry::Tool {
+        source_name: "exec".to_string(),
+        name: "Run".to_string(),
+        detail: detail.to_string(),
+        code_view: None,
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:00".to_string(),
+        started_at: Utc::now(),
+        completed_at: complete.then(Utc::now),
+        complete,
+        error: false,
+        user_interrupted: false,
+        backgrounded,
+        expanded: false,
+        outcome: None,
+        cwd: None,
+    };
+    let mut transcript = Transcript::default();
+    transcript.order.push(tool("first-step", true, false));
+    transcript.order.push(tool("long-build", false, true));
+    let render = |transcript: &Transcript| {
+        transcript
+            .lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // Live work is the only place a running action is visible, so the group
+    // holding it stays open even though nothing follows it.
+    let running = render(&transcript);
+    assert!(running.contains("long-build"), "{running}");
+    assert!(running.contains("▾"), "{running}");
+
+    if let Some(TranscriptEntry::Tool {
+        complete,
+        backgrounded,
+        completed_at,
+        ..
+    }) = transcript.order.get_mut(1)
+    {
+        *complete = true;
+        *backgrounded = false;
+        *completed_at = Some(Utc::now());
+    }
+
+    // The work is done and nothing follows, so the group folds. Being the
+    // newest group is not by itself a reason to stay open once it was only
+    // held open by that work.
+    let finished = render(&transcript);
+    assert!(!finished.contains("long-build"), "{finished}");
+    assert!(finished.contains("▸ 12:00 · 2 actions"), "{finished}");
+}
+
+#[test]
 fn expanded_tool_run_shows_every_action_and_collapses_again() {
     let mut transcript = Transcript::default();
     for index in 0..20 {
