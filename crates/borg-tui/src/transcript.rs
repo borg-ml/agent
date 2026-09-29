@@ -299,10 +299,6 @@ struct Transcript {
     image_cell: Option<(u16, u16)>,
     message_markdown_cache: RefCell<MessageMarkdownCache>,
     tool_body_cache: RefCell<ToolBodyCache>,
-    /// Groups that a running process or unfinished action has held open. The
-    /// newest group stays open on its own, so without this a group pinned by
-    /// live work would never fold once that work finished.
-    work_pinned_tool_runs: RefCell<HashSet<usize>>,
     /// The last cache-mode render at each width the draw uses: the full width
     /// and, once a scrollbar appears, the width beside its gutter.
     render_resumes: RefCell<Vec<RenderResume>>,
@@ -434,7 +430,6 @@ impl Default for Transcript {
             image_cell: None,
             message_markdown_cache: RefCell::new(MessageMarkdownCache::default()),
             tool_body_cache: RefCell::new(ToolBodyCache::default()),
-            work_pinned_tool_runs: RefCell::new(HashSet::new()),
             render_resumes: RefCell::new(Vec::new()),
         }
     }
@@ -5130,22 +5125,6 @@ impl Transcript {
         })
     }
 
-    /// Groups currently held open by work that has not finished, remembered
-    /// after it finishes so the group can fold. A group is only ever added
-    /// here while something in it is still running.
-    fn work_pinned_tool_runs(
-        &self,
-        windows: &[Option<ToolRunWindow>],
-    ) -> HashSet<usize> {
-        let mut pinned = self.work_pinned_tool_runs.borrow_mut();
-        for window in windows.iter().flatten() {
-            if self.window_has_unfinished_work(window) {
-                pinned.insert(window.start);
-            }
-        }
-        pinned.clone()
-    }
-
     fn open_tool_run(&self, windows: &[Option<ToolRunWindow>]) -> Option<usize> {
         windows
             .iter()
@@ -5330,7 +5309,6 @@ impl Transcript {
     ) {
         let today_prefix = today.format("%Y-%m-%d ").to_string();
         let open_window_start = self.open_tool_run(tool_run_windows);
-        let work_pinned = self.work_pinned_tool_runs(tool_run_windows);
         if focused_tool.is_none() && start == 0 {
             self.prepare_message_markdown_cache(width);
         }
@@ -6456,10 +6434,13 @@ impl Transcript {
                         // the latest group is ever "open", so a long command
                         // still running would otherwise be folded away as soon
                         // as the next action started, taking its live row with it.
+                        // That also keeps a group open once its live work finishes:
+                        // it stays expanded until a new message ends the group,
+                        // rather than collapsing the moment the last running
+                        // action stops.
                         let foldable = total_lines > 0
                             && !self.window_has_unfinished_work(&window)
-                            && (open_window_start != Some(window.start)
-                                || work_pinned.contains(&window.start));
+                            && open_window_start != Some(window.start);
                         let folded = foldable && !self.tool_run_expanded(window.start);
                         let expandable = foldable || total_lines > tool_run_viewport_height;
                         let expanded = expandable && self.tool_run_expanded(window.start);

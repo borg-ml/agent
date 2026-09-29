@@ -4922,15 +4922,23 @@ impl BorgTerminal {
         };
         let targets = self.status_focus_targets();
         let Some(position) = targets.iter().position(|(target, _)| *target == focus) else {
+            // The focused control vanished from the frame (its data went
+            // away), so there is no menu to navigate. Arrow keys are still
+            // swallowed here: leaking them would scroll the transcript behind
+            // a menu the user believes is still open.
             self.leave_status_focus();
-            return Ok(None);
+            return Ok(matches!(key.code, KeyCode::Up | KeyCode::Down).then_some(
+                UiAction::None,
+            ));
         };
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
         {
             self.leave_status_focus();
-            return Ok(None);
+            return Ok(matches!(key.code, KeyCode::Up | KeyCode::Down).then_some(
+                UiAction::None,
+            ));
         }
         let rows = self.status_focus_rows(focus).len();
         let row = self.status_focus_row.filter(|row| *row < rows);
@@ -4953,6 +4961,11 @@ impl BorgTerminal {
                 let row = row.map(|row| row + 1).filter(|row| *row < rows);
                 self.set_status_focus(Some(focus), row);
             }
+            // Up on a control whose menu has not been laid out yet still belongs
+            // to the menu. Holding focus here is what makes the first Up open
+            // the list instead of scrolling the transcript behind it; the rows
+            // appear on the frame this schedules.
+            KeyCode::Up => self.set_status_focus(Some(focus), None),
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let area = match row {
                     Some(row) => self.status_focus_rows(focus).get(row).copied(),
@@ -4983,7 +4996,7 @@ impl BorgTerminal {
                 self.close_status_menus();
                 self.set_status_focus(Some(focus), None);
             }
-            KeyCode::Up | KeyCode::Esc => self.leave_status_focus(),
+            KeyCode::Esc => self.leave_status_focus(),
             _ => {
                 self.leave_status_focus();
                 return Ok(None);

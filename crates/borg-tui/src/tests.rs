@@ -13402,7 +13402,7 @@ fn a_finished_action_group_folds_to_its_summary_until_clicked() {
 }
 
 #[test]
-fn a_group_held_open_by_unfinished_work_folds_once_that_work_finishes() {
+fn a_group_held_open_by_unfinished_work_stays_open_until_a_new_message_ends_it() {
     let tool = |detail: &str, complete: bool, backgrounded: bool| TranscriptEntry::Tool {
         source_name: "exec".to_string(),
         name: "Run".to_string(),
@@ -13451,12 +13451,30 @@ fn a_group_held_open_by_unfinished_work_folds_once_that_work_finishes() {
         *completed_at = Some(Utc::now());
     }
 
-    // The work is done and nothing follows, so the group folds. Being the
-    // newest group is not by itself a reason to stay open once it was only
-    // held open by that work.
+    // The work is done but nothing has ended the group, so it stays open. It was
+    // held open longer than it would have been, and only a new message should
+    // end it -- not the last running action simply stopping.
     let finished = render(&transcript);
-    assert!(!finished.contains("long-build"), "{finished}");
-    assert!(finished.contains("▸ 12:00 · 2 actions"), "{finished}");
+    assert!(finished.contains("long-build"), "{finished}");
+    assert!(finished.contains("▾"), "{finished}");
+
+    transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::Assistant,
+        text: "done".into(),
+        attachments: Vec::new(),
+        model: None,
+        effort: None,
+        time: "12:01".into(),
+        status: MessageStatus::Complete,
+        complete: true,
+        user_interrupted: false,
+        redirected: false,
+    });
+
+    // The new message ends the group, so it folds to its summary.
+    let ended = render(&transcript);
+    assert!(!ended.contains("long-build"), "{ended}");
+    assert!(ended.contains("▸ 12:00 · 2 actions"), "{ended}");
 }
 
 #[test]
