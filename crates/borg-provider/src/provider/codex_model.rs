@@ -2424,6 +2424,17 @@ mod tests {
             .to_string();
         assert!(error.contains("limit reached") && error.contains("2030-01-01 00:00:00 UTC"));
         assert!(!error.contains("private-"));
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ProviderProgress::ProviderEvent { kind, payload, raw_payload, .. }
+                if kind == "native_model_terminal_failure"
+                    && payload == json!({
+                        "event_type":"response.failed",
+                        "code":"rate_limit_exceeded",
+                        "retryable":false,
+                    })
+                    && raw_payload.is_none()
+        ));
         assert!(events.try_recv().is_err());
         let context_error = subscription_failure_message(
             Some(&json!({"code":"context_length_exceeded"})),
