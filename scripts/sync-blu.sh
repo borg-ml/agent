@@ -12,7 +12,15 @@ case "$mode" in
 esac
 
 pinned="$(sed -n 's/^blu-lang = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' "$manifest")"
-test -n "$pinned" || { echo "could not read pinned blu-lang revision" >&2; exit 1; }
+if [ -z "$pinned" ]; then
+  # blu-lang comes from the registry, not a pinned revision, so there is
+  # nothing here that can go stale and nothing for this script to update. The
+  # git-pin form below still works if it is ever pinned again. Bumping a
+  # registry version is a deliberate manifest edit, not a sync.
+  declared="$(sed -n 's/^blu-lang = "\(.*\)"$/\1/p' "$manifest" | head -1)"
+  echo "Blu is a registry dependency at ${declared:-unknown}; nothing to synchronise"
+  exit 0
+fi
 latest="$(git ls-remote "$remote" HEAD | awk 'NR == 1 { print $1 }')"
 test -n "$latest" || { echo "could not resolve Blu HEAD" >&2; exit 1; }
 
