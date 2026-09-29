@@ -1268,6 +1268,25 @@ impl Transcript {
             .order
             .iter()
             .rposition(|entry| matches!(entry, TranscriptEntry::Goal { .. }));
+        // A replayed goal -- every retry re-emits one, because the turn restarts
+        // and re-establishes the goal it is working to -- must not move the
+        // card. Taking it out and pushing it back would drop the whole block
+        // to the bottom of the transcript and re-announce it, so a resume would
+        // re-print a goal the reader already has in view. Only the fields the
+        // card actually prints are compared; the elapsed figure is derived
+        // from the goal at render time, so it keeps counting without the entry
+        // needing to be rewritten.
+        if let Some(index) = removed
+            && let Some(TranscriptEntry::Goal { goal: shown, .. }) = self.order.get(index)
+            && goal.objective == shown.objective
+            && goal.status == shown.status
+            && goal.token_budget == shown.token_budget
+        {
+            if let Some(TranscriptEntry::Goal { goal: shown, .. }) = self.order.get_mut(index) {
+                *shown = goal;
+            }
+            return Some(index);
+        }
         if let Some(index) = removed {
             self.order.remove(index);
             self.reindex_after_removal(index);

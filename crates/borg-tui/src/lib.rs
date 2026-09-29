@@ -3614,10 +3614,11 @@ impl BorgTerminal {
     /// at any point leaves a resumable prompt. Failures are logged, never
     /// surfaced: a draft that cannot be written must not break typing.
     pub fn persist_composer_draft(&mut self) {
-        let current = self.composer_draft().map_or_else(
-            ComposerDraft::default,
-            |(text, attachments)| ComposerDraft { text, attachments },
-        );
+        let current = self
+            .composer_draft()
+            .map_or_else(ComposerDraft::default, |(text, attachments)| {
+                ComposerDraft { text, attachments }
+            });
         if self.persisted_draft.as_ref() == Some(&current) {
             return;
         }

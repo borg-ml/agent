@@ -21150,20 +21150,24 @@ impl AgentTurnExecutor for FlakyCompactionExecutor {
     async fn compact_retained_context(&self, _turn: AgentTurn) -> Result<AgentCompaction> {
         let attempt = self.calls.fetch_add(1, Ordering::AcqRel);
         if let Some(kind) = self.kind {
-            return Err(anyhow::Error::new(borg_provider::provider::ProviderStreamError {
-                kind,
-                message: "openrouter streaming response failed: provider rejected the \
+            return Err(anyhow::Error::new(
+                borg_provider::provider::ProviderStreamError {
+                    kind,
+                    message: "openrouter streaming response failed: provider rejected the \
                           request: Provider returned an empty response"
-                    .to_string(),
-            }));
+                        .to_string(),
+                },
+            ));
         }
         if attempt < self.failures_before_success {
-            return Err(anyhow::Error::new(borg_provider::provider::ProviderStreamError {
-                kind: borg_provider::provider::ProviderErrorKind::ConnectionLost,
-                message: "openrouter streaming response failed: provider rejected the \
+            return Err(anyhow::Error::new(
+                borg_provider::provider::ProviderStreamError {
+                    kind: borg_provider::provider::ProviderErrorKind::ConnectionLost,
+                    message: "openrouter streaming response failed: provider rejected the \
                           request: Provider returned an empty response"
-                    .to_string(),
-            }));
+                        .to_string(),
+                },
+            ));
         }
         Ok(AgentCompaction {
             summary: "recovered summary".to_string(),

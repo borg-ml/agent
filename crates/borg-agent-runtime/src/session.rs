@@ -5748,14 +5748,54 @@ async fn run_agent_session_store_kernel_inner(
                             ..
                         } => {
                             team_message_ids.insert(message_id);
-                            deferred_commands.push_front(HostCommand::Prompt {
+                            // Take the whole run of team traffic waiting behind
+                            // this one and requeue it in order, rather than
+                            // pushing each note to the front in turn. Per-note
+                            // push_front reversed them: two messages sent as a
+                            // burst were admitted back to front, so the worker
+                            // read them in the opposite order to the one they
+                            // were sent. Draining first also lets the batch
+                            // coalescer see them in one boundary and fold them
+                            // into a single turn, which is what "sent together"
+                            // has to mean.
+                            let mut batch = vec![HostCommand::Prompt {
                                 session_id,
                                 message_id,
                                 text,
                                 attachments,
                                 output_schema,
                                 delivery,
-                            });
+                            }];
+                            while let Ok(next) = commands.try_recv() {
+                                if next.session_id() != Some(session_id) {
+                                    deferred_commands.push_back(next);
+                                    continue;
+                                }
+                                if let HostCommand::TeamPrompt {
+                                    message_id,
+                                    text,
+                                    attachments,
+                                    output_schema,
+                                    delivery,
+                                    ..
+                                } = next
+                                {
+                                    team_message_ids.insert(message_id);
+                                    batch.push(HostCommand::Prompt {
+                                        session_id,
+                                        message_id,
+                                        text,
+                                        attachments,
+                                        output_schema,
+                                        delivery,
+                                    });
+                                } else {
+                                    deferred_commands.push_back(next);
+                                }
+                            }
+                            for command in batch.into_iter().rev() {
+                                deferred_commands.push_front(command);
+                            }
                         }
                         HostCommand::Prompt {
                             message_id,
