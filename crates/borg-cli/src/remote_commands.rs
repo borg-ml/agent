@@ -1207,7 +1207,9 @@ fn systemd_quote(value: &str) -> String {
 
 pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
     if !cfg!(unix) && args.session_host.is_some() {
-        anyhow::bail!("detached local session hosts require Unix local session control; run borg in the foreground instead");
+        anyhow::bail!(
+            "detached local session hosts require Unix local session control; run borg in the foreground instead"
+        );
     }
     if args.print {
         print_mode_banner();

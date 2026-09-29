@@ -303,7 +303,8 @@ impl OpenAiCompatibleProvider {
         };
         if request.fast || request.ultrafast {
             return Err(ProviderCallError {
-                message: "fast or ultrafast mode is not supported by this compatible model route".to_string(),
+                message: "fast or ultrafast mode is not supported by this compatible model route"
+                    .to_string(),
                 trace: Box::new(trace),
                 session_id: None,
                 kind: ProviderErrorKind::Unknown,
