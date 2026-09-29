@@ -1827,6 +1827,12 @@ async fn run_borg_provider_turn(
     let mut pending_reasoning = String::new();
     let mut last_reasoning_emit = Instant::now() - Duration::from_millis(50);
     let mut last_completed_reasoning = None;
+    // A reasoning-capable turn that stops producing entirely is stuck, not
+    // thinking: the provider stopped sending deltas without ever finishing
+    // the turn. Track when output last arrived, and only arm the watchdog
+    // once this turn has actually exposed reasoning.
+    let mut saw_reasoning_output = false;
+    let mut last_provider_output = Instant::now();
     loop {
         let pending_text_flush = (text.len() != emitted_text_len)
             .then(|| live_output_interval().saturating_sub(last_text_emit.elapsed()));
@@ -1847,7 +1853,20 @@ async fn run_borg_provider_turn(
                 last_reasoning_emit = Instant::now();
                 continue;
             }
+            // Only arm after reasoning was exposed, so a silent-but-healthy
+            // provider that never streams reasoning is never cancelled.
+            () = tokio::time::sleep(
+                stalled_reasoning_timeout().saturating_sub(last_provider_output.elapsed()),
+            ),
+                if saw_reasoning_output && !terminal_seen => {
+                bail!(
+                    "the model stopped responding after {}s of reasoning; the turn was cancelled",
+                    stalled_reasoning_timeout().as_secs()
+                );
+            }
         };
+        // Any provider event at all means the turn is still making progress.
+        last_provider_output = Instant::now();
         let Some(event) = event else { break };
         match event {
             ChatStreamEvent::ProviderEvent { kind, payload, .. } => {
@@ -1953,6 +1972,7 @@ async fn run_borg_provider_turn(
                         "Borg provider stage"
                     );
                 }
+                saw_reasoning_output = true;
                 pending_reasoning.push_str(&delta);
                 send(&events, SessionEventKind::ReasoningTextDelta { delta }).await;
                 if last_reasoning_emit.elapsed() >= live_output_interval()
@@ -2408,6 +2428,13 @@ async fn run_borg_provider_turn(
 
 pub(crate) fn live_output_interval() -> Duration {
     Duration::from_millis(40)
+}
+
+/// How long a reasoning-exposed turn may produce nothing before it is treated
+/// as stuck and cancelled. Long enough that a slow model still finishes, and
+/// short enough that a dead stream does not hold the turn open indefinitely.
+pub(crate) fn stalled_reasoning_timeout() -> Duration {
+    Duration::from_secs(180)
 }
 
 async fn send_live_assistant_text(
@@ -3553,6 +3580,16 @@ mod tests {
             "Claude sign-in required. Run /login to reconnect, then retry your message."
         );
         assert!(!message.contains("x-api-key"));
+    }
+
+    #[test]
+    fn the_stalled_reasoning_timeout_bounds_a_dead_reasoning_stream() {
+        // The watchdog exists so a reasoning stream that dies mid-turn does
+        // not hold the turn open forever. It must stay bounded, and long
+        // enough that a slow-but-alive reasoning model is not cut off.
+        let timeout = stalled_reasoning_timeout();
+        assert!(timeout >= Duration::from_secs(60), "{timeout:?}");
+        assert!(timeout <= Duration::from_secs(600), "{timeout:?}");
     }
 
     #[test]
