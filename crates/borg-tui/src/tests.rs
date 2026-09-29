@@ -11135,12 +11135,8 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
 
     let area = Rect::new(0, 0, 60, queued_prompt_panel_height(&prompts, 60, true));
     let mut buffer = ratatui::buffer::Buffer::empty(area);
-    let widget = Paragraph::new(queued_prompt_lines(&prompts, area.width, None)).block(
-        Block::default()
-            .borders(Borders::TOP | Borders::LEFT)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(pending_input_title(UiLanguage::Auto, 1, true, area.width)),
-    );
+    let widget = Paragraph::new(queued_prompt_lines(&prompts, area.width, None))
+        .block(Block::default().title(pending_input_title(UiLanguage::Auto, 1, true, area.width)));
     ratatui::widgets::Widget::render(widget, area, &mut buffer);
     let content = (0..area.width)
         .map(|x| buffer[(x, 1)].symbol())
@@ -11153,8 +11149,9 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
     let header = (0..area.width)
         .map(|x| buffer[(x, 0)].symbol())
         .collect::<String>();
-    assert!(header.contains("click to collapse"), "{header}");
-    assert!(hint.trim_start_matches('│').trim().is_empty(), "{hint}");
+    // Reads as an action group: same disclosure marker, same summary shape.
+    assert!(header.contains("▾ Pending Input · 1"), "{header}");
+    assert!(hint.trim().is_empty(), "{hint}");
 }
 
 #[test]
@@ -11172,30 +11169,20 @@ fn collapsed_pending_input_keeps_the_queue_count_and_reclaims_transcript_rows() 
 
     let area = Rect::new(0, 0, 80, 1);
     let mut buffer = ratatui::buffer::Buffer::empty(area);
-    let widget = Paragraph::new(Vec::<Line>::new()).block(
-        Block::default()
-            .borders(Borders::TOP | Borders::LEFT)
-            .title(pending_input_title(
-                UiLanguage::Auto,
-                prompts.len(),
-                false,
-                area.width,
-            )),
-    );
+    let widget = Paragraph::new(Vec::<Line>::new()).block(Block::default().title(
+        pending_input_title(UiLanguage::Auto, prompts.len(), false, area.width),
+    ));
     ratatui::widgets::Widget::render(widget, area, &mut buffer);
     let header = (0..area.width)
         .map(|x| buffer[(x, 0)].symbol())
         .collect::<String>();
-    assert!(header.contains("Pending Input · 23 · click to expand"));
+    assert!(header.contains("▸ Pending Input · 23"), "{header}");
     assert!(!header.contains("long pending input"));
-    for (width, expected) in [(20, "23 pending"), (8, "▸ 23")] {
+    for (width, expected) in [(20, "▸ 23"), (8, "▸ 23")] {
         let narrow = Rect::new(0, 0, width, 1);
         let mut buffer = ratatui::buffer::Buffer::empty(narrow);
-        let widget = Paragraph::new(Vec::<Line>::new()).block(
-            Block::default()
-                .borders(Borders::TOP | Borders::LEFT)
-                .title(pending_input_title(UiLanguage::Auto, 23, false, width)),
-        );
+        let widget = Paragraph::new(Vec::<Line>::new())
+            .block(Block::default().title(pending_input_title(UiLanguage::Auto, 23, false, width)));
         ratatui::widgets::Widget::render(widget, narrow, &mut buffer);
         let header = (0..width)
             .map(|x| buffer[(x, 0)].symbol())
@@ -11293,9 +11280,9 @@ fn pending_steer_ui_uses_the_shared_next_label_and_live_flush_action() {
     assert!(!rendered.contains("NEXT TURN"));
     assert!(rendered.contains("focus on the failing test"));
     assert!(!rendered.contains("esc send input"));
+    // The hint is now the short action-group form, not spelled-out prose.
     let title = pending_input_title(UiLanguage::Auto, 1, true, 120);
-    assert!(title.contains("esc send input · ↑"), "{title}");
-    assert!(title.contains("↑ edit / recall input"), "{title}");
+    assert!(title.contains("esc send · ↑ recall"), "{title}");
 }
 
 #[test]

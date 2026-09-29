@@ -9274,22 +9274,22 @@ impl BorgTerminal {
                         Vec::new()
                     })
                     .block(
-                        Block::default()
-                            .borders(Borders::TOP | Borders::LEFT)
-                            .border_style(Style::default().fg(Color::DarkGray))
-                            .title(pending_input_title_line(
-                                &pending_input_title(
-                                    ui_language,
-                                    queued_prompts.len(),
-                                    self.pending_input_expanded,
-                                    chunks[1].width,
-                                ),
-                                if self.focused_child.is_some() {
-                                    SUBAGENT_PURPLE
-                                } else {
-                                    BORG_ORANGE
-                                },
-                            )),
+                        // No border: the action groups carry no box, and a
+                        // frame here is what made pending input read as a panel
+                        // beside the transcript rather than a group in it.
+                        Block::default().title(pending_input_title_line(
+                            &pending_input_title(
+                                ui_language,
+                                queued_prompts.len(),
+                                self.pending_input_expanded,
+                                chunks[1].width,
+                            ),
+                            if self.focused_child.is_some() {
+                                SUBAGENT_PURPLE
+                            } else {
+                                BORG_ORANGE
+                            },
+                        )),
                     ),
                     chunks[1],
                 );
@@ -13991,73 +13991,40 @@ fn queued_prompt_panel_height(
         .min(u16::MAX as usize) as u16
 }
 
+/// Pending input reads as an action group: the same `▸`/`▾` disclosure, the
+/// same `label · count` summary, the same hint after it. It used to be a
+/// bordered panel with `click to expand` spelled out, which is a different
+/// visual language for the same thing the transcript already has a word for.
 fn pending_input_title(
     language: UiLanguage,
     count: usize,
     expanded: bool,
     panel_width: u16,
 ) -> String {
-    let (arrow, action) = if expanded {
-        ("▾", "collapse")
-    } else {
-        ("▸", "expand")
-    };
-    let with_controls = format!(
-        " {arrow} {} · {count} · click to {action} · esc send input · ↑ edit / recall input ",
-        ui_text(language, "Pending Input")
-    );
-    if with_controls.width() < usize::from(panel_width) {
-        return with_controls;
+    let arrow = if expanded { "▾" } else { "▸" };
+    let label = ui_text(language, "Pending Input");
+    let with_hint = format!(" {arrow} {label} · {count} · esc send · ↑ recall ");
+    if with_hint.width() < usize::from(panel_width) {
+        return with_hint;
     }
-    let short_controls = format!(
-        " {arrow} {} · {count} · click to {action} · esc send · ↑ recall ",
-        ui_text(language, "Pending Input")
-    );
-    if short_controls.width() < usize::from(panel_width) {
-        return short_controls;
-    }
-    let full = format!(
-        " {arrow} {} · {count} · click to {action} ",
-        ui_text(language, "Pending Input")
-    );
-    if full.width() < usize::from(panel_width) {
-        return full;
-    }
-    let compact = format!(" {arrow} {} · {count} ", ui_text(language, "Pending Input"));
-    if compact.width() < usize::from(panel_width) {
-        return compact;
-    }
-    let short = format!(" {arrow} {count} pending ");
+    let short = format!(" {arrow} {label} · {count} ");
     if short.width() < usize::from(panel_width) {
-        short
-    } else {
-        format!(" {arrow} {count} ")
+        return short;
     }
+    format!(" {arrow} {count} ")
 }
 
-/// Accent the heading and count; controls are dark grey with their keys in
-/// white, like the footer's command and palette hints.
-fn pending_input_title_line(title: &str, accent: Color) -> Line<'static> {
-    let (head, controls) = match title.match_indices(" · ").nth(1) {
-        Some((at, _)) => title.split_at(at),
-        None => (title, ""),
-    };
-    let mut spans = vec![Span::styled(
-        head.to_string(),
-        Style::default().fg(accent).add_modifier(Modifier::BOLD),
-    )];
-    for (index, word) in controls.split(' ').enumerate() {
-        if index > 0 {
-            spans.push(Span::raw(" "));
-        }
-        let color = if matches!(word, "click" | "esc" | "↑") {
-            Color::White
-        } else {
-            Color::DarkGray
-        };
-        spans.push(Span::styled(word.to_string(), Style::default().fg(color)));
+/// One grey line, matching `tool_window_header`: a disclosure marker and the
+/// summary beside it, in the same colour as every other group header.
+fn pending_input_title_line(title: &str, _accent: Color) -> Line<'static> {
+    let grey = Style::default().fg(Color::DarkGray);
+    match title.trim_start().split_once(' ') {
+        Some((marker, rest)) => Line::from(vec![
+            Span::styled(format!("{marker} "), grey),
+            Span::styled(rest.trim_end().to_string(), grey),
+        ]),
+        None => Line::from(Span::styled(title.trim().to_string(), grey)),
     }
-    Line::from(spans)
 }
 
 fn wrapped_pending_prompt_lines(text: &str, width: usize) -> Vec<String> {
