@@ -456,6 +456,7 @@ struct RuntimeSessionStore {
     context_complete: bool,
     workspace_projection: Option<WorkspaceProjection>,
     projection_diagnostics: VecDeque<SessionEvent>,
+    plan_projection_generation: u64,
 }
 
 #[derive(Clone)]
@@ -791,6 +792,7 @@ impl RuntimeSessionStore {
             context_complete,
             workspace_projection: None,
             projection_diagnostics: VecDeque::new(),
+            plan_projection_generation: 0,
         }
     }
 
@@ -911,6 +913,14 @@ impl RuntimeSessionStore {
 
     /// Fold a persisted event into the live context, exactly as `append` does.
     async fn absorb_appended(&mut self, event: &SessionEvent) -> Result<()> {
+        if matches!(
+            event.kind,
+            SessionEventKind::PlanProjected { .. }
+                | SessionEventKind::AgentPlanProjected { .. }
+                | SessionEventKind::ContextCleared
+        ) {
+            self.plan_projection_generation = self.plan_projection_generation.wrapping_add(1);
+        }
         if matches!(event.kind, SessionEventKind::ContextCleared) {
             self.context_events.clear();
             self.context_complete = true;
@@ -1105,6 +1115,48 @@ impl TurnPhase {
             Self::Active => "turn phase: provider active",
             Self::Draining => "turn phase: provider draining",
             Self::Cancelling => "turn phase: cancelling",
+        }
+    }
+}
+
+struct SessionBranchTrace {
+    session_id: Uuid,
+    branch: &'static str,
+    backlog: usize,
+    started: Option<Instant>,
+}
+
+impl SessionBranchTrace {
+    fn begin(enabled: bool, session_id: Uuid, branch: &'static str, backlog: usize) -> Self {
+        if enabled {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "type": "session_loop_trace", "stage": "enter", "session_id": session_id,
+                    "branch": branch, "provider_backlog": backlog, "at": Utc::now(),
+                })
+            );
+        }
+        Self {
+            session_id,
+            branch,
+            backlog,
+            started: enabled.then(Instant::now),
+        }
+    }
+}
+
+impl Drop for SessionBranchTrace {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "type": "session_loop_trace", "stage": "exit", "session_id": self.session_id,
+                    "branch": self.branch, "provider_backlog": self.backlog,
+                    "elapsed_us": started.elapsed().as_micros(), "at": Utc::now(),
+                })
+            );
         }
     }
 }
@@ -2245,14 +2297,7 @@ async fn run_agent_session_store_kernel_inner(
         participant_id,
         observed_revision: None,
     };
-    project_work_plan(
-        &mut journal,
-        &events,
-        session_id,
-        &work_plan.snapshot().await?,
-        work_plan.participant_id,
-    )
-    .await?;
+    let mut work_plan_refresh = WorkPlanRefresh::default();
     let mut work_plan_tick = tokio::time::interval(Duration::from_secs(2));
     work_plan_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Explicit user-stop gate. A human Escape engages it; only an explicit
@@ -2563,14 +2608,7 @@ async fn run_agent_session_store_kernel_inner(
             batch: Vec::new(),
         });
     }
-    refresh_work_plans(
-        &mut journal,
-        &events,
-        session_id,
-        &work_plan,
-        subagents.as_ref(),
-    )
-    .await?;
+    work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
     'session: loop {
         if let Some(receiver) = title_result_rx.as_mut() {
             match receiver.try_recv() {
@@ -3091,8 +3129,15 @@ async fn run_agent_session_store_kernel_inner(
                                         .await?;
                                         continue 'session;
                                     }
+                    result = work_plan_refresh.next(), if work_plan_refresh.is_pending() => {
+                        match result {
+                            Ok(kind) => work_plan_refresh.apply(kind, &mut journal, &events, &work_plan).await?,
+                            Err(error) => tracing::warn!(%session_id, %error, "work-plan collection failed; retrying on the next maintenance tick"),
+                        }
+                        continue;
+                    }
                     _ = work_plan_tick.tick() => {
-                        refresh_work_plans(&mut journal, &events, session_id, &work_plan, subagents.as_ref()).await?;
+                        work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
                         continue;
                     }
                                 };
@@ -5028,6 +5073,7 @@ async fn run_agent_session_store_kernel_inner(
         let mut batch_pending_after_interrupt = false;
         let mut interrupted_result = None;
         let mut generation = crate::generation_activity::GenerationActivity::new(launch.provider);
+        let trace_loop = std::env::var("BORG_TRACE_SESSION_LOOP").as_deref() == Ok("1");
         let mut watchdog = TurnWatchdog::new(TurnPhase::AwaitingProvider);
         let mut watchdog_poll = tokio::time::interval(TURN_WATCHDOG_POLL_INTERVAL);
         // A sleeping host freezes the monotonic clock, so ticks would otherwise
@@ -5732,6 +5778,7 @@ async fn run_agent_session_store_kernel_inner(
                 // Commands (interrupts, steers) outrank team and watchdog
                 // traffic: a busy team must not delay the person's Esc.
                 command = next_host_command(&mut deferred_commands, &mut commands) => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "command", provider_events.len() + provider_carry.len());
                     let Some(command) = command else {
                         running.0.abort();
                         let _ = (&mut running.0).await;
@@ -6592,6 +6639,7 @@ async fn run_agent_session_store_kernel_inner(
                 // The actor owns the journal; an append from another task
                 // would leave the live context behind and change replay.
                 activity = child_activity_rx.recv(), if child_activity_open => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "child_activity", provider_events.len() + provider_carry.len());
                     let Some(activity) = activity else {
                         // The forwarder is gone, so nothing can arrive on this
                         // channel again.
@@ -6608,6 +6656,7 @@ async fn run_agent_session_store_kernel_inner(
                     ).await?;
                 }
                 message = root_message_rx.recv(), if owns_team => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "root_message", provider_events.len() + provider_carry.len());
                     match message {
                         Ok(message) => {
                             team_message_ids.insert(message.message_id);
@@ -6625,6 +6674,7 @@ async fn run_agent_session_store_kernel_inner(
                     }
                 }
                 _ = root_inbox_tick.tick(), if owns_team => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "root_inbox_refresh", provider_events.len() + provider_carry.len());
                     refresh_durable_root_inbox(
                         &mut journal,
                         &events,
@@ -6634,6 +6684,7 @@ async fn run_agent_session_store_kernel_inner(
                     ).await?;
                 }
                 _ = team_ack_tick.tick(), if owns_team && !team_broadcasts.is_empty() => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "team_ack_refresh", provider_events.len() + provider_carry.len());
                     refresh_team_broadcasts(&mut journal, &events, session_id,
                         subagents.as_ref().expect("team broadcast requires coordinator"),
                         &mut team_broadcasts).await?;
@@ -6643,6 +6694,7 @@ async fn run_agent_session_store_kernel_inner(
                 // worker being stalled.
                 _ = watchdog_poll.tick(), if pending_approval.is_none()
                     && pending_provider_interaction.is_none() => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "watchdog", provider_events.len() + provider_carry.len());
                     let error = match watchdog.verdict() {
                         WatchdogVerdict::Healthy => continue,
                         WatchdogVerdict::Stalling(detail) => {
@@ -6835,6 +6887,7 @@ async fn run_agent_session_store_kernel_inner(
                 }
                 kind = next_provider_event(&mut provider_carry, &mut provider_events),
                     if provider_events_open || !provider_carry.is_empty() => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "provider_events", provider_events.len() + provider_carry.len());
                     let Some(first_kind) = kind else {
                         provider_events_open = false;
                         continue;
@@ -6999,8 +7052,15 @@ async fn run_agent_session_store_kernel_inner(
                     }
                     }
                 }
+                result = work_plan_refresh.next(), if work_plan_refresh.is_pending() => {
+                    match result {
+                        Ok(kind) => work_plan_refresh.apply(kind, &mut journal, &events, &work_plan).await?,
+                        Err(error) => tracing::warn!(%session_id, %error, "work-plan collection failed; retrying on the next maintenance tick"),
+                    }
+                }
                 _ = work_plan_tick.tick() => {
-                    refresh_work_plans(&mut journal, &events, session_id, &work_plan, subagents.as_ref()).await?;
+                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "work_plan_refresh", provider_events.len() + provider_carry.len());
+                    work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
                 }
             }
         }
@@ -11666,12 +11726,34 @@ async fn migrate_child_plan(
     child_id: Uuid,
     participant_id: Uuid,
 ) -> Result<()> {
+    let state = journal.state(session_id).await?;
+    if let Some(kind) = collect_child_plan_migration(
+        journal.store.as_ref(),
+        &state,
+        plan,
+        child_id,
+        participant_id,
+    )
+    .await?
+    {
+        record(journal, events, session_id, kind).await?;
+    }
+    Ok(())
+}
+
+async fn collect_child_plan_migration(
+    store: &dyn SessionStore,
+    state: &SessionState,
+    plan: &SessionWorkPlan,
+    child_id: Uuid,
+    participant_id: Uuid,
+) -> Result<Option<SessionEventKind>> {
     if plan
         .store
         .legacy_plan_migrated(plan.workspace_id, plan.actor_id, child_id)
         .await?
     {
-        return Ok(());
+        return Ok(None);
     }
     let roster = plan
         .store
@@ -11687,16 +11769,10 @@ async fn migrate_child_plan(
         crate::WorkspaceRole::Owner | crate::WorkspaceRole::Admin | crate::WorkspaceRole::Editor
     ) || (role == crate::WorkspaceRole::Contributor
         && plan.actor_id == participant_id);
-    if !can_migrate
-        && journal
-            .state(session_id)
-            .await?
-            .agent_plans
-            .contains_key(&child_id)
-    {
-        return Ok(());
+    if !can_migrate && state.agent_plans.contains_key(&child_id) {
+        return Ok(None);
     }
-    let items = local_legacy_plan(journal.store.as_ref(), child_id).await?;
+    let items = local_legacy_plan(store, child_id).await?;
     if can_migrate {
         plan.store
             .ensure_legacy_plan_migrated(
@@ -11708,13 +11784,16 @@ async fn migrate_child_plan(
             )
             .await?;
     } else if !items.is_empty() {
-        record(journal, events, session_id, SessionEventKind::Error {
-            message: format!("Legacy todos for session {child_id} remain in its journal: migration requires an authorized coordinator. Showing the canonical assigned plan."),
-        }).await?;
+        return Ok(Some(SessionEventKind::Error {
+            message: format!(
+                "Legacy todos for session {child_id} remain in its journal: migration requires an authorized coordinator. Showing the canonical assigned plan."
+            ),
+        }));
     }
-    Ok(())
+    Ok(None)
 }
 
+#[derive(Clone)]
 struct SessionWorkPlan {
     session_id: Uuid,
     actor_id: Uuid,
@@ -11805,91 +11884,161 @@ async fn project_work_plan(
     Ok(())
 }
 
-async fn refresh_work_plans(
-    journal: &mut RuntimeSessionStore,
-    events: &mpsc::Sender<SessionEvent>,
-    session_id: Uuid,
+#[derive(Default)]
+struct WorkPlanRefresh {
+    task: Option<AbortTask<Result<VecDeque<SessionEventKind>>>>,
+    pending: VecDeque<SessionEventKind>,
+    generation: u64,
+    identity: Option<(Uuid, Uuid, Uuid, Uuid)>,
+}
+
+impl WorkPlanRefresh {
+    fn is_pending(&self) -> bool {
+        self.task.is_some() || !self.pending.is_empty()
+    }
+
+    fn start(
+        &mut self,
+        journal: &RuntimeSessionStore,
+        plan: &SessionWorkPlan,
+        team: Option<&SubagentCoordinator>,
+    ) {
+        if self.is_pending() {
+            return;
+        }
+        self.generation = journal.plan_projection_generation;
+        self.identity = Some((
+            plan.session_id,
+            plan.workspace_id,
+            plan.actor_id,
+            plan.participant_id,
+        ));
+        let store = Arc::clone(&journal.store);
+        let plan = plan.clone();
+        let team = team.cloned();
+        self.task = Some(AbortTask(tokio::spawn(async move {
+            collect_work_plans(store.as_ref(), &plan, team.as_ref()).await
+        })));
+    }
+
+    async fn next(&mut self) -> Result<Option<SessionEventKind>> {
+        if self.pending.is_empty() {
+            if let Some(task) = self.task.as_mut() {
+                let result = (&mut task.0).await.context("work plan collector failed");
+                self.task = None;
+                self.pending = result??;
+            }
+        }
+        Ok(self.pending.pop_front())
+    }
+
+    async fn apply(
+        &mut self,
+        kind: Option<SessionEventKind>,
+        journal: &mut RuntimeSessionStore,
+        events: &mpsc::Sender<SessionEvent>,
+        plan: &SessionWorkPlan,
+    ) -> Result<()> {
+        if self.identity
+            != Some((
+                plan.session_id,
+                plan.workspace_id,
+                plan.actor_id,
+                plan.participant_id,
+            ))
+            || self.generation != journal.plan_projection_generation
+        {
+            self.pending.clear();
+            return Ok(());
+        }
+        if let Some(kind) = kind {
+            record(journal, events, plan.session_id, kind).await?;
+            self.generation = journal.plan_projection_generation;
+        }
+        Ok(())
+    }
+}
+
+async fn collect_work_plans(
+    store: &dyn SessionStore,
     plan: &SessionWorkPlan,
     subagents: Option<&SubagentCoordinator>,
-) -> Result<()> {
-    project_work_plan(
-        journal,
-        events,
-        session_id,
-        &plan.snapshot().await?,
-        plan.participant_id,
-    )
-    .await?;
+) -> Result<VecDeque<SessionEventKind>> {
+    let state = store.state(plan.session_id).await?;
+    let mut projections = VecDeque::new();
+    let snapshot = plan.snapshot().await?;
+    if state.plan_participant_id != Some(plan.participant_id)
+        || state
+            .plan_workspace_revision
+            .is_none_or(|revision| revision < snapshot.revision)
+    {
+        projections.push_back(SessionEventKind::PlanProjected {
+            participant_id: plan.participant_id,
+            items: assigned_plan(&snapshot),
+            workspace_revision: snapshot.revision,
+        });
+    }
     if let Some(subagents) = subagents {
         let roster = plan
             .store
             .workspace_roster(plan.workspace_id, plan.actor_id)
             .await?;
         for child in subagents.list(None).await {
-            if child.session_id == session_id {
+            if child.session_id == plan.session_id {
                 continue;
             }
-            let Some(binding) = journal.store.workspace_binding(child.session_id).await? else {
+            let Some(binding) = store.workspace_binding(child.session_id).await? else {
                 continue;
             };
             if binding.workspace_id != plan.workspace_id {
                 continue;
             }
-            let child_participant_id = journal
-                .store
+            let participant_id = store
                 .state(child.session_id)
                 .await?
                 .plan_participant_id
                 .unwrap_or(binding.participant_id);
             if !roster
                 .iter()
-                .any(|entry| entry.participant.id == child_participant_id)
+                .any(|entry| entry.participant.id == participant_id)
             {
                 continue;
             }
-            migrate_child_plan(
-                journal,
-                events,
-                session_id,
-                plan,
-                child.session_id,
-                child_participant_id,
-            )
-            .await?;
+            if let Some(kind) =
+                collect_child_plan_migration(store, &state, plan, child.session_id, participant_id)
+                    .await?
+            {
+                projections.push_back(kind);
+            }
             let snapshot = plan
                 .store
                 .work_items(
                     binding.workspace_id,
                     plan.participant_id,
-                    Some(child_participant_id),
+                    Some(participant_id),
                 )
                 .await?;
-            let state = journal.state(session_id).await?;
             if state
                 .agent_plans
                 .get(&child.session_id)
                 .is_some_and(|current| {
-                    current.participant_id == child_participant_id
+                    current.participant_id == participant_id
                         && current.workspace_revision >= snapshot.revision
                 })
             {
                 continue;
             }
-            record(
-                journal,
-                events,
-                session_id,
-                SessionEventKind::AgentPlanProjected {
-                    session_id: child.session_id,
-                    participant_id: child_participant_id,
-                    items: assigned_plan(&snapshot),
-                    workspace_revision: snapshot.revision,
-                },
-            )
-            .await?;
+            projections.push_back(SessionEventKind::AgentPlanProjected {
+                session_id: child.session_id,
+                participant_id,
+                items: assigned_plan(&snapshot),
+                workspace_revision: snapshot.revision,
+            });
         }
     }
-    Ok(())
+    #[cfg(test)]
+    tests::pause_work_plan_refresh(plan.session_id).await;
+    Ok(projections)
 }
 
 async fn apply_model_todo_request(

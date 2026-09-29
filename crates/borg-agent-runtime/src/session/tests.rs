@@ -20602,9 +20602,15 @@ async fn workspace_plan_rejects_stale_replacement_and_unassigns_without_deleting
         .unwrap();
     assert_eq!(plan.snapshot().await.unwrap().revision, first.revision);
     let before_refresh = store.state(session_id).await.unwrap().latest_sequence;
-    refresh_work_plans(&mut journal, &events, session_id, &plan, None)
-        .await
-        .unwrap();
+    let mut refresh = WorkPlanRefresh::default();
+    refresh.start(&journal, &plan, None);
+    while refresh.is_pending() {
+        let kind = refresh.next().await.unwrap();
+        refresh
+            .apply(kind, &mut journal, &events, &plan)
+            .await
+            .unwrap();
+    }
     assert_eq!(
         store.state(session_id).await.unwrap().latest_sequence,
         before_refresh
@@ -21599,4 +21605,234 @@ async fn a_fatal_compaction_failure_is_not_retried() {
         1,
         "an auth failure must reach the user on the first attempt, not after a backoff"
     );
+}
+
+
+// Session-keyed, one-shot barriers leave parallel actor tests independent.
+static WORK_PLAN_REFRESH_BARRIERS: Mutex<Vec<(Uuid, Arc<Notify>, Arc<Notify>)>> =
+    Mutex::new(Vec::new());
+
+pub(super) async fn pause_work_plan_refresh(session_id: Uuid) {
+    let barrier = {
+        let mut barriers = WORK_PLAN_REFRESH_BARRIERS.lock().unwrap();
+        barriers
+            .iter()
+            .position(|(id, _, _)| *id == session_id)
+            .map(|index| barriers.remove(index))
+    };
+    if let Some((_, entered, release)) = barrier {
+        entered.notify_one();
+        release.notified().await;
+    }
+}
+
+// A compiler check cannot pin scheduling: a real actor must journal provider
+// output and serve human commands while its maintenance collector is blocked.
+#[tokio::test]
+async fn blocked_plan_collector_does_not_block_provider_or_stop() {
+    blocked_plan_collector_actor(false).await;
+}
+
+// A maintenance snapshot collected before a direct plan update must not append
+// an older projection after that update, even when the collector finishes later.
+#[tokio::test]
+async fn delayed_plan_collection_cannot_overwrite_direct_plan_update() {
+    blocked_plan_collector_actor(true).await;
+}
+
+async fn blocked_plan_collector_actor(update_plan: bool) {
+    struct MarkerExecutor(Arc<Notify>);
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for MarkerExecutor {
+        async fn execute(
+            &self,
+            _turn: AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            self.0.notified().await;
+            for kind in ["native_model_message", "native_model_request"] {
+                events
+                    .send(SessionEventKind::ProviderEvent {
+                        provider: CodingProvider::Codex,
+                        kind: kind.into(),
+                        payload: json!({"maintenance_test_marker": true}),
+                    })
+                    .await
+                    .unwrap();
+            }
+            std::future::pending().await
+        }
+    }
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(postgres);
+    store.create_session(session_id).await.unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    WORK_PLAN_REFRESH_BARRIERS
+        .lock()
+        .unwrap()
+        .push((session_id, entered.clone(), release.clone()));
+    let provider_release = Arc::new(Notify::new());
+    let (commands, command_rx) = mpsc::channel(8);
+    let (events, mut event_rx) = mpsc::channel(256);
+    let mut capabilities = crate::SessionCapabilities::default();
+    capabilities.subagents = false;
+    capabilities.multiplayer = false;
+    let launch = LaunchSession {
+        request_id: Uuid::new_v4(),
+        cwd: root.path().to_path_buf(),
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        fast: Some(false),
+        ultrafast: None,
+        response_language: crate::ResponseLanguage::Auto,
+        permission_mode: PermissionMode::Manual,
+        name: None,
+        initial_prompt: Some("maintenance must not block this turn".into()),
+        capabilities,
+        subagent_concurrency_limit: None,
+        extension_skill_roots: Vec::new(),
+        team_policy: None,
+    };
+    let actor_store = store.clone();
+    let lock = root.path().join("maintenance.lock");
+    let executor = Arc::new(MarkerExecutor(provider_release.clone()));
+    let actor = tokio::spawn(async move {
+        run_session_actor(
+            &lock,
+            session_id,
+            launch,
+            command_rx,
+            events,
+            executor,
+            actor_store,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("real maintenance collector reaches its barrier");
+    provider_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut markers = HashSet::new();
+        while markers.len() < 2 {
+            let event = event_rx.recv().await.expect("actor remains available");
+            if let SessionEventKind::ProviderEvent { kind, payload, .. } = event.kind {
+                if payload.get("maintenance_test_marker") == Some(&json!(true)) {
+                    markers.insert(kind);
+                }
+            }
+        }
+    })
+    .await
+    .expect("provider output is delivered before releasing maintenance");
+    let journal = store.events_after(session_id, 0, 512).await.unwrap();
+    assert_eq!(
+        journal
+            .iter()
+            .filter(|event| matches!(&event.kind,
+        SessionEventKind::ProviderEvent { payload, .. }
+            if payload.get("maintenance_test_marker") == Some(&json!(true))))
+            .count(),
+        2
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = event_rx.recv().await.expect("watchdog remains available");
+            if matches!(&event.kind, SessionEventKind::StatusChanged { detail: Some(detail), .. }
+                if detail.contains("; waiting for provider;"))
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("watchdog warning is served while maintenance is blocked");
+
+    if update_plan {
+        commands
+            .send(HostCommand::Todo {
+                session_id,
+                action: TodoAction::Add {
+                    content: "newer direct plan".into(),
+                },
+            })
+            .await
+            .unwrap();
+        let (revision, sequence) = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = event_rx.recv().await.expect("direct plan update is served");
+                if let SessionEventKind::PlanProjected {
+                    items,
+                    workspace_revision,
+                    ..
+                } = event.kind
+                {
+                    if items.iter().any(|item| item.content == "newer direct plan") {
+                        break (workspace_revision, event.sequence);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("human plan update is served while collector is blocked");
+        let next_entered = Arc::new(Notify::new());
+        let next_release = Arc::new(Notify::new());
+        WORK_PLAN_REFRESH_BARRIERS.lock().unwrap().push((
+            session_id,
+            next_entered.clone(),
+            next_release.clone(),
+        ));
+        release.notify_one();
+        // A second collection proves the stale completion was consumed.
+        commands
+            .send(HostCommand::Interrupt { session_id })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = event_rx
+                    .recv()
+                    .await
+                    .expect("interrupted actor remains available");
+                if matches!(
+                    event.kind,
+                    SessionEventKind::StatusChanged {
+                        status: SessionStatus::Ready,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), next_entered.notified())
+            .await
+            .expect("stale collector was consumed and a fresh collection started");
+        let later = store.events_after(session_id, sequence, 512).await.unwrap();
+        assert!(!later.iter().any(|event| matches!(&event.kind,
+            SessionEventKind::PlanProjected { workspace_revision, .. } if *workspace_revision < revision)));
+        let state = store.state(session_id).await.unwrap();
+        assert_eq!(state.plan_workspace_revision, Some(revision));
+        assert_eq!(state.todos[0].content, "newer direct plan");
+        next_release.notify_one();
+    }
+    // In the first case maintenance remains blocked even through Stop.
+    commands
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), actor)
+        .await
+        .expect("Stop is not queued behind the collector")
+        .unwrap()
+        .unwrap();
+    scratch.discard().await;
 }

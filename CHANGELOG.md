@@ -7,6 +7,10 @@ Git comparison.
 
 ### Runtime responsiveness
 
+- Shared-work plan projection collection runs off the session actor so workspace
+  scans cannot block provider events, steering or watchdogs. Revision-fenced
+  application preserves newer direct plan updates.
+
 - Python and Bun actions still running after 60 seconds continue as background
   watchers. Completion wakes the session; `list_watchers` retrieves the result
   and `stop_watcher` cancels execution.
