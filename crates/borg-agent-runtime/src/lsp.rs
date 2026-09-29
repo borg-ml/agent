@@ -687,8 +687,8 @@ impl LspService {
                 results.insert(label, skipped_for_budget_report());
                 continue;
             }
-            let value = match client.workspace_diagnostics().await {
-                Ok(value) => value,
+            let value = workspace_diagnostic_result(match client.workspace_diagnostics().await {
+                Ok(value) => Ok(value),
                 Err(error) if is_unknown_workspace_diagnostics_request(&error) => {
                     let spec = spec_for_id(key.server_id)
                         .with_context(|| format!("unknown language server `{}`", key.server_id))?;
@@ -697,13 +697,11 @@ impl LspService {
                         .await
                         .with_context(|| {
                             format!("{label} document diagnostics fallback failed ({error:#})")
-                        })?
+                        })
                 }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("{label} workspace diagnostics request failed"));
-                }
-            };
+                Err(error) => Err(error)
+                    .with_context(|| format!("{label} workspace diagnostics request failed")),
+            });
             results.insert(label, value);
         }
         Ok(Value::Object(results))
@@ -1501,6 +1499,18 @@ fn workspace_label(key: &LspClientKey, server_count: usize) -> String {
     } else {
         format!("{}@{}", key.server_id, key.workspace_root.display())
     }
+}
+
+// One failed server must not hide diagnostics from healthy workspaces. Keep
+// failure explicit: an empty item array here is NOT a clean diagnostic pass.
+fn workspace_diagnostic_result(result: Result<Value>) -> Value {
+    result.unwrap_or_else(|error| {
+        json!({
+            "items": [],
+            "partial": true,
+            "partialReason": format!("{error:#}")
+        })
+    })
 }
 
 fn is_unknown_workspace_diagnostics_request(error: &anyhow::Error) -> bool {
@@ -2505,6 +2515,20 @@ mod tests {
                 .opened_versions
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn workspace_server_failure_is_explicit_partial_report() {
+        let failed = workspace_diagnostic_result(Err(anyhow::anyhow!("workspace request timeout")));
+        assert_eq!(failed["partial"], true);
+        assert!(
+            failed["partialReason"]
+                .as_str()
+                .unwrap()
+                .contains("timeout")
+        );
+        let healthy = json!({ "items": [{ "uri": "file:///healthy.c", "items": [] }] });
+        assert_eq!(workspace_diagnostic_result(Ok(healthy.clone())), healthy);
     }
 
     /// A leased-but-unstarted server used to appear in `active_servers` and
