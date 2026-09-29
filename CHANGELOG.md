@@ -5,6 +5,25 @@ Git comparison.
 
 ## Unreleased (since 0.13.1)
 
+### Models and reasoning
+
+- New GPT sessions default to `gpt-6.1-sol` at medium reasoning effort.
+- Codex subscription requests now select sequential reasoning-summary delivery,
+  and completed summary events are displayed even when no text deltas arrive.
+  Summaries already streamed as deltas are not duplicated. Models may still
+  omit summaries; Borg cannot display text the provider does not send.
+
+### Windows
+
+- Windows foreground sessions no longer launch an unreachable detached session
+  host. Detached local hosts require Unix local session control; explicit
+  requests on Windows now fail promptly with foreground advice.
+- PostgreSQL server discovery now finds `.exe` binaries on PATH and standard
+  `ProgramFiles/PostgreSQL` installations, including PostgreSQL 18. Installation
+  advice names the exact `PostgreSQL.PostgreSQL.18` winget package.
+- The Windows installer and `borg update` accept ZIPs with a containing folder
+  as well as flat archives, and install the native provider alongside Borg.
+
 ## 0.13.1 (2026-09-29)
 
 ### Models and CI

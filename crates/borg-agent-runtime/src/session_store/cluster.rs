@@ -693,6 +693,8 @@ fn last_error_line(stderr: &[u8]) -> String {
 
 /// Find a PostgreSQL server binary, or explain how to install one.
 fn locate_binary(name: &str) -> Result<PathBuf> {
+    #[cfg(windows)]
+    let name = &format!("{name}.exe");
     if let Some(found) = search_path(name).or_else(|| search_prefixes(name)) {
         return Ok(found);
     }
@@ -718,8 +720,13 @@ fn search_path(name: &str) -> Option<PathBuf> {
 /// Version-suffixed directories (`/usr/lib/postgresql/16/bin`) are expanded one
 /// level and taken in descending order, so the newest installed server wins.
 fn search_prefixes(name: &str) -> Option<PathBuf> {
-    for prefix in BINARY_SEARCH_PREFIXES {
-        let prefix = Path::new(prefix);
+    let prefixes = BINARY_SEARCH_PREFIXES.iter().map(PathBuf::from);
+    #[cfg(windows)]
+    let prefixes = std::env::var_os("ProgramFiles")
+        .map(|root| PathBuf::from(root).join("PostgreSQL"))
+        .into_iter()
+        .chain(prefixes);
+    for prefix in prefixes {
         let direct = prefix.join(name);
         if is_executable(&direct) {
             return Some(direct);
@@ -760,7 +767,7 @@ fn install_hint() -> &'static str {
     if cfg!(target_os = "macos") {
         "  brew install postgresql@17"
     } else if cfg!(target_os = "windows") {
-        "  winget install PostgreSQL.PostgreSQL"
+        "  winget install --id PostgreSQL.PostgreSQL.18 --exact"
     } else {
         "  Debian/Ubuntu:  sudo apt install postgresql\n  \
            Fedora/RHEL:    sudo dnf install postgresql-server\n  \

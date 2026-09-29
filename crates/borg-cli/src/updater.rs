@@ -317,11 +317,12 @@ fn extract_executable(archive: &[u8], destination: &Path) -> Result<()> {
     extract_windows_executable(archive, destination, "borg.exe")
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn extract_windows_executable(archive: &[u8], destination: &Path, name: &str) -> Result<()> {
     let mut zip = zip::ZipArchive::new(Cursor::new(archive)).context("invalid Borg release zip")?;
+    let archive_name = format!("{}{name}", windows_archive_root(&mut zip)?);
     let mut entry = zip
-        .by_name(name)
+        .by_name(&archive_name)
         .with_context(|| format!("Borg release zip does not contain `{name}`"))?;
     let mut output = fs::File::create(destination).context("failed to stage Borg update")?;
     std::io::copy(&mut entry, &mut output).context("failed to extract Borg update")?;
@@ -330,11 +331,37 @@ fn extract_windows_executable(archive: &[u8], destination: &Path, name: &str) ->
 
 #[cfg(windows)]
 fn extract_native_provider(archive: &[u8], destination: &Path) -> Result<()> {
+    extract_windows_native_provider(archive, destination)
+}
+
+#[cfg(any(windows, test))]
+fn windows_archive_root(zip: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<String> {
+    let mut root = None;
+    for index in 0..zip.len() {
+        let entry = zip.by_index(index).context("invalid Borg release entry")?;
+        if entry.is_file()
+            && entry
+                .enclosed_name()
+                .is_some_and(|path| path.file_name() == Some(std::ffi::OsStr::new("borg.exe")))
+        {
+            anyhow::ensure!(
+                root.is_none(),
+                "Borg release zip contains multiple borg.exe files"
+            );
+            root = entry.name().strip_suffix("borg.exe").map(str::to_owned);
+        }
+    }
+    root.context("Borg release zip does not contain `borg.exe`")
+}
+
+#[cfg(any(windows, test))]
+fn extract_windows_native_provider(archive: &[u8], destination: &Path) -> Result<()> {
     let mut zip = zip::ZipArchive::new(Cursor::new(archive)).context("invalid Borg release zip")?;
     fs::create_dir_all(destination)
         .context("failed to create native provider staging directory")?;
+    let root = windows_archive_root(&mut zip)?;
     for name in ["claude.exe", "manifest.json", "package.json", "LICENSE.md"] {
-        let archive_name = format!("providers/claude/{name}");
+        let archive_name = format!("{root}providers/claude/{name}");
         let mut entry = match zip.by_name(&archive_name) {
             Ok(entry) => entry,
             Err(zip::result::ZipError::FileNotFound) if name == "LICENSE.md" => continue,
@@ -1038,13 +1065,13 @@ mod tests {
         assert!(!installed.join("LICENSE.md").exists());
     }
 
-    #[cfg(windows)]
     #[test]
-    fn windows_native_provider_archives_keep_an_optional_license() {
+    fn windows_archives_extract_borg_and_its_native_provider() {
         use zip::write::SimpleFileOptions;
 
-        for has_license in [false, true] {
+        for (root, has_license) in [("", false), ("", true), ("borg-windows/", true)] {
             let mut files: Vec<(&str, &[u8])> = vec![
+                ("borg.exe", b"borg-binary"),
                 ("providers/claude/claude.exe", b"claude-binary"),
                 ("providers/claude/manifest.json", b"{}"),
                 ("providers/claude/package.json", b"{}"),
@@ -1055,24 +1082,25 @@ mod tests {
             let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
             for (name, bytes) in files {
                 archive
-                    .start_file(name, SimpleFileOptions::default())
+                    .start_file(format!("{root}{name}"), SimpleFileOptions::default())
                     .unwrap();
                 archive.write_all(bytes).unwrap();
             }
             let archive = archive.finish().unwrap().into_inner();
             let directory = tempfile::tempdir().unwrap();
             let staged = directory.path().join("staged");
-            extract_native_provider(&archive, &staged).unwrap();
-            let installed = directory.path().join("providers/claude");
-            install_native_provider_to(&staged, &installed).unwrap();
+            let binary = directory.path().join("borg.exe");
+            extract_windows_executable(&archive, &binary, "borg.exe").unwrap();
+            assert_eq!(fs::read(binary).unwrap(), b"borg-binary");
+            extract_windows_native_provider(&archive, &staged).unwrap();
             assert_eq!(
-                fs::read(installed.join("claude.exe")).unwrap(),
+                fs::read(staged.join("claude.exe")).unwrap(),
                 b"claude-binary"
             );
-            assert_eq!(installed.join("LICENSE.md").exists(), has_license);
+            assert_eq!(staged.join("LICENSE.md").exists(), has_license);
             if has_license {
                 assert_eq!(
-                    fs::read(installed.join("LICENSE.md")).unwrap(),
+                    fs::read(staged.join("LICENSE.md")).unwrap(),
                     b"platform license"
                 );
             }
