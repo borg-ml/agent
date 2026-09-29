@@ -902,7 +902,7 @@ fn read_spooled_attachment(
 
 /// Identify an image by signature. Only formats a vision model can be shown
 /// are accepted; anything else is refused here rather than failing later.
-fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+pub(crate) fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {

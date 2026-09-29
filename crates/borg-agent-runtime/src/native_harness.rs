@@ -4731,18 +4731,6 @@ pub(crate) async fn native_user_message(
             total_bytes <= MAX_NATIVE_USER_IMAGE_BYTES,
             "native message images exceed the 25 MiB combined limit"
         );
-        let media_type = match path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("png") => "image/png",
-            Some("jpg" | "jpeg") => "image/jpeg",
-            Some("gif") => "image/gif",
-            Some("webp") => "image/webp",
-            _ => bail!("unsupported native image attachment: {}", path.display()),
-        };
         let remaining_bytes = MAX_NATIVE_USER_IMAGE_BYTES - previous_bytes;
         let mut reader = tokio::fs::File::open(path)
             .await
@@ -4758,6 +4746,14 @@ pub(crate) async fn native_user_message(
             "native message images exceed the 25 MiB combined limit"
         );
         total_bytes = previous_bytes + bytes.len() as u64;
+        // The name is decoration. What the bytes contain decides the media
+        // type, so a `.png` that is really a JPEG is sent correctly instead
+        // of being announced as a PNG and rejected outright: OpenAI answers a
+        // mislabelled image with `invalid_value` on `input` and no usable
+        // detail. The other attachment path has always sniffed; this one
+        // trusted the extension, and the two disagreed.
+        let media_type = crate::native_process::image_media_type(&bytes)
+            .with_context(|| format!("not a PNG, JPEG, GIF, or WebP image: {}", path.display()))?;
         encoded.push(ModelInputAttachment {
             media_type: media_type.to_string(),
             data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
@@ -4932,6 +4928,34 @@ struct ReadSkillArgs {
 
 #[cfg(test)]
 mod tests {
+    /// A user's attachment is named by whatever saved it, and that name is
+    /// not evidence of what the bytes are. Announcing a JPEG as a PNG gets the
+    /// whole turn rejected with `invalid_value` on `input`, so the media type
+    /// comes from the content.
+    #[tokio::test]
+    async fn a_user_attachment_is_typed_by_its_bytes_not_its_name() {
+        let root = tempfile::tempdir().unwrap();
+        // A real PNG written to a file that claims to be a JPEG.
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(2, 2)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let path = root.path().join("screenshot.jpg");
+        std::fs::write(&path, &png).unwrap();
+
+        let message = native_user_message(root.path(), "look", std::slice::from_ref(&path))
+            .await
+            .expect("a PNG is accepted whatever the file is called");
+        let ModelMessage::User { attachments, .. } = message else {
+            panic!("attachments produce a user message");
+        };
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0].media_type, "image/png",
+            "the bytes decide the media type"
+        );
+    }
+
     #[test]
     fn request_image_budget_counts_tiled_screenshots() {
         let mut image = Vec::new();
