@@ -1481,22 +1481,42 @@ fn structured_error_detail(message: Option<&str>) -> Option<String> {
     }
     let mut out = String::with_capacity(MAX);
     let mut quoted = false;
+    let mut span = String::new();
     for character in message.chars() {
-        if character == '\'' {
-            // Toggle, and never keep what sits between the quotes.
-            quoted = !quoted;
-            continue;
-        }
-        if !quoted {
-            out.push(character);
+        match character {
+            '\'' => {
+                if !quoted || looks_like_field_path(&span) {
+                    out.push_str(&span);
+                }
+                span.clear();
+                quoted = !quoted;
+            }
+            _ if quoted => span.push(character),
+            _ => out.push(character),
         }
         if out.chars().count() >= MAX {
             break;
         }
     }
+    if !quoted || looks_like_field_path(&span) {
+        out.push_str(&span);
+    }
     let detail = out.split_whitespace().collect::<Vec<_>>().join(" ");
     let detail = detail.trim().trim_end_matches(',').to_string();
     (!detail.is_empty() && detail.chars().any(char::is_alphanumeric)).then_some(detail)
+}
+
+/// A quoted span that names a field, rather than one that quotes a value.
+///
+/// OpenAI writes the diagnostic path in quotes: `at 'input[3].content[0].type'`.
+/// That is the whole reason to report the message, and dropping it -- treating
+/// every quoted span as user content -- left `code` and `param` as the only
+/// evidence, which is what the message was added to end. A path is an
+/// identifier: no spaces, and either indexed or dotted.
+fn looks_like_field_path(span: &str) -> bool {
+    !span.is_empty()
+        && !span.contains(char::is_whitespace)
+        && (span.contains('[') || span.contains('.'))
 }
 
 #[cfg(test)]

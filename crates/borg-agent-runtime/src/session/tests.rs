@@ -10,12 +10,32 @@ use borg_provider::ProviderCallUsage;
 
 use super::*;
 
+/// A real, decodable PNG.
+///
+/// Image attachments are decoded before they reach a provider now, so a
+/// fixture of `b"png"` is not a stand-in for a picture: it is exactly the
+/// payload a provider answers with "does not represent a valid image". The
+/// bytes have to be real for the test to mean anything.
+/// The same PNG, as it is expected to arrive on the wire.
+fn real_png_base64() -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(real_png_bytes())
+}
+
+fn real_png_bytes() -> Vec<u8> {
+    let mut png = Vec::new();
+    image::DynamicImage::new_rgba8(1, 1)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("png");
+    png
+}
+
 #[test]
 fn fresh_replay_reattaches_images_the_model_never_finished_answering() {
     let dir = tempdir().unwrap();
     let image = |name: &str| {
         let path = dir.path().join(name);
-        std::fs::write(&path, b"png").unwrap();
+        std::fs::write(&path, real_png_bytes()).unwrap();
         path
     };
     let (answered, steered, current) = (image("a.png"), image("b.png"), image("c.png"));
@@ -65,7 +85,7 @@ async fn claude_to_native_replay_preserves_available_images_and_marks_omissions(
 
     let dir = tempdir().unwrap();
     let image = dir.path().join("available.png");
-    std::fs::write(&image, b"png").unwrap();
+    std::fs::write(&image, real_png_bytes()).unwrap();
     let unsupported = dir.path().join("unsupported.txt");
     std::fs::write(&unsupported, b"text").unwrap();
     let oversized = dir.path().join("oversized.png");
@@ -153,7 +173,7 @@ async fn claude_to_native_replay_preserves_available_images_and_marks_omissions(
             assert!(content.contains("[3 historical images not replayed]"));
             assert_eq!(attachments.len(), 1);
             assert_eq!(attachments[0].media_type, "image/png");
-            assert_eq!(attachments[0].data_base64, "cG5n");
+            assert_eq!(attachments[0].data_base64, real_png_base64());
         }
         other => panic!("expected replayed user image, got {other:?}"),
     }
@@ -165,7 +185,7 @@ async fn failed_compaction_start_keeps_native_history_and_claude_images() {
 
     let dir = tempdir().unwrap();
     let image = dir.path().join("screenshot.png");
-    std::fs::write(&image, b"png").unwrap();
+    std::fs::write(&image, real_png_bytes()).unwrap();
     let session_id = Uuid::new_v4();
     let claude_turn = Uuid::new_v4();
     let native_turn = Uuid::new_v4();
@@ -258,7 +278,7 @@ async fn failed_compaction_start_keeps_native_history_and_claude_images() {
         } => {
             assert_eq!(content, "inspect screenshot");
             assert_eq!(attachments.len(), 1);
-            assert_eq!(attachments[0].data_base64, "cG5n");
+            assert_eq!(attachments[0].data_base64, real_png_base64());
         }
         other => panic!("expected Claude image prompt, got {other:?}"),
     }
@@ -275,7 +295,7 @@ async fn failed_claude_turn_keeps_recent_images_in_its_interruption_record() {
     let images = (0..5)
         .map(|index| {
             let path = dir.path().join(format!("image-{index}.png"));
-            std::fs::write(&path, [b'0' + index]).unwrap();
+            std::fs::write(&path, real_png_bytes()).unwrap();
             path
         })
         .collect::<Vec<_>>();
