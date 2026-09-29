@@ -2328,13 +2328,12 @@ mod tests {
             output_schema: None,
         };
         let provider = CodexModelProvider {
-            model: "gpt-6-sol".into(),
+            model: "gpt-6.1-sol".into(),
             effort: "ultra".into(),
         };
-        assert_eq!(
-            provider.request_body(&request).unwrap()["reasoning"]["effort"],
-            "max"
-        );
+        let body = provider.request_body(&request).unwrap();
+        assert_eq!(body["model"], "gpt-6.1-sol");
+        assert_eq!(body["reasoning"]["effort"], "max");
     }
 
     #[test]

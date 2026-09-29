@@ -3996,6 +3996,7 @@ fn subagent_tool_and_validation_use_the_provider_model_catalog() {
             .expect("catalog model should be accepted");
     }
     assert!(description.contains("gpt-6-luna"));
+    assert!(description.contains("gpt-6.1-sol (Sol 6.1)"));
     assert!(
         validate_subagent_overrides(CodingProvider::Codex, Some("not-a-codex-model"), None)
             .is_err()

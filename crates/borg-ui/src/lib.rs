@@ -380,7 +380,7 @@ impl PeerTarget {
     pub const fn default_model(self) -> &'static str {
         match self {
             Self::Claude => borg_provider::CLAUDE_MODEL_CATALOG.default_model,
-            Self::Gpt => "gpt-5.6-sol",
+            Self::Gpt => "gpt-6.1-sol",
         }
     }
 
@@ -606,7 +606,7 @@ pub fn normalize_consultation_command(line: &str) -> String {
     for (alias, profile) in [
         ("/claude", "claude"),
         ("/gpt", "gpt"),
-        ("/codex", "gpt-5.6-sol@xhigh"),
+        ("/codex", "gpt-6.1-sol@xhigh"),
     ] {
         if trimmed == alias {
             return format!("/ask {profile}");
@@ -1075,8 +1075,15 @@ mod tests {
 
     #[test]
     fn native_model_picker_crosses_catalog_backends() {
-        let options = model_options(CodingProvider::Codex, Some("gpt-5.6-sol"));
+        let options = model_options(CodingProvider::Codex, Some("gpt-6.1-sol"));
 
+        assert!(
+            options.iter().any(
+                |option| option.provider == CodingProvider::Codex && option.id == "gpt-6.1-sol"
+            )
+        );
+        assert!(!options.iter().any(|option| option.id == "gpt-5.6-sol"));
+        assert_eq!(PeerTarget::Gpt.default_model(), "gpt-6.1-sol");
         assert!(
             options
                 .iter()
@@ -1132,7 +1139,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_submission(
-                "/peer gpt new gpt-5.6-sol@xhigh",
+                "/peer gpt new gpt-6.1-sol@xhigh",
                 CodingProvider::Claude,
                 PromptDelivery::Queue,
                 &[]
@@ -1145,7 +1152,7 @@ mod tests {
                 },
                 delivery: PromptDelivery::Queue,
                 ..
-            }) if model == "gpt-5.6-sol" && effort == "xhigh"
+            }) if model == "gpt-6.1-sol" && effort == "xhigh"
         ));
     }
 }

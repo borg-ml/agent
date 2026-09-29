@@ -803,7 +803,7 @@ fn consultation_aliases_route_through_the_primary_model() {
     );
     assert_eq!(
         normalize_consultation_command("/codex check the design"),
-        "/ask gpt-5.6-sol@xhigh check the design"
+        "/ask gpt-6.1-sol@xhigh check the design"
     );
     assert_eq!(
         normalize_consultation_command("/ask claude review"),
