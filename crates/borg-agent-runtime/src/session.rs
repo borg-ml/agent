@@ -157,6 +157,11 @@ const NETWORK_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 /// provider gave and a human decision.
 const NETWORK_RETRY_MAX_ATTEMPTS: usize = 10;
 
+/// Compaction gets a much shorter chain than a turn does: it runs before the
+/// user's turn starts, on a prompt the user is already waiting behind, and the
+/// first successful fold is worth far more than a fifth attempt.
+const COMPACTION_RETRY_MAX_ATTEMPTS: usize = 3;
+
 const USAGE_LIMIT_RETRY_MAX_DELAY: Duration = Duration::from_secs(30 * 60);
 const WORKSPACE_PROJECTION_REPAIR_BATCH_SIZE: usize = 512;
 macro_rules! compaction_checkpoint_rules {
@@ -8259,7 +8264,7 @@ async fn compact_subscription_context_for_budget(
                 "subscription compaction prompt exceeds the {}-character provider input budget",
                 SUBSCRIPTION_INPUT_BUDGET_CHARS
             );
-            let compaction = run_retained_compaction(
+            let compaction = run_compaction_fold_with_retry(
                 executor,
                 session_id,
                 launch,
@@ -8464,6 +8469,59 @@ fn message_content_is(message: &borg_provider::provider::ModelMessage, text: &st
 }
 
 /// Run one internal compaction provider turn and return its summary.
+/// Compaction is a single provider call, and a single call has none of the
+/// turn-level resilience around it. A gateway that answers with an empty
+/// upstream response -- already classified `ConnectionLost`, and retried
+/// transparently on a normal turn -- instead aborted the whole fold sequence
+/// and reported the turn failed. That is the same blip costing the user their
+/// context and the compaction work, so the fold is retried here on the same
+/// terms: bounded attempts with backoff, and only for causes retrying can fix.
+async fn run_compaction_fold_with_retry(
+    executor: &Arc<dyn AgentTurnExecutor>,
+    session_id: Uuid,
+    launch: &LaunchSession,
+    agent_mcp_server: &borg_provider::mcp::ExternalMcpServer,
+    dispatcher: &crate::AgentToolDispatcher,
+    prompt: String,
+) -> Result<AgentCompaction> {
+    let mut delay = NETWORK_RETRY_INITIAL_DELAY;
+    let mut attempt = 0;
+    loop {
+        let error = match run_retained_compaction(
+            executor,
+            session_id,
+            launch,
+            agent_mcp_server,
+            dispatcher,
+            prompt.clone(),
+        )
+        .await
+        {
+            Ok(compaction) => return Ok(compaction),
+            Err(error) => error,
+        };
+        attempt += 1;
+        let rendered = format!("{error:#}");
+        // Auth, billing and quota are the provider refusing for a reason a
+        // repeat cannot fix, and an oversized request is refused identically
+        // every time. Neither becomes transient by being seen twice.
+        let retryable = attempt < COMPACTION_RETRY_MAX_ATTEMPTS
+            && (turn_error_is_connection_lost(&error, &rendered)
+                || provider_error_is_transient_api_failure(&rendered));
+        if !retryable {
+            return Err(error);
+        }
+        tracing::warn!(
+            session_id = %session_id,
+            attempt,
+            %error,
+            "subscription compaction fold lost its connection, retrying"
+        );
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(NETWORK_RETRY_MAX_DELAY);
+    }
+}
+
 async fn run_retained_compaction(
     executor: &Arc<dyn AgentTurnExecutor>,
     session_id: Uuid,

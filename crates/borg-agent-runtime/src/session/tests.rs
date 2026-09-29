@@ -21121,3 +21121,164 @@ async fn viewer_resume_projects_work_without_granting_write_or_losing_deferred_l
     );
     scratch.discard().await;
 }
+
+/// Compaction is one provider call with none of the turn-level resilience
+/// around it. A gateway answering with an empty upstream response is already
+/// classified `ConnectionLost` and retried transparently on a normal turn, yet
+/// it aborted the whole fold sequence and failed the user's turn. Retry the
+/// fold, bounded, and only for causes a repeat can fix.
+struct FlakyCompactionExecutor {
+    calls: Arc<AtomicUsize>,
+    kind: Option<borg_provider::provider::ProviderErrorKind>,
+    failures_before_success: usize,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for FlakyCompactionExecutor {
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        Ok(AgentTurnResult {
+            provider_session_id: None,
+            final_text: String::new(),
+        })
+    }
+
+    async fn compact_retained_context(&self, _turn: AgentTurn) -> Result<AgentCompaction> {
+        let attempt = self.calls.fetch_add(1, Ordering::AcqRel);
+        if let Some(kind) = self.kind {
+            return Err(anyhow::Error::new(borg_provider::provider::ProviderStreamError {
+                kind,
+                message: "openrouter streaming response failed: provider rejected the \
+                          request: Provider returned an empty response"
+                    .to_string(),
+            }));
+        }
+        if attempt < self.failures_before_success {
+            return Err(anyhow::Error::new(borg_provider::provider::ProviderStreamError {
+                kind: borg_provider::provider::ProviderErrorKind::ConnectionLost,
+                message: "openrouter streaming response failed: provider rejected the \
+                          request: Provider returned an empty response"
+                    .to_string(),
+            }));
+        }
+        Ok(AgentCompaction {
+            summary: "recovered summary".to_string(),
+            usage: ProviderCallUsage::default(),
+            provider_session_id: None,
+        })
+    }
+}
+
+/// Drive one compaction fold against `executor`, building the launch, MCP
+/// server and dispatcher the real call site passes.
+async fn compaction_fold_with_executor(
+    executor: Arc<dyn AgentTurnExecutor>,
+) -> Result<AgentCompaction> {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let cwd = root.path().to_path_buf();
+    let dispatcher = crate::AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(&cwd),
+        CodingProvider::Codex,
+        session_id,
+        false,
+        None,
+        None,
+        cwd.clone(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    let launch = LaunchSession {
+        request_id: Uuid::new_v4(),
+        cwd,
+        provider: CodingProvider::Codex,
+        model: Some("test-model".to_string()),
+        effort: Some("medium".to_string()),
+        fast: Some(false),
+        response_language: crate::ResponseLanguage::Auto,
+        permission_mode: PermissionMode::FullAccess,
+        name: None,
+        initial_prompt: None,
+        capabilities: Default::default(),
+        subagent_concurrency_limit: None,
+        extension_skill_roots: Vec::new(),
+        team_policy: None,
+    };
+    let agent_mcp_server = borg_provider::mcp::ExternalMcpServer {
+        name: "test".to_string(),
+        command: "test".to_string(),
+        args: Vec::new(),
+        env: std::collections::BTreeMap::new(),
+        allowed_tools: Vec::new(),
+    };
+    run_compaction_fold_with_retry(
+        &executor,
+        session_id,
+        &launch,
+        &agent_mcp_server,
+        &dispatcher,
+        "summarise the conversation".to_string(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_transient_compaction_failure_is_retried_instead_of_failing_the_turn() {
+    let executor = Arc::new(FlakyCompactionExecutor {
+        calls: Arc::new(AtomicUsize::new(0)),
+        kind: None,
+        failures_before_success: 1,
+    });
+    let calls = Arc::clone(&executor.calls);
+    let compaction = compaction_fold_with_executor(executor).await.unwrap();
+    assert_eq!(compaction.summary, "recovered summary");
+    assert_eq!(calls.load(Ordering::Acquire), 2, "the blip cost one retry");
+}
+
+#[tokio::test]
+async fn compaction_stops_retrying_once_its_attempts_are_spent() {
+    let executor = Arc::new(FlakyCompactionExecutor {
+        calls: Arc::new(AtomicUsize::new(0)),
+        kind: None,
+        failures_before_success: usize::MAX,
+    });
+    let calls = Arc::clone(&executor.calls);
+    let error = compaction_fold_with_executor(executor).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("empty response"),
+        "the real cause has to survive to the user: {error:#}"
+    );
+    assert_eq!(
+        calls.load(Ordering::Acquire),
+        COMPACTION_RETRY_MAX_ATTEMPTS,
+        "a compaction that never recovers must not retry forever"
+    );
+}
+
+#[tokio::test]
+async fn a_fatal_compaction_failure_is_not_retried() {
+    let executor = Arc::new(FlakyCompactionExecutor {
+        calls: Arc::new(AtomicUsize::new(0)),
+        kind: Some(borg_provider::provider::ProviderErrorKind::Fatal),
+        failures_before_success: 0,
+    });
+    let calls = Arc::clone(&executor.calls);
+    compaction_fold_with_executor(executor).await.unwrap_err();
+    assert_eq!(
+        calls.load(Ordering::Acquire),
+        1,
+        "an auth failure must reach the user on the first attempt, not after a backoff"
+    );
+}
