@@ -33,7 +33,7 @@ pub const CODEX_EFFORT_LEVELS: [&str; 7] =
     ["none", "low", "medium", "high", "xhigh", "max", "ultra"];
 pub const CODEX_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
     backend: "codex",
-    default_model: "gpt-6-astra",
+    default_model: "gpt-6.1-sol",
     selectable_models: &CODEX_SELECTABLE_MODELS,
     effort_levels: &CODEX_EFFORT_LEVELS,
 };
@@ -645,8 +645,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codex_defaults_use_astra_at_medium_effort() {
-        assert_eq!(codex_product_model(), "gpt-6-astra");
+    fn codex_defaults_use_sol_6_1_at_medium_effort() {
+        assert_eq!(codex_product_model(), "gpt-6.1-sol");
         assert_eq!(codex_default_effort(), "medium");
         assert!(codex_effort_supported(codex_default_effort()));
         assert!(codex_effort_supported("none"));

@@ -912,6 +912,10 @@ impl CodexModelProvider {
                 .unwrap_or("auto");
             if capabilities.supports_reasoning_summary_parameter {
                 body["reasoning"]["summary"] = json!(summary);
+                if subscription_only {
+                    body["stream_options"] =
+                        json!({"reasoning_summary_delivery":"sequential_cutoff"});
+                }
             } else {
                 body["reasoning"].as_object_mut().unwrap().remove("summary");
             }
@@ -1297,6 +1301,7 @@ struct ResponseState {
     output: BTreeMap<u64, Value>,
     reasoning: String,
     reasoning_part: Option<(Option<String>, Option<u64>)>,
+    reasoning_fragments: HashMap<(Option<String>, Option<u64>), String>,
 }
 
 impl ResponseState {
@@ -1394,12 +1399,24 @@ impl ResponseState {
                     });
                 }
             }
-            "response.reasoning_summary_text.delta" => {
-                if let Some(text) = event["delta"].as_str().filter(|s| !s.is_empty()) {
+            "response.reasoning_summary_text.delta" | "response.reasoning_summary_text.done" => {
+                let done = event["type"] == "response.reasoning_summary_text.done";
+                let field = if done { "text" } else { "delta" };
+                if let Some(text) = event[field].as_str().filter(|s| !s.is_empty()) {
                     let part = (
                         event["item_id"].as_str().map(str::to_owned),
                         event["summary_index"].as_u64(),
                     );
+                    let received = self.reasoning_fragments.entry(part.clone()).or_default();
+                    let text = if done {
+                        text.strip_prefix(received.as_str()).unwrap_or("")
+                    } else {
+                        text
+                    };
+                    if text.is_empty() {
+                        return Ok(None);
+                    }
+                    received.push_str(text);
                     let text = if self
                         .reasoning_part
                         .as_ref()
@@ -1982,6 +1999,10 @@ mod tests {
             first["reasoning"],
             json!({"effort":"low", "context":"all_turns", "summary":"auto"})
         );
+        assert_eq!(
+            first["stream_options"]["reasoning_summary_delivery"],
+            "sequential_cutoff"
+        );
         assert_eq!(first["text"]["verbosity"], "low");
         assert_eq!(first["text"]["format"]["type"], "json_schema");
         let output = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]});
@@ -2344,7 +2365,23 @@ mod tests {
                 )
                 .unwrap();
         }
-        let expected = "Running validation\nReviewing the diff\nChecking replay";
+        for (item, part, text) in [
+            ("first", 0, "Running validation"),
+            ("second", 0, "Checking replay safely"),
+            ("third", 0, "Completed-only summary"),
+            ("third", 0, "Completed-only summary"),
+        ] {
+            state
+                .event(
+                    &json!({"type":"response.reasoning_summary_text.done",
+                        "item_id":item,"summary_index":part,"text":text}),
+                    Some(&tx),
+                    "model",
+                    "low",
+                )
+                .unwrap();
+        }
+        let expected = "Running validation\nReviewing the diff\nChecking replay safely\nCompleted-only summary";
         assert_eq!(state.reasoning, expected);
         let mut streamed = String::new();
         while let Ok(event) = rx.try_recv() {
