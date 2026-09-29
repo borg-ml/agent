@@ -1433,19 +1433,23 @@ const KNOWN_ERROR_PARAMS: [&str; 15] = [
 /// Reduce a backend string to a known token. Unrecognised values collapse to
 /// `other` and missing ones to `unknown`, so no backend-controlled text ever
 /// reaches the error message.
-/// The diagnostic half of a provider error message, with the value quoted
-/// inside it removed.
+/// A provider error message with the value quoted inside it removed.
 ///
 /// OpenAI's shape errors read like `Invalid value: 'x' at
-/// 'input[3].content[0].type'`. The path is what makes the failure
-/// fixable; the value is the one thing that may be the user's own
-/// conversation. So the text is kept up to the quoted value, every quoted
-/// span is dropped, the result is whitespace-collapsed and bounded, and a
-/// message carrying no path is discarded rather than paraphrased.
+/// 'input[3].content[0].type'`, naming the field that made the request
+/// unusable. The path is what makes the failure fixable; the value is
+/// the one thing that may be the user's own conversation, so every
+/// quoted span is dropped. The rest is whitespace-collapsed and bounded.
+///
+/// Not every message is shaped like that, and requiring one to be is how
+/// this ended up reporting nothing: a guard that looked for the literal
+/// path marker silently discarded the very errors it was added to
+/// explain. So any message is reported, and the scrubbing is what keeps
+/// that safe rather than a guess about the format.
 fn structured_error_detail(message: Option<&str>) -> Option<String> {
     const MAX: usize = 200;
     let message = message?.trim();
-    if !message.contains('\'') || !message.contains("at ") {
+    if message.is_empty() {
         return None;
     }
     let mut out = String::with_capacity(MAX);
@@ -1492,19 +1496,23 @@ mod structured_error_detail_tests {
         assert!(detail.chars().count() <= 200, "bounded: {detail}");
     }
 
+    /// A message that is nothing but a quoted value leaves no shape to
+    /// report, and repeating `Invalid value:` teaches nobody anything. A
+    /// message with no quotes at all is kept: it cannot be quoting the
+    /// user's text back, and it is the only evidence there is.
     #[test]
-    fn a_message_with_no_field_path_is_not_repeated() {
-        assert_eq!(
-            structured_error_detail(Some(
-                "The server had an error while processing your request."
-            )),
-            None
-        );
+    fn only_a_bare_quoted_value_is_dropped() {
         assert_eq!(
             structured_error_detail(Some("Invalid value: 'secret'.")),
-            None
+            None,
+            "a value on its own is not a diagnosis"
         );
+        assert_eq!(structured_error_detail(Some("   ")), None);
         assert_eq!(structured_error_detail(None), None);
+        assert_eq!(
+            structured_error_detail(Some("The model is overloaded.")).as_deref(),
+            Some("The model is overloaded.")
+        );
     }
 }
 
