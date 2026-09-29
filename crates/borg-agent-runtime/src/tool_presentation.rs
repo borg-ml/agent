@@ -826,7 +826,41 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
         }
     }
 
+    // A `capability` call is a container, not an action: titled by the tool it
+    // names, every one of them read "Capability" and the row said nothing about
+    // what was actually happening. The target is right there in the input.
+    if tool_leaf_name(name) == "capability" {
+        if let Some(target) = input
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|target| !target.is_empty())
+        {
+            return (capability_action_title(target), concise_tool_input(input));
+        }
+    }
+
     (humanize_tool_name(name), concise_tool_input(input))
+}
+
+/// The shortest honest title for a capability. The verb it is named after is
+/// dropped, since the row already spells out the action in words.
+fn capability_action_title(target: &str) -> String {
+    let words = target
+        .split(['_', '-'])
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let words = match words.as_slice() {
+        [
+            "get" | "list" | "read" | "send" | "create" | "update" | "set",
+            rest @ ..,
+        ] => rest,
+        _ => words.as_slice(),
+    };
+    if words.is_empty() {
+        "Capability".to_string()
+    } else {
+        title_case(&words.join(" "))
+    }
 }
 
 pub fn web_search_query(input: &Value) -> Option<String> {
@@ -3435,6 +3469,30 @@ all green"
     }
 
     #[test]
+    /// Every `capability` call was titled "Capability", so a run of them said
+    /// nothing about what was happening. The row has to name the action.
+    #[test]
+    fn a_capability_row_is_titled_by_the_capability_it_invokes() {
+        let titled = |target: &str| {
+            tool_call_summary(
+                "capability",
+                &serde_json::json!({"name": target, "arguments": {}}),
+            )
+            .0
+        };
+        assert_eq!(
+            titled("lsp_workspace_diagnostics"),
+            "Lsp workspace diagnostics"
+        );
+        assert_eq!(titled("list_instances"), "Instances");
+        assert_eq!(titled("get_goal"), "Goal");
+        // Nothing to name falls back rather than rendering an empty title.
+        assert_eq!(
+            tool_call_summary("capability", &serde_json::json!({"search": "x"})).0,
+            "Capability"
+        );
+    }
+
     fn humanizes_underscored_mcp_server_names() {
         let decision = project_tool_presentation(
             "mcp__borg_agent__record_workspace_decision",

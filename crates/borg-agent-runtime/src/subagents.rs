@@ -9661,6 +9661,59 @@ pub(crate) fn capability_tool_specs() -> Vec<Value> {
 /// Free-standing so the rules can be checked directly: refuse a name that has a
 /// tool of its own, clamp a limit the model invented, and treat an unknown name
 /// as a miss to correct rather than an error to shrug at.
+/// A capability reached through the generic passthrough lost every non-string
+/// argument: the number a `wait_agent` timeout needs, the list an
+/// `await_watchers` call needs, a boolean filter. Nothing caught it, because
+/// direct tool calls keep their types and only this path was affected.
+#[test]
+fn capability_passthrough_rebinds_stringified_arguments_to_their_declared_types() {
+    let schema = json!({
+        "name": "await_watchers",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "watch_ids": {"type": "array", "items": {"type": "string"}},
+                "one_id": {"type": "array", "items": {"type": "string"}},
+                "timeout_ms": {"type": "integer"},
+                "urgent": {"type": "boolean"},
+                "ratio": {"type": "number"},
+                "reason": {"type": "string"},
+                "either": {"type": ["string", "null"]}
+            }
+        }
+    });
+    let arguments = json!({
+        "watch_ids": {"0": "a", "1": "b"},
+        "one_id": "just-one",
+        "timeout_ms": "1500000",
+        "urgent": "true",
+        "ratio": "0.5",
+        // A declared string is left exactly as sent.
+        "reason": "1500000",
+        // A value that is already the right shape is not touched.
+        "already": 5,
+        // A string that is not the declared type is left alone, not guessed at.
+        "either": "anything",
+        "unparseable": "not a number"
+    });
+    // Production passes the capability's `inputSchema`, which is where the
+    // declared types live.
+    let restored = restore_declared_types(arguments, schema.get("inputSchema"));
+    assert_eq!(restored["watch_ids"], json!(["a", "b"]));
+    assert_eq!(restored["one_id"], json!(["just-one"]));
+    assert_eq!(restored["timeout_ms"], json!(1_500_000));
+    assert_eq!(restored["urgent"], json!(true));
+    assert_eq!(restored["ratio"], json!(0.5));
+    assert_eq!(restored["reason"], json!("1500000"));
+    assert_eq!(restored["already"], json!(5));
+    assert_eq!(restored["either"], json!("anything"));
+    assert_eq!(
+        restored["unparseable"],
+        json!("not a number"),
+        "an argument the schema does not declare is left exactly as sent"
+    );
+}
+
 fn classify_capability_call<'a>(arguments: &'a Value, specs: &[Value]) -> CapabilityInvocation<'a> {
     if let Some(query) = arguments.get("search").and_then(Value::as_str) {
         let limit = arguments
@@ -9684,11 +9737,101 @@ fn classify_capability_call<'a>(arguments: &'a Value, specs: &[Value]) -> Capabi
     }
     CapabilityInvocation::Forward {
         name,
-        arguments: arguments
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({})),
+        arguments: restore_declared_types(
+            arguments
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            specs
+                .iter()
+                .find(|spec| spec.get("name").and_then(Value::as_str) == Some(name))
+                .and_then(|spec| spec.get("inputSchema").or_else(|| spec.get("input_schema"))),
+        ),
     }
+}
+
+/// Put back the argument types the capability declared.
+///
+/// A capability reached through this passthrough arrives with its non-string
+/// arguments stringified: `false` as `"false"`, `3` as `"3"`, `["a","b"]` as a
+/// map. A direct tool call keeps its types, so the loss is specific to the
+/// generic path, and it cost every non-string argument on this host -- the
+/// blocking wait primitives included, since `wait_agent` needs a number and
+/// `await_watchers` a list.
+///
+/// The schema is right here, so the declared type is what decides. A value that
+/// is already the right shape is left alone, and a string that does not parse
+/// as the declared type is left alone too rather than guessed at: this is
+/// repair, not interpretation.
+fn declared_type_names(declared: &Value) -> Vec<&str> {
+    declared
+        .get("type")
+        .and_then(Value::as_str)
+        .map(|name| vec![name])
+        .or_else(|| {
+            declared
+                .get("type")
+                .and_then(Value::as_array)
+                .map(|types| types.iter().filter_map(Value::as_str).collect())
+        })
+        .unwrap_or_default()
+}
+
+fn restore_declared_types(mut arguments: Value, schema: Option<&Value>) -> Value {
+    let Some(properties) = schema
+        .and_then(|schema| schema.get("properties"))
+        .and_then(Value::as_object)
+    else {
+        return arguments;
+    };
+    let Some(entries) = arguments.as_object_mut() else {
+        return arguments;
+    };
+    for (key, declared) in properties {
+        // A list of two or more arrived as a map, a list of one as a bare
+        // string, and a number or boolean as a quoted one. All three are the
+        // same loss, so all three are read back the same way.
+        let text = match entries.get(key) {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Object(members))
+                if declared_type_names(declared)
+                    .iter()
+                    .any(|declared_type| *declared_type == "array") =>
+            {
+                // Keys carry the position, so the order the list was sent in is
+                // recoverable even though the map itself is key-sorted.
+                serde_json::to_string(&Value::Array(members.values().cloned().collect::<Vec<_>>()))
+                    .unwrap_or_default()
+            }
+            _ => continue,
+        };
+        let types = declared_type_names(declared);
+        let repaired = types.iter().find_map(|declared_type| match *declared_type {
+            "boolean" => match text.as_str() {
+                "true" => Some(json!(true)),
+                "false" => Some(json!(false)),
+                _ => None,
+            },
+            "integer" => text.parse::<i64>().ok().map(|n| json!(n)),
+            "number" => text.parse::<f64>().ok().map(|n| json!(n)),
+            // A list of one came back as a bare string, so a string that is
+            // not itself a list is the single member rather than a failure.
+            "array" => Some(
+                serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .filter(Value::is_array)
+                    .unwrap_or_else(|| Value::Array(vec![Value::String(text.clone())])),
+            ),
+            "object" => serde_json::from_str::<Value>(&text)
+                .ok()
+                .filter(Value::is_object),
+            _ => None,
+        });
+        if let Some(repaired) = repaired {
+            entries.insert(key.clone(), repaired);
+        }
+    }
+    arguments
 }
 
 /// What a `capability` call turns into.
