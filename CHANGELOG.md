@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.12.9)
+## Unreleased (since 0.13.0)
+
+## 0.13.0 (2026-09-28)
 
 ### Tools
 
