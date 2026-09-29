@@ -222,6 +222,7 @@ struct Transcript {
     child_transcript: bool,
     director_prompt: DirectorPrompt,
     tools: HashMap<String, usize>,
+    tool_parents: HashMap<String, String>,
     command_edit_rows: HashMap<String, usize>,
     foreground_tool: Option<String>,
     preparing_tools: HashMap<String, String>,
@@ -365,6 +366,7 @@ impl Default for Transcript {
             child_transcript: false,
             director_prompt: DirectorPrompt::Unknown,
             tools: HashMap::new(),
+            tool_parents: HashMap::new(),
             command_edit_rows: HashMap::new(),
             foreground_tool: None,
             preparing_tools: HashMap::new(),
@@ -1756,6 +1758,49 @@ impl Transcript {
                         .is_some_and(ready_detail_is_waiting_on_watchers);
             }
             _ => {}
+        }
+
+        if let SessionEventKind::ToolStarted {
+            tool_call_id,
+            parent_tool_call_id: Some(parent),
+            ..
+        } = &event.kind
+        {
+            self.tool_parents
+                .insert(tool_call_id.clone(), parent.clone());
+        }
+        if let SessionEventKind::ToolCompleted {
+            tool_call_id,
+            is_error,
+            ..
+        } = &event.kind
+        {
+            let mut parents = vec![tool_call_id.clone()];
+            while let Some(parent) = parents.pop() {
+                let children = self
+                    .tool_parents
+                    .iter()
+                    .filter(|(_, recorded_parent)| **recorded_parent == parent)
+                    .map(|(child, _)| child.clone())
+                    .collect::<Vec<_>>();
+                for child in children {
+                    self.tool_parents.remove(&child);
+                    parents.push(child.clone());
+                    if let Some(index) = self.tools.get(&child)
+                        && let Some(TranscriptEntry::Tool {
+                            complete,
+                            error,
+                            completed_at,
+                            ..
+                        }) = self.order.get_mut(*index)
+                        && !*complete
+                    {
+                        *complete = true;
+                        *error = *is_error;
+                        *completed_at = Some(event.created_at);
+                    }
+                }
+            }
         }
 
         let provider_advanced = matches!(

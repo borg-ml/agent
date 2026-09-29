@@ -6760,6 +6760,69 @@ async fn child_event(coordinator: &SubagentCoordinator, child: Uuid, kind: Sessi
         });
 }
 
+// Aborting the parent runtime drops the nested capability future. Its durable
+// Started event still needs a terminal pair or live/replayed UI spins forever.
+#[tokio::test]
+async fn aborted_nested_wait_emits_one_cancelled_completion() {
+    let (directory, scratch, coordinator, root, _) = waiting_team().await;
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        Some(coordinator),
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        root,
+        true,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    let (events, mut rx) = mpsc::channel(8);
+    dispatcher.set_turn_events(&events);
+    let task = tokio::spawn(async move {
+        dispatcher
+            .call_from_command(
+                "python-parent".into(),
+                "wait_agent",
+                json!({"timeout_ms": 1_800_000}),
+                false,
+                None,
+            )
+            .await
+    });
+    let started = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SessionEventKind::ToolStarted {
+        tool_call_id,
+        parent_tool_call_id,
+        ..
+    } = started
+    else {
+        panic!("nested call must be announced");
+    };
+    assert_eq!(parent_tool_call_id.as_deref(), Some("python-parent"));
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let ended = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(ended, SessionEventKind::ToolCompleted {
+        tool_call_id: ended_id, is_error: true, parent_tool_call_id, ..
+    } if ended_id == tool_call_id && parent_tool_call_id.as_deref() == Some("python-parent")));
+    assert!(rx.try_recv().is_err(), "completion must not be duplicated");
+    scratch.discard().await;
+}
+
 #[tokio::test]
 async fn wait_agent_blocks_until_a_child_finishes_and_reports_it_once() {
     let (_directory, scratch, coordinator, root, worker) = waiting_team().await;

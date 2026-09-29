@@ -147,6 +147,7 @@ pub struct TimelineProjector {
     entries: Vec<Arc<TimelineEntry>>,
     messages: HashMap<Uuid, usize>,
     tools: HashMap<String, usize>,
+    tool_parents: HashMap<String, String>,
     preparing_tools: HashMap<String, usize>,
     unkeyed_preparing_tools: Vec<usize>,
     reasoning: Option<usize>,
@@ -187,6 +188,42 @@ impl TimelineProjector {
     }
 
     pub fn push(&mut self, event: &SessionEvent) {
+        if let SessionEventKind::ToolStarted {
+            tool_call_id,
+            parent_tool_call_id: Some(parent),
+            ..
+        } = &event.kind
+        {
+            self.tool_parents
+                .insert(tool_call_id.clone(), parent.clone());
+        }
+        if let SessionEventKind::ToolCompleted {
+            tool_call_id,
+            is_error,
+            ..
+        } = &event.kind
+        {
+            let mut parents = vec![tool_call_id.clone()];
+            while let Some(parent) = parents.pop() {
+                let children = self
+                    .tool_parents
+                    .iter()
+                    .filter(|(_, recorded_parent)| **recorded_parent == parent)
+                    .map(|(child, _)| child.clone())
+                    .collect::<Vec<_>>();
+                for child in children {
+                    self.tool_parents.remove(&child);
+                    parents.push(child.clone());
+                    if let Some(index) = self.tools.get(&child) {
+                        let entry = Arc::make_mut(&mut self.entries[*index]);
+                        if entry.running {
+                            entry.running = false;
+                            entry.failed = *is_error;
+                        }
+                    }
+                }
+            }
+        }
         match &event.kind {
             SessionEventKind::TurnStarted {
                 fast, ultrafast, ..
@@ -288,10 +325,17 @@ impl TimelineProjector {
                     Arc::make_mut(&mut self.entries[index]).running = false;
                 }
             }
-            SessionEventKind::ProviderEvent { kind, .. }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "action/preparing_cancelled" =>
             {
-                if let Some(index) = self.unkeyed_preparing_tools.pop() {
+                let index = match payload
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some(tool_call_id) => self.take_preparing_tool(tool_call_id),
+                    None => self.unkeyed_preparing_tools.pop(),
+                };
+                if let Some(index) = index {
                     if index + 1 == self.entries.len() {
                         self.entries.pop();
                     } else if let Some(entry) = self.entries.get_mut(index) {
@@ -625,6 +669,79 @@ mod tests {
     use super::*;
     use borg_remote::CodingProvider;
 
+    #[test]
+    fn keyed_preparation_cancellation_allows_id_reuse_without_orphaning_parallel_rows() {
+        let session_id = Uuid::new_v4();
+        let mut projector = TimelineProjector::default();
+        for (sequence, kind, id, label) in [
+            (1, "action/preparing", "retry", "first attempt"),
+            (2, "action/preparing", "parallel", "parallel work"),
+            (3, "action/preparing_cancelled", "retry", ""),
+            (4, "action/preparing", "retry", "new attempt"),
+        ] {
+            projector.push(&SessionEvent::new(
+                session_id,
+                sequence,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: kind.into(),
+                    payload: serde_json::json!({"tool_call_id": id, "label": label}),
+                },
+            ));
+        }
+        assert!(!projector.entries[0].running);
+        assert!(projector.entries[projector.preparing_tools["parallel"]].running);
+        let retry = &projector.entries[projector.preparing_tools["retry"]];
+        assert!(retry.running);
+        assert!(retry.title.ends_with("new attempt"));
+        assert_eq!(
+            projector
+                .entries
+                .iter()
+                .filter(|entry| entry.running)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn replay_parent_cancellation_settles_nested_wait_not_parallel_tool() {
+        let session_id = Uuid::new_v4();
+        let mut projector = TimelineProjector::default();
+        for (id, parent, name) in [
+            ("runtime", None, "runtime_exec"),
+            ("wait", Some("runtime"), "wait_agent"),
+            ("parallel", None, "exec"),
+        ] {
+            projector.push(&SessionEvent::new(
+                session_id,
+                1,
+                SessionEventKind::ToolStarted {
+                    tool_call_id: id.into(),
+                    name: name.into(),
+                    input: serde_json::json!({}),
+                    input_ref: None,
+                    parent_tool_call_id: parent.map(str::to_string),
+                },
+            ));
+        }
+        projector.push(&SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "runtime".into(),
+                output: "persistent runtime was cancelled".into(),
+                output_ref: None,
+                is_error: true,
+                input: None,
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        ));
+        assert!(!projector.entries[projector.tools["wait"]].running);
+        assert!(projector.entries[projector.tools["wait"]].failed);
+        assert!(projector.entries[projector.tools["parallel"]].running);
+    }
     #[test]
     fn replay_preserves_ultrafast_badge_when_an_old_message_updates() {
         let session_id = Uuid::new_v4();

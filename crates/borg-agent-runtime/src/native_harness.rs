@@ -3237,6 +3237,13 @@ async fn call_model_streaming(
                     }
                 }
                 Some(ProviderProgress::ProviderEvent { kind, payload, .. }) => {
+                    if kind == "native_model_attempt_failed" {
+                        cancel_preparing_tool_calls(context.events, context.coding_provider, &mut preparing).await;
+                        text.clear();
+                        emitted_text_len = 0;
+                        pending_reasoning.clear();
+                        reasoning_accumulated.clear();
+                    }
                     if kind == "claude_usage_grace"
                         && payload.get("five_hour").and_then(Value::as_f64).is_some_and(|v| v > 0.0)
                         && let Some(flag) = context.grace_wrapup
@@ -9603,6 +9610,151 @@ mod tests {
                 );
             }
             watches.cancel.cancel();
+        }
+    }
+
+    // A retried provider attempt must retire its preparation before the next
+    // attempt, even when the provider reuses the same call id.
+    #[tokio::test]
+    async fn a_retried_model_attempt_cancels_preparation_before_final_tools() {
+        struct RetryClient {
+            final_id: &'static str,
+        }
+        #[async_trait]
+        impl NativeModelClient for RetryClient {
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                _request: ModelTurnRequest,
+                progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                let progress = progress.unwrap();
+                progress
+                    .send(ProviderProgress::ToolCallStarted {
+                        id: "old-call".into(),
+                        name: "exec".into(),
+                        input: Value::Null,
+                    })
+                    .unwrap();
+                progress
+                    .send(ProviderProgress::ToolCallAction {
+                        id: Some("old-call".into()),
+                        action: "discarded attempt".into(),
+                    })
+                    .unwrap();
+                progress
+                    .send(ProviderProgress::ProviderEvent {
+                        kind: "native_model_attempt_failed".into(),
+                        payload: json!({"attempt": 1, "will_retry": true}),
+                        raw_payload: Box::new(None),
+                        stream_channel: None,
+                        content_text: None,
+                        provider_item_id: None,
+                        tool_use_id: None,
+                        tool_name: None,
+                        model: None,
+                        effort: None,
+                    })
+                    .unwrap();
+                progress
+                    .send(ProviderProgress::ToolCallStarted {
+                        id: self.final_id.into(),
+                        name: "exec".into(),
+                        input: Value::Null,
+                    })
+                    .unwrap();
+                progress
+                    .send(ProviderProgress::ToolCallAction {
+                        id: Some(self.final_id.into()),
+                        action: "final attempt".into(),
+                    })
+                    .unwrap();
+                Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(
+                        None,
+                        None,
+                        None,
+                        vec![ModelToolCall::function(
+                            self.final_id.into(),
+                            "exec".into(),
+                            json!({"cmd":"true"}).to_string(),
+                        )],
+                    ),
+                    finish_reason: "tool_calls".into(),
+                    usage: ProviderCallUsage::default(),
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+        for final_id in ["new-call", "old-call"] {
+            let (events_tx, mut events_rx) = mpsc::channel(32);
+            let mut controls = None;
+            let mut queued_steer = Vec::new();
+            let outcome = call_model_streaming(
+                &RetryClient { final_id },
+                crate::CodingProvider::Codex,
+                "test-model",
+                None,
+                ModelTurnRequest {
+                    fast: false,
+                    ultrafast: false,
+                    request_id: None,
+                    session_id: None,
+                    prompt_cache_key: None,
+                    turn_routing: Default::default(),
+                    messages: vec![],
+                    tools: vec![],
+                    output_schema: None,
+                },
+                ModelStreamContext {
+                    coding_provider: crate::CodingProvider::Codex,
+                    assistant_message_id: Uuid::new_v4(),
+                    events: &events_tx,
+                    controls: &mut controls,
+                    queued_steer: &mut queued_steer,
+                    grace_wrapup: None,
+                },
+            )
+            .await
+            .unwrap();
+            let NativeModelOutcome::Completed(result) = outcome else {
+                panic!("retry completes");
+            };
+            let ModelMessage::Assistant { tool_calls, .. } = result.message else {
+                panic!("assistant tools");
+            };
+            assert_eq!(tool_calls.len(), 1);
+            assert_eq!(tool_calls[0].id, final_id);
+            let mut events = Vec::new();
+            while let Ok(event) = events_rx.try_recv() {
+                events.push(event);
+            }
+            let cancelled = events.iter().position(|event| matches!(event,
+                SessionEventKind::ProviderEvent { kind, payload, .. }
+                    if kind == "action/preparing_cancelled" && payload["tool_call_id"] == "old-call"
+            )).expect("failed attempt's badge is cancelled");
+            let final_preparing = events
+                .iter()
+                .position(|event| {
+                    matches!(event,
+                        SessionEventKind::ProviderEvent { kind, payload, .. }
+                            if kind == "action/preparing" && payload["label"] == "final attempt"
+                    )
+                })
+                .expect("retry preparation survives");
+            assert!(cancelled < final_preparing);
+            assert_eq!(events.iter().filter(|event| matches!(event,
+                SessionEventKind::ProviderEvent { kind, .. } if kind == "action/preparing_cancelled"
+            )).count(), 1, "failed generation retires once, not the final generation");
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, SessionEventKind::ToolStarted { .. })),
+                "streaming presentation never dispatches tools"
+            );
         }
     }
 

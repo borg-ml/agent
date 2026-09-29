@@ -37,6 +37,29 @@ use crate::{
     WorkspaceReviewRequest, WorkspaceStore,
 };
 
+// Dropping a runtime request must settle tools it already announced, even
+// when cancellation drops the dispatch future before it can return a result.
+struct NestedToolCompletion {
+    events: mpsc::Sender<SessionEventKind>,
+    cancelled: Option<SessionEventKind>,
+}
+
+impl Drop for NestedToolCompletion {
+    fn drop(&mut self) {
+        if let Some(event) = self.cancelled.take() {
+            match self.events.try_send(event) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    let events = self.events.clone();
+                    tokio::spawn(async move {
+                        let _ = events.send(event).await;
+                    });
+                }
+            }
+        }
+    }
+}
+
 pub const DEFAULT_MAX_SUBAGENTS: usize = 16;
 const ROOT_MESSAGE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const RUNTIME_DEFAULT_FILE_BYTES: u64 = 256 * 1024;
@@ -1038,6 +1061,18 @@ impl AgentToolDispatcher {
                 })
                 .await;
         }
+        let mut completion = events.as_ref().map(|events| NestedToolCompletion {
+            events: events.clone(),
+            cancelled: Some(SessionEventKind::ToolCompleted {
+                tool_call_id: tool_call_id.clone(),
+                output: "Nested tool cancelled with its parent request".into(),
+                output_ref: None,
+                is_error: true,
+                input: None,
+                input_ref: None,
+                parent_tool_call_id: Some(parent.clone()),
+            }),
+        });
         let result = self
             .call_with_workflow_control(name, arguments, workflow_approved, cancellation)
             .await;
@@ -1057,6 +1092,9 @@ impl AgentToolDispatcher {
                     parent_tool_call_id: Some(parent),
                 })
                 .await;
+        }
+        if let Some(completion) = completion.as_mut() {
+            completion.cancelled = None;
         }
         result
     }
@@ -2475,7 +2513,9 @@ impl AgentToolDispatcher {
             }
             "lsp_workspace_diagnostics" => {
                 let args: LspWorkspaceDiagnosticsArgs = serde_json::from_value(arguments)?;
-                self.lsp.workspace_diagnostics_for_tool(args.path.as_deref()).await
+                self.lsp
+                    .workspace_diagnostics_for_tool(args.path.as_deref())
+                    .await
             }
             "lsp_hover" => {
                 let args: LspPositionArgs = serde_json::from_value(arguments)?;

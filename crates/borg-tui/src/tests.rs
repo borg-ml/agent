@@ -18221,3 +18221,54 @@ fn speed_picker_selection_dispatches_the_selected_tier() {
         });
     }
 }
+
+#[test]
+fn replay_parent_cancellation_settles_nested_wait_not_parallel_tool() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    for (id, parent, name) in [
+        ("runtime", None, "runtime_exec"),
+        ("wait", Some("runtime"), "wait_agent"),
+        ("parallel", None, "exec"),
+    ] {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::ToolStarted {
+                tool_call_id: id.into(),
+                name: name.into(),
+                input: serde_json::json!({}),
+                input_ref: None,
+                parent_tool_call_id: parent.map(str::to_string),
+            },
+        ));
+    }
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "runtime".into(),
+            output: "persistent runtime was cancelled".into(),
+            output_ref: None,
+            is_error: true,
+            input: None,
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    assert!(matches!(
+        transcript.order[transcript.tools["wait"]],
+        TranscriptEntry::Tool {
+            complete: true,
+            error: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        transcript.order[transcript.tools["parallel"]],
+        TranscriptEntry::Tool {
+            complete: false,
+            ..
+        }
+    ));
+}
