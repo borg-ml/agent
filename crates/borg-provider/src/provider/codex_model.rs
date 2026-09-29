@@ -733,7 +733,22 @@ impl CodexModelProvider {
                     tool_call_id,
                     content,
                     attachments,
-                } => input.push(function_call_output(tool_call_id, content, attachments)?),
+                } => {
+                    let (output, images) =
+                        function_call_output(tool_call_id, content, attachments)?;
+                    input.push(output);
+                    if let Some(blocks) = images {
+                        // A tool's result is text, and the Responses API reads
+                        // `function_call_output.output` as a string. Handing it
+                        // an array of content parts is what made a screenshot
+                        // come back as `invalid_value` on `input` -- "the
+                        // image data you provided does not represent a valid
+                        // image" -- with a perfectly valid PNG on the other
+                        // end. The pixels travel as their own user message,
+                        // which is where an `input_image` belongs.
+                        input.push(json!({"role": "user", "content": blocks}));
+                    }
+                }
             }
         }
         if effort_updates && applied_effort != Some(self.wire_effort()) {
@@ -1364,13 +1379,14 @@ fn function_call_output(
     tool_call_id: &str,
     content: &str,
     attachments: &[borg_core::ModelInputAttachment],
-) -> Result<Value> {
+) -> Result<(Value, Option<Value>)> {
+    let output = json!({
+        "type": "function_call_output", "call_id": tool_call_id, "output": content
+    });
     if attachments.is_empty() {
-        return Ok(json!({
-            "type": "function_call_output", "call_id": tool_call_id, "output": content
-        }));
+        return Ok((output, None));
     }
-    let mut blocks = vec![json!({"type": "input_text", "text": content})];
+    let mut blocks = Vec::with_capacity(attachments.len());
     for attachment in attachments {
         ensure!(
             attachment.media_type.starts_with("image/"),
@@ -1381,9 +1397,7 @@ fn function_call_output(
             "image_url": format!("data:{};base64,{}", attachment.media_type, attachment.data_base64)
         }));
     }
-    Ok(json!({
-        "type": "function_call_output", "call_id": tool_call_id, "output": blocks
-    }))
+    Ok((output, Some(Value::Array(blocks))))
 }
 
 /// Response statuses Borg recognises; anything else is reported as `other`.
@@ -2471,21 +2485,33 @@ mod tests {
         }
     }
 
+    /// The Responses API reads `function_call_output.output` as a string. An
+    /// array of content parts there is what turned a screenshot into
+    /// `invalid_value` on `input` -- "the image data you provided does not
+    /// represent a valid image" -- so the pixels leave as their own user
+    /// message and the tool result stays text.
     #[test]
-    fn tool_results_with_images_become_input_image_blocks() {
-        let plain = function_call_output("call-1", "ok", &[]).unwrap();
+    fn a_tool_result_stays_text_and_its_image_travels_separately() {
+        let (plain, images) = function_call_output("call-1", "ok", &[]).unwrap();
         assert_eq!(plain["output"], "ok");
+        assert!(images.is_none(), "no image, no follow-up message");
         let image = borg_core::ModelInputAttachment {
             media_type: "image/png".to_string(),
             data_base64: "AAAA".to_string(),
             filename: None,
         };
-        let rich = function_call_output("call-1", "screenshot taken", std::slice::from_ref(&image))
-            .unwrap();
+        let (rich, images) =
+            function_call_output("call-1", "screenshot taken", std::slice::from_ref(&image))
+                .unwrap();
         assert_eq!(rich["call_id"], "call-1");
-        assert_eq!(rich["output"][0]["type"], "input_text");
-        assert_eq!(rich["output"][1]["type"], "input_image");
-        assert_eq!(rich["output"][1]["image_url"], "data:image/png;base64,AAAA");
+        assert!(
+            rich["output"].is_string(),
+            "a tool result is a string, never content parts: {rich}"
+        );
+        assert_eq!(rich["output"], "screenshot taken");
+        let blocks = images.expect("the image still reaches the model");
+        assert_eq!(blocks[0]["type"], "input_image");
+        assert_eq!(blocks[0]["image_url"], "data:image/png;base64,AAAA");
         let mut not_image = image;
         not_image.media_type = "application/pdf".to_string();
         assert!(function_call_output("call-1", "x", &[not_image]).is_err());
