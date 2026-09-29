@@ -3468,7 +3468,6 @@ all green"
         assert_eq!(activity.category, ToolPresentationCategory::Agent);
     }
 
-    #[test]
     /// Every `capability` call was titled "Capability", so a run of them said
     /// nothing about what was happening. The row has to name the action.
     #[test]
@@ -3493,6 +3492,7 @@ all green"
         );
     }
 
+    #[test]
     fn humanizes_underscored_mcp_server_names() {
         let decision = project_tool_presentation(
             "mcp__borg_agent__record_workspace_decision",

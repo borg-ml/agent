@@ -4927,18 +4927,14 @@ impl BorgTerminal {
             // swallowed here: leaking them would scroll the transcript behind
             // a menu the user believes is still open.
             self.leave_status_focus();
-            return Ok(matches!(key.code, KeyCode::Up | KeyCode::Down).then_some(
-                UiAction::None,
-            ));
+            return Ok(matches!(key.code, KeyCode::Up | KeyCode::Down).then_some(UiAction::None));
         };
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
         {
             self.leave_status_focus();
-            return Ok(matches!(key.code, KeyCode::Up | KeyCode::Down).then_some(
-                UiAction::None,
-            ));
+            return Ok(matches!(key.code, KeyCode::Up | KeyCode::Down).then_some(UiAction::None));
         }
         let rows = self.status_focus_rows(focus).len();
         let row = self.status_focus_row.filter(|row| *row < rows);
