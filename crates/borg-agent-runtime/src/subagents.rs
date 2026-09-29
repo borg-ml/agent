@@ -3538,6 +3538,18 @@ pub struct SubagentCoordinator {
     wait_cursors: Arc<Mutex<HashMap<Uuid, wait::WaitCursor>>>,
 }
 
+/// How far a team broadcast reaches.
+///
+/// `ActiveTeam` is the root plus the workers currently running; it is what
+/// `/team` means. `Workspace` is the durable workspace-wide audience, which
+/// also reaches independent sessions and remote-synced participants, and is a
+/// different promise from "tell the team".
+#[derive(Clone, Copy)]
+pub enum TeamBroadcastReach {
+    ActiveTeam,
+    Workspace,
+}
+
 impl SubagentCoordinator {
     pub fn new_with_store_and_executor(
         journal_root: impl Into<PathBuf>,
@@ -5633,9 +5645,31 @@ impl SubagentCoordinator {
         actor_session_id: Uuid,
         message: &str,
     ) -> Result<WorkspaceMessageReceipt> {
-        self.broadcast_message_as_targeted(actor_session_id, message)
+        self.broadcast_message_as_targeted(actor_session_id, message, TeamBroadcastReach::Workspace)
             .await
             .map(|(receipt, _)| receipt)
+    }
+
+    /// Append one message addressed to the workers currently doing something.
+    ///
+    /// This is what `/team` means. A note shouted at the team is for the
+    /// agents running right now; it is not a workspace announcement. Addressing
+    /// the workspace instead left the message pending for every participant
+    /// that ever joined, so a broadcast aimed at the two agents on screen
+    /// reported dozens of recipients and buried their copies under traffic
+    /// from sessions nobody was watching.
+    pub async fn broadcast_message_to_active_as(
+        &self,
+        actor_session_id: Uuid,
+        message: &str,
+    ) -> Result<WorkspaceMessageReceipt> {
+        self.broadcast_message_as_targeted(
+            actor_session_id,
+            message,
+            TeamBroadcastReach::ActiveTeam,
+        )
+        .await
+        .map(|(receipt, _)| receipt)
     }
 
     /// Also return the team participants eligible when the send began. The
@@ -5644,24 +5678,35 @@ impl SubagentCoordinator {
         &self,
         actor_session_id: Uuid,
         message: &str,
+        reach: TeamBroadcastReach,
     ) -> Result<(WorkspaceMessageReceipt, Vec<Uuid>)> {
         anyhow::ensure!(
             self.root_launch.capabilities.multiplayer,
             "team broadcast requires multiplayer capability"
         );
         let message = required_message(message)?;
-        let (actor, recipients) =
-            {
-                let table = self.table.lock().await;
-                let actor = table.task_name(actor_session_id)?;
-                let mut recipients = vec![table.root_session_id];
-                recipients.extend(table.entries.iter().filter_map(|(id, entry)| {
-                    (!entry.snapshot.status.is_terminal()).then_some(*id)
-                }));
-                recipients.sort_unstable();
-                recipients.dedup();
-                (actor, recipients)
-            };
+        let (actor, recipients) = {
+            let table = self.table.lock().await;
+            let actor = table.task_name(actor_session_id)?;
+            let mut recipients = vec![table.root_session_id];
+            recipients.extend(table.entries.iter().filter_map(|(id, entry)| {
+                // A worker is on the active team while it holds an
+                // execution slot. `Ready` is idle between assignments and a
+                // dormant entry is metadata restored from disk: neither is
+                // listening, and counting them made a shout at two working
+                // agents report a roster nobody could act on.
+                let eligible = match reach {
+                    TeamBroadcastReach::ActiveTeam => {
+                        entry.snapshot.status.consumes_concurrency_slot() && !entry.dormant
+                    }
+                    TeamBroadcastReach::Workspace => !entry.snapshot.status.is_terminal(),
+                };
+                eligible.then_some(*id)
+            }));
+            recipients.sort_unstable();
+            recipients.dedup();
+            (actor, recipients)
+        };
         let sender = self
             .store
             .workspace_binding(actor_session_id)
@@ -5685,7 +5730,13 @@ impl SubagentCoordinator {
                 text: message.clone(),
                 mentions: Vec::new(),
                 attachments: Vec::new(),
-                audience: Audience::Workspace,
+                audience: match reach {
+                    // The live team, now that the recipient set is known.
+                    TeamBroadcastReach::ActiveTeam => Audience::Participants {
+                        participants: target_ids.clone(),
+                    },
+                    TeamBroadcastReach::Workspace => Audience::Workspace,
+                },
                 mode: DeliveryMode::NextTurn,
                 thread_id: None,
                 reply_to_message_id: None,
@@ -6891,7 +6942,7 @@ impl SubagentCoordinator {
             "broadcast_team" => {
                 let args: BroadcastArgs = serde_json::from_value(arguments)?;
                 let receipt = self
-                    .broadcast_message_as(actor_session_id, &args.message)
+                    .broadcast_message_to_active_as(actor_session_id, &args.message)
                     .await?;
                 let relay_pending = self
                     .store
@@ -7265,7 +7316,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "broadcast_team",
-            "Broadcast one durable message to every participant in the current workspace, including independent sessions and remote-synced participants.",
+            "Broadcast one durable message to the team that is working right now: the root plus every subagent that is starting, running or waiting for approval. Idle and dormant workers are not addressed, so a note meant for the active agents does not land in every historical inbox.",
             json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}),
         ),
         tool(

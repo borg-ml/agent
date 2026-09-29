@@ -9970,11 +9970,13 @@ async fn broadcast_team_message(
     text: String,
 ) -> Result<()> {
     let message = match subagents {
-        Some(coordinator) => {
-            coordinator
-                .broadcast_message_as_targeted(session_id, &text)
-                .await
-        }
+        Some(coordinator) => coordinator
+            .broadcast_message_to_active_as(session_id, &text)
+            .await
+            .map(|receipt| {
+                let recipients = receipt.recipient_ids.clone();
+                (receipt, recipients)
+            }),
         None => Err(anyhow::anyhow!(
             "no agent team is active to broadcast to; spawn a subagent first"
         )),
