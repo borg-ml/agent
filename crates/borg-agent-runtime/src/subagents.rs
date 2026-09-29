@@ -8033,7 +8033,7 @@ pub fn agent_tool_specs_for_surface(
         ),
         tool(
             "create_goal",
-            "Create a durable goal only when get_goal reports none. Exact call: {\"objective\":\"concise objective\"}. Add token_budget only when the user explicitly requests a token budget.",
+            "Create a durable goal only when get_goal reports no goal or a completed goal. Exact call: {\"objective\":\"concise objective\"}. Add token_budget only when the user explicitly requests a token budget.",
             json!({
                 "type": "object",
                 "properties": {
