@@ -1617,7 +1617,10 @@ struct CrossProviderCompactionExecutor {
 
 struct OversizedCompactionExecutor {
     calls: Arc<AtomicUsize>,
-    fail_on_second: bool,
+    /// The kind to fail the second fold with, or `None` to never fail. The
+    /// distinction is the point: a fold that drops its connection is retried,
+    /// while a refusal no repeat can fix still ends the compaction.
+    fail_on_second_with: Option<borg_provider::provider::ProviderErrorKind>,
 }
 
 fn test_provider_capabilities() -> Vec<crate::ProviderCapability> {
@@ -1966,10 +1969,12 @@ impl AgentTurnExecutor for OversizedCompactionExecutor {
 
     async fn compact_retained_context(&self, _turn: AgentTurn) -> Result<AgentCompaction> {
         let previous_calls = self.calls.fetch_add(1, Ordering::SeqCst);
-        if self.fail_on_second && previous_calls == 1 {
+        if let Some(kind) = self.fail_on_second_with
+            && previous_calls == 1
+        {
             return Err(borg_provider::provider::ProviderStreamError {
-                kind: borg_provider::provider::ProviderErrorKind::ConnectionLost,
-                message: "second compaction fold disconnected".to_string(),
+                kind,
+                message: "second compaction fold refused".to_string(),
             }
             .into());
         }
@@ -12914,7 +12919,7 @@ async fn subscription_compaction_counts_every_fold_and_reports_partial_failure()
     let calls = Arc::new(AtomicUsize::new(0));
     let executor: Arc<dyn AgentTurnExecutor> = Arc::new(OversizedCompactionExecutor {
         calls: calls.clone(),
-        fail_on_second: false,
+        fail_on_second_with: None,
     });
     let prompt_id = Uuid::new_v4();
     let mut events = vec![SessionEvent::new(
@@ -12989,30 +12994,80 @@ async fn subscription_compaction_counts_every_fold_and_reports_partial_failure()
         borg_provider::CostBasis::SubscriptionEquivalent
     );
 
-    let failed_calls = Arc::new(AtomicUsize::new(0));
-    let failing_executor: Arc<dyn AgentTurnExecutor> = Arc::new(OversizedCompactionExecutor {
-        calls: failed_calls.clone(),
-        fail_on_second: true,
+    async fn compact_with(
+        executor: &Arc<dyn AgentTurnExecutor>,
+        session_id: Uuid,
+        launch: &LaunchSession,
+        agent_mcp_server: &borg_provider::mcp::ExternalMcpServer,
+        dispatcher: &crate::AgentToolDispatcher,
+        events: &[SessionEvent],
+    ) -> Result<SubscriptionCompaction> {
+        compact_subscription_context_for_budget(SubscriptionCompactionRequest {
+            executor,
+            session_id,
+            launch,
+            agent_mcp_server,
+            dispatcher,
+            events,
+            actor: EventActor::User,
+            current_prompt: "continue",
+            retained_tail_budget_chars: subscription_retained_tail_budget_chars(
+                SUBSCRIPTION_INPUT_BUDGET_CHARS,
+            ),
+        })
+        .await
+    }
+
+    // A fold that drops its connection is retried, and the compaction lands.
+    // This is the case that cost a user their context outright: one blip on
+    // one fold aborted the whole sequence and failed the turn.
+    let retried_calls = Arc::new(AtomicUsize::new(0));
+    let transient: Arc<dyn AgentTurnExecutor> = Arc::new(OversizedCompactionExecutor {
+        calls: retried_calls.clone(),
+        fail_on_second_with: Some(borg_provider::provider::ProviderErrorKind::ConnectionLost),
     });
-    let error = match compact_subscription_context_for_budget(SubscriptionCompactionRequest {
-        executor: &failing_executor,
+    let recovered = compact_with(
+        &transient,
         session_id,
-        launch: &launch,
-        agent_mcp_server: &agent_mcp_server,
-        dispatcher: &dispatcher,
-        events: &events,
-        actor: EventActor::User,
-        current_prompt: "continue",
-        retained_tail_budget_chars: subscription_retained_tail_budget_chars(
-            SUBSCRIPTION_INPUT_BUDGET_CHARS,
-        ),
-    })
+        &launch,
+        &agent_mcp_server,
+        &dispatcher,
+        &events,
+    )
+    .await
+    .expect("a transient fold failure is retried, not fatal");
+    assert_eq!(
+        retried_calls.load(Ordering::SeqCst),
+        fold_count as usize + 1,
+        "the blip costs exactly one extra fold attempt"
+    );
+    assert_eq!(recovered.compaction.usage.total_tokens, 135 * fold_count);
+
+    // A refusal no repeat can fix still ends the compaction, and the usage
+    // already banked by the completed folds survives on the error.
+    let failed_calls = Arc::new(AtomicUsize::new(0));
+    let fatal: Arc<dyn AgentTurnExecutor> = Arc::new(OversizedCompactionExecutor {
+        calls: failed_calls.clone(),
+        fail_on_second_with: Some(borg_provider::provider::ProviderErrorKind::Fatal),
+    });
+    let error = match compact_with(
+        &fatal,
+        session_id,
+        &launch,
+        &agent_mcp_server,
+        &dispatcher,
+        &events,
+    )
     .await
     {
-        Ok(_) => panic!("the second fold should fail"),
+        Ok(_) => panic!("a fatal second fold should end the compaction"),
         Err(error) => error,
     };
-    assert_eq!(failed_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        failed_calls.load(Ordering::SeqCst),
+        2,
+        "a refusal is not retried"
+    );
     let partial = error
         .downcast_ref::<crate::agent::PartialCompactionUsage>()
         .expect("completed fold usage survives the later failure");

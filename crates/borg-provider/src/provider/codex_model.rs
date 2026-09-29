@@ -1061,6 +1061,16 @@ fn subscription_failure_message(
     let param = known_or_other(error["param"].as_str(), &KNOWN_ERROR_PARAMS);
     if code != "unknown" || param != "unknown" {
         message.push_str(&format!(" Provider error: code={code}, param={param}."));
+        // The provider names the offending field in its own message, and
+        // without it a malformed request is undiagnosable from the outside:
+        // `code` and `param` say *that* something is wrong, never *what*. It
+        // is still not copied wholesale -- a provider message can quote the
+        // value that was rejected, which may be the user's own text -- so
+        // only the part describing the request's shape is kept and anything
+        // value-like is elided.
+        if let Some(detail) = structured_error_detail(error["message"].as_str()) {
+            message.push_str(&format!(" The provider said: {detail}."));
+        }
     }
     if limited {
         let retry_date = retry_after
@@ -1423,6 +1433,81 @@ const KNOWN_ERROR_PARAMS: [&str; 15] = [
 /// Reduce a backend string to a known token. Unrecognised values collapse to
 /// `other` and missing ones to `unknown`, so no backend-controlled text ever
 /// reaches the error message.
+/// The diagnostic half of a provider error message, with the value quoted
+/// inside it removed.
+///
+/// OpenAI's shape errors read like `Invalid value: 'x' at
+/// 'input[3].content[0].type'`. The path is what makes the failure
+/// fixable; the value is the one thing that may be the user's own
+/// conversation. So the text is kept up to the quoted value, every quoted
+/// span is dropped, the result is whitespace-collapsed and bounded, and a
+/// message carrying no path is discarded rather than paraphrased.
+fn structured_error_detail(message: Option<&str>) -> Option<String> {
+    const MAX: usize = 200;
+    let message = message?.trim();
+    if !message.contains('\'') || !message.contains("at ") {
+        return None;
+    }
+    let mut out = String::with_capacity(MAX);
+    let mut quoted = false;
+    for character in message.chars() {
+        if character == '\'' {
+            // Toggle, and never keep what sits between the quotes.
+            quoted = !quoted;
+            continue;
+        }
+        if !quoted {
+            out.push(character);
+        }
+        if out.chars().count() >= MAX {
+            break;
+        }
+    }
+    let detail = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    let detail = detail.trim().trim_end_matches(',').to_string();
+    (!detail.is_empty() && detail.chars().any(char::is_alphanumeric)).then_some(detail)
+}
+
+#[cfg(test)]
+mod structured_error_detail_tests {
+    use super::structured_error_detail;
+
+    /// The point of the helper: the field path survives, the rejected value
+    /// does not. A provider message quoting the user's own conversation back
+    /// at us is the exact leak the redaction exists to prevent.
+    #[test]
+    fn a_shape_error_keeps_the_path_and_drops_the_value() {
+        let detail = structured_error_detail(Some(
+            "Invalid value: 'my private prompt' at 'input[3].content[0].type'.",
+        ))
+        .expect("a path is present");
+        assert!(
+            detail.contains("input[3].content[0].type"),
+            "the field path is the diagnostic: {detail}"
+        );
+        assert!(
+            !detail.contains("my private prompt"),
+            "the rejected value may be the user's own text: {detail}"
+        );
+        assert!(detail.chars().count() <= 200, "bounded: {detail}");
+    }
+
+    #[test]
+    fn a_message_with_no_field_path_is_not_repeated() {
+        assert_eq!(
+            structured_error_detail(Some(
+                "The server had an error while processing your request."
+            )),
+            None
+        );
+        assert_eq!(
+            structured_error_detail(Some("Invalid value: 'secret'.")),
+            None
+        );
+        assert_eq!(structured_error_detail(None), None);
+    }
+}
+
 fn known_or_other(value: Option<&str>, allowed: &[&'static str]) -> &'static str {
     match value {
         Some(value) => allowed
