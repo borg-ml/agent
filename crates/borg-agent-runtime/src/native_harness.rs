@@ -4754,6 +4754,8 @@ pub(crate) async fn native_user_message(
         // trusted the extension, and the two disagreed.
         let media_type = crate::native_process::image_media_type(&bytes)
             .with_context(|| format!("not a PNG, JPEG, GIF, or WebP image: {}", path.display()))?;
+        image::load_from_memory(&bytes)
+            .with_context(|| format!("image cannot be decoded: {}", path.display()))?;
         encoded.push(ModelInputAttachment {
             media_type: media_type.to_string(),
             data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
+use base64::Engine as _;
 use borg_core::{CostBasis, ModelProviderState, ProviderCallUsage};
 use futures::StreamExt;
 use reqwest::cookie::{CookieStore, Jar};
@@ -676,6 +677,11 @@ impl CodexModelProvider {
                             attachment.media_type.starts_with("image/"),
                             "Codex model attachment must be an image"
                         );
+                        if !image_decodes(attachment) {
+                            blocks.push(json!({"type": "input_text", "text":
+                                "An attached image could not be decoded. Please provide a valid image file."}));
+                            continue;
+                        }
                         blocks.push(
                             json!({"type": "input_image", "image_url": format!("data:{};base64,{}",
                             attachment.media_type, attachment.data_base64)}),
@@ -738,14 +744,6 @@ impl CodexModelProvider {
                         function_call_output(tool_call_id, content, attachments)?;
                     input.push(output);
                     if let Some(blocks) = images {
-                        // A tool's result is text, and the Responses API reads
-                        // `function_call_output.output` as a string. Handing it
-                        // an array of content parts is what made a screenshot
-                        // come back as `invalid_value` on `input` -- "the
-                        // image data you provided does not represent a valid
-                        // image" -- with a perfectly valid PNG on the other
-                        // end. The pixels travel as their own user message,
-                        // which is where an `input_image` belongs.
                         input.push(json!({"role": "user", "content": blocks}));
                     }
                 }
@@ -1372,32 +1370,47 @@ impl ResponseState {
     }
 }
 
-/// A tool result on the Responses wire. Text-only results stay a plain
-/// string; results carrying images become content blocks so the model sees
-/// the pixels (screenshots, rendered charts) rather than a base64 dump.
+/// A tool result on the Responses wire. Images travel in a following user
+/// message while the function call output remains text.
 fn function_call_output(
     tool_call_id: &str,
     content: &str,
     attachments: &[borg_core::ModelInputAttachment],
 ) -> Result<(Value, Option<Value>)> {
-    let output = json!({
+    let mut output = json!({
         "type": "function_call_output", "call_id": tool_call_id, "output": content
     });
     if attachments.is_empty() {
         return Ok((output, None));
     }
     let mut blocks = Vec::with_capacity(attachments.len());
+    let mut invalid = 0;
     for attachment in attachments {
         ensure!(
             attachment.media_type.starts_with("image/"),
             "Codex model tool attachment must be an image"
         );
+        if !image_decodes(attachment) {
+            invalid += 1;
+            continue;
+        }
         blocks.push(json!({
             "type": "input_image",
             "image_url": format!("data:{};base64,{}", attachment.media_type, attachment.data_base64)
         }));
     }
-    Ok((output, Some(Value::Array(blocks))))
+    if invalid > 0 {
+        output["output"] = json!(format!(
+            "{content}\n\n[{invalid} attached image(s) could not be decoded. Regenerate the image and attach it again.]"
+        ));
+    }
+    Ok((output, (!blocks.is_empty()).then_some(Value::Array(blocks))))
+}
+
+fn image_decodes(attachment: &borg_core::ModelInputAttachment) -> bool {
+    base64::engine::general_purpose::STANDARD
+        .decode(&attachment.data_base64)
+        .is_ok_and(|bytes| image::load_from_memory(&bytes).is_ok())
 }
 
 /// Response statuses Borg recognises; anything else is reported as `other`.
@@ -2485,19 +2498,19 @@ mod tests {
         }
     }
 
-    /// The Responses API reads `function_call_output.output` as a string. An
-    /// array of content parts there is what turned a screenshot into
-    /// `invalid_value` on `input` -- "the image data you provided does not
-    /// represent a valid image" -- so the pixels leave as their own user
-    /// message and the tool result stays text.
     #[test]
     fn a_tool_result_stays_text_and_its_image_travels_separately() {
         let (plain, images) = function_call_output("call-1", "ok", &[]).unwrap();
         assert_eq!(plain["output"], "ok");
         assert!(images.is_none(), "no image, no follow-up message");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png);
         let image = borg_core::ModelInputAttachment {
             media_type: "image/png".to_string(),
-            data_base64: "AAAA".to_string(),
+            data_base64: encoded.clone(),
             filename: None,
         };
         let (rich, images) =
@@ -2511,10 +2524,61 @@ mod tests {
         assert_eq!(rich["output"], "screenshot taken");
         let blocks = images.expect("the image still reaches the model");
         assert_eq!(blocks[0]["type"], "input_image");
-        assert_eq!(blocks[0]["image_url"], "data:image/png;base64,AAAA");
+        assert_eq!(
+            blocks[0]["image_url"],
+            format!("data:image/png;base64,{encoded}")
+        );
         let mut not_image = image;
         not_image.media_type = "application/pdf".to_string();
         assert!(function_call_output("call-1", "x", &[not_image]).is_err());
+    }
+
+    #[test]
+    fn corrupt_historical_images_are_not_sent_to_the_api() {
+        // This PNG has valid chunks and CRCs, but its IDAT omits the required
+        // scanline filter byte. Header-only checks accept it; pixel decoding
+        // and the Responses API reject it with invalid_value on input.
+        let invalid = borg_core::ModelInputAttachment {
+            media_type: "image/png".into(),
+            data_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAAC0lEQVR4nPvPwAAAAwABAIPJ7GsAAAAASUVORK5CYII=".into(),
+            filename: None,
+        };
+        let provider = CodexModelProvider {
+            model: "test-model".into(),
+            effort: "low".into(),
+        };
+        let request = ModelTurnRequest {
+            fast: false,
+            request_id: None,
+            session_id: None,
+            prompt_cache_key: None,
+            turn_routing: Default::default(),
+            messages: vec![
+                ModelMessage::user_with_attachments("look", vec![invalid.clone()]),
+                ModelMessage::Tool {
+                    tool_call_id: "call-1".into(),
+                    content: "screenshot taken".into(),
+                    attachments: vec![invalid],
+                },
+            ],
+            tools: vec![],
+            output_schema: None,
+        };
+        let body = provider.request_body(&request).unwrap();
+        assert_eq!(body["input"].as_array().unwrap().len(), 2);
+        assert!(
+            body["input"][0]["content"][1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("could not be decoded")
+        );
+        assert!(
+            body["input"][1]["output"]
+                .as_str()
+                .unwrap()
+                .contains("could not be decoded")
+        );
+        assert!(!body.to_string().contains("input_image"));
     }
 
     #[test]

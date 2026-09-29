@@ -891,6 +891,7 @@ fn read_spooled_attachment(
     // media type, so a `.png` that is really a JPEG is sent correctly instead
     // of failing to decode at the provider.
     let media_type = image_media_type(&bytes).context("not a PNG, JPEG, GIF, or WebP image")?;
+    image::load_from_memory(&bytes).context("image cannot be decoded")?;
     Ok(ModelInputAttachment {
         media_type: media_type.to_string(),
         data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
@@ -3018,8 +3019,13 @@ mod tests {
     #[test]
     fn the_media_type_comes_from_content_not_from_the_file_name() {
         let spool = tempfile::tempdir().expect("spool");
-        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
-        jpeg.extend_from_slice(b"pretend this is a photograph");
+        let mut jpeg = Vec::new();
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .expect("jpeg");
         std::fs::write(spool.path().join("0001.png"), &jpeg).expect("write");
 
         let (attachments, errors) = drain_attachment_spool(spool.path());
@@ -3027,6 +3033,21 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].media_type, "image/jpeg");
+    }
+
+    #[test]
+    fn a_png_with_valid_chunks_but_invalid_pixels_is_refused() {
+        let spool = tempfile::tempdir().expect("spool");
+        let malformed = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAAC0lEQVR4nPvPwAAAAwABAIPJ7GsAAAAASUVORK5CYII=")
+            .expect("base64");
+        std::fs::write(spool.path().join("0001.png"), malformed).expect("write");
+
+        let (attachments, errors) = drain_attachment_spool(spool.path());
+
+        assert!(attachments.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("image cannot be decoded"), "{errors:?}");
     }
 
     #[test]
@@ -3081,7 +3102,11 @@ mod tests {
             br#"{"media_type":"image/png","data_base64":"AAAA"}"#,
         )
         .expect("envelope");
-        std::fs::write(spool.path().join("0002.gif"), b"GIF89a and some pixels").expect("raw");
+        let mut gif = Vec::new();
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut std::io::Cursor::new(&mut gif), image::ImageFormat::Gif)
+            .expect("gif");
+        std::fs::write(spool.path().join("0002.gif"), gif).expect("raw");
         std::fs::write(
             spool.path().join("0003.tmp"),
             b"\x89PNG\r\n\x1a\nhalf written",
