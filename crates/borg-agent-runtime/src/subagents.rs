@@ -2475,7 +2475,7 @@ impl AgentToolDispatcher {
             }
             "lsp_workspace_diagnostics" => {
                 let args: LspWorkspaceDiagnosticsArgs = serde_json::from_value(arguments)?;
-                self.lsp.workspace_diagnostics(args.path.as_deref()).await
+                self.lsp.workspace_diagnostics_for_tool(args.path.as_deref()).await
             }
             "lsp_hover" => {
                 let args: LspPositionArgs = serde_json::from_value(arguments)?;

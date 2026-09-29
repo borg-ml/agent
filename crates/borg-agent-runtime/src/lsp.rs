@@ -648,6 +648,16 @@ impl LspService {
         self.workspace_diagnostics_local(path).await
     }
 
+    /// Model-facing projection; the raw LSP/broker API remains lossless.
+    pub async fn workspace_diagnostics_for_tool(&self, path: Option<&Path>) -> Result<Value> {
+        let report = self.workspace_diagnostics(path).await?;
+        workspace_diagnostics_tool_report(
+            report,
+            &crate::host_paths::host_home().join("diagnostics"),
+        )
+        .await
+    }
+
     async fn workspace_diagnostics_local(&self, path: Option<&Path>) -> Result<Value> {
         if let Some(path) = path {
             let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
@@ -1498,6 +1508,136 @@ fn is_unknown_workspace_diagnostics_request(error: &anyhow::Error) -> bool {
     message.contains("\"code\":-32601") || message.contains("unknown request")
 }
 
+const MAX_WORKSPACE_TOOL_REPORT_BYTES: usize = 32 * 1024;
+const MAX_WORKSPACE_TOOL_SAMPLES: usize = 12;
+
+async fn workspace_diagnostics_tool_report(report: Value, directory: &Path) -> Result<Value> {
+    let full = serde_json::to_vec(&report)?;
+    if full.len() <= MAX_WORKSPACE_TOOL_REPORT_BYTES {
+        return Ok(report);
+    }
+    tokio::fs::create_dir_all(directory).await?;
+    let path = directory.join(format!("{}.json", uuid::Uuid::new_v4()));
+    let mut file = tokio::fs::File::create(&path).await?;
+    file.write_all(&full).await?;
+    file.sync_all().await?;
+    let mut counts = [0usize; 5];
+    let mut documents = 0usize;
+    let mut samples = Vec::new();
+    let mut servers = serde_json::Map::new();
+    if let Some(reports) = report.as_object() {
+        for (server, report) in reports {
+            collect_workspace_diagnostics(report, "", &mut documents, &mut counts, &mut samples);
+            if servers.len() < 16 {
+                let mut metadata = serde_json::Map::new();
+                for key in [
+                    "kind",
+                    "partial",
+                    "partialReason",
+                    "failedDocuments",
+                    "documentsScanned",
+                    "documentsDiscovered",
+                    "compilationContext",
+                    "error",
+                    "message",
+                ] {
+                    if let Some(value) = report.get(key) {
+                        let value = if serde_json::to_vec(value)?.len() > 1024 {
+                            json!({"truncated": true, "detail": value.to_string().chars().take(512).collect::<String>()})
+                        } else {
+                            value.clone()
+                        };
+                        metadata.insert(key.to_owned(), value);
+                    }
+                }
+                servers.insert(server.chars().take(256).collect(), Value::Object(metadata));
+            }
+        }
+    }
+    samples.sort_by_key(|sample| sample["severity"].as_u64().unwrap_or(5));
+    samples.truncate(MAX_WORKSPACE_TOOL_SAMPLES);
+    let mut projected = json!({
+        "summarized": true,
+        "full_report_path": path,
+        "full_report_bytes": full.len(),
+        "documents": documents,
+        "diagnostic_counts": {"errors": counts[1], "warnings": counts[2],
+            "information": counts[3], "hints": counts[4], "unspecified": counts[0]},
+        "servers": servers,
+        "samples": samples,
+        "instruction": "Full diagnostics are preserved in full_report_path. Samples prioritize errors; use targeted lsp_diagnostics or read the file for complete details."
+    });
+    while serde_json::to_vec(&projected)?.len() > MAX_WORKSPACE_TOOL_REPORT_BYTES {
+        projected["summary_truncated"] = json!(true);
+        if !projected["samples"].as_array_mut().unwrap().is_empty() {
+            projected["samples"].as_array_mut().unwrap().pop();
+        } else if let Some(key) = projected["servers"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next_back()
+            .cloned()
+        {
+            projected["servers"].as_object_mut().unwrap().remove(&key);
+        } else {
+            break;
+        }
+    }
+    Ok(projected)
+}
+
+fn collect_workspace_diagnostics(
+    report: &Value,
+    uri: &str,
+    documents: &mut usize,
+    counts: &mut [usize; 5],
+    samples: &mut Vec<Value>,
+) {
+    let uri = report["uri"].as_str().unwrap_or(uri);
+    if report.get("uri").is_some() {
+        *documents += 1;
+    }
+    if let Some(items) = report["items"].as_array() {
+        for item in items {
+            if item.get("message").is_some() && item.get("range").is_some() {
+                let severity = item["severity"]
+                    .as_u64()
+                    .filter(|v| (1..=4).contains(v))
+                    .unwrap_or(0) as usize;
+                counts[severity] += 1;
+                let rank = if severity == 0 { 5 } else { severity as u64 };
+                if samples.len() < MAX_WORKSPACE_TOOL_SAMPLES
+                    || samples
+                        .iter()
+                        .any(|sample| sample["severity"].as_u64().unwrap_or(5) > rank)
+                {
+                    let sample = json!({
+                        "uri": uri.chars().take(1024).collect::<String>(),
+                        "severity": if severity == 0 { None } else { Some(severity) },
+                        "range": {"start": {"line": item["range"]["start"]["line"].as_u64(),
+                            "character": item["range"]["start"]["character"].as_u64()},
+                            "end": {"line": item["range"]["end"]["line"].as_u64(),
+                            "character": item["range"]["end"]["character"].as_u64()}},
+                        "message": item["message"].as_str().unwrap_or("").chars().take(512).collect::<String>()
+                    });
+                    if !samples.contains(&sample) {
+                        samples.push(sample);
+                    }
+                    samples.sort_by_key(|sample| sample["severity"].as_u64().unwrap_or(5));
+                    samples.truncate(MAX_WORKSPACE_TOOL_SAMPLES);
+                }
+            } else {
+                collect_workspace_diagnostics(item, uri, documents, counts, samples);
+            }
+        }
+    }
+    if let Some(related) = report["relatedDocuments"].as_object() {
+        for (uri, report) in related {
+            collect_workspace_diagnostics(report, uri, documents, counts, samples);
+        }
+    }
+}
+
 fn workspace_document_report(uri: &str, report: Value) -> Value {
     match report {
         Value::Object(mut report) => {
@@ -1872,6 +2012,45 @@ fn server_specs() -> &'static [ServerSpec] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oversized_workspace_tool_reports_preserve_full_data_and_prioritize_errors() {
+        let directory = tempfile::tempdir().expect("report directory");
+        let warning = json!({"severity": 2, "range": {"start": {"line": 1, "character": 2},
+            "end": {"line": 1, "character": 3}}, "message": "warning".repeat(200)});
+        let mut diagnostics = vec![warning; 1000];
+        diagnostics.push(
+            json!({"severity": 1, "range": {"start": {"line": 9, "character": 0},
+            "end": {"line": 9, "character": 1}}, "message": "late error"}),
+        );
+        let full = json!({"clangd": {"partial": true, "partialReason": "budget exhausted",
+            "compilationContext": {"coverage": "partial"},
+            "items": [{"uri": "file:///broken.cpp", "kind": "full", "items": diagnostics}]}});
+        let projected = workspace_diagnostics_tool_report(full.clone(), directory.path())
+            .await
+            .expect("projection");
+        assert!(serde_json::to_vec(&projected).unwrap().len() <= MAX_WORKSPACE_TOOL_REPORT_BYTES);
+        assert_eq!(projected["diagnostic_counts"]["errors"], 1);
+        assert_eq!(projected["diagnostic_counts"]["warnings"], 1000);
+        assert_eq!(projected["samples"][0]["message"], "late error");
+        assert_eq!(projected["samples"].as_array().unwrap().len(), 2);
+        assert_eq!(projected["servers"]["clangd"]["partial"], true);
+        assert_eq!(
+            projected["servers"]["clangd"]["compilationContext"],
+            full["clangd"]["compilationContext"]
+        );
+        let saved = tokio::fs::read(projected["full_report_path"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&saved).unwrap(), full);
+        let small = json!({"clangd": {"items": []}});
+        assert_eq!(
+            workspace_diagnostics_tool_report(small.clone(), directory.path())
+                .await
+                .unwrap(),
+            small
+        );
+    }
 
     #[test]
     fn common_language_servers_are_advertised_before_startup() {
