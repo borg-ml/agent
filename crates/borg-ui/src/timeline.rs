@@ -150,6 +150,8 @@ pub struct TimelineProjector {
     preparing_tools: HashMap<String, usize>,
     unkeyed_preparing_tools: Vec<usize>,
     reasoning: Option<usize>,
+    turn_tier: Option<&'static str>,
+    message_tiers: HashMap<Uuid, Option<&'static str>>,
 }
 
 impl TimelineProjector {
@@ -186,6 +188,17 @@ impl TimelineProjector {
 
     pub fn push(&mut self, event: &SessionEvent) {
         match &event.kind {
+            SessionEventKind::TurnStarted {
+                fast, ultrafast, ..
+            } => {
+                self.turn_tier = if *ultrafast {
+                    Some("ultrafast")
+                } else if *fast {
+                    Some("fast")
+                } else {
+                    None
+                };
+            }
             SessionEventKind::Message {
                 message_id,
                 actor,
@@ -209,7 +222,19 @@ impl TimelineProjector {
                     created_at: event.created_at,
                     kind,
                     title: title.into(),
-                    detail: message_status_label(*status).map(str::to_string),
+                    detail: if *actor == EventActor::Assistant {
+                        let tier = *self
+                            .message_tiers
+                            .entry(*message_id)
+                            .or_insert(self.turn_tier);
+                        match (tier, message_status_label(*status)) {
+                            (Some(tier), Some(status)) => Some(format!("{tier} · {status}")),
+                            (Some(tier), None) => Some(tier.to_string()),
+                            (None, status) => status.map(str::to_string),
+                        }
+                    } else {
+                        message_status_label(*status).map(str::to_string)
+                    },
                     body: text.clone(),
                     rich_body: matches!(actor, EventActor::Assistant)
                         .then(|| Arc::new(crate::markdown::project_markdown(text))),
@@ -599,6 +624,43 @@ fn message_status_label(status: MessageStatus) -> Option<&'static str> {
 mod tests {
     use super::*;
     use borg_remote::CodingProvider;
+
+    #[test]
+    fn replay_preserves_ultrafast_badge_when_an_old_message_updates() {
+        let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let mut projector = TimelineProjector::default();
+        for (sequence, fast, ultrafast) in [(1, false, true), (3, true, false)] {
+            projector.push(&SessionEvent::new(
+                session_id,
+                sequence,
+                SessionEventKind::TurnStarted {
+                    message_id: Uuid::new_v4(),
+                    provider: borg_remote::CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast,
+                    ultrafast,
+                },
+            ));
+            projector.push(&SessionEvent::new(
+                session_id,
+                sequence + 1,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::Assistant,
+                    text: "answer".into(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ));
+        }
+        assert_eq!(
+            projector.into_entries()[0].detail.as_deref(),
+            Some("ultrafast")
+        );
+    }
 
     #[test]
     fn cumulative_live_reasoning_replaces_instead_of_duplicating() {

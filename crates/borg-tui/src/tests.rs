@@ -229,6 +229,7 @@ fn completion_alert_waits_for_work_to_stop_rather_than_each_turn_boundary() {
         model: None,
         effort: None,
         fast: false,
+        ultrafast: false,
     };
     let ready = |detail: Option<&str>| SessionEventKind::StatusChanged {
         status: SessionStatus::Ready,
@@ -4736,6 +4737,7 @@ fn incremental_transcript_render_matches_a_full_render_through_a_live_session() 
         model: Some("gpt-5".to_string()),
         effort: Some("high".to_string()),
         fast: false,
+        ultrafast: false,
     };
     let turn_completed = |message_id| SessionEventKind::TurnCompleted {
         message_id,
@@ -5403,6 +5405,7 @@ fn effort_changes_do_not_relabel_usage_from_the_active_turn() {
         model: Some("gpt-5.4".to_string()),
         effort: Some(effort.to_string()),
         fast: false,
+        ultrafast: false,
         response_language: ResponseLanguage::English,
         permission_mode: PermissionMode::FullAccess,
     };
@@ -5412,6 +5415,7 @@ fn effort_changes_do_not_relabel_usage_from_the_active_turn() {
         model: Some("gpt-5.4".to_string()),
         effort: Some(effort.to_string()),
         fast: false,
+        ultrafast: false,
     };
     let usage = |cached_input_tokens| SessionEventKind::UsageUpdated {
         provider_duration_ms: 10,
@@ -5479,6 +5483,7 @@ fn model_changes_do_not_retain_the_old_context_percentage() {
         model: Some(model.to_string()),
         effort: Some("xhigh".to_string()),
         fast: false,
+        ultrafast: false,
         response_language: ResponseLanguage::English,
         permission_mode: PermissionMode::FullAccess,
     };
@@ -5527,6 +5532,7 @@ fn context_limit_label_includes_window_and_tooltip_details() {
             model: Some("local-model".to_string()),
             effort: Some("medium".to_string()),
             fast: false,
+            ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
         },
@@ -5584,6 +5590,7 @@ fn fixed_provider_context_label_hides_the_unchangeable_window_size() {
             model: Some("gpt-5.6-sol".to_string()),
             effort: Some("medium".to_string()),
             fast: false,
+            ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
         },
@@ -5616,6 +5623,7 @@ fn correlated_usage_from_another_turn_cannot_poison_cache_diagnostics() {
         model: Some("gpt-5.6-sol".to_string()),
         effort: Some("high".to_string()),
         fast: false,
+        ultrafast: false,
         response_language: ResponseLanguage::English,
         permission_mode: PermissionMode::FullAccess,
     };
@@ -5625,6 +5633,7 @@ fn correlated_usage_from_another_turn_cannot_poison_cache_diagnostics() {
         model: Some("gpt-5.6-sol".to_string()),
         effort: Some("high".to_string()),
         fast: false,
+        ultrafast: false,
     };
     let first_usage = SessionEventKind::UsageUpdated {
         provider_duration_ms: 1,
@@ -6909,6 +6918,7 @@ fn focused_transcript_configuration_switches_cwd_metadata() {
         effort: None,
         response_language: ResponseLanguage::default(),
         fast: false,
+        ultrafast: false,
         permission_mode: PermissionMode::FullAccess,
     };
     let child_id = Uuid::new_v4();
@@ -8030,6 +8040,7 @@ fn director_roster_preserves_historical_cost_basis_across_model_switches() {
             model: Some("gpt-6-sol".to_string()),
             effort: Some("ultra".to_string()),
             fast: false,
+            ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
         }),
@@ -9913,6 +9924,7 @@ fn turn_start_promotes_a_resumed_steer_out_of_pending_input() {
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
         },
         &mut None,
     );
@@ -9999,6 +10011,7 @@ fn optimistic_idle_submission_immediately_hides_cold_cache_guidance() {
             effort: Some("high".to_string()),
             response_language: ResponseLanguage::English,
             fast: false,
+            ultrafast: false,
             permission_mode: PermissionMode::FullAccess,
         }),
         ..Transcript::default()
@@ -10196,6 +10209,7 @@ fn active_turn_assistant_segments_preserve_event_order() {
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
         },
     ));
     for (sequence, status) in [(3, MessageStatus::InProgress), (4, MessageStatus::Complete)] {
@@ -10295,6 +10309,7 @@ fn active_partial_assistant_message_stays_before_later_tool_activity() {
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -10370,6 +10385,7 @@ fn running_tool_suppresses_stale_response_spinner() {
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -10572,6 +10588,7 @@ fn terminal_boundary_settles_a_late_assistant_live_snapshot() {
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -11408,6 +11425,7 @@ async fn keyboard_reaches_status_line_menus_without_a_mouse() {
         effort: Some("high".to_string()),
         response_language: ResponseLanguage::default(),
         fast: false,
+        ultrafast: false,
         permission_mode: PermissionMode::FullAccess,
     });
     let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
@@ -12163,6 +12181,7 @@ fn projected_session_state_restores_status_config_outside_the_history_tail() {
             model: Some("gpt-5.6-sol".to_string()),
             effort: Some("medium".to_string()),
             fast: false,
+            ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
         }),
@@ -12191,9 +12210,14 @@ fn projected_session_state_restores_status_config_outside_the_history_tail() {
 
 #[test]
 fn assistant_message_header_reflects_its_turn_fast_mode() {
-    for (fast, expected) in [(true, "gpt-6-astra high fast"), (false, "gpt-6-astra high")] {
+    for (fast, ultrafast, expected) in [
+        (true, false, "gpt-6-astra high fast"),
+        (false, false, "gpt-6-astra high"),
+        (false, true, "gpt-6-astra high ultrafast"),
+    ] {
         let session_id = Uuid::new_v4();
         let mut transcript = Transcript::default();
+        let assistant_id = Uuid::new_v4();
         transcript.apply(&SessionEvent::new(
             session_id,
             1,
@@ -12203,15 +12227,42 @@ fn assistant_message_header_reflects_its_turn_fast_mode() {
                 model: Some("gpt-6-astra".to_string()),
                 effort: Some("high".to_string()),
                 fast,
+                ultrafast,
             },
         ));
         transcript.apply(&SessionEvent::new(
             session_id,
             2,
             SessionEventKind::Message {
-                message_id: Uuid::new_v4(),
+                message_id: assistant_id,
                 actor: EventActor::Assistant,
                 text: "answer".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ));
+        // Replay a later standard turn and a late snapshot of the older message.
+        // Its stored header must not be relabelled with the new turn's tier.
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            3,
+            SessionEventKind::TurnStarted {
+                message_id: Uuid::new_v4(),
+                provider: CodingProvider::Codex,
+                model: Some("other-model".to_string()),
+                effort: None,
+                fast: false,
+                ultrafast: false,
+            },
+        ));
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            4,
+            SessionEventKind::Message {
+                message_id: assistant_id,
+                actor: EventActor::Assistant,
+                text: "updated answer".to_string(),
                 attachments: Vec::new(),
                 status: MessageStatus::Complete,
                 delivery: None,
@@ -12233,24 +12284,31 @@ fn assistant_message_header_reflects_its_turn_fast_mode() {
 
 #[test]
 fn fast_mode_gets_its_own_status_segment_only_when_enabled() {
-    let mut transcript = Transcript::default();
-    transcript.seed_session_state(&SessionState {
-        configuration: Some(borg_remote::SessionConfiguration {
-            cwd: PathBuf::from("/workspace/borg"),
-            provider: CodingProvider::Codex,
-            model: Some("gpt-5.6-sol".to_string()),
-            effort: Some("high".to_string()),
-            fast: true,
-            response_language: ResponseLanguage::Auto,
-            permission_mode: PermissionMode::FullAccess,
-        }),
-        ..Default::default()
-    });
+    for (fast, ultrafast, expected) in [
+        (true, false, Some("fast")),
+        (false, true, Some("ultrafast")),
+        (false, false, None),
+    ] {
+        let mut transcript = Transcript::default();
+        transcript.seed_session_state(&SessionState {
+            configuration: Some(borg_remote::SessionConfiguration {
+                cwd: PathBuf::from("/workspace/borg"),
+                provider: CodingProvider::Codex,
+                model: Some("gpt-5.6-sol".to_string()),
+                effort: Some("high".to_string()),
+                fast,
+                ultrafast,
+                response_language: ResponseLanguage::Auto,
+                permission_mode: PermissionMode::FullAccess,
+            }),
+            ..Default::default()
+        });
 
-    let statuses = transcript.config_statuses();
-    assert_eq!(statuses.model.as_deref(), Some("gpt-5.6-sol"));
-    assert_eq!(statuses.effort.as_deref(), Some("high"));
-    assert_eq!(statuses.fast.as_deref(), Some("fast"));
+        let statuses = transcript.config_statuses();
+        assert_eq!(statuses.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(statuses.effort.as_deref(), Some("high"));
+        assert_eq!(statuses.fast.as_deref(), expected);
+    }
 }
 
 #[test]
@@ -12279,6 +12337,7 @@ fn billing_status_follows_the_configured_provider_and_capability_refresh() {
             model: Some("claude-fable-5-1".to_string()),
             effort: None,
             fast: false,
+            ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
         }),
@@ -12332,6 +12391,7 @@ fn billing_status_follows_the_configured_provider_and_capability_refresh() {
             model: Some("gpt-6-astra".to_string()),
             effort: None,
             fast: false,
+            ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
         },
@@ -13669,6 +13729,7 @@ fn active_turn_action_group_closes_after_completed_reply() {
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
         }),
         ..Transcript::default()
     };
@@ -16510,6 +16571,7 @@ fn turn_started(session_id: Uuid, sequence: u64, message_id: Uuid) -> SessionEve
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
         },
     )
 }
@@ -17410,6 +17472,7 @@ fn optimistic_idle_submission_does_not_flicker_through_pending_input() {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
             message_id,
         ),
@@ -17431,6 +17494,7 @@ fn a_genuinely_queued_prompt_is_released_when_another_turn_starts() {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
             ours,
         ),
@@ -17766,6 +17830,7 @@ fn resumed_opus_and_fable_history_keeps_effort_switches_warm() {
             model: model.map(str::to_string),
             effort: Some(effort.to_string()),
             fast: false,
+            ultrafast: false,
             response_language: ResponseLanguage::English,
             permission_mode: PermissionMode::FullAccess,
         };
@@ -17778,6 +17843,7 @@ fn resumed_opus_and_fable_history_keeps_effort_switches_warm() {
                 model: model.map(str::to_string),
                 effort: Some("medium".to_string()),
                 fast: false,
+                ultrafast: false,
             },
         );
         apply(
@@ -18137,4 +18203,21 @@ fn authoritative_plan_identity_change_accepts_lower_revision_but_not_old_history
     replace_root_transcript_history(&mut transcript, &mut director, false, &[old]);
     assert_eq!(transcript.plan_participant_id, Some(b));
     assert_eq!(transcript.todos[0].content, "new participant");
+}
+
+#[test]
+fn speed_picker_selection_dispatches_the_selected_tier() {
+    for (fast, ultrafast, selected) in [(false, false, 0), (true, false, 1), (false, true, 2)] {
+        let mut picker = speed_picker(fast, ultrafast);
+        assert_eq!(picker.selected, selected);
+        // Selecting a different row must dispatch that row, not the old configuration.
+        picker.selected = (selected + 1) % 3;
+        let selected = picker.selected;
+        let action = speed_picker_action(picker);
+        assert!(match selected {
+            0 => matches!(action, UiAction::SetFast(false)),
+            1 => matches!(action, UiAction::SetFast(true)),
+            _ => matches!(action, UiAction::SetUltrafast(true)),
+        });
+    }
 }

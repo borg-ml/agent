@@ -359,6 +359,7 @@ fn subscription_request_body(
     capabilities: &Capabilities,
     refresh: Option<PromptCacheRefresh>,
 ) -> Result<Value> {
+    anyhow::ensure!(!request.ultrafast, "Claude does not support ultrafast mode");
     let mut body = messages_request_body(model, None, request);
     body["model"] = json!(capabilities.model);
     body["max_tokens"] = json!(
@@ -524,6 +525,7 @@ mod tests {
         };
         let request = ModelTurnRequest {
             fast: false,
+            ultrafast: false,
             request_id: Some("real-request".into()),
             session_id: Some("session".into()),
             prompt_cache_key: Some("cache-key".into()),

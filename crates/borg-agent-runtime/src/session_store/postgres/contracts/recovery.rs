@@ -97,6 +97,7 @@ async fn compacted_recovery_keeps_the_unresolved_prompt_tail() {
             model: Some("gpt-test".to_string()),
             effort: None,
             fast: false,
+            ultrafast: false,
         },
         message(summarized_id, "summarized old context"),
         SessionEventKind::TurnCompleted {
@@ -111,6 +112,7 @@ async fn compacted_recovery_keeps_the_unresolved_prompt_tail() {
             model: Some("gpt-test".to_string()),
             effort: None,
             fast: false,
+            ultrafast: false,
         },
         SessionEventKind::TurnCompleted {
             message_id: failed_id,
@@ -237,6 +239,7 @@ async fn provider_checkpoint_recovery_keeps_only_the_unacknowledged_tail() {
             model: Some("gpt-test".to_string()),
             effort: Some("high".to_string()),
             fast: false,
+            ultrafast: false,
         },
         SessionEventKind::Message {
             message_id: Uuid::new_v4(),
@@ -271,6 +274,7 @@ async fn provider_checkpoint_recovery_keeps_only_the_unacknowledged_tail() {
             model: Some("gpt-test".to_string()),
             effort: Some("high".to_string()),
             fast: false,
+            ultrafast: false,
         },
     ] {
         store

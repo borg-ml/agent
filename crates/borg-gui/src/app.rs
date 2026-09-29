@@ -71,6 +71,7 @@ struct BorgGui {
     sessions: Vec<LocalSessionOption>,
     sessions_open: bool,
     models_open: bool,
+    speed_open: bool,
     model_options: Vec<ModelOption>,
     dictation: Option<DictationWorker>,
     dictation_status: SharedString,
@@ -162,6 +163,11 @@ impl BorgGui {
                 }
                 "/resume" => {
                     this.sessions_open = true;
+                    cx.notify();
+                    return;
+                }
+                "/fast" => {
+                    this.speed_open = true;
                     cx.notify();
                     return;
                 }
@@ -328,6 +334,7 @@ impl BorgGui {
             sessions: Vec::new(),
             sessions_open: false,
             models_open: false,
+            speed_open: false,
             model_options: Vec::new(),
             dictation,
             dictation_status: "dictate".into(),
@@ -489,6 +496,8 @@ impl BorgGui {
             self.help_open = false;
         } else if self.sessions_open {
             self.sessions_open = false;
+        } else if self.speed_open {
+            self.speed_open = false;
         } else if self.models_open {
             self.models_open = false;
         } else {
@@ -563,14 +572,20 @@ impl BorgGui {
         let configuration = view.state.configuration.as_ref();
         let mut body = match configuration {
             Some(configuration) => format!(
-                "Model              {}\nProvider           {}\nEffort             {}\nFast mode          {}\nPermission         {}\nResponse language  {}\nWorking directory  {}",
+                "Model              {}\nProvider           {}\nEffort             {}\nSpeed tier         {}\nPermission         {}\nResponse language  {}\nWorking directory  {}",
                 configuration.model.as_deref().unwrap_or("provider default"),
                 configuration.provider.label(),
                 configuration
                     .effort
                     .as_deref()
                     .unwrap_or("provider default"),
-                if configuration.fast { "on" } else { "off" },
+                if configuration.ultrafast {
+                    "ultrafast"
+                } else if configuration.fast {
+                    "fast"
+                } else {
+                    "standard"
+                },
                 format!("{:?}", configuration.permission_mode).to_lowercase(),
                 configuration.response_language.code(),
                 configuration.cwd.display(),
@@ -731,13 +746,8 @@ impl BorgGui {
         self.send(FrontendCommand::SetPermission(next));
         cx.notify();
     }
-    fn toggle_fast(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let enabled = self
-            .view
-            .as_ref()
-            .and_then(|view| view.state.configuration.as_ref())
-            .is_some_and(|configuration| configuration.fast);
-        self.send(FrontendCommand::SetFast(!enabled));
+    fn open_speed_picker(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.speed_open = true;
         cx.notify();
     }
     fn cycle_language(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1021,6 +1031,7 @@ impl Render for BorgGui {
             .unwrap_or("unknown")
             .into();
         let fast = configuration.is_some_and(|c| c.fast);
+        let ultrafast = configuration.is_some_and(|c| c.ultrafast);
         let billing: Option<SharedString> = self
             .view
             .as_ref()
@@ -1138,7 +1149,12 @@ impl Render for BorgGui {
                 "change interface language",
                 "/ui-language ",
             ),
-            ("/fast on|off", "toggle priority mode", "/fast "),
+            ("/fast", "select standard, fast or ultrafast", "/fast"),
+            (
+                "/ultrafast on|off",
+                "Codex/OpenAI premium, access-dependent tier",
+                "/ultrafast ",
+            ),
             ("/settings", "inspect live session settings", "/settings"),
             ("/usage", "inspect tokens, time, and cost", "/usage"),
             ("/lsp", "inspect language server support", "/lsp"),
@@ -1276,6 +1292,35 @@ impl Render for BorgGui {
                                         .child(detail),
                                 )
                         })),
+                )
+            })
+            .when(self.speed_open, |root| {
+                root.child(
+                    div().absolute().inset_0().bg(gpui::rgba(0x00000088))
+                        .flex().items_center().justify_center()
+                        .child(
+                            div().id("speed-picker").w(px(560.)).bg(rgb(palette::SURFACE))
+                                .border_1().border_color(rgb(palette::BORDER)).p_3()
+                                .flex().flex_col().gap_2()
+                                .child("Speed tier · esc to close")
+                                .child(div().text_xs().text_color(rgb(palette::TEXT_MUTED))
+                                    .child("Ultrafast: Codex/OpenAI only · premium, access-dependent tier. No provider or billing fallback."))
+                                .children([("Standard", FrontendCommand::SetFast(false), !fast && !ultrafast),
+                                    ("Fast", FrontendCommand::SetFast(true), fast && !ultrafast),
+                                    ("Ultrafast", FrontendCommand::SetUltrafast(true), ultrafast)]
+                                    .into_iter().enumerate().map(|(index, (label, command, selected))| {
+                                        div().id(SharedString::from(format!("speed-{index}")))
+                                            .px_3().py_2().cursor_pointer()
+                                            .bg(rgb(if selected { palette::SURFACE_RAISED } else { palette::SURFACE }))
+                                            .hover(|style| style.bg(rgb(palette::SURFACE_RAISED)))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.send(command.clone());
+                                                this.speed_open = false;
+                                                cx.notify();
+                                            }))
+                                            .child(if selected { format!("● {label}") } else { label.to_string() })
+                                    }))
+                        )
                 )
             })
             .when(self.models_open, |root| {
@@ -1600,7 +1645,7 @@ impl Render for BorgGui {
                                     .child("·")
                                     .child(div().id("effort-setting").cursor_pointer().hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(Self::cycle_effort)).child(Self::status_segment("effort", effort, palette::TEXT_MUTED)))
                                     .child("·")
-                                    .child(div().id("fast-setting").cursor_pointer().text_color(rgb(if fast { palette::PEACH } else { palette::TEXT_MUTED })).hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(Self::toggle_fast)).child(if fast { "fast" } else { "standard" }))
+                                    .child(div().id("fast-setting").cursor_pointer().text_color(rgb(if fast || ultrafast { palette::PEACH } else { palette::TEXT_MUTED })).hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(Self::open_speed_picker)).child(if ultrafast { "ultrafast" } else if fast { "fast" } else { "standard" }))
                                     .child("·")
                                     .child(div().id("access-setting").cursor_pointer().hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(Self::cycle_permission)).child(Self::status_segment("access", access, palette::PEACH)))
                                     .child("·")

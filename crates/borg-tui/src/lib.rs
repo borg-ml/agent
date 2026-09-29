@@ -610,6 +610,11 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/model", "choose the model"),
     ("/effort", "choose reasoning effort"),
+    ("/fast", "choose standard, fast priority, or ultrafast tier"),
+    (
+        "/ultrafast",
+        "Codex/OpenAI premium, access-dependent tier; on|off",
+    ),
     ("/lsp", "view language server support"),
     ("/extensions", "view the live Blu extension runtime"),
     ("/usage", "view account limits and session usage"),
@@ -913,6 +918,7 @@ pub enum UiAction {
     SetResponseLanguage(ResponseLanguage),
     SetUiLanguage(UiLanguage),
     SetFast(bool),
+    SetUltrafast(bool),
     SetRefreshRate(u64),
     SetPreventSleep {
         enabled: bool,
@@ -1484,6 +1490,7 @@ fn draft_commit_message(
                         .model_turn_for_account(
                             ModelTurnRequest {
                                 fast: false,
+                                ultrafast: false,
                                 request_id: Some(uuid::Uuid::new_v4().to_string()),
                                 session_id: None,
                                 prompt_cache_key: None,
@@ -5378,7 +5385,7 @@ impl BorgTerminal {
             self.tr("Response language").to_string(),
             self.tr("UI language").to_string(),
             "Language servers".to_string(),
-            "Provider fast mode".to_string(),
+            "Speed tier".to_string(),
             "Active messages".to_string(),
             "Refresh rate".to_string(),
             "Keep machine awake".to_string(),
@@ -5671,13 +5678,8 @@ impl BorgTerminal {
         });
     }
 
-    pub fn open_fast_picker(&mut self, enabled: bool) {
-        self.picker = Some(Picker::new(
-            PickerKind::Fast,
-            "Provider fast mode",
-            ["On", "Off"],
-            Some(if enabled { "On" } else { "Off" }),
-        ));
+    pub fn open_fast_picker(&mut self, enabled: bool, ultrafast: bool) {
+        self.picker = Some(speed_picker(enabled, ultrafast));
     }
 
     pub fn open_refresh_rate_picker(&mut self, current: u64) {
@@ -6601,7 +6603,13 @@ impl BorgTerminal {
                             .fast_status_area
                             .is_some_and(|area| area.contains(pointer))
                         {
-                            self.open_fast_picker(true);
+                            let (fast, ultrafast) = self
+                                .transcript
+                                .config
+                                .as_ref()
+                                .map(|config| (config.fast, config.ultrafast))
+                                .unwrap_or_default();
+                            self.open_fast_picker(fast, ultrafast);
                             return Ok(UiAction::None);
                         }
                         if self
@@ -7820,7 +7828,7 @@ impl BorgTerminal {
                 UiLanguage::parse(&picker.selected_value())
                     .expect("UI language picker values are canonical"),
             ),
-            PickerKind::Fast => UiAction::SetFast(picker.selected_value() == "On"),
+            PickerKind::Fast => speed_picker_action(picker),
             PickerKind::RefreshRate => UiAction::SetRefreshRate(
                 picker
                     .selected_value()
@@ -11387,6 +11395,29 @@ fn completion_alert_policy_label(policy: CompletionAlertPolicy) -> &'static str 
         CompletionAlertPolicy::Off => "Off",
         CompletionAlertPolicy::Unfocused => "When unfocused",
         CompletionAlertPolicy::Always => "Always",
+    }
+}
+
+fn speed_picker(enabled: bool, ultrafast: bool) -> Picker {
+    Picker::new(
+        PickerKind::Fast,
+        "Speed tier (ultrafast: Codex/OpenAI premium, access-dependent)",
+        ["Standard", "Fast", "Ultrafast"],
+        Some(if ultrafast {
+            "Ultrafast"
+        } else if enabled {
+            "Fast"
+        } else {
+            "Standard"
+        }),
+    )
+}
+
+fn speed_picker_action(picker: Picker) -> UiAction {
+    match picker.selected_value().as_str() {
+        "Ultrafast" => UiAction::SetUltrafast(true),
+        "Fast" => UiAction::SetFast(true),
+        _ => UiAction::SetFast(false),
     }
 }
 

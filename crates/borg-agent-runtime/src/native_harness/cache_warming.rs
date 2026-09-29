@@ -862,6 +862,7 @@ mod tests {
             effort: None,
             request: ModelTurnRequest {
                 fast: false,
+                ultrafast: false,
                 request_id: Some("turn-1:1".to_string()),
                 session_id: Some("borg-session:test".to_string()),
                 prompt_cache_key: Some(CACHE_KEY.to_string()),

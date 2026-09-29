@@ -312,6 +312,7 @@ async fn copy_thread(
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
         },
@@ -336,6 +337,7 @@ async fn copy_thread(
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
         },
         start,
     );

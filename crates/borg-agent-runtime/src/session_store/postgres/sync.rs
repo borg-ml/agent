@@ -666,6 +666,7 @@ mod tests {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         )
     }

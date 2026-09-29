@@ -209,6 +209,7 @@ pub enum FrontendCommand {
     SetLanguage(ResponseLanguage),
     SetEffort(String),
     SetFast(bool),
+    SetUltrafast(bool),
     ClearContext,
     Compact,
     /// Stop a watch the agent armed (from the watches panel).
@@ -578,11 +579,26 @@ pub fn parse_submission(
         anyhow::ensure!(!effort.is_empty(), "usage: /effort LEVEL");
         return Ok(FrontendCommand::SetEffort(effort.to_string()));
     }
+    if text == "/ultrafast" {
+        return Ok(FrontendCommand::SetUltrafast(true));
+    }
+    if let Some(value) = text.strip_prefix("/ultrafast ").map(str::trim) {
+        return Ok(FrontendCommand::SetUltrafast(match value {
+            "on" | "true" => true,
+            "off" | "false" => false,
+            _ => anyhow::bail!(
+                "usage: /ultrafast [on|off] (Codex/OpenAI premium, access-dependent tier)"
+            ),
+        }));
+    }
     if let Some(value) = text.strip_prefix("/fast ").map(str::trim) {
+        if value == "ultrafast" {
+            return Ok(FrontendCommand::SetUltrafast(true));
+        }
         return Ok(FrontendCommand::SetFast(match value {
             "on" | "true" => true,
             "off" | "false" => false,
-            _ => anyhow::bail!("usage: /fast [on|off]"),
+            _ => anyhow::bail!("usage: /fast [on|off|ultrafast]"),
         }));
     }
     if let Some(language) = text.strip_prefix("/language ").map(str::trim) {
@@ -1098,6 +1114,39 @@ mod tests {
             options
                 .iter()
                 .any(|option| option.provider == CodingProvider::OpenRouter)
+        );
+    }
+
+    #[test]
+    fn speed_commands_preserve_priority_and_explicit_ultrafast_selection() {
+        for command in ["/ultrafast", "/ultrafast on", "/fast ultrafast"] {
+            assert!(matches!(
+                parse_submission(command, CodingProvider::Codex, PromptDelivery::Steer, &[]),
+                Ok(FrontendCommand::SetUltrafast(true))
+            ));
+        }
+        assert!(matches!(
+            parse_submission(
+                "/ultrafast off",
+                CodingProvider::Codex,
+                PromptDelivery::Steer,
+                &[]
+            ),
+            Ok(FrontendCommand::SetUltrafast(false))
+        ));
+        for (command, enabled) in [("/fast on", true), ("/fast off", false)] {
+            assert!(
+                matches!(parse_submission(command, CodingProvider::Codex, PromptDelivery::Steer, &[]), Ok(FrontendCommand::SetFast(actual)) if actual == enabled)
+            );
+        }
+        assert!(
+            parse_submission(
+                "/ultrafast maybe",
+                CodingProvider::Codex,
+                PromptDelivery::Steer,
+                &[]
+            )
+            .is_err()
         );
     }
 

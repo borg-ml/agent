@@ -120,9 +120,9 @@ impl AnthropicMessagesProvider {
                 kind: ProviderErrorKind::Fatal,
             });
         }
-        if request.fast {
+        if request.fast || request.ultrafast {
             return Err(ProviderCallError {
-                message: format!("{ANTHROPIC_LABEL} does not support fast mode"),
+                message: format!("{ANTHROPIC_LABEL} does not support fast or ultrafast mode"),
                 trace: Box::new(trace),
                 session_id: None,
                 kind: ProviderErrorKind::Fatal,
@@ -1071,6 +1071,7 @@ mod tests {
     fn request(messages: Vec<ModelMessage>, tools: Vec<ModelToolDefinition>) -> ModelTurnRequest {
         ModelTurnRequest {
             fast: false,
+            ultrafast: false,
             request_id: None,
             session_id: None,
             prompt_cache_key: None,

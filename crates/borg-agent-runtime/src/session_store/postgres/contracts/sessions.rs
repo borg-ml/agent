@@ -37,6 +37,7 @@ async fn empty_sessions_are_discarded_but_real_sessions_are_kept() {
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
         },

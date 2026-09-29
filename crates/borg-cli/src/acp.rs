@@ -589,6 +589,7 @@ impl AcpRuntime {
             model: self.args.model.clone(),
             effort: self.args.effort.clone(),
             fast: Some(false),
+            ultrafast: Some(false),
             response_language: ResponseLanguage::default(),
             permission_mode: self.args.permission.into(),
             name: cwd
@@ -666,6 +667,7 @@ impl AcpRuntime {
             model: configuration.model,
             effort: configuration.effort,
             fast: Some(configuration.fast),
+            ultrafast: Some(configuration.ultrafast),
             response_language: configuration.response_language,
             permission_mode: configuration.permission_mode,
             name: configuration

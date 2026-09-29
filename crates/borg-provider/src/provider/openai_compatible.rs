@@ -301,9 +301,9 @@ impl OpenAiCompatibleProvider {
             stdout: String::new(),
             stderr: String::new(),
         };
-        if request.fast {
+        if request.fast || request.ultrafast {
             return Err(ProviderCallError {
-                message: "fast mode is not supported by this compatible model route".to_string(),
+                message: "fast or ultrafast mode is not supported by this compatible model route".to_string(),
                 trace: Box::new(trace),
                 session_id: None,
                 kind: ProviderErrorKind::Unknown,
@@ -2875,6 +2875,7 @@ mod tests {
             .model_turn_via_profile(
                 ModelTurnRequest {
                     fast: false,
+                    ultrafast: false,
                     request_id: Some("kimi-test".to_string()),
                     session_id: None,
                     prompt_cache_key: None,
@@ -3344,6 +3345,7 @@ mod tests {
             .model_turn_via_profile(
                 ModelTurnRequest {
                     fast: false,
+                    ultrafast: false,
                     request_id: Some("openrouter-test".to_string()),
                     session_id: Some("borg-session:stable".to_string()),
                     prompt_cache_key: Some("borg-prefix:test".to_string()),

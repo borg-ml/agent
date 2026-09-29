@@ -88,7 +88,7 @@ async fn probe() -> Result<()> {
                 LaunchSession {
                     request_id: message_id, cwd: cwd.clone(), provider,
                     model: Some(model.into()),
-                    effort: Some(effort.into()), fast: Some(fast),
+                    effort: Some(effort.into()), fast: Some(fast), ultrafast: None,
                     response_language: ResponseLanguage::Auto,
                     permission_mode: if automatic { PermissionMode::Auto } else { PermissionMode::Manual },
                     name: None, initial_prompt: Some(if resumed {
@@ -329,7 +329,7 @@ async fn control_probe() -> Result<()> {
                 LaunchSession {
                     request_id: message_id, cwd: cwd.clone(), provider,
                     model: Some(model.into()),
-                    effort: Some(effort.into()), fast: Some(false),
+                    effort: Some(effort.into()), fast: Some(false), ultrafast: None,
                     response_language: ResponseLanguage::Auto, permission_mode: PermissionMode::Manual,
                     name: None, initial_prompt: Some(format!(
                         "This is a control integration probe in a disposable directory. Call exec exactly once with action `wait probe`, cmd exactly `{COMMAND}`, yield_time_ms 10000, and no workdir. Do not request any other tool or command. Afterwards reply DONE, unless the user steers you to a different response."
@@ -493,6 +493,7 @@ async fn child_probe() -> Result<()> {
                 model: Some(model.into()),
                 effort: Some(effort.into()),
                 fast: Some(false),
+                ultrafast: None,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: Some("Subscription child control probe".into()),

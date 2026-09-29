@@ -159,6 +159,14 @@ impl ModelCapabilities {
                 .any(|tier| tier == "fast")
     }
 
+    fn supports_ultrafast(&self) -> bool {
+        self.service_tiers.iter().any(|tier| tier.id == "ultrafast")
+            || self
+                .additional_speed_tiers
+                .iter()
+                .any(|tier| tier == "ultrafast")
+    }
+
     fn usable_context_window(&self) -> Result<u64> {
         let window = self
             .context_window
@@ -434,6 +442,20 @@ impl SubscriptionAccess {
     }
 }
 
+// The public API does not return context-window metadata in Responses usage.
+// Use its own catalog, never the subscription catalog's smaller default window.
+// Exact documented IDs cover newly released models before models.dev catches up:
+// https://developers.openai.com/api/docs/models/gpt-6.1-sol (1.05M context,
+// 128K maximum OUTPUT). Unknown models remain unknown, not guessed by prefix.
+fn api_context_window(model: &str) -> Option<u64> {
+    crate::models_catalog::context_window("openai", model)
+        .filter(|window| *window > 0)
+        .or_else(|| match model {
+            "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-astra" => Some(1_050_000),
+            _ => None,
+        })
+}
+
 impl CodexModelProvider {
     /// Non-secret access identity, captured by Borg for this turn only.
     pub async fn account_identity() -> Result<String> {
@@ -460,7 +482,7 @@ impl CodexModelProvider {
             "OpenAI credentials changed during this turn; retry to use the currently selected account"
         );
         if access.is_api_key() {
-            return Ok(None);
+            return Ok(api_context_window(&self.model));
         }
         let capabilities = access
             .model_capabilities(&model_http_client(expected_account)?, &self.model)
@@ -569,9 +591,14 @@ impl CodexModelProvider {
                     "selected effort is not supported by this Codex model");
                 ensure!(!request.fast || capabilities.supports_fast(),
                     "fast mode is not supported by this Codex model");
+                ensure!(!request.ultrafast || capabilities.supports_ultrafast(),
+                    "ultrafast mode is not supported by this Codex model or account");
                 Some(capabilities)
             };
-            let context_window = capabilities.as_ref().map(ModelCapabilities::usable_context_window).transpose()?;
+            let context_window = match capabilities.as_ref() {
+                Some(capabilities) => Some(capabilities.usable_context_window()?),
+                None => api_context_window(&self.model),
+            };
             // Read the protocol shape from the credential actually in use.
             // A catalogue cached by an earlier subscription login describes
             // what that front end accepts, not what the public API accepts.
@@ -592,7 +619,7 @@ impl CodexModelProvider {
                 "request_id": request.request_id,
                 "session_id": request.session_id,
                 "protocol": "openai_responses",
-                "model": self.model, "effort": self.effort, "fast": request.fast,
+                "model": self.model, "effort": self.effort, "fast": request.fast, "ultrafast": request.ultrafast,
                 "reasoning": body["reasoning"], "text": body.get("text"),
                 "responses_lite": capabilities.as_ref().is_some_and(|c| c.use_responses_lite),
                 "prompt_cache_key": request.prompt_cache_key,
@@ -725,6 +752,10 @@ impl CodexModelProvider {
         capabilities: Option<&ModelCapabilities>,
         subscription_only: bool,
     ) -> Result<Value> {
+        ensure!(
+            !(request.fast && request.ultrafast),
+            "choose either fast or ultrafast mode"
+        );
         let mut input = Vec::new();
         let mut instructions = Vec::new();
         let effort_updates =
@@ -898,7 +929,9 @@ impl CodexModelProvider {
                 body["text"] = json!({"verbosity":verbosity});
             }
         }
-        if request.fast {
+        if request.ultrafast {
+            body["service_tier"] = json!("ultrafast");
+        } else if request.fast {
             body["service_tier"] = json!("priority");
         }
         if let Some(key) = &request.prompt_cache_key {
@@ -922,7 +955,9 @@ impl CodexModelProvider {
         request: &ModelTurnRequest,
         body: &Value,
     ) -> Result<reqwest::Response> {
-        let routing_hint = if request.fast {
+        let routing_hint = if request.ultrafast {
+            format!("model={};tier=ultrafast", self.model)
+        } else if request.fast {
             format!("model={};tier=priority", self.model)
         } else {
             format!("model={}", self.model)
@@ -1858,6 +1893,7 @@ mod tests {
             prompt_cache_key: Some("cache".into()),
             turn_routing: Default::default(),
             fast: false,
+            ultrafast: false,
             output_schema: Some(json!({"type":"object"})),
         };
         let first = provider
@@ -1961,6 +1997,7 @@ mod tests {
                 vec![json!({"type":"reasoning", "encrypted_content":"opaque-account-state"})];
             let mut request = ModelTurnRequest {
                 fast: false,
+                ultrafast: false,
                 request_id: None,
                 session_id: Some("same-borg-session".into()),
                 prompt_cache_key: None,
@@ -2155,6 +2192,7 @@ mod tests {
         let account = access.identity();
         let request = || ModelTurnRequest {
             fast: false,
+            ultrafast: false,
             request_id: None,
             session_id: None,
             prompt_cache_key: None,
@@ -2413,13 +2451,22 @@ mod tests {
     }
 
     #[test]
-    fn fast_mode_uses_catalog_capabilities_and_explicit_priority_routing() {
+    fn public_api_uses_context_window_not_maximum_output() {
+        for model in ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-astra"] {
+            assert_eq!(api_context_window(model), Some(1_050_000));
+        }
+        assert_eq!(api_context_window("gpt-6.1-sol-unverified"), None);
+    }
+
+    #[test]
+    fn speed_modes_use_catalog_capabilities_and_explicit_tier_routing() {
         let provider = CodexModelProvider {
             model: "test-model".into(),
             effort: "low".into(),
         };
         let mut request = ModelTurnRequest {
             fast: false,
+            ultrafast: false,
             request_id: None,
             session_id: None,
             prompt_cache_key: None,
@@ -2440,6 +2487,20 @@ mod tests {
             provider.request_body(&request).unwrap()["service_tier"],
             "priority"
         );
+        request.fast = false;
+        request.ultrafast = true;
+        assert_eq!(
+            provider.request_body(&request).unwrap()["service_tier"],
+            "ultrafast"
+        );
+        request.fast = true;
+        assert!(
+            provider
+                .request_body(&request)
+                .unwrap_err()
+                .to_string()
+                .contains("either fast or ultrafast")
+        );
         for (tiers, legacy, expected) in [
             (json!([]), json!([]), false),
             (json!([{"id":"flex"}]), json!([]), false),
@@ -2452,6 +2513,19 @@ mod tests {
             }))
             .unwrap();
             assert_eq!(capabilities.supports_fast(), expected);
+            assert!(!capabilities.supports_ultrafast());
+        }
+        for (tiers, legacy) in [
+            (json!([{"id":"ultrafast"}]), json!([])),
+            (json!([]), json!(["ultrafast"])),
+        ] {
+            let capabilities: ModelCapabilities = serde_json::from_value(json!({
+                "slug":"test-model", "supported_reasoning_levels":[],
+                "service_tiers":tiers, "additional_speed_tiers":legacy
+            }))
+            .unwrap();
+            assert!(capabilities.supports_ultrafast());
+            assert!(!capabilities.supports_fast());
         }
     }
 
@@ -2459,6 +2533,7 @@ mod tests {
     fn catalog_ultra_uses_the_highest_accepted_responses_effort() {
         let request = ModelTurnRequest {
             fast: false,
+            ultrafast: false,
             request_id: None,
             session_id: None,
             prompt_cache_key: None,
@@ -2530,6 +2605,7 @@ mod tests {
         assert_eq!(original.identity(), refreshed.identity());
         let request = ModelTurnRequest {
             fast: false,
+            ultrafast: false,
             request_id: None,
             session_id: Some("session".into()),
             prompt_cache_key: None,
@@ -2637,7 +2713,7 @@ mod tests {
                 socket.write_all(&frame.as_bytes()[7..]).await.unwrap();
             });
             let provider = CodexModelProvider { model: "gpt-6-astra".into(), effort: "low".into() };
-            let mut request = ModelTurnRequest { fast: true, request_id: Some("request".into()), session_id: Some("session".into()),
+            let mut request = ModelTurnRequest { fast: true, ultrafast: false, request_id: Some("request".into()), session_id: Some("session".into()),
                 prompt_cache_key: Some("cache".into()),
                 turn_routing: Default::default(), messages: vec![ModelMessage::user("Inspect.")],
                 tools: vec![super::super::ModelToolDefinition::new("inspect", "Inspect", json!({"type":"object"})).unwrap()], output_schema: None };
@@ -2744,6 +2820,7 @@ mod tests {
         };
         let request = ModelTurnRequest {
             fast: false,
+            ultrafast: false,
             request_id: None,
             session_id: None,
             prompt_cache_key: None,

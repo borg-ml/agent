@@ -842,6 +842,10 @@ impl LocalSessionClient {
                 session_id,
                 action: SessionConfigAction::SetFast { enabled },
             },
+            FrontendCommand::SetUltrafast(enabled) => HostCommand::Configure {
+                session_id,
+                action: SessionConfigAction::SetUltrafast { enabled },
+            },
             FrontendCommand::ClearContext => HostCommand::ClearContext { session_id },
             FrontendCommand::Compact => HostCommand::Compact { session_id },
             FrontendCommand::StopWatch(watch_id) => HostCommand::StopWatch {

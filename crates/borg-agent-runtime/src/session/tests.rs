@@ -30,6 +30,96 @@ fn real_png_bytes() -> Vec<u8> {
     png
 }
 
+#[tokio::test]
+async fn speed_modes_are_exclusive_durable_and_provider_scoped() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let mut journal = RuntimeSessionStore::new(Arc::clone(&store), Vec::new(), true);
+    let (events, mut receiver) = mpsc::channel(16);
+    let mut launch = LaunchSession {
+        request_id: Uuid::new_v4(),
+        cwd: root.path().to_path_buf(),
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        fast: Some(true),
+        ultrafast: None,
+        response_language: crate::ResponseLanguage::Auto,
+        permission_mode: PermissionMode::Manual,
+        name: None,
+        initial_prompt: None,
+        capabilities: Default::default(),
+        subagent_concurrency_limit: None,
+        extension_skill_roots: Vec::new(),
+        team_policy: None,
+    };
+    use crate::SessionConfigAction::{SetFast, SetProvider, SetUltrafast};
+    for (action, fast, ultrafast) in [
+        (SetUltrafast { enabled: true }, false, true),
+        (SetFast { enabled: true }, true, false),
+        (SetUltrafast { enabled: false }, false, false),
+        (SetUltrafast { enabled: true }, false, true),
+    ] {
+        apply_session_config(&mut journal, &events, session_id, &mut launch, action)
+            .await
+            .unwrap();
+        assert_eq!(launch.fast, Some(fast));
+        assert_eq!(launch.ultrafast, Some(ultrafast));
+        let configuration = store
+            .state(session_id)
+            .await
+            .unwrap()
+            .configuration
+            .unwrap();
+        assert_eq!(
+            (configuration.fast, configuration.ultrafast),
+            (fast, ultrafast)
+        );
+        assert!(matches!(receiver.recv().await.unwrap().kind,
+            SessionEventKind::SessionConfigured { fast: saved_fast, ultrafast: saved_ultrafast, .. }
+                if (saved_fast, saved_ultrafast) == (fast, ultrafast)));
+    }
+    apply_session_config(
+        &mut journal,
+        &events,
+        session_id,
+        &mut launch,
+        SetProvider {
+            provider: CodingProvider::Claude,
+            model: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(launch.ultrafast, None);
+    assert!(
+        apply_session_config(
+            &mut journal,
+            &events,
+            session_id,
+            &mut launch,
+            SetUltrafast { enabled: true }
+        )
+        .await
+        .is_err()
+    );
+    let configuration = store
+        .state(session_id)
+        .await
+        .unwrap()
+        .configuration
+        .unwrap();
+    assert!(!configuration.ultrafast);
+    let mut legacy = serde_json::to_value(configuration).unwrap();
+    legacy.as_object_mut().unwrap().remove("ultrafast");
+    let restored: crate::SessionConfiguration = serde_json::from_value(legacy).unwrap();
+    assert!(!restored.ultrafast);
+    scratch.discard().await;
+}
+
 #[test]
 fn fresh_replay_reattaches_images_the_model_never_finished_answering() {
     let dir = tempdir().unwrap();
@@ -123,6 +213,7 @@ async fn claude_to_native_replay_preserves_available_images_and_marks_omissions(
                 model: Some("claude-opus-5-5".to_string()),
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -156,6 +247,7 @@ async fn claude_to_native_replay_preserves_available_images_and_marks_omissions(
                 model: Some("gpt-6-sol".to_string()),
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
     ];
@@ -210,6 +302,7 @@ async fn failed_compaction_start_keeps_native_history_and_claude_images() {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
         event(
@@ -229,6 +322,7 @@ async fn failed_compaction_start_keeps_native_history_and_claude_images() {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
         event(
@@ -327,6 +421,7 @@ async fn failed_claude_turn_keeps_recent_images_in_its_interruption_record() {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
         message(3, steer_id, "compare latest", images[4..].to_vec()),
@@ -349,6 +444,7 @@ async fn failed_claude_turn_keeps_recent_images_in_its_interruption_record() {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
     ];
@@ -539,6 +635,7 @@ async fn aborting_session_cancels_its_provider_turn_and_action_heartbeat() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -673,6 +770,7 @@ async fn session_generation_waits_on_silence_and_resumes_without_exposing_fragme
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -2747,6 +2845,7 @@ async fn empty_provider_response_retries_without_losing_user_prompt() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -2868,6 +2967,7 @@ async fn usage_limited_prompt_resumes_automatically_after_the_retry_delay() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -2969,6 +3069,7 @@ async fn a_human_message_ends_a_usage_limit_wait_immediately() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -3047,6 +3148,7 @@ async fn usage_limit_after_side_effects_continues_instead_of_replaying_the_promp
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -3184,6 +3286,7 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
             },
@@ -3224,6 +3327,7 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
                         model: model_changed.then(|| "replacement-model".into()),
                         effort: None,
                         fast: false,
+                        ultrafast: false,
                     },
                 ))
                 .await
@@ -3240,6 +3344,7 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
                         model: Some("replacement-model".into()),
                         effort: None,
                         fast: false,
+                        ultrafast: false,
                         response_language: crate::ResponseLanguage::Auto,
                         permission_mode: PermissionMode::Manual,
                     },
@@ -3295,6 +3400,7 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
                         model: model_changed.then(|| "replacement-model".into()),
                         effort: None,
                         fast: Some(false),
+                        ultrafast: None,
                         response_language: crate::ResponseLanguage::Auto,
                         permission_mode: PermissionMode::Manual,
                         name: None,
@@ -3421,6 +3527,7 @@ async fn queued_retry_can_be_recalled_while_waiting_without_later_delivery() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -3516,6 +3623,7 @@ async fn ready_is_emitted_only_after_all_queued_turn_events_are_complete() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -3689,6 +3797,7 @@ async fn provider_setup_stall_has_a_durable_terminal_boundary() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -3798,6 +3907,7 @@ async fn intermediate_narration_does_not_start_provider_drain_timeout() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -3886,6 +3996,7 @@ async fn executor_ready_has_a_bounded_provider_drain() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -3998,6 +4109,7 @@ async fn idle_immediate_input_is_persisted_as_queue_before_turn_admission() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -4098,6 +4210,7 @@ async fn stopping_an_active_turn_marks_its_prompt_failed() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -4213,6 +4326,7 @@ async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -4342,6 +4456,7 @@ async fn all_queued_prompts_can_be_recalled_at_the_turn_completion_boundary() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -4511,6 +4626,7 @@ async fn recalled_queue_prompt_is_not_started_after_the_pre_turn_handoff() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -4641,6 +4757,7 @@ async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() 
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -4801,6 +4918,7 @@ async fn assert_interrupted_fifo(
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -4968,6 +5086,7 @@ async fn user_stop_gate_holds_background_turns_until_a_human_prompt() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -5174,6 +5293,7 @@ async fn user_stop_gate_is_re_engaged_from_durable_state_after_actor_restart() {
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
         },
@@ -5191,6 +5311,7 @@ async fn user_stop_gate_is_re_engaged_from_durable_state_after_actor_restart() {
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
         },
         SessionEventKind::ProviderSessionLinked {
             provider_session_id: "codex-thread".to_string(),
@@ -5238,6 +5359,7 @@ async fn user_stop_gate_is_re_engaged_from_durable_state_after_actor_restart() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -5355,6 +5477,7 @@ async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -5518,6 +5641,7 @@ async fn an_unresponsive_cleanup_answers_escape_on_a_human_bound() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -5774,6 +5898,7 @@ async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -5886,6 +6011,7 @@ async fn assert_native_steer_settlement(marker_first: bool, fold: bool) {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -6168,6 +6294,7 @@ async fn accepted_codex_steer_is_settled_before_turn_is_interrupted() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -6290,6 +6417,7 @@ async fn escape_flush_keeps_the_turn_running_after_admission_and_steers_queued_i
                 model: Some("gpt-5.6-luna".to_string()),
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -6474,6 +6602,7 @@ async fn accepted_claude_steer_is_settled_before_turn_is_interrupted() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -6602,6 +6731,7 @@ async fn rejected_codex_steer_retries_at_the_next_tool_boundary() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -6783,6 +6913,7 @@ async fn compaction_defers_steers_preserves_next_attachments_and_respects_stop()
                         model: None,
                         effort: None,
                         fast: Some(false),
+                        ultrafast: None,
                         response_language: crate::ResponseLanguage::Auto,
                         permission_mode: PermissionMode::Manual,
                         name: None,
@@ -6990,6 +7121,7 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -7136,6 +7268,7 @@ async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -7263,6 +7396,7 @@ async fn session_semantics_are_independent_of_turn_execution_location() {
         model: Some("managed-model".to_string()),
         effort: Some("medium".to_string()),
         fast: Some(false),
+        ultrafast: None,
         response_language: crate::ResponseLanguage::Auto,
         permission_mode: PermissionMode::FullAccess,
         name: None,
@@ -7391,6 +7525,7 @@ async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() 
                     model: Some("claude-test".to_string()),
                     effort: Some("medium".to_string()),
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::FullAccess,
                     name: None,
@@ -7550,6 +7685,7 @@ async fn clear_context_starts_the_next_turn_without_provider_or_retained_context
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -7658,6 +7794,7 @@ async fn fresh_idle_session_has_one_durable_lifecycle() {
             model: None,
             effort: None,
             fast: Some(false),
+            ultrafast: None,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
             name: None,
@@ -7762,6 +7899,7 @@ async fn durably_preadmitted_prompt_executes_once_after_actor_handoff() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -7903,6 +8041,7 @@ async fn the_session_store_runs_the_canonical_session_actor() {
             model: None,
             effort: None,
             fast: Some(false),
+            ultrafast: None,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
             name: None,
@@ -7991,6 +8130,7 @@ async fn an_autonomy_job_runs_through_the_session_turn_boundary() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -8085,6 +8225,7 @@ async fn a_blu_workflow_job_runs_without_blocking_the_session_actor() {
                     model: Some("openrouter/auto".to_string()),
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::FullAccess,
                     name: None,
@@ -8164,6 +8305,7 @@ async fn crash_reconciled_child_stop_is_durable_before_resumed_ready() {
             model: Some("gpt-test".to_string()),
             effort: Some("low".to_string()),
             fast: false,
+            ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
         },
@@ -8220,6 +8362,7 @@ async fn crash_reconciled_child_stop_is_durable_before_resumed_ready() {
                 model: Some("gpt-test".to_string()),
                 effort: Some("low".to_string()),
                 fast: false,
+                ultrafast: false,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
             },
@@ -8258,6 +8401,7 @@ async fn crash_reconciled_child_stop_is_durable_before_resumed_ready() {
             model: Some("gpt-test".to_string()),
             effort: Some("low".to_string()),
             fast: Some(false),
+            ultrafast: None,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
             name: None,
@@ -8348,6 +8492,7 @@ async fn initial_mixed_provider_peer_starts_with_isolated_provider_configuration
                 model: Some("gpt-test".to_string()),
                 effort: Some("low".to_string()),
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
                 name: None,
@@ -8436,6 +8581,7 @@ async fn model_consultation_dispatches_a_freeform_briefing_to_an_isolated_provid
         model: Some("gpt-test".to_string()),
         effort: Some("medium".to_string()),
         fast: Some(false),
+        ultrafast: None,
         response_language: crate::ResponseLanguage::Auto,
         permission_mode: PermissionMode::FullAccess,
         name: None,
@@ -8525,6 +8671,7 @@ async fn resuming_an_idle_goal_emits_starting_before_running() {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
             },
@@ -8562,6 +8709,7 @@ async fn resuming_an_idle_goal_emits_starting_before_running() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -8659,6 +8807,7 @@ async fn resuming_a_goal_mid_turn_releases_the_stop_latch() {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
             },
@@ -8705,6 +8854,7 @@ async fn resuming_a_goal_mid_turn_releases_the_stop_latch() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -8812,6 +8962,7 @@ async fn fresh_human_input_resumes_a_parked_goal_only_when_opted_in() {
                     model: None,
                     effort: None,
                     fast: false,
+                    ultrafast: false,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                 },
@@ -8855,6 +9006,7 @@ async fn fresh_human_input_resumes_a_parked_goal_only_when_opted_in() {
                             model: None,
                             effort: None,
                             fast: Some(false),
+                            ultrafast: None,
                             response_language: crate::ResponseLanguage::Auto,
                             permission_mode: PermissionMode::Manual,
                             name: None,
@@ -10063,6 +10215,7 @@ fn subagent_concurrency_defaults_to_sixteen_and_accepts_a_lower_launch_limit() {
         model: None,
         effort: None,
         fast: Some(false),
+        ultrafast: None,
         response_language: crate::ResponseLanguage::Auto,
         permission_mode: PermissionMode::Manual,
         name: None,
@@ -10311,6 +10464,7 @@ async fn resumed_session_drains_unresolved_input_and_preserves_last_context_usag
             model: Some("test-model".to_string()),
             effort: Some("medium".to_string()),
             fast: false,
+            ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
         },
@@ -10368,6 +10522,7 @@ async fn resumed_session_drains_unresolved_input_and_preserves_last_context_usag
                     model: Some("test-model".to_string()),
                     effort: Some("medium".to_string()),
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::FullAccess,
                     name: None,
@@ -10526,6 +10681,7 @@ fn crashed_turn_events(session_id: Uuid, message_id: Uuid) -> Vec<SessionEventKi
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
         },
         SessionEventKind::Message {
             message_id: Uuid::new_v4(),
@@ -10618,6 +10774,7 @@ async fn a_turn_killed_before_it_produced_anything_replays_its_prompt_verbatim()
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
         },
         // The host died here, between the boundary and the first output.
     ] {
@@ -10665,6 +10822,7 @@ async fn a_resumed_turn_continues_the_original_prompt_and_settles_it_once() {
             model: Some("gpt-5.6-luna".to_string()),
             effort: Some("max".to_string()),
             fast: false,
+            ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
         },
@@ -10682,6 +10840,7 @@ async fn a_resumed_turn_continues_the_original_prompt_and_settles_it_once() {
             model: Some("gpt-5.6-luna".to_string()),
             effort: Some("max".to_string()),
             fast: false,
+            ultrafast: false,
         },
         // The answer the human already read, and a side effect that already
         // landed. Both must reach the resumed turn as history.
@@ -10742,6 +10901,7 @@ async fn a_resumed_turn_continues_the_original_prompt_and_settles_it_once() {
                 model: Some("gpt-5.6-luna".to_string()),
                 effort: Some("max".to_string()),
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -10888,6 +11048,7 @@ async fn a_resumed_turn_that_hits_a_usage_limit_checkpoints_as_a_continuation() 
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
         },
@@ -10905,6 +11066,7 @@ async fn a_resumed_turn_that_hits_a_usage_limit_checkpoints_as_a_continuation() 
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
         },
         SessionEventKind::Message {
             message_id: Uuid::new_v4(),
@@ -10944,6 +11106,7 @@ async fn a_resumed_turn_that_hits_a_usage_limit_checkpoints_as_a_continuation() 
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -11613,6 +11776,7 @@ fn native_replay_keeps_completed_batch_results_after_failure_or_crash() {
                     model: None,
                     effort: None,
                     fast: false,
+                    ultrafast: false,
                 },
             ),
         );
@@ -11659,6 +11823,7 @@ fn native_replay_keeps_completed_batch_results_after_failure_or_crash() {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ));
         events.push(SessionEvent::new(
@@ -11805,6 +11970,7 @@ fn mutable_prompt_context_replays_after_the_user_tail_without_breaking_prefix_or
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -11875,6 +12041,7 @@ fn mutable_prompt_context_replays_after_the_user_tail_without_breaking_prefix_or
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -11991,6 +12158,7 @@ fn failed_user_prompt_remains_in_provider_replay() {
                 model: Some("gpt-5.6-luna".to_string()),
                 effort: Some("max".to_string()),
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -12056,6 +12224,7 @@ fn legacy_completed_prompt_before_a_failed_turn_is_not_dropped() {
                 model: Some("gpt-5.6-luna".to_string()),
                 effort: Some("max".to_string()),
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -12092,6 +12261,7 @@ fn failed_user_prompt_survives_a_later_context_compaction_boundary() {
                 model: Some("gpt-5.6-luna".to_string()),
                 effort: Some("max".to_string()),
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -12125,6 +12295,7 @@ fn failed_user_prompt_survives_a_later_context_compaction_boundary() {
                 model: Some("claude-sonnet-5".to_string()),
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -12168,6 +12339,7 @@ fn a_clean_compaction_boundary_bounds_context_without_changing_replay() {
                     model: Some("gpt-5.6-luna".to_string()),
                     effort: Some("max".to_string()),
                     fast: false,
+                    ultrafast: false,
                 },
             ),
             SessionEvent::new(
@@ -12329,6 +12501,7 @@ fn provider_neutral_replay_carries_subscription_tools_across_provider_switches()
                 model: Some("gpt-5.6-luna".to_string()),
                 effort: Some("xhigh".to_string()),
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -12398,6 +12571,7 @@ fn provider_neutral_replay_carries_subscription_tools_across_provider_switches()
                 model: Some("openai/gpt-5".to_string()),
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -12524,6 +12698,7 @@ fn subscription_compaction_projection_truncates_large_tool_results() {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -12581,6 +12756,7 @@ fn subscription_compaction_projection_truncates_large_tool_results() {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -12638,6 +12814,7 @@ fn subscription_compaction_projection_truncates_large_tool_results() {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -12920,6 +13097,7 @@ async fn subscription_compaction_counts_every_fold_and_reports_partial_failure()
         model: Some("test-model".to_string()),
         effort: Some("medium".to_string()),
         fast: Some(false),
+        ultrafast: None,
         response_language: crate::ResponseLanguage::Auto,
         permission_mode: PermissionMode::FullAccess,
         name: None,
@@ -12951,6 +13129,7 @@ async fn subscription_compaction_counts_every_fold_and_reports_partial_failure()
             model: Some("test-model".to_string()),
             effort: Some("medium".to_string()),
             fast: false,
+            ultrafast: false,
         },
     )];
     for index in 0..6_u64 {
@@ -13145,6 +13324,7 @@ fn subscription_compaction_tail_replays_from_the_boundary_event_alone() {
                 model: Some("claude-sonnet-5".to_string()),
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -13281,6 +13461,7 @@ fn subscription_projection_is_append_only_until_compaction() {
                 model: Some("gpt-5.6-luna".to_string()),
                 effort: Some("xhigh".to_string()),
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -13375,6 +13556,7 @@ fn subscription_projection_is_append_only_until_compaction() {
             model: Some("claude-sonnet-5".to_string()),
             effort: None,
             fast: false,
+            ultrafast: false,
         },
     ));
     let after_compaction = retained_conversation_context(&compacted_events)
@@ -13405,6 +13587,7 @@ fn provider_neutral_replay_resets_subscription_history_at_compaction() {
                 model: Some("claude-sonnet-5".to_string()),
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -13447,6 +13630,7 @@ fn provider_neutral_replay_resets_subscription_history_at_compaction() {
                 model: Some("openai/gpt-5".to_string()),
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -13516,6 +13700,7 @@ fn interrupted_user_prompt_is_preserved_after_context_compaction() {
                 model: Some("gpt-5.6-luna".to_string()),
                 effort: Some("max".to_string()),
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -13729,6 +13914,7 @@ fn codex_resume_requires_a_terminal_checkpoint_after_the_latest_turn_start() {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
         SessionEvent::new(
@@ -13754,6 +13940,7 @@ fn codex_resume_requires_a_terminal_checkpoint_after_the_latest_turn_start() {
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
         },
     ));
     events.push(SessionEvent::new(
@@ -13823,6 +14010,7 @@ async fn reusable_subscription_pool_does_not_compact_large_durable_replay() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -13934,6 +14122,7 @@ async fn resumed_provider_turn_receives_team_messages_settled_while_idle() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -14059,6 +14248,7 @@ async fn same_provider_model_switch_does_not_compact_reusable_context() {
                 model: Some("gpt-5.6-sol".to_string()),
                 effort: Some("xhigh".to_string()),
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -14196,6 +14386,7 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
             model: Some("gpt-5.6-luna".to_string()),
             effort: Some("max".to_string()),
             fast: false,
+            ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
         },
@@ -14213,6 +14404,7 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
             model: Some("gpt-5.6-luna".to_string()),
             effort: Some("max".to_string()),
             fast: false,
+            ultrafast: false,
         },
         SessionEventKind::Message {
             message_id: Uuid::new_v4(),
@@ -14266,6 +14458,7 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
                 model: Some("gpt-5.6-luna".to_string()),
                 effort: Some("max".to_string()),
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -14342,6 +14535,7 @@ async fn crash_resume_forks_the_last_completed_codex_turn_before_replaying_input
             model: Some("gpt-5.6-sol".to_string()),
             effort: Some("xhigh".to_string()),
             fast: false,
+            ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
         },
@@ -14359,6 +14553,7 @@ async fn crash_resume_forks_the_last_completed_codex_turn_before_replaying_input
             model: Some("gpt-5.6-sol".to_string()),
             effort: Some("xhigh".to_string()),
             fast: false,
+            ultrafast: false,
         },
         SessionEventKind::Message {
             message_id: Uuid::new_v4(),
@@ -14393,6 +14588,7 @@ async fn crash_resume_forks_the_last_completed_codex_turn_before_replaying_input
             model: Some("gpt-5.6-sol".to_string()),
             effort: Some("xhigh".to_string()),
             fast: false,
+            ultrafast: false,
         },
         SessionEventKind::StatusChanged {
             status: SessionStatus::Running,
@@ -14436,6 +14632,7 @@ async fn crash_resume_forks_the_last_completed_codex_turn_before_replaying_input
                 model: Some("gpt-5.6-sol".to_string()),
                 effort: Some("xhigh".to_string()),
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -14499,6 +14696,7 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
             model: Some("gpt-5.6-sol".to_string()),
             effort: Some("xhigh".to_string()),
             fast: false,
+            ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
         },
@@ -14516,6 +14714,7 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
             model: Some("gpt-5.6-sol".to_string()),
             effort: Some("xhigh".to_string()),
             fast: false,
+            ultrafast: false,
         },
         SessionEventKind::Message {
             message_id: Uuid::new_v4(),
@@ -14573,6 +14772,7 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
             model: Some("gpt-5.6-sol".to_string()),
             effort: Some("xhigh".to_string()),
             fast: false,
+            ultrafast: false,
         },
         SessionEventKind::UsageUpdated {
             provider_duration_ms: 1,
@@ -14634,6 +14834,7 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
                 model: Some("gpt-5.6-sol".to_string()),
                 effort: Some("xhigh".to_string()),
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -14719,6 +14920,7 @@ async fn acknowledged_codex_escape_does_not_compact_a_reusable_large_context() {
                 model: Some("gpt-5.6-luna".to_string()),
                 effort: Some("max".to_string()),
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -14953,6 +15155,7 @@ async fn borg_tool_approvals_route_and_cancel_without_provider_controls() {
                     model: None,
                     effort: None,
                     fast: None,
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -15137,6 +15340,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
         model: Some("gpt-test".to_string()),
         effort: Some("low".to_string()),
         fast: Some(false),
+        ultrafast: None,
         response_language: crate::ResponseLanguage::Auto,
         permission_mode: PermissionMode::FullAccess,
         name: None,
@@ -15481,6 +15685,7 @@ async fn interrupt_is_honoured_while_a_stalled_observer_backs_up_the_event_strea
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::FullAccess,
                     name: None,
@@ -15634,6 +15839,7 @@ async fn a_usage_limit_is_never_retried_as_a_connection_loss() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -15929,6 +16135,7 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
                         model: None,
                         effort: None,
                         fast: false,
+                        ultrafast: false,
                         response_language: crate::ResponseLanguage::Auto,
                         permission_mode: PermissionMode::FullAccess,
                     },
@@ -15969,6 +16176,7 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
                         model: None,
                         effort: None,
                         fast: Some(false),
+                        ultrafast: None,
                         response_language: crate::ResponseLanguage::Auto,
                         permission_mode: PermissionMode::FullAccess,
                         name: None,
@@ -16185,6 +16393,7 @@ async fn monitor_event_wakes_an_idle_session_without_an_active_goal() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::FullAccess,
                     name: None,
@@ -16267,6 +16476,7 @@ async fn escape_cancels_connection_retry_without_losing_the_prompt() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -16343,6 +16553,7 @@ async fn imported_conversation_is_atomic_and_replays_both_sides_without_live_pro
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         ),
     ];
@@ -16515,6 +16726,7 @@ async fn imported_relay_message_wakes_the_actor_as_system_provenance() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -17114,6 +17326,7 @@ async fn a_provider_stall_is_visible_before_the_turn_fails() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -17238,6 +17451,7 @@ async fn a_pending_provider_interaction_suspends_the_watchdog() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -17406,6 +17620,7 @@ fn subscription_turn_events(
                 model: Some("claude-fable-5-1".to_string()),
                 effort: Some("medium".to_string()),
                 fast: false,
+                ultrafast: false,
             },
         ),
     ];
@@ -17558,6 +17773,7 @@ fn interrupted_subscription_turn_keeps_its_delivered_output() {
         model: Some("claude-fable-5-1".to_string()),
         effort: Some("medium".to_string()),
         fast: false,
+        ultrafast: false,
     };
     let user = |message_id, text: &str, status, delivery| SessionEventKind::Message {
         message_id,
@@ -17725,6 +17941,7 @@ fn collapsed_recovery_journal_still_places_prompts_before_their_replies() {
         model: Some("claude-fable-5-1".to_string()),
         effort: Some("medium".to_string()),
         fast: false,
+        ultrafast: false,
     };
     let message = |message_id, actor, text: &str, status| SessionEventKind::Message {
         message_id,
@@ -17944,6 +18161,7 @@ async fn steer_in_flight_when_the_turn_ends_starts_a_new_turn() {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -18674,6 +18892,7 @@ async fn assert_watcher_yield_blocks_automatic_turns(queue_reports: bool) {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::FullAccess,
                     name: None,
@@ -18834,6 +19053,7 @@ async fn a_stopped_silent_watcher_ends_the_yield_instead_of_stranding_the_goal()
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::FullAccess,
                     name: None,
@@ -18942,6 +19162,7 @@ async fn an_interrupt_while_yielded_holds_watcher_output_until_a_human_returns()
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::FullAccess,
                     name: None,
@@ -19074,6 +19295,7 @@ async fn a_watcher_that_finishes_while_yielded_resumes_the_goal_without_ending_t
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::FullAccess,
                     name: None,
@@ -19282,6 +19504,7 @@ async fn assert_immediate_interrupt(control_backlog: usize) {
                 model: None,
                 effort: None,
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -19569,6 +19792,7 @@ async fn a_human_steer_ends_a_blocking_wait_agent() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -19679,6 +19903,7 @@ async fn resume_from_interrupt_lets_the_parents_follow_up_start_a_turn() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -19776,6 +20001,7 @@ async fn escape_keeps_a_prompt_the_model_already_acted_on_delivered() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -19918,6 +20144,7 @@ async fn a_usage_limit_continues_the_turn_on_the_next_fallback_route() {
                     model: None,
                     effort: None,
                     fast: Some(false),
+                    ultrafast: None,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
                     name: None,
@@ -20159,6 +20386,7 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
             model: Some("test".into()),
             effort: Some("max".into()),
             fast: false,
+            ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
         },
@@ -20168,6 +20396,7 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
             model: Some("test".into()),
             effort: None,
             fast: false,
+            ultrafast: false,
         },
         SessionEventKind::ProviderEvent {
             provider: CodingProvider::OpenRouter,
@@ -20251,6 +20480,7 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
                 model: Some("test".to_string()),
                 effort: Some("max".to_string()),
                 fast: Some(false),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
                 name: None,
@@ -20591,6 +20821,7 @@ async fn private_workspace_plan_migrates_once_and_refreshes_while_idle_across_re
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
         },
@@ -20628,6 +20859,7 @@ async fn private_workspace_plan_migrates_once_and_refreshes_while_idle_across_re
             model: None,
             effort: None,
             fast: Some(false),
+            ultrafast: None,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
             name: None,
@@ -21044,6 +21276,7 @@ async fn viewer_resume_projects_work_without_granting_write_or_losing_deferred_l
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
         },
@@ -21082,6 +21315,7 @@ async fn viewer_resume_projects_work_without_granting_write_or_losing_deferred_l
         model: None,
         effort: None,
         fast: Some(false),
+        ultrafast: None,
         response_language: crate::ResponseLanguage::Auto,
         permission_mode: PermissionMode::Manual,
         name: None,
@@ -21286,6 +21520,7 @@ async fn compaction_fold_with_executor(
         model: Some("test-model".to_string()),
         effort: Some("medium".to_string()),
         fast: Some(false),
+        ultrafast: None,
         response_language: crate::ResponseLanguage::Auto,
         permission_mode: PermissionMode::FullAccess,
         name: None,

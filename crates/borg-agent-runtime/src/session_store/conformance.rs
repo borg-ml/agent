@@ -1920,6 +1920,7 @@ async fn prompt_admission_is_idempotent_on_both_backends() {
                     model: None,
                     effort: None,
                     fast: false,
+                    ultrafast: false,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: crate::PermissionMode::FullAccess,
                 },

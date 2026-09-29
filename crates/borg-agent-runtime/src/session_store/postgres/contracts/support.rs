@@ -34,6 +34,7 @@ pub(super) fn configured(directory: &Path) -> SessionEventKind {
         model: Some("gpt-test".to_string()),
         effort: Some("high".to_string()),
         fast: false,
+        ultrafast: false,
         response_language: ResponseLanguage::Auto,
         permission_mode: PermissionMode::FullAccess,
     }
@@ -46,6 +47,7 @@ pub(super) fn opencode_configured(model: &str) -> SessionEventKind {
         model: Some(model.to_string()),
         effort: None,
         fast: false,
+        ultrafast: false,
         response_language: ResponseLanguage::default(),
         permission_mode: PermissionMode::Auto,
     }

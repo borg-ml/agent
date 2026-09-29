@@ -374,3 +374,17 @@ Borg Agent pins Blu to an exact Git revision so builds remain reproducible.
 release CI runs this as a hard gate. `just blu-update` advances the manifest and
 lockfile together when upstream moves. A release therefore cannot silently ship
 an older Blu revision.
+
+## Speed tier
+
+Use `/fast` in the TUI or GUI to select **Standard**, **Fast** (provider
+priority mode), or **Ultrafast**. `/fast on` selects fast; `/fast off` selects
+standard. `/ultrafast` or `/ultrafast on` enables ultrafast, and
+`/ultrafast off` returns to standard. `/fast ultrafast` is an alias.
+New sessions can request `--fast` or `--ultrafast` (not both).
+
+Ultrafast is an explicit **Codex/OpenAI-only premium, access-dependent tier**
+request. It does not change your provider or silently fall back to a different
+tier or API-key billing. Unsupported providers or unavailable tier access are
+reported as errors. The selected tier is saved with the session; turn badges
+show the tier used for that turn, including during replay.

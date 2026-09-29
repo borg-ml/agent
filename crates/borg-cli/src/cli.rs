@@ -553,8 +553,12 @@ pub(crate) struct LocalAgentCliArgs {
     /// Reasoning effort override for --peer-provider.
     #[arg(long, requires = "peer_provider")]
     pub(crate) peer_effort: Option<String>,
-    #[arg(long)]
+    /// Request provider priority mode.
+    #[arg(long, conflicts_with = "ultrafast")]
     pub(crate) fast: bool,
+    /// Request the Codex/OpenAI premium, access-dependent ultrafast tier.
+    #[arg(long, conflicts_with = "fast")]
+    pub(crate) ultrafast: bool,
     #[arg(long)]
     pub(crate) config: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = RemotePermissionArg::FullAccess)]
@@ -641,6 +645,7 @@ impl LocalAgentCliArgs {
             peer_model: None,
             peer_effort: None,
             fast: false,
+            ultrafast: false,
             config: None,
             permission: RemotePermissionArg::FullAccess,
             json: false,
@@ -666,6 +671,7 @@ impl LocalAgentCliArgs {
             peer_model: None,
             peer_effort: None,
             fast: false,
+            ultrafast: false,
             config: None,
             permission: RemotePermissionArg::FullAccess,
             json: false,

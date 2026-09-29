@@ -81,6 +81,7 @@ async fn prompt_event_boundaries_drive_one_atomic_action_lifecycle() {
                 model: Some("gpt-test".to_string()),
                 effort: Some("high".to_string()),
                 fast: false,
+                ultrafast: false,
             },
         ))
         .await
@@ -269,6 +270,7 @@ async fn stale_in_progress_message_does_not_resurrect_terminal_action() {
             model: Some("gpt-test".to_string()),
             effort: Some("high".to_string()),
             fast: false,
+            ultrafast: false,
         },
         SessionEventKind::TurnCompleted {
             message_id,
@@ -331,6 +333,7 @@ async fn accepted_steer_queue_event_reopens_a_terminal_action_projection() {
             model: Some("gpt-test".to_string()),
             effort: Some("high".to_string()),
             fast: false,
+            ultrafast: false,
         },
         SessionEventKind::TurnCompleted {
             message_id,

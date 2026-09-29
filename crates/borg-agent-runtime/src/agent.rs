@@ -179,6 +179,7 @@ pub struct AgentTurn {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub fast: Option<bool>,
+    pub ultrafast: Option<bool>,
     pub response_language: crate::ResponseLanguage,
     pub permission_mode: PermissionMode,
     /// Provider-neutral conversation reconstructed for native providers.
@@ -444,6 +445,7 @@ pub trait AgentTurnExecutor: Send + Sync {
         _model: &str,
         _effort: Option<&str>,
         _fast: bool,
+        _ultrafast: bool,
         _conversation: Vec<borg_provider::provider::ModelMessage>,
         _observed_context_window_tokens: Option<u64>,
         _progress: Option<mpsc::UnboundedSender<NativeCompactionProgress>>,
@@ -1340,6 +1342,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         model: &str,
         effort: Option<&str>,
         fast: bool,
+        ultrafast: bool,
         conversation: Vec<borg_provider::provider::ModelMessage>,
         observed_context_window_tokens: Option<u64>,
         progress: Option<mpsc::UnboundedSender<NativeCompactionProgress>>,
@@ -1364,6 +1367,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 model,
                 effort,
                 fast,
+                ultrafast,
                 conversation,
                 access.request_prefix.as_ref(),
                 observed_context_window_tokens,
@@ -1636,6 +1640,10 @@ async fn run_borg_provider_turn(
         #[cfg(feature = "profiling")]
         profiler,
     } = runtime;
+    anyhow::ensure!(
+        !turn.ultrafast.unwrap_or(false),
+        "ultrafast requires Borg's native OpenAI transport"
+    );
     let provider_turn_started = Instant::now();
     let ttft_session_id = turn.session_id;
     let ttft_message_id = turn.message_id;
@@ -2786,6 +2794,7 @@ mod tests {
             model: Some("claude-fable-5-1".to_string()),
             effort: None,
             fast: None,
+            ultrafast: None,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: crate::PermissionMode::FullAccess,
             conversation: Vec::new(),
@@ -3089,6 +3098,7 @@ mod tests {
                 CodingProvider::Codex,
                 model,
                 Some("low"),
+                false,
                 false,
                 vec![borg_provider::provider::ModelMessage::user(
                     "private conversation",

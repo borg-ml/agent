@@ -414,8 +414,8 @@ enum RevertStartMode {
     StopThenFork,
 }
 
-fn revert_start_mode(status: SessionStatus) -> RevertStartMode {
-    if status == SessionStatus::Stopped {
+fn revert_start_mode(access: LocalSessionAccess, status: SessionStatus) -> RevertStartMode {
+    if access.is_attached() || status == SessionStatus::Stopped {
         RevertStartMode::ForkNow
     } else {
         RevertStartMode::StopThenFork
@@ -1663,6 +1663,9 @@ fn append_session_host_arguments(
     if args.fast {
         command.arg("--fast");
     }
+    if args.ultrafast {
+        command.arg("--ultrafast");
+    }
     if let Some(config) = args.config.as_ref() {
         command.arg("--config").arg(config);
     }
@@ -2198,6 +2201,7 @@ async fn run_local_agent_session(
             configuration.model.clone(),
             configuration.effort.clone(),
             Some(configuration.fast),
+            Some(configuration.ultrafast),
             configuration.response_language,
             configuration.permission_mode,
         )
@@ -2312,6 +2316,7 @@ async fn run_local_agent_session(
         mut model,
         mut effort,
         fast,
+        ultrafast,
         response_language,
         permission_mode,
     ) = if let Some(recorded_config) = recorded_config {
@@ -2325,6 +2330,7 @@ async fn run_local_agent_session(
             requested_model,
             requested_effort,
             Some(args.fast),
+            Some(args.ultrafast),
             ResponseLanguage::Auto,
             args.permission.into(),
         )
@@ -2375,6 +2381,7 @@ async fn run_local_agent_session(
     let mut current_model = model.clone();
     let mut current_effort = effort.clone();
     let mut current_fast = fast.unwrap_or(false);
+    let mut current_ultrafast = ultrafast.unwrap_or(false);
     let mut current_response_language = response_language;
     let local_settings = agent_config.local_agent_settings()?;
     let (mut extension_catalog, extension_servers, extension_workflows) =
@@ -2553,6 +2560,7 @@ async fn run_local_agent_session(
         model: model.clone(),
         effort: effort.clone(),
         fast,
+        ultrafast,
         response_language,
         permission_mode,
         // The directory is a workspace label, not an explicit thread title.
@@ -4226,6 +4234,7 @@ async fn run_local_agent_session(
                             model,
                             effort,
                             fast,
+                            ultrafast,
                             response_language,
                             ..
                         } => {
@@ -4250,6 +4259,7 @@ async fn run_local_agent_session(
                             current_model = model.clone();
                             current_effort = effort.clone();
                             current_fast = *fast;
+                            current_ultrafast = *ultrafast;
                             current_response_language = *response_language;
                         }
                         SessionEventKind::UsageUpdated {
@@ -4658,19 +4668,17 @@ async fn run_local_agent_session(
                 }
                 if line == "/fast" {
                     println!(
-                        "\n  Fast mode: {}\n  Use /fast on or /fast off.\n",
-                        if current_fast { "on" } else { "off" }
+                        "\n  Speed tier: {}\n  Use /fast off (standard), /fast on (priority), or /fast ultrafast (Codex/OpenAI premium, access-dependent).\n",
+                        if current_ultrafast { "ultrafast" } else if current_fast { "fast" } else { "standard" }
                     );
                     continue;
                 }
-                if let Some(value) = line.strip_prefix("/fast ") {
-                    if let Some(enabled) = parse_on_off(value) {
-                        session_command_tx.send(HostCommand::Configure {
-                            session_id,
-                            action: SessionConfigAction::SetFast { enabled },
-                        }).await.ok();
-                    } else {
-                        println!("\n  Choose /fast on or /fast off.\n");
+                if line == "/ultrafast" || line.starts_with("/ultrafast ") || line.starts_with("/fast ") {
+                    match parse_speed_action(line) {
+                        Some(action) => {
+                            session_command_tx.send(HostCommand::Configure { session_id, action }).await.ok();
+                        }
+                        None => println!("\n  Choose /fast on|off|ultrafast or /ultrafast on|off (Codex/OpenAI premium, access-dependent).\n"),
                     }
                     continue;
                 }
@@ -4711,10 +4719,10 @@ async fn run_local_agent_session(
                     "/settings" | "/followups" | "/refresh" | "/sleep"
                 ) {
                     println!(
-                        "\n  Settings\n  Model: {}\n  Effort: {}\n  Fast mode: {}\n  Active messages: {}\n  Refresh: {tui_fps} FPS\n  Keep machine awake: {}\n  User label: {}\n  Assistant label: {}\n  Use /model NAME, /effort LEVEL, /fast on|off, /followups steer|queue, /refresh FPS, /sleep lid|idle|off, /user-label TEXT, or /assistant-label TEXT.\n",
+                        "\n  Settings\n  Model: {}\n  Effort: {}\n  Speed tier: {}\n  Active messages: {}\n  Refresh: {tui_fps} FPS\n  Keep machine awake: {}\n  User label: {}\n  Assistant label: {}\n  Use /model NAME, /effort LEVEL, /fast on|off|ultrafast, /ultrafast on|off, /followups steer|queue, /refresh FPS, /sleep lid|idle|off, /user-label TEXT, or /assistant-label TEXT.\n",
                         current_model.as_deref().unwrap_or("provider default"),
                         current_effort.as_deref().unwrap_or("provider default"),
-                        if current_fast { "on" } else { "off" },
+                        if current_ultrafast { "ultrafast" } else if current_fast { "fast" } else { "standard" },
                         if steer_active_turn {
                             "send now and redirect the current turn"
                         } else {
@@ -5343,7 +5351,7 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .set_notice("A revert is already in progress".to_string());
-                        } else if revert_start_mode(status) == RevertStartMode::ForkNow {
+                        } else if revert_start_mode(session_access, status) == RevertStartMode::ForkNow {
                             rewind_prompt = Some((text, attachments));
                             revert_fork_task = Some(spawn_revert_fork(
                                 Arc::clone(&store),
@@ -5376,7 +5384,7 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .set_notice("A revert is already in progress".to_string());
-                        } else if revert_start_mode(status) == RevertStartMode::ForkNow {
+                        } else if revert_start_mode(session_access, status) == RevertStartMode::ForkNow {
                             rewind_prompt = None;
                             revert_fork_task = Some(spawn_revert_fork(
                                 Arc::clone(&store),
@@ -5573,6 +5581,15 @@ async fn run_local_agent_session(
                             HostCommand::Configure {
                                 session_id,
                                 action: SessionConfigAction::SetFast { enabled },
+                            },
+                        );
+                    }
+                    UiAction::SetUltrafast(enabled) => {
+                        dispatch_ui_command(
+                            &ui_interaction_tx,
+                            HostCommand::Configure {
+                                session_id,
+                                action: SessionConfigAction::SetUltrafast { enabled },
                             },
                         );
                     }
@@ -6424,7 +6441,7 @@ async fn run_local_agent_session(
                                 .expect("terminal")
                                 .open_ui_language_picker();
                         } else if line == "/fast" && attachments.is_empty() {
-                            terminal.as_mut().expect("terminal").open_fast_picker(current_fast);
+                            terminal.as_mut().expect("terminal").open_fast_picker(current_fast, current_ultrafast);
                         } else if line == "/refresh" && attachments.is_empty() {
                             terminal
                                 .as_mut()
@@ -6775,20 +6792,14 @@ async fn run_local_agent_session(
                                     "Unknown interface language. Use /ui-language to choose one.",
                                 );
                             }
-                        } else if let Some(value) = line.strip_prefix("/fast ")
+                        } else if (line == "/ultrafast" || line.starts_with("/ultrafast ") || line.starts_with("/fast "))
                             && attachments.is_empty()
                         {
-                            if let Some(enabled) = parse_on_off(value) {
-                                dispatch_ui_command(
-                                    &ui_interaction_tx,
-                                    HostCommand::Configure {
-                                        session_id,
-                                        action: SessionConfigAction::SetFast { enabled },
-                                    },
-                                );
+                            if let Some(action) = parse_speed_action(line) {
+                                dispatch_ui_command(&ui_interaction_tx, HostCommand::Configure { session_id, action });
                             } else {
                                 terminal.as_mut().expect("terminal").set_notice(
-                                    "Choose /fast on or /fast off",
+                                    "Choose /fast on|off|ultrafast or /ultrafast on|off (Codex/OpenAI premium, access-dependent)",
                                 );
                             }
                         } else if let Some(value) = line.strip_prefix("/user-label ")
@@ -7843,6 +7854,10 @@ async fn run_local_agent_session(
     drop(ui_interaction_tx);
     if let Err(error) = ui_interaction_task.await {
         tracing::warn!(%session_id, %error, "UI interaction dispatcher stopped unexpectedly");
+    }
+    if session_access.is_attached() {
+        // End only this viewer's attachment; do not forward Stop to its owner.
+        drop(session_command_tx);
     }
     drop(session_events);
     let mut actor_panicked = false;
@@ -9484,6 +9499,21 @@ fn sleep_setting_notice(enabled: bool, lid: bool, status: LidSleepStatus) -> Str
         _ => "",
     };
     format!("Keep machine awake while Borg works: {label}{caveat}")
+}
+
+fn parse_speed_action(line: &str) -> Option<SessionConfigAction> {
+    if line == "/ultrafast" {
+        return Some(SessionConfigAction::SetUltrafast { enabled: true });
+    }
+    if let Some(value) = line.strip_prefix("/ultrafast ") {
+        return parse_on_off(value).map(|enabled| SessionConfigAction::SetUltrafast { enabled });
+    }
+    let value = line.strip_prefix("/fast ")?.trim();
+    if value == "ultrafast" {
+        Some(SessionConfigAction::SetUltrafast { enabled: true })
+    } else {
+        parse_on_off(value).map(|enabled| SessionConfigAction::SetFast { enabled })
+    }
 }
 
 fn parse_on_off(value: &str) -> Option<bool> {

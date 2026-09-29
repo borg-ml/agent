@@ -551,6 +551,7 @@ struct SessionDisplayConfig {
     effort: Option<String>,
     response_language: ResponseLanguage,
     fast: bool,
+    ultrafast: bool,
     permission_mode: PermissionMode,
 }
 
@@ -590,6 +591,7 @@ struct ActiveTurnDisplayConfig {
     model: Option<String>,
     effort: Option<String>,
     fast: bool,
+    ultrafast: bool,
 }
 
 impl ActiveTurnDisplayConfig {
@@ -598,9 +600,10 @@ impl ActiveTurnDisplayConfig {
     }
 }
 
-fn display_message_effort(effort: Option<String>, fast: bool) -> Option<String> {
-    if fast {
-        Some(effort.map_or_else(|| "fast".to_string(), |effort| format!("{effort} fast")))
+fn display_message_effort(effort: Option<String>, fast: bool, ultrafast: bool) -> Option<String> {
+    if ultrafast || fast {
+        let tier = if ultrafast { "ultrafast" } else { "fast" };
+        Some(effort.map_or_else(|| tier.to_string(), |effort| format!("{effort} {tier}")))
     } else {
         effort
     }
@@ -992,6 +995,7 @@ impl Transcript {
                 model: config.model.clone(),
                 effort: config.effort.clone(),
                 fast: config.fast,
+                ultrafast: config.ultrafast,
             });
         }
     }
@@ -1129,6 +1133,7 @@ impl Transcript {
                 effort: configuration.effort.clone(),
                 response_language: configuration.response_language,
                 fast: configuration.fast,
+                ultrafast: configuration.ultrafast,
                 permission_mode: configuration.permission_mode,
             });
         if let (Some(context_tokens), Some(context_window_tokens)) = (
@@ -1859,6 +1864,7 @@ impl Transcript {
                 effort,
                 response_language,
                 fast,
+                ultrafast,
                 permission_mode,
                 ..
             } => {
@@ -1872,6 +1878,7 @@ impl Transcript {
                     effort: effort.clone(),
                     response_language: *response_language,
                     fast: *fast,
+                    ultrafast: *ultrafast,
                     permission_mode: *permission_mode,
                 });
                 if context_identity_changed {
@@ -1893,6 +1900,7 @@ impl Transcript {
                 model,
                 effort,
                 fast,
+                ultrafast,
             } => {
                 self.active_turn = Some(ActiveTurnDisplayConfig {
                     message_id: *message_id,
@@ -1900,6 +1908,7 @@ impl Transcript {
                     model: model.clone(),
                     effort: effort.clone(),
                     fast: *fast,
+                    ultrafast: *ultrafast,
                 });
             }
             SessionEventKind::UsageUpdated {
@@ -2190,18 +2199,30 @@ impl Transcript {
                 } else {
                     let attachments =
                         number_message_attachments(text, attachments, &mut self.next_image_number);
-                    let (model, effort, fast) = if *actor == EventActor::Assistant {
+                    let (model, effort, fast, ultrafast) = if *actor == EventActor::Assistant {
                         self.active_turn
                             .as_ref()
-                            .map(|turn| (turn.model.clone(), turn.effort.clone(), turn.fast))
+                            .map(|turn| {
+                                (
+                                    turn.model.clone(),
+                                    turn.effort.clone(),
+                                    turn.fast,
+                                    turn.ultrafast,
+                                )
+                            })
                             .or_else(|| {
                                 self.config.as_ref().map(|config| {
-                                    (config.model.clone(), config.effort.clone(), config.fast)
+                                    (
+                                        config.model.clone(),
+                                        config.effort.clone(),
+                                        config.fast,
+                                        config.ultrafast,
+                                    )
                                 })
                             })
                             .unwrap_or_default()
                     } else {
-                        (None, None, false)
+                        (None, None, false, false)
                     };
                     if *status != MessageStatus::Queued
                         && matches!(actor, EventActor::User | EventActor::Assistant)
@@ -2244,7 +2265,7 @@ impl Transcript {
                             text: text.clone(),
                             attachments,
                             model,
-                            effort: display_message_effort(effort, fast),
+                            effort: display_message_effort(effort, fast, ultrafast),
                             time: event_time,
                             status: *status,
                             complete: matches!(
@@ -3495,14 +3516,26 @@ impl Transcript {
         }
         self.finish_reasoning(event.created_at);
         self.collapse_previous_edit();
-        let (model, effort, fast) = self
+        let (model, effort, fast, ultrafast) = self
             .active_turn
             .as_ref()
-            .map(|turn| (turn.model.clone(), turn.effort.clone(), turn.fast))
+            .map(|turn| {
+                (
+                    turn.model.clone(),
+                    turn.effort.clone(),
+                    turn.fast,
+                    turn.ultrafast,
+                )
+            })
             .or_else(|| {
-                self.config
-                    .as_ref()
-                    .map(|config| (config.model.clone(), config.effort.clone(), config.fast))
+                self.config.as_ref().map(|config| {
+                    (
+                        config.model.clone(),
+                        config.effort.clone(),
+                        config.fast,
+                        config.ultrafast,
+                    )
+                })
             })
             .unwrap_or_default();
         let time = self.message_event_time(event);
@@ -3512,7 +3545,7 @@ impl Transcript {
             text: String::new(),
             attachments: Vec::new(),
             model,
-            effort: display_message_effort(effort, fast),
+            effort: display_message_effort(effort, fast, ultrafast),
             time,
             status: MessageStatus::InProgress,
             complete: false,
@@ -4517,7 +4550,11 @@ impl Transcript {
         ConfigStatuses {
             model: config.model.clone(),
             effort: config.effort.clone(),
-            fast: config.fast.then(|| "fast".to_string()),
+            fast: if config.ultrafast {
+                Some("ultrafast".to_string())
+            } else {
+                config.fast.then(|| "fast".to_string())
+            },
             permission: Some(permission_mode_label(config.permission_mode).to_string()),
             billing: if config.provider == CodingProvider::OpenCode
                 && config

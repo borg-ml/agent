@@ -161,6 +161,7 @@ async fn prompt_dispatch_does_not_block_input_while_the_journal_is_blocked() {
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
         },
@@ -631,10 +632,13 @@ fn active_rewind_stops_automatically_instead_of_being_rejected() {
         SessionStatus::Completed,
         SessionStatus::Failed,
     ] {
-        assert_eq!(revert_start_mode(status), RevertStartMode::StopThenFork);
+        assert_eq!(
+            revert_start_mode(LocalSessionAccess::Owned, status),
+            RevertStartMode::StopThenFork
+        );
     }
     assert_eq!(
-        revert_start_mode(SessionStatus::Stopped),
+        revert_start_mode(LocalSessionAccess::Owned, SessionStatus::Stopped),
         RevertStartMode::ForkNow
     );
 }
@@ -2731,6 +2735,7 @@ async fn resume_target_resolves_saved_session_and_skips_current_for_last() {
                     model: None,
                     effort: None,
                     fast: false,
+                    ultrafast: false,
                     response_language: ResponseLanguage::Auto,
                     permission_mode: PermissionMode::FullAccess,
                 },
@@ -2879,6 +2884,7 @@ async fn recent_sessions_are_ordered_by_latest_conversation_activity() {
                     model: None,
                     effort: None,
                     fast: false,
+                    ultrafast: false,
                     response_language: ResponseLanguage::Auto,
                     permission_mode: PermissionMode::FullAccess,
                 },
@@ -2987,6 +2993,7 @@ async fn host_bookkeeping_does_not_outrank_the_session_the_user_worked_in() {
                     model: Some("claude-opus-5".to_string()),
                     effort: Some("medium".to_string()),
                     fast: false,
+                    ultrafast: false,
                     response_language: ResponseLanguage::Auto,
                     permission_mode: PermissionMode::FullAccess,
                 },
@@ -3089,6 +3096,7 @@ async fn resume_picker_titles_and_previews_sessions_from_the_latest_response() {
             model: Some("gpt-resume-filter".to_string()),
             effort: Some("high".to_string()),
             fast: false,
+            ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
         },
@@ -3186,6 +3194,7 @@ async fn resume_discovery_ignores_launch_only_probe_sessions() {
                 model: Some("gpt-5.6-sol".to_string()),
                 effort: Some("low".to_string()),
                 fast: false,
+                ultrafast: false,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
             },
@@ -3257,6 +3266,7 @@ async fn continue_selects_the_latest_non_empty_session_in_the_current_directory(
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
             },
@@ -3307,6 +3317,7 @@ async fn resume_picker_prioritizes_current_directory_and_keeps_global_choices() 
                 model: Some("gpt-5.6-sol".to_string()),
                 effort: Some("high".to_string()),
                 fast: false,
+                ultrafast: false,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
             },
@@ -3361,6 +3372,7 @@ async fn resume_picker_loads_older_sessions_in_recent_first_order() {
                 model: Some(format!("picker-model-{index}")),
                 effort: None,
                 fast: false,
+                ultrafast: false,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
             },
@@ -3419,6 +3431,7 @@ async fn recent_session_picker_p95_gate() {
                 model: Some("performance-fixture".to_string()),
                 effort: None,
                 fast: false,
+                ultrafast: false,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
             },
@@ -3765,4 +3778,44 @@ async fn stream_drain_preserves_burst_order_and_yields_without_losing_events() {
         1,
         "time budget must not consume the next event"
     );
+}
+
+#[test]
+fn speed_commands_select_the_explicit_host_configuration_action() {
+    for command in ["/ultrafast", "/ultrafast on", "/fast ultrafast"] {
+        assert!(matches!(
+            parse_speed_action(command),
+            Some(SessionConfigAction::SetUltrafast { enabled: true })
+        ));
+    }
+    assert!(matches!(
+        parse_speed_action("/ultrafast off"),
+        Some(SessionConfigAction::SetUltrafast { enabled: false })
+    ));
+    for (command, enabled) in [("/fast on", true), ("/fast off", false)] {
+        assert!(
+            matches!(parse_speed_action(command), Some(SessionConfigAction::SetFast { enabled: actual }) if actual == enabled)
+        );
+    }
+    assert!(parse_speed_action("/ultrafast maybe").is_none());
+}
+
+#[test]
+fn attached_revert_forks_without_stopping_or_waiting_for_the_live_owner() {
+    // An attached viewer does not own cancellation. A historical-prefix fork
+    // must not depend on stopping another viewer's live session.
+    for status in [
+        SessionStatus::Starting,
+        SessionStatus::Ready,
+        SessionStatus::Running,
+        SessionStatus::WaitingForApproval,
+        SessionStatus::Completed,
+        SessionStatus::Failed,
+        SessionStatus::Stopped,
+    ] {
+        assert_eq!(
+            revert_start_mode(LocalSessionAccess::Attached, status),
+            RevertStartMode::ForkNow
+        );
+    }
 }

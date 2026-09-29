@@ -778,6 +778,7 @@ mod tests {
                 model: Some("claude-opus-5".to_string()),
                 effort: None,
                 fast: false,
+                ultrafast: false,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
             }),

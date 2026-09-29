@@ -2062,6 +2062,7 @@ mod tests {
                     model: Some("gpt-test".to_string()),
                     effort: None,
                     fast: false,
+                    ultrafast: false,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: crate::PermissionMode::Manual,
                 },
@@ -2261,6 +2262,7 @@ mod tests {
                     model: None,
                     effort: None,
                     fast: false,
+                    ultrafast: false,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: crate::PermissionMode::Manual,
                 },
@@ -2395,6 +2397,7 @@ mod tests {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         );
         server.publish_live_event(&turn);
@@ -2541,6 +2544,7 @@ mod tests {
                     model: None,
                     effort: None,
                     fast: false,
+                    ultrafast: false,
                 },
             ))
             .await
@@ -2626,6 +2630,7 @@ mod tests {
                 model: None,
                 effort: None,
                 fast: false,
+                ultrafast: false,
             },
         );
         preview.accept(turn, None).unwrap();

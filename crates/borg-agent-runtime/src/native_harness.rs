@@ -674,7 +674,7 @@ impl NativeHarness {
         // advertised window once so the first round can compact from an
         // estimate. A route that states no window is left to the post-round
         // check rather than compacted against a guess.
-        let route_window_tokens = self
+        let mut route_window_tokens = self
             .model_client
             .context_window(turn.provider, &model)
             .await;
@@ -682,6 +682,7 @@ impl NativeHarness {
         // fields, so each one extends the prefix the previous one cached.
         let request_template = ModelTurnRequest {
             fast: turn.fast.unwrap_or(false),
+            ultrafast: turn.ultrafast.unwrap_or(false),
             request_id: None,
             session_id: Some(provider_session_id.clone()),
             prompt_cache_key: Some(prompt_cache_key.clone()),
@@ -760,7 +761,7 @@ impl NativeHarness {
             // differed in any field would extend a different cache entry from
             // the one the next real request reads.
             let warm_request = warming_armed.then(|| request.clone());
-            let result = match self
+            let mut result = match self
                 .call_model(
                     turn.provider,
                     &model,
@@ -856,6 +857,15 @@ impl NativeHarness {
                 }
                 Err(error) => return Err(error),
             };
+            // A response may omit window metadata (notably the public API).
+            // Keep the window already resolved for this route instead of
+            // shrinking post-round compaction back to the generic fallback.
+            result.usage.context_window_tokens = result
+                .usage
+                .context_window_tokens
+                .filter(|window| *window > 0)
+                .or(route_window_tokens);
+            route_window_tokens = result.usage.context_window_tokens;
             absorb_usage(&mut usage, &result.usage);
             if let (Some(warmer), Some(request)) = (warmer.as_ref(), warm_request) {
                 warmer.start(CacheWarmRequest {
@@ -1201,6 +1211,7 @@ impl NativeHarness {
                                         provider: turn.provider,
                                         model: &model,
                                         fast: turn.fast.unwrap_or(false),
+                                        ultrafast: turn.ultrafast.unwrap_or(false),
                                     },
                                     &events,
                                     &mut controls,
@@ -1389,6 +1400,7 @@ impl NativeHarness {
                 effort,
                 ModelTurnRequest {
                     fast: false,
+                    ultrafast: false,
                     request_id: Some(format!("consult:{}", Uuid::new_v4())),
                     session_id: None,
                     prompt_cache_key: None,
@@ -1445,6 +1457,7 @@ impl NativeHarness {
         model: &str,
         effort: Option<&str>,
         fast: bool,
+        ultrafast: bool,
         conversation: Vec<ModelMessage>,
         prefix: Option<&crate::NativeRequestPrefix>,
         observed_context_window_tokens: Option<u64>,
@@ -1472,6 +1485,7 @@ impl NativeHarness {
             if fits {
                 let request = ModelTurnRequest {
                     fast,
+                    ultrafast,
                     request_id: None,
                     session_id: None,
                     prompt_cache_key: Some(prefix.prompt_cache_key.clone()),
@@ -1503,6 +1517,7 @@ impl NativeHarness {
                 model,
                 effort,
                 fast,
+                ultrafast,
                 conversation,
                 window,
                 &mut usage,
@@ -1522,6 +1537,7 @@ impl NativeHarness {
         model: &str,
         effort: Option<&str>,
         fast: bool,
+        ultrafast: bool,
         conversation: Vec<ModelMessage>,
         context_window_tokens: u64,
         usage: &mut ProviderCallUsage,
@@ -1590,6 +1606,7 @@ impl NativeHarness {
                     internal_compaction_effort(provider, effort),
                     ModelTurnRequest {
                         fast,
+                        ultrafast,
                         request_id: Some(format!("compact:{}", Uuid::new_v4())),
                         session_id: None,
                         prompt_cache_key: None,
@@ -1838,6 +1855,7 @@ impl NativeHarness {
                     model,
                     turn.effort.as_deref(),
                     turn.fast.unwrap_or(false),
+                    turn.ultrafast.unwrap_or(false),
                     messages.clone(),
                     context_window_tokens,
                     &mut compaction_usage,
@@ -3758,6 +3776,7 @@ struct NativeApprovalContext<'a> {
     provider: crate::CodingProvider,
     model: &'a str,
     fast: bool,
+    ultrafast: bool,
 }
 
 struct AutomaticReview {
@@ -3795,6 +3814,7 @@ async fn review_tool_automatically(
 ) -> Result<AutomaticReviewOutcome> {
     let request = ModelTurnRequest {
         fast: context.fast,
+        ultrafast: context.ultrafast,
         request_id: Some(format!("approval-review:{}", Uuid::new_v4())),
         session_id: None,
         prompt_cache_key: None,
@@ -4974,6 +4994,7 @@ mod tests {
         };
         let mut request = ModelTurnRequest {
             fast: false,
+            ultrafast: false,
             request_id: None,
             session_id: None,
             prompt_cache_key: None,
@@ -5007,6 +5028,7 @@ mod tests {
     fn request_image_budget_keeps_recent_images_and_identifies_older_ones() {
         let mut request = ModelTurnRequest {
             fast: false,
+            ultrafast: false,
             request_id: None,
             session_id: None,
             prompt_cache_key: None,
@@ -5221,6 +5243,7 @@ mod tests {
                     "test-model",
                     Some("high"),
                     false,
+                    false,
                     vec![ModelMessage::user("prior user")],
                     Some(&restored),
                     Some(100_000),
@@ -5341,6 +5364,7 @@ mod tests {
                 "test-model",
                 Some("high"),
                 false,
+                false,
                 vec![
                     ModelMessage::System {
                         content: "Continue editing until the build passes".into(),
@@ -5397,6 +5421,7 @@ mod tests {
                 crate::CodingProvider::Codex,
                 "test-model",
                 Some("high"),
+                false,
                 false,
                 vec![ModelMessage::user("important history")],
                 None,
@@ -5557,6 +5582,7 @@ mod tests {
                 "test-model",
                 Some("max"),
                 false,
+                false,
                 conversation,
                 None,
                 Some(20_000),
@@ -5689,6 +5715,7 @@ mod tests {
                 crate::CodingProvider::OpenRouter,
                 "test-model",
                 None,
+                false,
                 false,
                 conversation.clone(),
                 None,
@@ -5882,6 +5909,7 @@ mod tests {
                         provider: crate::CodingProvider::OpenRouter,
                         model: "test-model",
                         fast: false,
+                        ultrafast: false,
                     },
                     "exec",
                     &json!({"cmd":"must not execute"}),
@@ -6191,6 +6219,7 @@ mod tests {
                 model: Some("test-model".to_string()),
                 effort: None,
                 fast: Some(true),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
                 conversation: Vec::new(),
@@ -6399,6 +6428,7 @@ mod tests {
                 None,
                 ModelTurnRequest {
                     fast: false,
+                    ultrafast: false,
                     request_id: None,
                     session_id: None,
                     prompt_cache_key: None,
@@ -6532,6 +6562,7 @@ mod tests {
             None,
             ModelTurnRequest {
                 fast: false,
+                ultrafast: false,
                 request_id: None,
                 session_id: None,
                 prompt_cache_key: None,
@@ -6574,6 +6605,7 @@ mod tests {
             None,
             ModelTurnRequest {
                 fast: false,
+                ultrafast: false,
                 request_id: None,
                 session_id: None,
                 prompt_cache_key: None,
@@ -6713,6 +6745,7 @@ mod tests {
             None,
             ModelTurnRequest {
                 fast: false,
+                ultrafast: false,
                 request_id: None,
                 session_id: None,
                 prompt_cache_key: None,
@@ -6806,6 +6839,7 @@ mod tests {
             None,
             ModelTurnRequest {
                 fast: false,
+                ultrafast: false,
                 request_id: None,
                 session_id: None,
                 prompt_cache_key: None,
@@ -6869,6 +6903,7 @@ mod tests {
             None,
             ModelTurnRequest {
                 fast: false,
+                ultrafast: false,
                 request_id: None,
                 session_id: None,
                 prompt_cache_key: None,
@@ -6983,6 +7018,7 @@ mod tests {
                 None,
                 ModelTurnRequest {
                     fast: false,
+                    ultrafast: false,
                     request_id: Some("test-request".to_string()),
                     session_id: None,
                     prompt_cache_key: None,
@@ -8112,6 +8148,7 @@ mod tests {
             model: Some("test-model".to_string()),
             effort: None,
             fast: Some(true),
+            ultrafast: None,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
             conversation,
@@ -8217,6 +8254,7 @@ mod tests {
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
         });
         for event in events {
             if event.persistence() == crate::session_store::EventPersistence::Durable
@@ -8237,6 +8275,75 @@ mod tests {
             journal,
             completed,
         }
+    }
+
+    #[tokio::test]
+    async fn resolved_route_window_survives_usage_without_window_metadata() {
+        const WINDOW: u64 = 1_050_000;
+        struct RouteClient(Mutex<usize>);
+        #[async_trait]
+        impl NativeModelClient for RouteClient {
+            async fn context_window(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+            ) -> Option<u64> {
+                Some(WINDOW)
+            }
+
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                _request: ModelTurnRequest,
+                _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                let mut calls = self.0.lock().unwrap();
+                *calls += 1;
+                let tools = if *calls == 1 {
+                    vec![ModelToolCall::function(
+                        "goal".into(),
+                        "get_goal".into(),
+                        "{}".into(),
+                    )]
+                } else {
+                    Vec::new()
+                };
+                Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(Some("done".into()), None, None, tools),
+                    finish_reason: "stop".into(),
+                    // Over the old 128K fallback, comfortably inside the real
+                    // route window. Responses usage itself omits the window.
+                    usage: ProviderCallUsage {
+                        input_tokens: 200_000,
+                        ..Default::default()
+                    },
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let client = Arc::new(RouteClient(Mutex::new(0)));
+        let (events, completed) = run_turn_events(
+            client.clone(),
+            crate::CodingProvider::OpenRouter,
+            root.path().to_path_buf(),
+            Uuid::new_v4(),
+            Vec::new(),
+            HashMap::new(),
+            "check goal",
+            "",
+            "",
+        )
+        .await;
+        assert!(completed);
+        assert_eq!(*client.0.lock().unwrap(), 2);
+        assert!(!events.iter().any(|event| matches!(event,
+            SessionEventKind::ProviderEvent { kind, .. } if kind == "context_compaction")));
+        assert!(events.iter().any(|event| matches!(event,
+            SessionEventKind::UsageUpdated { context_window_tokens: Some(window), .. } if *window == WINDOW)));
     }
 
     /// A session adopted onto Borg's harness can arrive with a replay larger
@@ -8622,6 +8729,7 @@ mod tests {
                     model: Some("test-model".into()),
                     effort: None,
                     fast: true,
+                    ultrafast: false,
                 },
             )];
             for event in &events {
@@ -9178,6 +9286,7 @@ mod tests {
                 model: Some("test-model".to_string()),
                 effort: None,
                 fast: Some(true),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
                 conversation: Vec::new(),
@@ -9418,6 +9527,7 @@ mod tests {
                 model: Some("test-model".to_string()),
                 effort: None,
                 fast: Some(true),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
                 conversation: Vec::new(),
@@ -9563,6 +9673,7 @@ mod tests {
             None,
             ModelTurnRequest {
                 fast: false,
+                ultrafast: false,
                 request_id: None,
                 session_id: None,
                 prompt_cache_key: None,
@@ -9667,6 +9778,7 @@ mod tests {
             None,
             ModelTurnRequest {
                 fast: false,
+                ultrafast: false,
                 request_id: None,
                 session_id: None,
                 prompt_cache_key: None,
@@ -9881,6 +9993,7 @@ mod tests {
                 model: Some("test-model".to_string()),
                 effort: None,
                 fast: Some(true),
+                ultrafast: None,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
                 conversation: Vec::new(),

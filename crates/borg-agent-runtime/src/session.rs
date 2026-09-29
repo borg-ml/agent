@@ -84,6 +84,7 @@ async fn generate_subscription_session_title(prompt: String) -> Option<(String, 
         provider.model_turn_for_account(
             ModelTurnRequest {
                 fast: false,
+                ultrafast: false,
                 request_id: Some(Uuid::new_v4().to_string()),
                 session_id: None,
                 prompt_cache_key: None,
@@ -1628,6 +1629,14 @@ pub async fn run_agent_session_with_store_and_writer_and_lsp_policy(
     lsp_policy: crate::LspPathPolicy,
 ) -> Result<()> {
     anyhow::ensure!(
+        !launch.ultrafast.unwrap_or(false) || launch.provider == CodingProvider::Codex,
+        "ultrafast mode is only supported by the OpenAI transport"
+    );
+    anyhow::ensure!(
+        !(launch.fast.unwrap_or(false) && launch.ultrafast.unwrap_or(false)),
+        "choose either fast or ultrafast mode"
+    );
+    anyhow::ensure!(
         !launch.fast.unwrap_or(false) || launch.provider.supports_fast(),
         "fast mode is not supported by the {:?} transport",
         launch.provider
@@ -1662,6 +1671,14 @@ pub async fn run_agent_session_with_priority_commands(
     _writer: SessionWriterLease,
     initial_peers: Vec<crate::SpawnSubagent>,
 ) -> Result<()> {
+    anyhow::ensure!(
+        !launch.ultrafast.unwrap_or(false) || launch.provider == CodingProvider::Codex,
+        "ultrafast mode is only supported by the OpenAI transport"
+    );
+    anyhow::ensure!(
+        !(launch.fast.unwrap_or(false) && launch.ultrafast.unwrap_or(false)),
+        "choose either fast or ultrafast mode"
+    );
     anyhow::ensure!(
         !launch.fast.unwrap_or(false) || launch.provider.supports_fast(),
         "fast mode is not supported by the {:?} transport",
@@ -1698,6 +1715,14 @@ pub async fn run_agent_session_with_store_writer_and_peers(
     initial_peers: Vec<crate::SpawnSubagent>,
 ) -> Result<()> {
     anyhow::ensure!(
+        !launch.ultrafast.unwrap_or(false) || launch.provider == CodingProvider::Codex,
+        "ultrafast mode is only supported by the OpenAI transport"
+    );
+    anyhow::ensure!(
+        !(launch.fast.unwrap_or(false) && launch.ultrafast.unwrap_or(false)),
+        "choose either fast or ultrafast mode"
+    );
+    anyhow::ensure!(
         !launch.fast.unwrap_or(false) || launch.provider.supports_fast(),
         "fast mode is not supported by the {:?} transport",
         launch.provider
@@ -1730,6 +1755,14 @@ pub(crate) async fn run_agent_session_with_store_and_writer_and_team(
     _writer: SessionWriterLease,
     team: SubagentCoordinator,
 ) -> Result<()> {
+    anyhow::ensure!(
+        !launch.ultrafast.unwrap_or(false) || launch.provider == CodingProvider::Codex,
+        "ultrafast mode is only supported by the OpenAI transport"
+    );
+    anyhow::ensure!(
+        !(launch.fast.unwrap_or(false) && launch.ultrafast.unwrap_or(false)),
+        "choose either fast or ultrafast mode"
+    );
     anyhow::ensure!(
         !launch.fast.unwrap_or(false) || launch.provider.supports_fast(),
         "fast mode is not supported by the {:?} transport",
@@ -2036,6 +2069,7 @@ async fn run_agent_session_store_kernel_inner(
                 model: launch.model.clone(),
                 effort: launch.effort.clone(),
                 fast: launch.fast.unwrap_or(false),
+                ultrafast: launch.ultrafast.unwrap_or(false),
                 response_language: launch.response_language,
                 permission_mode: launch.permission_mode,
             },
@@ -3669,6 +3703,7 @@ async fn run_agent_session_store_kernel_inner(
                                         model,
                                         launch.effort.as_deref(),
                                         launch.fast.unwrap_or(false),
+                                        launch.ultrafast.unwrap_or(false),
                                         conversation,
                                         None,
                                         None,
@@ -3700,6 +3735,7 @@ async fn run_agent_session_store_kernel_inner(
                                         model: launch.model.clone(),
                                         effort: launch.effort.clone(),
                                         fast: launch.fast,
+                                        ultrafast: launch.ultrafast,
                                         response_language: launch.response_language,
                                         permission_mode: launch.permission_mode,
                                         conversation: Vec::new(),
@@ -3969,7 +4005,9 @@ async fn run_agent_session_store_kernel_inner(
                             &mut goal_active_since,
                         )
                         .await?;
-                        executor.stop_session(session_id).await?;
+                        let _ =
+                            stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT)
+                                .await;
                         break None;
                     }
                     Some(HostCommand::Interrupt {
@@ -4256,6 +4294,7 @@ async fn run_agent_session_store_kernel_inner(
                             .context("native context compaction requires a model")?,
                         launch.effort.as_deref(),
                         launch.fast.unwrap_or(false),
+                        launch.ultrafast.unwrap_or(false),
                         conversation,
                         Some(context_window_tokens),
                         Some(progress_tx),
@@ -4752,6 +4791,7 @@ async fn run_agent_session_store_kernel_inner(
                 model: launch.model.clone(),
                 effort: launch.effort.clone(),
                 fast: launch.fast.unwrap_or(false),
+                ultrafast: launch.ultrafast.unwrap_or(false),
             },
         )
         .await?;
@@ -4905,6 +4945,7 @@ async fn run_agent_session_store_kernel_inner(
             model: launch.model.clone(),
             effort: launch.effort.clone(),
             fast: launch.fast,
+            ultrafast: launch.ultrafast,
             response_language: launch.response_language,
             permission_mode: launch.permission_mode,
             conversation: if native_provider {
@@ -8588,6 +8629,7 @@ async fn run_retained_compaction(
             model: launch.model.clone(),
             effort: launch.effort.clone(),
             fast: launch.fast,
+            ultrafast: launch.ultrafast,
             response_language: launch.response_language,
             permission_mode: launch.permission_mode,
             conversation: Vec::new(),
@@ -11521,6 +11563,9 @@ async fn apply_session_config(
                 // Effort and fast vocabularies are per provider; anything the
                 // new provider does not understand is dropped rather than
                 // forwarded and rejected at turn time.
+                if provider != CodingProvider::Codex {
+                    launch.ultrafast = None;
+                }
                 if !provider.supports_fast() {
                     launch.fast = None;
                 }
@@ -11554,11 +11599,20 @@ async fn apply_session_config(
         }
         crate::SessionConfigAction::SetFast { enabled } => {
             anyhow::ensure!(
-                launch.provider.supports_fast(),
+                !enabled || launch.provider.supports_fast(),
                 "fast mode is not supported by the {:?} transport",
                 launch.provider
             );
             launch.fast = Some(enabled);
+            launch.ultrafast = Some(false);
+        }
+        crate::SessionConfigAction::SetUltrafast { enabled } => {
+            anyhow::ensure!(
+                !enabled || launch.provider == CodingProvider::Codex,
+                "ultrafast mode is only supported by the OpenAI transport"
+            );
+            launch.ultrafast = Some(enabled);
+            launch.fast = Some(false);
         }
         crate::SessionConfigAction::SetResponseLanguage { language } => {
             launch.response_language = language;
@@ -11577,6 +11631,7 @@ async fn apply_session_config(
             model: launch.model.clone(),
             effort: launch.effort.clone(),
             fast: launch.fast.unwrap_or(false),
+            ultrafast: launch.ultrafast.unwrap_or(false),
             response_language: launch.response_language,
             permission_mode: launch.permission_mode,
         },

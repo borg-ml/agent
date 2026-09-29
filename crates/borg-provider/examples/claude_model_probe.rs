@@ -35,6 +35,7 @@ async fn probe() -> Result<()> {
     };
     let mut request = ModelTurnRequest {
         fast: false,
+        ultrafast: false,
         request_id: Some(uuid::Uuid::new_v4().to_string()),
         session_id: Some(session),
         prompt_cache_key: None,

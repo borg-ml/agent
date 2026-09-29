@@ -452,6 +452,7 @@ async fn import_session(input: PathBuf, cwd: Option<PathBuf>, json: bool) -> Res
             model: None,
             effort: None,
             fast: false,
+            ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
         });
@@ -473,6 +474,7 @@ async fn import_session(input: PathBuf, cwd: Option<PathBuf>, json: bool) -> Res
                 model: configuration.model,
                 effort: configuration.effort,
                 fast: configuration.fast,
+                ultrafast: configuration.ultrafast,
                 response_language: configuration.response_language,
                 permission_mode: configuration.permission_mode,
             },

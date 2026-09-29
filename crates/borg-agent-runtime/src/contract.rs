@@ -972,6 +972,8 @@ pub struct LaunchSession {
     #[serde(default)]
     pub fast: Option<bool>,
     #[serde(default)]
+    pub ultrafast: Option<bool>,
+    #[serde(default)]
     pub response_language: ResponseLanguage,
     pub permission_mode: PermissionMode,
     pub name: Option<String>,
@@ -1404,6 +1406,8 @@ pub struct RemoteSession {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub fast: bool,
+    #[serde(default)]
+    pub ultrafast: bool,
     pub permission_mode: PermissionMode,
     pub provider_session_id: Option<String>,
     pub status: SessionStatus,
@@ -1628,6 +1632,9 @@ pub enum SessionConfigAction {
         permission_mode: PermissionMode,
     },
     SetFast {
+        enabled: bool,
+    },
+    SetUltrafast {
         enabled: bool,
     },
     SetResponseLanguage {
@@ -1905,6 +1912,8 @@ pub struct OpenTerminalRequest {
     pub effort: Option<String>,
     #[serde(default)]
     pub fast: bool,
+    #[serde(default)]
+    pub ultrafast: bool,
     #[serde(default)]
     pub response_language: ResponseLanguage,
     pub permission_mode: PermissionMode,
@@ -2433,6 +2442,8 @@ pub enum SessionEventKind {
         #[serde(default)]
         fast: bool,
         #[serde(default)]
+        ultrafast: bool,
+        #[serde(default)]
         response_language: ResponseLanguage,
         permission_mode: PermissionMode,
     },
@@ -2461,6 +2472,8 @@ pub enum SessionEventKind {
         effort: Option<String>,
         #[serde(default)]
         fast: bool,
+        #[serde(default)]
+        ultrafast: bool,
     },
     StatusChanged {
         status: SessionStatus,

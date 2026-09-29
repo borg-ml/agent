@@ -713,6 +713,8 @@ pub struct SessionConfiguration {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub fast: bool,
+    #[serde(default)]
+    pub ultrafast: bool,
     pub response_language: ResponseLanguage,
     pub permission_mode: PermissionMode,
 }
@@ -902,6 +904,7 @@ impl SessionState {
                 model,
                 effort,
                 fast,
+                ultrafast,
                 response_language,
                 permission_mode,
             } => {
@@ -918,6 +921,7 @@ impl SessionState {
                     model: model.clone(),
                     effort: effort.clone(),
                     fast: *fast,
+                    ultrafast: *ultrafast,
                     response_language: *response_language,
                     permission_mode: *permission_mode,
                 });
