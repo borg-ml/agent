@@ -9279,7 +9279,7 @@ async fn streamed_reasoning_frame_cost() {
                 .collect::<Vec<_>>()
         })
         .collect();
-    for line in &lines {
+    for _line in &lines {
         deltas.push("\n".to_string());
     }
 

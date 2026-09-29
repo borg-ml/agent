@@ -2859,7 +2859,7 @@ fn thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, character) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(character);
@@ -3615,7 +3615,7 @@ impl BorgTerminal {
     /// surfaced: a draft that cannot be written must not break typing.
     pub fn persist_composer_draft(&mut self) {
         let current = self.composer_draft().map_or_else(
-            || ComposerDraft::default(),
+            ComposerDraft::default,
             |(text, attachments)| ComposerDraft { text, attachments },
         );
         if self.persisted_draft.as_ref() == Some(&current) {
