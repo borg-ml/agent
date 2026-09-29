@@ -2541,8 +2541,10 @@ fn command_cwd(input: &Value, output: Option<&str>) -> Option<String> {
 /// commands, and rows show `rest` under the directory instead of the prefix.
 pub(crate) fn split_leading_cd(command: &str) -> Option<(&str, &str)> {
     static LEADING_CD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|'"]+))\s*(?:(?:&&|;)\s*|$)"#)
-            .expect("valid leading cd pattern")
+        regex::Regex::new(
+            r#"^\s*cd[ \t]+(?:"([^"]+)"|'([^']+)'|([^\s;&|'"]+))[ \t]*(?:(?:&&|;|\r?\n)\s*|$)"#,
+        )
+        .expect("valid leading cd pattern")
     });
     let captures = LEADING_CD.captures(command)?;
     let directory = captures
@@ -2933,6 +2935,16 @@ mod tests {
         );
         assert_eq!(split_leading_cd("cd 'my dir'; ls"), Some(("my dir", "ls")));
         assert_eq!(split_leading_cd("cd src"), Some(("src", "")));
+        // A newline is a shell command separator too: failing to split it
+        // makes the next exec silently return to the workspace root.
+        assert_eq!(split_leading_cd("cd src\npwd"), Some(("src", "pwd")));
+        assert_eq!(
+            split_leading_cd("cd 'my dir'\r\nls"),
+            Some(("my dir", "ls"))
+        );
+        assert_eq!(split_leading_cd("cd src \t\n  pwd"), Some(("src", "pwd")));
+        // A directory on the next line is not an argument to cd.
+        assert_eq!(split_leading_cd("cd\nsrc"), None);
         assert_eq!(split_leading_cd("cdx && ls"), None);
         assert_eq!(split_leading_cd("git status && cd x"), None);
     }
