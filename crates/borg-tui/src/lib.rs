@@ -12,7 +12,7 @@ mod tests;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Stdout, Write as _};
+use std::io::{self, Stdout};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};

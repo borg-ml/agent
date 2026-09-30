@@ -14198,7 +14198,10 @@ async fn resumed_provider_turn_receives_team_messages_that_wake_an_idle_root() {
     }))
     .await;
     assert_eq!(prompts.len(), 1, "{prompts:?}");
-    assert!(prompts[0]["prompt"].as_str().unwrap().contains("second"), "{prompts:?}");
+    assert!(
+        prompts[0]["prompt"].as_str().unwrap().contains("second"),
+        "{prompts:?}"
+    );
 
     command_tx
         .send(HostCommand::Stop { session_id })
@@ -21683,10 +21686,9 @@ async fn a_fatal_compaction_failure_is_not_retried() {
     );
 }
 
-
 // Session-keyed, one-shot barriers leave parallel actor tests independent.
-static WORK_PLAN_REFRESH_BARRIERS: Mutex<Vec<(Uuid, Arc<Notify>, Arc<Notify>)>> =
-    Mutex::new(Vec::new());
+type RefreshBarrier = (Uuid, Arc<Notify>, Arc<Notify>);
+static WORK_PLAN_REFRESH_BARRIERS: Mutex<Vec<RefreshBarrier>> = Mutex::new(Vec::new());
 
 pub(super) async fn pause_work_plan_refresh(session_id: Uuid) {
     let barrier = {
@@ -21754,9 +21756,11 @@ async fn blocked_plan_collector_actor(update_plan: bool) {
     let provider_release = Arc::new(Notify::new());
     let (commands, command_rx) = mpsc::channel(8);
     let (events, mut event_rx) = mpsc::channel(256);
-    let mut capabilities = crate::SessionCapabilities::default();
-    capabilities.subagents = false;
-    capabilities.multiplayer = false;
+    let capabilities = crate::SessionCapabilities {
+        subagents: false,
+        multiplayer: false,
+        ..Default::default()
+    };
     let launch = LaunchSession {
         request_id: Uuid::new_v4(),
         cwd: root.path().to_path_buf(),
@@ -21797,10 +21801,10 @@ async fn blocked_plan_collector_actor(update_plan: bool) {
         let mut markers = HashSet::new();
         while markers.len() < 2 {
             let event = event_rx.recv().await.expect("actor remains available");
-            if let SessionEventKind::ProviderEvent { kind, payload, .. } = event.kind {
-                if payload.get("maintenance_test_marker") == Some(&json!(true)) {
-                    markers.insert(kind);
-                }
+            if let SessionEventKind::ProviderEvent { kind, payload, .. } = event.kind
+                && payload.get("maintenance_test_marker") == Some(&json!(true))
+            {
+                markers.insert(kind);
             }
         }
     })
@@ -21848,10 +21852,9 @@ async fn blocked_plan_collector_actor(update_plan: bool) {
                     workspace_revision,
                     ..
                 } = event.kind
+                    && items.iter().any(|item| item.content == "newer direct plan")
                 {
-                    if items.iter().any(|item| item.content == "newer direct plan") {
-                        break (workspace_revision, event.sequence);
-                    }
+                    break (workspace_revision, event.sequence);
                 }
             }
         })
@@ -22021,9 +22024,11 @@ async fn peer_receipts_survive_disabled_subagents_stop_and_replay() {
         seen: calls.clone(),
         called,
     });
-    let mut capabilities = crate::SessionCapabilities::default();
-    capabilities.subagents = false;
-    capabilities.resume_paused_goal_on_message = false;
+    let capabilities = crate::SessionCapabilities {
+        subagents: false,
+        resume_paused_goal_on_message: false,
+        ..Default::default()
+    };
     let launch = LaunchSession {
         request_id: Uuid::new_v4(),
         cwd: root.path().to_path_buf(),

@@ -2099,12 +2099,17 @@ async fn run_agent_session_store_kernel_inner(
     if let Some(projection) = workspace_projection.clone() {
         journal = journal.with_workspace_projection(projection);
     }
-    journal.received_agent_messages.extend(recovery.subagent_events.iter().filter_map(|event| {
-        match &event.kind {
-            SessionEventKind::AgentMessageReceived { message_id, .. } => Some(*message_id),
-            _ => None,
-        }
-    }));
+    journal
+        .received_agent_messages
+        .extend(
+            recovery
+                .subagent_events
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    SessionEventKind::AgentMessageReceived { message_id, .. } => Some(*message_id),
+                    _ => None,
+                }),
+        );
     journal.resolve_deferred_provider_payloads().await?;
     if fresh {
         record(
@@ -11948,12 +11953,12 @@ impl WorkPlanRefresh {
     }
 
     async fn next(&mut self) -> Result<Option<SessionEventKind>> {
-        if self.pending.is_empty() {
-            if let Some(task) = self.task.as_mut() {
-                let result = (&mut task.0).await.context("work plan collector failed");
-                self.task = None;
-                self.pending = result??;
-            }
+        if self.pending.is_empty()
+            && let Some(task) = self.task.as_mut()
+        {
+            let result = (&mut task.0).await.context("work plan collector failed");
+            self.task = None;
+            self.pending = result??;
         }
         Ok(self.pending.pop_front())
     }

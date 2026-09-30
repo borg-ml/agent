@@ -1032,7 +1032,10 @@ pub async fn read_claude_subscription_status() -> Result<bool> {
             .map_err(anyhow::Error::msg)?;
         let mut command = tokio::process::Command::new(path);
         command.args(["auth", "status"]).kill_on_drop(true);
-        command.output().await.context("failed to read Claude login status")
+        command
+            .output()
+            .await
+            .context("failed to read Claude login status")
     })
     .await
     .context("Claude login probe timed out")??;
