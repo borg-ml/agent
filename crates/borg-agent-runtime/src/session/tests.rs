@@ -3691,13 +3691,25 @@ async fn ready_is_emitted_only_after_all_queued_turn_events_are_complete() {
                 .kind,
         );
     }
-    observed.push(
-        tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+    // The first Ready may be preceded by the launch plan projection it settles.
+    loop {
+        let kind = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
             .await
             .expect("canonical ready event arrives")
             .expect("session event stream remains open")
-            .kind,
-    );
+            .kind;
+        let ready = matches!(
+            kind,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                ..
+            }
+        );
+        observed.push(kind);
+        if ready {
+            break;
+        }
+    }
 
     command_tx
         .send(HostCommand::Stop { session_id })
