@@ -23,6 +23,35 @@ Git comparison.
   Summaries already streamed as deltas are not duplicated. Models may still
   omit summaries; Borg cannot display text the provider does not send.
 
+### Terminal UI
+
+- Dragging the scrollbar follows the pointer again. The one-line-per-row drag
+  from 0.13.0 is reverted: the thumb stays under the pointer and its place on
+  the track is its place in the transcript.
+- A mouse-wheel notch scrolls an eighth of the transcript view, up to 9 lines,
+  instead of a sixth, up to 12. Scrolling inside an action group eases in the
+  same way.
+- Scrolling up during a long turn loads older history. Pages fetched while a
+  reply was streaming were held back until the turn ended, so a long goal turn
+  showed "Loading thread history…" and never anything older.
+
+### Reliability
+
+- A session cluster wedged after running out of disk recovers on its own. A
+  PostgreSQL child blocked on a full disk could hold the postmaster in its
+  crash reset indefinitely, refusing every connection "in recovery mode" even
+  after space returned. Borg now restarts a cluster that stays there for 10
+  seconds, and it replays its log as after any crash.
+- Agent reports wake their director even when its goal is paused. A report
+  reaching a paused or goal-less director was filed without a turn, so after an
+  interrupt its agents' branches waited for a manual `/goal resume` to be merged
+  or re-evaluated. Escape still holds reports until your next message, and an
+  explicit watcher yield still holds queued ones. The goal itself stays paused.
+- A Claude thread whose history lost a tool result no longer fails every turn.
+  History repair dropped the unanswered call, but the native reply blocks were
+  replayed unchanged, so each retry sent the same `tool_use` without a
+  `tool_result` and was refused.
+
 ### Windows
 
 - Windows foreground sessions no longer launch an unreachable detached session
