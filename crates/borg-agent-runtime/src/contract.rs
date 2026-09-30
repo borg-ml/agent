@@ -695,12 +695,24 @@ impl ProviderCapability {
                 .filter(|plan| !plan.is_empty())
                 // Suffix the tier so a "max" plan is never mistaken for the
                 // "max" effort level rendered beside it.
-                .map(|plan| format!("{plan} sub"))
+                .map(|plan| match (self.provider, plan.as_str()) {
+                    // Only explicitly reported OpenAI tiers get a number; do
+                    // not infer a tier from quota size or a generic "pro".
+                    (CodingProvider::Codex, "pro_100" | "pro-100" | "pro 100" | "pro100") => {
+                        "pro 100".to_string()
+                    }
+                    (CodingProvider::Codex, "pro_200" | "pro-200" | "pro 200" | "pro200") => {
+                        "pro 200".to_string()
+                    }
+                    (CodingProvider::Codex, "pro_500" | "pro-500" | "pro 500" | "pro500") => {
+                        "pro 500".to_string()
+                    }
+                    _ => format!("{plan} sub"),
+                })
                 .unwrap_or_else(|| "sub".to_string()),
         })
     }
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -714,7 +726,7 @@ impl ProviderAuthMethod {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Subscription => "subscription",
-            Self::ApiKey => "API key",
+            Self::ApiKey => "api key",
             Self::Endpoint => "endpoint",
         }
     }
@@ -3258,6 +3270,22 @@ mod tests {
             plan: Some(" Max ".to_string()),
         });
         assert_eq!(capability.billing_label().as_deref(), Some("max sub"));
+        capability.provider = CodingProvider::Codex;
+        for (reported, expected) in [
+            ("Pro_100", "pro 100"),
+            (" PRO-200 ", "pro 200"),
+            ("Pro 500", "pro 500"),
+            ("pro100", "pro 100"),
+            ("Pro", "pro sub"),
+            ("", "sub"),
+            ("pro_300", "pro_300 sub"),
+        ] {
+            capability.usage.as_mut().unwrap().plan = Some(reported.to_string());
+            assert_eq!(capability.billing_label().as_deref(), Some(expected));
+        }
+        capability.billing = Some(BillingLane::Endpoint);
+        assert_eq!(capability.billing_label().as_deref(), Some("endpoint"));
+        assert_eq!(ProviderAuthMethod::ApiKey.label(), "api key");
         capability.billing = Some(BillingLane::ApiKey);
         assert_eq!(capability.billing_label().as_deref(), Some("api"));
         capability.billing = None;
