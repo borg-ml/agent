@@ -69,6 +69,10 @@ const INTERRUPT_TOOL_CANCEL_DRAIN: Duration = Duration::from_millis(300);
 pub(crate) struct NativeHarness {
     model_client: Arc<dyn NativeModelClient>,
     execution_provider: Arc<dyn ExecutionProvider>,
+    // Default local exec is owned by AgentToolDispatcher, which shares the
+    // session watch registry. Only an explicit execution-world override may
+    // replace it; a fresh local manager would hide exec shells from watch.
+    execution_provider_explicit: bool,
     workflow_process_manager: crate::native_process::ProcessManager,
     reviewer_model: Option<String>,
     reviewer_effort: Option<String>,
@@ -106,6 +110,7 @@ impl Default for NativeHarness {
         Self {
             model_client: Arc::new(ProviderModelClient::default()),
             execution_provider: Arc::new(crate::LocalExecutionProvider::new()),
+            execution_provider_explicit: false,
             workflow_process_manager: crate::native_process::ProcessManager::default(),
             reviewer_model: None,
             reviewer_effort: None,
@@ -205,6 +210,7 @@ impl NativeHarness {
             reviewer_model: settings.approval_reviewer_model.clone(),
             reviewer_effort: settings.approval_reviewer_effort.clone(),
             execution_provider: Arc::new(crate::LocalExecutionProvider::new()),
+            execution_provider_explicit: false,
             workflow_process_manager: crate::native_process::ProcessManager::default(),
             harness: settings.harness,
             compaction: settings.compaction.clone(),
@@ -235,6 +241,7 @@ impl NativeHarness {
 
     pub(crate) fn with_execution_provider(mut self, provider: Arc<dyn ExecutionProvider>) -> Self {
         self.execution_provider = provider;
+        self.execution_provider_explicit = true;
         self
     }
 
@@ -455,8 +462,10 @@ impl NativeHarness {
             .model
             .clone()
             .context("native provider sessions require an explicit model")?;
-        turn.agent_tools
-            .configure_execution_provider(self.execution_provider.clone());
+        if self.execution_provider_explicit {
+            turn.agent_tools
+                .configure_execution_provider(self.execution_provider.clone());
+        }
         let session_store = turn.agent_tools.session_store();
         let runtime = NativeToolRuntime::start(NativeToolRuntimeConfig {
             session_id: turn.session_id,
