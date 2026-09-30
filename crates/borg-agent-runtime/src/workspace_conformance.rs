@@ -97,6 +97,14 @@ fn message_event(
 
 /// A workspace with three members: an author and two others.
 async fn workspace_with_members(store: &dyn WorkspaceStore) -> (Uuid, Uuid, Uuid, Uuid) {
+    workspace_with_roles(store, [WorkspaceRole::Editor; 3]).await
+}
+
+/// A workspace whose author, second and third members hold `roles`.
+async fn workspace_with_roles(
+    store: &dyn WorkspaceStore,
+    roles: [WorkspaceRole; 3],
+) -> (Uuid, Uuid, Uuid, Uuid) {
     let workspace_id = Uuid::new_v4();
     let author = Uuid::new_v4();
     let second = Uuid::new_v4();
@@ -115,12 +123,12 @@ async fn workspace_with_members(store: &dyn WorkspaceStore) -> (Uuid, Uuid, Uuid
         })
         .await
         .expect("create workspace");
-    for id in [author, second, third] {
+    for (id, role) in [author, second, third].into_iter().zip(roles) {
         store
             .add_member(WorkspaceMembership {
                 workspace_id,
                 participant_id: id,
-                role: WorkspaceRole::Editor,
+                role,
                 joined_at: Utc::now(),
             })
             .await
@@ -1561,7 +1569,15 @@ pub async fn legacy_plans_migrate_once_and_preserve_work_identity(
     _name: &str,
 ) {
     use crate::workspace::WorkStatus;
-    let (workspace, actor, director, viewer) = workspace_with_members(store).await;
+    let (workspace, actor, director, viewer) = workspace_with_roles(
+        store,
+        [
+            WorkspaceRole::Editor,
+            WorkspaceRole::Editor,
+            WorkspaceRole::Viewer,
+        ],
+    )
+    .await;
     let source = Uuid::new_v4();
     let id = Uuid::new_v4();
     let legacy = vec![crate::PlanItem {
@@ -1574,14 +1590,6 @@ pub async fn legacy_plans_migrate_once_and_preserve_work_identity(
         .await
         .unwrap();
     assert_eq!(first.items[0].work.id, id);
-    store
-        .upsert_relay_roster_entry(
-            workspace,
-            store.participant(viewer).await.unwrap().unwrap(),
-            WorkspaceRole::Viewer,
-        )
-        .await
-        .unwrap();
     assert!(
         store
             .legacy_plan_migrated(workspace, viewer, source)
@@ -1649,16 +1657,15 @@ pub async fn work_assignment_permissions_and_parent_cycles_are_enforced_by_store
     _name: &str,
 ) {
     use crate::workspace::{SharedWork, WorkPatch, WorkStatus};
-    let (workspace, director, contributor, viewer) = workspace_with_members(store).await;
-    for (participant_id, role) in [
-        (contributor, WorkspaceRole::Contributor),
-        (viewer, WorkspaceRole::Viewer),
-    ] {
-        store
-            .upsert_relay_roster_entry(workspace, participant(participant_id, "role test"), role)
-            .await
-            .unwrap();
-    }
+    let (workspace, director, contributor, viewer) = workspace_with_roles(
+        store,
+        [
+            WorkspaceRole::Editor,
+            WorkspaceRole::Contributor,
+            WorkspaceRole::Viewer,
+        ],
+    )
+    .await;
     let id = Uuid::new_v4();
     let created = WorkspaceEvent {
         id: Uuid::new_v4(),
