@@ -156,6 +156,9 @@ pub struct AgentTurn {
     /// Shared fork ancestry for prefix-cache routing, never live continuation.
     pub prompt_cache_session_id: Option<Uuid>,
     pub message_id: Uuid,
+    /// Whether a person sent this turn's prompt, rather than a goal
+    /// continuation or a team report. A person is owed a visible reply.
+    pub(crate) answers_human: bool,
     /// Durable canonical-context epoch used to derive provider cache identity.
     /// It changes only at an explicit context boundary, not on reconnect or
     /// ordinary tool rounds.
@@ -345,6 +348,9 @@ pub enum AgentTurnControl {
         /// running turn after the tool in flight instead of folding the
         /// message into the current task (Claude Code's priority `now`).
         preempt: bool,
+        /// Sent by a person, who is owed a visible reply. Team reports and
+        /// steers Borg writes itself are not.
+        human: bool,
         ack: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
     Approval {
@@ -2695,6 +2701,7 @@ fn map_controls(
                         admission,
                         preempt,
                         ack,
+                        ..
                     } => {
                         match tx
                             .send(ChatStreamControl::Steer {
@@ -2832,6 +2839,7 @@ mod tests {
             declaration_base: None,
             request_prefix_base: None,
             prompt_context_base: Default::default(),
+            answers_human: false,
             volatile_system_prompt_appendix: "usage: 5-hour 65% left".to_string(),
         }
     }
@@ -3463,6 +3471,7 @@ mod tests {
                 attachments: Vec::new(),
                 admission,
                 preempt: true,
+                human: true,
                 ack,
             })
             .await

@@ -3819,6 +3819,7 @@ async fn run_agent_session_store_kernel_inner(
                                         declaration_base: None,
                                         request_prefix_base: None,
                                         prompt_context_base: Default::default(),
+                                        answers_human: false,
                                         volatile_system_prompt_appendix:
                                             crate::provider_capabilities_prompt(
                                                 &launch.capabilities.provider_capabilities,
@@ -5037,6 +5038,7 @@ async fn run_agent_session_store_kernel_inner(
                 .then(|| native_declarations(journal.context_events()))
                 .flatten(),
             prompt_context_base: prompt_context_base(journal.context_events()),
+            answers_human: prompt.actor == EventActor::User,
             volatile_system_prompt_appendix: crate::provider_capabilities_prompt(
                 &launch.capabilities.provider_capabilities,
             ),
@@ -6424,6 +6426,7 @@ async fn run_agent_session_store_kernel_inner(
                                             attachments: Vec::new(),
                                             admission: SteerAdmission::pending(),
                                             preempt: false,
+                                            human: false,
                                             ack,
                                         })
                                         .await
@@ -8733,6 +8736,7 @@ async fn run_retained_compaction(
             declaration_base: None,
             request_prefix_base: None,
             prompt_context_base: Default::default(),
+            answers_human: false,
             volatile_system_prompt_appendix: crate::provider_capabilities_prompt(
                 &launch.capabilities.provider_capabilities,
             ),
@@ -10936,6 +10940,7 @@ async fn dispatch_steer(
             // command and lands as a bare user block, which the model is
             // measurably less likely to answer.
             preempt: false,
+            human: prompt.actor == EventActor::User,
             ack,
         })
         .is_err()

@@ -47,6 +47,13 @@ Git comparison.
   interrupt its agents' branches waited for a manual `/goal resume` to be merged
   or re-evaluated. Escape still holds reports until your next message, and an
   explicit watcher yield still holds queued ones. The goal itself stays paused.
+- A question asked while a goal is running gets an answer as a message, not
+  only as a Reasoned row. When the agent parked on watchers, the turn ended the
+  moment the wait began, so a model that meant to answer after that tool call
+  never could, and its answer survived only inside its thinking summary. Every
+  unanswered human turn in four days of sessions (61 of 61) ended this way. A
+  parked turn that still owes its human a reply now gets one more response to
+  write it, and `await_watchers` tells the model its turn ends when it returns.
 - A Claude thread whose history lost a tool result no longer fails every turn.
   History repair dropped the unanswered call, but the native reply blocks were
   replayed unchanged, so each retry sent the same `tool_use` without a

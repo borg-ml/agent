@@ -719,6 +719,17 @@ impl NativeHarness {
         // rather than ending the request, so a tool call in mid-generation
         // still reaches execution. It is folded at the next safe boundary.
         let mut queued_steer: Vec<CapturedSteer> = Vec::new();
+        // A person who wrote to this turn is owed a visible reply. A turn that
+        // parks on watchers ends without asking the model again, so a model
+        // that meant to answer after its tool round never could, and its
+        // answer survived only as a thinking summary. Human input owes a
+        // reply, assistant text the person can see pays it, and a parked turn
+        // that still owes one gets a single further response to write it.
+        let mut reply_owed = turn.answers_human;
+        let mut reply_round_spent = false;
+        // Set for that one response: the context it sends that the model has
+        // not seen, for the usage anchor if the turn settles without a reply.
+        let mut parked_reply_unsent_tokens: Option<u64> = None;
         loop {
             model_round += 1;
             if grace_wrapup.load(std::sync::atomic::Ordering::Relaxed) && !grace_prompted {
@@ -798,6 +809,11 @@ impl NativeHarness {
                     messages.push(message);
                     canonicalize_native_messages(&mut messages);
                     confirm_steers(acks);
+                    if steer.human {
+                        reply_owed = true;
+                        reply_round_spent = false;
+                    }
+                    parked_reply_unsent_tokens = None;
                     // A human spoke, which is what makes a parked wait
                     // obsolete -- `Watches::resume` states the rule as "any
                     // real input resumes". The tool-boundary path below already
@@ -855,8 +871,26 @@ impl NativeHarness {
                     .await?;
                     continue;
                 }
+                // The tool results are already durable, so a failed attempt
+                // at the reply ends the parked turn exactly as parking would.
+                Err(error) if parked_reply_unsent_tokens.is_some() => {
+                    tracing::warn!(%error, "the reply after a watcher yield failed; ending the parked turn");
+                    settle_parked_turn(
+                        &events,
+                        &mut usage,
+                        turn.message_id,
+                        warmer.as_ref(),
+                        parked_reply_unsent_tokens.unwrap_or_default(),
+                    )
+                    .await;
+                    return Ok(AgentTurnResult {
+                        provider_session_id: None,
+                        final_text: truncated_text,
+                    });
+                }
                 Err(error) => return Err(error),
             };
+            let replying_while_parked = parked_reply_unsent_tokens.take().is_some();
             // A response may omit window metadata (notably the public API).
             // Keep the window already resolved for this route instead of
             // shrinking post-round compaction back to the generic fallback.
@@ -931,6 +965,7 @@ impl NativeHarness {
                     )
                     .await;
                     truncated_text.push_str(&partial);
+                    reply_owed = false;
                 }
                 assistant_message_id = Uuid::new_v4();
                 let nudge = ModelMessage::user(LENGTH_CONTINUATION_PROMPT);
@@ -960,6 +995,16 @@ impl NativeHarness {
                 }
                 let final_text = content.clone().unwrap_or_default();
                 if final_text.trim().is_empty() {
+                    if replying_while_parked {
+                        // Nothing more to say is a fine answer to "reply if
+                        // you meant to"; the turn stays parked.
+                        settle_parked_turn(&events, &mut usage, turn.message_id, warmer.as_ref(), 0)
+                            .await;
+                        return Ok(AgentTurnResult {
+                            provider_session_id: None,
+                            final_text: truncated_text,
+                        });
+                    }
                     bail!("native provider ended the turn without a final response");
                 }
                 send(
@@ -974,6 +1019,7 @@ impl NativeHarness {
                     },
                 )
                 .await;
+                reply_owed = false;
                 if let Some((steer, acks)) = admit_steers(std::mem::take(&mut queued_steer)) {
                     // The answer above is already recorded and on screen, so
                     // nothing the model wrote is lost. Ending the turn here
@@ -992,6 +1038,10 @@ impl NativeHarness {
                     messages.push(message);
                     canonicalize_native_messages(&mut messages);
                     confirm_steers(acks);
+                    if steer.human {
+                        reply_owed = true;
+                        reply_round_spent = false;
+                    }
                     truncated_text.clear();
                     assistant_message_id = Uuid::new_v4();
                     continue;
@@ -1075,6 +1125,7 @@ impl NativeHarness {
                     },
                 )
                 .await;
+                reply_owed = false;
             }
             assistant_message_id = Uuid::new_v4();
 
@@ -1246,6 +1297,10 @@ impl NativeHarness {
             let mut folded_steer = false;
             if let Some((steer, acks)) = admit_steers(captured) {
                 folded_steer = true;
+                if steer.human {
+                    reply_owed = true;
+                    reply_round_spent = false;
+                }
                 let message =
                     native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
                 trailing_context_tokens =
@@ -1306,6 +1361,10 @@ impl NativeHarness {
                         canonicalize_native_messages(&mut messages);
                         confirm_steers(acks);
                         folded_steer = true;
+                        if steer.human {
+                            reply_owed = true;
+                            reply_round_spent = false;
+                        }
                     }
                 }
                 if folded_steer {
@@ -1318,34 +1377,27 @@ impl NativeHarness {
                     // it still needs to wait once it has answered, it parks
                     // again and that fresh yield ends the turn here as usual.
                     turn.agent_tools.clear_watcher_yield();
+                } else if reply_owed && !reply_round_spent {
+                    // The person has no answer yet. Send the tool results
+                    // back once so the model can write one; the watchers
+                    // still park the session when this turn ends.
+                    reply_round_spent = true;
+                    parked_reply_unsent_tokens = Some(trailing_context_tokens);
                 } else {
-                    // Settle exactly as the ordinary completion below does, but
-                    // without an assistant message: the model wrote no answer
-                    // and inventing one would put words in its mouth. Any text
-                    // it did emit before parking is preserved in
+                    // Settle without an assistant message: the model wrote no
+                    // answer and inventing one would put words in its mouth.
+                    // Any text it did emit before parking is preserved in
                     // `truncated_text`. The pending tool results have not been
                     // sent back to the model yet; include them in the usage
                     // anchor that the next same-prefix turn may reuse.
-                    usage.context_tokens = usage
-                        .context_tokens
-                        .map(|tokens| tokens.saturating_add(trailing_context_tokens));
-                    send_usage(&events, &usage, Some(turn.message_id)).await;
-                    send(
+                    settle_parked_turn(
                         &events,
-                        SessionEventKind::StatusChanged {
-                            status: SessionStatus::Ready,
-                            detail: None,
-                        },
+                        &mut usage,
+                        turn.message_id,
+                        warmer.as_ref(),
+                        trailing_context_tokens,
                     )
                     .await;
-                    // The run settled here just as it does below, so warming
-                    // has to hear about it on this path too. Without this the
-                    // mode is silently ignored for a turn that ends on a
-                    // watcher yield: streaming warming would be stopped by
-                    // Drop anyway, but idle warming would never engage.
-                    if let Some(warmer) = warmer.as_ref() {
-                        warmer.on_agent_settled();
-                    }
                     return Ok(AgentTurnResult {
                         provider_session_id: None,
                         final_text: truncated_text,
@@ -2018,6 +2070,8 @@ fn compaction_summary_chars(context_window_tokens: u64) -> usize {
 struct NativeSteer {
     text: String,
     attachments: Vec<PathBuf>,
+    /// A person wrote at least one of the folded steers.
+    human: bool,
     /// The steers this fold stands for, for the marker below. Empty for a
     /// steer the harness built itself, which no session is waiting on.
     message_ids: Vec<Uuid>,
@@ -2988,6 +3042,7 @@ struct CapturedSteer {
     text: String,
     attachments: Vec<PathBuf>,
     admission: borg_provider::provider::SteerAdmission,
+    human: bool,
     ack: SteerAck,
 }
 
@@ -3000,6 +3055,7 @@ impl CapturedSteer {
                 text,
                 attachments,
                 admission,
+                human,
                 ack,
                 ..
             } => Some(Self {
@@ -3007,6 +3063,7 @@ impl CapturedSteer {
                 text,
                 attachments,
                 admission,
+                human,
                 ack,
             }),
             _ => None,
@@ -3026,6 +3083,7 @@ fn admit_steers(captured: Vec<CapturedSteer>) -> Option<(NativeSteer, Vec<SteerA
     let mut attachments = Vec::new();
     let mut message_ids = Vec::new();
     let mut acks = Vec::new();
+    let mut human = false;
     for steer in captured {
         if !steer.admission.accept() {
             let _ = steer
@@ -3039,6 +3097,7 @@ fn admit_steers(captured: Vec<CapturedSteer>) -> Option<(NativeSteer, Vec<SteerA
         text.push_str(&steer.text);
         attachments.extend(steer.attachments);
         message_ids.push(steer.message_id);
+        human |= steer.human;
         acks.push(steer.ack);
     }
     (!acks.is_empty()).then_some((
@@ -3046,6 +3105,7 @@ fn admit_steers(captured: Vec<CapturedSteer>) -> Option<(NativeSteer, Vec<SteerA
             text,
             attachments,
             message_ids,
+            human,
         },
         acks,
     ))
@@ -4185,6 +4245,37 @@ pub(crate) async fn record_context_checkpoint(
             .context("record native context checkpoint")?;
     }
     Ok(())
+}
+
+/// Settle a turn that ends parked on watchers, exactly as the ordinary
+/// completion does but without an assistant message. `unsent_tokens` is
+/// context the model was never sent, which the next same-prefix turn may reuse.
+async fn settle_parked_turn(
+    events: &mpsc::Sender<SessionEventKind>,
+    usage: &mut ProviderCallUsage,
+    turn_id: Uuid,
+    warmer: Option<&CacheWarmer>,
+    unsent_tokens: u64,
+) {
+    usage.context_tokens = usage
+        .context_tokens
+        .map(|tokens| tokens.saturating_add(unsent_tokens));
+    send_usage(events, usage, Some(turn_id)).await;
+    send(
+        events,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: None,
+        },
+    )
+    .await;
+    // Warming has to hear the run settle on this path too. Without this the
+    // mode is silently ignored for a turn that ends on a watcher yield:
+    // streaming warming would be stopped by Drop anyway, but idle warming
+    // would never engage.
+    if let Some(warmer) = warmer {
+        warmer.on_agent_settled();
+    }
 }
 
 async fn send_usage(
@@ -5809,6 +5900,7 @@ mod tests {
                         attachments: vec![PathBuf::from(text)],
                         admission: admission.clone(),
                         preempt: true,
+                        human: false,
                         ack,
                     })
                     .await
@@ -5938,6 +6030,7 @@ mod tests {
                         attachments: Vec::new(),
                         admission: borg_provider::provider::SteerAdmission::pending(),
                         preempt: true,
+                        human: false,
                         ack,
                     }
                 })
@@ -5997,6 +6090,7 @@ mod tests {
                 attachments: Vec::new(),
                 admission: admission.clone(),
                 preempt: true,
+                human: false,
                 ack,
             })
             .await
@@ -6068,6 +6162,7 @@ mod tests {
                         attachments: vec![PathBuf::from(text)],
                         admission: borg_provider::provider::SteerAdmission::pending(),
                         preempt: true,
+                        human: false,
                         ack,
                     })
                     .await
@@ -6271,6 +6366,7 @@ mod tests {
                 declaration_base: None,
                 request_prefix_base: None,
                 prompt_context_base: Default::default(),
+                answers_human: false,
                 volatile_system_prompt_appendix: String::new(),
             };
             // One event of backpressure makes the first result a deterministic control boundary.
@@ -6306,6 +6402,7 @@ mod tests {
                                 attachments: Vec::new(),
                                 admission: borg_provider::provider::SteerAdmission::pending(),
                                 preempt: true,
+                                human: false,
                                 ack,
                             }
                         };
@@ -6643,6 +6740,7 @@ mod tests {
                     attachments: Vec::new(),
                     admission: borg_provider::provider::SteerAdmission::pending(),
                     preempt: true,
+                    human: false,
                     ack,
                 })
                 .await
@@ -8195,6 +8293,7 @@ mod tests {
             declaration_base: None,
             request_prefix_base: None,
             prompt_context_base,
+            answers_human: false,
             volatile_system_prompt_appendix: volatile.to_string(),
         };
         let (events_tx, mut events_rx) = mpsc::channel(256);
@@ -9186,6 +9285,9 @@ mod tests {
         /// `Some` establishes the yield out of band, the way the subprocess
         /// would. `None` is the negative control: an ordinary tool round.
         yield_on_first_round: Option<(crate::watch::Watches, Uuid)>,
+        /// What the model says once it sees the tool results; `None` is a
+        /// model with nothing to add.
+        reply: Option<&'static str>,
     }
 
     #[async_trait]
@@ -9224,7 +9326,10 @@ mod tests {
             .to_string();
             Ok(ModelTurnResult {
                 message: ModelMessage::assistant(
-                    calls.is_empty().then(|| "done".to_string()),
+                    calls
+                        .is_empty()
+                        .then(|| self.reply.map(str::to_string))
+                        .flatten(),
                     None,
                     None,
                     calls,
@@ -9237,9 +9342,19 @@ mod tests {
         }
     }
 
+    /// A parked goal turn ends at once, but a person who asked something is
+    /// owed an answer. Every reply-less turn in the journal was one that
+    /// parked: the model drafted its answer in thinking, meant to write it
+    /// after the tool round, and the turn ended first. It gets exactly one
+    /// response to write it, and one with nothing to add still just parks.
     #[tokio::test]
-    async fn a_watcher_yield_ends_the_turn_without_another_model_request() {
-        for yielded in [true, false] {
+    async fn a_watcher_yield_ends_the_turn_once_any_owed_reply_is_written() {
+        for (yielded, answers_human, reply) in [
+            (true, false, Some("done")),
+            (false, false, Some("done")),
+            (true, true, Some("done")),
+            (true, true, None),
+        ] {
             let root = tempfile::tempdir().unwrap();
             let cwd = root.path().to_path_buf();
             let session_id = Uuid::new_v4();
@@ -9270,6 +9385,7 @@ mod tests {
             let client = Arc::new(YieldAtRoundBoundaryClient {
                 rounds: std::sync::Arc::clone(&rounds),
                 yield_on_first_round: yielded.then(|| (watches.clone(), info.watch_id)),
+                reply,
             });
             let harness = NativeHarness {
                 model_client: client.clone(),
@@ -9334,6 +9450,7 @@ mod tests {
                 declaration_base: None,
                 request_prefix_base: None,
                 prompt_context_base: Default::default(),
+                answers_human,
                 volatile_system_prompt_appendix: String::new(),
             };
 
@@ -9355,7 +9472,19 @@ mod tests {
                 }
             }
 
-            if yielded {
+            if yielded && answers_human {
+                assert_eq!(
+                    rounds.load(std::sync::atomic::Ordering::SeqCst),
+                    2,
+                    "the person gets exactly one response to be answered in"
+                );
+                let expected = reply.map(str::to_string).into_iter().collect::<Vec<_>>();
+                assert_eq!(result.final_text, reply.unwrap_or_default());
+                assert_eq!(
+                    assistant_messages, expected,
+                    "the answer is a message, not a thinking summary"
+                );
+            } else if yielded {
                 assert_eq!(
                     rounds.load(std::sync::atomic::Ordering::SeqCst),
                     1,
@@ -9434,6 +9563,7 @@ mod tests {
                         attachments: Vec::new(),
                         admission: borg_provider::provider::SteerAdmission::pending(),
                         preempt: false,
+                        human: false,
                         ack: ack_tx,
                     })
                     .await
@@ -9575,6 +9705,7 @@ mod tests {
                 declaration_base: None,
                 request_prefix_base: None,
                 prompt_context_base: Default::default(),
+                answers_human: false,
                 volatile_system_prompt_appendix: String::new(),
             };
 
@@ -9854,6 +9985,7 @@ mod tests {
                     // What a human steer actually sends: fold this in, do not
                     // replace what is running.
                     preempt: false,
+                    human: false,
                     ack,
                 })
                 .await
@@ -10041,6 +10173,7 @@ mod tests {
                     attachments: Vec::new(),
                     admission: self.admission.clone(),
                     preempt: false,
+                    human: false,
                     ack,
                 })
                 .await
@@ -10185,6 +10318,7 @@ mod tests {
                 declaration_base: None,
                 request_prefix_base: None,
                 prompt_context_base: Default::default(),
+                answers_human: false,
                 volatile_system_prompt_appendix: String::new(),
             };
 

@@ -6284,6 +6284,7 @@ async fn forwarded_image_reaches_the_recipient_model_as_pixels() {
         declaration_base: None,
         request_prefix_base: None,
         prompt_context_base: Default::default(),
+        answers_human: false,
         volatile_system_prompt_appendix: String::new(),
     };
 

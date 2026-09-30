@@ -2174,6 +2174,7 @@ impl AgentToolDispatcher {
                             "status": "waiting",
                             "watch_ids": yielded.watch_ids,
                             "reason": yielded.reason,
+                            "detail": "Parked until a watcher reports. This turn ends after your next response: answer anything the human asked, and start no new work.",
                         }),
                         None => json!({
                             "status": "not_waiting",
@@ -7861,7 +7862,7 @@ pub fn agent_tool_specs_for_surface(
         ),
         tool(
             "await_watchers",
-            "Yield the active goal until a watcher reports progress, when every remaining step is blocked on watchers you already started. Only call this after finishing all other actionable work: name the watchers you are blocked on and say why nothing else can proceed. It does not pause, complete, or otherwise change the goal, and it does not stop any watcher. The next watcher update, human prompt, or explicit team wake resumes you automatically. Ordinary queued team reports are recorded without starting a turn. If none of the named watchers is still running you get `not_waiting` back and should keep working. A wait also ends when the last named watcher stops running, when every agent a named watcher watches is gone, or after a long silence, which returns the watch ids, how long each has been silent, and what its subjects are doing now. Waiting on a worker means watching the agent, not an artifact it touches: a watch over a file, a ref, a port, or a log cannot see its producer die, so it cannot end the wait when the producer does.",
+            "Yield the active goal until a watcher reports progress, when every remaining step is blocked on watchers you already started. Only call this after finishing all other actionable work: name the watchers you are blocked on and say why nothing else can proceed. Your turn ends once this returns, so write any reply the human is waiting for before calling it. It does not pause, complete, or otherwise change the goal, and it does not stop any watcher. The next watcher update, human prompt, or explicit team wake resumes you automatically. Ordinary queued team reports are recorded without starting a turn. If none of the named watchers is still running you get `not_waiting` back and should keep working. A wait also ends when the last named watcher stops running, when every agent a named watcher watches is gone, or after a long silence, which returns the watch ids, how long each has been silent, and what its subjects are doing now. Waiting on a worker means watching the agent, not an artifact it touches: a watch over a file, a ref, a port, or a log cannot see its producer die, so it cannot end the wait when the producer does.",
             json!({
                 "type": "object",
                 "properties": {
