@@ -516,7 +516,7 @@ impl ProcessManager {
             entry.cancellation.cancel();
             let _ =
                 tokio::time::timeout(Duration::from_secs(2), wait_for_process_finish(&entry)).await;
-        } else if let Some(chars) = chars {
+        } else if let Some(chars) = chars.filter(|chars| !chars.is_empty()) {
             let mut stdin = entry.stdin.lock().await;
             let pipe = stdin
                 .as_mut()
