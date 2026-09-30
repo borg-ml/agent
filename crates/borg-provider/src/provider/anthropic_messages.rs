@@ -272,7 +272,21 @@ pub(crate) fn messages_request_body(
             } => {
                 if let Some(ModelProviderState::AnthropicMessages { content, .. }) = provider_state
                 {
-                    push_turn(&mut messages, "assistant", content.clone());
+                    // History repair drops calls nothing answers from
+                    // `tool_calls`. The native blocks must follow it, or every
+                    // retry replays a `tool_use` the API refuses.
+                    let blocks = content
+                        .iter()
+                        .filter(|block| {
+                            block.get("type").and_then(Value::as_str) != Some("tool_use")
+                                || block
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|id| tool_calls.iter().any(|call| call.id == id))
+                        })
+                        .cloned()
+                        .collect();
+                    push_turn(&mut messages, "assistant", blocks);
                     continue;
                 }
                 let mut blocks: Vec<Value> = Vec::new();
@@ -1224,6 +1238,52 @@ mod tests {
         // The API requires a budget, so one is always present.
         assert_eq!(body["max_tokens"], json!(DEFAULT_MAX_OUTPUT_TOKENS));
         assert!(body.get("thinking").is_none());
+    }
+
+    /// A durable history can keep a native `tool_use` whose result was never
+    /// recorded. Repair removes the call from `tool_calls`; replaying the
+    /// native blocks verbatim would still send it, failing every retry.
+    #[test]
+    fn native_blocks_replay_only_the_tool_calls_that_survived_repair() {
+        let native = vec![
+            json!({ "type": "thinking", "thinking": "poll twice", "signature": "sig" }),
+            json!({ "type": "tool_use", "id": "toolu_lost", "name": "exec", "input": {} }),
+            json!({ "type": "tool_use", "id": "toolu_kept", "name": "exec", "input": {} }),
+        ];
+        let body = messages_request_body(
+            "claude-sonnet-4-5",
+            None,
+            &request(
+                vec![
+                    ModelMessage::user("hello"),
+                    ModelMessage::Assistant {
+                        content: None,
+                        reasoning_content: None,
+                        reasoning_details: None,
+                        provider_state: Some(ModelProviderState::AnthropicMessages {
+                            content: native,
+                            account_identity: None,
+                        }),
+                        tool_calls: vec![ModelToolCall::function(
+                            "toolu_kept".to_string(),
+                            "exec".to_string(),
+                            "{}".to_string(),
+                        )],
+                    },
+                    ModelMessage::tool("toolu_kept", "still running"),
+                ],
+                Vec::new(),
+            ),
+        );
+
+        let replayed = body["messages"][1]["content"].as_array().unwrap();
+        let ids: Vec<_> = replayed
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .map(|block| block["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["toolu_kept"]);
+        assert_eq!(replayed[0]["type"], json!("thinking"));
     }
 
     #[test]
