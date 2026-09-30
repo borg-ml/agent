@@ -65,8 +65,8 @@ mod subagents;
 mod tool_presentation;
 mod watch;
 mod workspace;
-#[cfg(test)]
-mod workspace_conformance;
+#[cfg(any(test, feature = "test-support"))]
+pub mod workspace_conformance;
 mod workspace_snapshot;
 
 pub use command_changes::CommandChange;

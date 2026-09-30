@@ -7,27 +7,33 @@
 use chrono::{Duration, Utc};
 use uuid::Uuid;
 
+#[cfg(test)]
 use crate::session_store::postgres::PostgresSessionStore;
+#[cfg(test)]
 use crate::session_store::postgres::testing::{ScratchDatabase, test_url};
 use crate::workspace::{
     Audience, DeliveryMode, DeliveryState, DirectoryInstance, Participant, ParticipantKind,
     PresenceLease, Thread, Workspace, WorkspaceEvent, WorkspaceEventKind, WorkspaceMembership,
     WorkspaceMessage, WorkspaceMessageBody, WorkspaceRole, WorkspaceStore,
 };
+#[cfg(test)]
 use crate::workspace_postgres::PostgresWorkspaceStore;
 
+#[cfg(test)]
 struct Harness {
     name: &'static str,
     store: Box<dyn WorkspaceStore>,
     scratch: ScratchDatabase,
 }
 
+#[cfg(test)]
 impl Harness {
     async fn discard(self) {
         self.scratch.discard().await;
     }
 }
 
+#[cfg(test)]
 async fn harnesses() -> Vec<Harness> {
     let Some(url) = test_url() else {
         eprintln!("workspace conformance: skipping postgres, BORG_TEST_SESSIONS_URL is not set");
@@ -123,924 +129,885 @@ async fn workspace_with_members(store: &dyn WorkspaceStore) -> (Uuid, Uuid, Uuid
     (workspace_id, author, second, third)
 }
 
-#[tokio::test]
-async fn an_appended_message_is_sequenced_and_replayable_by_its_recipients() {
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let name = harness.name;
-        let (workspace_id, author, second, _third) = workspace_with_members(store).await;
+pub async fn an_appended_message_is_sequenced_and_replayable_by_its_recipients(
+    store: &dyn WorkspaceStore,
+    name: &str,
+) {
+    let (workspace_id, author, second, _third) = workspace_with_members(store).await;
 
-        let event = store
-            .append(message_event(
-                workspace_id,
-                author,
-                "hello workspace",
-                Audience::Workspace,
-                "key-1",
-            ))
-            .await
-            .expect("append");
-        assert_eq!(event.sequence, 1, "[{name}] sequences start at one");
-
-        // The author sees their own event; so does a recipient.
-        assert_eq!(
-            store
-                .replay(workspace_id, author, 0, 50)
-                .await
-                .expect("replay")
-                .len(),
-            1,
-            "[{name}] an author sees their own event"
-        );
-        assert_eq!(
-            store
-                .replay(workspace_id, second, 0, 50)
-                .await
-                .expect("replay")
-                .len(),
-            1,
-            "[{name}] a recipient sees a delivered event"
-        );
-
-        // A non-member cannot replay at all.
-        assert!(
-            store
-                .replay(workspace_id, Uuid::new_v4(), 0, 50)
-                .await
-                .is_err(),
-            "[{name}] a non-member must not read a workspace"
-        );
-
-        let second_event = store
-            .append(message_event(
-                workspace_id,
-                author,
-                "second message",
-                Audience::Workspace,
-                "key-2",
-            ))
-            .await
-            .expect("append");
-        assert_eq!(second_event.sequence, 2, "[{name}]");
-        harness.discard().await;
-    }
-}
-
-#[tokio::test]
-async fn an_idempotency_key_admits_once_and_rejects_a_changed_payload() {
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let name = harness.name;
-        let (workspace_id, author, _second, _third) = workspace_with_members(store).await;
-
-        let event = message_event(
+    let event = store
+        .append(message_event(
             workspace_id,
             author,
-            "only once",
+            "hello workspace",
             Audience::Workspace,
-            "shared-key",
-        );
-        let first = store.append(event.clone()).await.expect("append");
-        // A retry of the same logical event returns the original rather than
-        // admitting a duplicate.
-        let retried = store.append(event).await.expect("retry");
-        assert_eq!(first.sequence, retried.sequence, "[{name}]");
-        assert_eq!(
-            store
-                .replay(workspace_id, author, 0, 50)
-                .await
-                .unwrap()
-                .len(),
-            1,
-            "[{name}] a retry must not create a second event"
-        );
+            "key-1",
+        ))
+        .await
+        .expect("append");
+    assert_eq!(event.sequence, 1, "[{name}] sequences start at one");
 
-        // The same key with different content is a caller bug, not a retry.
-        let conflicting = message_event(
+    // The author sees their own event; so does a recipient.
+    assert_eq!(
+        store
+            .replay(workspace_id, author, 0, 50)
+            .await
+            .expect("replay")
+            .len(),
+        1,
+        "[{name}] an author sees their own event"
+    );
+    assert_eq!(
+        store
+            .replay(workspace_id, second, 0, 50)
+            .await
+            .expect("replay")
+            .len(),
+        1,
+        "[{name}] a recipient sees a delivered event"
+    );
+
+    // A non-member cannot replay at all.
+    assert!(
+        store
+            .replay(workspace_id, Uuid::new_v4(), 0, 50)
+            .await
+            .is_err(),
+        "[{name}] a non-member must not read a workspace"
+    );
+
+    let second_event = store
+        .append(message_event(
             workspace_id,
             author,
-            "something else",
+            "second message",
             Audience::Workspace,
-            "shared-key",
-        );
-        assert!(store.append(conflicting).await.is_err(), "[{name}]");
-        harness.discard().await;
-    }
+            "key-2",
+        ))
+        .await
+        .expect("append");
+    assert_eq!(second_event.sequence, 2, "[{name}]");
 }
 
-#[tokio::test]
-async fn a_direct_audience_reaches_only_its_target() {
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let name = harness.name;
-        let (workspace_id, author, second, third) = workspace_with_members(store).await;
+pub async fn an_idempotency_key_admits_once_and_rejects_a_changed_payload(
+    store: &dyn WorkspaceStore,
+    name: &str,
+) {
+    let (workspace_id, author, _second, _third) = workspace_with_members(store).await;
 
+    let event = message_event(
+        workspace_id,
+        author,
+        "only once",
+        Audience::Workspace,
+        "shared-key",
+    );
+    let first = store.append(event.clone()).await.expect("append");
+    // A retry of the same logical event returns the original rather than
+    // admitting a duplicate.
+    let retried = store.append(event).await.expect("retry");
+    assert_eq!(first.sequence, retried.sequence, "[{name}]");
+    assert_eq!(
+        store
+            .replay(workspace_id, author, 0, 50)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "[{name}] a retry must not create a second event"
+    );
+
+    // The same key with different content is a caller bug, not a retry.
+    let conflicting = message_event(
+        workspace_id,
+        author,
+        "something else",
+        Audience::Workspace,
+        "shared-key",
+    );
+    assert!(store.append(conflicting).await.is_err(), "[{name}]");
+}
+
+pub async fn a_direct_audience_reaches_only_its_target(store: &dyn WorkspaceStore, name: &str) {
+    let (workspace_id, author, second, third) = workspace_with_members(store).await;
+
+    store
+        .append(message_event(
+            workspace_id,
+            author,
+            "for your eyes only",
+            Audience::Direct {
+                participant: second,
+            },
+            "direct-1",
+        ))
+        .await
+        .expect("append");
+
+    assert_eq!(
+        store
+            .deliveries_after(workspace_id, second, 0, 50)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "[{name}] the target receives a direct message"
+    );
+    assert!(
+        store
+            .deliveries_after(workspace_id, third, 0, 50)
+            .await
+            .unwrap()
+            .is_empty(),
+        "[{name}] an uninvolved member must not receive a direct message"
+    );
+    assert!(
+        store
+            .replay(workspace_id, third, 0, 50)
+            .await
+            .unwrap()
+            .is_empty(),
+        "[{name}] a private audience must not leak through replay"
+    );
+
+    // An audience naming a non-member is refused outright.
+    assert!(
         store
             .append(message_event(
                 workspace_id,
                 author,
-                "for your eyes only",
+                "to a stranger",
                 Audience::Direct {
-                    participant: second,
+                    participant: Uuid::new_v4()
                 },
-                "direct-1",
+                "direct-2",
             ))
             .await
-            .expect("append");
-
-        assert_eq!(
-            store
-                .deliveries_after(workspace_id, second, 0, 50)
-                .await
-                .unwrap()
-                .len(),
-            1,
-            "[{name}] the target receives a direct message"
-        );
-        assert!(
-            store
-                .deliveries_after(workspace_id, third, 0, 50)
-                .await
-                .unwrap()
-                .is_empty(),
-            "[{name}] an uninvolved member must not receive a direct message"
-        );
-        assert!(
-            store
-                .replay(workspace_id, third, 0, 50)
-                .await
-                .unwrap()
-                .is_empty(),
-            "[{name}] a private audience must not leak through replay"
-        );
-
-        // An audience naming a non-member is refused outright.
-        assert!(
-            store
-                .append(message_event(
-                    workspace_id,
-                    author,
-                    "to a stranger",
-                    Audience::Direct {
-                        participant: Uuid::new_v4()
-                    },
-                    "direct-2",
-                ))
-                .await
-                .is_err(),
-            "[{name}]"
-        );
-        // So is an author who is not a member.
-        assert!(
-            store
-                .append(message_event(
-                    workspace_id,
-                    Uuid::new_v4(),
-                    "from a stranger",
-                    Audience::Workspace,
-                    "direct-3",
-                ))
-                .await
-                .is_err(),
-            "[{name}]"
-        );
-        harness.discard().await;
-    }
-}
-
-#[tokio::test]
-async fn delivery_transitions_are_monotonic_and_count_attempts() {
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let name = harness.name;
-        let (workspace_id, author, second, _third) = workspace_with_members(store).await;
-        let event = store
+            .is_err(),
+        "[{name}]"
+    );
+    // So is an author who is not a member.
+    assert!(
+        store
             .append(message_event(
                 workspace_id,
-                author,
-                "deliver me",
+                Uuid::new_v4(),
+                "from a stranger",
                 Audience::Workspace,
-                "delivery-1",
+                "direct-3",
             ))
             .await
-            .expect("append");
-
-        let delivered = store
-            .transition_delivery(
-                workspace_id,
-                event.sequence,
-                second,
-                DeliveryState::Relayed,
-                None,
-            )
-            .await
-            .expect("relay");
-        assert_eq!(delivered.state, DeliveryState::Relayed, "[{name}]");
-
-        // Repeating the current state is a no-op rather than an error, so a
-        // retrying relay is not punished.
-        let repeated = store
-            .transition_delivery(
-                workspace_id,
-                event.sequence,
-                second,
-                DeliveryState::Relayed,
-                None,
-            )
-            .await
-            .expect("repeat");
-        assert_eq!(repeated.attempts, delivered.attempts, "[{name}]");
-
-        // Going backwards is refused: delivery state only moves forward.
-        assert!(
-            store
-                .transition_delivery(
-                    workspace_id,
-                    event.sequence,
-                    second,
-                    DeliveryState::Pending,
-                    None
-                )
-                .await
-                .is_err(),
-            "[{name}] a non-monotonic delivery transition must be refused"
-        );
-
-        let acknowledged = store
-            .transition_delivery(
-                workspace_id,
-                event.sequence,
-                second,
-                DeliveryState::Acknowledged,
-                None,
-            )
-            .await
-            .expect("acknowledge");
-        assert_eq!(acknowledged.state, DeliveryState::Acknowledged, "[{name}]");
-
-        // A delivery that was never created cannot be transitioned.
-        assert!(
-            store
-                .transition_delivery(
-                    workspace_id,
-                    event.sequence,
-                    Uuid::new_v4(),
-                    DeliveryState::Relayed,
-                    None
-                )
-                .await
-                .is_err(),
-            "[{name}]"
-        );
-        harness.discard().await;
-    }
+            .is_err(),
+        "[{name}]"
+    );
 }
 
-#[tokio::test]
-async fn presence_leases_expire_and_exclude_non_members() {
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let name = harness.name;
-        let (workspace_id, author, second, _third) = workspace_with_members(store).await;
+pub async fn delivery_transitions_are_monotonic_and_count_attempts(
+    store: &dyn WorkspaceStore,
+    name: &str,
+) {
+    let (workspace_id, author, second, _third) = workspace_with_members(store).await;
+    let event = store
+        .append(message_event(
+            workspace_id,
+            author,
+            "deliver me",
+            Audience::Workspace,
+            "delivery-1",
+        ))
+        .await
+        .expect("append");
 
+    let delivered = store
+        .transition_delivery(
+            workspace_id,
+            event.sequence,
+            second,
+            DeliveryState::Relayed,
+            None,
+        )
+        .await
+        .expect("relay");
+    assert_eq!(delivered.state, DeliveryState::Relayed, "[{name}]");
+
+    // Repeating the current state is a no-op rather than an error, so a
+    // retrying relay is not punished.
+    let repeated = store
+        .transition_delivery(
+            workspace_id,
+            event.sequence,
+            second,
+            DeliveryState::Relayed,
+            None,
+        )
+        .await
+        .expect("repeat");
+    assert_eq!(repeated.attempts, delivered.attempts, "[{name}]");
+
+    // Going backwards is refused: delivery state only moves forward.
+    assert!(
+        store
+            .transition_delivery(
+                workspace_id,
+                event.sequence,
+                second,
+                DeliveryState::Pending,
+                None
+            )
+            .await
+            .is_err(),
+        "[{name}] a non-monotonic delivery transition must be refused"
+    );
+
+    let acknowledged = store
+        .transition_delivery(
+            workspace_id,
+            event.sequence,
+            second,
+            DeliveryState::Acknowledged,
+            None,
+        )
+        .await
+        .expect("acknowledge");
+    assert_eq!(acknowledged.state, DeliveryState::Acknowledged, "[{name}]");
+
+    // A delivery that was never created cannot be transitioned.
+    assert!(
+        store
+            .transition_delivery(
+                workspace_id,
+                event.sequence,
+                Uuid::new_v4(),
+                DeliveryState::Relayed,
+                None
+            )
+            .await
+            .is_err(),
+        "[{name}]"
+    );
+}
+
+pub async fn presence_leases_expire_and_exclude_non_members(
+    store: &dyn WorkspaceStore,
+    name: &str,
+) {
+    let (workspace_id, author, second, _third) = workspace_with_members(store).await;
+
+    store
+        .acquire_presence_lease(PresenceLease {
+            workspace_id,
+            participant_id: author,
+            client_id: Uuid::new_v4(),
+            host_id: None,
+            expires_at: Utc::now() + Duration::hours(1),
+        })
+        .await
+        .expect("acquire");
+    let active = store
+        .active_presence(workspace_id, Utc::now())
+        .await
+        .expect("active");
+    assert_eq!(active.len(), 1, "[{name}]");
+    assert_eq!(active[0].participant_id, author, "[{name}]");
+
+    // A lease that has already expired is not a lease.
+    assert!(
         store
             .acquire_presence_lease(PresenceLease {
                 workspace_id,
-                participant_id: author,
+                participant_id: second,
+                client_id: Uuid::new_v4(),
+                host_id: None,
+                expires_at: Utc::now() - Duration::minutes(1),
+            })
+            .await
+            .is_err(),
+        "[{name}]"
+    );
+    // Nor may a non-member hold presence in a workspace.
+    assert!(
+        store
+            .acquire_presence_lease(PresenceLease {
+                workspace_id,
+                participant_id: Uuid::new_v4(),
                 client_id: Uuid::new_v4(),
                 host_id: None,
                 expires_at: Utc::now() + Duration::hours(1),
             })
             .await
-            .expect("acquire");
-        let active = store
-            .active_presence(workspace_id, Utc::now())
+            .is_err(),
+        "[{name}]"
+    );
+
+    // Reading presence in the future sweeps what has lapsed.
+    assert!(
+        store
+            .active_presence(workspace_id, Utc::now() + Duration::hours(2))
             .await
-            .expect("active");
-        assert_eq!(active.len(), 1, "[{name}]");
-        assert_eq!(active[0].participant_id, author, "[{name}]");
-
-        // A lease that has already expired is not a lease.
-        assert!(
-            store
-                .acquire_presence_lease(PresenceLease {
-                    workspace_id,
-                    participant_id: second,
-                    client_id: Uuid::new_v4(),
-                    host_id: None,
-                    expires_at: Utc::now() - Duration::minutes(1),
-                })
-                .await
-                .is_err(),
-            "[{name}]"
-        );
-        // Nor may a non-member hold presence in a workspace.
-        assert!(
-            store
-                .acquire_presence_lease(PresenceLease {
-                    workspace_id,
-                    participant_id: Uuid::new_v4(),
-                    client_id: Uuid::new_v4(),
-                    host_id: None,
-                    expires_at: Utc::now() + Duration::hours(1),
-                })
-                .await
-                .is_err(),
-            "[{name}]"
-        );
-
-        // Reading presence in the future sweeps what has lapsed.
-        assert!(
-            store
-                .active_presence(workspace_id, Utc::now() + Duration::hours(2))
-                .await
-                .expect("active")
-                .is_empty(),
-            "[{name}] an expired lease must not remain active"
-        );
-        harness.discard().await;
-    }
+            .expect("active")
+            .is_empty(),
+        "[{name}] an expired lease must not remain active"
+    );
 }
 
-#[tokio::test]
-async fn the_shared_read_surface_answers_identically() {
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let name = harness.name;
-        let (workspace_id, author, second, _third) = workspace_with_members(store).await;
+pub async fn the_shared_read_surface_answers_identically(store: &dyn WorkspaceStore, name: &str) {
+    let (workspace_id, author, second, _third) = workspace_with_members(store).await;
 
-        assert_eq!(
-            store.workspace_name(workspace_id).await.expect("name"),
-            Some("conformance".to_string()),
-            "[{name}]"
-        );
-        assert_eq!(
-            store.workspace_name(Uuid::new_v4()).await.expect("name"),
-            None,
-            "[{name}] an unknown workspace has no name"
-        );
+    assert_eq!(
+        store.workspace_name(workspace_id).await.expect("name"),
+        Some("conformance".to_string()),
+        "[{name}]"
+    );
+    assert_eq!(
+        store.workspace_name(Uuid::new_v4()).await.expect("name"),
+        None,
+        "[{name}] an unknown workspace has no name"
+    );
 
-        let found = store
-            .participant(author)
+    let found = store
+        .participant(author)
+        .await
+        .expect("participant")
+        .expect("author exists");
+    assert_eq!(found.id, author, "[{name}]");
+    assert!(
+        store
+            .participant(Uuid::new_v4())
             .await
             .expect("participant")
-            .expect("author exists");
-        assert_eq!(found.id, author, "[{name}]");
-        assert!(
-            store
-                .participant(Uuid::new_v4())
-                .await
-                .expect("participant")
-                .is_none(),
-            "[{name}]"
-        );
+            .is_none(),
+        "[{name}]"
+    );
 
-        let roster = store
-            .workspace_roster(workspace_id, author)
-            .await
-            .expect("roster");
-        assert_eq!(roster.len(), 3, "[{name}]");
-        // A roster is membership information, so a stranger may not read it.
-        assert!(
-            store
-                .workspace_roster(workspace_id, Uuid::new_v4())
-                .await
-                .is_err(),
-            "[{name}] a non-member must not read the roster"
-        );
-
-        let workspaces = store
-            .list_workspaces_for_participant(second)
-            .await
-            .expect("workspaces");
-        assert_eq!(workspaces.len(), 1, "[{name}]");
-        assert_eq!(workspaces[0].id, workspace_id, "[{name}]");
-        assert!(
-            store
-                .list_workspaces_for_participant(Uuid::new_v4())
-                .await
-                .expect("workspaces")
-                .is_empty(),
-            "[{name}]"
-        );
-
-        let event = store
-            .append(message_event(
-                workspace_id,
-                author,
-                "findable",
-                Audience::Workspace,
-                "read-surface-1",
-            ))
-            .await
-            .expect("append");
-        assert!(
-            store.contains_message(event.id).await.expect("contains"),
-            "[{name}] an appended message is findable by id"
-        );
-        assert!(
-            !store
-                .contains_message(Uuid::new_v4())
-                .await
-                .expect("contains"),
-            "[{name}]"
-        );
-        assert!(
-            store
-                .contains_idempotent_event(workspace_id, author, "read-surface-1")
-                .await
-                .expect("idempotent"),
-            "[{name}]"
-        );
-        assert!(
-            !store
-                .contains_idempotent_event(workspace_id, author, "never-used")
-                .await
-                .expect("idempotent"),
-            "[{name}]"
-        );
-
-        // No session projection yet, so the replay watermark is zero rather
-        // than an error: a fresh workspace replays from the beginning.
-        assert_eq!(
-            store
-                .latest_projected_session_sequence(workspace_id, Uuid::new_v4())
-                .await
-                .expect("watermark"),
-            0,
-            "[{name}]"
-        );
-        harness.discard().await;
-    }
-}
-
-#[tokio::test]
-async fn workspace_provisioning_is_idempotent_and_direction_independent() {
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let name = harness.name;
-        let workspace_id = Uuid::new_v4();
-        let human = Uuid::new_v4();
-        let agent = Uuid::new_v4();
-
+    let roster = store
+        .workspace_roster(workspace_id, author)
+        .await
+        .expect("roster");
+    assert_eq!(roster.len(), 3, "[{name}]");
+    // A roster is membership information, so a stranger may not read it.
+    assert!(
         store
-            .ensure_execution_workspace(workspace_id, "project", human, "Human", agent, "Agent")
+            .workspace_roster(workspace_id, Uuid::new_v4())
             .await
-            .expect("provision");
-        // Relaunching the same session must refresh names, not duplicate
-        // membership or fail on the existing workspace.
+            .is_err(),
+        "[{name}] a non-member must not read the roster"
+    );
+
+    let workspaces = store
+        .list_workspaces_for_participant(second)
+        .await
+        .expect("workspaces");
+    assert_eq!(workspaces.len(), 1, "[{name}]");
+    assert_eq!(workspaces[0].id, workspace_id, "[{name}]");
+    assert!(
         store
-            .ensure_execution_workspace(
-                workspace_id,
-                "project",
-                human,
-                "Human Renamed",
-                agent,
-                "Agent",
-            )
+            .list_workspaces_for_participant(Uuid::new_v4())
             .await
-            .expect("re-provision");
+            .expect("workspaces")
+            .is_empty(),
+        "[{name}]"
+    );
 
-        let roster = store
-            .workspace_roster(workspace_id, human)
-            .await
-            .expect("roster");
-        assert_eq!(roster.len(), 2, "[{name}] membership must not duplicate");
-        let human_entry = roster
-            .iter()
-            .find(|entry| entry.participant.id == human)
-            .expect("human is a member");
-        assert_eq!(
-            human_entry.participant.display_name, "Human Renamed",
-            "[{name}] a relaunch refreshes display names"
-        );
-        assert_eq!(human_entry.role, WorkspaceRole::Owner, "[{name}]");
-        for (id, role) in [
-            (human, WorkspaceRole::Contributor),
-            (agent, WorkspaceRole::Viewer),
-        ] {
-            store
-                .upsert_relay_roster_entry(
-                    workspace_id,
-                    store.participant(id).await.unwrap().unwrap(),
-                    role,
-                )
-                .await
-                .unwrap();
-        }
-        store
-            .ensure_execution_workspace(workspace_id, "project", human, "Human", agent, "Agent")
-            .await
-            .unwrap();
-        let roles = store.workspace_roster(workspace_id, human).await.unwrap();
-        assert_eq!(
-            roles
-                .iter()
-                .find(|r| r.participant.id == human)
-                .unwrap()
-                .role,
-            WorkspaceRole::Contributor
-        );
-        assert_eq!(
-            roles
-                .iter()
-                .find(|r| r.participant.id == agent)
-                .unwrap()
-                .role,
-            WorkspaceRole::Viewer
-        );
-        assert!(
-            store
-                .update_work_plan(workspace_id, agent, agent, "viewer-write".into(), 0, vec![])
-                .await
-                .is_err()
-        );
-        assert!(
-            store
-                .update_work_plan(
-                    workspace_id,
-                    human,
-                    agent,
-                    "contributor-directs".into(),
-                    0,
-                    vec![]
-                )
-                .await
-                .is_err()
-        );
-
-        // A direct workspace is derived from the sorted participant pair, so
-        // both directions must land on the same workspace rather than two.
-        let forward = store
-            .ensure_direct_workspace(human, agent)
-            .await
-            .expect("direct");
-        let reverse = store
-            .ensure_direct_workspace(agent, human)
-            .await
-            .expect("direct");
-        assert_eq!(forward, reverse, "[{name}] direct workspaces are symmetric");
-        assert!(
-            store.ensure_direct_workspace(human, human).await.is_err(),
-            "[{name}] a direct message needs two distinct participants"
-        );
-        assert!(
-            store
-                .ensure_direct_workspace(human, Uuid::new_v4())
-                .await
-                .is_err(),
-            "[{name}] an unknown participant cannot be direct-messaged"
-        );
-        harness.discard().await;
-    }
-}
-
-#[tokio::test]
-async fn a_pending_message_is_listed_until_its_delivery_settles() {
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let name = harness.name;
-        let (workspace_id, author, second, _third) = workspace_with_members(store).await;
-
-        let event = store
-            .append(message_event(
-                workspace_id,
-                author,
-                "please read me",
-                Audience::Workspace,
-                "pending-1",
-            ))
-            .await
-            .expect("append");
-
-        let pending = store
-            .pending_message_events(workspace_id, second, 10)
-            .await
-            .expect("pending");
-        assert_eq!(
-            pending.len(),
-            1,
-            "[{name}] an undelivered message is pending"
-        );
-        assert_eq!(pending[0].0.id, event.id, "[{name}]");
-        assert_eq!(pending[0].1.state, DeliveryState::Pending, "[{name}]");
-        // The author is not a recipient of their own message.
-        assert!(
-            store
-                .pending_message_events(workspace_id, author, 10)
-                .await
-                .expect("pending")
-                .is_empty(),
-            "[{name}]"
-        );
-        assert!(
-            store
-                .pending_message_events(workspace_id, second, 0)
-                .await
-                .expect("pending")
-                .is_empty(),
-            "[{name}] a zero limit asks for nothing"
-        );
-
-        // Every recipient's row is visible for the message, across workspaces.
-        let deliveries = store
-            .message_deliveries(event.id)
-            .await
-            .expect("deliveries");
-        assert_eq!(deliveries.len(), 2, "[{name}]");
-        assert!(
-            deliveries
-                .iter()
-                .all(|delivery| delivery.workspace_id == workspace_id),
-            "[{name}]"
-        );
-
-        // Pending cannot jump straight to acknowledged; it is admitted first.
-        store
-            .transition_delivery(
-                workspace_id,
-                event.sequence,
-                second,
-                DeliveryState::Admitted,
-                None,
-            )
-            .await
-            .expect("admit");
-        store
-            .transition_delivery(
-                workspace_id,
-                event.sequence,
-                second,
-                DeliveryState::Acknowledged,
-                None,
-            )
-            .await
-            .expect("acknowledge");
-        assert!(
-            store
-                .pending_message_events(workspace_id, second, 10)
-                .await
-                .expect("pending")
-                .is_empty(),
-            "[{name}] a settled delivery stops being pending"
-        );
-        harness.discard().await;
-    }
-}
-
-#[tokio::test]
-async fn a_message_cannot_reference_a_thread_or_reply_outside_its_workspace() {
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let name = harness.name;
-        let (workspace_id, author, _second, _third) = workspace_with_members(store).await;
-        let (other_workspace, other_author, _, _) = workspace_with_members(store).await;
-
-        // A thread that belongs to a different workspace must not be usable as
-        // a parent here, or a message grafts itself onto a conversation it is
-        // not part of.
-        let foreign_thread = Uuid::new_v4();
-        store
-            .create_thread(Thread {
-                id: foreign_thread,
-                workspace_id: other_workspace,
-                title: "elsewhere".to_string(),
-                created_at: Utc::now(),
-            })
-            .await
-            .expect("create thread");
-
-        let mut event = message_event(
+    let event = store
+        .append(message_event(
             workspace_id,
             author,
-            "grafted",
+            "findable",
             Audience::Workspace,
-            "reference-1",
-        );
-        if let WorkspaceEventKind::Message { message, .. } = &mut event.kind {
-            message.thread_id = Some(foreign_thread);
-        }
-        assert!(
-            store.append(event).await.is_err(),
-            "[{name}] a thread from another workspace must be refused"
-        );
-
-        // Same for a reply target: the message being replied to has to exist
-        // in this workspace.
-        let elsewhere = store
-            .append(message_event(
-                other_workspace,
-                other_author,
-                "over here",
-                Audience::Workspace,
-                "reference-2",
-            ))
+            "read-surface-1",
+        ))
+        .await
+        .expect("append");
+    assert!(
+        store.contains_message(event.id).await.expect("contains"),
+        "[{name}] an appended message is findable by id"
+    );
+    assert!(
+        !store
+            .contains_message(Uuid::new_v4())
             .await
-            .expect("append elsewhere");
-        let WorkspaceEventKind::Message {
-            message: foreign, ..
-        } = &elsewhere.kind
-        else {
-            panic!("[{name}] message expected");
-        };
-        let mut event = message_event(
-            workspace_id,
-            author,
-            "replying across a boundary",
-            Audience::Workspace,
-            "reference-3",
-        );
-        if let WorkspaceEventKind::Message { message, .. } = &mut event.kind {
-            message.reply_to_message_id = Some(foreign.id);
-        }
-        assert!(
-            store.append(event).await.is_err(),
-            "[{name}] a reply target from another workspace must be refused"
-        );
-
-        // A thread in this workspace is accepted, so the check is not simply
-        // rejecting every reference.
-        let local_thread = Uuid::new_v4();
+            .expect("contains"),
+        "[{name}]"
+    );
+    assert!(
         store
-            .create_thread(Thread {
-                id: local_thread,
-                workspace_id,
-                title: "here".to_string(),
-                created_at: Utc::now(),
-            })
+            .contains_idempotent_event(workspace_id, author, "read-surface-1")
             .await
-            .expect("create thread");
-        let mut event = message_event(
-            workspace_id,
-            author,
-            "properly threaded",
-            Audience::Workspace,
-            "reference-4",
-        );
-        if let WorkspaceEventKind::Message { message, .. } = &mut event.kind {
-            message.thread_id = Some(local_thread);
-        }
-        store.append(event).await.expect("local thread is valid");
-        harness.discard().await;
-    }
+            .expect("idempotent"),
+        "[{name}]"
+    );
+    assert!(
+        !store
+            .contains_idempotent_event(workspace_id, author, "never-used")
+            .await
+            .expect("idempotent"),
+        "[{name}]"
+    );
+
+    // No session projection yet, so the replay watermark is zero rather
+    // than an error: a fresh workspace replays from the beginning.
+    assert_eq!(
+        store
+            .latest_projected_session_sequence(workspace_id, Uuid::new_v4())
+            .await
+            .expect("watermark"),
+        0,
+        "[{name}]"
+    );
 }
 
-#[tokio::test]
-async fn a_relay_message_lands_locally_without_local_reference_checks() {
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let name = harness.name;
-        let recipient = Uuid::new_v4();
-        let remote_author = Uuid::new_v4();
-        store
-            .create_participant(participant(recipient, "local"))
-            .await
-            .expect("create recipient");
-        let workspace_id = Uuid::new_v4();
+pub async fn workspace_provisioning_is_idempotent_and_direction_independent(
+    store: &dyn WorkspaceStore,
+    name: &str,
+) {
+    let workspace_id = Uuid::new_v4();
+    let human = Uuid::new_v4();
+    let agent = Uuid::new_v4();
 
-        let message = WorkspaceMessage {
-            id: Uuid::new_v4(),
+    store
+        .ensure_execution_workspace(workspace_id, "project", human, "Human", agent, "Agent")
+        .await
+        .expect("provision");
+    // Relaunching the same session must refresh names, not duplicate
+    // membership or fail on the existing workspace.
+    store
+        .ensure_execution_workspace(
             workspace_id,
-            // Cloud identities: neither exists locally, and that must not stop
-            // the message from being delivered.
-            thread_id: Some(Uuid::new_v4()),
-            reply_to_message_id: Some(Uuid::new_v4()),
-            author_id: remote_author,
-            body: WorkspaceMessageBody {
-                text: "from another installation".to_string(),
-                mentions: Vec::new(),
-                attachments: Vec::new(),
-            },
-            audience: Audience::Direct {
-                participant: recipient,
-            },
-            created_at: Utc::now(),
-        };
-        let event = store
-            .import_relay_message(
-                message.clone(),
-                "Remote Agent",
-                recipient,
-                DeliveryMode::Notify,
-            )
-            .await
-            .expect("import relay message");
-        assert_eq!(event.author_id, remote_author, "[{name}]");
-        assert!(
-            store.contains_message(event.id).await.expect("contains"),
-            "[{name}] an imported relay message is durable locally"
-        );
+            "project",
+            human,
+            "Human Renamed",
+            agent,
+            "Agent",
+        )
+        .await
+        .expect("re-provision");
 
-        // Re-importing the same message is a replay, not a second delivery.
-        let repeated = store
-            .import_relay_message(
-                message.clone(),
-                "Remote Agent",
-                recipient,
-                DeliveryMode::Notify,
-            )
-            .await
-            .expect("re-import");
-        assert_eq!(repeated.sequence, event.sequence, "[{name}]");
-
-        // The guards still hold: a message whose audience disagrees with the
-        // recipient it was delivered for is refused.
-        let mut mismatched = message.clone();
-        mismatched.id = Uuid::new_v4();
-        mismatched.audience = Audience::Direct {
-            participant: Uuid::new_v4(),
-        };
-        assert!(
-            store
-                .import_relay_message(mismatched, "Remote Agent", recipient, DeliveryMode::Notify)
-                .await
-                .is_err(),
-            "[{name}] relay recipient mismatch must be refused"
-        );
-        let mut self_addressed = message;
-        self_addressed.id = Uuid::new_v4();
-        self_addressed.author_id = recipient;
-        assert!(
-            store
-                .import_relay_message(
-                    self_addressed,
-                    "Remote Agent",
-                    recipient,
-                    DeliveryMode::Notify
-                )
-                .await
-                .is_err(),
-            "[{name}] a relay sender cannot be its own recipient"
-        );
-        harness.discard().await;
-    }
-}
-
-#[tokio::test]
-async fn a_relay_roster_entry_projects_only_onto_a_local_workspace() {
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let name = harness.name;
-        let (workspace_id, author, _second, _third) = workspace_with_members(store).await;
-
-        // Projecting onto a workspace this machine has never materialised
-        // would be inventing membership rather than caching it.
-        assert!(
-            store
-                .upsert_relay_roster_entry(
-                    Uuid::new_v4(),
-                    participant(Uuid::new_v4(), "cloud"),
-                    WorkspaceRole::Viewer,
-                )
-                .await
-                .is_err(),
-            "[{name}]"
-        );
-
-        let cloud = Uuid::new_v4();
+    let roster = store
+        .workspace_roster(workspace_id, human)
+        .await
+        .expect("roster");
+    assert_eq!(roster.len(), 2, "[{name}] membership must not duplicate");
+    let human_entry = roster
+        .iter()
+        .find(|entry| entry.participant.id == human)
+        .expect("human is a member");
+    assert_eq!(
+        human_entry.participant.display_name, "Human Renamed",
+        "[{name}] a relaunch refreshes display names"
+    );
+    assert_eq!(human_entry.role, WorkspaceRole::Owner, "[{name}]");
+    for (id, role) in [
+        (human, WorkspaceRole::Contributor),
+        (agent, WorkspaceRole::Viewer),
+    ] {
         store
             .upsert_relay_roster_entry(
                 workspace_id,
-                participant(cloud, "Cloud"),
+                store.participant(id).await.unwrap().unwrap(),
+                role,
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .ensure_execution_workspace(workspace_id, "project", human, "Human", agent, "Agent")
+        .await
+        .unwrap();
+    let roles = store.workspace_roster(workspace_id, human).await.unwrap();
+    assert_eq!(
+        roles
+            .iter()
+            .find(|r| r.participant.id == human)
+            .unwrap()
+            .role,
+        WorkspaceRole::Contributor
+    );
+    assert_eq!(
+        roles
+            .iter()
+            .find(|r| r.participant.id == agent)
+            .unwrap()
+            .role,
+        WorkspaceRole::Viewer
+    );
+    assert!(
+        store
+            .update_work_plan(workspace_id, agent, agent, "viewer-write".into(), 0, vec![])
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .update_work_plan(
+                workspace_id,
+                human,
+                agent,
+                "contributor-directs".into(),
+                0,
+                vec![]
+            )
+            .await
+            .is_err()
+    );
+
+    // A direct workspace is derived from the sorted participant pair, so
+    // both directions must land on the same workspace rather than two.
+    let forward = store
+        .ensure_direct_workspace(human, agent)
+        .await
+        .expect("direct");
+    let reverse = store
+        .ensure_direct_workspace(agent, human)
+        .await
+        .expect("direct");
+    assert_eq!(forward, reverse, "[{name}] direct workspaces are symmetric");
+    assert!(
+        store.ensure_direct_workspace(human, human).await.is_err(),
+        "[{name}] a direct message needs two distinct participants"
+    );
+    assert!(
+        store
+            .ensure_direct_workspace(human, Uuid::new_v4())
+            .await
+            .is_err(),
+        "[{name}] an unknown participant cannot be direct-messaged"
+    );
+}
+
+pub async fn a_pending_message_is_listed_until_its_delivery_settles(
+    store: &dyn WorkspaceStore,
+    name: &str,
+) {
+    let (workspace_id, author, second, _third) = workspace_with_members(store).await;
+
+    let event = store
+        .append(message_event(
+            workspace_id,
+            author,
+            "please read me",
+            Audience::Workspace,
+            "pending-1",
+        ))
+        .await
+        .expect("append");
+
+    let pending = store
+        .pending_message_events(workspace_id, second, 10)
+        .await
+        .expect("pending");
+    assert_eq!(
+        pending.len(),
+        1,
+        "[{name}] an undelivered message is pending"
+    );
+    assert_eq!(pending[0].0.id, event.id, "[{name}]");
+    assert_eq!(pending[0].1.state, DeliveryState::Pending, "[{name}]");
+    // The author is not a recipient of their own message.
+    assert!(
+        store
+            .pending_message_events(workspace_id, author, 10)
+            .await
+            .expect("pending")
+            .is_empty(),
+        "[{name}]"
+    );
+    assert!(
+        store
+            .pending_message_events(workspace_id, second, 0)
+            .await
+            .expect("pending")
+            .is_empty(),
+        "[{name}] a zero limit asks for nothing"
+    );
+
+    // Every recipient's row is visible for the message, across workspaces.
+    let deliveries = store
+        .message_deliveries(event.id)
+        .await
+        .expect("deliveries");
+    assert_eq!(deliveries.len(), 2, "[{name}]");
+    assert!(
+        deliveries
+            .iter()
+            .all(|delivery| delivery.workspace_id == workspace_id),
+        "[{name}]"
+    );
+
+    // Pending cannot jump straight to acknowledged; it is admitted first.
+    store
+        .transition_delivery(
+            workspace_id,
+            event.sequence,
+            second,
+            DeliveryState::Admitted,
+            None,
+        )
+        .await
+        .expect("admit");
+    store
+        .transition_delivery(
+            workspace_id,
+            event.sequence,
+            second,
+            DeliveryState::Acknowledged,
+            None,
+        )
+        .await
+        .expect("acknowledge");
+    assert!(
+        store
+            .pending_message_events(workspace_id, second, 10)
+            .await
+            .expect("pending")
+            .is_empty(),
+        "[{name}] a settled delivery stops being pending"
+    );
+}
+
+pub async fn a_message_cannot_reference_a_thread_or_reply_outside_its_workspace(
+    store: &dyn WorkspaceStore,
+    name: &str,
+) {
+    let (workspace_id, author, _second, _third) = workspace_with_members(store).await;
+    let (other_workspace, other_author, _, _) = workspace_with_members(store).await;
+
+    // A thread that belongs to a different workspace must not be usable as
+    // a parent here, or a message grafts itself onto a conversation it is
+    // not part of.
+    let foreign_thread = Uuid::new_v4();
+    store
+        .create_thread(Thread {
+            id: foreign_thread,
+            workspace_id: other_workspace,
+            title: "elsewhere".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .expect("create thread");
+
+    let mut event = message_event(
+        workspace_id,
+        author,
+        "grafted",
+        Audience::Workspace,
+        "reference-1",
+    );
+    if let WorkspaceEventKind::Message { message, .. } = &mut event.kind {
+        message.thread_id = Some(foreign_thread);
+    }
+    assert!(
+        store.append(event).await.is_err(),
+        "[{name}] a thread from another workspace must be refused"
+    );
+
+    // Same for a reply target: the message being replied to has to exist
+    // in this workspace.
+    let elsewhere = store
+        .append(message_event(
+            other_workspace,
+            other_author,
+            "over here",
+            Audience::Workspace,
+            "reference-2",
+        ))
+        .await
+        .expect("append elsewhere");
+    let WorkspaceEventKind::Message {
+        message: foreign, ..
+    } = &elsewhere.kind
+    else {
+        panic!("[{name}] message expected");
+    };
+    let mut event = message_event(
+        workspace_id,
+        author,
+        "replying across a boundary",
+        Audience::Workspace,
+        "reference-3",
+    );
+    if let WorkspaceEventKind::Message { message, .. } = &mut event.kind {
+        message.reply_to_message_id = Some(foreign.id);
+    }
+    assert!(
+        store.append(event).await.is_err(),
+        "[{name}] a reply target from another workspace must be refused"
+    );
+
+    // A thread in this workspace is accepted, so the check is not simply
+    // rejecting every reference.
+    let local_thread = Uuid::new_v4();
+    store
+        .create_thread(Thread {
+            id: local_thread,
+            workspace_id,
+            title: "here".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .expect("create thread");
+    let mut event = message_event(
+        workspace_id,
+        author,
+        "properly threaded",
+        Audience::Workspace,
+        "reference-4",
+    );
+    if let WorkspaceEventKind::Message { message, .. } = &mut event.kind {
+        message.thread_id = Some(local_thread);
+    }
+    store.append(event).await.expect("local thread is valid");
+}
+
+pub async fn a_relay_message_lands_locally_without_local_reference_checks(
+    store: &dyn WorkspaceStore,
+    name: &str,
+) {
+    let recipient = Uuid::new_v4();
+    let remote_author = Uuid::new_v4();
+    store
+        .create_participant(participant(recipient, "local"))
+        .await
+        .expect("create recipient");
+    let workspace_id = Uuid::new_v4();
+
+    let message = WorkspaceMessage {
+        id: Uuid::new_v4(),
+        workspace_id,
+        // Cloud identities: neither exists locally, and that must not stop
+        // the message from being delivered.
+        thread_id: Some(Uuid::new_v4()),
+        reply_to_message_id: Some(Uuid::new_v4()),
+        author_id: remote_author,
+        body: WorkspaceMessageBody {
+            text: "from another installation".to_string(),
+            mentions: Vec::new(),
+            attachments: Vec::new(),
+        },
+        audience: Audience::Direct {
+            participant: recipient,
+        },
+        created_at: Utc::now(),
+    };
+    let event = store
+        .import_relay_message(
+            message.clone(),
+            "Remote Agent",
+            recipient,
+            DeliveryMode::Notify,
+        )
+        .await
+        .expect("import relay message");
+    assert_eq!(event.author_id, remote_author, "[{name}]");
+    assert!(
+        store.contains_message(event.id).await.expect("contains"),
+        "[{name}] an imported relay message is durable locally"
+    );
+
+    // Re-importing the same message is a replay, not a second delivery.
+    let repeated = store
+        .import_relay_message(
+            message.clone(),
+            "Remote Agent",
+            recipient,
+            DeliveryMode::Notify,
+        )
+        .await
+        .expect("re-import");
+    assert_eq!(repeated.sequence, event.sequence, "[{name}]");
+
+    // The guards still hold: a message whose audience disagrees with the
+    // recipient it was delivered for is refused.
+    let mut mismatched = message.clone();
+    mismatched.id = Uuid::new_v4();
+    mismatched.audience = Audience::Direct {
+        participant: Uuid::new_v4(),
+    };
+    assert!(
+        store
+            .import_relay_message(mismatched, "Remote Agent", recipient, DeliveryMode::Notify)
+            .await
+            .is_err(),
+        "[{name}] relay recipient mismatch must be refused"
+    );
+    let mut self_addressed = message;
+    self_addressed.id = Uuid::new_v4();
+    self_addressed.author_id = recipient;
+    assert!(
+        store
+            .import_relay_message(
+                self_addressed,
+                "Remote Agent",
+                recipient,
+                DeliveryMode::Notify
+            )
+            .await
+            .is_err(),
+        "[{name}] a relay sender cannot be its own recipient"
+    );
+}
+
+pub async fn a_relay_roster_entry_projects_only_onto_a_local_workspace(
+    store: &dyn WorkspaceStore,
+    name: &str,
+) {
+    let (workspace_id, author, _second, _third) = workspace_with_members(store).await;
+
+    // Projecting onto a workspace this machine has never materialised
+    // would be inventing membership rather than caching it.
+    assert!(
+        store
+            .upsert_relay_roster_entry(
+                Uuid::new_v4(),
+                participant(Uuid::new_v4(), "cloud"),
                 WorkspaceRole::Viewer,
             )
             .await
-            .expect("project roster");
-        let roster = store
-            .workspace_roster(workspace_id, author)
-            .await
-            .expect("roster");
-        let entry = roster
+            .is_err(),
+        "[{name}]"
+    );
+
+    let cloud = Uuid::new_v4();
+    store
+        .upsert_relay_roster_entry(
+            workspace_id,
+            participant(cloud, "Cloud"),
+            WorkspaceRole::Viewer,
+        )
+        .await
+        .expect("project roster");
+    let roster = store
+        .workspace_roster(workspace_id, author)
+        .await
+        .expect("roster");
+    let entry = roster
+        .iter()
+        .find(|entry| entry.participant.id == cloud)
+        .expect("projected participant is a member");
+    assert_eq!(entry.role, WorkspaceRole::Viewer, "[{name}]");
+
+    // Re-projecting updates the cached role rather than duplicating it.
+    store
+        .upsert_relay_roster_entry(
+            workspace_id,
+            participant(cloud, "Cloud"),
+            WorkspaceRole::Editor,
+        )
+        .await
+        .expect("re-project");
+    let roster = store
+        .workspace_roster(workspace_id, author)
+        .await
+        .expect("roster");
+    assert_eq!(roster.len(), 4, "[{name}] re-projection must not duplicate");
+    assert_eq!(
+        roster
             .iter()
             .find(|entry| entry.participant.id == cloud)
-            .expect("projected participant is a member");
-        assert_eq!(entry.role, WorkspaceRole::Viewer, "[{name}]");
-
-        // Re-projecting updates the cached role rather than duplicating it.
-        store
-            .upsert_relay_roster_entry(
-                workspace_id,
-                participant(cloud, "Cloud"),
-                WorkspaceRole::Editor,
-            )
-            .await
-            .expect("re-project");
-        let roster = store
-            .workspace_roster(workspace_id, author)
-            .await
-            .expect("roster");
-        assert_eq!(roster.len(), 4, "[{name}] re-projection must not duplicate");
-        assert_eq!(
-            roster
-                .iter()
-                .find(|entry| entry.participant.id == cloud)
-                .expect("member")
-                .role,
-            WorkspaceRole::Editor,
-            "[{name}]"
-        );
-        harness.discard().await;
-    }
+            .expect("member")
+            .role,
+        WorkspaceRole::Editor,
+        "[{name}]"
+    );
 }
 
 /// A local instance is discoverable, tombstoned on exit, and revived on relaunch.
@@ -1050,107 +1017,103 @@ async fn a_relay_roster_entry_projects_only_onto_a_local_workspace() {
 /// subtle part: exiting must not DELETE the row, because the instance's
 /// identity and last-known location stay useful to anyone holding a reference
 /// to it -- it must stop being advertised while remaining retrievable.
-#[tokio::test]
-async fn instance_discovery_tombstones_and_revives_identically() {
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let name = harness.name;
-        let participant_id = Uuid::new_v4();
-        store
-            .create_participant(participant(participant_id, "worker"))
-            .await
-            .expect("participant");
+pub async fn instance_discovery_tombstones_and_revives_identically(
+    store: &dyn WorkspaceStore,
+    name: &str,
+) {
+    let participant_id = Uuid::new_v4();
+    store
+        .create_participant(participant(participant_id, "worker"))
+        .await
+        .expect("participant");
 
-        let cwd = std::path::Path::new("/tmp/borg-conformance-checkout");
-        store
-            .register_local_instance(participant_id, None, cwd, 4242)
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] register: {error:#}"));
+    let cwd = std::path::Path::new("/tmp/borg-conformance-checkout");
+    store
+        .register_local_instance(participant_id, None, cwd, 4242)
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] register: {error:#}"));
 
-        let live = store
-            .list_instances(false)
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] list: {error:#}"));
-        let found = live
+    let live = store
+        .list_instances(false)
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] list: {error:#}"));
+    let found = live
+        .iter()
+        .find(|instance| instance.participant.id == participant_id)
+        .unwrap_or_else(|| panic!("[{name}] a registered instance is discoverable"));
+    assert_eq!(
+        found.cwd.as_deref(),
+        Some("/tmp/borg-conformance-checkout"),
+        "[{name}] the launch directory distinguishes checkouts"
+    );
+    assert_eq!(found.pid, Some(4242), "[{name}]");
+    assert!(
+        found.seen_at.is_some(),
+        "[{name}] a local registration records when it was seen"
+    );
+
+    let reaped = store
+        .mark_local_instances_exited(&[participant_id])
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] reap: {error:#}"));
+    assert_eq!(reaped, 1, "[{name}] exactly the named instance is reaped");
+
+    let advertised = store
+        .list_instances(false)
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] list after reap: {error:#}"));
+    assert!(
+        !advertised
             .iter()
-            .find(|instance| instance.participant.id == participant_id)
-            .unwrap_or_else(|| panic!("[{name}] a registered instance is discoverable"));
-        assert_eq!(
-            found.cwd.as_deref(),
-            Some("/tmp/borg-conformance-checkout"),
-            "[{name}] the launch directory distinguishes checkouts"
-        );
-        assert_eq!(found.pid, Some(4242), "[{name}]");
-        assert!(
-            found.seen_at.is_some(),
-            "[{name}] a local registration records when it was seen"
-        );
+            .any(|instance| instance.participant.id == participant_id),
+        "[{name}] an exited instance is no longer advertised"
+    );
 
-        let reaped = store
-            .mark_local_instances_exited(&[participant_id])
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] reap: {error:#}"));
-        assert_eq!(reaped, 1, "[{name}] exactly the named instance is reaped");
+    let including_exited = store
+        .list_instances(true)
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] list incl. exited: {error:#}"));
+    assert!(
+        including_exited
+            .iter()
+            .any(|instance| instance.participant.id == participant_id),
+        "[{name}] an exited instance is retained, not deleted"
+    );
 
-        let advertised = store
-            .list_instances(false)
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] list after reap: {error:#}"));
-        assert!(
-            !advertised
-                .iter()
-                .any(|instance| instance.participant.id == participant_id),
-            "[{name}] an exited instance is no longer advertised"
-        );
+    // Relaunching the same participant clears the tombstone rather than
+    // creating a second row.
+    store
+        .register_local_instance(participant_id, None, cwd, 5353)
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] re-register: {error:#}"));
+    let revived: Vec<_> = store
+        .list_instances(false)
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] list after revive: {error:#}"))
+        .into_iter()
+        .filter(|instance| instance.participant.id == participant_id)
+        .collect();
+    assert_eq!(
+        revived.len(),
+        1,
+        "[{name}] relaunch revives the existing instance instead of duplicating it"
+    );
+    assert_eq!(
+        revived[0].pid,
+        Some(5353),
+        "[{name}] the revived instance carries the new process"
+    );
 
-        let including_exited = store
-            .list_instances(true)
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] list incl. exited: {error:#}"));
-        assert!(
-            including_exited
-                .iter()
-                .any(|instance| instance.participant.id == participant_id),
-            "[{name}] an exited instance is retained, not deleted"
-        );
-
-        // Relaunching the same participant clears the tombstone rather than
-        // creating a second row.
-        store
-            .register_local_instance(participant_id, None, cwd, 5353)
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] re-register: {error:#}"));
-        let revived: Vec<_> = store
-            .list_instances(false)
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] list after revive: {error:#}"))
-            .into_iter()
-            .filter(|instance| instance.participant.id == participant_id)
-            .collect();
-        assert_eq!(
-            revived.len(),
-            1,
-            "[{name}] relaunch revives the existing instance instead of duplicating it"
-        );
-        assert_eq!(
-            revived[0].pid,
-            Some(5353),
-            "[{name}] the revived instance carries the new process"
-        );
-
-        // Reaping something already gone is a no-op, not an error: the reaper
-        // races with ordinary exits and must be safe to run repeatedly.
-        let again = store
-            .mark_local_instances_exited(&[Uuid::new_v4()])
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] reap unknown: {error:#}"));
-        assert_eq!(
-            again, 0,
-            "[{name}] reaping an unknown instance changes nothing"
-        );
-
-        harness.discard().await;
-    }
+    // Reaping something already gone is a no-op, not an error: the reaper
+    // races with ordinary exits and must be safe to run repeatedly.
+    let again = store
+        .mark_local_instances_exited(&[Uuid::new_v4()])
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] reap unknown: {error:#}"));
+    assert_eq!(
+        again, 0,
+        "[{name}] reaping an unknown instance changes nothing"
+    );
 }
 
 /// Postgres is the only backend, so an unset or broken `BORG_TEST_SESSIONS_URL`
@@ -1162,202 +1125,198 @@ async fn instance_discovery_tombstones_and_revives_identically() {
 /// and no liveness, and nothing here can retire it: the reap sweep observes
 /// local rows only, so a stopped peer stays in the default listing for ever and
 /// buries the instances that are actually running.
-#[tokio::test]
-async fn a_directory_sync_identifies_instances_and_retires_stopped_ones() {
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let name = harness.name;
-        let participant_id = Uuid::new_v4();
-        let remote_host = Uuid::new_v4();
+pub async fn a_directory_sync_identifies_instances_and_retires_stopped_ones(
+    store: &dyn WorkspaceStore,
+    name: &str,
+) {
+    let participant_id = Uuid::new_v4();
+    let remote_host = Uuid::new_v4();
+    store
+        .create_participant(participant(participant_id, "remote peer"))
+        .await
+        .expect("participant");
+
+    let sync = move |status: &'static str, cwd: &'static str| async move {
         store
-            .create_participant(participant(participant_id, "remote peer"))
+            .upsert_directory_instances(&[DirectoryInstance {
+                participant: participant(participant_id, "remote peer"),
+                host_id: Some(remote_host),
+                workspace_id: None,
+                cwd: Some(str::to_string(cwd)),
+                status: Some(str::to_string(status)),
+            }])
             .await
-            .expect("participant");
+    };
 
-        let sync = move |status: &'static str, cwd: &'static str| async move {
-            store
-                .upsert_directory_instances(&[DirectoryInstance {
-                    participant: participant(participant_id, "remote peer"),
-                    host_id: Some(remote_host),
-                    workspace_id: None,
-                    cwd: Some(str::to_string(cwd)),
-                    status: Some(str::to_string(status)),
-                }])
-                .await
-        };
+    sync("running", "/home/remote/checkout")
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] directory sync: {error:#}"));
 
-        sync("running", "/home/remote/checkout")
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] directory sync: {error:#}"));
+    let listed = store
+        .list_instances(false)
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] list: {error:#}"));
+    let found = listed
+        .iter()
+        .find(|instance| instance.participant.id == participant_id)
+        .unwrap_or_else(|| panic!("[{name}] a running directory peer is discoverable"));
+    assert_eq!(
+        found.cwd.as_deref(),
+        Some("/home/remote/checkout"),
+        "[{name}] the owning host working directory identifies the peer"
+    );
+    assert_eq!(
+        found.status.as_deref(),
+        Some("running"),
+        "[{name}] the owning host lifecycle state is carried through"
+    );
 
-        let listed = store
-            .list_instances(false)
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] list: {error:#}"));
-        let found = listed
+    // Stopped is the state that retires a peer: nothing on this
+    // installation can reach it, and no local sweep will ever see it.
+    sync("stopped", "/home/remote/checkout")
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] stopped sync: {error:#}"));
+    let advertised = store
+        .list_instances(false)
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] list: {error:#}"));
+    assert!(
+        !advertised
             .iter()
-            .find(|instance| instance.participant.id == participant_id)
-            .unwrap_or_else(|| panic!("[{name}] a running directory peer is discoverable"));
-        assert_eq!(
-            found.cwd.as_deref(),
-            Some("/home/remote/checkout"),
-            "[{name}] the owning host working directory identifies the peer"
-        );
-        assert_eq!(
-            found.status.as_deref(),
-            Some("running"),
-            "[{name}] the owning host lifecycle state is carried through"
-        );
+            .any(|instance| instance.participant.id == participant_id),
+        "[{name}] a stopped peer leaves the default listing"
+    );
+    let history = store
+        .list_instances(true)
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] list incl. exited: {error:#}"));
+    assert!(
+        history
+            .iter()
+            .any(|instance| instance.participant.id == participant_id
+                && instance.status.as_deref() == Some("stopped")),
+        "[{name}] the stopped peer is still readable as history"
+    );
 
-        // Stopped is the state that retires a peer: nothing on this
-        // installation can reach it, and no local sweep will ever see it.
-        sync("stopped", "/home/remote/checkout")
+    // The shape that started this: one running peer on another host, buried
+    // under a long history of stopped ones. Dead rows must not occupy the
+    // default view in numbers that swamp it.
+    for index in 0..40 {
+        store
+            .upsert_directory_instances(&[DirectoryInstance {
+                participant: participant(Uuid::new_v4(), &format!("stopped peer {index}")),
+                host_id: Some(remote_host),
+                workspace_id: None,
+                cwd: Some(str::to_string("/home/remote/checkout")),
+                status: Some(str::to_string("stopped")),
+            }])
             .await
-            .unwrap_or_else(|error| panic!("[{name}] stopped sync: {error:#}"));
-        let advertised = store
-            .list_instances(false)
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] list: {error:#}"));
-        assert!(
-            !advertised
-                .iter()
-                .any(|instance| instance.participant.id == participant_id),
-            "[{name}] a stopped peer leaves the default listing"
-        );
-        let history = store
-            .list_instances(true)
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] list incl. exited: {error:#}"));
-        assert!(
-            history
-                .iter()
-                .any(|instance| instance.participant.id == participant_id
-                    && instance.status.as_deref() == Some("stopped")),
-            "[{name}] the stopped peer is still readable as history"
-        );
-
-        // The shape that started this: one running peer on another host, buried
-        // under a long history of stopped ones. Dead rows must not occupy the
-        // default view in numbers that swamp it.
-        for index in 0..40 {
-            store
-                .upsert_directory_instances(&[DirectoryInstance {
-                    participant: participant(Uuid::new_v4(), &format!("stopped peer {index}")),
-                    host_id: Some(remote_host),
-                    workspace_id: None,
-                    cwd: Some(str::to_string("/home/remote/checkout")),
-                    status: Some(str::to_string("stopped")),
-                }])
-                .await
-                .unwrap_or_else(|error| panic!("[{name}] stopped peer: {error:#}"));
-        }
-
-        // A peer that starts again is advertised again.
-        sync("ready", "/home/remote/checkout")
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] revive sync: {error:#}"));
-        let revived = store
-            .list_instances(false)
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] list: {error:#}"));
-        assert!(
-            revived
-                .iter()
-                .any(|instance| instance.participant.id == participant_id),
-            "[{name}] a peer that is ready again is discoverable again"
-        );
-        assert_eq!(
-            revived
-                .iter()
-                .filter(|instance| instance.status.as_deref() == Some("stopped"))
-                .count(),
-            0,
-            "[{name}] forty stopped peers must not swamp the one that is running"
-        );
-        assert_eq!(
-            revived
-                .iter()
-                .filter(|instance| instance.host_id == Some(remote_host))
-                .count(),
-            1,
-            "[{name}] exactly the running peer on that host is advertised"
-        );
-        let history = store
-            .list_instances(true)
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] list incl. exited: {error:#}"));
-        assert_eq!(
-            history
-                .iter()
-                .filter(|instance| instance.host_id == Some(remote_host))
-                .count(),
-            41,
-            "[{name}] the stopped peers remain readable as history"
-        );
+            .unwrap_or_else(|error| panic!("[{name}] stopped peer: {error:#}"));
     }
+
+    // A peer that starts again is advertised again.
+    sync("ready", "/home/remote/checkout")
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] revive sync: {error:#}"));
+    let revived = store
+        .list_instances(false)
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] list: {error:#}"));
+    assert!(
+        revived
+            .iter()
+            .any(|instance| instance.participant.id == participant_id),
+        "[{name}] a peer that is ready again is discoverable again"
+    );
+    assert_eq!(
+        revived
+            .iter()
+            .filter(|instance| instance.status.as_deref() == Some("stopped"))
+            .count(),
+        0,
+        "[{name}] forty stopped peers must not swamp the one that is running"
+    );
+    assert_eq!(
+        revived
+            .iter()
+            .filter(|instance| instance.host_id == Some(remote_host))
+            .count(),
+        1,
+        "[{name}] exactly the running peer on that host is advertised"
+    );
+    let history = store
+        .list_instances(true)
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] list incl. exited: {error:#}"));
+    assert_eq!(
+        history
+            .iter()
+            .filter(|instance| instance.host_id == Some(remote_host))
+            .count(),
+        41,
+        "[{name}] the stopped peers remain readable as history"
+    );
 }
 
 /// A directory entry is a thin mirror of another host registry, and it usually
 /// omits the workspace. Letting that empty field overwrite what local
 /// registration knows is how a peer loses the one identity that makes it
 /// recognisable in a listing.
-#[tokio::test]
-async fn a_directory_entry_never_erases_a_locally_known_identity() {
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let name = harness.name;
-        let participant_id = Uuid::new_v4();
-        let workspace_id = Uuid::new_v4();
-        store
-            .create_participant(participant(participant_id, "local peer"))
-            .await
-            .expect("participant");
-        store
-            .register_local_instance(
-                participant_id,
-                Some(workspace_id),
-                std::path::Path::new("/home/local/checkout"),
-                4242,
-            )
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] register: {error:#}"));
-
-        store
-            .upsert_directory_instances(&[DirectoryInstance {
-                participant: participant(participant_id, "local peer"),
-                host_id: Some(Uuid::new_v4()),
-                workspace_id: None,
-                cwd: None,
-                status: Some(str::to_string("running")),
-            }])
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] directory sync: {error:#}"));
-
-        let listed = store
-            .list_instances(false)
-            .await
-            .unwrap_or_else(|error| panic!("[{name}] list: {error:#}"));
-        let found = listed
-            .iter()
-            .find(|instance| instance.participant.id == participant_id)
-            .unwrap_or_else(|| panic!("[{name}] the instance is still discoverable"));
-        assert_eq!(
-            found.workspace_id,
+pub async fn a_directory_entry_never_erases_a_locally_known_identity(
+    store: &dyn WorkspaceStore,
+    name: &str,
+) {
+    let participant_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    store
+        .create_participant(participant(participant_id, "local peer"))
+        .await
+        .expect("participant");
+    store
+        .register_local_instance(
+            participant_id,
             Some(workspace_id),
-            "[{name}] an omitted workspace in the mirror does not erase the local one"
-        );
-        assert_eq!(
-            found.cwd.as_deref(),
-            Some("/home/local/checkout"),
-            "[{name}] the locally recorded launch directory survives the mirror"
-        );
-        assert_eq!(found.pid, Some(4242), "[{name}]");
-        assert_eq!(
-            found.status.as_deref(),
-            Some("running"),
-            "[{name}] the mirror still supplies the lifecycle state it is the only source of"
-        );
-    }
+            std::path::Path::new("/home/local/checkout"),
+            4242,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] register: {error:#}"));
+
+    store
+        .upsert_directory_instances(&[DirectoryInstance {
+            participant: participant(participant_id, "local peer"),
+            host_id: Some(Uuid::new_v4()),
+            workspace_id: None,
+            cwd: None,
+            status: Some(str::to_string("running")),
+        }])
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] directory sync: {error:#}"));
+
+    let listed = store
+        .list_instances(false)
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] list: {error:#}"));
+    let found = listed
+        .iter()
+        .find(|instance| instance.participant.id == participant_id)
+        .unwrap_or_else(|| panic!("[{name}] the instance is still discoverable"));
+    assert_eq!(
+        found.workspace_id,
+        Some(workspace_id),
+        "[{name}] an omitted workspace in the mirror does not erase the local one"
+    );
+    assert_eq!(
+        found.cwd.as_deref(),
+        Some("/home/local/checkout"),
+        "[{name}] the locally recorded launch directory survives the mirror"
+    );
+    assert_eq!(found.pid, Some(4242), "[{name}]");
+    assert_eq!(
+        found.status.as_deref(),
+        Some("running"),
+        "[{name}] the mirror still supplies the lifecycle state it is the only source of"
+    );
 }
 
 #[tokio::test]
@@ -1376,464 +1335,452 @@ async fn postgres_coverage_follows_its_configuration() {
 }
 
 // Claim CAS must hold across concurrent transactions, not just sequential callers.
-#[tokio::test]
-async fn concurrent_work_claims_have_exactly_one_winner() {
+pub async fn concurrent_work_claims_have_exactly_one_winner(
+    store: &dyn WorkspaceStore,
+    _name: &str,
+) {
     use crate::workspace::{AtomicWorkClaim, SharedWork};
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let (workspace_id, author, second, third) = workspace_with_members(store).await;
-        let work_id = Uuid::new_v4();
-        let event = |author_id, kind| WorkspaceEvent {
-            id: Uuid::new_v4(),
-            workspace_id,
-            sequence: 0,
-            author_id,
-            idempotency_key: Uuid::new_v4().to_string(),
-            created_at: Utc::now(),
-            kind,
-        };
-        store
-            .append(event(
-                author,
-                WorkspaceEventKind::WorkCreated {
-                    work: SharedWork {
-                        id: work_id,
-                        title: "exclusive assignment".into(),
-                        detail: None,
-                        ..SharedWork::default()
-                    },
-                    mode: DeliveryMode::Notify,
-                },
-            ))
-            .await
-            .unwrap();
-        let mut expected_claim_id = None;
-        for _ in 0..8 {
-            let claim = |claimant_id| {
-                event(
-                    claimant_id,
-                    WorkspaceEventKind::WorkClaimed {
-                        claim: AtomicWorkClaim {
-                            work_id,
-                            claimant_id,
-                            expected_claim_id,
-                        },
-                        mode: DeliveryMode::Notify,
-                    },
-                )
-            };
-            let (a, b, c) = tokio::join!(
-                store.append(claim(author)),
-                store.append(claim(second)),
-                store.append(claim(third)),
-            );
-            let results = [a, b, c];
-            assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
-            for result in results {
-                match result {
-                    Ok(winner) => expected_claim_id = Some(winner.id),
-                    Err(error) => assert!(
-                        error.to_string().contains("atomic claim conflict"),
-                        "{error:#}"
-                    ),
-                }
-            }
-        }
-        let replay = store.replay(workspace_id, author, 0, 50).await.unwrap();
-        assert_eq!(replay.len(), 9, "losing claims must not be journaled");
-        harness.discard().await;
-    }
-}
-
-// A stale whole-plan write must not discard a director's intervening assignment;
-// omission at a current revision moves work to backlog without deleting history.
-#[tokio::test]
-async fn work_plan_is_a_revision_checked_assignment_projection() {
-    use crate::workspace::{WorkPlanUpdate, WorkStatus};
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let (workspace, actor, director, _) = workspace_with_members(store).await;
-        let updates = vec![WorkPlanUpdate {
-            id: None,
-            content: "kept work".into(),
-            status: WorkStatus::Completed,
-        }];
-        let first = store
-            .update_work_plan(
-                workspace,
-                actor,
-                actor,
-                "plan-create".into(),
-                0,
-                updates.clone(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.items.len(), 1);
-        assert_eq!(
-            store
-                .update_work_plan(workspace, actor, actor, "plan-create".into(), 0, updates)
-                .await
-                .unwrap(),
-            first
-        );
-        store
-            .append(message_event(
-                workspace,
-                actor,
-                "not a work mutation",
-                Audience::Workspace,
-                "chat",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .work_items(workspace, actor, Some(actor))
-                .await
-                .unwrap()
-                .revision,
-            first.revision
-        );
-        let other = store
-            .update_work_plan(
-                workspace,
-                director,
-                director,
-                "director-plan".into(),
-                0,
-                vec![WorkPlanUpdate {
-                    id: None,
-                    content: "new assignment".into(),
-                    status: WorkStatus::InProgress,
-                }],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .work_items(workspace, actor, Some(actor))
-                .await
-                .unwrap()
-                .revision,
-            first.revision,
-            "another agent plan does not invalidate this plan"
-        );
-        let task = &other.items[0];
-        store
-            .assign_work(
-                workspace,
-                director,
-                task.work.id,
-                Some(actor),
-                task.assignment_id,
-                "assign".into(),
-            )
-            .await
-            .unwrap();
-        let empty_director = store
-            .work_items(workspace, director, Some(director))
-            .await
-            .unwrap();
-        assert!(empty_director.items.is_empty());
-        assert!(
-            empty_director.revision > other.revision,
-            "reassignment advances the now-empty old owner plan"
-        );
-        assert!(
-            store
-                .update_work_plan(
-                    workspace,
-                    actor,
-                    actor,
-                    "stale".into(),
-                    first.revision,
-                    vec![]
-                )
-                .await
-                .is_err()
-        );
-        let current = store
-            .work_items(workspace, actor, Some(actor))
-            .await
-            .unwrap();
-        assert_eq!(current.items.len(), 2);
-        let cleared = store
-            .update_work_plan(
-                workspace,
-                actor,
-                actor,
-                "clear".into(),
-                current.revision,
-                vec![],
-            )
-            .await
-            .unwrap();
-        assert!(cleared.items.is_empty());
-        assert!(
-            cleared.revision > current.revision,
-            "empty plan retains unassignment revision"
-        );
-        let all = store.work_items(workspace, actor, None).await.unwrap();
-        assert_eq!(all.items.len(), 2);
-        assert!(all.items.iter().all(|item| item.work.assignee_id.is_none()));
-        assert_eq!(
-            all.items
-                .iter()
-                .find(|item| item.work.id == first.items[0].work.id)
-                .unwrap()
-                .work
-                .status,
-            WorkStatus::Completed
-        );
-        assert_eq!(
-            all.items
-                .iter()
-                .find(|item| item.work.id == task.work.id)
-                .unwrap()
-                .work
-                .status,
-            WorkStatus::Pending
-        );
-        harness.discard().await;
-    }
-}
-
-// Import is once-only even for an empty plan, and a restart cannot resurrect
-// legacy content after authoritative work has been reassigned or removed.
-#[tokio::test]
-async fn legacy_plans_migrate_once_and_preserve_work_identity() {
-    use crate::workspace::WorkStatus;
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let (workspace, actor, director, viewer) = workspace_with_members(store).await;
-        let source = Uuid::new_v4();
-        let id = Uuid::new_v4();
-        let legacy = vec![crate::PlanItem {
-            id,
-            content: "old plan".into(),
-            status: WorkStatus::Blocked,
-        }];
-        let first = store
-            .ensure_legacy_plan_migrated(workspace, director, actor, source, legacy.clone())
-            .await
-            .unwrap();
-        assert_eq!(first.items[0].work.id, id);
-        store
-            .upsert_relay_roster_entry(
-                workspace,
-                store.participant(viewer).await.unwrap().unwrap(),
-                WorkspaceRole::Viewer,
-            )
-            .await
-            .unwrap();
-        assert!(
-            store
-                .legacy_plan_migrated(workspace, viewer, source)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !store
-                .legacy_plan_migrated(workspace, viewer, Uuid::new_v4())
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            store
-                .work_items(workspace, viewer, Some(actor))
-                .await
-                .unwrap(),
-            first
-        );
-        assert!(
-            store
-                .legacy_plan_migrated(workspace, Uuid::new_v4(), source)
-                .await
-                .is_err()
-        );
-
-        store
-            .update_work_plan(
-                workspace,
-                actor,
-                actor,
-                "clear-import".into(),
-                first.revision,
-                vec![],
-            )
-            .await
-            .unwrap();
-        assert!(
-            store
-                .ensure_legacy_plan_migrated(workspace, actor, actor, source, legacy.clone())
-                .await
-                .unwrap()
-                .items
-                .is_empty()
-        );
-        let empty_source = Uuid::new_v4();
-        store
-            .ensure_legacy_plan_migrated(workspace, actor, actor, empty_source, vec![])
-            .await
-            .unwrap();
-        assert!(
-            store
-                .ensure_legacy_plan_migrated(workspace, actor, actor, empty_source, legacy)
-                .await
-                .unwrap()
-                .items
-                .is_empty()
-        );
-        let all = store.work_items(workspace, actor, None).await.unwrap();
-        assert_eq!(all.items.len(), 1);
-        harness.discard().await;
-    }
-}
-
-#[tokio::test]
-async fn work_assignment_permissions_and_parent_cycles_are_enforced_by_store() {
-    use crate::workspace::{SharedWork, WorkPatch, WorkStatus};
-    for harness in harnesses().await {
-        let store = harness.store.as_ref();
-        let (workspace, director, contributor, viewer) = workspace_with_members(store).await;
-        for (participant_id, role) in [
-            (contributor, WorkspaceRole::Contributor),
-            (viewer, WorkspaceRole::Viewer),
-        ] {
-            store
-                .upsert_relay_roster_entry(
-                    workspace,
-                    participant(participant_id, "role test"),
-                    role,
-                )
-                .await
-                .unwrap();
-        }
-        let id = Uuid::new_v4();
-        let created = WorkspaceEvent {
-            id: Uuid::new_v4(),
-            workspace_id: workspace,
-            sequence: 0,
-            author_id: director,
-            idempotency_key: "backlog".into(),
-            created_at: Utc::now(),
-            kind: WorkspaceEventKind::WorkCreated {
+    let (workspace_id, author, second, third) = workspace_with_members(store).await;
+    let work_id = Uuid::new_v4();
+    let event = |author_id, kind| WorkspaceEvent {
+        id: Uuid::new_v4(),
+        workspace_id,
+        sequence: 0,
+        author_id,
+        idempotency_key: Uuid::new_v4().to_string(),
+        created_at: Utc::now(),
+        kind,
+    };
+    store
+        .append(event(
+            author,
+            WorkspaceEventKind::WorkCreated {
                 work: SharedWork {
-                    id,
-                    title: "backlog".into(),
+                    id: work_id,
+                    title: "exclusive assignment".into(),
+                    detail: None,
                     ..SharedWork::default()
                 },
                 mode: DeliveryMode::Notify,
             },
+        ))
+        .await
+        .unwrap();
+    let mut expected_claim_id = None;
+    for _ in 0..8 {
+        let claim = |claimant_id| {
+            event(
+                claimant_id,
+                WorkspaceEventKind::WorkClaimed {
+                    claim: AtomicWorkClaim {
+                        work_id,
+                        claimant_id,
+                        expected_claim_id,
+                    },
+                    mode: DeliveryMode::Notify,
+                },
+            )
         };
-        store.append(created).await.unwrap();
-        let backlog = store
-            .work_items(workspace, contributor, None)
+        let (a, b, c) = tokio::join!(
+            store.append(claim(author)),
+            store.append(claim(second)),
+            store.append(claim(third)),
+        );
+        let results = [a, b, c];
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        for result in results {
+            match result {
+                Ok(winner) => expected_claim_id = Some(winner.id),
+                Err(error) => assert!(
+                    error.to_string().contains("atomic claim conflict"),
+                    "{error:#}"
+                ),
+            }
+        }
+    }
+    let replay = store.replay(workspace_id, author, 0, 50).await.unwrap();
+    assert_eq!(replay.len(), 9, "losing claims must not be journaled");
+}
+
+// A stale whole-plan write must not discard a director's intervening assignment;
+// omission at a current revision moves work to backlog without deleting history.
+pub async fn work_plan_is_a_revision_checked_assignment_projection(
+    store: &dyn WorkspaceStore,
+    _name: &str,
+) {
+    use crate::workspace::{WorkPlanUpdate, WorkStatus};
+    let (workspace, actor, director, _) = workspace_with_members(store).await;
+    let updates = vec![WorkPlanUpdate {
+        id: None,
+        content: "kept work".into(),
+        status: WorkStatus::Completed,
+    }];
+    let first = store
+        .update_work_plan(
+            workspace,
+            actor,
+            actor,
+            "plan-create".into(),
+            0,
+            updates.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(
+        store
+            .update_work_plan(workspace, actor, actor, "plan-create".into(), 0, updates)
+            .await
+            .unwrap(),
+        first
+    );
+    store
+        .append(message_event(
+            workspace,
+            actor,
+            "not a work mutation",
+            Audience::Workspace,
+            "chat",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .work_items(workspace, actor, Some(actor))
+            .await
+            .unwrap()
+            .revision,
+        first.revision
+    );
+    let other = store
+        .update_work_plan(
+            workspace,
+            director,
+            director,
+            "director-plan".into(),
+            0,
+            vec![WorkPlanUpdate {
+                id: None,
+                content: "new assignment".into(),
+                status: WorkStatus::InProgress,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .work_items(workspace, actor, Some(actor))
+            .await
+            .unwrap()
+            .revision,
+        first.revision,
+        "another agent plan does not invalidate this plan"
+    );
+    let task = &other.items[0];
+    store
+        .assign_work(
+            workspace,
+            director,
+            task.work.id,
+            Some(actor),
+            task.assignment_id,
+            "assign".into(),
+        )
+        .await
+        .unwrap();
+    let empty_director = store
+        .work_items(workspace, director, Some(director))
+        .await
+        .unwrap();
+    assert!(empty_director.items.is_empty());
+    assert!(
+        empty_director.revision > other.revision,
+        "reassignment advances the now-empty old owner plan"
+    );
+    assert!(
+        store
+            .update_work_plan(
+                workspace,
+                actor,
+                actor,
+                "stale".into(),
+                first.revision,
+                vec![]
+            )
+            .await
+            .is_err()
+    );
+    let current = store
+        .work_items(workspace, actor, Some(actor))
+        .await
+        .unwrap();
+    assert_eq!(current.items.len(), 2);
+    let cleared = store
+        .update_work_plan(
+            workspace,
+            actor,
+            actor,
+            "clear".into(),
+            current.revision,
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert!(cleared.items.is_empty());
+    assert!(
+        cleared.revision > current.revision,
+        "empty plan retains unassignment revision"
+    );
+    let all = store.work_items(workspace, actor, None).await.unwrap();
+    assert_eq!(all.items.len(), 2);
+    assert!(all.items.iter().all(|item| item.work.assignee_id.is_none()));
+    assert_eq!(
+        all.items
+            .iter()
+            .find(|item| item.work.id == first.items[0].work.id)
+            .unwrap()
+            .work
+            .status,
+        WorkStatus::Completed
+    );
+    assert_eq!(
+        all.items
+            .iter()
+            .find(|item| item.work.id == task.work.id)
+            .unwrap()
+            .work
+            .status,
+        WorkStatus::Pending
+    );
+}
+
+// Import is once-only even for an empty plan, and a restart cannot resurrect
+// legacy content after authoritative work has been reassigned or removed.
+pub async fn legacy_plans_migrate_once_and_preserve_work_identity(
+    store: &dyn WorkspaceStore,
+    _name: &str,
+) {
+    use crate::workspace::WorkStatus;
+    let (workspace, actor, director, viewer) = workspace_with_members(store).await;
+    let source = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    let legacy = vec![crate::PlanItem {
+        id,
+        content: "old plan".into(),
+        status: WorkStatus::Blocked,
+    }];
+    let first = store
+        .ensure_legacy_plan_migrated(workspace, director, actor, source, legacy.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.items[0].work.id, id);
+    store
+        .upsert_relay_roster_entry(
+            workspace,
+            store.participant(viewer).await.unwrap().unwrap(),
+            WorkspaceRole::Viewer,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .legacy_plan_migrated(workspace, viewer, source)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .legacy_plan_migrated(workspace, viewer, Uuid::new_v4())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .work_items(workspace, viewer, Some(actor))
+            .await
+            .unwrap(),
+        first
+    );
+    assert!(
+        store
+            .legacy_plan_migrated(workspace, Uuid::new_v4(), source)
+            .await
+            .is_err()
+    );
+
+    store
+        .update_work_plan(
+            workspace,
+            actor,
+            actor,
+            "clear-import".into(),
+            first.revision,
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .ensure_legacy_plan_migrated(workspace, actor, actor, source, legacy.clone())
             .await
             .unwrap()
             .items
-            .remove(0);
-        assert!(backlog.work.assignee_id.is_none());
-        assert!(
-            store
-                .assign_work(
-                    workspace,
-                    viewer,
-                    id,
-                    Some(viewer),
-                    None,
-                    "viewer-claim".into()
-                )
-                .await
-                .is_err()
-        );
-        let claimed = store
+            .is_empty()
+    );
+    let empty_source = Uuid::new_v4();
+    store
+        .ensure_legacy_plan_migrated(workspace, actor, actor, empty_source, vec![])
+        .await
+        .unwrap();
+    assert!(
+        store
+            .ensure_legacy_plan_migrated(workspace, actor, actor, empty_source, legacy)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    let all = store.work_items(workspace, actor, None).await.unwrap();
+    assert_eq!(all.items.len(), 1);
+}
+
+pub async fn work_assignment_permissions_and_parent_cycles_are_enforced_by_store(
+    store: &dyn WorkspaceStore,
+    _name: &str,
+) {
+    use crate::workspace::{SharedWork, WorkPatch, WorkStatus};
+    let (workspace, director, contributor, viewer) = workspace_with_members(store).await;
+    for (participant_id, role) in [
+        (contributor, WorkspaceRole::Contributor),
+        (viewer, WorkspaceRole::Viewer),
+    ] {
+        store
+            .upsert_relay_roster_entry(workspace, participant(participant_id, "role test"), role)
+            .await
+            .unwrap();
+    }
+    let id = Uuid::new_v4();
+    let created = WorkspaceEvent {
+        id: Uuid::new_v4(),
+        workspace_id: workspace,
+        sequence: 0,
+        author_id: director,
+        idempotency_key: "backlog".into(),
+        created_at: Utc::now(),
+        kind: WorkspaceEventKind::WorkCreated {
+            work: SharedWork {
+                id,
+                title: "backlog".into(),
+                ..SharedWork::default()
+            },
+            mode: DeliveryMode::Notify,
+        },
+    };
+    store.append(created).await.unwrap();
+    let backlog = store
+        .work_items(workspace, contributor, None)
+        .await
+        .unwrap()
+        .items
+        .remove(0);
+    assert!(backlog.work.assignee_id.is_none());
+    assert!(
+        store
+            .assign_work(
+                workspace,
+                viewer,
+                id,
+                Some(viewer),
+                None,
+                "viewer-claim".into()
+            )
+            .await
+            .is_err()
+    );
+    let claimed = store
+        .assign_work(
+            workspace,
+            contributor,
+            id,
+            Some(contributor),
+            None,
+            "self-claim".into(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
             .assign_work(
                 workspace,
                 contributor,
                 id,
-                Some(contributor),
-                None,
-                "self-claim".into(),
+                Some(director),
+                claimed.assignment_id,
+                "foreign-assign".into()
             )
             .await
-            .unwrap();
-        assert!(
-            store
-                .assign_work(
-                    workspace,
-                    contributor,
-                    id,
-                    Some(director),
-                    claimed.assignment_id,
-                    "foreign-assign".into()
-                )
-                .await
-                .is_err()
-        );
-        let edited = store
+            .is_err()
+    );
+    let edited = store
+        .update_work(
+            workspace,
+            contributor,
+            id,
+            claimed.revision,
+            WorkPatch {
+                status: Some(WorkStatus::AwaitingReview),
+                blocked_reason: Some(Some("review needed".into())),
+                ..WorkPatch::default()
+            },
+            "review-state".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(edited.work.status, WorkStatus::AwaitingReview);
+    assert!(
+        store
             .update_work(
                 workspace,
                 contributor,
                 id,
-                claimed.revision,
+                edited.revision,
                 WorkPatch {
-                    status: Some(WorkStatus::AwaitingReview),
-                    blocked_reason: Some(Some("review needed".into())),
+                    parent_id: Some(Some(id)),
                     ..WorkPatch::default()
                 },
-                "review-state".into(),
+                "cycle".into()
             )
             .await
-            .unwrap();
-        assert_eq!(edited.work.status, WorkStatus::AwaitingReview);
-        assert!(
-            store
-                .update_work(
-                    workspace,
-                    contributor,
-                    id,
-                    edited.revision,
-                    WorkPatch {
-                        parent_id: Some(Some(id)),
-                        ..WorkPatch::default()
-                    },
-                    "cycle".into()
-                )
-                .await
-                .is_err()
-        );
-        let moved = store
-            .assign_work(
+            .is_err()
+    );
+    let moved = store
+        .assign_work(
+            workspace,
+            director,
+            id,
+            Some(director),
+            edited.assignment_id,
+            "director-reassign".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(moved.work.assignee_id, Some(director));
+    assert!(
+        store
+            .update_work(
                 workspace,
-                director,
+                contributor,
                 id,
-                Some(director),
-                edited.assignment_id,
-                "director-reassign".into(),
+                moved.revision,
+                WorkPatch {
+                    title: Some("stolen".into()),
+                    ..WorkPatch::default()
+                },
+                "not-owned".into()
             )
             .await
-            .unwrap();
-        assert_eq!(moved.work.assignee_id, Some(director));
-        assert!(
-            store
-                .update_work(
-                    workspace,
-                    contributor,
-                    id,
-                    moved.revision,
-                    WorkPatch {
-                        title: Some("stolen".into()),
-                        ..WorkPatch::default()
-                    },
-                    "not-owned".into()
-                )
-                .await
-                .is_err()
-        );
-        harness.discard().await;
-    }
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1967,3 +1914,49 @@ async fn legacy_work_backfill_preserves_canonical_retries_and_claim_tokens() {
         harness.discard().await;
     }
 }
+
+/// One portable conformance case, run against a store under test.
+pub type Case =
+    for<'a> fn(&'a dyn WorkspaceStore, &'a str) -> futures::future::LocalBoxFuture<'a, ()>;
+
+macro_rules! portable_cases {
+    ($($case:ident),* $(,)?) => {
+        /// The cases every `WorkspaceStore` must pass, so a store implemented
+        /// outside this crate can run them against its own backend.
+        pub const CASES: &[(&str, Case)] = &[$((stringify!($case), |store, name| Box::pin($case(store, name)))),*];
+
+        #[cfg(test)]
+        mod postgres {
+            $(
+                #[tokio::test]
+                async fn $case() {
+                    for harness in super::harnesses().await {
+                        super::$case(harness.store.as_ref(), harness.name).await;
+                        harness.discard().await;
+                    }
+                }
+            )*
+        }
+    };
+}
+
+portable_cases!(
+    an_appended_message_is_sequenced_and_replayable_by_its_recipients,
+    an_idempotency_key_admits_once_and_rejects_a_changed_payload,
+    a_direct_audience_reaches_only_its_target,
+    delivery_transitions_are_monotonic_and_count_attempts,
+    presence_leases_expire_and_exclude_non_members,
+    the_shared_read_surface_answers_identically,
+    workspace_provisioning_is_idempotent_and_direction_independent,
+    a_pending_message_is_listed_until_its_delivery_settles,
+    a_message_cannot_reference_a_thread_or_reply_outside_its_workspace,
+    a_relay_message_lands_locally_without_local_reference_checks,
+    a_relay_roster_entry_projects_only_onto_a_local_workspace,
+    instance_discovery_tombstones_and_revives_identically,
+    a_directory_sync_identifies_instances_and_retires_stopped_ones,
+    a_directory_entry_never_erases_a_locally_known_identity,
+    concurrent_work_claims_have_exactly_one_winner,
+    work_plan_is_a_revision_checked_assignment_projection,
+    legacy_plans_migrate_once_and_preserve_work_identity,
+    work_assignment_permissions_and_parent_cycles_are_enforced_by_store,
+);
