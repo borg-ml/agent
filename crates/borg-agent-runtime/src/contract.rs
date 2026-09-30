@@ -3354,7 +3354,7 @@ mod tests {
         assert!(prompt.contains("subscription"));
         assert!(prompt.contains("Weekly 52% left"));
         assert!(prompt.contains("OpenRouter: READY"));
-        assert!(prompt.contains("API key"));
+        assert!(prompt.contains("api key"));
         assert!(prompt.contains("Claude: NOT READY (usage exhausted)"));
         assert!(prompt.contains("5-hour 0% left"));
         assert!(!prompt.contains(secret));

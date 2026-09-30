@@ -2634,6 +2634,7 @@ async fn run_agent_session_store_kernel_inner(
         });
     }
     work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
+    let mut launch_plan_settled = false;
     'session: loop {
         if let Some(receiver) = title_result_rx.as_mut() {
             match receiver.try_recv() {
@@ -2849,6 +2850,14 @@ async fn run_agent_session_store_kernel_inner(
                     },
                 )
                 .await?;
+            }
+            // The first Ready reports a settled plan (projection and legacy
+            // migration); later refreshes stay in the background.
+            if !launch_plan_settled {
+                launch_plan_settled = true;
+                work_plan_refresh
+                    .settle(&mut journal, &events, &work_plan)
+                    .await?;
             }
             record(
                 &mut journal,
@@ -4072,6 +4081,9 @@ async fn run_agent_session_store_kernel_inner(
                             &mut goal_active_since,
                         )
                         .await?;
+                        work_plan_refresh
+                            .settle(&mut journal, &events, &work_plan)
+                            .await?;
                         let _ =
                             stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT)
                                 .await;
@@ -6589,6 +6601,7 @@ async fn run_agent_session_store_kernel_inner(
                                 &mut goal,
                                 &mut goal_active_since,
                             ).await?;
+                            work_plan_refresh.settle(&mut journal, &events, &work_plan).await?;
                             running.0.abort();
                             let _ = (&mut running.0).await;
                             let _ = stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT).await;
@@ -11989,6 +12002,35 @@ impl WorkPlanRefresh {
         Ok(())
     }
 }
+
+impl WorkPlanRefresh {
+    /// Record a collection already in flight before the session stops, so a
+    /// session stopped moments after launch still projects its plan. Only the
+    /// collection is bounded: a blocked collector must not hold Stop.
+    async fn settle(
+        &mut self,
+        journal: &mut RuntimeSessionStore,
+        events: &mpsc::Sender<SessionEvent>,
+        plan: &SessionWorkPlan,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + WORK_PLAN_STOP_GRACE;
+        while self.is_pending() {
+            let Ok(collected) = tokio::time::timeout_at(deadline, self.next()).await else {
+                break;
+            };
+            match collected {
+                Ok(kind) => self.apply(kind, journal, events, plan).await?,
+                Err(error) => {
+                    tracing::warn!(session_id = %plan.session_id, %error, "work-plan collection failed at stop");
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+const WORK_PLAN_STOP_GRACE: Duration = Duration::from_secs(1);
 
 async fn collect_work_plans(
     store: &dyn SessionStore,

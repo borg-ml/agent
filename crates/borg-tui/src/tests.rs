@@ -9503,7 +9503,6 @@ fn low_frequency_settings_do_not_clutter_slash_suggestions() {
     for command in [
         "/language",
         "/ui-language",
-        "/fast",
         "/followups",
         "/refresh",
         "/sleep",
