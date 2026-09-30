@@ -45,7 +45,7 @@ base64 = "0.23.1"
 borg-core = { path = "crates/borg-core" }
 borg-dictation = { path = "crates/borg-dictation" }
 blu-lang = "0.1.0"
-claude-agents = "0.1.1"
+claude-agents = { git = "https://github.com/borg-ml/claude-agents", rev = "cba399699fc1a19fad058d5dabc9e2017b42b5f9" }
 chrono = { version = "0.4.45", features = ["serde"] }
 borg-search = { path = "crates/borg-search" }
 borg-ui = { path = "crates/borg-ui" }

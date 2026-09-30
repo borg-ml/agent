@@ -1656,8 +1656,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "claude-agents"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc0ada54053d3e3c33fdb3488efd3e493b0e23d60e3685263df209b8bfcce841"
+source = "git+https://github.com/borg-ml/claude-agents?rev=cba399699fc1a19fad058d5dabc9e2017b42b5f9#cba399699fc1a19fad058d5dabc9e2017b42b5f9"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
