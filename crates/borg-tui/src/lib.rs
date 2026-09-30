@@ -1673,9 +1673,6 @@ pub struct BorgTerminal {
     scrollbar_area: Option<Rect>,
     scrollbar_thumb_area: Option<Rect>,
     scrollbar_drag_offset: u16,
-    /// Where a scrollbar drag started: the pointer's row and the scroll it was
-    /// at, so movement is measured from there rather than from the track.
-    scrollbar_drag_anchor: Option<(u16, usize)>,
     transcript_viewport_area: Option<Rect>,
     composer_area: Option<Rect>,
     composer_text_area: Option<Rect>,
@@ -3071,7 +3068,6 @@ impl BorgTerminal {
             scrollbar_area: None,
             scrollbar_thumb_area: None,
             scrollbar_drag_offset: 0,
-            scrollbar_drag_anchor: None,
             transcript_viewport_area: None,
             composer_area: None,
             composer_text_area: None,
@@ -3267,7 +3263,6 @@ impl BorgTerminal {
         self.scrollbar_area = None;
         self.scrollbar_thumb_area = None;
         self.scrollbar_drag_offset = 0;
-        self.scrollbar_drag_anchor = None;
         self.transcript_viewport_area = None;
         self.transcript_scroll_max = 0;
         self.dragging_scrollbar = false;
@@ -6749,10 +6744,6 @@ impl BorgTerminal {
                                 |thumb| mouse.row.saturating_sub(thumb.y),
                             );
                         self.scroll_to_scrollbar_row(mouse.row);
-                        // A grab on the thumb has already placed it; a grab on
-                        // the track has just jumped. Either way the drag starts
-                        // from here, not from the track as a whole.
-                        self.scrollbar_drag_anchor = Some((mouse.row, self.scroll_from_bottom));
                     }
                     MouseEventKind::Down(MouseButton::Left)
                         if self.picker.is_none()
@@ -6798,7 +6789,7 @@ impl BorgTerminal {
                     }
                     MouseEventKind::Drag(MouseButton::Left) if self.dragging_scrollbar => {
                         self.cancel_scroll_motion();
-                        self.drag_scrollbar_by_rows(mouse.row);
+                        self.scroll_to_scrollbar_row(mouse.row);
                     }
                     MouseEventKind::Drag(MouseButton::Left)
                         if self
@@ -6819,7 +6810,6 @@ impl BorgTerminal {
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         self.dragging_scrollbar = false;
-                        self.scrollbar_drag_anchor = None;
                         if self
                             .composer_selection
                             .is_some_and(|selection| selection.dragging)
@@ -7419,36 +7409,6 @@ impl BorgTerminal {
             text.to_string(),
             "✓ Copied composer selection to clipboard",
         ))
-    }
-
-    /// Move the transcript with the pointer: one row of drag is one line.
-    ///
-    /// A scrollbar's own mapping is proportional, because the thumb's place in
-    /// the document is what says where you are, and a long transcript gives
-    /// most of its length to a few rows of track. Dragging one cell then moves
-    /// hundreds of lines, and the less of the thumb you grabbed the less each
-    /// cell is worth. That is right for a click and wrong for a drag: a drag is
-    /// direct manipulation, and under the pointer the thing that moves should be
-    /// the thing you are moving.
-    ///
-    /// The anchor moves with the pointer, so one event covering several rows
-    /// does not lose them, and a scroll clamped at either end re-anchors on the
-    /// value it reached rather than the one it asked for, so dragging back out
-    /// starts moving immediately instead of eating the slack.
-    fn drag_scrollbar_by_rows(&mut self, row: u16) {
-        let Some((anchor_row, anchor_scroll)) = self.scrollbar_drag_anchor else {
-            // No grab to measure from, so fall back to proportional placement
-            // rather than refusing to move at all.
-            self.scroll_to_scrollbar_row(row);
-            return;
-        };
-        // Down is towards the top of the transcript, and `scroll_from_bottom`
-        // counts up towards it.
-        let delta = i32::from(row) - i32::from(anchor_row);
-        let moved = anchor_scroll as i64 - i64::from(delta);
-        self.scroll_from_bottom = moved.clamp(0, self.transcript_scroll_max as i64) as usize;
-        self.transcript.follow_tail = self.scroll_from_bottom == 0;
-        self.scrollbar_drag_anchor = Some((row, self.scroll_from_bottom));
     }
 
     fn scroll_to_scrollbar_row(&mut self, row: u16) {
