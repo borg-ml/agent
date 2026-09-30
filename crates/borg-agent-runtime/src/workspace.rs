@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -992,8 +992,248 @@ pub(crate) fn resolve_recipients(
     Ok(ids)
 }
 
+impl WorkspaceEventKind {
+    /// Events that change the shared work projection.
+    pub fn is_work(&self) -> bool {
+        matches!(
+            self,
+            Self::WorkCreated { .. }
+                | Self::WorkClaimed { .. }
+                | Self::WorkAssigned { .. }
+                | Self::WorkUpdated { .. }
+                | Self::WorkPlanUpdated { .. }
+                | Self::WorkPlanMigrated { .. }
+                | Self::DependencyDeclared { .. }
+                | Self::ReviewRequested { .. }
+                | Self::ReviewRecorded { .. }
+        )
+    }
+}
+
 impl WorkSnapshot {
-    pub(crate) fn apply(&mut self, event: &WorkspaceEvent) -> Result<()> {
+    /// Check a work event against this snapshot: roles, assignment and
+    /// revision fences, plan content, and the invariants the result must keep.
+    /// `plan_revision` is the stored plan revision of a `WorkPlanUpdated`
+    /// assignee. A dependency cycle needs the store's edges, so stores check
+    /// that themselves.
+    pub fn validate(
+        &self,
+        event: &WorkspaceEvent,
+        members: &[(Uuid, WorkspaceRole)],
+        plan_revision: u64,
+    ) -> Result<()> {
+        if !event.kind.is_work() {
+            return Ok(());
+        }
+        let role = members
+            .iter()
+            .find(|(id, _)| *id == event.author_id)
+            .map(|(_, role)| *role)
+            .context("author is not a workspace member")?;
+        ensure!(role != WorkspaceRole::Viewer, "viewer cannot change work");
+        let director = matches!(
+            role,
+            WorkspaceRole::Owner | WorkspaceRole::Admin | WorkspaceRole::Editor
+        );
+        let item = |id| {
+            self.items
+                .iter()
+                .find(|item| item.work.id == id)
+                .context("work item is not in workspace")
+        };
+        let member = |id| -> Result<()> {
+            ensure!(
+                members.iter().any(|(member, _)| *member == id),
+                "assignee is not a workspace member"
+            );
+            Ok(())
+        };
+        let edit = |id| -> Result<()> {
+            ensure!(
+                director || item(id)?.work.assignee_id == Some(event.author_id),
+                "only assignee or director may edit work"
+            );
+            Ok(())
+        };
+        match &event.kind {
+            WorkspaceEventKind::WorkCreated { work, .. } => {
+                if let Some(assignee) = work.assignee_id {
+                    member(assignee)?;
+                    ensure!(
+                        director || assignee == event.author_id,
+                        "only director may assign another participant"
+                    );
+                }
+            }
+            WorkspaceEventKind::WorkAssigned {
+                work_id,
+                assignee_id,
+                expected_assignment_id,
+                ..
+            } => {
+                let current = item(*work_id)?;
+                ensure!(
+                    current.assignment_id == *expected_assignment_id,
+                    "atomic claim conflict"
+                );
+                if let Some(assignee) = assignee_id {
+                    member(*assignee)?;
+                }
+                ensure!(
+                    director
+                        || (current.work.assignee_id == Some(event.author_id)
+                            && (assignee_id.is_none() || *assignee_id == Some(event.author_id)))
+                        || (current.work.assignee_id.is_none()
+                            && *assignee_id == Some(event.author_id)),
+                    "only director may reassign another participant's work"
+                );
+            }
+            WorkspaceEventKind::WorkClaimed { claim, .. } => {
+                let current = item(claim.work_id)?;
+                ensure!(
+                    current.assignment_id == claim.expected_claim_id,
+                    "atomic claim conflict"
+                );
+                ensure!(
+                    director
+                        || (claim.claimant_id == event.author_id
+                            && (current.work.assignee_id.is_none()
+                                || current.work.assignee_id == Some(event.author_id))),
+                    "only director may reassign another participant's work"
+                );
+            }
+            WorkspaceEventKind::WorkUpdated {
+                work_id,
+                expected_revision,
+                ..
+            } => {
+                edit(*work_id)?;
+                ensure!(
+                    item(*work_id)?.revision == *expected_revision,
+                    "work revision conflict"
+                );
+            }
+            WorkspaceEventKind::WorkPlanUpdated {
+                assignee_id,
+                expected_revision,
+                items,
+                ..
+            } => {
+                ensure!(
+                    director || *assignee_id == event.author_id,
+                    "only director may edit another participant plan"
+                );
+                member(*assignee_id)?;
+                ensure!(
+                    plan_revision == *expected_revision,
+                    "work revision conflict"
+                );
+                let mut ids = std::collections::HashSet::new();
+                for update in items {
+                    ensure!(
+                        !update.content.trim().is_empty() && update.content.chars().count() <= 500,
+                        "plan content must contain 1-500 characters"
+                    );
+                    if let Some(id) = update.id {
+                        ensure!(ids.insert(id), "duplicate plan work id");
+                        ensure!(
+                            item(id)?.work.assignee_id == Some(*assignee_id),
+                            "plan item is not assigned to author"
+                        );
+                    }
+                }
+            }
+            WorkspaceEventKind::WorkPlanMigrated {
+                assignee_id, items, ..
+            } => {
+                ensure!(
+                    director || *assignee_id == event.author_id,
+                    "only director may migrate another participant plan"
+                );
+                member(*assignee_id)?;
+                let mut ids = std::collections::HashSet::new();
+                for update in items {
+                    if let Some(id) = update.id {
+                        ensure!(ids.insert(id), "duplicate legacy work id");
+                    }
+                }
+            }
+            WorkspaceEventKind::DependencyDeclared { dependency, .. } => edit(dependency.work_id)?,
+            WorkspaceEventKind::ReviewRequested { request, .. } => edit(request.work_id)?,
+            WorkspaceEventKind::ReviewRecorded { review, .. } => ensure!(
+                director || review.reviewer_id == event.author_id,
+                "reviewer must be author"
+            ),
+            _ => {}
+        }
+        let mut candidate = self.clone();
+        candidate.apply(event)?;
+        let mut active = std::collections::HashSet::new();
+        for item in &candidate.items {
+            ensure!(
+                !item.work.title.trim().is_empty(),
+                "work title must not be empty"
+            );
+            if item.work.status == WorkStatus::InProgress {
+                let assignee = item
+                    .work
+                    .assignee_id
+                    .context("in-progress work requires an assignee")?;
+                ensure!(
+                    active.insert(assignee),
+                    "only one in-progress item per assignee"
+                );
+            }
+            let mut seen = std::collections::HashSet::from([item.work.id]);
+            let mut parent = item.work.parent_id;
+            while let Some(id) = parent {
+                ensure!(seen.insert(id), "work parent cycle");
+                parent = candidate
+                    .items
+                    .iter()
+                    .find(|item| item.work.id == id)
+                    .context("parent work is not in workspace")?
+                    .work
+                    .parent_id;
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply `event` and return every assignee whose plan it changed: current
+    /// and previous owners of touched items, and a plan event's assignee.
+    pub fn apply_with_plan_assignees(
+        &mut self,
+        event: &WorkspaceEvent,
+    ) -> Result<std::collections::BTreeSet<Uuid>> {
+        let previous: std::collections::HashMap<_, _> = self
+            .items
+            .iter()
+            .map(|item| (item.work.id, item.work.assignee_id))
+            .collect();
+        self.apply(event)?;
+        let mut assignees = std::collections::BTreeSet::new();
+        for item in self
+            .items
+            .iter()
+            .filter(|item| item.updated_sequence == event.sequence)
+        {
+            if let Some(assignee) = item.work.assignee_id {
+                assignees.insert(assignee);
+            }
+            if let Some(Some(assignee)) = previous.get(&item.work.id) {
+                assignees.insert(*assignee);
+            }
+        }
+        if let WorkspaceEventKind::WorkPlanUpdated { assignee_id, .. }
+        | WorkspaceEventKind::WorkPlanMigrated { assignee_id, .. } = &event.kind
+        {
+            assignees.insert(*assignee_id);
+        }
+        Ok(assignees)
+    }
+
+    pub fn apply(&mut self, event: &WorkspaceEvent) -> Result<()> {
         let mut touched = Vec::new();
         match &event.kind {
             WorkspaceEventKind::WorkCreated { work, .. } => {
