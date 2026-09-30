@@ -5783,9 +5783,12 @@ async fn sync_instance_directory(
         .error_for_status()?
         .json()
         .await?;
+    // This host's own sessions are known locally, and the relay's copy of
+    // their status lags: syncing it back revived sessions that had exited.
     let instances = directory
         .participants
         .into_iter()
+        .filter(|remote| remote.host_id != Some(config.host_id))
         .map(|remote| DirectoryInstance {
             participant: Participant {
                 id: remote.id,

@@ -3142,9 +3142,11 @@ async fn a_cross_participant_message_names_a_reply_target_the_recipient_can_reac
         "\"/root\" addresses the recipient back to itself, got: {}",
         inbox.text
     );
-    // The sender is still identified by its task name; only the reply
-    // address changes.
-    assert!(inbox.text.contains("Team message from /root:"));
+    // Both sessions are /root of their own trees, so the sender's path is
+    // qualified as another session's rather than shown bare.
+    assert!(inbox.text.contains(&format!(
+        "Team message from /root of another session (participant:{first}):"
+    )));
     scratch.discard().await;
 }
 

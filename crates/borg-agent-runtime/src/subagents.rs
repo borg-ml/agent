@@ -5962,6 +5962,44 @@ impl SubagentCoordinator {
             .map(|_| ())
     }
 
+    /// Refuse a message to a session this machine ran whose owner is gone.
+    /// Queueing it reported success for mail nobody will ever read. Only
+    /// positive evidence counts: the row was retired, or the owner pid it
+    /// recorded here is no longer alive.
+    async fn refuse_dead_local_target(&self, actor_session_id: Uuid, target: Uuid) -> Result<()> {
+        let socket_path = crate::session_control_socket_path(&self.journal_root, target);
+        if crate::session_control_socket_is_reachable(&socket_path).await {
+            return Ok(());
+        }
+        let own_host = self
+            .store
+            .workspace_binding(actor_session_id)
+            .await?
+            .and_then(|binding| binding.host_id);
+        let Some(instance) = self
+            .workspace_store()
+            .await?
+            .list_instances(true)
+            .await?
+            .into_iter()
+            .find(|instance| instance.participant.id == target)
+        else {
+            return Ok(());
+        };
+        let ours = instance.pid.is_some() || (own_host.is_some() && instance.host_id == own_host);
+        let dead = instance.exited_at.is_some()
+            || instance
+                .pid
+                .and_then(|pid| u32::try_from(pid).ok())
+                .is_some_and(|pid| !crate::local_control::process_is_alive(pid));
+        ensure!(
+            !(ours && dead),
+            "session {target} is not running: its process on this machine has exited, so it \
+             cannot receive messages. Use list_instances to find a live peer."
+        );
+        Ok(())
+    }
+
     async fn route_message_with_options_as(
         &self,
         actor_session_id: Uuid,
@@ -5993,6 +6031,9 @@ impl SubagentCoordinator {
                 RemoteMessageTarget::Session(id) => id,
             },
         };
+        if local_id.is_none() {
+            self.refuse_dead_local_target(actor_session_id, id).await?;
+        }
         ensure!(
             id != actor_session_id,
             "message recipient must differ from its author"
@@ -6181,6 +6222,9 @@ impl SubagentCoordinator {
                 RemoteMessageTarget::Session(id) => id,
             },
         };
+        if local_id.is_none() {
+            self.refuse_dead_local_target(actor_session_id, id).await?;
+        }
         ensure!(
             id != actor_session_id,
             "message recipient must differ from its author"
@@ -6365,6 +6409,8 @@ impl SubagentCoordinator {
             actor.participant_id != recipient_participant_id,
             "message recipient must differ from its author"
         );
+        self.refuse_dead_local_target(actor_session_id, recipient_participant_id)
+            .await?;
         let store = self.workspace_store().await?;
         if self
             .store
@@ -6817,6 +6863,14 @@ impl SubagentCoordinator {
                     .map(str::trim)
                     .filter(|cwd| !cwd.is_empty());
                 let workspace_store = self.workspace_store().await?;
+                // This machine's own sessions also come back through the remote
+                // directory, as rows with no local binding and whatever status
+                // they last synced. Liveness for those is known here.
+                let own_host = self
+                    .store
+                    .workspace_binding(actor_session_id)
+                    .await?
+                    .and_then(|binding| binding.host_id);
                 let mut candidates = Vec::new();
                 let mut newest_seen = None;
                 // Cheap, purely row-local filtering first. Liveness used to be
@@ -6846,7 +6900,8 @@ impl SubagentCoordinator {
                         .store
                         .workspace_binding(instance.participant.id)
                         .await?;
-                    let local = binding.is_some();
+                    let local =
+                        binding.is_some() || (own_host.is_some() && instance.host_id == own_host);
                     if let Some(binding) = binding {
                         instance.host_id = binding.host_id.or(instance.host_id);
                         instance.workspace_id = Some(binding.workspace_id);
@@ -6894,6 +6949,18 @@ impl SubagentCoordinator {
                         && instance.participant.id != actor_session_id
                     {
                         reap.push(instance.participant.id);
+                    }
+                    // A local session whose owner is gone is not a peer, whatever
+                    // status it last reported: it only lists as exited.
+                    let dead = local
+                        && !live
+                        && !owner_running
+                        && instance.participant.id != actor_session_id;
+                    if dead && !args.include_exited {
+                        continue;
+                    }
+                    if dead {
+                        instance.status = Some("stopped".into());
                     }
                     if args.live && !live {
                         continue;
@@ -10335,11 +10402,22 @@ fn optional_tool_text(value: Option<String>) -> Option<String> {
 }
 
 fn attributed_team_message(actor: &str, reply_target: &str, message: &str) -> String {
+    if reply_target == actor {
+        return format!(
+            "Team message from {actor}:\n\n{message}\n\n\
+             ({actor} is another Borg instance, not the human user. In the main thread, address \
+             your updates to the user; send replies or acknowledgments to {actor} via \
+             send_message with target \"{reply_target}\".)"
+        );
+    }
+    // Every top-level session is /root of its own team, so a bare path from
+    // another session reads as the recipient itself.
     format!(
-        "Team message from {actor}:\n\n{message}\n\n\
-         ({actor} is another Borg instance, not the human user. In the main thread, address your \
-         updates to the user; send replies or acknowledgments to {actor} via send_message with \
-         target \"{reply_target}\".)"
+        "Team message from {actor} of another session ({reply_target}):\n\n{message}\n\n\
+         (This sender is a separate Borg session with its own team tree: not you, your parent, \
+         or your children, and not the human user. Team paths are per session, so its {actor} \
+         can equal your own. In the main thread, address your updates to the user; send replies \
+         or acknowledgments via send_message with target \"{reply_target}\".)"
     )
 }
 
