@@ -10,6 +10,33 @@ Git comparison.
 - Fresh sessions honor the saved last-used model. The background host no longer
   receives an implicit `--provider claude` that bypasses the saved choice, such
   as Sol 6.1. Explicit provider choices and resumed-session models are unchanged.
+- Borg's native Claude adapter aligns with the Claude Code 2.1.286 protocol
+  through a pinned `claude-agents` revision. This updates protocol handling;
+  it does not install or upgrade the Claude binary.
+
+### Claude reliability
+
+- Claude turns wait for the session's idle event before finishing, including
+  follow-up turns woken by background agents. Ambient tasks no longer hold a
+  turn open, and tracked background tasks survive pooled-session reuse. Older
+  CLIs without session-state events retain result/task-based completion.
+- Failed interrupt requests and results marked `is_error`, even with a success
+  subtype, are reported as failures rather than silently accepted.
+- Waiting between background follow-up turns is bounded to ten minutes by
+  default. `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` changes the limit; `0` disables
+  it. Expiry fails the turn and discards the process instead of pooling a
+  potentially active session. The limit does not time out active model work.
+- Priority SDK steering retains its separate-turn behavior. Claude Code
+  2.1.286's join-the-running-turn behavior is reserved for human-origin messages;
+  SDK steers do not claim that origin.
+
+### Terminal UI
+
+- The watcher menu closes and clears its hover and keyboard focus when the
+  last running watcher stops or exits, even when exited watchers remain in
+  history. It no longer stays open after its footer control disappears.
+- Moving into or out of watcher controls and menu rows triggers a redraw, so
+  watcher highlights and popups no longer remain stale until another event.
 
 ### Collaboration
 
