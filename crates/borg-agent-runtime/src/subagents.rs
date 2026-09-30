@@ -2490,7 +2490,8 @@ impl AgentToolDispatcher {
                 .await;
                 Ok(json!({
                     "providers": providers,
-                    "instruction": "Check usage availability before cross-provider spawn or consultation. Only providers with can_spawn=true are eligible."
+                    "session_capabilities": { "subagents": self.subagents_enabled },
+                    "instruction": "Provider admission is host-local; it does not enable session tools. Check session_capabilities.subagents before delegation or messaging, and provider can_spawn before cross-provider work."
                 }))
             }
             "web_search" => {
@@ -2563,7 +2564,7 @@ impl AgentToolDispatcher {
             }
             _ => {
                 if !self.subagents_enabled {
-                    bail!("subagent tools are disabled by session capabilities");
+                    bail!("{name} is disabled for this session: capabilities.subagents=false. This gate also covers messaging/discovery; provider login does not enable it. `borg capabilities` reads configuration defaults, not this running session.");
                 }
                 let subagents = self
                     .subagents

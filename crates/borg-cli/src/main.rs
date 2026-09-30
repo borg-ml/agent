@@ -586,9 +586,12 @@ fn print_capabilities(args: CapabilitiesArgs) -> Result<()> {
     let configured = agent_config::AgentConfig::load(args.config.as_deref())?;
     let effective = borg_remote::SessionCapabilities::from(&configured.capabilities).effective();
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&effective)?);
+        let mut report = serde_json::to_value(&effective)?;
+        report["scope"] = serde_json::json!("configuration, not a running session snapshot");
+        println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
+    println!("Configured capabilities (not a running session snapshot):");
     println!("Active capabilities:");
     for capability in effective.active {
         println!(
