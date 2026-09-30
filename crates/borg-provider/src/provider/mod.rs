@@ -1207,7 +1207,7 @@ mod tests {
             CLAUDE_SELECTABLE_MODELS,
             [
                 ("claude-opus-5-5", "Opus 5.5"),
-                ("claude-sonnet-5", "Sonnet 5"),
+                ("claude-sonnet-5-5", "Sonnet 5.5"),
                 ("claude-fable-5-1", "Fable 5.1"),
             ]
         );

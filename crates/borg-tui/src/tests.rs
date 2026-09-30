@@ -2083,7 +2083,7 @@ fn model_picker_openrouter_uses_runtime_entries_and_existing_fuzzy_filter() {
     assert!(
         matches
             .iter()
-            .any(|index| { picker.options[*index].value == "claude-sonnet-5" })
+            .any(|index| { picker.options[*index].value == "claude-sonnet-5-5" })
     );
     assert_eq!(matches.len(), 2);
     picker.set_query("opencode-go".to_string());
