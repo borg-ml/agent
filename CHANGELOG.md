@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.13.2)
+## Unreleased (since 0.13.3)
+
+## 0.13.3 (2026-09-30)
 
 ### Models
 
