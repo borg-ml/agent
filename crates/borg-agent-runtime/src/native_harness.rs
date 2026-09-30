@@ -9369,9 +9369,6 @@ mod tests {
                     crate::watch::WatchArgs {
                         command: "sleep 30".to_string(),
                         label: "Build".to_string(),
-                        workdir: None,
-                        notify_on: Some(crate::watch::NotifyOn::Output),
-                        notify_pattern: None,
                         ..Default::default()
                     },
                     None,
@@ -9621,9 +9618,6 @@ mod tests {
                     crate::watch::WatchArgs {
                         command: "sleep 30".to_string(),
                         label: "Build".to_string(),
-                        workdir: None,
-                        notify_on: Some(crate::watch::NotifyOn::Output),
-                        notify_pattern: None,
                         ..Default::default()
                     },
                     None,

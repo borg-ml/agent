@@ -2565,7 +2565,9 @@ impl AgentToolDispatcher {
             }
             _ => {
                 if !self.subagents_enabled {
-                    bail!("{name} is disabled for this session: capabilities.subagents=false. This gate also covers messaging/discovery; provider login does not enable it. `borg capabilities` reads configuration defaults, not this running session.");
+                    bail!(
+                        "{name} is disabled for this session: capabilities.subagents=false. This gate also covers messaging/discovery; provider login does not enable it. `borg capabilities` reads configuration defaults, not this running session."
+                    );
                 }
                 let subagents = self
                     .subagents
@@ -7840,16 +7842,16 @@ pub fn agent_tool_specs_for_surface(
         ),
         tool(
             "watch",
-            "Watch a session-scoped background command, or watch child agents and be woken when they settle. Give `command`, or `agents`, not both. A command watch runs a background command that watches logs, files, or external status: by default output wakes you in bounded batches, notify_on=exit reports terminal events only, and notify_on=match with notify_pattern (Rust regex) selects error/milestone lines. An agent watch names child sessions: the default is notify_on=attention, which reports a child that is ALIVE and waiting on the parent (idle after finishing its assignment, or blocked on an approval), while notify_on=exit means the child was stopped or failed - so exit does NOT report a child that finished successfully and parked, and a batch of successful children would never wake you. aggregate=all (the default) waits for every named agent, aggregate=any for the first. One event per watch, and then the watch is done. Matching is per line (oversized lines split at 16KiB); exit and stop always notify, and filtering affects model notifications only, not process output capture/journaling. Requires shell approval or Full Access; runs until stopped, session exit, or 24 hours. An artifact watch (a file, a ref, a port, a log) reports only what the artifact does: it cannot see the process producing it die, so it cannot end an await when that happens. To wait on a worker, watch the agent with `agents`, not something the agent happens to touch. Use list_watchers and stop_watcher to manage watchers.",
+            "Be woken when something stops: a background command exits, a shell you already started with exec exits, or child agents settle. Give exactly one of `command`, `session_id`, or `agents`. A command watch runs the command in the background; a session_id watch attaches to a running exec shell (pass the session_id exec returned) without taking it over, so stopping the watch leaves the shell running. Either process watch wakes you once, when the process exits, with its exit code and the tail of its output; output before that stays in the process capture. An agent watch names child sessions: the default is notify_on=attention, which reports a child that is ALIVE and waiting on the parent (idle after finishing its assignment, or blocked on an approval), while notify_on=exit means the child was stopped or failed - so exit does NOT report a child that finished successfully and parked, and a batch of successful children would never wake you. aggregate=all (the default) waits for every named agent, aggregate=any for the first. One event per watch, and then the watch is done; stopping a watch also notifies. Requires shell approval or Full Access; runs until stopped, session exit, or 24 hours. A command that watches an artifact (a file, a ref, a port, a log) cannot see the process producing it die: to wait on a worker, watch the agent with `agents`, and to wait on a shell, watch its session_id. Use list_watchers and stop_watcher to manage watchers.",
             json!({
                 "type": "object", "properties": {
-                    "command": {"type": "string", "minLength": 1, "description": "The command to run and watch. Give this or agents, not both."},
+                    "command": {"type": "string", "minLength": 1, "description": "A command to run in the background, reported when it exits."},
+                    "session_id": {"type": "string", "format": "uuid", "description": "The session_id of a running exec shell, reported when it exits."},
                     "agents": {"type": "array", "items": {"type": "string", "format": "uuid"}, "minItems": 1, "description": "Child agent session ids to watch, settled when they reach the life notify_on names."},
                     "aggregate": {"type": "string", "enum": ["all", "any"], "default": "all", "description": "all: every named agent must settle. any: the first one does."},
                     "label": {"type": "string", "minLength": 1, "maxLength": 100},
-                    "workdir": {"type": "string"},
-                    "notify_on": {"type": "string", "enum": ["output", "match", "exit", "attention"], "description": "Command watches default to output, and match requires notify_pattern. Agent watches default to attention: exit means stopped or failed, while attention means alive and waiting on the parent."},
-                    "notify_pattern": {"type": "string", "maxLength": 4096, "description": "Required only with notify_on=match; Rust regex selecting error/milestone output lines. Terminal events always notify."}
+                    "workdir": {"type": "string", "description": "Working directory for `command`."},
+                    "notify_on": {"type": "string", "enum": ["attention", "exit"], "description": "Agent watches only. attention (default): alive and waiting on the parent. exit: stopped or failed."}
                 }, "required": ["label"], "additionalProperties": false
             }),
         ),
