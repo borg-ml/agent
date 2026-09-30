@@ -52,7 +52,11 @@ fn detached_host_preserves_implicit_provider_selection() {
     let mut command = TokioCommand::new("borg");
     append_session_host_arguments(&mut command, &args, true).unwrap();
     let forwarded: Vec<_> = command.as_std().get_args().collect();
-    assert!(forwarded.windows(2).any(|pair| pair == ["--provider", "codex"]));
+    assert!(
+        forwarded
+            .windows(2)
+            .any(|pair| pair == ["--provider", "codex"])
+    );
 }
 
 #[test]
