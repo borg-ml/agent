@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.13.2)
 
+### Models
+
+- Fresh sessions honor the saved last-used model. The background host no longer
+  receives an implicit `--provider claude` that bypasses the saved choice, such
+  as Sol 6.1. Explicit provider choices and resumed-session models are unchanged.
+
 ### Collaboration
 
 - `list_instances` lists only live sessions by default. Sessions from this
