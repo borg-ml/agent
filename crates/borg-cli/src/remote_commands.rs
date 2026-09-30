@@ -3006,13 +3006,15 @@ async fn run_local_agent_session(
     let mut session_host_idle_since = None;
     let mut last_ctrl_c = None;
     let mut terminal_dirty = false;
-    // Rebuilding from durable history while a coalesced live row is on screen
-    // would roll that row back to its first-paint snapshot.
-    let mut transcript_live_tail = history
-        .iter()
-        .any(|event| event.sequence == 0 && coalesced_transcript_event(&event.kind));
     let mut history_has_coalesced_events = history.iter().any(|event| event.sequence == 0);
-    let mut transcript_rebuild_pending = false;
+    // Rebuilding from durable history while a coalesced live row is on screen
+    // would roll that row back to its first-paint snapshot. While one streams,
+    // keep the events the transcript was actually built from, in arrival
+    // order, so an older page can be prepended and shown mid-turn.
+    let mut live_transcript_events = history
+        .iter()
+        .any(|event| event.sequence == 0 && coalesced_transcript_event(&event.kind))
+        .then(|| history.clone());
     let mut interaction_dirty = false;
     let mut streaming_frame_pending = false;
     let mut last_stream_text_at: Option<tokio::time::Instant> = None;
@@ -3706,15 +3708,18 @@ async fn run_local_agent_session(
                         {
                             history_page_before_sequence = before;
                         }
+                        if let Some(live) = live_transcript_events.as_mut() {
+                            let mut rebuilt = older.clone();
+                            rebuilt.append(live);
+                            *live = rebuilt;
+                        }
                         merge_tui_history_page(&mut history, older);
                         history_start_reached = history_page_before_sequence <= 1;
                         if let Some(terminal) = terminal.as_mut() {
-                            if transcript_live_tail {
-                                transcript_rebuild_pending = true;
-                            } else {
-                                terminal.replace_history(&history);
-                                terminal.seed_session_state(delivered_projection.state());
-                            }
+                            terminal.replace_history(
+                                live_transcript_events.as_deref().unwrap_or(&history),
+                            );
+                            terminal.seed_session_state(delivered_projection.state());
                             terminal_dirty = true;
                         }
                     }
@@ -4332,7 +4337,10 @@ async fn run_local_agent_session(
                             render_tick = tui_render_interval(render_frame_interval);
                         }
                         if event.sequence == 0 && coalesced_transcript_event(&event.kind) {
-                            transcript_live_tail = true;
+                            live_transcript_events.get_or_insert_with(|| history.clone());
+                        }
+                        if let Some(live) = live_transcript_events.as_mut() {
+                            live.push(event.clone());
                         }
                         if event.sequence > 0
                             && history
@@ -4348,13 +4356,7 @@ async fn run_local_agent_session(
                                 history.retain(|event| event.sequence > 0);
                                 history_has_coalesced_events = false;
                             }
-                            transcript_live_tail = false;
-                        }
-                        if transcript_rebuild_pending && !transcript_live_tail {
-                            terminal.replace_history(&history);
-                            terminal.seed_session_state(delivered_projection.state());
-                            transcript_rebuild_pending = false;
-                            terminal_dirty = true;
+                            live_transcript_events = None;
                         }
                         if terminal_dirty && session_event_needs_immediate_frame(&event.kind) {
                             if render_frame_interval <= ACTIVITY_FRAME_INTERVAL {
@@ -5512,6 +5514,9 @@ async fn run_local_agent_session(
                                 .await?;
                                 restored.seed_team_roster(&agents);
                                 restored.seed_history(&latest.events);
+                                if let Some(live) = live_transcript_events.as_mut() {
+                                    live.clone_from(&latest.events);
+                                }
                                 seed_terminal_subagent_threads(&mut restored, &agents, &histories);
                                 restored.seed_session_state(&latest_state);
                                 restored.restore_composer_draft();
@@ -7450,6 +7455,9 @@ async fn run_local_agent_session(
                                                 .await?;
                                         restored.seed_team_roster(&agents);
                                         restored.seed_history(&latest.events);
+                                        if let Some(live) = live_transcript_events.as_mut() {
+                                            live.clone_from(&latest.events);
+                                        }
                                         seed_terminal_subagent_threads(
                                             &mut restored,
                                             &agents,
