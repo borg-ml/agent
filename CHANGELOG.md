@@ -5,6 +5,24 @@ Git comparison.
 
 ## Unreleased (since 0.13.2)
 
+### Collaboration
+
+- `list_instances` lists only live sessions by default. Sessions from this
+  machine whose process has exited no longer come back from the relay
+  directory as `running`, `ready` or `starting`; they appear only with
+  `include_exited`. Sending to an exited session now fails with a clear error
+  instead of reporting `queued_offline`.
+- Every top-level session is `/root` of its own team, so messages from another
+  session's tree are labelled "from /root of another session (participant:…)",
+  and each session's context states its own team path, address and parent.
+
+### Embedding
+
+- Stores that implement `WorkspaceStore` outside this crate can reuse the
+  shared work rules (`WorkSnapshot::validate` and
+  `apply_with_plan_assignees`) and run the backend-neutral workspace
+  conformance cases (`workspace_conformance::CASES`, `test-support` feature).
+
 ## 0.13.2 (2026-09-30)
 
 ### Runtime responsiveness

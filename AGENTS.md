@@ -39,6 +39,11 @@
   work merely to create a commit.
 - Keep the working tree recoverable: do not leave a long-running task with a
   large, uncommitted change set when a coherent checkpoint can be committed.
+- Agents must not attribute work to themselves. Never add `Co-Authored-By`
+  trailers, "Generated with" lines, signatures or other credit naming an AI
+  agent or model (Claude, Codex, Borg or any other) to commits, pull requests,
+  release notes or files. Commits carry only the repository's configured
+  identity.
 
 ## Scratch and storage
 
