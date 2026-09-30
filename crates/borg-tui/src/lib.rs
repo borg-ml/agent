@@ -7004,8 +7004,11 @@ impl BorgTerminal {
 
     fn send_completion_alert(&mut self, notification: bool, sound: bool) {
         if notification {
-            let sequence = desktop_notification_sequence("Borg Agent", "Finished working");
-            let _ = write!(self.terminal.backend_mut(), "{sequence}");
+            send_desktop_notification(
+                self.terminal.backend_mut(),
+                "Borg Agent",
+                "Finished working",
+            );
         }
         // Play the chime without holding up the TUI. A terminal bell has no
         // per-play volume control, so a missing sound player stays silent.
@@ -7015,17 +7018,14 @@ impl BorgTerminal {
         let _ = io::Write::flush(self.terminal.backend_mut());
     }
 
-    /// Emit one desktop notification so the host terminal asks the OS for
-    /// notification permission the first time Borg runs. On macOS this is what
-    /// surfaces the "<terminal> wants to send notifications" prompt; a CLI
-    /// process cannot request it directly. Returns whether the sequence was
-    /// written.
+    /// Prime the available desktop-notification route. On terminals that
+    /// support it, this can also prompt for OS notification permission.
     pub fn prime_desktop_notification(&mut self) -> bool {
-        let sequence = desktop_notification_sequence(
+        let written = send_desktop_notification(
+            self.terminal.backend_mut(),
             "Borg Agent",
             "Notifications are on \u{2014} you'll be alerted when a turn finishes.",
         );
-        let written = write!(self.terminal.backend_mut(), "{sequence}").is_ok();
         let _ = io::Write::flush(self.terminal.backend_mut());
         written
     }
@@ -11343,6 +11343,37 @@ fn completion_alert_enabled(policy: CompletionAlertPolicy, window_focused: bool)
         CompletionAlertPolicy::Unfocused => !window_focused,
         CompletionAlertPolicy::Always => true,
     }
+}
+
+fn send_desktop_notification(output: &mut impl io::Write, title: &str, body: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("SSH_CONNECTION").is_none()
+        && std::env::var_os("SSH_TTY").is_none()
+        && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+    {
+        // OSC notifications depend on the terminal's implementation and policy.
+        // Use the local desktop service, but never notify an SSH server's desktop.
+        let mut command = Command::new("notify-send");
+        command
+            .args([
+                "--app-name=Borg Agent",
+                "--hint=boolean:suppress-sound:true",
+                "--",
+            ])
+            .args([title, body])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Ok(mut child) = command.spawn() {
+            thread::spawn(move || {
+                if !child.wait().is_ok_and(|status| status.success()) {
+                    tracing::warn!("desktop notification service rejected Borg's notification");
+                }
+            });
+            return true;
+        }
+    }
+    write!(output, "{}", desktop_notification_sequence(title, body)).is_ok()
 }
 
 /// Build the desktop-notification escape sequence for the host terminal.
