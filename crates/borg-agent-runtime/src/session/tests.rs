@@ -14092,11 +14092,12 @@ async fn reusable_subscription_pool_does_not_compact_large_durable_replay() {
     scratch.discard().await;
 }
 
-/// Failure mode: a non-waking team message settled while the root was idle is
-/// in the durable transcript, but a resumed provider session only receives
-/// each turn's own input, so the model never saw the peer's reply.
+/// Failure mode: a team message reaching an idle root is in the durable
+/// transcript, but a resumed provider session only receives each turn's own
+/// input, so the model never saw the peer's reply. The report wakes its own
+/// turn, which must carry it on the reused provider context.
 #[tokio::test]
-async fn resumed_provider_turn_receives_team_messages_settled_while_idle() {
+async fn resumed_provider_turn_receives_team_messages_that_wake_an_idle_root() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
@@ -14182,14 +14183,14 @@ async fn resumed_provider_turn_receives_team_messages_settled_while_idle() {
         })
         .await
         .unwrap();
-    wait_for(Box::new(move |kind| {
-        matches!(
-            kind,
-            SessionEventKind::Message { message_id, status: MessageStatus::Complete, .. }
-                if *message_id == team_id
-        )
+    let prompts = wait_for(Box::new(move |kind| {
+        matches!(kind, SessionEventKind::TurnCompleted { message_id, .. } if *message_id == team_id)
     }))
     .await;
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert_eq!(prompts[0]["provider_context_reused"], true, "{prompts:?}");
+    let sent = prompts[0]["prompt"].as_str().unwrap();
+    assert!(sent.contains("peer reply"), "{sent}");
 
     command_tx.send(prompt(second_id, "second")).await.unwrap();
     let prompts = wait_for(Box::new(move |kind| {
@@ -14197,13 +14198,7 @@ async fn resumed_provider_turn_receives_team_messages_settled_while_idle() {
     }))
     .await;
     assert_eq!(prompts.len(), 1, "{prompts:?}");
-    assert_eq!(prompts[0]["provider_context_reused"], true, "{prompts:?}");
-    let sent = prompts[0]["prompt"].as_str().unwrap();
-    assert!(
-        sent.contains("peer reply") && sent.contains("second"),
-        "{sent}"
-    );
-    assert!(sent.find("peer reply") < sent.find("second"), "{sent}");
+    assert!(prompts[0]["prompt"].as_str().unwrap().contains("second"), "{prompts:?}");
 
     command_tx
         .send(HostCommand::Stop { session_id })
@@ -19007,6 +19002,87 @@ async fn assert_watcher_yield_blocks_automatic_turns(queue_reports: bool) {
         .await
         .expect("real input resumes the session");
     assert!(calls.load(Ordering::SeqCst) >= 2, "the prompt ran a turn");
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
+    scratch.discard().await;
+}
+
+/// A paused goal is still the director of its team. When an agent reports,
+/// the root must wake to merge or re-evaluate that work rather than settle the
+/// report silently until someone resumes the goal by hand.
+#[tokio::test]
+async fn a_team_report_wakes_a_root_without_an_active_goal() {
+    let root = tempdir().unwrap();
+    let root_path = root.path().to_path_buf();
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+    let seen = RecordedTurns::default();
+    let called = Arc::new(Notify::new());
+    let executor = Arc::new(RecordingExecutor {
+        seen: Arc::clone(&seen),
+        called: Arc::clone(&called),
+    });
+    let actor = tokio::spawn({
+        let journal_path = root_path.join("session.lock");
+        let cwd = root_path.clone();
+        let store = Arc::clone(&store);
+        async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    ultrafast: None,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                    name: None,
+                    initial_prompt: Some("spawn the agents".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                store,
+            )
+            .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(20), called.notified())
+        .await
+        .expect("the first turn runs");
+    command_tx
+        .send(HostCommand::TeamPrompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "agent finished its branch".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), called.notified())
+        .await
+        .expect("the report wakes the root");
+    assert_eq!(seen.lock().unwrap().len(), 2);
 
     command_tx
         .send(HostCommand::Stop { session_id })

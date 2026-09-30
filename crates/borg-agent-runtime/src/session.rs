@@ -2645,10 +2645,7 @@ async fn run_agent_session_store_kernel_inner(
                 Err(oneshot::error::TryRecvError::Empty) => {}
             }
         }
-        let goal_was_active = goal
-            .as_ref()
-            .is_some_and(|goal| goal.status == GoalStatus::Active);
-        if !goal_was_active || user_stop || watches.yielded().is_some() {
+        if user_stop || watches.yielded().is_some() {
             settle_non_waking_team_notifications(
                 &mut journal,
                 &events,
@@ -2714,10 +2711,7 @@ async fn run_agent_session_store_kernel_inner(
             // already ran. Settle again so a report held during a stop is
             // committed to the transcript before the human prompt selected
             // below clears the gate.
-            let goal_active_after_boundary = goal
-                .as_ref()
-                .is_some_and(|goal| goal.status == GoalStatus::Active);
-            if !goal_active_after_boundary || user_stop || watches.yielded().is_some() {
+            if user_stop || watches.yielded().is_some() {
                 settle_non_waking_team_notifications(
                     &mut journal,
                     &events,
@@ -2791,6 +2785,7 @@ async fn run_agent_session_store_kernel_inner(
             && let Some(prompt) = pop_next_pending_prompt(
                 &mut pending,
                 goal_is_active
+                    || !user_stop
                     || network_retry_message_id.is_some()
                     || usage_limit_continuation_id.is_some(),
             ) {
@@ -2891,7 +2886,7 @@ async fn run_agent_session_store_kernel_inner(
                                     _ = usage_limit_wait, if retry_not_before.is_some() => {
                                         retry_not_before = None;
                                         let goal_is_active = goal.as_ref().is_some_and(|goal| goal.status == GoalStatus::Active);
-                                        break pop_next_pending_prompt(&mut pending, goal_is_active || network_retry_message_id.is_some() || usage_limit_continuation_id.is_some()).or_else(|| {
+                                        break pop_next_pending_prompt(&mut pending, goal_is_active || !user_stop || network_retry_message_id.is_some() || usage_limit_continuation_id.is_some()).or_else(|| {
                                             (!user_stop && watches.yielded().is_none()).then_some(()).and_then(|()| goal.as_ref()
                                                 .filter(|goal| goal_allows_automatic_continuation(goal)))
                                                 .map(|active_goal| QueuedPrompt {
@@ -3241,10 +3236,7 @@ async fn run_agent_session_store_kernel_inner(
                             && (user_stop
                                 || (delivery == PromptDelivery::Queue
                                     && !answers_followup
-                                    && (watches.yielded().is_some()
-                                        || !goal.as_ref().is_some_and(|goal| {
-                                            goal.status == GoalStatus::Active
-                                        }))))
+                                    && watches.yielded().is_some()))
                         {
                             settle_team_notification(
                                 &mut journal,
@@ -10430,13 +10422,15 @@ async fn settle_team_notification(
     Ok(())
 }
 
-/// An idle root without an active durable goal, or explicitly yielded to
-/// watchers, must not spend provider turns replying to queued internal reports.
-/// The report remains present in the durable transcript/subagent projection and becomes context for later turns, but it
-/// cannot seize the boundary from a human or make Escape advance to another
-/// invisible system turn. While the user-stop gate is engaged this also
-/// settles `Steer`-delivery reports that would otherwise be retained for a
-/// root turn.
+/// A root stopped with Escape, or explicitly yielded to watchers, must not
+/// spend provider turns replying to queued internal reports. Otherwise a
+/// report wakes the root whether or not its goal is active, so a paused goal
+/// still merges and re-evaluates the work its agents deliver. A settled report
+/// remains present in the durable transcript/subagent projection and becomes
+/// context for later turns, but it cannot seize the boundary from a human or
+/// make Escape advance to another invisible system turn. While the user-stop
+/// gate is engaged this also settles `Steer`-delivery reports that would
+/// otherwise be retained for a root turn.
 async fn settle_non_waking_team_notifications(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
