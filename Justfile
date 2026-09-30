@@ -1,5 +1,9 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
+# Every recipe selects the same packages so Cargo resolves one feature set and
+# reuses dependency builds; only the profile and test-only features split them.
+workspace := "--workspace --exclude borg-gui"
+
 default:
     @just --list
 
@@ -53,13 +57,12 @@ tui-stress:
 verify:
     @[[ "${BORG_TEST_SESSIONS_URL:-}" =~ [^[:space:]] && "${BORG_SESSIONS_URL:-}" =~ [^[:space:]] ]] || { echo "Set BORG_TEST_SESSIONS_URL and BORG_SESSIONS_URL to a disposable Postgres test server with CREATEDB permission; neither may name a production journal" >&2; exit 1; }
     cargo fmt --all -- --check
-    cargo check --workspace --exclude borg-gui --locked
-    cargo test --workspace --exclude borg-gui --locked --no-fail-fast -- --test-threads=1
-    cargo clippy --workspace --exclude borg-gui --all-targets --locked -- -D warnings
+    cargo test {{ workspace }} --locked --no-fail-fast -- --test-threads=1
+    cargo clippy {{ workspace }} --all-targets --locked -- -D warnings
     cargo deny check advisories bans licenses sources
     # Keep the RSA dependency check explicit so a future database feature
     # cannot reintroduce the Marvin-attack edge into the active graph.
-    if cargo tree --workspace --exclude borg-gui --target all -e features -i rsa 2>/dev/null | grep -q 'rsa'; then echo 'active rsa dependency detected' >&2; exit 1; fi
+    if cargo tree {{ workspace }} --target all -e features -i rsa 2>/dev/null | grep -q 'rsa'; then echo 'active rsa dependency detected' >&2; exit 1; fi
     # Unmaintained transitive dependencies with no safe upgrade are documented
     # in deny.toml; keep cargo-audit aligned with that reviewed exception list.
     cargo audit --ignore RUSTSEC-2024-0320 --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2025-0052 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0173 --ignore RUSTSEC-2025-0134 --ignore RUSTSEC-2026-0206 --ignore RUSTSEC-2026-0192 --ignore RUSTSEC-2026-0196
@@ -78,36 +81,32 @@ release-minor version="":
     ./scripts/release.sh --minor {{ quote(version) }}
 
 # Build and install the optimized public Borg Agent from this checkout.
-cli:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    install_root="${BORG_CLI_INSTALL_ROOT:-$HOME/.local}"
-    cargo install --root "$install_root" --path crates/borg-cli --locked --force --bin borg
-    if [[ "$(uname -s)" == "Linux" ]]; then
-      # The computer-use private display; the helper finds it next to borg.
-      cargo install --root "$install_root" --path crates/borg-display --locked --force --bin borg-display
-    fi
-    hash -r
-    installed="$install_root/bin/borg"
-    resolved="$(command -v borg)"
-    if [[ "$resolved" != "$installed" ]]; then
-      echo "Installed $installed, but this shell resolves borg to $resolved" >&2
-      exit 1
-    fi
-    remote_config="${BORG_REMOTE_CONFIG:-${BORG_HOME:-$HOME/.borg}/remote/host.json}"
-    if [[ "$(uname -s)" == "Linux" && -f "$remote_config" ]]; then
-      "$installed" remote install --config "$remote_config"
-    fi
-    "$installed" --version
+cli: (_install "release")
 
 # Build and install an unoptimized binary for local debugging.
-cli-dev:
+cli-dev: (_install "dev")
+
+_install profile:
     #!/usr/bin/env bash
     set -euo pipefail
     install_root="${BORG_CLI_INSTALL_ROOT:-$HOME/.local}"
-    cargo install --root "$install_root" --debug --path crates/borg-cli --locked --force --bin borg
+    bins=(borg)
+    if [[ "$(uname -s)" == "Linux" ]]; then
+      # The computer-use private display; the helper finds it next to borg.
+      bins+=(borg-display)
+    fi
+    cargo build {{ workspace }} --locked --profile {{ profile }} "${bins[@]/#/--bin=}"
+    target_dir="$(cargo metadata --format-version 1 --no-deps | sed -E 's/.*"target_directory":"([^"]*)".*/\1/')"
+    exe=""
+    [[ "${OS:-}" == "Windows_NT" ]] && exe=".exe"
+    mkdir -p "$install_root/bin"
+    for bin in "${bins[@]}"; do
+      # Replace by rename so a running borg keeps its old executable.
+      install -m 755 "$target_dir/{{ if profile == "dev" { "debug" } else { profile } }}/$bin$exe" "$install_root/bin/.$bin$exe.new"
+      mv -f "$install_root/bin/.$bin$exe.new" "$install_root/bin/$bin$exe"
+    done
     hash -r
-    installed="$install_root/bin/borg"
+    installed="$install_root/bin/borg$exe"
     resolved="$(command -v borg)"
     if [[ "$resolved" != "$installed" ]]; then
       echo "Installed $installed, but this shell resolves borg to $resolved" >&2
