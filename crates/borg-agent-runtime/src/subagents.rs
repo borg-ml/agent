@@ -5588,6 +5588,30 @@ impl SubagentCoordinator {
         self.table.lock().await.task_name(session_id)
     }
 
+    /// Who `session_id` is on this team, for its system context. Every
+    /// top-level session is `/root` of its own tree, so a session could not
+    /// otherwise tell its own path from another session's.
+    pub(crate) async fn identity_prompt(&self, session_id: Uuid) -> Option<String> {
+        let table = self.table.lock().await;
+        let path = table.task_name(session_id).ok()?;
+        let parent = table
+            .entries
+            .get(&session_id)
+            .map(|entry| entry.snapshot.parent_session_id)
+            .filter(|parent| *parent != session_id)
+            .and_then(|parent| table.task_name(parent).ok());
+        let parent = match parent {
+            Some(parent) => format!("Your parent is {parent}."),
+            None => "You are the top-level session of this team.".to_string(),
+        };
+        Some(format!(
+            "Your identity: team path {path}, session {session_id} (address: \
+             participant:{session_id}). {parent} Your children are {path}/<name>; list_agents \
+             shows them. Other top-level sessions are /root of their own trees, so a message \
+             labelled \"from /root of another session\" is never you."
+        ))
+    }
+
     pub async fn resolve_snapshot(&self, target: &str) -> Result<SubagentSnapshot> {
         let table = self.table.lock().await;
         let id = table.resolve(target)?;

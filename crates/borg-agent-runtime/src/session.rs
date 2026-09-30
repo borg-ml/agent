@@ -5056,9 +5056,17 @@ async fn run_agent_session_store_kernel_inner(
                 .flatten(),
             prompt_context_base: prompt_context_base(journal.context_events()),
             answers_human: prompt.actor == EventActor::User,
-            volatile_system_prompt_appendix: crate::provider_capabilities_prompt(
-                &launch.capabilities.provider_capabilities,
-            ),
+            volatile_system_prompt_appendix: {
+                let capabilities =
+                    crate::provider_capabilities_prompt(&launch.capabilities.provider_capabilities);
+                match &subagents {
+                    Some(team) => match team.identity_prompt(session_id).await {
+                        Some(identity) => format!("{identity}\n\n{capabilities}"),
+                        None => capabilities,
+                    },
+                    None => capabilities,
+                }
+            },
         };
         if recall_queued_prompt_before_provider_admission(
             &mut journal,
