@@ -75,6 +75,15 @@ const DATABASE: &str = "borg_sessions";
 /// bounded wait into a multiple of itself.
 pub(crate) const TRANSITION_BUDGET: Duration = Duration::from_secs(30);
 
+/// How long a postmaster may hold its post-crash reset before it counts as
+/// wedged.
+///
+/// The reset only waits for the crashed cluster's children to exit, which
+/// takes well under a second. A child blocked on a full disk can hold it open
+/// indefinitely, and the postmaster never retries once space returns. Short
+/// enough that the restart still fits inside [`TRANSITION_BUDGET`].
+const WEDGE_GRACE: Duration = Duration::from_secs(10);
+
 /// Where `initdb` and `pg_ctl` live when they are not on `PATH`.
 ///
 /// Distributions keep server binaries off the default `PATH` on purpose, since
@@ -161,7 +170,13 @@ impl ManagedCluster {
             if !self.is_running(&pg_ctl).await? {
                 self.start(&pg_ctl).await?;
             }
-            self.ensure_database().await?;
+            match self.ensure_database().await {
+                Err(error) if is_crash_reset(&error) && self.stays_in_crash_reset().await => {
+                    self.restart_wedged(&pg_ctl).await?;
+                    self.ensure_database().await?;
+                }
+                result => result?,
+            }
         }
         // Here rather than in `start`, so it covers the cluster that was
         // already running when we arrived -- the case we did not create and
@@ -472,6 +487,55 @@ impl ManagedCluster {
         Ok(Err(last_error_line(&output.stderr)))
     }
 
+    /// Whether the postmaster is still in its post-crash reset after
+    /// [`WEDGE_GRACE`]. Any other answer means it moved on by itself.
+    async fn stays_in_crash_reset(&self) -> bool {
+        use sqlx::{Connection, postgres::PgConnection};
+
+        let maintenance = format!("postgres://{ROLE}@127.0.0.1:{}/postgres", self.port);
+        let deadline = tokio::time::Instant::now() + WEDGE_GRACE;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            match PgConnection::connect(&maintenance).await {
+                Err(error) if is_crash_reset_reply(&error) => {}
+                Ok(connection) => {
+                    connection.close().await.ok();
+                    return false;
+                }
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
+    /// Stop a wedged postmaster and start it again.
+    ///
+    /// An immediate stop is what the crash that wedged it already did, so it
+    /// loses nothing further; the start replays WAL as any crash recovery does.
+    async fn restart_wedged(&self, pg_ctl: &Path) -> Result<()> {
+        tracing::warn!(
+            data_dir = %self.data_dir.display(),
+            "the Borg session cluster is stuck resetting after a crash; restarting it"
+        );
+        let output = Command::new(pg_ctl)
+            .kill_on_drop(true)
+            .arg("-D")
+            .arg(&self.data_dir)
+            .args(["-m", "immediate", "-w", "stop"])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .with_context(|| format!("could not run {}", pg_ctl.display()))?;
+        if !output.status.success() && self.is_running(pg_ctl).await? {
+            bail!(
+                "could not stop the wedged Borg session cluster at {}: {}",
+                self.data_dir.display(),
+                last_error_line(&output.stderr)
+            );
+        }
+        self.start(pg_ctl).await
+    }
+
     /// Create the journal database if this is a fresh cluster.
     async fn ensure_database(&self) -> Result<()> {
         use sqlx::{Connection, Executor, postgres::PgConnection};
@@ -576,6 +640,23 @@ pub(crate) fn is_between_states(error: &anyhow::Error) -> bool {
                         | std::io::ErrorKind::UnexpectedEof
                 )
         )
+    })
+}
+
+/// The postmaster refusing connections while it resets after a crash.
+///
+/// `57P03` alone also covers starting up and shutting down, and only the
+/// message separates this case. A server logging in another locale is never
+/// matched, which leaves it with the plain transitional wait.
+fn is_crash_reset(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref().is_some_and(is_crash_reset_reply))
+}
+
+fn is_crash_reset_reply(error: &sqlx::Error) -> bool {
+    error.as_database_error().is_some_and(|error| {
+        error.code().as_deref() == Some("57P03") && error.message().contains("in recovery mode")
     })
 }
 
