@@ -1,0 +1,34 @@
+name: Sync release notes
+
+# A changelog correction after a release otherwise never reaches the release
+# page: the release job renders its notes once, from the tag.
+on:
+  push:
+    branches: [main]
+    paths: [CHANGELOG.md, .github/workflows/release-notes.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Update the latest release's notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(git describe --tags --abbrev=0 --match 'v*')"
+          if ! gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .id >/dev/null 2>&1; then
+            echo "No release for $tag yet; the release job renders its notes."
+            exit 0
+          fi
+          python3 scripts/release-notes.py extract "${tag#v}" CHANGELOG.md >release-notes.md
+          previous_tag="$(git describe --tags --abbrev=0 --match 'v*' "${tag}^")"
+          printf '\n[Full changelog](https://github.com/%s/compare/%s...%s)\n' "$GITHUB_REPOSITORY" "$previous_tag" "$tag" >>release-notes.md
+          gh release edit "$tag" --notes-file release-notes.md
+          echo "Synced notes for $tag"
