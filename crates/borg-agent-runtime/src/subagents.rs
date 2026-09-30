@@ -671,6 +671,15 @@ struct AgentToolWireRequest {
     parent: Option<String>,
 }
 
+/// The model wrote the command, and every poll of a running process repeated
+/// it -- with the remembered `cd` prefixed -- in its own context. Native and
+/// MCP sessions share this result, and the UI names a command from the call.
+fn drop_command_echo(result: &mut Value) {
+    if let Some(result) = result.as_object_mut() {
+        result.remove("command");
+    }
+}
+
 async fn serve_agent_tool_connection<S>(
     stream: S,
     dispatcher: AgentToolDispatcher,
@@ -1156,7 +1165,7 @@ impl AgentToolDispatcher {
             other => bail!("{other} is not a shell tool"),
         };
         if let Some(args) = stdin {
-            return Ok(serde_json::to_value(
+            let mut result = serde_json::to_value(
                 execution_provider
                     .write_stdin(crate::ExecutionStdinRequest {
                         owner_session_id: self.actor_session_id,
@@ -1167,7 +1176,9 @@ impl AgentToolDispatcher {
                         max_output_tokens: args.max_output_tokens,
                     })
                     .await?,
-            )?);
+            )?;
+            drop_command_echo(&mut result);
+            return Ok(result);
         }
         let args = command.expect("a shell call is a command or a process write");
         let sleep_seconds = bare_sleep_seconds(&args.cmd);
@@ -1197,6 +1208,7 @@ impl AgentToolDispatcher {
                 })
                 .await?,
         )?;
+        drop_command_echo(&mut result);
         let guidance = self.newly_reached_guidance(&command_text, shell_directory.as_deref());
         if let Some(result) = result.as_object_mut() {
             if let Some(directory) = shell_directory {

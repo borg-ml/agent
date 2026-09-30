@@ -4173,18 +4173,14 @@ fn command_result_for_model(output: &str) -> String {
     let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(output) else {
         return output.to_string();
     };
-    if fields.get("session_id").and_then(Value::as_str).is_none()
-        || fields.get("command").and_then(Value::as_str).is_none()
-        || fields.get("running").and_then(Value::as_bool).is_none()
+    if fields.get("session_id").and_then(Value::as_str).is_some()
+        && fields.get("running").and_then(Value::as_bool).is_some()
+        && fields.remove("changes").is_some()
     {
-        return output.to_string();
+        Value::Object(fields).to_string()
+    } else {
+        output.to_string()
     }
-    // The model wrote the command, so echoing it back -- on every poll of a
-    // running process, with the remembered `cd` prefixed -- only spends
-    // context. The UI and journal keep the full result.
-    fields.remove("command");
-    fields.remove("changes");
-    Value::Object(fields).to_string()
 }
 
 async fn record_native_message(
@@ -7717,7 +7713,6 @@ mod tests {
         let model_result: Value = serde_json::from_str(content).expect("model JSON");
         assert_eq!(model_result["stdout"], "saved");
         assert!(model_result.get("changes").is_none());
-        assert!(model_result.get("command").is_none());
         let _model_journal = received.recv().await.expect("model journal");
         let SessionEventKind::ToolCompleted { output, .. } =
             received.recv().await.expect("UI journal")
@@ -7726,7 +7721,6 @@ mod tests {
         };
         let ui_result: Value = serde_json::from_str(&output).expect("UI JSON");
         assert_eq!(ui_result["changes"][0]["path"], "src/lib.rs");
-        assert_eq!(ui_result["command"], "python3 rewrite.py");
         assert_eq!(
             command_result_for_model(&json!({"changes": [{"status": "ready"}]}).to_string()),
             json!({"changes": [{"status": "ready"}]}).to_string(),
