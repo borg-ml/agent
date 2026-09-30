@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.13.1)
+## Unreleased (since 0.13.2)
+
+## 0.13.2 (2026-09-30)
 
 ### Runtime responsiveness
 
