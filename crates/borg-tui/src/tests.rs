@@ -15206,6 +15206,56 @@ fn composer_selection_highlights_text_without_the_prompt_marker() {
     );
 }
 
+// The composer surface includes two blank separator rows. Checking the
+// rendered buffer catches a child tint applied only to the paragraph, leaving
+// those separators neutral, and guards the root/attention palettes too.
+#[test]
+fn focused_subagent_composer_tints_follow_up_and_both_separator_rows() {
+    use ratatui::buffer::Buffer;
+    use ratatui::widgets::Widget;
+
+    let area = Rect::new(0, 0, 72, 3);
+    for (focused, attention) in [(false, false), (true, false), (true, true)] {
+        let surface = composer_surface_style(false, focused);
+        let placeholder = composer_placeholder_style(focused, attention);
+        let mut buffer = Buffer::empty(area);
+        Block::default().style(surface).render(area, &mut buffer);
+        Paragraph::new(Line::from(vec![
+            Span::styled(" › ", placeholder),
+            Span::styled(active_message_placeholder(true), placeholder),
+        ]))
+        .style(surface)
+        .render(Rect::new(0, 1, area.width, 1), &mut buffer);
+        let background = if focused {
+            SUBAGENT_COMPOSER_BG
+        } else {
+            COMPOSER_INPUT_BG
+        };
+        for y in 0..3 {
+            for x in 0..area.width {
+                assert_eq!(
+                    buffer[(x, y)].bg,
+                    background,
+                    "composer row {y}, column {x}"
+                );
+            }
+        }
+        assert_eq!(
+            buffer[(3, 1)].fg,
+            if focused && !attention {
+                SUBAGENT_PURPLE
+            } else {
+                Color::DarkGray
+            }
+        );
+        assert!(buffer.content().iter().any(|cell| cell.symbol() == "T"));
+    }
+    // A surface tint must not override typed syntax or semantic foregrounds.
+    assert_eq!(composer_surface_style(false, true).fg, None);
+    assert_eq!(composer_surface_style(true, false).bg, Some(Color::Reset));
+    assert_eq!(composer_surface_style(true, true).bg, Some(Color::Reset));
+}
+
 #[test]
 fn active_message_placeholder_explains_both_follow_up_modes() {
     assert_eq!(

@@ -109,6 +109,7 @@ const COMPOSER_BG: Color = Color::Rgb(35, 27, 31);
 /// you type in read as a well rather than another band of transcript, and the
 /// same value the pickers use for their surface.
 const COMPOSER_INPUT_BG: Color = Color::Rgb(20, 20, 22);
+const SUBAGENT_COMPOSER_BG: Color = Color::Rgb(49, 27, 40);
 /// Divider between status-line segments. It is its own span so a hovered
 /// segment underlines its own text only.
 const STATUS_SEPARATOR: &str = " · ";
@@ -8491,9 +8492,13 @@ impl BorgTerminal {
                     _ => ui_text(ui_language, "Describe a task…"),
                 }
             };
+            let style = composer_placeholder_style(
+                self.focused_child.is_some(),
+                pending_approval || pending_provider_interaction,
+            );
             vec![Line::from(vec![
-                Span::styled(prompt_marker, Style::default().fg(Color::DarkGray)),
-                Span::styled(placeholder, Style::default().fg(Color::DarkGray)),
+                Span::styled(prompt_marker, style),
+                Span::styled(placeholder, style),
             ])]
         } else if pending_provider_interaction_secret {
             styled_plain_composer_lines(&composer_display_text, &composer_ranges, prompt_marker)
@@ -9333,11 +9338,10 @@ impl BorgTerminal {
                 }
             }
             let composer_block = Block::default()
-                .style(Style::default().bg(if is_launch_screen {
-                    Color::Reset
-                } else {
-                    COMPOSER_INPUT_BG
-                }))
+                .style(composer_surface_style(
+                    is_launch_screen,
+                    self.focused_child.is_some(),
+                ))
                 .borders(if is_launch_screen {
                     Borders::LEFT
                 } else {
@@ -9358,11 +9362,8 @@ impl BorgTerminal {
                 }
             };
             frame.render_widget(composer_block, composer_area);
-            let composer_content_style = Style::default().bg(if is_launch_screen {
-                Color::Reset
-            } else {
-                COMPOSER_INPUT_BG
-            });
+            let composer_content_style =
+                composer_surface_style(is_launch_screen, self.focused_child.is_some());
             if let Some(lines) = picker_lines.clone() {
                 frame.render_widget(
                     Paragraph::new(lines)
@@ -15507,6 +15508,24 @@ fn primary_controls_spans(keymap: &KeyMap, language: UiLanguage) -> Vec<Span<'st
         Span::styled(" or ", binding_style),
         Span::styled(keymap.label(KeyAction::Keybindings), key_style),
     ]
+}
+
+fn composer_surface_style(is_launch_screen: bool, focused_subagent: bool) -> Style {
+    Style::default().bg(if is_launch_screen {
+        Color::Reset
+    } else if focused_subagent {
+        SUBAGENT_COMPOSER_BG
+    } else {
+        COMPOSER_INPUT_BG
+    })
+}
+
+fn composer_placeholder_style(focused_subagent: bool, needs_attention: bool) -> Style {
+    Style::default().fg(if focused_subagent && !needs_attention {
+        SUBAGENT_PURPLE
+    } else {
+        Color::DarkGray
+    })
 }
 
 fn active_message_placeholder(steer_active: bool) -> &'static str {
