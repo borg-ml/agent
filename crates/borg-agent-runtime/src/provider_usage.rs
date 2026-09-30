@@ -27,6 +27,21 @@ pub async fn refresh_provider_capability_usage(
 ) -> Vec<ProviderCapability> {
     let mut capabilities = capabilities.to_vec();
     for capability in &mut capabilities {
+        if capability.provider == CodingProvider::Claude
+            && capability.installed
+            && !matches!(
+                capability.billing,
+                Some(crate::BillingLane::ApiKey | crate::BillingLane::Endpoint)
+            )
+        {
+            // Login can change after this session's startup snapshot. A failed
+            // read is not proof of logout; retain the last admitted state.
+            if let Ok(authenticated) =
+                borg_provider::provider::read_claude_subscription_status().await
+            {
+                apply_claude_subscription_status(capability, authenticated);
+            }
+        }
         if capability.provider == CodingProvider::OpenCode
             && borg_provider::credentials::opencode_go_api_key().is_some()
         {
@@ -239,5 +254,70 @@ fn provider_usage_window_label(duration_mins: u64) -> String {
         mins if mins % 1_440 == 0 => format!("{}-day", mins / 1_440),
         mins if mins % 60 == 0 => format!("{}-hour", mins / 60),
         mins => format!("{mins}-minute"),
+    }
+}
+
+/// Update only the subscription lane; never select a different paid route.
+fn apply_claude_subscription_status(capability: &mut ProviderCapability, authenticated: bool) {
+    if matches!(
+        capability.billing,
+        Some(crate::BillingLane::ApiKey | crate::BillingLane::Endpoint)
+    ) {
+        return;
+    }
+    capability.authenticated = authenticated;
+    capability
+        .auth_methods
+        .retain(|method| *method != ProviderAuthMethod::Subscription);
+    if authenticated {
+        capability
+            .auth_methods
+            .push(ProviderAuthMethod::Subscription);
+        capability.billing = Some(crate::BillingLane::Subscription);
+        capability.auth_detail = Some("Claude subscription authenticated".to_string());
+    } else {
+        capability.billing = None;
+        capability.auth_detail = None;
+        capability.usage = None;
+        capability.can_spawn = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_claude_login_repairs_a_stale_admission_snapshot() {
+        let mut capability = ProviderCapability {
+            provider: CodingProvider::Claude,
+            installed: true,
+            version: None,
+            authenticated: false,
+            auth_detail: None,
+            auth_methods: Vec::new(),
+            can_spawn: false,
+            usage: None,
+            billing: None,
+        };
+        apply_claude_subscription_status(&mut capability, true);
+        assert!(capability.authenticated);
+        assert_eq!(
+            capability.auth_methods,
+            vec![ProviderAuthMethod::Subscription]
+        );
+        assert_eq!(capability.billing, Some(crate::BillingLane::Subscription));
+        apply_claude_subscription_status(&mut capability, false);
+        assert!(!capability.authenticated);
+        assert!(!capability.can_spawn);
+        assert!(capability.auth_methods.is_empty());
+        assert_eq!(capability.billing, None);
+        for lane in [crate::BillingLane::ApiKey, crate::BillingLane::Endpoint] {
+            capability.billing = Some(lane);
+            capability.authenticated = true;
+            apply_claude_subscription_status(&mut capability, false);
+            assert_eq!(capability.billing, Some(lane));
+            assert!(capability.authenticated);
+        }
     }
 }

@@ -1023,6 +1023,35 @@ fn parse_claude_account_rate_limits(value: &Value) -> Result<ClaudeAccountRateLi
     })
 }
 
+/// Check Claude's current local login without starting a model turn or changing credentials.
+pub async fn read_claude_subscription_status() -> Result<bool> {
+    let output = tokio::time::timeout(Duration::from_secs(8), async {
+        // Capability reads must not install software or trust an old resolver cache.
+        let path = crate::provider_bin::resolve_uncached(crate::provider_bin::Runtime::Claude)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let mut command = tokio::process::Command::new(path);
+        command.args(["auth", "status"]).kill_on_drop(true);
+        command.output().await.context("failed to read Claude login status")
+    })
+    .await
+    .context("Claude login probe timed out")??;
+    if !output.status.success() {
+        bail!("Claude login probe failed");
+    }
+    let status: Value =
+        serde_json::from_slice(&output.stdout).context("Claude login probe did not return JSON")?;
+    Ok(claude_subscription_status_authenticated(&status))
+}
+
+fn claude_subscription_status_authenticated(status: &Value) -> bool {
+    status
+        .get("loggedIn")
+        .or_else(|| status.get("logged_in"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && status.get("authMethod").and_then(Value::as_str) != Some("api_key")
+}
 /// Read the explicitly selected native subscription authority without refreshing tokens.
 pub async fn read_codex_subscription_status() -> Result<bool> {
     Ok(crate::openai_subscription::account()?.is_some())
@@ -2092,6 +2121,23 @@ fn has_nonempty_env(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_subscription_status_uses_explicit_login_not_api_auth() {
+        for status in [
+            serde_json::json!({"loggedIn":true,"authMethod":"claude.ai"}),
+            serde_json::json!({"logged_in":true}),
+        ] {
+            assert!(claude_subscription_status_authenticated(&status));
+        }
+        for status in [
+            serde_json::json!({"loggedIn":false}),
+            serde_json::json!({"loggedIn":true,"authMethod":"api_key"}),
+            serde_json::json!({}),
+        ] {
+            assert!(!claude_subscription_status_authenticated(&status));
+        }
+    }
 
     #[test]
     fn a_context_length_refusal_classifies_as_recoverable_not_unknown() {
