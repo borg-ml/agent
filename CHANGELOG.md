@@ -19,11 +19,26 @@ Git comparison.
 
 ### Models and reasoning
 
+- Claude Sonnet 5.5 sessions use its 1M-token context window instead of 200k.
+  Borg's Claude runtime moves to 2.1.285, the first to list Sonnet 5.5, so
+  long Sonnet sessions compact far less often.
 - New GPT sessions default to `gpt-6.1-sol` at medium reasoning effort.
 - Codex subscription requests now select sequential reasoning-summary delivery,
   and completed summary events are displayed even when no text deltas arrive.
   Summaries already streamed as deltas are not duplicated. Models may still
   omit summaries; Borg cannot display text the provider does not send.
+
+### Watchers and context
+
+- Watchers are lifecycle triggers. A command watch wakes the agent once, when
+  the command exits, with its exit code and output tail; the per-output and
+  regex (`notify_pattern`) modes are gone. `watch` can also follow a shell
+  already started with `exec` by its `session_id`, and stopping that watch
+  leaves the shell running.
+- `exec` results no longer repeat the command back to the model. Every poll of
+  a running process echoed the full command, with the remembered `cd`
+  prefixed; in one subagent that was over half its tool-result text. The UI and
+  journal still show the command.
 
 ### Terminal UI
 
