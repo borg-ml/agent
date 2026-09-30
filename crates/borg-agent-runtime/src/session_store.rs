@@ -503,7 +503,9 @@ impl SessionEventKind {
     pub fn is_subagent_relevant(&self) -> bool {
         matches!(
             self,
-            Self::SubagentActivity { .. } | Self::TeamBroadcastUpdated { .. }
+            Self::SubagentActivity { .. }
+                | Self::TeamBroadcastUpdated { .. }
+                | Self::AgentMessageReceived { .. }
         )
     }
 

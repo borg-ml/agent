@@ -49,7 +49,11 @@ fn inherited_event_id(session_id: Uuid, source_event_id: Uuid) -> Uuid {
 /// multi-hundred-megabyte tool payloads out of the result set.
 fn recovery_scan_predicate(parts: RecoveryParts, alias: &str) -> String {
     if parts.context {
-        return format!("{alias}recovery_relevant");
+        return if parts.subagents {
+            format!("({alias}recovery_relevant or {alias}event_kind = 'agent_message_received')")
+        } else {
+            format!("{alias}recovery_relevant")
+        };
     }
     let mut kinds: Vec<&str> = Vec::new();
     if parts.queue {
@@ -58,15 +62,17 @@ fn recovery_scan_predicate(parts: RecoveryParts, alias: &str) -> String {
     }
     if parts.subagents {
         kinds.push("'subagent_activity'");
+        kinds.push("'agent_message_received'");
     }
     match kinds.as_slice() {
         [] => "false".to_string(),
-        // Every subagent_activity row is recovery-relevant by construction, so
-        // dropping the redundant flag lets the planner use the dedicated roster
-        // index instead of walking the whole recovery index.
-        ["'subagent_activity'"] => format!("{alias}event_kind = 'subagent_activity'"),
+        // Older receipt rows lack the recovery flag; kind selection also lets
+        // roster-only callers avoid walking the whole context index.
+        ["'subagent_activity'", "'agent_message_received'"] => {
+            format!("{alias}event_kind in ('subagent_activity', 'agent_message_received')")
+        }
         kinds => format!(
-            "{alias}recovery_relevant and {alias}event_kind in ({})",
+            "({alias}recovery_relevant or {alias}event_kind = 'agent_message_received') and {alias}event_kind in ({})",
             kinds.join(", ")
         ),
     }
@@ -282,7 +288,8 @@ impl PostgresSessionStore {
             let sql = format!(
                 "select e.event_json, e.event_body, e.dict_id from session_events e \
                  where e.session_id = $1 and e.sequence < $2 \
-                   and e.event_kind = 'subagent_activity' and {LATEST_SUBAGENT_ROWS} \
+                   and ((e.event_kind = 'subagent_activity' and {LATEST_SUBAGENT_ROWS}) \
+                     or e.event_kind = 'agent_message_received') \
                  order by e.sequence"
             );
             let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
@@ -726,8 +733,29 @@ mod tests {
             return;
         };
         let (scratch, store, session_id) = started_session(&url).await;
+        let receipt_id = Uuid::new_v4();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::AgentMessageReceived {
+                    message_id: receipt_id,
+                    sender_id: Uuid::new_v4(),
+                    sender_name: "Peer".into(),
+                    text: "Received before checkpoint".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        // Receipts written by older owners lacked the recovery flag. Both full
+        // and provider-checkpoint recovery must still seed durable dedup.
+        sqlx::query("update session_events set recovery_relevant = false where session_id = $1 and event_kind = 'agent_message_received'")
+            .bind(session_id).execute(store.pool()).await.unwrap();
         let first = user_message(&store, session_id, "first").await;
         complete_turn(&store, session_id, first).await;
+        assert!(store.recovery(session_id).await.unwrap().subagent_events.iter().any(|event| matches!(
+            &event.kind, SessionEventKind::AgentMessageReceived { message_id, .. } if *message_id == receipt_id
+        )));
 
         assert!(
             store
@@ -742,6 +770,9 @@ mod tests {
             .await
             .expect("checkpoint recovery")
             .expect("a matching checkpoint must be found");
+        assert!(recovery.subagent_events.iter().any(|event| matches!(
+            &event.kind, SessionEventKind::AgentMessageReceived { message_id, .. } if *message_id == receipt_id
+        )));
         // The checkpoint's own prompt is resolved, so it must not be replayed.
         let queue_ids: Vec<Uuid> = recovery
             .queue_events

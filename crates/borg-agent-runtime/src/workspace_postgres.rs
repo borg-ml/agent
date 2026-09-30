@@ -1462,6 +1462,34 @@ impl WorkspaceStore for PostgresWorkspaceStore {
         Ok(workspace_id)
     }
 
+    async fn message_events_after(
+        &self,
+        workspace_id: Uuid,
+        recipient_id: Uuid,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceEvent>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "select e.event_json from workspace_events e \
+             join workspace_deliveries d on d.workspace_id = e.workspace_id \
+               and d.sequence = e.sequence and d.recipient_id = $2 \
+             where e.workspace_id = $1 and e.is_message and e.sequence > $3 \
+             order by e.sequence limit $4",
+        )
+        .bind(workspace_id.to_string())
+        .bind(recipient_id.to_string())
+        .bind(i64::try_from(after_sequence)?)
+        .bind(i64::try_from(limit.min(256))?)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| Ok(serde_json::from_str(row.try_get("event_json")?)?))
+            .collect()
+    }
+
     async fn pending_message_events(
         &self,
         workspace_id: Uuid,

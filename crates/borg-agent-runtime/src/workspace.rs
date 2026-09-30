@@ -703,6 +703,16 @@ pub trait WorkspaceStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<(WorkspaceEvent, RecipientDelivery)>>;
 
+    /// Canonical messages addressed to a recipient, including already consumed
+    /// deliveries, in bounded sequence pages. This read does not admit input.
+    async fn message_events_after(
+        &self,
+        workspace_id: Uuid,
+        recipient_id: Uuid,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceEvent>>;
+
     /// Every recipient delivery row for one message, across all workspaces.
     async fn message_deliveries(&self, message_id: Uuid) -> Result<Vec<RecipientDelivery>>;
 

@@ -457,6 +457,7 @@ struct RuntimeSessionStore {
     workspace_projection: Option<WorkspaceProjection>,
     projection_diagnostics: VecDeque<SessionEvent>,
     plan_projection_generation: u64,
+    received_agent_messages: HashSet<Uuid>,
 }
 
 #[derive(Clone)]
@@ -793,6 +794,7 @@ impl RuntimeSessionStore {
             workspace_projection: None,
             projection_diagnostics: VecDeque::new(),
             plan_projection_generation: 0,
+            received_agent_messages: HashSet::new(),
         }
     }
 
@@ -913,6 +915,9 @@ impl RuntimeSessionStore {
 
     /// Fold a persisted event into the live context, exactly as `append` does.
     async fn absorb_appended(&mut self, event: &SessionEvent) -> Result<()> {
+        if let SessionEventKind::AgentMessageReceived { message_id, .. } = &event.kind {
+            self.received_agent_messages.insert(*message_id);
+        }
         if matches!(
             event.kind,
             SessionEventKind::PlanProjected { .. }
@@ -2094,6 +2099,12 @@ async fn run_agent_session_store_kernel_inner(
     if let Some(projection) = workspace_projection.clone() {
         journal = journal.with_workspace_projection(projection);
     }
+    journal.received_agent_messages.extend(recovery.subagent_events.iter().filter_map(|event| {
+        match &event.kind {
+            SessionEventKind::AgentMessageReceived { message_id, .. } => Some(*message_id),
+            _ => None,
+        }
+    }));
     journal.resolve_deferred_provider_payloads().await?;
     if fresh {
         record(
@@ -2454,6 +2465,15 @@ async fn run_agent_session_store_kernel_inner(
         .unwrap_or_else(|| disabled_root_tx.subscribe());
     let mut root_inbox_tick = tokio::time::interval(ROOT_INBOX_REFRESH_INTERVAL);
     root_inbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let (receipt_tx, mut receipt_rx) = mpsc::channel(16);
+    let _receipt_collector = workspace_projection.as_ref().map(|projection| {
+        AbortTask(tokio::spawn(collect_agent_message_receipts(
+            Arc::clone(&projection.store),
+            projection.agent_participant_id,
+            journal.received_agent_messages.clone(),
+            receipt_tx,
+        )))
+    });
     let mut team_ack_tick = tokio::time::interval(TEAM_ACK_REFRESH_INTERVAL);
     team_ack_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // The recovery slice includes these lightweight rows without replaying
@@ -3129,6 +3149,10 @@ async fn run_agent_session_store_kernel_inner(
                                         .await?;
                                         continue 'session;
                                     }
+                    Some(kind) = receipt_rx.recv() => {
+                        record(&mut journal, &events, session_id, kind).await?;
+                        continue;
+                    }
                     result = work_plan_refresh.next(), if work_plan_refresh.is_pending() => {
                         match result {
                             Ok(kind) => work_plan_refresh.apply(kind, &mut journal, &events, &work_plan).await?,
@@ -7051,6 +7075,9 @@ async fn run_agent_session_store_kernel_inner(
                         .await?;
                     }
                     }
+                }
+                Some(kind) = receipt_rx.recv() => {
+                    record(&mut journal, &events, session_id, kind).await?;
                 }
                 result = work_plan_refresh.next(), if work_plan_refresh.is_pending() => {
                     match result {
@@ -12267,6 +12294,71 @@ fn subject_life(status: SubagentStatus) -> SubjectLife {
     }
 }
 
+// Receipt projection is independent of input delivery and of the subagent
+// runtime. Only the actor receiving these rows may append its journal.
+async fn collect_agent_message_receipts(
+    store: Arc<dyn WorkspaceStore>,
+    recipient_id: Uuid,
+    mut seen: HashSet<Uuid>,
+    receipts: mpsc::Sender<SessionEventKind>,
+) {
+    const PAGE_SIZE: usize = 32;
+    let mut cursors = HashMap::<Uuid, u64>::new();
+    loop {
+        let poll: Result<()> = async {
+            for workspace in store.list_workspaces_for_participant(recipient_id).await? {
+                // A busy workspace must not starve receipts in another one.
+                for _ in 0..4 {
+                    let after = cursors.get(&workspace.id).copied().unwrap_or(0);
+                    let page = store
+                        .message_events_after(workspace.id, recipient_id, after, PAGE_SIZE)
+                        .await?;
+                    let full = page.len() == PAGE_SIZE;
+                    for event in page {
+                        let sequence = event.sequence;
+                        if let WorkspaceEventKind::Message { message, .. } = event.kind
+                            && message.author_id == event.author_id
+                            && message.workspace_id == workspace.id
+                            && message.author_id != recipient_id
+                            && !seen.contains(&message.id)
+                            && let Some(sender) = store.participant(message.author_id).await?
+                            && sender.kind == crate::ParticipantKind::Agent
+                        {
+                            let message_id = message.id;
+                            receipts
+                                .send(SessionEventKind::AgentMessageReceived {
+                                    message_id,
+                                    sender_id: sender.id,
+                                    sender_name: sender.display_name,
+                                    text: message.body.text,
+                                })
+                                .await
+                                .context("receipt actor closed")?;
+                            seen.insert(message_id);
+                        }
+                        cursors.insert(workspace.id, sequence);
+                    }
+                    if !full {
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if receipts.is_closed() {
+            return;
+        }
+        if let Err(error) = poll {
+            tracing::warn!(%recipient_id, %error, "peer receipt collection failed; retrying");
+        }
+        tokio::select! {
+            _ = receipts.closed() => return,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
 /// Forward the coordinator's child activity onto the actor's own channel.
 ///
 /// The coordinator broadcasts on a receiver of its own, so without this every
@@ -13473,6 +13565,11 @@ async fn record(
     session_id: Uuid,
     kind: SessionEventKind,
 ) -> Result<()> {
+    if let SessionEventKind::AgentMessageReceived { message_id, .. } = &kind
+        && journal.received_agent_messages.contains(message_id)
+    {
+        return Ok(());
+    }
     let preceding_diagnostics = journal.take_projection_diagnostics();
     let persistence = kind.persistence();
     let event = journal
