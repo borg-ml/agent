@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-const VERSION: &str = "2.1.281";
+const VERSION: &str = "2.1.285";
 const PROTOCOL: u32 = 1;
 const SCRIPT: &str = include_str!("claude_connector.js");
 const RELEASE_ROOT: &str = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases";
@@ -173,35 +173,35 @@ fn platform_release() -> Result<(&'static str, &'static str)> {
     ) {
         ("linux", "x86_64", false) => Ok((
             "linux-x64",
-            "56fe3da88458465fb27d7e9299dddb3fead55750fb9c2de795f233b5eea6dce1",
+            "33dad1ec615a2e08cc78b494f05c110e49916de2c79d78ec8799ebf46b233d29",
         )),
         ("linux", "aarch64", false) => Ok((
             "linux-arm64",
-            "dd27b36438a4fed1670cd29bad2fda6a73b628b6da55443e5c2f647fe6ed328f",
+            "24fac77749bed3d91365d6b6915aa4b824e14318ecb6bc17adbc192f01c9173d",
         )),
         ("linux", "x86_64", true) => Ok((
             "linux-x64-musl",
-            "30220a5cf0628634599e0ede13a5cc8144b2c40e35abf762f0598a33636f7bca",
+            "7b4414af1bc06eb6d91730759bd01c4c02a4976d0b8526237e9a6d8c33eaf102",
         )),
         ("linux", "aarch64", true) => Ok((
             "linux-arm64-musl",
-            "4f72ebbb08706651e7a2204303793700698f4046bc31f3e7e65b381063b7c210",
+            "31efc4136bc678575f4c6730e248d34f89dbfea0468be1c5d012af199cd62ee8",
         )),
         ("macos", "aarch64", _) => Ok((
             "darwin-arm64",
-            "a922981f6f3b55a251ef9f9dbaa0621a5f99cbcb5ca67f8a797476ccfc83f626",
+            "51f09bd1e021d9fa8a1864c179799bd37cb39962a937935c5cf6823398e86db4",
         )),
         ("macos", "x86_64", _) => Ok((
             "darwin-x64",
-            "a9355cbb0d291ce948efcf61a6ef397401672f64fa5e5e67bca092fed6cd9088",
+            "24835f7ca4b4338c33ad21c98a3402d9c22f89b8055075d18828e97973844ec3",
         )),
         ("windows", "x86_64", _) => Ok((
             "win32-x64",
-            "39be063c2512b43347fe7b0ab18c46f1596141701c9c5fc895ddfca9a051067c",
+            "121fc8151ed40bd9c144d68aa1cea23427803628ffab65e23da1cceda155697e",
         )),
         ("windows", "aarch64", _) => Ok((
             "win32-arm64",
-            "103730182fe4dd36b8ff7791a408ac6144b2c40e35ab7b56b3561ce1d385ecbb",
+            "0865d6bdeec16e2d523dce329c3c73f2c3d7675b804e679c0fc3b477651b1059",
         )),
         _ => bail!("the Claude shared model connector has no pinned runtime for this platform"),
     }

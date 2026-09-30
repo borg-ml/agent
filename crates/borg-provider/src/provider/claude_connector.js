@@ -1,11 +1,11 @@
-// Subscription model transport for the unmodified, checksummed 2.1.281 runtime.
+// Subscription model transport for the unmodified, checksummed 2.1.285 runtime.
 // This preload exits before Claude Code's entrypoint and never runs its agent loop.
 import http from 'node:http';
 import { once } from 'node:events';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '2.1.281';
+const VERSION = '2.1.285';
 const PROTOCOL = 1;
 const MAX_BODY = 64 * 1024 * 1024;
 const MAX_HELD = 256 * 1024 * 1024;
@@ -25,15 +25,15 @@ let lastActivity = Date.now();
 const active = new Map();
 
 function subscriptionToken() {
-  const auth = core.un();
-  if (!core.Ec() || !auth?.accessToken || !auth.scopes?.includes('user:inference')) {
+  const auth = core.ln();
+  if (!core.nl() || !auth?.accessToken || !auth.scopes?.includes('user:inference')) {
     throw Error('Claude subscription login required. Run claude auth login for the selected account.');
   }
   return auth.accessToken;
 }
 
 async function verifyIdentity() {
-  await core.Cie();
+  await core.A6();
   const token = subscriptionToken();
   if (verifiedToken === token) return;
   if (verification) {
@@ -41,7 +41,7 @@ async function verifyIdentity() {
     return verifyIdentity();
   }
   verification = (async () => {
-    const profile = await core.PMe(token);
+    const profile = await core.EFe(token);
     const account = profile?.account?.uuid;
     const organization = profile?.organization?.uuid;
     if (!account || !organization) {
@@ -56,17 +56,17 @@ async function verifyIdentity() {
 
 function capabilities(name) {
   if (typeof name !== 'string' || name.length > 200) throw Error('Invalid model');
-  const resolved = core.kt(name);
-  if (!core.Kr(resolved)) throw Error('The selected Claude model is unavailable for this account.');
-  const spec = model.tY([{ value: resolved, label: resolved, description: '' }])[0];
-  const limits = core.T4(resolved);
+  const resolved = core.Ot(name);
+  if (!core.$r(resolved)) throw Error('The selected Claude model is unavailable for this account.');
+  const spec = model.IX([{ value: resolved, label: resolved, description: '' }])[0];
+  const limits = core.E6(resolved);
   return {
-    model: core.BO(resolved), context_window: core.cg(resolved),
+    model: core.Wx(resolved), context_window: core.Wg(resolved),
     default_output_tokens: limits.default, max_output_tokens: limits.upperLimit,
-    thinking: core.uAr(resolved), adaptive_thinking: !!spec.supportsAdaptiveThinking,
-    thinking_required: core.fKe(resolved), fast: !!spec.supportsFastMode,
+    thinking: core.xNo(resolved), adaptive_thinking: !!spec.supportsAdaptiveThinking,
+    thinking_required: core.t_e(resolved), fast: !!spec.supportsFastMode,
     efforts: spec.supportedEffortLevels ?? [],
-    betas: core.C8(resolved).map(beta => beta.header),
+    betas: core.FJ(resolved).map(beta => beta.header),
   };
 }
 
@@ -163,11 +163,11 @@ async function infer(request, response, value) {
     const wire = {
       ...body, model: spec.model, stream: true,
       betas: [...new Set([...spec.betas, ...(body.betas ?? [])])],
-      system: [{ type: 'text', text: billing.LEr(fingerprint(body.messages), agentContext, undefined, undefined, undefined, { ignoreEnvOptOut: true }) }, ...(body.system ?? [])],
-      metadata: { user_id: JSON.stringify({ device_id: core.zO(), account_uuid: accountUuid, session_id }) },
+      system: [{ type: 'text', text: billing.ZNr(fingerprint(body.messages), agentContext, undefined, undefined, undefined, undefined, { ignoreEnvOptOut: true }) }, ...(body.system ?? [])],
+      metadata: { user_id: JSON.stringify({ device_id: core.ID(), account_uuid: accountUuid, session_id }) },
     };
     const clientForCall = async () => {
-      const client = await model.kG({ maxRetries: 0, model: spec.model, source: 'borg_model_connector', agentContext });
+      const client = await model.rF({ maxRetries: 0, model: spec.model, source: 'borg_model_connector', agentContext });
       if (client.apiKey || !client.authToken || new URL(client.baseURL).origin !== 'https://api.anthropic.com') {
         const error = Error();
         error.borgMessage = 'Claude subscription transport refused a different credential or endpoint.';
@@ -205,7 +205,7 @@ async function infer(request, response, value) {
         break;
       } catch (error) {
         if (attempt !== 0 || receivedEvent || controller.signal.aborted || error.status !== 401) throw error;
-        if (!await core._y(client.authToken)) throw error;
+        if (!await core.p_(client.authToken)) throw error;
         await verifyIdentity();
         if (identity !== account_identity) throw Error('Claude account changed during recovery');
       }
@@ -266,11 +266,11 @@ try {
   if (!/^[a-f0-9]{64}$/.test(secret) || options.protocol !== PROTOCOL ||
       !/^[a-f0-9]{64}$/.test(options.revision) || typeof options.endpoint_path !== 'string') throw Error('Invalid connector bootstrap');
   [core, model, billing] = await Promise.all([
-    import('/$bunfs/root/chunk-5khn4tvf.js'),
-    import('/$bunfs/root/chunk-adsaemws.js'),
-    import('/$bunfs/root/chunk-649gsb4b.js'),
+    import('/$bunfs/root/chunk-f74xvn8g.js'),
+    import('/$bunfs/root/chunk-9v35ka7v.js'),
+    import('/$bunfs/root/chunk-t5hhxe3x.js'),
   ]);
-  await core.LKe();
+  await core.f8e();
   await verifyIdentity();
   const server = http.createServer({ requestTimeout: 30000, headersTimeout: 10000, maxHeaderSize: 8192 }, (request, response) => {
     serve(request, response).catch(() => response.destroy());

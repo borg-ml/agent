@@ -2,7 +2,7 @@
 
 **Historical compatibility transport.** Normal Claude execution now uses
 [the shared model connector](claude-shared-model-connector.md), pinned to
-Claude Code 2.1.281. Borg owns the agent loop and calls private model modules
+Claude Code 2.1.285. Borg owns the agent loop and calls private model modules
 through a shared helper. The stream-json controls described below remain a
 reference for the legacy adapter; they do not provide the new sharing boundary.
 

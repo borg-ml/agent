@@ -10,7 +10,7 @@ path. The historical prototype measurements below are labeled separately.
 The [subscription model provider](../crates/borg-provider/src/provider/claude_model.rs)
 now uses a [host broker](../crates/borg-provider/src/provider/claude_connector.rs)
 and [model-only preload](../crates/borg-provider/src/provider/claude_connector.js).
-The broker validates the official **2.1.281** binary checksum, coordinates startup
+The broker validates the official **2.1.285** binary checksum, coordinates startup
 across Borg processes, and protects its local transport with a private random
 credential. The helper inherits the startup lock and publishes its own endpoint,
 so a launcher exit cannot release ownership during startup. It selects a persistent credential authority independently of the
