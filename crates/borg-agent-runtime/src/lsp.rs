@@ -886,7 +886,12 @@ impl LspClient {
         } else {
             json!({
                 "textDocument": { "uri": uri, "version": version },
-                "contentChanges": [{ "text": text.clone() }]
+                "contentChanges": [{ "text": text.clone() }],
+                // clangd may suppress diagnostics for an unchanged buffer,
+                // even though this client waits for the new version. Its
+                // protocol extension requests publication for this generation;
+                // other servers ignore the additional field.
+                "wantDiagnostics": true
             })
         };
         self.notify(method, params).await?;
