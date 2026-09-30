@@ -39,6 +39,22 @@ fn detached_host_uses_replacement_after_atomic_update() {
     );
 }
 
+// The child must distinguish a bare launch from an explicit provider choice,
+// otherwise it cannot apply the user's saved model preference.
+#[test]
+fn detached_host_preserves_implicit_provider_selection() {
+    let mut args = LocalAgentCliArgs::resume(None);
+    let mut command = TokioCommand::new("borg");
+    append_session_host_arguments(&mut command, &args, true).unwrap();
+    assert!(!command.as_std().get_args().any(|arg| arg == "--provider"));
+
+    args.provider = Some(crate::cli::RemoteProviderArg::Codex);
+    let mut command = TokioCommand::new("borg");
+    append_session_host_arguments(&mut command, &args, true).unwrap();
+    let forwarded: Vec<_> = command.as_std().get_args().collect();
+    assert!(forwarded.windows(2).any(|pair| pair == ["--provider", "codex"]));
+}
+
 #[test]
 fn force_quit_does_not_wait_for_runtime_teardown() {
     const CHILD: &str = "BORG_TEST_FORCE_QUIT_CHILD";

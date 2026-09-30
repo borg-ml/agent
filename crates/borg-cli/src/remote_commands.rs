@@ -1657,9 +1657,9 @@ fn append_session_host_arguments(
     if let Some(cwd) = args.cwd.as_ref().or(implicit_cwd.as_ref()) {
         command.arg("--cwd").arg(cwd);
     }
-    command
-        .arg("--provider")
-        .arg(provider_argument(args.provider()));
+    if let Some(provider) = args.provider {
+        command.arg("--provider").arg(provider_argument(provider));
+    }
     if let Some(model) = args.model.as_ref() {
         command.arg("--model").arg(model);
     }
