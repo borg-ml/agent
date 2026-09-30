@@ -1842,6 +1842,8 @@ struct HoverState {
     billing_status_hovered: bool,
     shell_status_hovered: bool,
     hovered_shell_row: Option<usize>,
+    watch_status_hovered: bool,
+    hovered_watch_row: Option<usize>,
     agents_status_hovered: bool,
     model_status_hovered: bool,
     effort_status_hovered: bool,
@@ -1874,6 +1876,8 @@ impl BorgTerminal {
             billing_status_hovered: self.billing_status_hovered,
             shell_status_hovered: self.shell_status_hovered,
             hovered_shell_row: self.hovered_shell_row,
+            watch_status_hovered: self.watch_status_hovered,
+            hovered_watch_row: self.hovered_watch_row,
             agents_status_hovered: self.agents_status_hovered,
             model_status_hovered: self.model_status_hovered,
             effort_status_hovered: self.effort_status_hovered,
@@ -8258,8 +8262,13 @@ impl BorgTerminal {
         }
         let watch_status = self.transcript.watch_status();
         let watch_rows = self.transcript.watch_rows();
-        if watch_rows.is_empty() {
+        if watch_status.is_none() {
             self.watch_menu_open = false;
+            self.watch_status_hovered = false;
+            self.hovered_watch_row = None;
+            if self.status_focus == Some(StatusFocus::Watch) {
+                self.leave_status_focus();
+            }
         }
         let todo_status = self.transcript.todo_status();
         let slash_suggestions = (self.picker.is_none())

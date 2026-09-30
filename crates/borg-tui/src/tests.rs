@@ -1810,6 +1810,8 @@ fn hover_redraw_gate_ignores_motion_inside_one_target() {
         billing_status_hovered: false,
         shell_status_hovered: false,
         hovered_shell_row: None,
+        watch_status_hovered: false,
+        hovered_watch_row: None,
         agents_status_hovered: false,
         model_status_hovered: false,
         effort_status_hovered: false,
@@ -1833,7 +1835,20 @@ fn hover_redraw_gate_ignores_motion_inside_one_target() {
 
     assert!(!hover_state_changed(idle.clone(), idle.clone()));
     assert!(hover_state_changed(idle.clone(), hovered_link));
-    assert!(hover_state_changed(idle, running));
+    assert!(hover_state_changed(idle.clone(), running));
+    let watch_hover = HoverState {
+        watch_status_hovered: true,
+        ..idle.clone()
+    };
+    let watch_row_hover = HoverState {
+        hovered_watch_row: Some(0),
+        ..idle.clone()
+    };
+    for hovered in [watch_hover, watch_row_hover] {
+        assert!(hover_state_changed(idle.clone(), hovered.clone()));
+        assert!(hover_state_changed(hovered.clone(), idle.clone()));
+        assert!(!hover_state_changed(hovered.clone(), hovered));
+    }
 }
 
 #[test]
@@ -11454,7 +11469,7 @@ async fn keyboard_reaches_status_line_menus_without_a_mouse() {
     };
     terminal.watch_status_area = Some(Rect::new(
         2,
-        terminal.composer_area.expect("drawn composer").bottom() + 1,
+        terminal.status_focus_targets().last().unwrap().1.bottom(),
         8,
         1,
     ));
@@ -11502,6 +11517,46 @@ async fn keyboard_reaches_status_line_menus_without_a_mouse() {
         Some(PickerKind::Permission)
     ));
     assert_eq!(terminal.status_focus, None);
+    terminal.apply_session_event(&SessionEvent::new(
+        Uuid::new_v4(),
+        1,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "Build".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    ));
+    terminal.transcript.watches = vec![WatchSummary {
+        watch_id: Uuid::new_v4(),
+        label: "Build".to_string(),
+        command: "build".to_string(),
+        running: true,
+        started_at: Utc::now(),
+        last_event_at: None,
+        event_count: 0,
+    }];
+    terminal.picker = None;
+    terminal.watch_menu_open = true;
+    terminal.set_status_focus(Some(StatusFocus::Watch), Some(0));
+    terminal.draw().unwrap();
+    assert!(terminal.watch_status_area.is_some());
+    assert!(!terminal.watch_row_hit_areas.is_empty());
+
+    // Exited watches remain in history, but cannot leave an orphaned menu
+    // after the last running watch's footer control disappears.
+    terminal.transcript.watches[0].running = false;
+    terminal.draw().unwrap();
+    assert!(!terminal.watch_menu_open);
+    assert!(!terminal.watch_status_hovered);
+    assert_eq!(terminal.hovered_watch_row, None);
+    assert_eq!(terminal.status_focus, None);
+    assert!(terminal.watch_status_area.is_none());
+    assert!(terminal.watch_row_hit_areas.is_empty());
+    terminal.handle_key(key(KeyCode::Char('z'))).unwrap();
+    assert_eq!(terminal.composer.text, "z");
     terminal.shutdown().await;
 }
 
