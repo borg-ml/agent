@@ -13198,13 +13198,13 @@ fn nested_wheel_motion_applies_a_coalesced_gesture_in_one_render_frame() {
 #[test]
 fn wheel_distance_scales_with_the_target_viewport_height() {
     assert_eq!(wheel_scroll_lines(1), 1);
-    assert_eq!(wheel_scroll_lines(6), 1);
-    assert_eq!(wheel_scroll_lines(12), 2);
-    assert_eq!(wheel_scroll_lines(18), 3);
-    assert_eq!(wheel_scroll_lines(30), 5);
-    assert_eq!(wheel_scroll_lines(48), 8);
-    assert_eq!(wheel_scroll_lines(72), 12);
-    assert_eq!(wheel_scroll_lines(120), 12);
+    assert_eq!(wheel_scroll_lines(8), 1);
+    assert_eq!(wheel_scroll_lines(16), 2);
+    assert_eq!(wheel_scroll_lines(24), 3);
+    assert_eq!(wheel_scroll_lines(30), 4);
+    assert_eq!(wheel_scroll_lines(48), 6);
+    assert_eq!(wheel_scroll_lines(72), 9);
+    assert_eq!(wheel_scroll_lines(120), 9);
 }
 
 #[test]
@@ -13221,11 +13221,11 @@ fn nested_wheel_distance_eases_in_quadratically_with_terminal_height() {
     assert_eq!(nested_wheel_scroll_lines(1), 1);
     assert_eq!(nested_wheel_scroll_lines(36), 1);
     assert_eq!(nested_wheel_scroll_lines(48), 2);
-    assert_eq!(nested_wheel_scroll_lines(54), 4);
-    assert_eq!(nested_wheel_scroll_lines(60), 6);
-    assert_eq!(nested_wheel_scroll_lines(66), 9);
-    assert_eq!(nested_wheel_scroll_lines(72), 12);
-    assert_eq!(nested_wheel_scroll_lines(120), 12);
+    assert_eq!(nested_wheel_scroll_lines(54), 3);
+    assert_eq!(nested_wheel_scroll_lines(60), 5);
+    assert_eq!(nested_wheel_scroll_lines(66), 7);
+    assert_eq!(nested_wheel_scroll_lines(72), 9);
+    assert_eq!(nested_wheel_scroll_lines(120), 9);
 }
 
 #[test]
@@ -13233,8 +13233,8 @@ fn coalesced_nested_wheel_bursts_preserve_height_scaled_distance() {
     let repetitions = 3;
 
     assert_eq!(nested_wheel_scroll_distance(36, repetitions), 3);
-    assert_eq!(nested_wheel_scroll_distance(54, repetitions), 12);
-    assert_eq!(nested_wheel_scroll_distance(72, repetitions), 36);
+    assert_eq!(nested_wheel_scroll_distance(54, repetitions), 9);
+    assert_eq!(nested_wheel_scroll_distance(72, repetitions), 27);
 }
 
 #[test]
