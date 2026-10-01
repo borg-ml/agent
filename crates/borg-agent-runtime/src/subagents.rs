@@ -3503,7 +3503,10 @@ impl SubagentTable {
         if target == "/root" || target == "root" {
             return Ok(self.root_session_id);
         }
-        let session_id = target.strip_prefix("session:").unwrap_or(target);
+        let session_id = target
+            .strip_prefix("session:")
+            .or_else(|| target.strip_prefix("participant:"))
+            .unwrap_or(target);
         if let Ok(id) = Uuid::parse_str(session_id)
             && (id == self.root_session_id || self.entries.contains_key(&id))
         {
@@ -5924,6 +5927,10 @@ impl SubagentCoordinator {
                 // the live set instead of re-probing years of dead sessions.
                 if !crate::local_session_owner_is_active(&self.journal_root, participant_id)
                     .unwrap_or(false)
+                    && !instance
+                        .pid
+                        .and_then(|pid| u32::try_from(pid).ok())
+                        .is_some_and(crate::local_control::process_is_alive)
                 {
                     reap.push(participant_id);
                 }
@@ -5986,44 +5993,6 @@ impl SubagentCoordinator {
             .map(|_| ())
     }
 
-    /// Refuse a message to a session this machine ran whose owner is gone.
-    /// Queueing it reported success for mail nobody will ever read. Only
-    /// positive evidence counts: the row was retired, or the owner pid it
-    /// recorded here is no longer alive.
-    async fn refuse_dead_local_target(&self, actor_session_id: Uuid, target: Uuid) -> Result<()> {
-        let socket_path = crate::session_control_socket_path(&self.journal_root, target);
-        if crate::session_control_socket_is_reachable(&socket_path).await {
-            return Ok(());
-        }
-        let own_host = self
-            .store
-            .workspace_binding(actor_session_id)
-            .await?
-            .and_then(|binding| binding.host_id);
-        let Some(instance) = self
-            .workspace_store()
-            .await?
-            .list_instances(true)
-            .await?
-            .into_iter()
-            .find(|instance| instance.participant.id == target)
-        else {
-            return Ok(());
-        };
-        let ours = instance.pid.is_some() || (own_host.is_some() && instance.host_id == own_host);
-        let dead = instance.exited_at.is_some()
-            || instance
-                .pid
-                .and_then(|pid| u32::try_from(pid).ok())
-                .is_some_and(|pid| !crate::local_control::process_is_alive(pid));
-        ensure!(
-            !(ours && dead),
-            "session {target} is not running: its process on this machine has exited, so it \
-             cannot receive messages. Use list_instances to find a live peer."
-        );
-        Ok(())
-    }
-
     async fn route_message_with_options_as(
         &self,
         actor_session_id: Uuid,
@@ -6055,9 +6024,6 @@ impl SubagentCoordinator {
                 RemoteMessageTarget::Session(id) => id,
             },
         };
-        if local_id.is_none() {
-            self.refuse_dead_local_target(actor_session_id, id).await?;
-        }
         ensure!(
             id != actor_session_id,
             "message recipient must differ from its author"
@@ -6077,6 +6043,8 @@ impl SubagentCoordinator {
             .session_message_needs_relay(actor_session_id, id)
             .await?;
         if local_id.is_none() {
+            // A retired process does not retire the logical recipient. Keep
+            // the durable message pending when immediate dispatch is unavailable.
             let socket_path = crate::session_control_socket_path(&self.journal_root, id);
             let dispatched_locally =
                 if !relay_pending && tokio::fs::try_exists(&socket_path).await.unwrap_or(false) {
@@ -6246,9 +6214,6 @@ impl SubagentCoordinator {
                 RemoteMessageTarget::Session(id) => id,
             },
         };
-        if local_id.is_none() {
-            self.refuse_dead_local_target(actor_session_id, id).await?;
-        }
         ensure!(
             id != actor_session_id,
             "message recipient must differ from its author"
@@ -6433,8 +6398,6 @@ impl SubagentCoordinator {
             actor.participant_id != recipient_participant_id,
             "message recipient must differ from its author"
         );
-        self.refuse_dead_local_target(actor_session_id, recipient_participant_id)
-            .await?;
         let store = self.workspace_store().await?;
         if self
             .store
@@ -6901,7 +6864,32 @@ impl SubagentCoordinator {
                 // probed for every row before anything was discarded, so a
                 // listing cost one binding query plus a socket connect per
                 // historical participant to return a page of results.
-                for instance in workspace_store.list_instances(args.include_exited).await? {
+                let team = {
+                    let table = self.table.lock().await;
+                    let mut team: HashMap<Uuid, SubagentStatus> = table
+                        .entries
+                        .iter()
+                        .filter(|(_, entry)| !entry.snapshot.status.is_terminal())
+                        .map(|(id, entry)| (*id, entry.snapshot.status))
+                        .collect();
+                    team.insert(table.root_session_id, SubagentStatus::Running);
+                    team
+                };
+                for mut instance in workspace_store.list_instances(true).await? {
+                    if let Some(status) = team.get(&instance.participant.id) {
+                        instance.exited_at = None;
+                        instance.status = Some(
+                            match status {
+                                SubagentStatus::Running | SubagentStatus::WaitingForApproval => {
+                                    "running"
+                                }
+                                SubagentStatus::Starting => "starting",
+                                SubagentStatus::Ready => "ready",
+                                SubagentStatus::Stopped | SubagentStatus::Failed => "stopped",
+                            }
+                            .into(),
+                        );
+                    }
                     // host_id is deliberately NOT filtered here: a local row
                     // takes its host from the session binding resolved below,
                     // so matching the raw column would drop every local
@@ -6958,14 +6946,19 @@ impl SubagentCoordinator {
                     let live =
                         local && crate::session_control_socket_is_reachable(&socket_path).await;
                     let owner_running = local
-                        && crate::local_session_owner_is_active(
-                            &self.journal_root,
-                            instance.participant.id,
-                        )
-                        .unwrap_or(false);
-                    // A local row whose owner is gone is dead for good: nothing
-                    // reanimates that participant id. Tombstone it so the table
-                    // stops growing without bound.
+                        && (team.contains_key(&instance.participant.id)
+                            || crate::local_session_owner_is_active(
+                                &self.journal_root,
+                                instance.participant.id,
+                            )
+                            .unwrap_or(false)
+                            || instance
+                                .pid
+                                .and_then(|pid| u32::try_from(pid).ok())
+                                .is_some_and(crate::local_control::process_is_alive));
+                    // Children in this team belong to this process, not an
+                    // independent control-socket owner. Retired registry rows
+                    // must not hide a reused child that the team still owns.
                     if local
                         && !live
                         && !owner_running
