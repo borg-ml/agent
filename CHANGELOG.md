@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.13.4)
 
+### Models
+
+- Long screenshot sessions on Claude no longer exceed the API's 32 MB request
+  limit. The newest images are kept within the budget and older ones are
+  replaced with a note, instead of the oversized request being misread as a
+  full context window and forcing an early compaction. When a provider refuses
+  a request as too long, the refusal text is recorded, and the compaction notice
+  no longer reports Borg's local estimate as the context window.
+
 ## 0.13.4 (2026-10-01)
 
 ### Models
