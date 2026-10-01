@@ -16460,6 +16460,106 @@ async fn monitor_event_wakes_an_idle_session_without_an_active_goal() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn connection_retry_with_queued_followup_continues_completed_work() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let followup_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(NetworkThenSuccessExecutor {
+        calls: Arc::clone(&calls),
+        error: "Codex model stream disconnected",
+        failures: 1,
+    });
+    let actor_store = Arc::clone(&store);
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    ultrafast: None,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                    name: None,
+                    initial_prompt: Some("finish this task".into()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                actor_store,
+            )
+            .await
+        }
+    });
+
+    let mut completed = HashSet::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+            .await
+            .expect("batched connection retry completes")
+            .expect("session remains attached");
+        match event.kind {
+            SessionEventKind::ProviderEvent { kind, .. } if kind == "network_retry" => {
+                command_tx
+                    .send(HostCommand::Prompt {
+                        session_id,
+                        message_id: followup_id,
+                        text: "also recover destroyed-container contents".into(),
+                        attachments: Vec::new(),
+                        output_schema: None,
+                        delivery: PromptDelivery::Queue,
+                    })
+                    .await
+                    .unwrap();
+            }
+            SessionEventKind::Message {
+                actor: EventActor::User,
+                message_id,
+                status: MessageStatus::Complete,
+                ..
+            } => {
+                completed.insert(message_id);
+            }
+            SessionEventKind::TurnCompleted {
+                message_id: id,
+                error,
+                ..
+            } if id == followup_id => {
+                assert!(error.is_none(), "batched retry failed: {error:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+    assert_eq!(calls.load(Ordering::Acquire), 2);
+    assert_eq!(completed, HashSet::from([message_id, followup_id]));
+    scratch.discard().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn escape_cancels_connection_retry_without_losing_the_prompt() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();

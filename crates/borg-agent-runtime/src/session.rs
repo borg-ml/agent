@@ -4191,6 +4191,17 @@ async fn run_agent_session_store_kernel_inner(
             stop(&mut journal, &events, session_id).await?;
             return Ok(());
         };
+        // Queue batching adopts the newest message's id. Keep a retry tied to
+        // the batch containing its original prompt so continuation framing and
+        // retry accounting survive a follow-up arriving during reconnection.
+        if network_retry_message_id.is_some_and(|id| {
+            prompt
+                .batch_entries()
+                .iter()
+                .any(|entry| entry.message_id == id)
+        }) {
+            network_retry_message_id = Some(prompt.message_id);
+        }
         // Single chokepoint for the user-stop gate: every background admission
         // path funnels through here, so after a human Escape nothing but an
         // explicit human prompt reaches provider admission.
