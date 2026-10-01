@@ -332,7 +332,7 @@ pub(super) fn markdown_link_ranges(markdown: &str, lines: &[Line<'_>]) -> Vec<Li
     for event in Parser::new_ext(&markdown, Options::all()) {
         match event {
             MarkdownEvent::Start(Tag::Link { dest_url, .. }) => {
-                active = Some((safe_http_url(&dest_url), String::new()));
+                active = Some((link_target(&dest_url), String::new()));
             }
             MarkdownEvent::Text(text) | MarkdownEvent::Code(text) => {
                 if let Some((_, label)) = active.as_mut() {
@@ -390,29 +390,111 @@ pub(super) fn markdown_link_ranges(markdown: &str, lines: &[Line<'_>]) -> Vec<Li
             column += width;
         }
     }
+    // Bare URLs. One the layout wrapped continues as the first text of the
+    // next row, so its pieces are joined into a single destination.
+    let mut bare: Vec<(Vec<(usize, usize, usize)>, String)> = Vec::new();
+    let mut continues = false;
     for (row, line) in lines.iter().enumerate() {
+        let first = line
+            .spans
+            .iter()
+            .position(|span| !span.content.trim().is_empty());
+        let last = line
+            .spans
+            .iter()
+            .rposition(|span| !span.content.trim().is_empty());
         let mut column = 0usize;
-        for span in &line.spans {
+        let mut open = false;
+        for (index, span) in line.spans.iter().enumerate() {
             let width = span.width();
             if span.style.fg == Some(Color::LightBlue)
                 && span.style.add_modifier.contains(Modifier::UNDERLINED)
                 && !links
                     .iter()
                     .any(|link| link.row == row && link.start < column + width && column < link.end)
-                && let Some(url) = safe_http_url(&span.content)
             {
-                links.push(LinkRowRange {
-                    row,
-                    start: column,
-                    end: column + width,
-                    url,
-                });
+                let text = span.content.trim();
+                let piece = (row, column, column + width);
+                match bare.last_mut() {
+                    Some((pieces, url))
+                        if continues
+                            && Some(index) == first
+                            && !text.starts_with("http://")
+                            && !text.starts_with("https://") =>
+                    {
+                        pieces.push(piece);
+                        url.push_str(text);
+                    }
+                    _ => bare.push((vec![piece], text.to_string())),
+                }
+                open = Some(index) == last;
             }
             column += width;
+        }
+        continues = open;
+    }
+    for (pieces, url) in bare {
+        if let Some(url) = safe_http_url(&url) {
+            links.extend(pieces.into_iter().map(|(row, start, end)| LinkRowRange {
+                row,
+                start,
+                end,
+                url: url.clone(),
+            }));
         }
     }
     links.sort_by_key(|link| (link.row, link.start));
     links
+}
+
+/// What a markdown link may open: a web page, or a local file named by path
+/// or `file:` URL. Every other scheme is dropped.
+fn link_target(destination: &str) -> Option<String> {
+    let destination = destination.trim();
+    if let Some(url) = safe_http_url(destination) {
+        return Some(url);
+    }
+    match url::Url::parse(destination) {
+        Ok(url) => (url.scheme() == "file").then(|| url.to_string()),
+        Err(url::ParseError::RelativeUrlWithoutBase) => (!destination.is_empty()
+            && !destination.starts_with('#'))
+        .then(|| destination.to_string()),
+        Err(_) => None,
+    }
+}
+
+/// Resolve a clicked link to what the system opener receives. A path is the
+/// session's, so a relative one resolves against the session directory, and
+/// a missing file is reported rather than guessed at.
+pub(super) fn resolve_link(target: &str, cwd: Option<&Path>) -> Result<String> {
+    if let Some(url) = safe_http_url(target) {
+        return Ok(url);
+    }
+    let cwd = cwd.with_context(|| format!("no session directory to resolve {target}"))?;
+    let base = url::Url::from_directory_path(cwd)
+        .map_err(|()| anyhow::anyhow!("no session directory to resolve {target}"))?;
+    let url = base.join(target).context("invalid link target")?;
+    anyhow::ensure!(
+        url.scheme() == "file",
+        "only HTTP(S) links and local files can be opened"
+    );
+    let path = url
+        .to_file_path()
+        .map_err(|()| anyhow::anyhow!("{target} is not a local file"))?;
+    let metadata =
+        std::fs::metadata(&path).with_context(|| format!("no file at {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        anyhow::ensure!(
+            metadata.is_dir() || metadata.permissions().mode() & 0o111 == 0,
+            "{} is executable, so it is not opened from a link",
+            path.display()
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = metadata;
+    Ok(url.to_string())
 }
 
 fn push_markdown_text(output: &mut Vec<Span<'static>>, text: &str, style: Style) {

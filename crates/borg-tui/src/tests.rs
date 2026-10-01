@@ -7498,19 +7498,55 @@ fn diff_expansion_policy_controls_action_lifetime() {
 }
 
 #[test]
-fn markdown_links_retain_only_clickable_http_destinations() {
-    let markdown = "[Borg docs](https://example.com/docs) and [local](file:///tmp/private.txt)";
-    let lines = markdown_lines(markdown, 80, None);
+fn markdown_links_keep_web_and_local_file_destinations_only() {
+    // Agents link the artifacts they write by relative path; those must be as
+    // clickable as web pages, while any other scheme stays inert text.
+    let markdown = "[Borg docs](https://example.com/docs) [local](file:///tmp/private.txt) \
+                    [SVG](exports/logo.svg) [run](javascript:alert(1)) [top](#top)";
+    let lines = markdown_lines(markdown, 200, None);
 
     assert_eq!(
-        markdown_link_ranges(markdown, &lines),
-        vec![LinkRowRange {
-            row: 0,
-            start: 0,
-            end: 9,
-            url: "https://example.com/docs".to_string(),
-        }]
+        markdown_link_ranges(markdown, &lines)
+            .into_iter()
+            .map(|link| link.url)
+            .collect::<Vec<_>>(),
+        [
+            "https://example.com/docs",
+            "file:///tmp/private.txt",
+            "exports/logo.svg"
+        ]
     );
+}
+
+#[test]
+fn a_clicked_link_resolves_against_the_session_directory() {
+    let session = tempfile::tempdir().unwrap();
+    let exports = session.path().join("exports");
+    std::fs::create_dir(&exports).unwrap();
+    std::fs::write(exports.join("logo.svg"), "<svg/>").unwrap();
+    let opened = url::Url::from_file_path(exports.join("logo.svg"))
+        .unwrap()
+        .to_string();
+
+    assert_eq!(
+        resolve_link("exports/logo.svg", Some(session.path())).unwrap(),
+        opened
+    );
+    assert_eq!(
+        resolve_link("https://example.com/docs", None).unwrap(),
+        "https://example.com/docs"
+    );
+    // A path the session names but this machine lacks is reported, not opened.
+    assert!(resolve_link("exports/missing.png", Some(session.path())).is_err());
+    assert!(resolve_link("exports/logo.svg", None).is_err());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = exports.join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(resolve_link("exports/run.sh", Some(session.path())).is_err());
+    }
 }
 
 #[test]
@@ -7534,6 +7570,14 @@ fn bare_http_urls_are_styled_and_clickable() {
             url: "http://127.0.0.1:4173/".to_string(),
         }]
     );
+
+    // A URL longer than the line wraps; every row of it opens the whole URL.
+    let url = "https://example.com/a/very/long/path/that/keeps/going/until/it/wraps/index.html";
+    let markdown = format!("Long: {url} done");
+    let lines = markdown_lines(&markdown, 40, None);
+    let links = markdown_link_ranges(&markdown, &lines);
+    assert!(links.len() > 1, "{links:?}");
+    assert!(links.iter().all(|link| link.url == url), "{links:?}");
 }
 
 #[test]
@@ -11277,6 +11321,91 @@ async fn pending_input_title_click_toggles_and_empty_queue_clears_hit_area() {
     terminal.queued_prompts.clear();
     terminal.draw().unwrap();
     assert!(terminal.pending_input_header_area.is_none());
+    terminal.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a PTY; verifies a click and a Ctrl-click open a relative message link"]
+async fn clicking_a_relative_message_link_opens_the_session_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = tempfile::tempdir().unwrap();
+    std::fs::create_dir(session.path().join("exports")).unwrap();
+    std::fs::write(session.path().join("exports/logo.svg"), "<svg/>").unwrap();
+    let session_id = Uuid::new_v4();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        session_id,
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    terminal.transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::SessionConfigured {
+            cwd: session.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+            ultrafast: false,
+            response_language: ResponseLanguage::Auto,
+            permission_mode: PermissionMode::Auto,
+            speed_support: Default::default(),
+        },
+    ));
+    terminal.transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::Assistant,
+        text: "Saved [the logo](exports/logo.svg).".to_string(),
+        attachments: Vec::new(),
+        model: None,
+        effort: None,
+        time: "12:00".to_string(),
+        status: MessageStatus::Complete,
+        complete: true,
+        user_interrupted: false,
+        redirected: false,
+    });
+    terminal.invalidate_transcript_render_cache();
+    terminal.draw().unwrap();
+    let (area, _) = terminal
+        .link_hit_areas
+        .first()
+        .cloned()
+        .expect("the rendered link has a hit area");
+    let expected = url::Url::from_file_path(session.path().join("exports/logo.svg"))
+        .unwrap()
+        .to_string();
+    for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+        let mut last = UiAction::None;
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            last = terminal
+                .handle_event(TerminalInputEvent {
+                    event: Event::Mouse(MouseEvent {
+                        kind,
+                        column: area.x + 1,
+                        row: area.y,
+                        modifiers,
+                    }),
+                    scroll_repetitions: 1,
+                })
+                .unwrap();
+        }
+        assert!(
+            matches!(
+                &last,
+                UiAction::TerminalIo(TerminalIoRequest {
+                    kind: TerminalIoRequestKind::OpenLink { url },
+                }) if *url == expected
+            ),
+            "{modifiers:?}"
+        );
+        terminal.draw().unwrap();
+    }
     terminal.shutdown().await;
 }
 

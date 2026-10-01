@@ -81,7 +81,8 @@ use uuid::Uuid;
 use self::cache_diagnostics::{CacheDiagnostics, CacheSignature, CacheStatus, CacheUsage};
 use self::key_hints::KeyHints;
 use self::markdown::{
-    markdown_lines, markdown_link_ranges, markdown_plain_text, open_link, truncate_table_cell,
+    markdown_lines, markdown_link_ranges, markdown_plain_text, open_link, resolve_link,
+    truncate_table_cell,
 };
 use self::terminal_input::TerminalInput;
 pub use self::terminal_input::{TerminalInputEvent, take_last_enter_read, take_last_escape_read};
@@ -7159,6 +7160,30 @@ impl BorgTerminal {
         self.nested_scroll_motion = None;
     }
 
+    /// The directory the shown session's relative paths name.
+    fn session_cwd(&self) -> Option<&Path> {
+        self.transcript
+            .config
+            .as_ref()
+            .map(|config| config.cwd.as_path())
+    }
+
+    /// Where a click on the hovered link goes, said before the click.
+    fn link_hint(&self) -> Option<String> {
+        let target = self.hovered_link.as_deref()?;
+        Some(match resolve_link(target, self.session_cwd()) {
+            Ok(url) => {
+                let destination = url::Url::parse(&url)
+                    .ok()
+                    .filter(|url| url.scheme() == "file")
+                    .and_then(|url| url.to_file_path().ok())
+                    .map_or(url, |path| path.display().to_string());
+                format!("click open {destination}")
+            }
+            Err(error) => format!("link {target}: {error:#}"),
+        })
+    }
+
     fn pending_transcript_click(
         &self,
         hovered_tool_run: Option<(usize, usize)>,
@@ -7183,8 +7208,14 @@ impl BorgTerminal {
 
     fn run_pending_transcript_click(&mut self, click: PendingTranscriptClick) -> UiAction {
         match click {
-            PendingTranscriptClick::Link(url) => {
-                return UiAction::TerminalIo(TerminalIoRequest::open_link(url));
+            PendingTranscriptClick::Link(target) => {
+                return match resolve_link(&target, self.session_cwd()) {
+                    Ok(url) => UiAction::TerminalIo(TerminalIoRequest::open_link(url)),
+                    Err(error) => {
+                        self.notice = Some(format!("Could not open link: {error:#}"));
+                        UiAction::None
+                    }
+                };
             }
             PendingTranscriptClick::ToolRunHeader(start) => {
                 if self.transcript.tool_run_expanded(start) {
@@ -8296,18 +8327,20 @@ impl BorgTerminal {
             .map(CacheStatus::cold_cache_guidance);
         let showing_primary_controls =
             !showing_slash_suggestions && notice.is_none() && cold_cache_guidance.is_none();
-        let transcript_interaction_hint = self
-            .hovered_tool
-            .and_then(|index| self.transcript.tool_copy_hint(index))
-            .or_else(|| {
-                self.hovered_tool_run_header
-                    .map(|start| self.transcript.tool_run_header_hint(start))
-            })
-            .or_else(|| {
-                self.hovered_entry
-                    .and_then(|index| self.transcript.entry_click_hint(index))
-            })
-            .or_else(|| message_interaction_hint(&self.transcript.order, self.hovered_message));
+        let transcript_interaction_hint = self.link_hint().or_else(|| {
+            self.hovered_tool
+                .and_then(|index| self.transcript.tool_copy_hint(index))
+                .or_else(|| {
+                    self.hovered_tool_run_header
+                        .map(|start| self.transcript.tool_run_header_hint(start))
+                })
+                .or_else(|| {
+                    self.hovered_entry
+                        .and_then(|index| self.transcript.entry_click_hint(index))
+                })
+                .or_else(|| message_interaction_hint(&self.transcript.order, self.hovered_message))
+                .map(str::to_string)
+        });
         let showing_transcript_interaction_hint =
             showing_primary_controls && transcript_interaction_hint.is_some();
         let primary_controls = if resume_picker_open {
@@ -8333,12 +8366,13 @@ impl BorgTerminal {
             permission_status_hovered: self.permission_status_hovered,
         });
         let hover_notice_hint = transcript_interaction_hint
-            .or(interaction_hint)
+            .clone()
+            .or(interaction_hint.map(str::to_string))
             .filter(|_| !showing_slash_suggestions && notice.is_some());
         let primary_controls_display = if showing_transcript_interaction_hint {
             transcript_interaction_hint
+                .clone()
                 .expect("transcript interaction hint is present")
-                .to_string()
         } else {
             interaction_hint.map_or_else(
                 || primary_controls.clone(),
@@ -8363,7 +8397,7 @@ impl BorgTerminal {
                 vec![Line::from(primary_controls.clone())]
             } else if let Some(notice) = copy_notice_text.as_ref() {
                 vec![copy_notice_line(notice.clone())]
-            } else if let Some(hint) = hover_notice_hint {
+            } else if let Some(hint) = hover_notice_hint.as_deref() {
                 vec![Line::from(hint_spans(hint))]
             } else if let Some(notice) = notice {
                 if copy_notice_active {
@@ -8376,10 +8410,11 @@ impl BorgTerminal {
                     .into_iter()
                     .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Yellow))))
                     .collect()
-            } else if showing_transcript_interaction_hint {
-                vec![Line::from(hint_spans(
-                    transcript_interaction_hint.expect("transcript interaction hint is present"),
-                ))]
+            } else if let Some(hint) = transcript_interaction_hint
+                .as_deref()
+                .filter(|_| showing_transcript_interaction_hint)
+            {
+                vec![Line::from(hint_spans(hint))]
             } else {
                 vec![if let Some(hint) = interaction_hint {
                     let mut spans = hint_spans(hint);
@@ -17092,7 +17127,7 @@ fn todo_tooltip_row_style(completed: bool) -> Style {
 
 /// A hover hint in the footer: the mouse action in white, what it does in grey,
 /// matching the Pending Input controls.
-fn hint_spans(hint: &'static str) -> Vec<Span<'static>> {
+fn hint_spans(hint: &str) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (index, part) in hint.split(" · ").enumerate() {
         if index > 0 {
@@ -17105,7 +17140,10 @@ fn hint_spans(hint: &'static str) -> Vec<Span<'static>> {
         if !key.is_empty() {
             spans.push(Span::styled(key, Style::default().fg(Color::White)));
         }
-        spans.push(Span::styled(rest, Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            rest.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
     }
     spans
 }
