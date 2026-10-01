@@ -5611,8 +5611,12 @@ impl SubagentCoordinator {
         };
         Some(format!(
             "Your identity: team path {path}, session {session_id} (address: \
-             participant:{session_id}). {parent} Your children are {path}/<name>; list_agents \
-             shows them. Other top-level sessions are /root of their own trees, so a message \
+             participant:{session_id}). {parent} This team uses a root-managed worker pool: \
+             spawn_agent assigns /root/<name> workers even when requested by a child; it \
+             does not create nested {path}/<name> children. Read parent_session_id and \
+             task_name from its result, and address that session directly for reviews. \
+             list_agents shows the shared roster. Other top-level sessions are /root of \
+             their own trees, so a message \
              labelled \"from /root of another session\" is never you."
         ))
     }
