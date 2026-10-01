@@ -3491,7 +3491,9 @@ async fn run_agent_session_store_kernel_inner(
                                 if retry_selection {
                                     provider_context_usage_valid = false;
                                     resumed_native_context_tokens = None;
-                                    speed_support_confirmed = true;
+                                    // A change probe that went unanswered is
+                                    // asked again before the next turn.
+                                    speed_support_confirmed = false;
                                 }
                                 if provider_switched {
                                     executor
@@ -6359,7 +6361,7 @@ async fn run_agent_session_store_kernel_inner(
                                     if context_selection_changed {
                                         provider_context_usage_valid = false;
                                         resumed_native_context_tokens = None;
-                                        speed_support_confirmed = true;
+                                        speed_support_confirmed = false;
                                     }
                                     provider_switch_pending |= provider_switched;
                                 }
