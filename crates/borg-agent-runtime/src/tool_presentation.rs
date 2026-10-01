@@ -835,14 +835,25 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
             .and_then(Value::as_str)
             .filter(|target| !target.is_empty())
     {
-        let arguments = input.get("arguments").unwrap_or(&Value::Null);
-        return (
-            capability_action_title(target),
-            tool_call_summary(target, arguments).1,
+        let detail = capability_inner_call(name, input).map_or_else(
+            || concise_tool_input(input),
+            |(target, arguments)| tool_call_summary(target, arguments).1,
         );
+        return (capability_action_title(target), detail);
     }
 
     (humanize_tool_name(name), concise_tool_input(input))
+}
+
+/// The call a `capability` wrapper makes. A wrapper of itself is not unwrapped,
+/// so untrusted nesting cannot recurse.
+fn capability_inner_call<'a>(name: &str, input: &'a Value) -> Option<(&'a str, &'a Value)> {
+    (tool_leaf_name(name) == "capability").then_some(())?;
+    let target = string_field(input, "name").filter(|target| !target.is_empty())?;
+    let arguments = input
+        .get("arguments")
+        .filter(|arguments| !arguments.is_null())?;
+    (tool_leaf_name(target) != "capability").then_some((target, arguments))
 }
 
 /// The shortest honest title for a capability. The verb it is named after is
@@ -1236,10 +1247,8 @@ fn is_git_label(label: &str) -> bool {
 
 fn tool_detail_rows(name: &str, input: &Value) -> Vec<String> {
     let leaf = tool_leaf_name(name);
-    if leaf == "capability"
-        && let Some(target) = string_field(input, "name").filter(|target| !target.is_empty())
-    {
-        return tool_detail_rows(target, input.get("arguments").unwrap_or(&Value::Null));
+    if let Some((target, arguments)) = capability_inner_call(name, input) {
+        return tool_detail_rows(target, arguments);
     }
     if matches!(
         leaf.as_str(),
@@ -3517,6 +3526,37 @@ all green"
                 }),
             ),
             ("Web search".to_string(), "“ratatui wrap”".to_string())
+        );
+        assert_eq!(
+            project_tool_presentation(
+                "capability",
+                &serde_json::json!({
+                    "name": "web_search",
+                    "arguments": {"query": "ratatui wrap"},
+                }),
+                None,
+                false,
+            )
+            .body_rows,
+            vec!["Query: ratatui wrap".to_string()]
+        );
+        // Without arguments the wrapper's own fields are all there is to show.
+        assert_eq!(
+            tool_call_summary(
+                "capability",
+                &serde_json::json!({"action": "search web", "name": "web_search"}),
+            )
+            .1,
+            "action: search web · name: web_search"
+        );
+        // A wrapper of itself is not unwrapped, so nesting cannot recurse.
+        assert_eq!(
+            tool_call_summary(
+                "capability",
+                &serde_json::json!({"name": "capability", "arguments": {"name": "web_search"}}),
+            )
+            .1,
+            "arguments: 1 fields · name: capability"
         );
         // Nothing to name falls back rather than rendering an empty title.
         assert_eq!(
