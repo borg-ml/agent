@@ -3908,11 +3908,11 @@ impl BorgTerminal {
                         self.set_notice(format!("Codex authentication lookup unavailable · attempt {attempt}/{bound} · work saved · Esc to cancel"));
                     } else if let Some((attempt, max_attempts)) = self.connection_retry_attempt {
                         self.set_notice(format!(
-                            "Retrying the request · attempt {attempt}/{max_attempts} · work saved · Esc to cancel · the reason: {}",
+                            "error: {} · retry {attempt}/{max_attempts} · Esc to cancel",
                             payload
                                 .get("error")
                                 .and_then(serde_json::Value::as_str)
-                                .unwrap_or("the provider did not say")
+                                .unwrap_or("unknown provider error")
                         ));
                     } else {
                         self.set_notice("Retrying the request · work saved · Esc to cancel");
