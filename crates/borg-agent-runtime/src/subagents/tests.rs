@@ -2019,6 +2019,129 @@ async fn a_human_stopped_worker_is_not_reused_for_a_new_task() {
     scratch.discard().await;
 }
 
+/// Every roster worker is the director's child, so a team member that
+/// delegates must not claim one. It used to take whichever compatible worker
+/// was idle -- the director's, with unrelated context and a last answer the
+/// claim dropped, or the member's own seat between turns -- and the worker
+/// then reported to the director without knowing who had asked.
+#[tokio::test]
+async fn a_member_delegation_spawns_fresh_and_names_the_requester() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let prompts = Arc::new(StdMutex::new(Vec::new()));
+    let executor = RecordingPeerExecutor {
+        prompts: Arc::clone(&prompts),
+    };
+    let mut root_launch = launch();
+    root_launch.capabilities.multiplayer = false;
+    root_launch.cwd = directory.path().to_path_buf();
+    // Room for a third worker, so declining to reuse can actually spawn
+    // instead of being refused by the cap and passing for the wrong reason.
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        root_launch,
+        3,
+        Arc::new(executor),
+        store,
+    )
+    .unwrap();
+    let settle = |session_id: Uuid| {
+        let coordinator = &coordinator;
+        async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while coordinator.get(session_id).await.unwrap().status != SubagentStatus::Ready {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("assignment should settle");
+        }
+    };
+
+    let idle = coordinator
+        .call_tool(
+            "spawn_agent",
+            json!({"task_name": "director_task", "message": "Complete the director's task."}),
+        )
+        .await
+        .unwrap();
+    let idle = Uuid::parse_str(idle["session_id"].as_str().unwrap()).unwrap();
+    settle(idle).await;
+    let member = coordinator
+        .call_tool(
+            "spawn_agent",
+            json!({"task_name": "member", "message": "Lead the member's task.", "fresh": true}),
+        )
+        .await
+        .unwrap();
+    let member = Uuid::parse_str(member["session_id"].as_str().unwrap()).unwrap();
+    settle(member).await;
+    let idle_answer = coordinator.get(idle).await.unwrap().final_text;
+
+    // Both workers are idle and compatible, so the claim filter would have
+    // matched either of them.
+    let helper = coordinator
+        .call_tool_as(
+            member,
+            "spawn_agent",
+            json!({"task_name": "helper", "message": "Complete the member's subtask."}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(helper["reused"], false);
+    assert_eq!(helper["assignment_task_name"], "/root/helper");
+    let helper = Uuid::parse_str(helper["session_id"].as_str().unwrap()).unwrap();
+    assert_ne!(helper, idle);
+    assert_ne!(helper, member);
+
+    // Neither idle worker was renamed or lost its answer.
+    let director_worker = coordinator.get(idle).await.unwrap();
+    assert_eq!(director_worker.task_name, "/root/director_task");
+    assert_eq!(director_worker.final_text, idle_answer);
+    assert_eq!(
+        coordinator.get(member).await.unwrap().task_name,
+        "/root/member"
+    );
+
+    // The fresh worker is told who asked and how to reach them.
+    settle(helper).await;
+    let recorded = prompts.lock().unwrap().clone();
+    let assignment = recorded
+        .iter()
+        .find(|prompt| prompt.contains("member's subtask"))
+        .expect("the helper should receive its assignment");
+    assert!(assignment.contains("Requested by team member /root/member"));
+    assert!(
+        assignment.contains(&format!("session:{member}")),
+        "{assignment}"
+    );
+    assert!(
+        recorded
+            .iter()
+            .filter(|prompt| prompt.contains("Requested by team member"))
+            .count()
+            == 1,
+        "the director's own assignments carry no requester note"
+    );
+
+    // The director still reuses its own idle workers.
+    let reassigned = coordinator
+        .call_tool(
+            "spawn_agent",
+            json!({"task_name": "director_followup", "message": "Complete another task."}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reassigned["reused"], true);
+
+    coordinator.stop_all().await;
+    scratch.discard().await;
+}
+
 /// A model switch must not rotate the worker, lose its conversation, or
 /// revert to the launch lane when that child is resumed after a stop.
 #[tokio::test]

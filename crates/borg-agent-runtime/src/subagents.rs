@@ -4528,12 +4528,38 @@ impl SubagentCoordinator {
         request: SpawnSubagent,
         fresh: bool,
     ) -> Result<Value> {
-        let launch = self.subagent_launch(&request).await?;
+        let mut launch = self.subagent_launch(&request).await?;
         let assignment_name = launch
             .name
             .as_deref()
             .expect("subagent launch has a canonical task name")
             .to_string();
+        // Every worker on the roster is the director's: its snapshot's parent
+        // is always the root session, whoever asked for it. Only the director
+        // can know whether an idle worker holds context or unlanded work it
+        // means to follow up on, so only the director hands one a new task.
+        // A member that delegated used to claim whichever compatible worker
+        // was idle -- a worker of the director's, with unrelated context and
+        // a last answer the claim dropped, or the member's own seat when the
+        // member was between turns. A member always gets a fresh worker, told
+        // who asked, because the worker's reports otherwise go to the director.
+        let member = (actor_session_id != self.root_session_id).then_some(actor_session_id);
+        let may_reuse = !fresh && member.is_none();
+        if let Some(member) = member {
+            let requester = self
+                .get(member)
+                .await
+                .map_or_else(|| format!("session:{member}"), |agent| agent.task_name);
+            let prompt = launch
+                .initial_prompt
+                .take()
+                .expect("subagent launch has an initial prompt");
+            launch.initial_prompt = Some(format!(
+                "Requested by team member {requester}. Send it your questions and your final \
+                 report with send_message to target \"session:{member}\"; the director also \
+                 receives your final answer.\n\n{prompt}"
+            ));
+        }
         let claimed = {
             let mut table = self.table.lock().await;
             anyhow::ensure!(
@@ -4550,7 +4576,7 @@ impl SubagentCoordinator {
                 .entries
                 .values_mut()
                 .filter(|entry| {
-                    !fresh
+                    may_reuse
                         && entry.snapshot.status == SubagentStatus::Ready
                         && !entry.assignment_claimed
                         && !is_persistent_peer_lane(&entry.snapshot.task_name)
