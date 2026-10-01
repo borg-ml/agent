@@ -5,6 +5,46 @@ Git comparison.
 
 ## Unreleased (since 0.13.3)
 
+### Models
+
+- Fast and Ultrafast are offered only when the selected model and account
+  confirm support. Standard remains available; changing models clears
+  unsupported speeds. Unknown capability data does not advertise faster tiers,
+  and remote frontends use the runtime host's capabilities, not local accounts.
+
+### Terminal UI
+
+- Rich plan updates appear beside the action that made them instead of updating
+  an off-screen card in old scrollback. Live updates and rebuilt history retain
+  a single plan card.
+- Web-search action summaries lead with the search query, including searches
+  made through the capability wrapper.
+- The retry footer puts the provider error first, followed by the retry attempt
+  and the Esc-to-cancel hint.
+- Normal and Ctrl-click open message artifact links relative to the local
+  session's working directory. Wrapped web links retain their full destination.
+  Remote file paths are not opened as local files; missing files are reported,
+  and executable or special files are refused. Link hovering no longer checks
+  the filesystem, and opening links does not use a command shell.
+
+### Collaboration
+
+- Message images can travel between enrolled hosts as captured, verified bytes,
+  with encrypted relay storage and recipient-only access. Pending transfers can
+  be retried without duplicates; failed or recalled deliveries stay terminal.
+  This requires updated agents on both hosts and an updated relay server.
+- Team participant addresses resolve against the live local session before stale
+  directory metadata can incorrectly reject an active recipient as exited.
+
+### Reliability
+
+- Network retries preserve the conversation's structured continuation even when
+  a queued follow-up changes the input batch, rather than restarting the request
+  as a fresh prompt.
+- Native local execution preserves the session's process registry, so watchers
+  can follow shells started with `exec`. Empty process input is treated as a poll
+  instead of an attempted write to a closed stdin.
+
 ## 0.13.3 (2026-09-30)
 
 ### Models
