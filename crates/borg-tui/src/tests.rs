@@ -7552,6 +7552,19 @@ fn a_clicked_link_resolves_against_the_session_directory() {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let script = url::Url::from_file_path(script).unwrap();
         assert!(open_link(script.as_str()).is_err());
+        // A pipe would block the viewer it is handed to.
+        let fifo = exports.join("pipe");
+        let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+        let fifo = url::Url::from_file_path(fifo).unwrap();
+        assert!(open_link(fifo.as_str()).is_err());
+    }
+    // Windows has no executable bit, so what runs on open is known by name.
+    for name in ["setup.EXE", "run.bat", "tool.ps1", "shortcut.lnk"] {
+        assert!(windows_runs_on_open(Path::new(name)), "{name}");
+    }
+    for name in ["logo.svg", "abundance.png", "notes"] {
+        assert!(!windows_runs_on_open(Path::new(name)), "{name}");
     }
 }
 

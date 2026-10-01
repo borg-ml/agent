@@ -80,6 +80,8 @@ use uuid::Uuid;
 
 use self::cache_diagnostics::{CacheDiagnostics, CacheSignature, CacheStatus, CacheUsage};
 use self::key_hints::KeyHints;
+#[cfg(test)]
+use self::markdown::windows_runs_on_open;
 use self::markdown::{
     markdown_lines, markdown_link_ranges, markdown_plain_text, open_link, resolve_link,
     truncate_table_cell,

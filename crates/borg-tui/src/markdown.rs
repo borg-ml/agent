@@ -525,6 +525,19 @@ fn safe_http_url(value: &str) -> Option<String> {
     matches!(parsed.scheme(), "http" | "https").then(|| parsed.to_string())
 }
 
+/// Whether Windows runs this file, rather than showing it, when it is opened;
+/// Windows has no executable bit, so the extension decides.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn windows_runs_on_open(path: &Path) -> bool {
+    const RUNS: &[&str] = &[
+        "exe", "com", "bat", "cmd", "ps1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi", "msp",
+        "scr", "pif", "cpl", "hta", "lnk", "url", "reg",
+    ];
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| RUNS.iter().any(|runs| extension.eq_ignore_ascii_case(runs)))
+}
+
 /// Hand a resolved link to the system opener. Runs on the terminal I/O
 /// worker, so checking a file here never stalls drawing.
 pub(super) fn open_link(url: &str) -> Result<()> {
@@ -539,17 +552,26 @@ pub(super) fn open_link(url: &str) -> Result<()> {
             .map_err(|()| anyhow::anyhow!("{url} is not a local file"))?;
         let metadata =
             std::fs::metadata(&path).with_context(|| format!("no file at {}", path.display()))?;
+        // A pipe or device would hang or confuse the viewer it is handed to.
+        anyhow::ensure!(
+            metadata.is_file() || metadata.is_dir(),
+            "{} is not a regular file or folder",
+            path.display()
+        );
         #[cfg(unix)]
-        {
+        let executable = {
             use std::os::unix::fs::PermissionsExt;
-            anyhow::ensure!(
-                metadata.is_dir() || metadata.permissions().mode() & 0o111 == 0,
-                "{} is executable, so it is not opened from a link",
-                path.display()
-            );
-        }
-        #[cfg(not(unix))]
-        let _ = metadata;
+            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(windows)]
+        let executable = metadata.is_file() && windows_runs_on_open(&path);
+        #[cfg(not(any(unix, windows)))]
+        let executable = metadata.is_file();
+        anyhow::ensure!(
+            !executable,
+            "{} is executable, so it is not opened from a link",
+            path.display()
+        );
     }
     // Each opener takes the link as one argument; none goes through a shell,
     // where characters in a URL could become commands.
