@@ -392,7 +392,7 @@ pub(super) fn markdown_link_ranges(markdown: &str, lines: &[Line<'_>]) -> Vec<Li
     }
     // Bare URLs. One the layout wrapped continues as the first text of the
     // next row, so its pieces are joined into a single destination.
-    let mut bare: Vec<(Vec<(usize, usize, usize)>, String)> = Vec::new();
+    let mut bare: Vec<(Vec<RowRange>, String)> = Vec::new();
     let mut continues = false;
     for (row, line) in lines.iter().enumerate() {
         let first = line
