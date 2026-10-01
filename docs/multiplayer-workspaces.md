@@ -411,14 +411,27 @@ keys; previously accepted messages are not duplicated. Default sync receives onl
 child reports to `/root`. It does not start an idle recipient. Use
 `send_message` with `wake: true`, or `followup_task`, to request a new turn.
 
-`send_message` also accepts `attachments`, an array of sender-local PNG/JPEG
-paths (at most four, each at most 4.5 MiB). Borg captures the image bytes when
-sending and journals content-addressed references; recipients receive verified
-image files, so replay does not depend on the original sender path. This is
-supported only when local delivery can be established. Cross-host image byte
-transfer is not implemented: unsupported routes fail before queuing a message
-rather than reporting successful image delivery. A delivery receipt proves
-admission, not that a recipient model has inspected the pixels.
+`send_message` and `followup_task` accept `attachments`, an array of sender-local
+PNG/JPEG paths (at most four, each at most 4.5 MiB). Borg captures the image bytes
+when sending and journals content-addressed references; replay does not depend on
+the original sender path.
+
+Images can travel between enrolled machines through the host relay. The sender
+uploads the captured bytes before the message; the receiver verifies each image's
+SHA-256, length, and media type before importing or acknowledging the message.
+Recipients receive verified local image files through the normal image-admission
+path, not sender-local paths or base64 text. An unavailable image holds the whole
+message back; a relay that does not support images reports a failed delivery
+rather than silently delivering text alone.
+
+`borg remote sync --session SESSION_UUID --send-pending` retries pending uploads
+from the captured blobs and replays messages with stable idempotency keys. Already
+accepted messages are not duplicated; terminal failed deliveries require a new
+message and are not silently revived. `get_message_status` distinguishes relay
+acceptance from recipient admission; neither proves that a recipient model has
+inspected the pixels. This path requires updated Agent relay code on the sending
+and receiving machines and an updated relay server; syncing does not upgrade a
+running executable.
 
 An explicit user stop takes precedence over background wake requests until a
 human sends new input or explicitly resumes the session. This stop state is
