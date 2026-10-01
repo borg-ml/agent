@@ -3503,7 +3503,13 @@ impl SubagentTable {
         if target == "/root" || target == "root" {
             return Ok(self.root_session_id);
         }
-        let session_id = target.strip_prefix("session:").unwrap_or(target);
+        // A team participant has the same durable id as its session, but no
+        // independent control socket/process. Resolve it through this table
+        // before directory liveness checks, just like session: and team paths.
+        let session_id = target
+            .strip_prefix("session:")
+            .or_else(|| target.strip_prefix("participant:"))
+            .unwrap_or(target);
         if let Ok(id) = Uuid::parse_str(session_id)
             && (id == self.root_session_id || self.entries.contains_key(&id))
         {
