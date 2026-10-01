@@ -3550,14 +3550,15 @@ all green"
             "action: search web · name: web_search"
         );
         // A wrapper of itself is not unwrapped, so nesting cannot recurse.
-        assert_eq!(
-            tool_call_summary(
-                "capability",
-                &serde_json::json!({"name": "capability", "arguments": {"name": "web_search"}}),
-            )
-            .1,
-            "arguments: 1 fields · name: capability"
-        );
+        let detail = tool_call_summary(
+            "capability",
+            &serde_json::json!({"name": "capability", "arguments": {"name": "web_search"}}),
+        )
+        .1;
+        // Workspace features can enable JSON insertion order; both fields must remain.
+        let mut fields: Vec<_> = detail.split(" · ").collect();
+        fields.sort_unstable();
+        assert_eq!(fields, ["arguments: 1 fields", "name: capability"]);
         // Nothing to name falls back rather than rendering an empty title.
         assert_eq!(
             tool_call_summary("capability", &serde_json::json!({"search": "x"})).0,
