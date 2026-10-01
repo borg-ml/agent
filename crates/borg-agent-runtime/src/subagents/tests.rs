@@ -1610,11 +1610,15 @@ fn child_identity_is_stable_and_inherits_execution_context() {
     assert_eq!(table.resolve("review_api").unwrap(), child.session_id);
     assert_eq!(table.resolve("/root/review_api").unwrap(), child.session_id);
     assert_eq!(
-        table.resolve(&format!("participant:{}", child.session_id)).unwrap(),
+        table
+            .resolve(&format!("participant:{}", child.session_id))
+            .unwrap(),
         child.session_id
     );
     assert_eq!(
-        table.resolve(&format!("participant:{}", table.root_session_id)).unwrap(),
+        table
+            .resolve(&format!("participant:{}", table.root_session_id))
+            .unwrap(),
         table.root_session_id
     );
     assert_eq!(
