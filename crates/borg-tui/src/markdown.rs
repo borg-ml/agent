@@ -5,6 +5,25 @@ pub(super) fn markdown_lines(
     width: usize,
     text_color: Option<Color>,
 ) -> Vec<Line<'static>> {
+    render_markdown_lines(markdown, width, text_color, false)
+}
+
+/// A person's newlines are deliberate, unlike a model's soft-wrapped prose:
+/// keep each composer line and paragraph gap instead of reflowing them.
+pub(super) fn user_markdown_lines(
+    markdown: &str,
+    width: usize,
+    text_color: Option<Color>,
+) -> Vec<Line<'static>> {
+    render_markdown_lines(markdown, width, text_color, true)
+}
+
+fn render_markdown_lines(
+    markdown: &str,
+    width: usize,
+    text_color: Option<Color>,
+    keep_line_breaks: bool,
+) -> Vec<Line<'static>> {
     let markdown = escape_currency_dollars(markdown);
     let mut lines = Vec::new();
     let mut current = Vec::new();
@@ -209,9 +228,19 @@ pub(super) fn markdown_lines(
             MarkdownEvent::SoftBreak => {
                 if let Some(table) = table.as_mut() {
                     table.push_text(" ");
+                } else if keep_line_breaks {
+                    flush_markdown_line(&mut lines, &mut current, width, quote_depth);
                 } else {
                     current.push(Span::styled(" ", markdown_style(&styles)));
                 }
+            }
+            MarkdownEvent::Start(Tag::Paragraph)
+                if keep_line_breaks
+                    && quote_depth == 0
+                    && list_indices.is_empty()
+                    && !lines.is_empty() =>
+            {
+                lines.push(Line::default());
             }
             MarkdownEvent::HardBreak => {
                 flush_markdown_line(&mut lines, &mut current, width, quote_depth);

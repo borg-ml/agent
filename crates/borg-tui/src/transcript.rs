@@ -41,6 +41,30 @@ fn structured_user_message_lines(
         .collect()
 }
 
+/// The body of a chat message. Both the frame and the parallel warm-up fill
+/// the same cache, so they must render a message identically.
+fn message_markdown_render(
+    actor: EventActor,
+    text: &str,
+    width: usize,
+    text_color: Option<Color>,
+) -> MarkdownRender {
+    if actor != EventActor::User {
+        let lines = markdown_lines(text, width, text_color);
+        let links = markdown_link_ranges(text, &lines);
+        return MarkdownRender { lines, links };
+    }
+    if user_message_has_structured_whitespace(text) {
+        return MarkdownRender {
+            lines: structured_user_message_lines(text, width, text_color),
+            links: Vec::new(),
+        };
+    }
+    let lines = crate::markdown::user_markdown_lines(text, width, text_color);
+    let links = markdown_link_ranges(text, &lines);
+    MarkdownRender { lines, links }
+}
+
 fn goal_status_label(status: GoalStatus) -> &'static str {
     match status {
         GoalStatus::Active => "▶ active",
@@ -4084,24 +4108,33 @@ impl Transcript {
         if self.diff_expansion == DiffExpansionPolicy::UntilNextAction {
             self.collapse_previous_edit();
         }
-        let index = self.order.len();
-        self.order.push(TranscriptEntry::Tool {
-            source_name: "command_edit".to_string(),
-            name: edit.label,
-            detail: edit.detail,
-            code_view: Some((body.language, body.text)),
-            output_view: None,
-            payload_refs,
-            time,
-            started_at: completed_at,
-            completed_at: Some(completed_at),
-            complete: true,
-            error: false,
-            user_interrupted: false,
-            backgrounded: false,
-            expanded,
-            outcome: None, cwd: None,
-        });
+        // A backgrounded command reports its changes when it exits, often
+        // after later rows; keep the diff under the command that made it.
+        let index = self.tools[tool_call_id] + 1;
+        if index < self.order.len() {
+            self.reindex_after_insertion(index);
+        }
+        self.order.insert(
+            index,
+            TranscriptEntry::Tool {
+                source_name: "command_edit".to_string(),
+                name: edit.label,
+                detail: edit.detail,
+                code_view: Some((body.language, body.text)),
+                output_view: None,
+                payload_refs,
+                time,
+                started_at: completed_at,
+                completed_at: Some(completed_at),
+                complete: true,
+                error: false,
+                user_interrupted: false,
+                backgrounded: false,
+                expanded,
+                outcome: None,
+                cwd: None,
+            },
+        );
         self.command_edit_rows
             .insert(tool_call_id.to_string(), index);
         self.last_edit = Some(index);
@@ -5604,18 +5637,15 @@ impl Transcript {
                                 }
                                 let content_width =
                                     width.saturating_sub(MESSAGE_HORIZONTAL_PADDING * 2);
-                                let preserve_structure = *actor == EventActor::User
-                                    && user_message_has_structured_whitespace(text);
-                                let mut lines = if preserve_structure {
-                                    structured_user_message_lines(text, content_width, text_color)
-                                } else {
-                                    markdown_lines(text, content_width, text_color)
-                                };
-                                let mut links = if preserve_structure {
-                                    Vec::new()
-                                } else {
-                                    markdown_link_ranges(text, &lines)
-                                };
+                                let MarkdownRender {
+                                    mut lines,
+                                    mut links,
+                                } = message_markdown_render(
+                                    *actor,
+                                    text,
+                                    content_width,
+                                    text_color,
+                                );
                                 for link in &mut links {
                                     link.start += MESSAGE_HORIZONTAL_PADDING;
                                     link.end += MESSAGE_HORIZONTAL_PADDING;
@@ -5967,14 +5997,23 @@ impl Transcript {
                     let (display_items, hidden) = plan_card_rows(items, previous, collapsed);
                     let mut rows: Vec<(&PlanItem, Option<Color>, bool)> = Vec::new();
                     for item in display_items {
-                        if let Some(old) = previous.iter().find(|old| old.id == item.id)
-                            && (old.content != item.content || old.status != item.status)
+                        let old = previous.iter().find(|old| old.id == item.id);
+                        // A status change keeps its text: the new glyph says
+                        // what changed, so it is one row, not a removed copy.
+                        if let Some(old) = old
+                            && old.content != item.content
                         {
                             rows.push((old, Some(crate::rendering::DIFF_REMOVED_BG), true));
                         }
-                        let added = !previous.is_empty() && previous.iter().all(|old| old.id != item.id);
-                        let changed = previous.iter().any(|old| old.id == item.id && (old.content != item.content || old.status != item.status));
-                        rows.push((item, (added || changed).then_some(crate::rendering::DIFF_ADDED_BG), false));
+                        let added = !previous.is_empty() && old.is_none();
+                        let changed = old.is_some_and(|old| {
+                            old.content != item.content || old.status != item.status
+                        });
+                        rows.push((
+                            item,
+                            (added || changed).then_some(crate::rendering::DIFF_ADDED_BG),
+                            false,
+                        ));
                     }
                     if !previous.is_empty() {
                         rows.extend(previous.iter().filter(|old| items.iter().all(|item| item.id != old.id))
@@ -6760,8 +6799,15 @@ impl Transcript {
                                     EventActor::Assistant => Some(assistant_message_color),
                                     _ => None,
                                 };
-                                let mut lines = markdown_lines(text, content_width, text_color);
-                                let mut links = markdown_link_ranges(text, &lines);
+                                let MarkdownRender {
+                                    mut lines,
+                                    mut links,
+                                } = message_markdown_render(
+                                    *actor,
+                                    text,
+                                    content_width,
+                                    text_color,
+                                );
                                 for link in &mut links {
                                     link.start += MESSAGE_HORIZONTAL_PADDING;
                                     link.end += MESSAGE_HORIZONTAL_PADDING;

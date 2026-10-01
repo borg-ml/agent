@@ -255,6 +255,15 @@ struct TranscriptViewportAnchor {
     collapsed_tool_header: Option<usize>,
 }
 
+enum ActionInspectorAnchor {
+    Tool(String),
+    CommandEdit(String),
+    Agent(Uuid),
+    Broadcast(Uuid),
+    Reasoning(DateTime<Utc>),
+    Compaction(u64),
+}
+
 #[derive(Clone, Copy)]
 enum KeyAction {
     Send,
@@ -3470,6 +3479,7 @@ impl BorgTerminal {
 
     pub fn replace_history(&mut self, events: &[SessionEvent]) {
         let previous_height = self.rendered_transcript_height;
+        let inspector_anchor = self.action_inspector_anchor();
         let replaced_displayed = replace_root_transcript_history(
             &mut self.transcript,
             &mut self.director_transcript,
@@ -3487,6 +3497,7 @@ impl BorgTerminal {
         if !replaced_displayed {
             return;
         }
+        self.restore_action_inspector(inspector_anchor);
         self.rewind_targets = rewind_targets_from_history(events);
         self.text_selection = None;
         self.pending_transcript_click = None;
@@ -3847,6 +3858,7 @@ impl BorgTerminal {
     }
 
     pub fn apply_session_event(&mut self, event: &SessionEvent) -> bool {
+        let inspector_anchor = self.action_inspector_anchor();
         if !self.replaying_history {
             if self.connection_retry_at.is_some()
                 && matches!(
@@ -4198,6 +4210,12 @@ impl BorgTerminal {
                 self.remap_selection_after_entry_insertion(inserted);
             }
         }
+        if self.focused_child.is_none() {
+            if inspector_anchor.is_some() || matches!(event.kind, SessionEventKind::ContextCleared)
+            {
+                self.restore_action_inspector(inspector_anchor);
+            }
+        }
         if transcript_changed {
             if should_preserve_transcript_viewport(self.transcript.follow_tail)
                 && self.pending_scroll_anchor_height.is_none()
@@ -4375,6 +4393,7 @@ impl BorgTerminal {
             _ => {}
         }
         if self.focused_child == Some(agent.session_id) {
+            let inspector_anchor = self.action_inspector_anchor();
             let entries_before = self.transcript.order.len();
             let changed = session_event_changes_transcript(&child_event.kind);
             let removed_entry = self.transcript.apply(child_event);
@@ -4384,6 +4403,11 @@ impl BorgTerminal {
             }
             for inserted in inserted_entries {
                 self.remap_selection_after_entry_insertion(inserted);
+            }
+            if inspector_anchor.is_some()
+                || matches!(child_event.kind, SessionEventKind::ContextCleared)
+            {
+                self.restore_action_inspector(inspector_anchor);
             }
             changed || self.transcript.order.len() != entries_before
         } else {
@@ -4581,7 +4605,9 @@ impl BorgTerminal {
             optimistic_pending,
         );
         if self.focused_child == Some(child_id) {
+            let inspector_anchor = self.action_inspector_anchor();
             self.transcript = transcript;
+            self.restore_action_inspector(inspector_anchor);
             self.text_selection = None;
             self.pending_transcript_click = None;
             self.invalidate_transcript_render_cache();
@@ -4769,6 +4795,74 @@ impl BorgTerminal {
         self.hovered_tool = None;
         self.hovered_tool_run = None;
         self.hovered_tool_run_header = None;
+    }
+
+    fn action_inspector_anchor(&self) -> Option<ActionInspectorAnchor> {
+        let index = self.focused_tool?;
+        let transcript = &self.transcript;
+        if let Some((id, _)) = transcript.tools.iter().find(|(_, row)| **row == index) {
+            return Some(ActionInspectorAnchor::Tool(id.clone()));
+        }
+        if let Some((id, _)) = transcript
+            .command_edit_rows
+            .iter()
+            .find(|(_, row)| **row == index)
+        {
+            return Some(ActionInspectorAnchor::CommandEdit(id.clone()));
+        }
+        if let Some((id, _)) = transcript
+            .subagent_entries
+            .iter()
+            .find(|(_, row)| **row == index)
+        {
+            return Some(ActionInspectorAnchor::Agent(*id));
+        }
+        if let Some((id, _)) = transcript
+            .team_broadcast_entries
+            .iter()
+            .find(|(_, row)| **row == index)
+        {
+            return Some(ActionInspectorAnchor::Broadcast(*id));
+        }
+        match transcript.order.get(index)? {
+            TranscriptEntry::Tool {
+                source_name,
+                started_at,
+                ..
+            } if source_name == "reasoning" => Some(ActionInspectorAnchor::Reasoning(*started_at)),
+            TranscriptEntry::Compaction { sequence, .. } => {
+                Some(ActionInspectorAnchor::Compaction(*sequence))
+            }
+            _ => None,
+        }
+    }
+
+    fn restore_action_inspector(&mut self, anchor: Option<ActionInspectorAnchor>) {
+        if self.focused_tool.is_none() {
+            return;
+        }
+        let index = match anchor {
+            Some(ActionInspectorAnchor::Tool(id)) => self.transcript.tools.get(&id).copied(),
+            Some(ActionInspectorAnchor::CommandEdit(id)) => self.transcript.command_edit_rows.get(&id).copied(),
+            Some(ActionInspectorAnchor::Agent(id)) => self.transcript.subagent_entries.get(&id).copied(),
+            Some(ActionInspectorAnchor::Broadcast(id)) => self.transcript.team_broadcast_entries.get(&id).copied(),
+            Some(ActionInspectorAnchor::Reasoning(start)) => self.transcript.order.iter().position(|entry| {
+                matches!(entry, TranscriptEntry::Tool { source_name, started_at, .. }
+                    if source_name == "reasoning" && *started_at == start)
+            }),
+            Some(ActionInspectorAnchor::Compaction(seq)) => self.transcript.order.iter().position(|entry| {
+                matches!(entry, TranscriptEntry::Compaction { sequence, .. } if *sequence == seq)
+            }),
+            None => None,
+        };
+        if let Some(index) = index {
+            if self.focused_tool != Some(index) {
+                self.focused_tool = Some(index);
+                self.invalidate_transcript_render_cache();
+            }
+        } else {
+            self.close_tool_inspector();
+        }
     }
 
     fn open_tool_inspector(&mut self, index: usize) -> Vec<SessionPayloadRef> {
@@ -9083,22 +9177,6 @@ impl BorgTerminal {
                             continue;
                         }
                         for x in content_area.right()..transcript_area.right() {
-                            buffer[(x, y)].set_bg(bg);
-                        }
-                    }
-                }
-                // Diff bars also reach the left edge, under the detail rule.
-                {
-                    let buffer = frame.buffer_mut();
-                    for y in content_area.y..content_area.bottom() {
-                        let bg = buffer[(content_area.right() - 1, y)].bg;
-                        if !matches!(bg, rendering::DIFF_ADDED_BG | rendering::DIFF_REMOVED_BG) {
-                            continue;
-                        }
-                        for x in content_area.x..content_area.right() {
-                            if buffer[(x, y)].bg != Color::Reset {
-                                break;
-                            }
                             buffer[(x, y)].set_bg(bg);
                         }
                     }
@@ -14820,7 +14898,11 @@ fn selected_transcript_text(
         let mut chunks = Vec::new();
         for (selectable_start, selectable_end) in selectable {
             let chunk_start = from.max(selectable_start);
-            let chunk_end = to.min(selectable_end);
+            let chunk_end = if continues && diff_selection_ranges(line).is_some() {
+                to
+            } else {
+                to.min(selectable_end)
+            };
             if chunk_start >= chunk_end {
                 continue;
             }

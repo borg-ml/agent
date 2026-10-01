@@ -491,6 +491,7 @@ fn syntax_for_language<'a>(syntaxes: &'a SyntaxSet, language: &str) -> Option<&'
 fn diff_lines(source: &str, width: usize, source_language: Option<&str>) -> Vec<Line<'static>> {
     if width >= SPLIT_DIFF_MIN_WIDTH
         && diff_has_balanced_changes(source)
+        && diff_fits_split_panes(source, width)
         && source.lines().any(|line| hunk_starts(line).is_some())
         && !source.lines().any(is_apply_patch_control_line)
     {
@@ -498,6 +499,17 @@ fn diff_lines(source: &str, width: usize, source_language: Option<&str>) -> Vec<
     } else {
         unified_diff_lines(source, width, source_language, false)
     }
+}
+
+/// Split panes clip, so a row wider than its pane uses the wrapping view.
+fn diff_fits_split_panes(source: &str, width: usize) -> bool {
+    let pane = width.saturating_sub(3) / 2;
+    let content = pane.saturating_sub(diff_number_width(source) + 5);
+    source
+        .lines()
+        .filter(|line| !line.starts_with("+++") && !line.starts_with("---"))
+        .filter_map(|line| line.strip_prefix(['+', '-', ' ']))
+        .all(|text| UnicodeWidthStr::width(text) <= content)
 }
 
 fn diff_has_balanced_changes(source: &str) -> bool {
@@ -604,7 +616,7 @@ fn unified_diff_lines(
                     None,
                 )
             };
-        let line = highlighted_diff_line(
+        output.extend(highlighted_diff_lines(
             old_number,
             new_number,
             marker,
@@ -612,28 +624,18 @@ fn unified_diff_lines(
             background,
             highlighter.as_mut(),
             syntaxes,
-            if wrap {
-                width.max(UnicodeWidthStr::width(text) + 2 * number_width + 6)
-            } else {
-                width
-            },
+            width,
             show_line_numbers,
             number_width,
-        );
-        if wrap {
-            output.extend(super::markdown::wrap_markdown_spans(
-                &line.spans,
-                width.max(1),
-            ));
-        } else {
-            output.push(line);
-        }
+        ));
     }
     output
 }
 
+/// A diff row wraps under a continuation gutter instead of clipping: long
+/// prose rows such as Markdown tables are otherwise unreadable inline.
 #[allow(clippy::too_many_arguments)]
-fn highlighted_diff_line(
+fn highlighted_diff_lines(
     old_number: Option<usize>,
     new_number: Option<usize>,
     marker: char,
@@ -644,7 +646,7 @@ fn highlighted_diff_line(
     width: usize,
     show_line_numbers: bool,
     number_width: usize,
-) -> Line<'static> {
+) -> Vec<Line<'static>> {
     let prefix = if show_line_numbers {
         format!(
             "{} {} │ {marker} ",
@@ -662,20 +664,32 @@ fn highlighted_diff_line(
     let base_style = background
         .map(|color| Style::default().bg(color))
         .unwrap_or_default();
-    let mut spans = vec![Span::styled(
-        prefix.clone(),
-        base_style.fg(marker_color).add_modifier(Modifier::BOLD),
-    )];
-    let remaining = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
-    spans.extend(highlighted_source_spans(
+    let gutter_width = UnicodeWidthStr::width(prefix.as_str());
+    let source = highlighted_source_spans(
         text,
         highlighter,
         syntaxes,
         base_style,
         Color::Gray,
-        remaining,
+        UnicodeWidthStr::width(text),
+    );
+    let mut gutter = Some(Span::styled(
+        prefix,
+        base_style.fg(marker_color).add_modifier(Modifier::BOLD),
     ));
-    Line::from(spans)
+    // Continuations use the code view's `┊` gutter, which copy rejoins.
+    let continuation = Span::styled(
+        format!("{}┊ ", " ".repeat(gutter_width.saturating_sub(2))),
+        base_style.fg(Color::DarkGray),
+    );
+    super::markdown::wrap_markdown_spans(&source, width.saturating_sub(gutter_width).max(1))
+        .into_iter()
+        .map(|mut line| {
+            let gutter = gutter.take().unwrap_or_else(|| continuation.clone());
+            line.spans.insert(0, gutter);
+            line
+        })
+        .collect()
 }
 
 fn highlighted_source_spans(
@@ -709,8 +723,10 @@ fn highlighted_source_spans(
         remaining = remaining.saturating_sub(UnicodeWidthStr::width(content.as_str()));
         spans.push(Span::styled(content, base_style.fg(fallback_color)));
     }
+    // Only the changed text carries its colour; a full-width bar on every
+    // row turns a rewritten section into one solid block.
     if remaining > 0 {
-        spans.push(Span::styled(" ".repeat(remaining), base_style));
+        spans.push(Span::raw(" ".repeat(remaining)));
     }
     spans
 }

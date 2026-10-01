@@ -2508,10 +2508,10 @@ fn command_changes_become_a_separate_replay_stable_edit_action() {
     );
     assert_eq!(
         transcript.selected,
-        Some(1),
+        Some(transcript.tools["later"]),
         "the later action keeps its selection"
     );
-    assert_eq!(transcript.tools.get("later"), Some(&1));
+    assert_eq!(transcript.tools.get("later"), Some(&2));
     assert!(matches!(
         &transcript.order[0],
         TranscriptEntry::Tool {
@@ -2523,12 +2523,12 @@ fn command_changes_become_a_separate_replay_stable_edit_action() {
             && output.contains("rewrote src/lib.rs") && !output.contains("@@ -1")
     ));
     assert!(matches!(
-        &transcript.order[1],
+        &transcript.order[2],
         TranscriptEntry::Tool { code_view: Some((_, command)), .. }
             if command == "cargo check"
     ));
     assert!(matches!(
-        &transcript.order[2],
+        &transcript.order[1],
         TranscriptEntry::Tool {
             name,
             code_view: Some((language, diff)),
@@ -2543,7 +2543,7 @@ fn command_changes_become_a_separate_replay_stable_edit_action() {
     }
     assert_eq!(replay.order.len(), 3);
     assert!(matches!(
-        &replay.order[2],
+        &replay.order[1],
         TranscriptEntry::Tool { name, code_view: Some((_, diff)), .. }
             if name == "Edit" && diff.contains("+new")
     ));
@@ -2673,9 +2673,22 @@ fn background_process_change_and_terminal_poll_share_one_edit_action() {
             parent_tool_call_id: None,
         },
     ));
+    // The agent moves on while the process runs, so its change report
+    // arrives after a later row. The diff must still sit under the command.
     transcript.apply(&SessionEvent::new(
         session_id,
         4,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "read".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "README.md"}),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        5,
         SessionEventKind::RuntimeProcessCompleted {
             process_id,
             pid: 42,
@@ -2690,16 +2703,17 @@ fn background_process_change_and_terminal_poll_share_one_edit_action() {
             changes: changes.clone(),
         },
     ));
-    assert_eq!(transcript.order.len(), 2);
+    assert_eq!(transcript.order.len(), 3);
     assert!(matches!(
         &transcript.order[1],
         TranscriptEntry::Tool { name, code_view: Some((_, diff)), .. }
             if name == "Edit" && diff.contains("+new")
     ));
+    assert_eq!(transcript.tools.get("read"), Some(&2));
 
     transcript.apply(&SessionEvent::new(
         session_id,
-        5,
+        6,
         SessionEventKind::ToolStarted {
             tool_call_id: "poll".to_string(),
             name: "write_stdin".to_string(),
@@ -2710,7 +2724,7 @@ fn background_process_change_and_terminal_poll_share_one_edit_action() {
     ));
     transcript.apply(&SessionEvent::new(
         session_id,
-        6,
+        7,
         SessionEventKind::ToolCompleted {
             tool_call_id: "poll".to_string(),
             output: serde_json::json!({
@@ -2731,7 +2745,7 @@ fn background_process_change_and_terminal_poll_share_one_edit_action() {
     // The terminal poll repeats what RuntimeProcessCompleted already delivered,
     // so it adds no row - and crucially its change report still merges into the
     // single Edit row rather than becoming a second one.
-    assert_eq!(transcript.order.len(), 2);
+    assert_eq!(transcript.order.len(), 3);
     assert_eq!(transcript.command_edit_rows.len(), 1);
     assert_eq!(transcript.command_edit_rows.get("run"), Some(&1));
 }
@@ -3051,6 +3065,61 @@ fn structured_user_message_lines_preserve_column_spacing() {
         rendered.iter().map(Line::to_string).collect::<Vec<_>>(),
         vec!["NAME      VALUE", "alpha     10", "beta      20"]
     );
+}
+
+/// A prompt typed over several composer lines keeps those lines, its blank
+/// line and its Markdown, rather than reflowing into one paragraph.
+#[test]
+fn user_messages_keep_their_composer_line_breaks() {
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        Uuid::new_v4(),
+        1,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "% chance it rains\nfirst **point**\nsecond point\nthird point\n\nafter a gap"
+                .to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    ));
+    let rendered = |width| {
+        transcript
+            .lines(width)
+            .into_iter()
+            .map(|line| line.to_string().trim().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let wide = rendered(80);
+    let body = wide
+        .iter()
+        .skip_while(|line| *line != "% chance it rains")
+        .take_while(|line| *line != "after a gap")
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        body,
+        [
+            "% chance it rains",
+            "first point",
+            "second point",
+            "third point",
+            ""
+        ],
+        "rendered: {wide:#?}"
+    );
+    // A narrow pane wraps the long line but still starts each composer line
+    // on its own row.
+    let narrow = rendered(18);
+    for composer_line in ["first point", "second point", "third point"] {
+        assert!(
+            narrow.iter().any(|line| line == composer_line),
+            "{composer_line:?} missing from {narrow:#?}"
+        );
+    }
 }
 
 #[test]
@@ -14881,11 +14950,13 @@ fn a_collapsed_plan_card_shows_the_update_not_the_first_rows() {
     assert!(!progressed.contains("Task 14"), "{progressed}");
     assert!(progressed.contains("+ 14 more"), "{progressed}");
 
-    // The changed step shows its old and new status before the open rows.
+    // A status change keeps its text, so the step reads as one updated row,
+    // not a removed and re-added copy, before the open rows.
     mixed[11].status = PlanItemStatus::InProgress;
     transcript.upsert_plan(mixed, "12:13".to_string());
     let started = render(&transcript);
-    assert_eq!(started.matches("Task 11").count(), 2, "{started}");
+    assert_eq!(started.matches("Task 11").count(), 1, "{started}");
+    assert!(!started.contains('−'), "{started}");
     for open in ["Task 12", "Task 13", "Task 14"] {
         assert!(started.contains(open), "{open} missing from {started}");
     }
@@ -16743,6 +16814,38 @@ fn fullscreen_diff_preserves_wide_changed_lines() {
     assert!(lines.iter().all(|line| line.width() <= 60));
 }
 
+/// The transcript's inline diff must not clip a wide Markdown table row: the
+/// ellipsis is all a reader or a copy could ever recover of the hidden cells.
+#[test]
+fn inline_diff_wraps_a_wide_markdown_row_instead_of_clipping_it() {
+    let row = format!(
+        "| No technology required | {}END |",
+        "Basic single-colour dyeing of the garment. ".repeat(4)
+    );
+    let source = format!("@@ -1,0 +1,2 @@\n+| Tier | Capability |\n+{row}\n");
+    let lines = rendering::tool_body_lines("diff:md", &source, 80, "  │ ");
+    let rendered = lines
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(lines.iter().all(|line| line.width() <= 80), "{rendered}");
+    assert!(rendered.contains("END |"), "{rendered}");
+    assert!(!rendered.contains('…'), "{rendered}");
+    // Copy rejoins the wrapped rows into the one source line they came from.
+    let copied = selected_transcript_text(
+        &lines,
+        TranscriptPoint { row: 0, column: 0 },
+        TranscriptPoint {
+            row: lines.len() - 1,
+            column: usize::MAX,
+        },
+    )
+    .expect("diff copy");
+    assert_eq!(copied, format!("| Tier | Capability |\n{row}"));
+}
+
 #[tokio::test]
 #[ignore = "requires a PTY; verifies global timeline click behavior and fullscreen return"]
 async fn timeline_detail_click_policy_applies_to_every_expandable_entry() {
@@ -17278,6 +17381,139 @@ fn reasoning_snapshot_repairs_a_dropped_live_preview() {
     assert_eq!(reasoning_text(&transcript), "abcdefghi");
     transcript.apply(&snapshot("abcdefghi"));
     assert_eq!(reasoning_text(&transcript), "abcdefghi");
+}
+
+#[tokio::test]
+#[ignore = "requires a PTY; exercises action clicks across live updates and history replacement"]
+async fn action_inspector_keeps_identity_across_history_reprojection() {
+    let session_id = Uuid::new_v4();
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        session_id,
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    terminal.set_tool_click_behavior(ToolClickBehavior::Fullscreen);
+    let mut history = Vec::new();
+    for (sequence, id) in [(10, "selected-tool"), (11, "other-tool")] {
+        let event = SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ToolStarted {
+                tool_call_id: id.into(),
+                name: "exec".into(),
+                input: serde_json::json!({"cmd": id}),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        );
+        terminal.apply_session_event(&event);
+        history.push(event);
+    }
+    terminal.run_pending_transcript_click(PendingTranscriptClick::Tool {
+        index: terminal.transcript.tools["selected-tool"],
+        run: None,
+    });
+    assert!(terminal.is_inspecting_action());
+    let late_prompt = SessionEvent::new(
+        session_id,
+        12,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "late prompt".into(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+    terminal.apply_session_event(&late_prompt);
+    history.push(late_prompt);
+    let completion = SessionEvent::new(
+        session_id,
+        13,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "selected-tool".into(),
+            output: "selected result".into(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    );
+    terminal.apply_session_event(&completion);
+    history.push(completion);
+    assert_eq!(
+        terminal.focused_tool,
+        Some(terminal.transcript.tools["selected-tool"])
+    );
+    history.insert(
+        0,
+        SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "older-tool".into(),
+                name: "exec".into(),
+                input: serde_json::json!({"cmd": "older action"}),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        ),
+    );
+    terminal.replace_history(&history);
+    assert_eq!(
+        terminal.focused_tool,
+        Some(terminal.transcript.tools["selected-tool"])
+    );
+    assert!(matches!(
+        &terminal.transcript.order[terminal.focused_tool.unwrap()],
+        TranscriptEntry::Tool { complete: true, output_view: Some((_, output)), .. }
+            if output.contains("selected result")
+    ));
+    history.retain(|event| {
+        !matches!(
+            &event.kind,
+            SessionEventKind::ToolStarted { tool_call_id, .. }
+                | SessionEventKind::ToolCompleted { tool_call_id, .. }
+                if tool_call_id == "selected-tool"
+        )
+    });
+    terminal.replace_history(&history);
+    assert!(
+        !terminal.is_inspecting_action(),
+        "removed action must not select another row"
+    );
+    let child_id = Uuid::new_v4();
+    terminal.seed_child_history(child_id, &history);
+    terminal.focus_child_transcript(child_id);
+    terminal.run_pending_transcript_click(PendingTranscriptClick::Tool {
+        index: terminal.transcript.tools["other-tool"],
+        run: None,
+    });
+    history.insert(
+        0,
+        SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "older-child-tool".into(),
+                name: "exec".into(),
+                input: serde_json::json!({"cmd": "older child action"}),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        ),
+    );
+    terminal.seed_child_history(child_id, &history);
+    assert_eq!(
+        terminal.focused_tool,
+        Some(terminal.transcript.tools["other-tool"])
+    );
+    terminal.shutdown().await;
 }
 
 #[tokio::test]
