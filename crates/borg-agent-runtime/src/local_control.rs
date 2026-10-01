@@ -18,6 +18,7 @@ use crate::{
 
 const MAX_CONTROL_COMMAND_BYTES: u64 = 1024 * 1024;
 const ATTACHED_SESSION_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+const ATTACHED_LIVE_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const ATTACHED_STORE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const LOCAL_LIVE_EVENT_BUFFER: usize = 128;
 const LOCAL_LIVE_FRAME_MAX_BYTES: usize = 1024 * 1024;
@@ -1702,8 +1703,35 @@ async fn forward_attached_events(
                     }
                 }
             }
+            let mut reconcile = tokio::time::interval(ATTACHED_LIVE_RECONCILE_INTERVAL);
+            reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // A healthy socket owns preview ordering. Repair only after silence.
+            reconcile.reset();
             loop {
-                let frame = match read_live_frame(&mut connection.reader).await {
+                // Keep the frame read alive across checks: cancelling it after
+                // consuming only part of a JSON frame would corrupt the stream.
+                let frame = {
+                    let read = read_live_frame(&mut connection.reader);
+                    tokio::pin!(read);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            frame = &mut read => break frame,
+                            _ = reconcile.tick() => {
+                                if forward_attached_durable_events(
+                                    store.as_ref(), session_id, &mut last_sequence,
+                                    &mut preview, &events,
+                                ).await? {
+                                    return Ok(());
+                                }
+                                if !writer_is_active(&lock_path)? {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                };
+                let frame = match frame {
                     Ok(Some(frame)) => frame,
                     Ok(None) => break,
                     Err(error) => {
@@ -1711,6 +1739,7 @@ async fn forward_attached_events(
                         break;
                     }
                 };
+                reconcile.reset();
                 let LocalLiveFrame::Event {
                     event,
                     text_start,
@@ -1785,33 +1814,16 @@ async fn forward_attached_events(
         }
 
         refresh.tick().await;
-        let historical = match store.events_after(session_id, last_sequence, 1_000).await {
-            Ok(events) => events,
-            Err(error) if attached_store_error_is_retryable(&error) => {
-                tracing::debug!(%error, %session_id, "attached session store read is busy; retrying");
-                tokio::time::sleep(ATTACHED_STORE_RETRY_DELAY).await;
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        for event in historical {
-            let stopped = matches!(
-                event.kind,
-                SessionEventKind::StatusChanged {
-                    status: SessionStatus::Stopped,
-                    ..
-                }
-            );
-            let sequence = event.sequence;
-            if let Some(event) = preview.accept(event, None)
-                && events.send(event).await.is_err()
-            {
-                return Ok(());
-            }
-            last_sequence = sequence;
-            if stopped {
-                return Ok(());
-            }
+        if forward_attached_durable_events(
+            store.as_ref(),
+            session_id,
+            &mut last_sequence,
+            &mut preview,
+            &events,
+        )
+        .await?
+        {
+            return Ok(());
         }
         let live_events = match store.live_events_after(session_id, live_revision).await {
             Ok(events) => events,
@@ -1834,6 +1846,46 @@ async fn forward_attached_events(
             return Ok(());
         }
     }
+}
+
+// Live delivery is bounded and can miss the final durable event. Reconcile
+// after a connected socket goes quiet; a later frame is not guaranteed to arrive.
+#[cfg(unix)]
+async fn forward_attached_durable_events(
+    store: &dyn SessionStore,
+    session_id: Uuid,
+    last_sequence: &mut u64,
+    preview: &mut AttachedPreviewCursor,
+    events: &mpsc::Sender<SessionEvent>,
+) -> Result<bool> {
+    let historical = match store.events_after(session_id, *last_sequence, 1_000).await {
+        Ok(events) => events,
+        Err(error) if attached_store_error_is_retryable(&error) => {
+            tracing::debug!(%error, %session_id, "attached session store read is busy; retrying");
+            tokio::time::sleep(ATTACHED_STORE_RETRY_DELAY).await;
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    for event in historical {
+        let stopped = matches!(
+            event.kind,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Stopped,
+                ..
+            }
+        );
+        *last_sequence = event.sequence;
+        if let Some(event) = preview.accept(event, None)
+            && events.send(event).await.is_err()
+        {
+            return Ok(true);
+        }
+        if stopped {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(unix)]
@@ -2844,6 +2896,236 @@ mod tests {
             .expect("attachment should notice released ownership")
             .expect("attachment task should not panic")
             .expect("owner loss is a clean detach");
+        scratch.discard().await;
+    }
+
+    #[tokio::test]
+    async fn connected_attachment_does_not_overtake_flowing_previews() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let lock_path = root.path().join("session.lock");
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let writer = SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .unwrap();
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let postgres = Arc::new(postgres);
+        postgres.create_session(session_id).await.unwrap();
+        let running = postgres
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Running,
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let (owner_tx, _owner_rx) = mpsc::channel(1);
+        let server =
+            LocalSessionControlServer::start(socket_path.clone(), session_id, &writer, owner_tx)
+                .unwrap();
+        server.seed_durable_watermark(running.sequence);
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let attachment = tokio::spawn(run_attached_session(
+            postgres.clone(),
+            session_id,
+            lock_path,
+            socket_path,
+            running.sequence,
+            command_rx,
+            event_tx,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while server.live.lock().unwrap().events.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("viewer subscribes before previews flow");
+        server.publish_live_event(&SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::Assistant,
+                text: "prefix".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: None,
+            },
+        ));
+        let prefix = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(prefix.kind, SessionEventKind::Message { ref text, .. } if text == "prefix")
+        );
+        // The journal gets ahead of the socket, whose deltas still carry the
+        // old watermark. Replaying this row mid-stream would drop those deltas
+        // and invalidate every following offset until a new snapshot arrived.
+        let unpublished = postgres
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionTitled {
+                    title: "ahead".into(),
+                    generated: false,
+                    usage_tokens: None,
+                },
+            ))
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            tokio::time::sleep(std::time::Duration::from_millis(125)).await;
+            server.publish_live_event(&SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::MessageDelta {
+                    message_id,
+                    delta: "x".into(),
+                },
+            ));
+            let delta = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(delta.kind, SessionEventKind::MessageDelta { ref delta, .. } if delta == "x"),
+                "durable repair must not jump ahead of a flowing preview: {:?}",
+                delta.kind
+            );
+        }
+        // Once the socket is quiet, the unpublished tail must still recover.
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.id, unpublished.id);
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        attachment.await.unwrap().unwrap();
+        drop(server);
+        drop(postgres);
+        scratch.discard().await;
+    }
+
+    #[tokio::test]
+    async fn connected_attachment_recovers_a_silent_terminal_tail() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let lock_path = root.path().join("session.lock");
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let writer = SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .unwrap();
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let postgres = Arc::new(postgres);
+        postgres.create_session(session_id).await.unwrap();
+        let running = postgres
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Running,
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let (owner_tx, _owner_rx) = mpsc::channel(1);
+        let server =
+            LocalSessionControlServer::start(socket_path.clone(), session_id, &writer, owner_tx)
+                .unwrap();
+        server.seed_durable_watermark(running.sequence);
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let attachment = tokio::spawn(run_attached_session(
+            postgres.clone(),
+            session_id,
+            lock_path,
+            socket_path,
+            running.sequence,
+            command_rx,
+            event_tx,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while server.live.lock().unwrap().events.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("viewer subscribes before the missed tail is committed");
+
+        // The socket stays open, but the owner fails to publish its last events.
+        let tail = postgres
+            .append_batch(vec![
+                SessionEvent::new(
+                    session_id,
+                    0,
+                    SessionEventKind::Message {
+                        message_id,
+                        actor: EventActor::Assistant,
+                        text: "finished".into(),
+                        attachments: Vec::new(),
+                        status: MessageStatus::Complete,
+                        delivery: None,
+                    },
+                ),
+                SessionEvent::new(
+                    session_id,
+                    0,
+                    SessionEventKind::StatusChanged {
+                        status: SessionStatus::Ready,
+                        detail: None,
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        for expected in &tail {
+            let received = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+                .await
+                .expect("committed tail must appear without Stop or another socket event")
+                .unwrap();
+            assert_eq!(received.id, expected.id);
+            assert_eq!(received.sequence, expected.sequence);
+        }
+        // Late live traffic must not resurrect the draft or duplicate the reply.
+        server.publish_live_event(&SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::Assistant,
+                text: "stale draft".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: None,
+            },
+        ));
+        for event in tail {
+            server.publish_live_event(&event);
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), event_rx.recv())
+                .await
+                .is_err()
+        );
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        attachment.await.unwrap().unwrap();
+        drop(server);
+        drop(postgres);
         scratch.discard().await;
     }
 

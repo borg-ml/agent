@@ -2843,7 +2843,14 @@ async fn run_local_agent_session(
         );
         terminal.set_transcript_colors(&editor_preferences.transcript);
         if let Some((text, attachments)) = restored_prompt {
-            terminal.restore_composer(text, attachments);
+            // The sidecar or reused terminal may already hold this same draft.
+            // Appending it again would duplicate unsent text during handoff.
+            let already_restored = terminal
+                .composer_draft()
+                .is_some_and(|(draft, files)| draft == text && files == attachments);
+            if !already_restored {
+                terminal.restore_composer(text, attachments);
+            }
         }
         // Credential pre-flight: a fresh session on a provider with no usable
         // credential must offer the sign-in flow now, not fail the first turn
@@ -3082,6 +3089,9 @@ async fn run_local_agent_session(
     let mut session_event_stream_open = true;
     let mut queued_session_events = VecDeque::new();
     let mut projection_gap_repair_task: Option<ProjectionGapRepairTask> = None;
+    let mut projection_tail_repair_task: Option<ProjectionGapRepairTask> = None;
+    let mut projection_tail_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    projection_tail_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut stale_owner_handoff_task: Option<StaleOwnerHandoffTask> =
         if stale_local_owner && stale_local_owner_can_handoff(session_state.status) {
             let lock_path = lock_path.clone();
@@ -3238,6 +3248,39 @@ async fn run_local_agent_session(
                     Err(error) => {
                         tracing::warn!(%error, %session_id, "obsolete session owner handoff task failed");
                     }
+                }
+            }
+            // A bounded live send can miss the last durable row. With no
+            // successor there is no sequence gap to trigger the repair below.
+            // Read in a task so journal I/O cannot hold up Esc or painting.
+            _ = projection_tail_tick.tick(), if session_access == LocalSessionAccess::Owned
+                && session_event_stream_open
+                && projection_tail_repair_task.is_none()
+                && projection_gap_repair_task.is_none()
+                && queued_session_events.is_empty()
+                && session_events.is_empty() => {
+                let store = Arc::clone(&store);
+                let after = delivered_projection.state().latest_sequence;
+                projection_tail_repair_task = Some(tokio::spawn(async move {
+                    store.events_after(session_id, after, 1_024).await
+                }));
+            }
+            result = async {
+                projection_tail_repair_task
+                    .as_mut()
+                    .expect("projection tail repair branch is guarded")
+                    .await
+            }, if projection_tail_repair_task.is_some() => {
+                projection_tail_repair_task = None;
+                match result {
+                    // Do not let a store snapshot overtake previews that
+                    // arrived while the query was in flight. Retry when idle.
+                    Ok(Ok(events)) if session_events.is_empty() && queued_session_events.is_empty() => {
+                        queued_session_events.extend(events);
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => tracing::warn!(%error, %session_id, "session tail repair will retry"),
+                    Err(error) => tracing::warn!(%error, %session_id, "session tail repair task will retry"),
                 }
             }
             result = async {
@@ -4110,6 +4153,13 @@ async fn run_local_agent_session(
                         }
                         continue 'session;
                     };
+                    // A periodic replay may beat the original live send.
+                    // Never render its later arrival twice or roll state back.
+                    if event.sequence > 0
+                        && event.sequence <= delivered_projection.state().latest_sequence
+                    {
+                        continue 'session;
+                    }
                     if event.sequence > delivered_projection.state().latest_sequence.saturating_add(1) {
                         projection_gap_repair_task = Some(tokio::spawn(load_projection_gap(
                             Arc::clone(&store),
@@ -7847,6 +7897,9 @@ async fn run_local_agent_session(
     if let Some(task) = projection_gap_repair_task.take() {
         task.abort();
     }
+    if let Some(task) = projection_tail_repair_task.take() {
+        task.abort();
+    }
     if let Some(task) = stale_owner_handoff_task.take() {
         task.abort();
     }
@@ -7859,7 +7912,9 @@ async fn run_local_agent_session(
     // transient reconnect) reuses or recreates the terminal, and both paths
     // reset the composer. Capture the draft now so typed text survives.
     let composer_draft = terminal.as_ref().and_then(BorgTerminal::composer_draft);
-    let preserve_terminal = resume_session.is_some() && !user_requested_exit && terminal.is_some();
+    let preserve_terminal =
+        relaunch_keeps_terminal(session_access, user_requested_exit, resume_session)
+            && terminal.is_some();
     if !preserve_terminal {
         shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
     }
@@ -7935,6 +7990,7 @@ async fn run_local_agent_session(
             if retry_prompt.is_some() {
                 return Ok(Some((session_id, retry_prompt, terminal)));
             }
+            shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
             println!("{}", resume_instructions(session_id, false));
             return Ok(None);
         }
@@ -7999,7 +8055,7 @@ async fn run_local_agent_session(
     }
     if session_access.is_attached() && !user_requested_exit && resume_session.is_none() {
         tracing::info!(%session_id, "active session owner exited; acquiring ownership");
-        return Ok(Some((session_id, next_prompt, None)));
+        return Ok(Some((session_id, next_prompt, terminal)));
     }
     let next_terminal = if resume_session.is_some() && !user_requested_exit {
         terminal
@@ -8464,6 +8520,17 @@ fn resume_instructions(session_id: Uuid, active_elsewhere: bool) -> String {
     format!("{warning}Copy and paste the line below to resume:\nborg resume {session_id}")
 }
 
+/// A relaunch that stays in Borg keeps the alternate screen: switching
+/// sessions, or a viewer taking over after its owner exited. Leaving it in
+/// between flashes the underlying shell before the next session paints.
+fn relaunch_keeps_terminal(
+    access: LocalSessionAccess,
+    user_requested_exit: bool,
+    resume_session: Option<Uuid>,
+) -> bool {
+    !user_requested_exit && (resume_session.is_some() || access.is_attached())
+}
+
 fn should_print_exit_resume(
     user_requested_exit: bool,
     resume_session: Option<Uuid>,
@@ -8894,10 +8961,15 @@ async fn recent_tui_history(
     // could open on an old prompt instead of the last reply. Splice the
     // newest turns back in by sequence; raising the scan cap cannot fix this
     // because the gap is unbounded.
+    // The live cursor starts at `latest_sequence`, so an attached viewer is
+    // redelivered every later row. Seeding one here as well would render it
+    // twice and show a transcript ahead of the seeded status.
     let mut scanned = scanned;
+    scanned.retain(|event| event.sequence <= latest_sequence);
     for message in latest_messages
         .into_iter()
         .chain(latest_user_messages.into_iter().next())
+        .filter(|message| message.sequence <= latest_sequence)
     {
         if scanned.iter().any(|event| event.id == message.id) {
             continue;
@@ -8908,6 +8980,7 @@ async fn recent_tui_history(
     let selection = select_resume_bootstrap_history(scanned);
     let mut selected = selection.events;
     if let Some(checkpoint) = checkpoint
+        && checkpoint.sequence <= latest_sequence
         && !selected.iter().any(|event| event.id == checkpoint.id)
     {
         let index = selected.partition_point(|event| event.sequence < checkpoint.sequence);

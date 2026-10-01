@@ -265,6 +265,182 @@ fn run_esc_probe(queued_prompts: usize) {
     server.join().expect("mock provider thread");
 }
 
+/// A viewer whose session host exits takes ownership and attaches to the
+/// replacement host. That handoff happens inside Borg, so the terminal must
+/// stay on the alternate screen: leaving it flashes the user's shell between
+/// the two frames. A deliberate `/exit` still restores the terminal.
+///
+/// The journal, not the live stream, is the transcript's source of truth: a
+/// durable row with no later event to trigger gap repair must still reach the
+/// screen promptly, and only once.
+#[test]
+#[ignore = "requires BORG_SESSIONS_URL, an isolated live TUI, detached session host and streaming provider"]
+fn session_host_restart_keeps_the_viewer_on_the_alternate_screen() {
+    const LEAVE_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049l";
+    let runtime = tempfile::tempdir().expect("isolated Borg runtime");
+    let borg_home = runtime.path().join("borg-home");
+    let config_home = runtime.path().join("config");
+    fs::create_dir_all(config_home.join("borg")).expect("config root");
+    fs::write(
+        config_home.join("borg/agent.toml"),
+        "[updates]\nauto_install = false\n",
+    )
+    .expect("disable updates");
+    let (endpoint, stream_started, _server) = spawn_streaming_provider();
+    let executable = std::env::var("BORG_TUI_STRESS_EXE")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_borg").to_string());
+    // Declared before the viewer so it drops after it: a live viewer would
+    // start a replacement for any host killed underneath it.
+    let host_guard = SessionHostGuard::default();
+    let mut terminal = PtyChild::spawn(
+        &executable,
+        runtime.path(),
+        &borg_home,
+        &config_home,
+        &endpoint,
+    )
+    .expect("start isolated Borg TUI");
+    stream_started
+        .recv_timeout(Duration::from_secs(30))
+        .expect("provider started");
+    terminal
+        .wait_for_screen_text("stream complete", Duration::from_secs(60))
+        .expect("the streaming turn finished");
+    let session_id = fs::read_dir(borg_home.join("remote/sessions"))
+        .expect("isolated sessions directory")
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .strip_suffix(".lock")
+                .map(str::to_owned)
+        })
+        .expect("isolated session lock");
+    host_guard
+        .0
+        .set(session_id.clone())
+        .expect("one fresh session");
+    let journal = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("journal client runtime");
+    let store = journal
+        .block_on(borg_agent_runtime::PostgresSessionStore::connect(
+            &std::env::var(borg_agent_runtime::SESSIONS_URL_ENV)
+                .expect("BORG_SESSIONS_URL names the isolated journal"),
+        ))
+        .expect("connect to the isolated journal");
+    let session = session_id.parse().expect("session id");
+    wait_for_idle_journal(&journal, &store, session, &mut terminal, None);
+    const DRAFT: &str = "unsent-draft-survives-handoff";
+    terminal
+        .type_and_measure(DRAFT, Duration::from_secs(2))
+        .expect("type an unsent draft");
+    let host = session_host_pid(&session_id).expect("detached session host");
+    let first_paints = |log: &str| {
+        log.matches("interactive session reached first paint")
+            .count()
+    };
+    let painted = first_paints(&fs::read_to_string(&terminal.log_path).unwrap_or_default());
+    terminal.drain_output().expect("drain previous frames");
+
+    // SAFETY: the PID is this test's own detached host for a fresh session.
+    assert_eq!(unsafe { libc::kill(host as i32, libc::SIGKILL) }, 0);
+    let mut handoff = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        terminal
+            .read_available(Some(&mut handoff))
+            .expect("read handoff output");
+        let log = fs::read_to_string(&terminal.log_path).unwrap_or_default();
+        if log.contains("active session owner exited; acquiring ownership")
+            && first_paints(&log) > painted
+            && session_host_pid(&session_id).is_some_and(|pid| pid != host)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "viewer did not reattach to a replacement host; log={log}"
+        );
+        assert!(
+            terminal.child.try_wait().expect("poll viewer").is_none(),
+            "viewer exited during the host handoff"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    wait_for_idle_journal(&journal, &store, session, &mut terminal, Some(&mut handoff));
+    assert!(
+        !handoff
+            .windows(LEAVE_ALTERNATE_SCREEN.len())
+            .any(|window| window == LEAVE_ALTERNATE_SCREEN),
+        "viewer left the alternate screen while its host restarted"
+    );
+
+    terminal
+        .wait_for_screen_text(DRAFT, Duration::from_secs(2))
+        .expect("host handoff preserves the unsent composer draft");
+    assert_eq!(
+        terminal.screen.text().matches(DRAFT).count(),
+        1,
+        "host handoff must not duplicate the unsent draft"
+    );
+
+    // Nothing follows this row, so only a journal reconciliation can show it.
+    use borg_agent_runtime::SessionStore as _;
+    let marker = "journal-only-reply-ZQX";
+    let appended = journal
+        .block_on(store.append(borg_agent_runtime::SessionEvent::new(
+            session,
+            0,
+            borg_agent_runtime::SessionEventKind::Message {
+                message_id: uuid::Uuid::new_v4(),
+                actor: borg_agent_runtime::EventActor::Assistant,
+                text: marker.to_string(),
+                attachments: Vec::new(),
+                status: borg_agent_runtime::MessageStatus::Complete,
+                delivery: None,
+            },
+        )))
+        .expect("append a journal-only reply");
+    terminal
+        .wait_for_screen_text(marker, Duration::from_secs(2))
+        .expect("a durable row without a successor reaches the screen");
+    // A later row would let ordinary gap repair deliver the marker instead.
+    assert_eq!(
+        journal
+            .block_on(store.state(session))
+            .expect("journal state")
+            .latest_sequence,
+        appended.sequence,
+        "the marker must still be the journal head when it is painted"
+    );
+    let settle = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < settle {
+        terminal.read_available(None).expect("read settled frames");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        terminal.screen.text().matches(marker).count(),
+        1,
+        "journal-only reply must render exactly once"
+    );
+
+    terminal
+        .write_all_retry(b"\x03/exit")
+        .expect("replace the preserved draft with an exit command");
+    terminal
+        .wait_for_screen_text("/exit", Duration::from_secs(2))
+        .expect("the exit command is in the composer");
+    terminal
+        .write_all_retry(b"\r")
+        .expect("request an explicit exit");
+    terminal
+        .wait_for_pattern(LEAVE_ALTERNATE_SCREEN, Duration::from_secs(10))
+        .expect("an explicit exit restores the terminal");
+}
+
 #[test]
 #[ignore = "explicit read-only viewer gate against a live Borg session"]
 fn live_attached_session_interaction_latency() {
@@ -366,6 +542,71 @@ fn live_attached_session_interaction_latency() {
             latency <= MOUSE_INPUT_SLO,
             "live {interaction}-to-paint exceeded {MOUSE_INPUT_SLO:?}: {latency:?}"
         );
+    }
+}
+
+/// Wait until the session is Ready and its journal has not grown for a second,
+/// draining the viewer meanwhile.
+fn wait_for_idle_journal(
+    journal: &tokio::runtime::Runtime,
+    store: &borg_agent_runtime::PostgresSessionStore,
+    session: uuid::Uuid,
+    terminal: &mut PtyChild,
+    mut output: Option<&mut Vec<u8>>,
+) {
+    use borg_agent_runtime::SessionStore as _;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last = (0, Instant::now());
+    loop {
+        terminal
+            .read_available(output.as_deref_mut())
+            .expect("drain viewer output");
+        let state = journal
+            .block_on(store.state(session))
+            .expect("journal state");
+        if state.latest_sequence != last.0 {
+            last = (state.latest_sequence, Instant::now());
+        } else if state.status == Some(borg_agent_runtime::SessionStatus::Ready)
+            && last.1.elapsed() >= Duration::from_secs(1)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session did not go idle: {state:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The detached host for exactly this session: matched on the
+/// `--session-host <id>` argument pair, never on a viewer that names the id.
+fn session_host_pid(session_id: &str) -> Option<u32> {
+    fs::read_dir("/proc")
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .find(|pid| {
+            fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|command| {
+                command
+                    .split(|byte| *byte == 0)
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|pair| pair[0] == b"--session-host" && pair[1] == session_id.as_bytes())
+            })
+        })
+}
+
+/// Kills the fresh session's host on every exit path, including a panic.
+#[derive(Default)]
+struct SessionHostGuard(std::cell::OnceCell<String>);
+
+impl Drop for SessionHostGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0.get().map(String::as_str).and_then(session_host_pid) {
+            // SAFETY: the PID is the detached host of this test's fresh session.
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
     }
 }
 
@@ -731,7 +972,10 @@ impl PtyChild {
         }
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            "Borg did not paint the active streaming screen",
+            format!(
+                "TUI did not emit {pattern:?}; screen={:?}",
+                self.screen.text()
+            ),
         ))
     }
 

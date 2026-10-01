@@ -3849,3 +3849,58 @@ fn attached_revert_forks_without_stopping_or_waiting_for_the_live_owner() {
         );
     }
 }
+
+/// An attached viewer hands `latest_sequence` to its live forwarder, which
+/// redelivers every later row. Rows committed while the bootstrap queries run
+/// must therefore stay out of the seeded transcript, or they render twice and
+/// the transcript runs ahead of the seeded status.
+#[tokio::test]
+async fn resume_bootstrap_stops_at_the_live_cursor() {
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let message = |actor, text: &str| SessionEventKind::Message {
+        message_id: Uuid::new_v4(),
+        actor,
+        text: text.to_string(),
+        attachments: Vec::new(),
+        status: MessageStatus::Complete,
+        delivery: None,
+    };
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            message(EventActor::User, "prompt"),
+        ))
+        .await
+        .unwrap();
+    let cursor = store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            message(EventActor::Assistant, "seen"),
+        ))
+        .await
+        .unwrap()
+        .sequence;
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            message(EventActor::Assistant, "after"),
+        ))
+        .await
+        .unwrap();
+
+    let history = recent_tui_history(&store, session_id, cursor)
+        .await
+        .unwrap();
+
+    assert!(history.events.iter().all(|event| event.sequence <= cursor));
+    assert!(history.events.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::Message { text, .. } if text == "seen"
+    )));
+    scratch.discard().await;
+}
