@@ -10298,7 +10298,7 @@ pub async fn load_message_attachment(
     attachment: &MessageAttachment,
 ) -> Result<Vec<u8>> {
     validate_message_attachment(attachment)?;
-    let bytes = tokio::fs::read(attachment_blob_path(journal_root, attachment))
+    let file = tokio::fs::File::open(attachment_blob_path(journal_root, attachment))
         .await
         .with_context(|| {
             format!(
@@ -10306,6 +10306,15 @@ pub async fn load_message_attachment(
                 attachment.name, attachment.sha256
             )
         })?;
+    // Bounded, so a swapped or corrupted blob cannot be read into memory
+    // whole before its length is found to be wrong.
+    let mut bytes = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(
+        &mut tokio::io::AsyncReadExt::take(file, MAX_MESSAGE_ATTACHMENT_BYTES + 1),
+        &mut bytes,
+    )
+    .await
+    .with_context(|| format!("failed to read image {}", attachment.name))?;
     verify_message_attachment_bytes(attachment, &bytes)?;
     Ok(bytes)
 }

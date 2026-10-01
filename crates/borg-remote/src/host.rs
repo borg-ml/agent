@@ -6345,6 +6345,34 @@ async fn flush_workspace_messages(
                             continue;
                         }
                     }
+                    // A failed delivery is terminal: a replay (a restart, or
+                    // `--send-pending` from an empty cursor) must neither resend
+                    // it nor try to move it out of Failed. A new message is the
+                    // retry.
+                    let failed = store
+                        .message_deliveries(message.id)
+                        .await?
+                        .into_iter()
+                        .filter(|delivery| delivery.state == crate::DeliveryState::Failed)
+                        .map(|delivery| delivery.recipient_id)
+                        .collect::<HashSet<_>>();
+                    let nothing_left = if recipients.is_empty() {
+                        !failed.is_empty()
+                            && store
+                                .delivery_recipients(workspace.id, event.sequence)
+                                .await?
+                                .iter()
+                                .all(|recipient| failed.contains(recipient))
+                    } else {
+                        recipients.retain(|recipient| !failed.contains(recipient));
+                        recipients.is_empty()
+                    };
+                    if nothing_left {
+                        uploaded_sequence = event.sequence;
+                        sync.uploaded_workspace_sequences
+                            .insert(workspace.id, uploaded_sequence);
+                        continue;
+                    }
                     let relay_path = if shared_workspace {
                         format!("/api/remote/host/sessions/{session_id}/workspace/messages")
                     } else {
@@ -6363,11 +6391,20 @@ async fn flush_workspace_messages(
                         {
                             AttachmentUpload::Uploaded => {}
                             AttachmentUpload::Rejected(detail) => {
+                                // A workspace or role audience is resolved by
+                                // the store, not listed on the message.
+                                let failed = if delivery_recipients.is_empty() {
+                                    store
+                                        .delivery_recipients(workspace.id, event.sequence)
+                                        .await?
+                                } else {
+                                    delivery_recipients.clone()
+                                };
                                 fail_relay_deliveries(
                                     store,
                                     workspace.id,
                                     message.id,
-                                    &delivery_recipients,
+                                    &failed,
                                     detail,
                                 )
                                 .await?;
@@ -7702,8 +7739,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut png = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-        png.extend_from_slice(b"relayed pixels");
+        // A real 1x1 PNG, so integrity here also means decodable pixels.
+        let png: Vec<u8> = vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xc9, 0xfe, 0x92,
+            0xef, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
         let attachment = crate::MessageAttachment {
             name: "frame.png".to_string(),
             media_type: "image/png".to_string(),
@@ -7768,7 +7811,12 @@ mod tests {
                                 let digest = reference["sha256"].as_str().unwrap();
                                 assert!(relay.blobs.contains_key(digest), "message before bytes");
                             }
-                            relay.messages.push(message);
+                            // The relay is idempotent on the key, as the server is.
+                            if !relay.messages.iter().any(|accepted| {
+                                accepted["idempotency_key"] == message["idempotency_key"]
+                            }) {
+                                relay.messages.push(message);
+                            }
                             ("204 No Content", Vec::new())
                         } else if path.ends_with("/inbox") {
                             let messages = relay
@@ -7869,6 +7917,34 @@ mod tests {
             let wire = relay.messages[0].to_string();
             assert!(!wire.contains(&*sender_root.path().to_string_lossy()));
         }
+
+        // Replay from an empty cursor, as `--send-pending` does after an
+        // upgrade: the failed message stays failed and is not resent.
+        sync.uploaded_workspace_sequences.clear();
+        flush_workspace_messages(
+            &client,
+            &sender_config,
+            &sender_store,
+            Some(sender_workspace.as_ref()),
+            sender,
+            None,
+            &mut sync,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sender_workspace
+                .message_deliveries(refused.message_id)
+                .await
+                .unwrap()[0]
+                .state,
+            crate::DeliveryState::Failed
+        );
+        assert_eq!(
+            relay.lock().unwrap().messages.len(),
+            1,
+            "a failed message was resent"
+        );
 
         // Tampered bytes are neither admitted nor acknowledged.
         relay.lock().unwrap().tamper = true;
