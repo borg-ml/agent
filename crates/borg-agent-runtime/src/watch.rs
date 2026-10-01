@@ -1028,8 +1028,10 @@ mod tests {
             .unwrap();
         let job = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if let Ok(pid) = std::fs::read_to_string(root.path().join("job.pid")) {
-                    break pid.trim().parse::<i32>().unwrap();
+                if let Ok(pid) = std::fs::read_to_string(root.path().join("job.pid"))
+                    && let Ok(pid) = pid.trim().parse::<i32>()
+                {
+                    break pid;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
