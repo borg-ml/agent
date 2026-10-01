@@ -7529,23 +7529,29 @@ fn a_clicked_link_resolves_against_the_session_directory() {
         .to_string();
 
     assert_eq!(
-        resolve_link("exports/logo.svg", Some(session.path())).unwrap(),
+        resolve_link("exports/logo.svg", Some(session.path()), true).unwrap(),
         opened
     );
     assert_eq!(
-        resolve_link("https://example.com/docs", None).unwrap(),
+        resolve_link("https://example.com/docs", None, false).unwrap(),
         "https://example.com/docs"
     );
-    // A path the session names but this machine lacks is reported, not opened.
-    assert!(resolve_link("exports/missing.png", Some(session.path())).is_err());
-    assert!(resolve_link("exports/logo.svg", None).is_err());
+    assert!(resolve_link("exports/logo.svg", None, true).is_err());
+    // A session on another machine names its own files, even where the same
+    // path happens to exist here.
+    assert!(resolve_link("exports/logo.svg", Some(session.path()), false).is_err());
+    // What a file link reaches is checked when it is opened: a path the
+    // session names but this machine lacks, or an executable, is refused.
+    let missing = url::Url::from_file_path(exports.join("missing.png")).unwrap();
+    assert!(open_link(missing.as_str()).is_err());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let script = exports.join("run.sh");
         std::fs::write(&script, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(resolve_link("exports/run.sh", Some(session.path())).is_err());
+        let script = url::Url::from_file_path(script).unwrap();
+        assert!(open_link(script.as_str()).is_err());
     }
 }
 
@@ -11366,6 +11372,7 @@ async fn clicking_a_relative_message_link_opens_the_session_file() {
         user_interrupted: false,
         redirected: false,
     });
+    terminal.set_local_file_links(true);
     terminal.invalidate_transcript_render_cache();
     terminal.draw().unwrap();
     let (area, _) = terminal
@@ -11376,7 +11383,7 @@ async fn clicking_a_relative_message_link_opens_the_session_file() {
     let expected = url::Url::from_file_path(session.path().join("exports/logo.svg"))
         .unwrap()
         .to_string();
-    for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+    let click = |terminal: &mut BorgTerminal, modifiers| {
         let mut last = UiAction::None;
         for kind in [
             MouseEventKind::Moved,
@@ -11395,6 +11402,10 @@ async fn clicking_a_relative_message_link_opens_the_session_file() {
                 })
                 .unwrap();
         }
+        last
+    };
+    for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+        let last = click(&mut terminal, modifiers);
         assert!(
             matches!(
                 &last,
@@ -11406,6 +11417,18 @@ async fn clicking_a_relative_message_link_opens_the_session_file() {
         );
         terminal.draw().unwrap();
     }
+    // The same path from a session on another machine is not a file here.
+    terminal.set_local_file_links(false);
+    assert!(matches!(
+        click(&mut terminal, KeyModifiers::NONE),
+        UiAction::None
+    ));
+    assert!(
+        terminal
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("another machine"))
+    );
     terminal.shutdown().await;
 }
 

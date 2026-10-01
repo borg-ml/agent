@@ -463,13 +463,17 @@ fn link_target(destination: &str) -> Option<String> {
     }
 }
 
-/// Resolve a clicked link to what the system opener receives. A path is the
-/// session's, so a relative one resolves against the session directory, and
-/// a missing file is reported rather than guessed at.
-pub(super) fn resolve_link(target: &str, cwd: Option<&Path>) -> Result<String> {
+/// Resolve a link to what the system opener receives, without touching the
+/// filesystem. A path is the session's, so a relative one resolves against the
+/// session directory, and only a session on this machine names local files.
+pub(super) fn resolve_link(target: &str, cwd: Option<&Path>, local_files: bool) -> Result<String> {
     if let Some(url) = safe_http_url(target) {
         return Ok(url);
     }
+    anyhow::ensure!(
+        local_files,
+        "{target} is a file of a session on another machine, so it cannot be opened here"
+    );
     let cwd = cwd.with_context(|| format!("no session directory to resolve {target}"))?;
     let base = url::Url::from_directory_path(cwd)
         .map_err(|()| anyhow::anyhow!("no session directory to resolve {target}"))?;
@@ -478,22 +482,8 @@ pub(super) fn resolve_link(target: &str, cwd: Option<&Path>) -> Result<String> {
         url.scheme() == "file",
         "only HTTP(S) links and local files can be opened"
     );
-    let path = url
-        .to_file_path()
+    url.to_file_path()
         .map_err(|()| anyhow::anyhow!("{target} is not a local file"))?;
-    let metadata =
-        std::fs::metadata(&path).with_context(|| format!("no file at {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        anyhow::ensure!(
-            metadata.is_dir() || metadata.permissions().mode() & 0o111 == 0,
-            "{} is executable, so it is not opened from a link",
-            path.display()
-        );
-    }
-    #[cfg(not(unix))]
-    let _ = metadata;
     Ok(url.to_string())
 }
 
@@ -535,18 +525,38 @@ fn safe_http_url(value: &str) -> Option<String> {
     matches!(parsed.scheme(), "http" | "https").then(|| parsed.to_string())
 }
 
+/// Hand a resolved link to the system opener. Runs on the terminal I/O
+/// worker, so checking a file here never stalls drawing.
 pub(super) fn open_link(url: &str) -> Result<()> {
     let parsed = url::Url::parse(url).context("invalid link target")?;
     anyhow::ensure!(
         matches!(parsed.scheme(), "http" | "https" | "file"),
         "only HTTP(S) links and local files can be opened"
     );
+    if parsed.scheme() == "file" {
+        let path = parsed
+            .to_file_path()
+            .map_err(|()| anyhow::anyhow!("{url} is not a local file"))?;
+        let metadata =
+            std::fs::metadata(&path).with_context(|| format!("no file at {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            anyhow::ensure!(
+                metadata.is_dir() || metadata.permissions().mode() & 0o111 == 0,
+                "{} is executable, so it is not opened from a link",
+                path.display()
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = metadata;
+    }
+    // Each opener takes the link as one argument; none goes through a shell,
+    // where characters in a URL could become commands.
     let mut command = if cfg!(target_os = "macos") {
         std::process::Command::new("open")
     } else if cfg!(target_os = "windows") {
-        let mut command = std::process::Command::new("cmd");
-        command.args(["/C", "start", ""]);
-        command
+        std::process::Command::new("explorer.exe")
     } else {
         std::process::Command::new("xdg-open")
     };

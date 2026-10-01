@@ -1715,6 +1715,9 @@ pub struct BorgTerminal {
     entry_hit_areas: Vec<(Rect, usize)>,
     message_hit_areas: Vec<(Rect, usize)>,
     link_hit_areas: Vec<(Rect, String)>,
+    /// Whether the shown session runs on this machine, so its file links name
+    /// files here. Off until the frontend says so.
+    local_file_links: bool,
     /// Terminal graphics protocol detected at startup (Kitty/Sixel/iTerm2);
     /// `None` keeps the half-block fallback drawn by the transcript.
     image_picker: Option<ImagePicker>,
@@ -3114,6 +3117,7 @@ impl BorgTerminal {
             entry_hit_areas: Vec::new(),
             message_hit_areas: Vec::new(),
             link_hit_areas: Vec::new(),
+            local_file_links: false,
             image_picker,
             image_scroll_settles_at: None,
             image_protocols: HashMap::new(),
@@ -6081,6 +6085,11 @@ impl BorgTerminal {
         self.invalidate_transcript_render_cache();
     }
 
+    /// Let file links open: only for a session whose files are on this machine.
+    pub fn set_local_file_links(&mut self, allowed: bool) {
+        self.local_file_links = allowed;
+    }
+
     pub fn set_dictation_icon(&mut self, style: DictationIconStyle) {
         self.dictation_icon = style;
         self.event_redraw_needed = true;
@@ -7171,17 +7180,19 @@ impl BorgTerminal {
     /// Where a click on the hovered link goes, said before the click.
     fn link_hint(&self) -> Option<String> {
         let target = self.hovered_link.as_deref()?;
-        Some(match resolve_link(target, self.session_cwd()) {
-            Ok(url) => {
-                let destination = url::Url::parse(&url)
-                    .ok()
-                    .filter(|url| url.scheme() == "file")
-                    .and_then(|url| url.to_file_path().ok())
-                    .map_or(url, |path| path.display().to_string());
-                format!("click open {destination}")
-            }
-            Err(error) => format!("link {target}: {error:#}"),
-        })
+        Some(
+            match resolve_link(target, self.session_cwd(), self.local_file_links) {
+                Ok(url) => {
+                    let destination = url::Url::parse(&url)
+                        .ok()
+                        .filter(|url| url.scheme() == "file")
+                        .and_then(|url| url.to_file_path().ok())
+                        .map_or(url, |path| path.display().to_string());
+                    format!("click open {destination}")
+                }
+                Err(error) => format!("link {target}: {error:#}"),
+            },
+        )
     }
 
     fn pending_transcript_click(
@@ -7209,7 +7220,7 @@ impl BorgTerminal {
     fn run_pending_transcript_click(&mut self, click: PendingTranscriptClick) -> UiAction {
         match click {
             PendingTranscriptClick::Link(target) => {
-                return match resolve_link(&target, self.session_cwd()) {
+                return match resolve_link(&target, self.session_cwd(), self.local_file_links) {
                     Ok(url) => UiAction::TerminalIo(TerminalIoRequest::open_link(url)),
                     Err(error) => {
                         self.notice = Some(format!("Could not open link: {error:#}"));

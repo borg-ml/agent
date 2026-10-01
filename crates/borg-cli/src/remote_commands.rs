@@ -2777,6 +2777,9 @@ async fn run_local_agent_session(
     let display_session_state =
         resume_display_state(session_state.clone(), session_access, resuming);
     if let Some(terminal) = terminal.as_mut() {
+        // This session's actor and tools run on this machine, so the paths
+        // its messages link name files here.
+        terminal.set_local_file_links(true);
         terminal.set_configured_model_entries(agent_config.configured_model_entries());
         terminal.set_extension_commands(extension_catalog.api_snapshot().commands);
         terminal.seed_team_roster(&team_snapshots);
@@ -5498,6 +5501,7 @@ async fn run_local_agent_session(
                                 restored.set_dictation_icon(dictation_icon_style_for_preference(
                                     editor_preferences.presentation.dictation_icon,
                                 ));
+                                restored.set_local_file_links(true);
                                 restored.set_active_message_behavior(steer_active_turn);
                                 restored.set_key_hints(editor_preferences.interaction.key_hints);
                                 restored.set_configured_model_entries(agent_config.configured_model_entries());
@@ -7437,6 +7441,7 @@ async fn run_local_agent_session(
                                         restored.set_dictation_icon(dictation_icon_style_for_preference(
                                             editor_preferences.presentation.dictation_icon,
                                         ));
+                                        restored.set_local_file_links(true);
                                         restored.set_configured_model_entries(agent_config.configured_model_entries());
                                         restored.set_extension_commands(extension_catalog.api_snapshot().commands);
                                         let composer_history = store
