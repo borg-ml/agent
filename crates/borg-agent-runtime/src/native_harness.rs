@@ -891,7 +891,7 @@ impl NativeHarness {
                     let window = route_window_tokens
                         .map_or(estimated, |window| window.min(estimated))
                         .max(1);
-                    let budget = native_context_budget(
+                    let mut budget = native_context_budget(
                         &ProviderCallUsage {
                             context_window_tokens: Some(window),
                             ..Default::default()
@@ -899,6 +899,23 @@ impl NativeHarness {
                         &messages,
                         0,
                     );
+                    // `window` is a compaction target, not the model's window;
+                    // the refusal text says what the provider actually rejected.
+                    budget.window_source = "refusal";
+                    let refusal: String = format!("{error:#}").chars().take(2000).collect();
+                    send(
+                        &events,
+                        SessionEventKind::ProviderEvent {
+                            provider: turn.provider,
+                            kind: "context_length_refusal".to_string(),
+                            payload: json!({
+                                "error": refusal,
+                                "estimated_context_tokens": estimated,
+                                "context_window_tokens": route_window_tokens,
+                            }),
+                        },
+                    )
+                    .await;
                     self.compact_context_if_needed(
                         &turn,
                         &model,
@@ -4396,7 +4413,8 @@ struct NativeContextBudget {
     /// `provider` when usage was reported, `estimated` when Borg counted the
     /// transcript itself (`chars / 4`) because the provider reported nothing.
     context_source: &'static str,
-    /// `provider` or `assumed` (see [`NATIVE_ASSUMED_CONTEXT_WINDOW_TOKENS`]).
+    /// `provider`, `assumed` (see [`NATIVE_ASSUMED_CONTEXT_WINDOW_TOKENS`]), or
+    /// `refusal` when a length refusal forced compaction toward the estimate.
     window_source: &'static str,
 }
 

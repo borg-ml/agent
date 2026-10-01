@@ -325,6 +325,12 @@ pub(crate) fn messages_request_body(
         }
     }
 
+    let mut image_bytes = 0;
+    for message in messages.iter_mut().rev() {
+        if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+            fit_request_images(blocks, &mut image_bytes);
+        }
+    }
     // Marked before assembly: `json!` takes a reference, so a marker applied to
     // the vector afterwards would never reach the request.
     mark_tail_for_cache(&mut messages);
@@ -373,6 +379,37 @@ pub(crate) fn messages_request_body(
         body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
     }
     body
+}
+
+/// The API refuses a request body over 32 MB with HTTP 413, and history
+/// replays every image on every turn, so a long screenshot session crosses it.
+/// The newest images are kept within this share of the limit; the rest of the
+/// body is left for text.
+const REQUEST_IMAGE_BYTES: usize = 24_000_000;
+const OMITTED_IMAGE_NOTE: &str =
+    "[Earlier image omitted to keep the request under the provider's 32 MB limit.]";
+
+/// Walk blocks newest first, replacing each image that would push the running
+/// total past `REQUEST_IMAGE_BYTES` with a note, including tool-result images.
+fn fit_request_images(blocks: &mut [Value], kept: &mut usize) {
+    for block in blocks.iter_mut().rev() {
+        if let Some(nested) = block.get_mut("content").and_then(Value::as_array_mut) {
+            fit_request_images(nested, kept);
+            continue;
+        }
+        if block.get("type").and_then(Value::as_str) != Some("image") {
+            continue;
+        }
+        let size = block
+            .pointer("/source/data")
+            .and_then(Value::as_str)
+            .map_or(0, str::len);
+        if *kept + size > REQUEST_IMAGE_BYTES {
+            *block = json!({ "type": "text", "text": OMITTED_IMAGE_NOTE });
+        } else {
+            *kept += size;
+        }
+    }
 }
 
 /// Move the conversation marker onto the newest cacheable block.
@@ -1417,6 +1454,37 @@ mod tests {
         assert_eq!(
             body["messages"][0]["content"][1]["source"]["data"],
             json!("AAAA")
+        );
+    }
+
+    #[test]
+    fn replayed_images_stay_under_the_request_size_limit() {
+        // Six 6 MB screenshots crossed the API's 32 MB body limit (HTTP 413),
+        // which Borg then misread as a full context window.
+        let screenshot = |tag: &str| ModelInputAttachment {
+            media_type: "image/png".to_string(),
+            data_base64: format!("{tag}{}", "A".repeat(6_000_000)),
+            filename: None,
+        };
+        let messages = (0..6)
+            .map(|index| {
+                ModelMessage::user_with_attachments("look", vec![screenshot(&format!("{index}A"))])
+            })
+            .collect();
+        let body = messages_request_body("claude-opus-5-5", None, &request(messages, Vec::new()));
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        let images: Vec<&str> = blocks
+            .iter()
+            .filter_map(|block| block.pointer("/source/data").and_then(Value::as_str))
+            .collect();
+        assert!(images.iter().map(|data| data.len()).sum::<usize>() <= REQUEST_IMAGE_BYTES);
+        assert!(
+            images.last().unwrap().starts_with("5A"),
+            "the newest image is kept"
+        );
+        assert_eq!(
+            blocks[1],
+            json!({ "type": "text", "text": OMITTED_IMAGE_NOTE })
         );
     }
 

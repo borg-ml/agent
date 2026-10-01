@@ -3076,7 +3076,23 @@ impl Transcript {
                     } else {
                         "Compacting context…"
                     };
+                    let refused = payload
+                        .get("context_window_source")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("refusal");
                     let progress_summary = if started
+                        && refused
+                        && let Some(tokens) = payload
+                            .get("context_tokens_before")
+                            .and_then(serde_json::Value::as_u64)
+                    {
+                        // The recovery window is the estimate itself, not the
+                        // model's window, so showing it as one misleads.
+                        format!(
+                            "{progress_summary} · provider refused the request · local estimate {}",
+                            format_context_tokens(tokens)
+                        )
+                    } else if started
                         && payload
                             .get("context_source")
                             .and_then(serde_json::Value::as_str)
