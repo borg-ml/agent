@@ -317,6 +317,43 @@ impl NativeHarness {
         Ok(next)
     }
 
+    /// Speed tiers `model` offers on the subscription authority this harness
+    /// binds for turns. Routes without speed metadata confirm none.
+    pub(crate) async fn speed_support(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+    ) -> Result<crate::SpeedSupport> {
+        #[cfg(feature = "subscription-adapters")]
+        match provider {
+            crate::CodingProvider::Codex => {
+                let (fast, ultrafast) = borg_provider::provider::CodexModelProvider {
+                    model: model.to_string(),
+                    effort: borg_provider::codex_default_effort().to_string(),
+                }
+                .speed_tiers_with_auth(self.codex_auth_file.clone())
+                .await?;
+                return Ok(crate::SpeedSupport { fast, ultrafast });
+            }
+            crate::CodingProvider::Claude => {
+                let fast = borg_provider::provider::ClaudeModelProvider {
+                    model: model.to_string(),
+                    effort: None,
+                }
+                .supports_fast(self.claude_config_dir.as_deref())
+                .await?;
+                return Ok(crate::SpeedSupport {
+                    fast,
+                    ultrafast: false,
+                });
+            }
+            _ => {}
+        }
+        #[cfg(not(feature = "subscription-adapters"))]
+        let _ = (provider, model);
+        Ok(crate::SpeedSupport::default())
+    }
+
     pub(crate) async fn run(
         &self,
         turn: AgentTurn,

@@ -44,6 +44,17 @@ impl ClaudeModelProvider {
             .context_window)
     }
 
+    /// Whether the selected model offers fast mode on these credentials.
+    pub async fn supports_fast(&self, auth_directory: Option<&Path>) -> Result<bool> {
+        Ok(Connector::connect(auth_directory)
+            .await?
+            .info(Some(&self.model))
+            .await?
+            .capabilities
+            .context("missing Claude capabilities")?
+            .fast)
+    }
+
     /// Complete model input and output belong to Borg. No upstream session,
     /// tool handler, approval callback, or native child is created here.
     pub async fn model_turn(

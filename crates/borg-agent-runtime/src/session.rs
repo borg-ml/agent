@@ -2120,12 +2120,23 @@ async fn run_agent_session_store_kernel_inner(
         )
         .await?;
     }
+    // The account behind a resumed session may have changed, so the tiers are
+    // asked again rather than taken from the journal. An unanswered probe
+    // advertises none, leaves the selection alone, and is retried before the
+    // next turn.
+    let probed_speed_support = probe_speed_support(executor.as_ref(), &launch).await;
+    let mut speed_support_confirmed = probed_speed_support.is_ok();
+    let speed_support = probed_speed_support.unwrap_or_default();
     if fresh
         || (launch.provider == CodingProvider::Claude
             && initial_state
                 .configuration
                 .as_ref()
                 .is_some_and(|config| config.effort != launch.effort))
+        || initial_state
+            .configuration
+            .as_ref()
+            .is_some_and(|config| config.speed_support != speed_support)
     {
         record(
             &mut journal,
@@ -2140,6 +2151,7 @@ async fn run_agent_session_store_kernel_inner(
                 ultrafast: launch.ultrafast.unwrap_or(false),
                 response_language: launch.response_language,
                 permission_mode: launch.permission_mode,
+                speed_support,
             },
         )
         .await?;
@@ -3470,6 +3482,7 @@ async fn run_agent_session_store_kernel_inner(
                             &events,
                             session_id,
                             &mut launch,
+                            executor.as_ref(),
                             action,
                         )
                         .await
@@ -3478,6 +3491,7 @@ async fn run_agent_session_store_kernel_inner(
                                 if retry_selection {
                                     provider_context_usage_valid = false;
                                     resumed_native_context_tokens = None;
+                                    speed_support_confirmed = true;
                                 }
                                 if provider_switched {
                                     executor
@@ -4871,6 +4885,16 @@ async fn run_agent_session_store_kernel_inner(
         {
             continue;
         }
+        if !speed_support_confirmed {
+            speed_support_confirmed = reconfirm_speed_support(
+                &mut journal,
+                &events,
+                session_id,
+                &launch,
+                executor.as_ref(),
+            )
+            .await?;
+        }
         record(
             &mut journal,
             &events,
@@ -5413,6 +5437,7 @@ async fn run_agent_session_store_kernel_inner(
                                     &events,
                                     session_id,
                                     &mut launch,
+                                    executor.as_ref(),
                                     &mut route_limits,
                                     usage_limit_reset_delay,
                                     &mut usage_limit_wait,
@@ -6321,6 +6346,7 @@ async fn run_agent_session_store_kernel_inner(
                                 &events,
                                 session_id,
                                 &mut launch,
+                                executor.as_ref(),
                                 action,
                             )
                             .await
@@ -6333,6 +6359,7 @@ async fn run_agent_session_store_kernel_inner(
                                     if context_selection_changed {
                                         provider_context_usage_valid = false;
                                         resumed_native_context_tokens = None;
+                                        speed_support_confirmed = true;
                                     }
                                     provider_switch_pending |= provider_switched;
                                 }
@@ -11552,6 +11579,7 @@ async fn apply_route(
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
     launch: &mut LaunchSession,
+    executor: &dyn AgentTurnExecutor,
     route: &crate::ModelRoute,
 ) -> Result<bool> {
     let provider_changed = apply_session_config(
@@ -11559,6 +11587,7 @@ async fn apply_route(
         events,
         session_id,
         launch,
+        executor,
         crate::SessionConfigAction::SetProvider {
             provider: route.provider,
             model: route.model.clone(),
@@ -11573,6 +11602,7 @@ async fn apply_route(
             events,
             session_id,
             launch,
+            executor,
             crate::SessionConfigAction::SetEffort {
                 effort: effort.clone(),
             },
@@ -11590,6 +11620,7 @@ async fn fall_back_on_usage_limit(
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
     launch: &mut LaunchSession,
+    executor: &dyn AgentTurnExecutor,
     route_limits: &mut crate::model_fallback::RouteLimits,
     reset_delay: Option<Duration>,
     usage_limit_wait: &mut Option<Duration>,
@@ -11640,7 +11671,8 @@ async fn fall_back_on_usage_limit(
     if Some(next) == from {
         return Ok(None);
     }
-    let provider_changed = apply_route(journal, events, session_id, launch, &chain[next]).await?;
+    let provider_changed =
+        apply_route(journal, events, session_id, launch, executor, &chain[next]).await?;
     let switch = FallbackSwitch {
         from: limited.label(),
         to: chain[next].label(),
@@ -11665,9 +11697,23 @@ async fn apply_session_config(
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
     launch: &mut LaunchSession,
+    executor: &dyn AgentTurnExecutor,
     action: crate::SessionConfigAction,
 ) -> Result<bool> {
     let mut provider_switched = false;
+    // Only a change of model is a reason to ask again; any other setting
+    // keeps the tiers last confirmed, so a failed probe cannot cost them.
+    let selection_changed = matches!(
+        action,
+        crate::SessionConfigAction::SetModel { .. }
+            | crate::SessionConfigAction::SetProvider { .. }
+    );
+    let mut speed_support = journal
+        .state(session_id)
+        .await?
+        .configuration
+        .map(|config| config.speed_support)
+        .unwrap_or_default();
     match action {
         crate::SessionConfigAction::SetModel { model } => {
             let model = model.trim();
@@ -11721,19 +11767,21 @@ async fn apply_session_config(
             launch.permission_mode = permission_mode;
         }
         crate::SessionConfigAction::SetFast { enabled } => {
-            anyhow::ensure!(
-                !enabled || launch.provider.supports_fast(),
-                "fast mode is not supported by the {:?} transport",
-                launch.provider
-            );
+            if enabled {
+                speed_support =
+                    confirmed_speed_support(executor, launch, "fast", |support| support.fast)
+                        .await?;
+            }
             launch.fast = Some(enabled);
             launch.ultrafast = Some(false);
         }
         crate::SessionConfigAction::SetUltrafast { enabled } => {
-            anyhow::ensure!(
-                !enabled || launch.provider == CodingProvider::Codex,
-                "ultrafast mode is only supported by the OpenAI transport"
-            );
+            if enabled {
+                speed_support = confirmed_speed_support(executor, launch, "ultrafast", |support| {
+                    support.ultrafast
+                })
+                .await?;
+            }
             launch.ultrafast = Some(enabled);
             launch.fast = Some(false);
         }
@@ -11743,6 +11791,19 @@ async fn apply_session_config(
     }
     if launch.provider == CodingProvider::Claude && launch.effort.is_none() {
         launch.effort = Some(borg_provider::claude_default_effort().to_string());
+    }
+    if selection_changed {
+        // A tier the new model does not offer is dropped, never carried over
+        // to fail at turn time; an unconfirmed one counts as not offered.
+        speed_support = probe_speed_support(executor, launch)
+            .await
+            .unwrap_or_default();
+        if !speed_support.fast {
+            launch.fast = None;
+        }
+        if !speed_support.ultrafast {
+            launch.ultrafast = None;
+        }
     }
     record(
         journal,
@@ -11757,10 +11818,94 @@ async fn apply_session_config(
             ultrafast: launch.ultrafast.unwrap_or(false),
             response_language: launch.response_language,
             permission_mode: launch.permission_mode,
+            speed_support,
         },
     )
     .await?;
     Ok(provider_switched)
+}
+
+/// Ask again for tiers an earlier probe could not confirm, and publish them
+/// once answered. Returns whether the provider answered.
+async fn reconfirm_speed_support(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    launch: &LaunchSession,
+    executor: &dyn AgentTurnExecutor,
+) -> Result<bool> {
+    let Ok(speed_support) = probe_speed_support(executor, launch).await else {
+        return Ok(false);
+    };
+    let journaled = journal
+        .state(session_id)
+        .await?
+        .configuration
+        .map(|config| config.speed_support);
+    if journaled.is_none_or(|journaled| journaled == speed_support) {
+        return Ok(true);
+    }
+    record(
+        journal,
+        events,
+        session_id,
+        SessionEventKind::SessionConfigured {
+            cwd: launch.cwd.clone(),
+            provider: launch.provider,
+            model: launch.model.clone(),
+            effort: launch.effort.clone(),
+            fast: launch.fast.unwrap_or(false),
+            ultrafast: launch.ultrafast.unwrap_or(false),
+            response_language: launch.response_language,
+            permission_mode: launch.permission_mode,
+            speed_support,
+        },
+    )
+    .await?;
+    Ok(true)
+}
+
+/// The speed tiers the session's model offers on the credentials its turns
+/// use. A probe that fails or stalls confirms nothing.
+async fn probe_speed_support(
+    executor: &dyn AgentTurnExecutor,
+    launch: &LaunchSession,
+) -> Result<crate::SpeedSupport> {
+    let Some(model) = launch.model.clone().or_else(|| {
+        launch
+            .provider
+            .model_catalog()
+            .map(|catalog| catalog.default_model.to_string())
+    }) else {
+        return Ok(crate::SpeedSupport::default());
+    };
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        executor.speed_support(
+            launch.provider,
+            &model,
+            launch.capabilities.runtime_provider_context.as_ref(),
+        ),
+    )
+    .await
+    .context("timed out confirming the model's speed tiers")?
+}
+
+/// Confirm `tier` before it is selected, so an unsupported request changes
+/// nothing.
+async fn confirmed_speed_support(
+    executor: &dyn AgentTurnExecutor,
+    launch: &LaunchSession,
+    tier: &str,
+    offered: impl Fn(crate::SpeedSupport) -> bool,
+) -> Result<crate::SpeedSupport> {
+    match probe_speed_support(executor, launch).await {
+        Ok(support) if offered(support) => Ok(support),
+        Ok(_) => anyhow::bail!("the selected model does not offer {tier} mode"),
+        Err(error) => {
+            anyhow::bail!("could not confirm {tier} mode for the selected model: {error:#}")
+        }
+    }
 }
 
 async fn local_legacy_plan(store: &dyn SessionStore, session_id: Uuid) -> Result<Vec<PlanItem>> {

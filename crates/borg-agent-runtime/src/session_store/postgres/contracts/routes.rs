@@ -227,6 +227,7 @@ fn context_generation_changes_only_at_explicit_prefix_boundaries() {
                 ultrafast: false,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
+                speed_support: Default::default(),
             },
         ))
         .unwrap();
@@ -257,6 +258,7 @@ fn same_provider_codex_model_change_preserves_resume_checkpoint() {
                 ultrafast: false,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
+                speed_support: Default::default(),
             },
         ))
         .unwrap();
@@ -285,6 +287,7 @@ fn same_provider_codex_model_change_preserves_resume_checkpoint() {
                 ultrafast: false,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
+                speed_support: Default::default(),
             },
         ))
         .unwrap();

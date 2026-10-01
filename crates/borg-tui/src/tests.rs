@@ -5423,6 +5423,7 @@ fn effort_changes_do_not_relabel_usage_from_the_active_turn() {
         ultrafast: false,
         response_language: ResponseLanguage::English,
         permission_mode: PermissionMode::FullAccess,
+        speed_support: Default::default(),
     };
     let started = |message_id, effort: &str| SessionEventKind::TurnStarted {
         message_id,
@@ -5501,6 +5502,7 @@ fn model_changes_do_not_retain_the_old_context_percentage() {
         ultrafast: false,
         response_language: ResponseLanguage::English,
         permission_mode: PermissionMode::FullAccess,
+        speed_support: Default::default(),
     };
 
     transcript.apply(&SessionEvent::new(session_id, 1, configured("gpt-5.6-sol")));
@@ -5550,6 +5552,7 @@ fn context_limit_label_includes_window_and_tooltip_details() {
             ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
+            speed_support: Default::default(),
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -5608,6 +5611,7 @@ fn fixed_provider_context_label_hides_the_unchangeable_window_size() {
             ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
+            speed_support: Default::default(),
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -5641,6 +5645,7 @@ fn correlated_usage_from_another_turn_cannot_poison_cache_diagnostics() {
         ultrafast: false,
         response_language: ResponseLanguage::English,
         permission_mode: PermissionMode::FullAccess,
+        speed_support: Default::default(),
     };
     let started = SessionEventKind::TurnStarted {
         message_id: active_turn,
@@ -6935,6 +6940,7 @@ fn focused_transcript_configuration_switches_cwd_metadata() {
         fast: false,
         ultrafast: false,
         permission_mode: PermissionMode::FullAccess,
+        speed_support: Default::default(),
     };
     let child_id = Uuid::new_v4();
     let mut displayed = Transcript {
@@ -8058,6 +8064,7 @@ fn director_roster_preserves_historical_cost_basis_across_model_switches() {
             ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
+            speed_support: Default::default(),
         }),
         usage: borg_remote::SessionUsage {
             total_tokens: 472_696_660,
@@ -10027,6 +10034,7 @@ fn optimistic_idle_submission_immediately_hides_cold_cache_guidance() {
             fast: false,
             ultrafast: false,
             permission_mode: PermissionMode::FullAccess,
+            speed_support: Default::default(),
         }),
         ..Transcript::default()
     };
@@ -11441,6 +11449,7 @@ async fn keyboard_reaches_status_line_menus_without_a_mouse() {
         fast: false,
         ultrafast: false,
         permission_mode: PermissionMode::FullAccess,
+        speed_support: Default::default(),
     });
     let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
     terminal.draw().unwrap();
@@ -12238,6 +12247,7 @@ fn projected_session_state_restores_status_config_outside_the_history_tail() {
             ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
+            speed_support: Default::default(),
         }),
         usage: borg_remote::SessionUsage {
             total_tokens: 123_000,
@@ -12354,6 +12364,7 @@ fn fast_mode_gets_its_own_status_segment_only_when_enabled() {
                 ultrafast,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
+                speed_support: Default::default(),
             }),
             ..Default::default()
         });
@@ -12394,6 +12405,7 @@ fn billing_status_follows_the_configured_provider_and_capability_refresh() {
             ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
+            speed_support: Default::default(),
         }),
         provider_capabilities: vec![
             capability(
@@ -12448,6 +12460,7 @@ fn billing_status_follows_the_configured_provider_and_capability_refresh() {
             ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
+            speed_support: Default::default(),
         },
     ));
     assert_eq!(transcript.config_statuses().billing.as_deref(), Some("api"));
@@ -17937,6 +17950,7 @@ fn resumed_opus_and_fable_history_keeps_effort_switches_warm() {
             ultrafast: false,
             response_language: ResponseLanguage::English,
             permission_mode: PermissionMode::FullAccess,
+            speed_support: Default::default(),
         };
         apply(&mut transcript, configured("medium"));
         apply(
@@ -18364,8 +18378,52 @@ fn authoritative_plan_identity_change_accepts_lower_revision_but_not_old_history
 
 #[test]
 fn speed_picker_selection_dispatches_the_selected_tier() {
+    let tiers = |picker: Picker| {
+        picker
+            .options
+            .into_iter()
+            .map(|option| option.value)
+            .collect::<Vec<_>>()
+    };
+    // Only confirmed tiers are offered, even when an older selection names
+    // another; Standard always remains to turn it off.
+    for (fast, ultrafast, support, offered) in [
+        (
+            false,
+            false,
+            borg_remote::SpeedSupport::default(),
+            vec!["Standard"],
+        ),
+        (
+            false,
+            false,
+            borg_remote::SpeedSupport {
+                fast: true,
+                ultrafast: false,
+            },
+            vec!["Standard", "Fast"],
+        ),
+        (
+            true,
+            false,
+            borg_remote::SpeedSupport::default(),
+            vec!["Standard"],
+        ),
+        (
+            false,
+            true,
+            borg_remote::SpeedSupport::default(),
+            vec!["Standard"],
+        ),
+    ] {
+        assert_eq!(tiers(speed_picker(fast, ultrafast, support)), offered);
+    }
+    let all = borg_remote::SpeedSupport {
+        fast: true,
+        ultrafast: true,
+    };
     for (fast, ultrafast, selected) in [(false, false, 0), (true, false, 1), (false, true, 2)] {
-        let mut picker = speed_picker(fast, ultrafast);
+        let mut picker = speed_picker(fast, ultrafast, all);
         assert_eq!(picker.selected, selected);
         // Selecting a different row must dispatch that row, not the old configuration.
         picker.selected = (selected + 1) % 3;

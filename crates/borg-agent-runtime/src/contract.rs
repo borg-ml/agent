@@ -2433,6 +2433,15 @@ impl WorkflowRuntime {
     }
 }
 
+/// Speed tiers a model offers beyond Standard, which is always available.
+/// Anything the runtime could not confirm is unsupported.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SpeedSupport {
+    pub fast: bool,
+    pub ultrafast: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
@@ -2458,6 +2467,10 @@ pub enum SessionEventKind {
         #[serde(default)]
         response_language: ResponseLanguage,
         permission_mode: PermissionMode,
+        /// The speed tiers the selected model offers on this session's
+        /// credentials, as the runtime host last confirmed them.
+        #[serde(default)]
+        speed_support: SpeedSupport,
     },
     /// Host-local, secret-free provider admission state captured when the
     /// session actor starts or resumes. It is durable metadata, not model

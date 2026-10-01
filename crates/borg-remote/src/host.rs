@@ -8408,6 +8408,7 @@ mod tests {
                     ultrafast: false,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: crate::PermissionMode::Auto,
+                    speed_support: Default::default(),
                 },
             ),
             SessionEvent::new(
@@ -8422,6 +8423,7 @@ mod tests {
                     ultrafast: false,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: crate::PermissionMode::Manual,
+                    speed_support: Default::default(),
                 },
             ),
         ];
@@ -9718,6 +9720,7 @@ mod tests {
                         ultrafast: false,
                         response_language: launch.response_language,
                         permission_mode: launch.permission_mode,
+                        speed_support: Default::default(),
                     },
                 ))
                 .await
@@ -9935,6 +9938,7 @@ mod tests {
                     ultrafast: false,
                     response_language: launch.response_language,
                     permission_mode: launch.permission_mode,
+                    speed_support: Default::default(),
                 },
             ))
             .await
@@ -10072,6 +10076,7 @@ mod tests {
                         ultrafast: false,
                         response_language: launch.response_language,
                         permission_mode: launch.permission_mode,
+                        speed_support: Default::default(),
                     },
                 ] {
                     store.append(SessionEvent::new(id, 0, kind)).await.unwrap();
@@ -11177,6 +11182,7 @@ mod tests {
                 ultrafast: false,
                 response_language: launch.response_language,
                 permission_mode: launch.permission_mode,
+                speed_support: Default::default(),
             },
         ] {
             store
@@ -11347,6 +11353,7 @@ mod tests {
                     ultrafast: false,
                     response_language: launch.response_language,
                     permission_mode: launch.permission_mode,
+                    speed_support: Default::default(),
                 },
                 crate::SessionEventKind::StatusChanged {
                     status: crate::SessionStatus::Ready,
@@ -11703,6 +11710,7 @@ mod tests {
                 ultrafast: false,
                 response_language: launch.response_language,
                 permission_mode: launch.permission_mode,
+                speed_support: Default::default(),
             },
             crate::SessionEventKind::StatusChanged {
                 status: crate::SessionStatus::Ready,
@@ -13880,6 +13888,7 @@ connection: close
                 ultrafast: false,
                 response_language: launch.response_language,
                 permission_mode: launch.permission_mode,
+                speed_support: Default::default(),
             },
         ] {
             store
@@ -14418,6 +14427,7 @@ connection: close
                 ultrafast: false,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: crate::PermissionMode::Manual,
+                speed_support: Default::default(),
             },
         ] {
             session_store

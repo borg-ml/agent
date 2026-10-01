@@ -611,10 +611,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/model", "choose the model"),
     ("/effort", "choose reasoning effort"),
-    ("/fast", "choose standard, fast priority, or ultrafast tier"),
+    ("/fast", "choose a speed tier the model offers"),
     (
         "/ultrafast",
-        "Codex/OpenAI premium, access-dependent tier; on|off",
+        "ultrafast tier, where the model offers it; on|off",
     ),
     ("/lsp", "view language server support"),
     ("/extensions", "view the live Blu extension runtime"),
@@ -5679,7 +5679,13 @@ impl BorgTerminal {
     }
 
     pub fn open_fast_picker(&mut self, enabled: bool, ultrafast: bool) {
-        self.picker = Some(speed_picker(enabled, ultrafast));
+        let support = self
+            .transcript
+            .config
+            .as_ref()
+            .map(|config| config.speed_support)
+            .unwrap_or_default();
+        self.picker = Some(speed_picker(enabled, ultrafast, support));
     }
 
     pub fn open_refresh_rate_picker(&mut self, current: u64) {
@@ -11399,19 +11405,31 @@ fn completion_alert_policy_label(policy: CompletionAlertPolicy) -> &'static str 
     }
 }
 
-fn speed_picker(enabled: bool, ultrafast: bool) -> Picker {
-    Picker::new(
-        PickerKind::Fast,
-        "Speed tier (ultrafast: Codex/OpenAI premium, access-dependent)",
-        ["Standard", "Fast", "Ultrafast"],
-        Some(if ultrafast {
-            "Ultrafast"
-        } else if enabled {
-            "Fast"
-        } else {
-            "Standard"
-        }),
-    )
+/// Standard is always offered, so a faster tier can always be turned off; a
+/// faster tier only when the runtime confirmed the model offers it.
+fn speed_picker(enabled: bool, ultrafast: bool, support: borg_remote::SpeedSupport) -> Picker {
+    let current = if ultrafast {
+        "Ultrafast"
+    } else if enabled {
+        "Fast"
+    } else {
+        "Standard"
+    };
+    let options = [
+        ("Standard", true),
+        ("Fast", support.fast),
+        ("Ultrafast", support.ultrafast),
+    ]
+    .into_iter()
+    .filter(|(_, offered)| *offered)
+    .map(|(tier, _)| tier)
+    .collect::<Vec<_>>();
+    let title = if options.len() == 1 {
+        "Speed tier (no faster tier confirmed for this model)"
+    } else {
+        "Speed tier"
+    };
+    Picker::new(PickerKind::Fast, title, options, Some(current))
 }
 
 fn speed_picker_action(picker: Picker) -> UiAction {

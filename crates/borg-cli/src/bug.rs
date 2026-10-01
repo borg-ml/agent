@@ -781,6 +781,7 @@ mod tests {
                 ultrafast: false,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
+                speed_support: Default::default(),
             }),
             ..SessionState::default()
         };

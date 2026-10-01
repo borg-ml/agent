@@ -719,6 +719,8 @@ pub struct SessionConfiguration {
     pub ultrafast: bool,
     pub response_language: ResponseLanguage,
     pub permission_mode: PermissionMode,
+    #[serde(default)]
+    pub speed_support: crate::SpeedSupport,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -909,6 +911,7 @@ impl SessionState {
                 ultrafast,
                 response_language,
                 permission_mode,
+                speed_support,
             } => {
                 let provider_changed = self
                     .configuration
@@ -926,6 +929,7 @@ impl SessionState {
                     ultrafast: *ultrafast,
                     response_language: *response_language,
                     permission_mode: *permission_mode,
+                    speed_support: *speed_support,
                 });
                 if context_identity_changed {
                     if let Some(retry) = &mut self.usage_limit_retry {

@@ -555,6 +555,7 @@ struct SessionDisplayConfig {
     fast: bool,
     ultrafast: bool,
     permission_mode: PermissionMode,
+    speed_support: borg_remote::SpeedSupport,
 }
 
 /// Status-row values derived from the session configuration.
@@ -1137,6 +1138,7 @@ impl Transcript {
                 fast: configuration.fast,
                 ultrafast: configuration.ultrafast,
                 permission_mode: configuration.permission_mode,
+                speed_support: configuration.speed_support,
             });
         if let (Some(context_tokens), Some(context_window_tokens)) = (
             state.usage.context_tokens,
@@ -1911,7 +1913,7 @@ impl Transcript {
                 fast,
                 ultrafast,
                 permission_mode,
-                ..
+                speed_support,
             } => {
                 let context_identity_changed = self.config.as_ref().is_some_and(|old| {
                     old.provider != *provider || old.model.as_ref() != model.as_ref()
@@ -1925,6 +1927,7 @@ impl Transcript {
                     fast: *fast,
                     ultrafast: *ultrafast,
                     permission_mode: *permission_mode,
+                    speed_support: *speed_support,
                 });
                 if context_identity_changed {
                     // Context usage belongs to the provider/model identity that

@@ -37,6 +37,7 @@ pub(super) fn configured(directory: &Path) -> SessionEventKind {
         ultrafast: false,
         response_language: ResponseLanguage::Auto,
         permission_mode: PermissionMode::FullAccess,
+        speed_support: Default::default(),
     }
 }
 
@@ -50,6 +51,7 @@ pub(super) fn opencode_configured(model: &str) -> SessionEventKind {
         ultrafast: false,
         response_language: ResponseLanguage::default(),
         permission_mode: PermissionMode::Auto,
+        speed_support: Default::default(),
     }
 }
 

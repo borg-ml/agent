@@ -1807,6 +1807,7 @@ async fn a_child_without_a_lane_inherits_the_parent_live_lane() {
                 ultrafast: false,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
+                speed_support: Default::default(),
             },
         ))
         .await
@@ -3610,6 +3611,7 @@ async fn focused_human_prompt_and_recall_target_the_exact_child_actor() {
                 ultrafast: false,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
+                speed_support: Default::default(),
             },
         ))
         .await
@@ -4549,6 +4551,7 @@ async fn restore_mirrors_a_child_stop_journaled_before_the_parent_crashed() {
             ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
+            speed_support: Default::default(),
         },
         SessionEventKind::StatusChanged {
             status: SessionStatus::Stopped,
@@ -4643,6 +4646,7 @@ async fn restored_live_child_stays_dormant_and_parks_with_its_root() {
             ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
+            speed_support: Default::default(),
         },
         SessionEventKind::StatusChanged {
             status: SessionStatus::Ready,

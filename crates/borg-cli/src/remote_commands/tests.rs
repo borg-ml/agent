@@ -184,6 +184,7 @@ async fn prompt_dispatch_does_not_block_input_while_the_journal_is_blocked() {
             ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
+            speed_support: Default::default(),
         },
     ] {
         store
@@ -2758,6 +2759,7 @@ async fn resume_target_resolves_saved_session_and_skips_current_for_last() {
                     ultrafast: false,
                     response_language: ResponseLanguage::Auto,
                     permission_mode: PermissionMode::FullAccess,
+                    speed_support: Default::default(),
                 },
             ),
             SessionEvent::new(
@@ -2907,6 +2909,7 @@ async fn recent_sessions_are_ordered_by_latest_conversation_activity() {
                     ultrafast: false,
                     response_language: ResponseLanguage::Auto,
                     permission_mode: PermissionMode::FullAccess,
+                    speed_support: Default::default(),
                 },
             ),
         ]
@@ -3016,6 +3019,7 @@ async fn host_bookkeeping_does_not_outrank_the_session_the_user_worked_in() {
                     ultrafast: false,
                     response_language: ResponseLanguage::Auto,
                     permission_mode: PermissionMode::FullAccess,
+                    speed_support: Default::default(),
                 },
             ),
         ]
@@ -3119,6 +3123,7 @@ async fn resume_picker_titles_and_previews_sessions_from_the_latest_response() {
             ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
+            speed_support: Default::default(),
         },
         SessionEventKind::Message {
             message_id: Uuid::new_v4(),
@@ -3217,6 +3222,7 @@ async fn resume_discovery_ignores_launch_only_probe_sessions() {
                 ultrafast: false,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
+                speed_support: Default::default(),
             },
             SessionEventKind::StatusChanged {
                 status: SessionStatus::Ready,
@@ -3289,6 +3295,7 @@ async fn continue_selects_the_latest_non_empty_session_in_the_current_directory(
                 ultrafast: false,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
+                speed_support: Default::default(),
             },
             SessionEventKind::Message {
                 message_id: Uuid::new_v4(),
@@ -3340,6 +3347,7 @@ async fn resume_picker_prioritizes_current_directory_and_keeps_global_choices() 
                 ultrafast: false,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
+                speed_support: Default::default(),
             },
             SessionEventKind::Message {
                 message_id: Uuid::new_v4(),
@@ -3395,6 +3403,7 @@ async fn resume_picker_loads_older_sessions_in_recent_first_order() {
                 ultrafast: false,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
+                speed_support: Default::default(),
             },
             SessionEventKind::Message {
                 message_id: Uuid::new_v4(),
@@ -3454,6 +3463,7 @@ async fn recent_session_picker_p95_gate() {
                 ultrafast: false,
                 response_language: ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
+                speed_support: Default::default(),
             },
             SessionEventKind::Message {
                 message_id: Uuid::new_v4(),

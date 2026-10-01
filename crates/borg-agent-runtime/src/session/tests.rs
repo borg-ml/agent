@@ -31,7 +31,8 @@ fn real_png_bytes() -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn speed_modes_are_exclusive_durable_and_provider_scoped() {
+async fn speed_modes_are_exclusive_durable_and_model_scoped() {
+    let probe = SpeedProbe::default();
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
     let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
@@ -63,9 +64,16 @@ async fn speed_modes_are_exclusive_durable_and_provider_scoped() {
         (SetUltrafast { enabled: false }, false, false),
         (SetUltrafast { enabled: true }, false, true),
     ] {
-        apply_session_config(&mut journal, &events, session_id, &mut launch, action)
-            .await
-            .unwrap();
+        apply_session_config(
+            &mut journal,
+            &events,
+            session_id,
+            &mut launch,
+            &probe,
+            action,
+        )
+        .await
+        .unwrap();
         assert_eq!(launch.fast, Some(fast));
         assert_eq!(launch.ultrafast, Some(ultrafast));
         let configuration = store
@@ -82,11 +90,83 @@ async fn speed_modes_are_exclusive_durable_and_provider_scoped() {
             SessionEventKind::SessionConfigured { fast: saved_fast, ultrafast: saved_ultrafast, .. }
                 if (saved_fast, saved_ultrafast) == (fast, ultrafast)));
     }
+    // A model without the selected tier drops it rather than carrying it to
+    // fail at turn time, and publishes what the new model offers.
+    let fast_only = crate::SpeedSupport {
+        fast: true,
+        ultrafast: false,
+    };
     apply_session_config(
         &mut journal,
         &events,
         session_id,
         &mut launch,
+        &probe,
+        crate::SessionConfigAction::SetModel {
+            model: "fast-only".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(launch.ultrafast, None);
+    assert!(matches!(receiver.recv().await.unwrap().kind,
+        SessionEventKind::SessionConfigured { ultrafast: false, speed_support, .. }
+            if speed_support == fast_only));
+    // A tier the model does not offer is refused before anything changes.
+    let before = store.state(session_id).await.unwrap().configuration;
+    assert!(
+        apply_session_config(
+            &mut journal,
+            &events,
+            session_id,
+            &mut launch,
+            &probe,
+            SetUltrafast { enabled: true }
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(launch.ultrafast, None);
+    assert_eq!(store.state(session_id).await.unwrap().configuration, before);
+    // An unrelated change while the provider cannot be asked keeps the
+    // confirmed tiers and the selection.
+    apply_session_config(
+        &mut journal,
+        &events,
+        session_id,
+        &mut launch,
+        &probe,
+        SetFast { enabled: true },
+    )
+    .await
+    .unwrap();
+    probe.failing.store(true, Ordering::SeqCst);
+    apply_session_config(
+        &mut journal,
+        &events,
+        session_id,
+        &mut launch,
+        &probe,
+        crate::SessionConfigAction::SetEffort {
+            effort: "high".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let configuration = store
+        .state(session_id)
+        .await
+        .unwrap()
+        .configuration
+        .unwrap();
+    assert!(configuration.fast);
+    assert_eq!(configuration.speed_support, fast_only);
+    apply_session_config(
+        &mut journal,
+        &events,
+        session_id,
+        &mut launch,
+        &probe,
         SetProvider {
             provider: CodingProvider::Claude,
             model: None,
@@ -101,6 +181,7 @@ async fn speed_modes_are_exclusive_durable_and_provider_scoped() {
             &events,
             session_id,
             &mut launch,
+            &probe,
             SetUltrafast { enabled: true }
         )
         .await
@@ -115,9 +196,42 @@ async fn speed_modes_are_exclusive_durable_and_provider_scoped() {
     assert!(!configuration.ultrafast);
     let mut legacy = serde_json::to_value(configuration).unwrap();
     legacy.as_object_mut().unwrap().remove("ultrafast");
+    legacy.as_object_mut().unwrap().remove("speed_support");
     let restored: crate::SessionConfiguration = serde_json::from_value(legacy).unwrap();
     assert!(!restored.ultrafast);
+    assert_eq!(restored.speed_support, crate::SpeedSupport::default());
     scratch.discard().await;
+}
+
+/// Speed tiers by model name, standing in for the provider catalog.
+#[derive(Default)]
+struct SpeedProbe {
+    failing: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for SpeedProbe {
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        unreachable!("configuration never runs a turn")
+    }
+
+    async fn speed_support(
+        &self,
+        _provider: CodingProvider,
+        model: &str,
+        _provider_context: Option<&crate::RuntimeProviderContext>,
+    ) -> Result<crate::SpeedSupport> {
+        anyhow::ensure!(!self.failing.load(Ordering::SeqCst), "catalog unavailable");
+        Ok(crate::SpeedSupport {
+            fast: true,
+            ultrafast: model != "fast-only",
+        })
+    }
 }
 
 #[test]
@@ -3289,6 +3403,7 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
                 ultrafast: false,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
+                speed_support: Default::default(),
             },
             SessionEventKind::Message {
                 message_id: original.message_id,
@@ -3347,6 +3462,7 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
                         ultrafast: false,
                         response_language: crate::ResponseLanguage::Auto,
                         permission_mode: PermissionMode::Manual,
+                        speed_support: Default::default(),
                     },
                 ))
                 .await
@@ -5308,6 +5424,7 @@ async fn user_stop_gate_is_re_engaged_from_durable_state_after_actor_restart() {
             ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
+            speed_support: Default::default(),
         },
         SessionEventKind::Message {
             message_id: first_id,
@@ -8320,6 +8437,7 @@ async fn crash_reconciled_child_stop_is_durable_before_resumed_ready() {
             ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
+            speed_support: Default::default(),
         },
         SessionEventKind::SubagentActivity {
             activity: SubagentActivityKind::Updated,
@@ -8377,6 +8495,7 @@ async fn crash_reconciled_child_stop_is_durable_before_resumed_ready() {
                 ultrafast: false,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
+                speed_support: Default::default(),
             },
         ))
         .await
@@ -8686,6 +8805,7 @@ async fn resuming_an_idle_goal_emits_starting_before_running() {
                 ultrafast: false,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
+                speed_support: Default::default(),
             },
         ))
         .await
@@ -8822,6 +8942,7 @@ async fn resuming_a_goal_mid_turn_releases_the_stop_latch() {
                 ultrafast: false,
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::Manual,
+                speed_support: Default::default(),
             },
         ),
         SessionEvent::new(session_id, 0, SessionEventKind::GoalUpdated { goal }),
@@ -8977,6 +9098,7 @@ async fn fresh_human_input_resumes_a_parked_goal_only_when_opted_in() {
                     ultrafast: false,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
+                    speed_support: Default::default(),
                 },
                 SessionEventKind::GoalUpdated { goal },
             ];
@@ -10479,6 +10601,7 @@ async fn resumed_session_drains_unresolved_input_and_preserves_last_context_usag
             ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
+            speed_support: Default::default(),
         },
         SessionEventKind::Message {
             message_id: stale_id,
@@ -10837,6 +10960,7 @@ async fn a_resumed_turn_continues_the_original_prompt_and_settles_it_once() {
             ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
+            speed_support: Default::default(),
         },
         SessionEventKind::Message {
             message_id,
@@ -11063,6 +11187,7 @@ async fn a_resumed_turn_that_hits_a_usage_limit_checkpoints_as_a_continuation() 
             ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
+            speed_support: Default::default(),
         },
         SessionEventKind::Message {
             message_id,
@@ -14399,6 +14524,7 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
             ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
+            speed_support: Default::default(),
         },
         SessionEventKind::Message {
             message_id: previous_id,
@@ -14548,6 +14674,7 @@ async fn crash_resume_forks_the_last_completed_codex_turn_before_replaying_input
             ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
+            speed_support: Default::default(),
         },
         SessionEventKind::Message {
             message_id: completed_id,
@@ -14709,6 +14836,7 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
             ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
+            speed_support: Default::default(),
         },
         SessionEventKind::Message {
             message_id: completed_id,
@@ -16152,6 +16280,7 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
                         ultrafast: false,
                         response_language: crate::ResponseLanguage::Auto,
                         permission_mode: PermissionMode::FullAccess,
+                        speed_support: Default::default(),
                     },
                 ))
                 .await
@@ -20584,6 +20713,7 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
             ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
+            speed_support: Default::default(),
         },
         SessionEventKind::TurnStarted {
             message_id: previous_id,
@@ -21025,6 +21155,7 @@ async fn private_workspace_plan_migrates_once_and_refreshes_while_idle_across_re
             ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
+            speed_support: Default::default(),
         },
         SessionEventKind::PlanUpdated { items: vec![item] },
         SessionEventKind::ContextCleared,
@@ -21480,6 +21611,7 @@ async fn viewer_resume_projects_work_without_granting_write_or_losing_deferred_l
             ultrafast: false,
             response_language: crate::ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
+            speed_support: Default::default(),
         },
         SessionEventKind::PlanUpdated {
             items: vec![legacy.clone()],
@@ -22053,6 +22185,7 @@ async fn peer_receipts_survive_disabled_subagents_stop_and_replay() {
                     ultrafast: false,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: PermissionMode::Manual,
+                    speed_support: Default::default(),
                 },
             ),
             SessionEvent::new(

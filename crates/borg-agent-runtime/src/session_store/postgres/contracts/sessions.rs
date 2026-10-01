@@ -40,6 +40,7 @@ async fn empty_sessions_are_discarded_but_real_sessions_are_kept() {
             ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
+            speed_support: Default::default(),
         },
         SessionEventKind::ProviderCapabilitiesUpdated {
             providers: Vec::new(),

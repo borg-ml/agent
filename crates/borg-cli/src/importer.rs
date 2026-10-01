@@ -315,6 +315,7 @@ async fn copy_thread(
             ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::Manual,
+            speed_support: Default::default(),
         },
         start,
     );

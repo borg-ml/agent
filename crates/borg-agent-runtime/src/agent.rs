@@ -397,6 +397,17 @@ pub trait AgentTurnExecutor: Send + Sync {
         controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult>;
 
+    /// The speed tiers `model` offers on the credentials this session's turns
+    /// use. An executor that cannot ask the provider confirms none.
+    async fn speed_support(
+        &self,
+        _provider: CodingProvider,
+        _model: &str,
+        _provider_context: Option<&crate::RuntimeProviderContext>,
+    ) -> Result<crate::SpeedSupport> {
+        Ok(crate::SpeedSupport::default())
+    }
+
     /// Whether a successful subscription turn can append only its new input
     /// to a provider-owned process on the next turn. The session actor uses
     /// this to avoid measuring the whole durable replay when the executor will
@@ -1160,6 +1171,20 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
 
     fn web_search_provider(&self) -> Option<Arc<dyn borg_search::WebSearchProvider>> {
         self.web_search.clone()
+    }
+
+    async fn speed_support(
+        &self,
+        provider: CodingProvider,
+        model: &str,
+        provider_context: Option<&crate::RuntimeProviderContext>,
+    ) -> Result<crate::SpeedSupport> {
+        // The same authority a turn binds: the controller's context, else the
+        // host-local one.
+        self.native_harness
+            .with_provider_context(provider, provider_context.unwrap_or(&self.provider_context))?
+            .speed_support(provider, model)
+            .await
     }
 
     fn supports_subscription_context_reuse(&self, _provider: CodingProvider) -> bool {

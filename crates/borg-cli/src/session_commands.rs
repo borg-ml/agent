@@ -455,6 +455,7 @@ async fn import_session(input: PathBuf, cwd: Option<PathBuf>, json: bool) -> Res
             ultrafast: false,
             response_language: ResponseLanguage::Auto,
             permission_mode: PermissionMode::FullAccess,
+            speed_support: Default::default(),
         });
     let configuration = if let Some(cwd) = cwd {
         SessionConfiguration {
@@ -477,6 +478,7 @@ async fn import_session(input: PathBuf, cwd: Option<PathBuf>, json: bool) -> Res
                 ultrafast: configuration.ultrafast,
                 response_language: configuration.response_language,
                 permission_mode: configuration.permission_mode,
+                speed_support: Default::default(),
             },
         ))
         .await?;

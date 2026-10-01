@@ -490,6 +490,28 @@ impl CodexModelProvider {
         Ok(Some(capabilities.usable_context_window()?))
     }
 
+    /// The `(fast, ultrafast)` tiers this model offers on the given
+    /// credential, from the account's catalog. The API-key route has no
+    /// catalog, so its tiers cannot be confirmed.
+    pub async fn speed_tiers_with_auth(
+        &self,
+        auth_file: Option<std::path::PathBuf>,
+    ) -> Result<(bool, bool)> {
+        let mut access = SubscriptionAccess::read_with(auth_file, None).await?;
+        ensure!(
+            !access.is_api_key(),
+            "an OpenAI API key has no model catalog to confirm speed tiers"
+        );
+        let account = access.identity();
+        let capabilities = access
+            .model_capabilities(&model_http_client(&account)?, &self.model)
+            .await?;
+        Ok((
+            capabilities.supports_fast(),
+            capabilities.supports_ultrafast(),
+        ))
+    }
+
     /// Keep the credentials selected at turn admission stable while this turn runs.
     pub async fn model_turn_for_account(
         &self,

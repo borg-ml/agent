@@ -2065,6 +2065,7 @@ mod tests {
                     ultrafast: false,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: crate::PermissionMode::Manual,
+                    speed_support: Default::default(),
                 },
             ))
             .await
@@ -2265,6 +2266,7 @@ mod tests {
                     ultrafast: false,
                     response_language: crate::ResponseLanguage::Auto,
                     permission_mode: crate::PermissionMode::Manual,
+                    speed_support: Default::default(),
                 },
             ))
             .await

@@ -1032,6 +1032,7 @@ impl Render for BorgGui {
             .into();
         let fast = configuration.is_some_and(|c| c.fast);
         let ultrafast = configuration.is_some_and(|c| c.ultrafast);
+        let speed_support = configuration.map(|c| c.speed_support).unwrap_or_default();
         let billing: Option<SharedString> = self
             .view
             .as_ref()
@@ -1149,10 +1150,10 @@ impl Render for BorgGui {
                 "change interface language",
                 "/ui-language ",
             ),
-            ("/fast", "select standard, fast or ultrafast", "/fast"),
+            ("/fast", "select a speed tier the model offers", "/fast"),
             (
                 "/ultrafast on|off",
-                "Codex/OpenAI premium, access-dependent tier",
+                "ultrafast tier, where the model offers it",
                 "/ultrafast ",
             ),
             ("/settings", "inspect live session settings", "/settings"),
@@ -1304,11 +1305,13 @@ impl Render for BorgGui {
                                 .flex().flex_col().gap_2()
                                 .child("Speed tier · esc to close")
                                 .child(div().text_xs().text_color(rgb(palette::TEXT_MUTED))
-                                    .child("Ultrafast: Codex/OpenAI only · premium, access-dependent tier. No provider or billing fallback."))
-                                .children([("Standard", FrontendCommand::SetFast(false), !fast && !ultrafast),
-                                    ("Fast", FrontendCommand::SetFast(true), fast && !ultrafast),
-                                    ("Ultrafast", FrontendCommand::SetUltrafast(true), ultrafast)]
-                                    .into_iter().enumerate().map(|(index, (label, command, selected))| {
+                                    .child("Faster tiers appear only when confirmed for the selected model on this account. No provider or billing fallback."))
+                                .children([("Standard", FrontendCommand::SetFast(false), !fast && !ultrafast, true),
+                                    ("Fast", FrontendCommand::SetFast(true), fast && !ultrafast, speed_support.fast),
+                                    ("Ultrafast", FrontendCommand::SetUltrafast(true), ultrafast, speed_support.ultrafast)]
+                                    .into_iter().filter(|(_, _, _, offered)| *offered)
+                                    .map(|(label, command, selected, _)| (label, command, selected))
+                                    .enumerate().map(|(index, (label, command, selected))| {
                                         div().id(SharedString::from(format!("speed-{index}")))
                                             .px_3().py_2().cursor_pointer()
                                             .bg(rgb(if selected { palette::SURFACE_RAISED } else { palette::SURFACE }))
