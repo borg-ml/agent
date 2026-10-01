@@ -3969,28 +3969,27 @@ impl SubagentCoordinator {
         // is created and given members durably: a refusal afterwards would
         // leave a workspace behind for a message that was never admitted.
         //
-        // The test has to be positive evidence. `session_message_needs_relay`
-        // answers false when either host binding is absent, which means
-        // "nothing recorded a host", not "same host" -- trusting it would let
-        // an unknown recipient through on missing information. A session this
-        // process drives, two bindings naming the same host, or a live local
-        // owner are the three things that actually prove a shared store.
+        // The test has to be positive evidence: an absent host binding means
+        // "nothing recorded a host", not "same host". A session this process
+        // drives or a live local owner proves a shared store. Two recorded
+        // hosts are either the same host, so the same store, or two enrolled
+        // hosts, whose relay uploads the captured bytes for the recipient's
+        // host to verify before admission.
         if !attachments.is_empty() {
             // Only a message that really carries images pays for the owner
             // probe, and it is ordered last so the in-memory answers settle it
             // first. A text message touches no new filesystem state at all.
-            let recipient_shares_attachment_store = recipient_is_local_task
+            let images_can_arrive = recipient_is_local_task
                 || matches!(
                     (actor_binding.host_id, recipient_binding.host_id),
-                    (Some(sender_host), Some(recipient_host)) if sender_host == recipient_host
+                    (Some(_), Some(_))
                 )
                 || crate::local_session_owner_is_active(&self.journal_root, recipient_session_id)
                     .unwrap_or(false);
             ensure!(
-                recipient_shares_attachment_store,
-                "forwarding images to a recipient that does not share this host's attachment \
-                 store is not supported yet; send the message without attachments, or reach a \
-                 session on this host"
+                images_can_arrive,
+                "images can only be forwarded to a session on this host or to one reached \
+                 through an enrolled host relay; send the message without attachments"
             );
         }
         let workspace_store = self.workspace_store().await?;
@@ -6470,15 +6469,16 @@ impl SubagentCoordinator {
             };
         }
         // Past the local redirect, so this participant has no session in this
-        // installation: it is reached through the workspace rather than a
-        // process here, and nothing resolves an attachment digest for it.
+        // installation: only this host's relay can carry its images, by
+        // uploading the captured bytes for the recipient's host to verify.
         // Refuse before ensure_direct_workspace and the append below, both
         // durable, rather than admit a message whose images cannot arrive.
         ensure!(
-            options.attachments.is_empty(),
-            "images can only be forwarded to a recipient on this host, and this participant has \
-             no local session here; send without attachments"
+            options.attachments.is_empty() || actor.host_id.is_some(),
+            "images can only reach a participant on another machine through an enrolled host \
+             relay, and this session is not enrolled; send without attachments"
         );
+        resolve_message_attachments(&self.journal_root, &options.attachments).await?;
         let roster = store
             .workspace_roster(actor.workspace_id, actor.participant_id)
             .await?;
@@ -6499,7 +6499,7 @@ impl SubagentCoordinator {
                 author_id: actor.participant_id,
                 text: message.to_string(),
                 mentions: options.mentions,
-                attachments: Vec::new(),
+                attachments: options.attachments,
                 audience: Audience::Direct {
                     participant: recipient_participant_id,
                 },
@@ -10099,8 +10099,8 @@ fn lsp_position_schema() -> Value {
 
 /// Matches what the local image channel already accepts, so a forwarded image
 /// and a directly attached one are refused for the same reasons.
-const MAX_MESSAGE_ATTACHMENTS: usize = 4;
-const MAX_MESSAGE_ATTACHMENT_BYTES: u64 = 6 * 1024 * 1024 / 4 * 3;
+pub const MAX_MESSAGE_ATTACHMENTS: usize = 4;
+pub const MAX_MESSAGE_ATTACHMENT_BYTES: u64 = 6 * 1024 * 1024 / 4 * 3;
 
 /// PNG and JPEG by signature, never by file extension.
 ///
@@ -10193,7 +10193,13 @@ async fn capture_message_attachments(
             sha256,
         };
         write_attachment_blob(&attachment_blob_path(journal_root, &attachment), &bytes).await?;
-        captured.push(attachment);
+        // The same bytes twice are one image; a relay refuses repeated digests.
+        if !captured
+            .iter()
+            .any(|existing: &MessageAttachment| existing.sha256 == attachment.sha256)
+        {
+            captured.push(attachment);
+        }
     }
     Ok(captured)
 }
@@ -10221,42 +10227,115 @@ async fn write_attachment_blob(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Turn durable references back into files, proving the bytes on the way out.
+/// Reject a reference before its digest names a file or its length is
+/// trusted. A relayed reference was written by another machine, and the digest
+/// becomes a path component here, so anything but SHA-256 hex is refused
+/// rather than sanitised.
+pub fn validate_message_attachment(attachment: &MessageAttachment) -> Result<()> {
+    ensure!(
+        attachment.sha256.len() == 64
+            && attachment
+                .sha256
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+        "image digest is not a lowercase SHA-256 hex string"
+    );
+    ensure!(
+        matches!(attachment.media_type.as_str(), "image/png" | "image/jpeg"),
+        "image {} has unsupported media type {}",
+        attachment.name,
+        attachment.media_type
+    );
+    ensure!(
+        attachment.byte_len > 0 && attachment.byte_len <= MAX_MESSAGE_ATTACHMENT_BYTES,
+        "image {} declares {} bytes; the limit is {MAX_MESSAGE_ATTACHMENT_BYTES}",
+        attachment.name,
+        attachment.byte_len
+    );
+    ensure!(
+        attachment.name.len() <= 1024,
+        "image name exceeds 1024 bytes"
+    );
+    Ok(())
+}
+
+/// Bytes are the image a reference describes only if length, digest and
+/// signature all agree with it.
+fn verify_message_attachment_bytes(attachment: &MessageAttachment, bytes: &[u8]) -> Result<()> {
+    ensure!(
+        bytes.len() as u64 == attachment.byte_len,
+        "image {} is {} bytes but the message recorded {}",
+        attachment.name,
+        bytes.len(),
+        attachment.byte_len
+    );
+    let digest = hex::encode(Sha256::digest(bytes));
+    ensure!(
+        digest == attachment.sha256,
+        "image {} failed integrity verification: expected {}, found {digest}",
+        attachment.name,
+        attachment.sha256
+    );
+    ensure!(
+        message_attachment_media_type(bytes) == Some(attachment.media_type.as_str()),
+        "image {} is not the {} it was declared as",
+        attachment.name,
+        attachment.media_type
+    );
+    Ok(())
+}
+
+/// Read a captured image back out of this host's store, proven.
 ///
 /// The digest is recomputed on every read instead of being trusted from the
-/// journal, because this is the last point before the bytes become pixels in
-/// someone's context. A truncated, swapped or half-written blob has to fail
-/// here and take the whole message with it: handing over unverified bytes as
-/// if they were the sender's image is precisely the fake delivery this path
-/// exists to prevent.
+/// journal, because the bytes are about to become pixels in someone's context
+/// or leave this machine through the relay. A truncated, swapped or
+/// half-written blob has to fail here and take the whole message with it:
+/// handing over unverified bytes as if they were the sender's image is
+/// precisely the fake delivery this path exists to prevent.
+pub async fn load_message_attachment(
+    journal_root: &Path,
+    attachment: &MessageAttachment,
+) -> Result<Vec<u8>> {
+    validate_message_attachment(attachment)?;
+    let bytes = tokio::fs::read(attachment_blob_path(journal_root, attachment))
+        .await
+        .with_context(|| {
+            format!(
+                "image {} ({}) is not in this host's attachment store",
+                attachment.name, attachment.sha256
+            )
+        })?;
+    verify_message_attachment_bytes(attachment, &bytes)?;
+    Ok(bytes)
+}
+
+/// Materialise bytes another host relayed into this host's store, so the
+/// message that references them resolves exactly like a locally captured one.
+/// Nothing is written unless the reference and the bytes both verify.
+pub async fn store_relayed_message_attachment(
+    journal_root: &Path,
+    attachment: &MessageAttachment,
+    bytes: &[u8],
+) -> Result<()> {
+    validate_message_attachment(attachment)?;
+    verify_message_attachment_bytes(attachment, bytes)?;
+    let directory = journal_root.join("attachments");
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .with_context(|| format!("failed to create {}", directory.display()))?;
+    write_attachment_blob(&attachment_blob_path(journal_root, attachment), bytes).await
+}
+
+/// Turn durable references back into files, proving the bytes on the way out.
 async fn resolve_message_attachments(
     journal_root: &Path,
     attachments: &[MessageAttachment],
 ) -> Result<Vec<PathBuf>> {
     let mut resolved = Vec::with_capacity(attachments.len());
     for attachment in attachments {
-        let path = attachment_blob_path(journal_root, attachment);
-        let bytes = tokio::fs::read(&path).await.with_context(|| {
-            format!(
-                "image {} ({}) is not in this host's attachment store",
-                attachment.name, attachment.sha256
-            )
-        })?;
-        ensure!(
-            bytes.len() as u64 == attachment.byte_len,
-            "image {} is {} bytes but the message recorded {}",
-            attachment.name,
-            bytes.len(),
-            attachment.byte_len
-        );
-        let digest = hex::encode(Sha256::digest(&bytes));
-        ensure!(
-            digest == attachment.sha256,
-            "image {} failed integrity verification: expected {}, found {digest}",
-            attachment.name,
-            attachment.sha256
-        );
-        resolved.push(path);
+        load_message_attachment(journal_root, attachment).await?;
+        resolved.push(attachment_blob_path(journal_root, attachment));
     }
     Ok(resolved)
 }
@@ -10275,7 +10354,7 @@ fn message_tool(name: &str, description: &str) -> Value {
                 "attachments": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Up to 4 local PNG/JPEG paths to forward as images. Bytes are captured and verified at send time; the recipient sees pixels, never your path. Same-host recipients only -- a target that needs a host relay is refused before the message is sent."
+                    "description": "Up to 4 local PNG/JPEG paths to forward as images. Bytes are captured and verified at send time; the recipient sees pixels, never your path. A recipient on another enrolled machine gets them through the host relay, which verifies them before admission; if the relay cannot carry them, get_message_status reports the delivery failed rather than sending the text alone."
                 }
             },
             "required": ["target", "message"],

@@ -278,6 +278,10 @@ struct RelayInboxMessage {
     reply_to_message_id: Option<Uuid>,
     created_at: DateTime<Utc>,
     delivery_mode: crate::DeliveryMode,
+    /// References only; the bytes are fetched separately and verified before
+    /// the message is admitted. A relay that predates images omits the field.
+    #[serde(default)]
+    attachments: Vec<crate::MessageAttachment>,
 }
 
 #[derive(Deserialize)]
@@ -2287,6 +2291,7 @@ pub(crate) async fn run_host_with_resolved_store(
         config.clone(),
         Arc::clone(&session_store),
         Arc::clone(&sessions),
+        session_root.clone(),
     )));
     let operations = AbortTask(tokio::spawn(run_host_operation_loop(
         client.clone(),
@@ -2625,7 +2630,9 @@ async fn recover_host_journal(
     store
         .acknowledge_host_journal(session_id, cursor.event_cursor, cursor.live_revision)
         .await?;
-    let mut sync = JournalSync::new(cursor, false);
+    // Event replay only: this sync never relays messages, so it has no
+    // attachment store to read.
+    let mut sync = JournalSync::new(cursor, false, PathBuf::new());
     let result = flush_pending(client, config, store, session_id, &mut sync).await;
     store
         .acknowledge_host_journal(
@@ -2643,6 +2650,7 @@ async fn run_host_workspace_recovery_loop(
     config: HostConfig,
     store: Arc<dyn SessionStore>,
     sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
+    journal_root: PathBuf,
 ) {
     let workspace = loop {
         match store.workspace_store().await {
@@ -2698,6 +2706,7 @@ async fn run_host_workspace_recovery_loop(
                         live_revision: 0,
                     },
                     false,
+                    journal_root.clone(),
                 )
             });
             let result = tokio::time::timeout(
@@ -3069,6 +3078,11 @@ pub async fn mirror_local_session(
         next_instance_directory_sync: Instant::now(),
         next_inbox_sync: Instant::now(),
         retry_at: Instant::now(),
+        journal_root: config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("sessions"),
+        inbox_retry_at: HashMap::new(),
     };
 
     let mut capabilities =
@@ -5282,7 +5296,7 @@ async fn run_session(
     }
     let store: Arc<dyn SessionStore> = durable_store.clone();
     let cursor = load_session_sync(&client, &config, session_id).await?;
-    let mut sync = JournalSync::new(cursor, attachment.is_some());
+    let mut sync = JournalSync::new(cursor, attachment.is_some(), session_root.clone());
     sync.uploaded_workspace_sequences = durable_store
         .host_workspace_cursors(config.host_id, session_id)
         .await?;
@@ -5747,10 +5761,21 @@ struct JournalSync {
     next_instance_directory_sync: Instant,
     next_inbox_sync: Instant,
     retry_at: Instant,
+    /// The sessions directory whose `attachments/` store holds the images
+    /// this host captured or received; the relay reads and fills it.
+    journal_root: PathBuf,
+    /// Inbox messages whose images failed to arrive or verify, withheld from
+    /// admission until this time so one bad message is not refetched every
+    /// pass.
+    inbox_retry_at: HashMap<Uuid, Instant>,
 }
 
 impl JournalSync {
-    fn new(cursor: SessionSyncResponse, workspace_relay_available: bool) -> Self {
+    fn new(
+        cursor: SessionSyncResponse,
+        workspace_relay_available: bool,
+        journal_root: PathBuf,
+    ) -> Self {
         Self {
             uploaded_sequence: cursor.event_cursor,
             uploaded_live_revision: cursor.live_revision,
@@ -5762,6 +5787,8 @@ impl JournalSync {
             next_instance_directory_sync: Instant::now(),
             next_inbox_sync: Instant::now(),
             retry_at: Instant::now(),
+            journal_root,
+            inbox_retry_at: HashMap::new(),
         }
     }
 }
@@ -5839,6 +5866,10 @@ pub async fn sync_remote_session(
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(35))
         .build()?;
+    let journal_root = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("sessions");
     let count = sync_instance_directory(&client, &config, workspace.as_ref(), session_id).await?;
     ensure!(
         sync_relay_inbox(
@@ -5846,7 +5877,9 @@ pub async fn sync_remote_session(
             &config,
             workspace.as_ref(),
             session_id,
-            binding.participant_id
+            binding.participant_id,
+            &journal_root,
+            &mut HashMap::new(),
         )
         .await?,
         "relay does not support the agent inbox yet"
@@ -5868,6 +5901,8 @@ pub async fn sync_remote_session(
             next_instance_directory_sync: next_sync,
             next_inbox_sync: next_sync,
             retry_at: Instant::now(),
+            journal_root,
+            inbox_retry_at: HashMap::new(),
         };
         ensure!(
             flush_host_workspace_messages(
@@ -5892,6 +5927,8 @@ async fn sync_relay_inbox(
     store: &dyn WorkspaceStore,
     session_id: Uuid,
     participant_id: Uuid,
+    journal_root: &Path,
+    retry_at: &mut HashMap<Uuid, Instant>,
 ) -> Result<bool> {
     let path = format!("/api/remote/host/sessions/{session_id}/inbox");
     let response = client
@@ -5903,8 +5940,21 @@ async fn sync_relay_inbox(
         return Ok(false);
     }
     let inbox: RelayInbox = response.error_for_status()?.json().await?;
+    retry_at.retain(|_, retry| *retry > Instant::now());
     for incoming in inbox.messages {
         let message_id = incoming.id;
+        if retry_at.contains_key(&message_id) {
+            continue;
+        }
+        // Unacknowledged, so the relay keeps offering it; nothing is admitted
+        // whose images are not already verified bytes in this host's store.
+        if let Err(error) =
+            fetch_relayed_attachments(client, config, &path, &incoming, journal_root).await
+        {
+            tracing::warn!(?error, %message_id, "relayed images unavailable; message withheld");
+            retry_at.insert(message_id, Instant::now() + Duration::from_secs(60));
+            continue;
+        }
         store
             .import_relay_message(
                 crate::WorkspaceMessage {
@@ -5916,7 +5966,7 @@ async fn sync_relay_inbox(
                     body: crate::WorkspaceMessageBody {
                         text: incoming.text,
                         mentions: Vec::new(),
-                        attachments: Vec::new(),
+                        attachments: incoming.attachments,
                     },
                     audience: Audience::Direct {
                         participant: participant_id,
@@ -5941,6 +5991,167 @@ async fn sync_relay_inbox(
     Ok(true)
 }
 
+/// Bring a relayed message's images into this host's store, proven.
+///
+/// Each reference is validated before it names a URL or a buffer size, the
+/// download is cut off at the declared length, and the bytes must match the
+/// digest and signature before anything is written. A blob already here under
+/// that digest is reused, so a retried sync never refetches it.
+async fn fetch_relayed_attachments(
+    client: &Client,
+    config: &HostConfig,
+    inbox_path: &str,
+    message: &RelayInboxMessage,
+    journal_root: &Path,
+) -> Result<()> {
+    ensure!(
+        message.attachments.len() <= crate::MAX_MESSAGE_ATTACHMENTS,
+        "relayed message carries {} images; the limit is {}",
+        message.attachments.len(),
+        crate::MAX_MESSAGE_ATTACHMENTS
+    );
+    for (index, attachment) in message.attachments.iter().enumerate() {
+        crate::validate_message_attachment(attachment)?;
+        ensure!(
+            message.attachments[..index]
+                .iter()
+                .all(|earlier| earlier.sha256 != attachment.sha256),
+            "relayed message repeats image {}",
+            attachment.sha256
+        );
+        if crate::load_message_attachment(journal_root, attachment)
+            .await
+            .is_ok()
+        {
+            continue;
+        }
+        let mut response = client
+            .get(endpoint(
+                &config.server,
+                &format!(
+                    "{inbox_path}/{}/attachments/{}",
+                    message.id, attachment.sha256
+                ),
+            ))
+            .bearer_auth(&config.host_token)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await?
+            .error_for_status()?;
+        let declared = usize::try_from(attachment.byte_len)?;
+        let mut bytes = Vec::with_capacity(declared);
+        while let Some(chunk) = response.chunk().await? {
+            ensure!(
+                bytes.len() + chunk.len() <= declared,
+                "relay sent more than the {declared} bytes image {} declares",
+                attachment.name
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        crate::store_relayed_message_attachment(journal_root, attachment, &bytes).await?;
+    }
+    Ok(())
+}
+
+enum AttachmentUpload {
+    Uploaded,
+    Rejected(String),
+    Retry,
+}
+
+/// Upload a message's captured images ahead of the message itself, so the
+/// relay never accepts text whose pictures it cannot serve. The bytes come
+/// from this host's content-addressed store and are re-verified on the way
+/// out; uploads are keyed by digest, so a replay re-sends identical bytes.
+async fn upload_message_attachments(
+    client: &Client,
+    config: &HostConfig,
+    session_id: Uuid,
+    journal_root: &Path,
+    attachments: &[crate::MessageAttachment],
+) -> Result<AttachmentUpload> {
+    for attachment in attachments {
+        let bytes = match crate::load_message_attachment(journal_root, attachment).await {
+            Ok(bytes) => bytes,
+            Err(error) => return Ok(AttachmentUpload::Rejected(format!("{error:#}"))),
+        };
+        let response = client
+            .post(endpoint(
+                &config.server,
+                &format!(
+                    "/api/remote/host/sessions/{session_id}/attachments/{}",
+                    attachment.sha256
+                ),
+            ))
+            .bearer_auth(&config.host_token)
+            .timeout(Duration::from_secs(60))
+            .query(&[
+                ("media_type", attachment.media_type.clone()),
+                ("byte_len", attachment.byte_len.to_string()),
+            ])
+            .body(bytes)
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
+                return Err(response.error_for_status().unwrap_err())
+                    .context("remote host token was rejected; enroll this host again");
+            }
+            Ok(response)
+                if response.status().is_client_error()
+                    && response.status() != StatusCode::TOO_MANY_REQUESTS =>
+            {
+                let status = response.status();
+                let detail = response
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(512)
+                    .collect::<String>();
+                return Ok(AttachmentUpload::Rejected(format!(
+                    "the relay refused image {} ({status}): {detail}",
+                    attachment.name
+                )));
+            }
+            Ok(response) => {
+                tracing::warn!(status = %response.status(), "message image upload failed");
+                return Ok(AttachmentUpload::Retry);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "message image upload failed");
+                return Ok(AttachmentUpload::Retry);
+            }
+        }
+    }
+    Ok(AttachmentUpload::Uploaded)
+}
+
+async fn fail_relay_deliveries(
+    store: &dyn WorkspaceStore,
+    workspace_id: Uuid,
+    message_id: Uuid,
+    recipients: &[Uuid],
+    detail: String,
+) -> Result<()> {
+    for recipient in recipients {
+        store
+            .transition_message_delivery(
+                workspace_id,
+                message_id,
+                *recipient,
+                crate::DeliveryState::Failed,
+                Some(crate::DeliveryAttempt {
+                    attempted_at: Utc::now(),
+                    detail: Some(detail.clone()),
+                }),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 async fn flush_workspace_messages(
     client: &Client,
     config: &HostConfig,
@@ -5960,7 +6171,16 @@ async fn flush_workspace_messages(
     };
     let participant_id = binding.participant_id;
     if Instant::now() >= sync.next_inbox_sync {
-        let delay = match sync_relay_inbox(client, config, store, session_id, participant_id).await
+        let delay = match sync_relay_inbox(
+            client,
+            config,
+            store,
+            session_id,
+            participant_id,
+            &sync.journal_root,
+            &mut sync.inbox_retry_at,
+        )
+        .await
         {
             Ok(true) => Duration::from_secs(1),
             Ok(false) => Duration::from_secs(30),
@@ -6131,6 +6351,39 @@ async fn flush_workspace_messages(
                         format!("/api/remote/host/sessions/{session_id}/messages")
                     };
                     let delivery_recipients = recipients.clone();
+                    if !message.body.attachments.is_empty() {
+                        match upload_message_attachments(
+                            client,
+                            config,
+                            session_id,
+                            &sync.journal_root,
+                            &message.body.attachments,
+                        )
+                        .await?
+                        {
+                            AttachmentUpload::Uploaded => {}
+                            AttachmentUpload::Rejected(detail) => {
+                                fail_relay_deliveries(
+                                    store,
+                                    workspace.id,
+                                    message.id,
+                                    &delivery_recipients,
+                                    detail,
+                                )
+                                .await?;
+                                uploaded_sequence = event.sequence;
+                                sync.uploaded_workspace_sequences
+                                    .insert(workspace.id, uploaded_sequence);
+                                continue;
+                            }
+                            AttachmentUpload::Retry => {
+                                sync.workspace_retry_at
+                                    .insert(workspace.id, Instant::now() + Duration::from_secs(2));
+                                caught_up = false;
+                                continue 'workspaces;
+                            }
+                        }
+                    }
                     let response = client
                         .post(endpoint(&config.server, &relay_path))
                         .bearer_auth(&config.host_token)
@@ -6140,6 +6393,7 @@ async fn flush_workspace_messages(
                             "audience_role": audience_role,
                             "recipient_participant_ids": recipients,
                             "mentions": message.body.mentions,
+                            "attachments": message.body.attachments,
                             "thread_id": message.thread_id,
                             "reply_to_message_id": message.reply_to_message_id,
                             "idempotency_key": event.id.to_string(),
@@ -6188,22 +6442,16 @@ async fn flush_workspace_messages(
                                 .chars()
                                 .take(512)
                                 .collect::<String>();
-                            for recipient in delivery_recipients {
-                                store
-                                    .transition_message_delivery(
-                                        workspace.id,
-                                        message.id,
-                                        recipient,
-                                        crate::DeliveryState::Failed,
-                                        Some(crate::DeliveryAttempt {
-                                            attempted_at: Utc::now(),
-                                            detail: Some(format!(
-                                                "remote instance relay rejected the message ({status}): {detail}"
-                                            )),
-                                        }),
-                                    )
-                                    .await?;
-                            }
+                            fail_relay_deliveries(
+                                store,
+                                workspace.id,
+                                message.id,
+                                &delivery_recipients,
+                                format!(
+                                    "remote instance relay rejected the message ({status}): {detail}"
+                                ),
+                            )
+                            .await?;
                             tracing::warn!(
                                 %status,
                                 %detail,
@@ -7339,7 +7587,9 @@ mod tests {
                 &config,
                 workspace.as_ref(),
                 recipient,
-                recipient
+                recipient,
+                root.path(),
+                &mut HashMap::new(),
             )
             .await
             .is_err()
@@ -7350,7 +7600,9 @@ mod tests {
                 &config,
                 workspace.as_ref(),
                 recipient,
-                recipient
+                recipient,
+                root.path(),
+                &mut HashMap::new(),
             )
             .await
             .unwrap()
@@ -7374,6 +7626,311 @@ mod tests {
         );
         assert!(!store.contains_message(recipient, message_id).await.unwrap());
         scratch.discard().await;
+    }
+
+    /// Images cross machines as verified bytes or not at all. The sender host
+    /// must upload the captured bytes before the message, and a relay that
+    /// cannot take them must leave a failed delivery rather than accepted text
+    /// without its pictures. The recipient host must neither admit nor
+    /// acknowledge a message whose bytes do not verify, and once they do, the
+    /// message must resolve to files in its own store.
+    #[tokio::test]
+    async fn relayed_images_arrive_as_verified_local_files_or_not_at_all() {
+        #[derive(Default)]
+        struct Relay {
+            blob_route: bool,
+            tamper: bool,
+            log: Vec<String>,
+            blobs: HashMap<String, Vec<u8>>,
+            messages: Vec<serde_json::Value>,
+            acks: usize,
+        }
+        fn sha256_hex(bytes: &[u8]) -> String {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
+        let sender_root = tempdir().unwrap();
+        let recipient_root = tempdir().unwrap();
+        let (sender_scratch, sender_store) =
+            crate::session_store::postgres::testing::session_store().await;
+        let (recipient_scratch, recipient_store) =
+            crate::session_store::postgres::testing::session_store().await;
+        let sender = Uuid::new_v4();
+        let recipient = Uuid::new_v4();
+        let human = crate::local_human_participant_id("Human");
+        let mut workspaces = Vec::new();
+        for (store, session) in [(&sender_store, sender), (&recipient_store, recipient)] {
+            store.create_session(session).await.unwrap();
+            let workspace = store.workspace_store().await.unwrap().unwrap();
+            let binding = store.workspace_binding(session).await.unwrap().unwrap();
+            workspace
+                .ensure_execution_workspace(
+                    binding.workspace_id,
+                    "Project",
+                    human,
+                    "Human",
+                    session,
+                    "Agent",
+                )
+                .await
+                .unwrap();
+            workspaces.push(workspace);
+        }
+        let (sender_workspace, recipient_workspace) = (&workspaces[0], &workspaces[1]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_url = format!("http://{}", listener.local_addr().unwrap());
+        let sender_config = HostConfig {
+            server: server_url.clone(),
+            ..test_config(sender_root.path())
+        };
+        let recipient_config = HostConfig {
+            server: server_url,
+            ..test_config(recipient_root.path())
+        };
+        sender_workspace
+            .upsert_instance(
+                Participant {
+                    id: recipient,
+                    display_name: "Remote peer".to_string(),
+                    kind: ParticipantKind::Agent,
+                    created_at: Utc::now(),
+                },
+                Some(recipient_config.host_id),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut png = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(b"relayed pixels");
+        let attachment = crate::MessageAttachment {
+            name: "frame.png".to_string(),
+            media_type: "image/png".to_string(),
+            byte_len: png.len() as u64,
+            sha256: sha256_hex(&png),
+        };
+        crate::store_relayed_message_attachment(sender_root.path(), &attachment, &png)
+            .await
+            .unwrap();
+        let channel = sender_workspace
+            .ensure_direct_workspace(sender, recipient)
+            .await
+            .unwrap();
+        let send = |key: &'static str| {
+            sender_workspace.append_message(crate::NewWorkspaceMessage {
+                workspace_id: channel,
+                author_id: sender,
+                text: "see the frame".to_string(),
+                mentions: Vec::new(),
+                attachments: vec![attachment.clone()],
+                audience: Audience::Direct {
+                    participant: recipient,
+                },
+                mode: crate::DeliveryMode::NextTurn,
+                thread_id: None,
+                reply_to_message_id: None,
+                idempotency_key: key.to_string(),
+            })
+        };
+
+        let relay = Arc::new(std::sync::Mutex::new(Relay::default()));
+        let relay_message_id = Uuid::new_v4();
+        let relay_channel = Uuid::new_v4();
+        let server = tokio::spawn({
+            let relay = Arc::clone(&relay);
+            async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let (target, body) = read_http_request(&mut stream).await;
+                    let path = target
+                        .split_once('?')
+                        .map_or(target.as_str(), |(path, _)| path);
+                    let (status, payload) = {
+                        let mut relay = relay.lock().unwrap();
+                        relay.log.push(path.to_string());
+                        let digest = path.rsplit('/').next().unwrap().to_string();
+                        if path.contains("/inbox/") && path.contains("/attachments/") {
+                            let mut bytes = relay.blobs[&digest].clone();
+                            if relay.tamper {
+                                *bytes.last_mut().unwrap() ^= 1;
+                            }
+                            ("200 OK", bytes)
+                        } else if path.contains("/attachments/") && !relay.blob_route {
+                            ("404 Not Found", Vec::new())
+                        } else if path.contains("/attachments/") {
+                            assert_eq!(sha256_hex(&body), digest);
+                            relay.blobs.insert(digest, body);
+                            ("204 No Content", Vec::new())
+                        } else if path.ends_with("/messages") {
+                            let message: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            for reference in message["attachments"].as_array().unwrap() {
+                                let digest = reference["sha256"].as_str().unwrap();
+                                assert!(relay.blobs.contains_key(digest), "message before bytes");
+                            }
+                            relay.messages.push(message);
+                            ("204 No Content", Vec::new())
+                        } else if path.ends_with("/inbox") {
+                            let messages = relay
+                                .messages
+                                .iter()
+                                .map(|message| {
+                                    serde_json::json!({
+                                        "id": relay_message_id, "workspace_id": relay_channel,
+                                        "author_id": sender, "author_name": "Sender",
+                                        "text": message["text"], "thread_id": null,
+                                        "reply_to_message_id": null, "created_at": Utc::now(),
+                                        "delivery_mode": "next_turn",
+                                        "attachments": message["attachments"],
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            (
+                                "200 OK",
+                                serde_json::json!({ "messages": messages })
+                                    .to_string()
+                                    .into_bytes(),
+                            )
+                        } else if path.ends_with("/ack") {
+                            relay.acks += 1;
+                            ("204 No Content", Vec::new())
+                        } else {
+                            panic!("unexpected relay request: {path}");
+                        }
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    stream.write_all(head.as_bytes()).await.unwrap();
+                    stream.write_all(&payload).await.unwrap();
+                }
+            }
+        });
+        let later = Instant::now() + Duration::from_secs(60);
+        let mut sync = JournalSync::new(
+            SessionSyncResponse {
+                event_cursor: 0,
+                live_revision: 0,
+            },
+            false,
+            sender_root.path().to_path_buf(),
+        );
+        sync.next_inbox_sync = later;
+        sync.next_instance_directory_sync = later;
+        let client = Client::new();
+
+        // A relay that predates images: a failed delivery, and no text posted.
+        let refused = send("before-images").await.unwrap();
+        flush_workspace_messages(
+            &client,
+            &sender_config,
+            &sender_store,
+            Some(sender_workspace.as_ref()),
+            sender,
+            None,
+            &mut sync,
+        )
+        .await
+        .unwrap();
+        let deliveries = sender_workspace
+            .message_deliveries(refused.message_id)
+            .await
+            .unwrap();
+        assert_eq!(deliveries[0].state, crate::DeliveryState::Failed);
+        assert!(relay.lock().unwrap().messages.is_empty());
+
+        // A relay that takes images: bytes first, then references, then Relayed.
+        relay.lock().unwrap().blob_route = true;
+        let relayed = send("with-images").await.unwrap();
+        flush_workspace_messages(
+            &client,
+            &sender_config,
+            &sender_store,
+            Some(sender_workspace.as_ref()),
+            sender,
+            None,
+            &mut sync,
+        )
+        .await
+        .unwrap();
+        let deliveries = sender_workspace
+            .message_deliveries(relayed.message_id)
+            .await
+            .unwrap();
+        assert_eq!(deliveries[0].state, crate::DeliveryState::Relayed);
+        {
+            let relay = relay.lock().unwrap();
+            assert_eq!(relay.messages.len(), 1);
+            assert_eq!(
+                relay.messages[0]["attachments"],
+                serde_json::json!([attachment])
+            );
+            let wire = relay.messages[0].to_string();
+            assert!(!wire.contains(&*sender_root.path().to_string_lossy()));
+        }
+
+        // Tampered bytes are neither admitted nor acknowledged.
+        relay.lock().unwrap().tamper = true;
+        assert!(
+            sync_relay_inbox(
+                &client,
+                &recipient_config,
+                recipient_workspace.as_ref(),
+                recipient,
+                recipient,
+                recipient_root.path(),
+                &mut HashMap::new(),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            recipient_workspace
+                .pending_message_events(relay_channel, recipient, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(relay.lock().unwrap().acks, 0);
+        assert!(
+            crate::load_message_attachment(recipient_root.path(), &attachment)
+                .await
+                .is_err()
+        );
+
+        // Verified bytes land in the recipient's own store before admission.
+        relay.lock().unwrap().tamper = false;
+        sync_relay_inbox(
+            &client,
+            &recipient_config,
+            recipient_workspace.as_ref(),
+            recipient,
+            recipient,
+            recipient_root.path(),
+            &mut HashMap::new(),
+        )
+        .await
+        .unwrap();
+        let pending = recipient_workspace
+            .pending_message_events(relay_channel, recipient, 10)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        let WorkspaceEventKind::Message { message, .. } = &pending[0].0.kind else {
+            panic!("expected the relayed message");
+        };
+        assert_eq!(message.body.attachments, vec![attachment.clone()]);
+        assert_eq!(
+            crate::load_message_attachment(recipient_root.path(), &attachment)
+                .await
+                .unwrap(),
+            png
+        );
+        assert_eq!(relay.lock().unwrap().acks, 1);
+        server.abort();
+        sender_scratch.discard().await;
+        recipient_scratch.discard().await;
     }
 
     #[tokio::test]
@@ -7558,6 +8115,8 @@ mod tests {
             next_instance_directory_sync: Instant::now(),
             next_inbox_sync: Instant::now(),
             retry_at: Instant::now(),
+            journal_root: PathBuf::new(),
+            inbox_retry_at: HashMap::new(),
         };
         flush_workspace_messages(
             &Client::new(),
@@ -8143,6 +8702,8 @@ mod tests {
                 next_instance_directory_sync: later,
                 next_inbox_sync: later,
                 retry_at: Instant::now(),
+                journal_root: PathBuf::new(),
+                inbox_retry_at: HashMap::new(),
             };
             let error = flush_workspace_messages(
                 &client,
@@ -11671,6 +12232,7 @@ connection: close
                 live_revision: 0,
             },
             true,
+            PathBuf::new(),
         );
         sync.next_inbox_sync = Instant::now() + Duration::from_secs(60);
         sync.next_instance_directory_sync = Instant::now() + Duration::from_secs(60);
@@ -11874,6 +12436,7 @@ connection: close
                     live_revision: 0,
                 },
                 true,
+                PathBuf::new(),
             );
             sync.uploaded_workspace_sequences = store
                 .host_workspace_cursors(config.host_id, session_id)
@@ -11951,6 +12514,7 @@ connection: close
                 live_revision: 0,
             },
             true,
+            PathBuf::new(),
         );
         sync.uploaded_workspace_sequences = store
             .host_workspace_cursors(config.host_id, session_id)
@@ -12157,6 +12721,7 @@ connection: close
                 live_revision: 0,
             },
             false,
+            PathBuf::new(),
         );
         recover_host_workspace_messages(
             &client,
@@ -12240,6 +12805,7 @@ connection: close
             config.clone(),
             Arc::clone(&store),
             Arc::clone(&sessions),
+            PathBuf::new(),
         )));
         assert!(
             tokio::time::timeout(Duration::from_millis(200), received.recv())
@@ -12449,6 +13015,7 @@ connection: close
             config.clone(),
             Arc::clone(&store),
             Arc::clone(&sessions),
+            PathBuf::new(),
         )));
         let first = tokio::time::timeout(Duration::from_secs(5), received.recv())
             .await
@@ -12613,6 +13180,7 @@ connection: close
                 live_revision: 0,
             },
             false,
+            PathBuf::new(),
         );
         flush_pending(&client, &config, &store, session_id, &mut sync)
             .await

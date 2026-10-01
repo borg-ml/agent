@@ -6002,19 +6002,20 @@ async fn image_routing_fixture(
     (coordinator, sender, recipient, store, scratch)
 }
 
-/// A participant with no session in this installation is reached through the
-/// workspace, not through a process here, so nothing can resolve its image
-/// digests. The refusal has to land before the first durable write: this route
-/// creates a direct workspace and appends a message, and a message admitted
-/// without its pictures is the fake delivery this path exists to prevent.
+/// A participant with no session in this installation is reached only
+/// through this host's relay, so its images can travel only when the sender is
+/// enrolled. Unenrolled, the refusal has to land before the first durable
+/// write: this route creates a direct workspace and appends a message, and a
+/// message admitted without its pictures is the fake delivery this path exists
+/// to prevent. Enrolled, the durable message must carry the image references,
+/// because they are all the relay outbox has to upload from.
 ///
 /// The guard must sit AFTER the local-session redirect, though. Participant
 /// addressing is the normal way to reach a known peer, and refusing every
 /// attachment on sight made same-host forwarding work only through
 /// session:<UUID> syntax -- see the sibling test.
 #[tokio::test]
-async fn forwarding_images_to_a_participant_with_no_local_session_is_refused_before_durable_writes()
-{
+async fn images_to_a_participant_with_no_local_session_need_an_enrolled_relay() {
     let directory = tempdir().unwrap();
     let (coordinator, sender, _recipient, store, scratch) =
         image_routing_fixture(directory.path()).await;
@@ -6043,14 +6044,57 @@ async fn forwarding_images_to_a_participant_with_no_local_session_is_refused_bef
 
     let source = directory.path().join("screenshot.png");
     std::fs::write(&source, sample_png()).unwrap();
+    let attachments = capture_message_attachments(directory.path(), &[source])
+        .await
+        .unwrap();
     let options = TeamMessageOptions {
-        attachments: capture_message_attachments(directory.path(), &[source])
-            .await
-            .unwrap(),
+        attachments: attachments.clone(),
         ..TeamMessageOptions::default()
     };
+    let enrolled = store.workspace_binding(sender).await.unwrap().unwrap();
+    store
+        .attach_workspace(crate::SessionWorkspaceBinding {
+            host_id: None,
+            ..enrolled.clone()
+        })
+        .await
+        .unwrap();
+    let workspaces = store.workspace_store().await.unwrap().unwrap();
+    let workspaces_before = workspaces
+        .list_workspaces_for_participant(enrolled.participant_id)
+        .await
+        .unwrap()
+        .len();
 
     let refusal = coordinator
+        .route_workspace_participant_message_as(
+            sender,
+            elsewhere,
+            "here is the failing frame",
+            options.clone(),
+            DeliveryMode::NextTurn,
+        )
+        .await;
+    let error = match refusal {
+        Ok(_) => panic!("images from an unenrolled sender to a remote participant must be refused"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains("not enrolled"),
+        "refusal should say why, got: {error}"
+    );
+    assert_eq!(
+        workspaces
+            .list_workspaces_for_participant(enrolled.participant_id)
+            .await
+            .unwrap()
+            .len(),
+        workspaces_before,
+        "a refused image message must not leave a direct workspace behind"
+    );
+
+    store.attach_workspace(enrolled).await.unwrap();
+    let routed = coordinator
         .route_workspace_participant_message_as(
             sender,
             elsewhere,
@@ -6058,29 +6102,18 @@ async fn forwarding_images_to_a_participant_with_no_local_session_is_refused_bef
             options,
             DeliveryMode::NextTurn,
         )
-        .await;
-    let error = match refusal {
-        Ok(_) => panic!("images to a participant with no local session must be refused"),
-        Err(error) => format!("{error:#}"),
-    };
-    assert!(
-        error.contains("no local session here"),
-        "refusal should say why, got: {error}"
-    );
-
-    // Positive control: the identical message without images still routes,
-    // creating the direct workspace the refusal above had to prevent. Without
-    // this the assertion could pass on a broken fixture.
-    coordinator
-        .route_workspace_participant_message_as(
-            sender,
-            elsewhere,
-            "here is the failing frame",
-            TeamMessageOptions::default(),
-            DeliveryMode::NextTurn,
-        )
         .await
-        .expect("the same message without images must still route");
+        .expect("an enrolled sender hands images to its relay");
+    assert!(routed.relay_pending);
+    let receipt = routed.receipt.expect("a relayed message has a receipt");
+    let pending = workspaces
+        .pending_message_events(receipt.workspace_id, elsewhere, 10)
+        .await
+        .unwrap();
+    let WorkspaceEventKind::Message { message, .. } = &pending[0].0.kind else {
+        panic!("expected the relayed message");
+    };
+    assert_eq!(message.body.attachments, attachments);
     scratch.discard().await;
 }
 
@@ -6591,7 +6624,7 @@ async fn images_are_refused_when_nothing_proves_the_recipient_shares_this_host()
     match refusal {
         Ok(_) => panic!("an unproven recipient must not receive images"),
         Err(error) => assert!(
-            format!("{error:#}").contains("attachment store"),
+            format!("{error:#}").contains("enrolled host relay"),
             "unexpected error: {error:#}"
         ),
     }
