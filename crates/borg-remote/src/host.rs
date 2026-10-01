@@ -6345,27 +6345,39 @@ async fn flush_workspace_messages(
                             continue;
                         }
                     }
-                    // A failed delivery is terminal: a replay (a restart, or
-                    // `--send-pending` from an empty cursor) must neither resend
-                    // it nor try to move it out of Failed. A new message is the
-                    // retry.
-                    let failed = store
+                    // A replay (a restart, or `--send-pending` from an empty
+                    // cursor) only advances deliveries still Pending or Relayed.
+                    // Failed and Recalled are never posted again, and a receipt
+                    // state is never moved backwards: a new message is the
+                    // retry. Recipients already accepted under this key stay in
+                    // the post so the relay sees the same idempotent payload.
+                    let states = store
                         .message_deliveries(message.id)
                         .await?
                         .into_iter()
-                        .filter(|delivery| delivery.state == crate::DeliveryState::Failed)
-                        .map(|delivery| delivery.recipient_id)
-                        .collect::<HashSet<_>>();
+                        .map(|delivery| (delivery.recipient_id, delivery.state))
+                        .collect::<HashMap<_, _>>();
+                    let advanceable = |recipient: &Uuid| {
+                        states.get(recipient).is_none_or(|state| {
+                            matches!(
+                                state,
+                                crate::DeliveryState::Pending | crate::DeliveryState::Relayed
+                            )
+                        })
+                    };
                     let nothing_left = if recipients.is_empty() {
-                        !failed.is_empty()
-                            && store
-                                .delivery_recipients(workspace.id, event.sequence)
-                                .await?
-                                .iter()
-                                .all(|recipient| failed.contains(recipient))
+                        let resolved = store
+                            .delivery_recipients(workspace.id, event.sequence)
+                            .await?;
+                        !resolved.is_empty() && !resolved.iter().any(advanceable)
                     } else {
-                        recipients.retain(|recipient| !failed.contains(recipient));
-                        recipients.is_empty()
+                        recipients.retain(|recipient| {
+                            !matches!(
+                                states.get(recipient),
+                                Some(crate::DeliveryState::Failed | crate::DeliveryState::Recalled)
+                            )
+                        });
+                        !recipients.iter().any(advanceable)
                     };
                     if nothing_left {
                         uploaded_sequence = event.sequence;
@@ -6378,7 +6390,11 @@ async fn flush_workspace_messages(
                     } else {
                         format!("/api/remote/host/sessions/{session_id}/messages")
                     };
-                    let delivery_recipients = recipients.clone();
+                    let delivery_recipients = recipients
+                        .iter()
+                        .copied()
+                        .filter(advanceable)
+                        .collect::<Vec<_>>();
                     if !message.body.attachments.is_empty() {
                         match upload_message_attachments(
                             client,
@@ -6397,6 +6413,9 @@ async fn flush_workspace_messages(
                                     store
                                         .delivery_recipients(workspace.id, event.sequence)
                                         .await?
+                                        .into_iter()
+                                        .filter(advanceable)
+                                        .collect()
                                 } else {
                                     delivery_recipients.clone()
                                 };
@@ -7944,6 +7963,35 @@ mod tests {
             relay.lock().unwrap().messages.len(),
             1,
             "a failed message was resent"
+        );
+
+        // A message recalled before relay is never posted.
+        let recalled = send("recalled").await.unwrap();
+        sender_workspace
+            .transition_message_delivery(
+                channel,
+                recalled.message_id,
+                recipient,
+                crate::DeliveryState::Recalled,
+                None,
+            )
+            .await
+            .unwrap();
+        flush_workspace_messages(
+            &client,
+            &sender_config,
+            &sender_store,
+            Some(sender_workspace.as_ref()),
+            sender,
+            None,
+            &mut sync,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            relay.lock().unwrap().messages.len(),
+            1,
+            "a recalled message was posted"
         );
 
         // Tampered bytes are neither admitted nor acknowledged.
