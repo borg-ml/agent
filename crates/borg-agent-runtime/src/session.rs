@@ -11617,6 +11617,7 @@ async fn apply_route(
 /// The active route hit a usage limit: record when it resets, then move the
 /// session to the first route with quota and retry at once. When every route
 /// is limited, move to the one that resets first and wait for it.
+#[allow(clippy::too_many_arguments)]
 async fn fall_back_on_usage_limit(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
