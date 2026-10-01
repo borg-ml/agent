@@ -2480,6 +2480,8 @@ async fn run_agent_session_store_kernel_inner(
         .as_ref()
         .map(SubagentCoordinator::subscribe_root_messages)
         .unwrap_or_else(|| disabled_root_tx.subscribe());
+    // Completed sweeps reset maintenance timers. Skip alone leaves a slow
+    // sweep permanently ready in the biased select, starving provider output.
     let mut root_inbox_tick = tokio::time::interval(ROOT_INBOX_REFRESH_INTERVAL);
     root_inbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let (receipt_tx, mut receipt_rx) = mpsc::channel(16);
@@ -3021,12 +3023,14 @@ async fn run_agent_session_store_kernel_inner(
                                             subagents.as_ref().expect("team inbox requires coordinator"),
                                             &watches,
                                         ).await?;
+                                        root_inbox_tick.reset();
                                         continue;
                                     }
                                     _ = team_ack_tick.tick(), if owns_team && !team_broadcasts.is_empty() => {
                                         refresh_team_broadcasts(&mut journal, &events, session_id,
                                             subagents.as_ref().expect("team broadcast requires coordinator"),
                                             &mut team_broadcasts).await?;
+                                        team_ack_tick.reset();
                                         continue;
                                     }
                                     Some(providers) = capability_refresh_rx.recv() => {
@@ -6767,12 +6771,14 @@ async fn run_agent_session_store_kernel_inner(
                         subagents.as_ref().expect("team inbox requires coordinator"),
                         &watches,
                     ).await?;
+                    root_inbox_tick.reset();
                 }
                 _ = team_ack_tick.tick(), if owns_team && !team_broadcasts.is_empty() => {
                     let _trace = SessionBranchTrace::begin(trace_loop, session_id, "team_ack_refresh", provider_events.len() + provider_carry.len());
                     refresh_team_broadcasts(&mut journal, &events, session_id,
                         subagents.as_ref().expect("team broadcast requires coordinator"),
                         &mut team_broadcasts).await?;
+                    team_ack_tick.reset();
                 }
                 // Suspended while a human owns the turn: an operator may sit on
                 // an approval or a provider question indefinitely without the
@@ -7010,6 +7016,7 @@ async fn run_agent_session_store_kernel_inner(
                             );
                             deferred_commands.push_front(command);
                             if cancellation {
+                                provider_carry.push_back(kind);
                                 provider_carry.append(&mut remaining);
                                 break;
                             }

@@ -22601,3 +22601,5 @@ async fn peer_receipts_survive_disabled_subagents_stop_and_replay() {
         SessionEventKind::AgentMessageReceived { message_id, .. } if *message_id == hidden_id)));
     scratch.discard().await;
 }
+
+mod runtime_sync;
