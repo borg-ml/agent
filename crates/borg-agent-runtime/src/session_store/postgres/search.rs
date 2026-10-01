@@ -264,7 +264,29 @@ impl PostgresSessionStore {
                 .await;
         }
         if text.is_some() {
-            self.ensure_history_projection(session_id).await?;
+            if let Err(error) = self.ensure_history_projection(session_id).await {
+                // PostgreSQL caps a tsvector at 1 MiB. One large tool payload
+                // must not poison recall of the whole journal; keep it intact
+                // and use the existing bounded canonical scanner instead.
+                let vector_limit = error.chain().any(|cause| {
+                    cause.downcast_ref::<sqlx::Error>().is_some_and(|error| {
+                        error.as_database_error().is_some_and(|database| {
+                            database.code().as_deref() == Some("54000")
+                                && database.message().contains("tsvector")
+                        })
+                    })
+                });
+                if !vector_limit {
+                    return Err(error);
+                }
+                let mut page = self
+                    .query_history_composed(session_id, &query, text.as_deref())
+                    .await?;
+                // The fallback uses the lineage scanner's literal-term matching,
+                // not tsvector ranking; expose that distinction to the caller.
+                page.backend = "postgres_unindexed_scan".to_string();
+                return Ok(page);
+            }
         }
         match (text.as_deref(), query.mode) {
             (None, _) => self.query_history_exact(Some(session_id), &query).await,
@@ -607,7 +629,18 @@ impl PostgresSessionStore {
             _ => Vec::new(),
         };
 
-        let mut events = self.composed_events(session_id, None).await?;
+        let mut events = self
+            .composed_events(session_id, None)
+            .await?
+            .into_iter()
+            .filter_map(|event| match history_event_matches_filters(&event, query) {
+                Ok(true) => Some(Ok(event)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Apply filters before choosing the window so sequence cursors and
+        // exact-event reads can reach candidates outside the newest window.
         // A text query has to be able to reach the events the caller is
         // actually asking about. Scanning composed history oldest-first and
         // stopping at the scan limit meant any session larger than the limit
@@ -628,16 +661,13 @@ impl PostgresSessionStore {
         let mut covered: Option<(u64, u64)> = None;
         let mut payload_budget = history_payload_budget(query);
         for event in events {
-            if !history_event_matches_filters(&event, query)? {
-                continue;
-            }
             if scanned_events >= scan_limit {
                 candidate_overflow = true;
                 break;
             }
             scanned_events += 1;
             covered = Some(match covered {
-                Some((from, _)) => (from.min(event.sequence), event.sequence),
+                Some((from, to)) => (from.min(event.sequence), to.max(event.sequence)),
                 None => (event.sequence, event.sequence),
             });
             let snippet = if let Some(expression) = &expression {
@@ -987,6 +1017,251 @@ mod tests {
                 .await
                 .expect("reproject"),
             0
+        );
+        scratch.discard().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_tsvector_falls_back_without_losing_payload_filters_or_pages() {
+        use std::fmt::Write as _;
+
+        let Some(url) = test_url() else {
+            eprintln!("skipping: BORG_TEST_SESSIONS_URL is not set");
+            return;
+        };
+        let scratch = ScratchDatabase::create(&url).await;
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+            .await
+            .expect("connect");
+        let session_id = session_with(
+            &store,
+            &[
+                (EventActor::User, "oversizedneedle first"),
+                (EventActor::Assistant, "oversizedneedle assistant"),
+                (EventActor::User, "oversizedneedle recent"),
+            ],
+        )
+        .await;
+        let mut user_events = store
+            .read(session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    SessionEventKind::Message {
+                        actor: EventActor::User,
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut output = String::with_capacity(2_000_000);
+        for index in 0..100_000 {
+            write!(&mut output, "vectorword{index:06} ").unwrap();
+        }
+        output.push_str("payloadneedle");
+        let oversized = store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ToolCompleted {
+                    tool_call_id: "oversized-tool".into(),
+                    output: output.clone(),
+                    output_ref: None,
+                    input: None,
+                    input_ref: None,
+                    parent_tool_call_id: None,
+                    is_error: false,
+                },
+            ))
+            .await
+            .unwrap();
+        let reference = match &oversized.kind {
+            SessionEventKind::ToolCompleted {
+                output,
+                output_ref: Some(reference),
+                ..
+            } => {
+                assert!(
+                    !output.contains("payloadneedle"),
+                    "match is beyond the preview"
+                );
+                reference.clone()
+            }
+            _ => panic!("large tool output must remain a deferred canonical payload"),
+        };
+        let latest = store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::User,
+                    text: "oversizedneedle latest".into(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ))
+            .await
+            .unwrap();
+        user_events.push(latest.clone());
+
+        let error = store
+            .ensure_history_projection(session_id)
+            .await
+            .expect_err("unique lexemes must exceed PostgreSQL's real tsvector limit");
+        let database = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<sqlx::Error>())
+            .and_then(sqlx::Error::as_database_error)
+            .expect("PostgreSQL projection error");
+        assert_eq!(database.code().as_deref(), Some("54000"));
+        assert!(database.message().contains("tsvector"));
+
+        let tool_query = SessionHistoryQuery {
+            event_id: Some(oversized.id),
+            start_sequence: Some(oversized.sequence),
+            end_sequence: Some(oversized.sequence),
+            event_kinds: vec!["tool_completed".into()],
+            limit: Some(1),
+            scan_limit: Some(1),
+            expand_payloads: true,
+            max_payload_bytes: Some(64),
+            ..lexical("payloadneedle")
+        };
+        let page = store
+            .query_history(session_id, tool_query.clone())
+            .await
+            .unwrap();
+        assert_eq!(page.backend, "postgres_unindexed_scan");
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.hits[0].event.id, oversized.id);
+        assert_eq!(page.hits[0].event.sequence, oversized.sequence);
+        assert!(page.hits[0].score.is_none());
+        assert!(
+            page.hits[0]
+                .snippet
+                .as_deref()
+                .unwrap()
+                .contains("payloadneedle")
+        );
+        assert_eq!(page.hits[0].payloads.len(), 1);
+        assert_eq!(page.hits[0].payloads[0].reference.id, reference.id);
+        assert_eq!(page.hits[0].payloads[0].text, output[..64]);
+        assert!(page.hits[0].payloads[0].truncated);
+        assert!(!page.truncated && !page.search_incomplete);
+        let excluded = store
+            .query_history(
+                session_id,
+                SessionHistoryQuery {
+                    actors: vec![EventActor::Assistant],
+                    ..tool_query
+                },
+            )
+            .await
+            .unwrap();
+        assert!(excluded.hits.is_empty());
+        assert!(!excluded.search_incomplete);
+
+        let bounded = SessionHistoryQuery {
+            limit: Some(1),
+            scan_limit: Some(1),
+            ..lexical("payloadneedle")
+        };
+        let newest = store
+            .query_history(session_id, bounded.clone())
+            .await
+            .unwrap();
+        assert!(newest.hits.is_empty());
+        assert!(newest.truncated && newest.search_incomplete);
+        assert_eq!(newest.scanned_events, 1);
+        assert_eq!(newest.scanned_from_sequence, Some(latest.sequence));
+        assert_eq!(newest.scanned_to_sequence, Some(latest.sequence));
+        let older = store
+            .query_history(
+                session_id,
+                SessionHistoryQuery {
+                    end_sequence: Some(newest.scanned_from_sequence.unwrap() - 1),
+                    ..bounded
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(older.hits.len(), 1);
+        assert_eq!(older.hits[0].event.id, oversized.id);
+        assert_eq!(older.scanned_events, 1);
+        assert_eq!(older.scanned_from_sequence, Some(oversized.sequence));
+        assert_eq!(older.scanned_to_sequence, Some(oversized.sequence));
+        assert!(older.search_incomplete);
+
+        let reversed = store
+            .query_history(
+                session_id,
+                SessionHistoryQuery {
+                    actors: vec![EventActor::User],
+                    event_kinds: vec!["message".into()],
+                    newest_first: true,
+                    limit: Some(2),
+                    scan_limit: Some(2),
+                    ..lexical("oversizedneedle")
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reversed
+                .hits
+                .iter()
+                .map(|hit| hit.event.id)
+                .collect::<Vec<_>>(),
+            vec![user_events[2].id, user_events[1].id]
+        );
+        assert_eq!(
+            reversed.scanned_from_sequence,
+            Some(user_events[1].sequence)
+        );
+        assert_eq!(reversed.scanned_to_sequence, Some(latest.sequence));
+        assert_eq!(reversed.scanned_events, 2);
+        assert!(reversed.truncated && reversed.search_incomplete);
+
+        let mut start = None;
+        for (index, expected) in user_events.iter().enumerate() {
+            let page = store
+                .query_history(
+                    session_id,
+                    SessionHistoryQuery {
+                        start_sequence: start,
+                        actors: vec![EventActor::User],
+                        event_kinds: vec!["message".into()],
+                        limit: Some(1),
+                        scan_limit: Some(100),
+                        ..lexical("oversizedneedle")
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.backend, "postgres_unindexed_scan");
+            assert_eq!(page.hits.len(), 1);
+            assert_eq!(page.hits[0].event.id, expected.id);
+            assert!(!page.search_incomplete);
+            assert_eq!(page.truncated, index + 1 < user_events.len());
+            start = Some(page.hits[0].event.sequence + 1);
+        }
+        assert_eq!(
+            store.load_payload(&reference).await.unwrap(),
+            output.as_bytes()
+        );
+        let persisted = store
+            .events_after(session_id, oversized.sequence - 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(persisted[0].id, oversized.id);
+        assert_eq!(
+            serde_json::to_value(&persisted[0].kind).unwrap(),
+            serde_json::to_value(&oversized.kind).unwrap()
         );
         scratch.discard().await;
     }
