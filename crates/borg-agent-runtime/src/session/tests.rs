@@ -10155,6 +10155,134 @@ async fn inactive_wake_report_is_retained_for_the_root_provider_turn() {
 }
 
 #[tokio::test]
+async fn setup_recall_returns_all_pending_prompts_in_submission_order() {
+    for last_delivery in [PromptDelivery::Steer, PromptDelivery::Queue] {
+        let session_id = Uuid::new_v4();
+        let (scratch, store, mut journal) = runtime_store(session_id).await;
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let expected = ["first", "second", "third"].map(|text| {
+            (
+                Uuid::new_v4(),
+                text.to_string(),
+                vec![PathBuf::from(format!("{text}.png"))],
+            )
+        });
+        let mut pending = VecDeque::new();
+        let mut team_ids = HashSet::new();
+        queue_pending_prompt(
+            &mut journal,
+            &event_tx,
+            session_id,
+            &mut pending,
+            &mut team_ids,
+            expected[0].0,
+            expected[0].1.clone(),
+            expected[0].2.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let current = pending.pop_front().unwrap();
+        for (index, (message_id, text, attachments)) in expected.iter().enumerate().skip(1) {
+            command_tx
+                .send(HostCommand::Prompt {
+                    session_id,
+                    message_id: *message_id,
+                    text: text.clone(),
+                    attachments: attachments.clone(),
+                    output_schema: None,
+                    delivery: if index == 1 {
+                        PromptDelivery::Steer
+                    } else {
+                        last_delivery
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        let team_id = Uuid::new_v4();
+        command_tx
+            .send(HostCommand::TeamPrompt {
+                session_id,
+                message_id: team_id,
+                text: "worker report".into(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        let mut commands = HostCommandInbox::new(command_rx, None);
+        let mut deferred = VecDeque::new();
+        assert!(
+            !recall_queued_prompt_before_provider_admission(
+                &mut journal,
+                &event_tx,
+                session_id,
+                &mut pending,
+                &mut commands,
+                &mut deferred,
+                &mut team_ids,
+                &current,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            deferred.iter().any(|command| matches!(command,
+                HostCommand::Prompt { message_id, delivery: PromptDelivery::Steer, .. }
+                    if *message_id == expected[1].0
+            )),
+            "without recall, follow-ups must still steer the active turn"
+        );
+
+        command_tx
+            .send(HostCommand::RecallQueuedPrompt {
+                session_id,
+                message_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            recall_queued_prompt_before_provider_admission(
+                &mut journal,
+                &event_tx,
+                session_id,
+                &mut pending,
+                &mut commands,
+                &mut deferred,
+                &mut team_ids,
+                &current,
+            )
+            .await
+            .unwrap()
+        );
+        let mut recalled = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let SessionEventKind::PromptRecalled {
+                message_id,
+                text,
+                attachments,
+            } = event.kind
+            {
+                recalled.push((message_id, text, attachments));
+            }
+        }
+        assert_eq!(recalled, expected);
+        assert!(pending.is_empty());
+        assert!(
+            matches!(deferred.pop_front(), Some(HostCommand::TeamPrompt { message_id, .. })
+                if message_id == team_id
+            )
+        );
+        assert!(deferred.is_empty());
+        assert!(recover_queued_prompts(&store.read(session_id).await.unwrap()).is_empty());
+        scratch.discard().await;
+    }
+}
+
+#[tokio::test]
 async fn recovered_pending_batch_is_admitted_before_flush_at_turn_boundary() {
     let session_id = Uuid::new_v4();
     let (scratch, _store, mut journal) = runtime_store(session_id).await;

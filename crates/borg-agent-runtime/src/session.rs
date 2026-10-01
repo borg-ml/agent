@@ -10680,31 +10680,44 @@ async fn recall_queued_prompt_before_provider_admission(
     let mut recalled_current = false;
     while let Some(command) = ready.pop_front() {
         match command {
-            HostCommand::Prompt {
-                session_id: command_session_id,
-                message_id,
-                text,
-                attachments,
-                output_schema,
-                delivery: PromptDelivery::Queue,
-            } if command_session_id == session_id => {
-                queue_pending_prompt(
-                    journal,
-                    events,
-                    session_id,
-                    pending,
-                    team_message_ids,
-                    message_id,
-                    text,
-                    attachments,
-                    output_schema,
-                )
-                .await?;
-            }
             HostCommand::RecallQueuedPrompt {
                 session_id: command_session_id,
                 message_id,
             } if command_session_id == session_id => {
+                // Follow-ups are still host commands during provider setup.
+                // Recall only input preceding this request; without recall,
+                // leave its delivery unchanged for the active turn.
+                let mut retained = VecDeque::new();
+                while let Some(command) = deferred.pop_front() {
+                    match command {
+                        HostCommand::Prompt {
+                            session_id: prompt_session_id,
+                            message_id: prompt_id,
+                            text,
+                            attachments,
+                            output_schema,
+                            ..
+                        } if prompt_session_id == session_id
+                            && message_id.is_none_or(|target| target == prompt_id)
+                            && !team_message_ids.contains(&prompt_id) =>
+                        {
+                            queue_pending_prompt(
+                                journal,
+                                events,
+                                session_id,
+                                pending,
+                                team_message_ids,
+                                prompt_id,
+                                text,
+                                attachments,
+                                output_schema,
+                            )
+                            .await?;
+                        }
+                        command => retained.push_back(command),
+                    }
+                }
+                *deferred = retained;
                 let recalled = recall_visible_queued_prompts(pending, message_id);
                 let recalls_current = queued_prompt_matches_recall(current, message_id);
                 if recalled.is_empty() && !recalls_current {
@@ -10714,12 +10727,12 @@ async fn recall_queued_prompt_before_provider_admission(
                     });
                     continue;
                 }
-                for recalled in recalled {
-                    record_recalled_prompt(journal, events, session_id, &recalled).await?;
-                }
                 if recalls_current && !recalled_current {
                     record_recalled_prompt(journal, events, session_id, current).await?;
                     recalled_current = true;
+                }
+                for recalled in recalled {
+                    record_recalled_prompt(journal, events, session_id, &recalled).await?;
                 }
             }
             command => deferred.push_back(command),
