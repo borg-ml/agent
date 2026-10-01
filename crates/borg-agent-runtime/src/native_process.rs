@@ -453,6 +453,8 @@ impl ProcessManager {
 
         let yield_for =
             Duration::from_millis(yield_time_ms.unwrap_or(DEFAULT_YIELD_MS).min(MAX_YIELD_MS));
+        // Subscribe before the check so an exit in between still wakes us.
+        let finished = entry.finished.notified();
         if entry
             .status
             .lock()
@@ -484,7 +486,7 @@ impl ProcessManager {
                     }
                     bail!("process execution was cancelled");
                 }
-                _ = tokio::time::timeout(yield_for, entry.finished.notified()) => {}
+                _ = tokio::time::timeout(yield_for, finished) => {}
             }
         }
         let result = snapshot(
@@ -525,6 +527,7 @@ impl ProcessManager {
             pipe.flush().await?;
         }
         let yield_for = Duration::from_millis(yield_time_ms.unwrap_or(250).min(MAX_YIELD_MS));
+        let changed = entry.changed.notified();
         if yield_for != Duration::ZERO
             && entry
                 .status
@@ -532,7 +535,7 @@ impl ProcessManager {
                 .expect("native process status lock poisoned")
                 .running
         {
-            let _ = tokio::time::timeout(yield_for, entry.changed.notified()).await;
+            let _ = tokio::time::timeout(yield_for, changed).await;
         }
         let result = snapshot(
             process_id,
