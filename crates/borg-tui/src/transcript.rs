@@ -2810,13 +2810,25 @@ impl Transcript {
                 workspace_revision,
                 ..
             } => {
-                self.apply_projected_plan(
-                    items,
-                    *participant_id,
-                    *workspace_revision,
-                    local_event_time(event),
-                );
-                return None;
+                let stale = self.plan_participant_id == Some(*participant_id)
+                    && self
+                        .plan_workspace_revision
+                        .is_some_and(|current| *workspace_revision < current);
+                if stale {
+                    return None;
+                }
+                self.seed_plan(items, Some(*participant_id), Some(*workspace_revision));
+                if items.is_empty()
+                    && !self
+                        .order
+                        .iter()
+                        .any(|entry| matches!(entry, TranscriptEntry::Plan { .. }))
+                {
+                    return None;
+                }
+                // The card moves to where the plan changed, as a legacy update
+                // did; left in place it updates hours of scrollback above.
+                return self.upsert_plan(items.clone(), local_event_time(event));
             }
             SessionEventKind::AgentPlanProjected {
                 session_id,

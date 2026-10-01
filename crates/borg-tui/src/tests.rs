@@ -18205,6 +18205,59 @@ fn projected_plan_preserves_order_and_statuses_and_rejects_legacy_replay() {
     assert_eq!(transcript.plan_workspace_revision, Some(10));
 }
 
+/// A plan created early and revised hours later must surface beside the
+/// revision, live and after the history is rebuilt, not update off-screen.
+#[test]
+fn a_projected_plan_update_surfaces_beside_the_action_that_made_it() {
+    let session = Uuid::new_v4();
+    let participant_id = Uuid::new_v4();
+    let projection = |sequence, workspace_revision, content: &str| {
+        SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::PlanProjected {
+                participant_id,
+                workspace_revision,
+                items: vec![PlanItem {
+                    id: Uuid::nil(),
+                    content: content.into(),
+                    status: PlanItemStatus::InProgress,
+                }],
+            },
+        )
+    };
+    let events = [
+        projection(1, 1, "First step"),
+        SessionEvent::new(
+            session,
+            2,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "read".into(),
+                name: "get_plan".into(),
+                input: serde_json::json!({}),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        ),
+        projection(3, 2, "Revised step"),
+    ];
+    let mut transcript = Transcript::default();
+    for event in &events {
+        transcript.apply(event);
+    }
+    let plan_position = |transcript: &Transcript| {
+        let cards = (0..transcript.order.len())
+            .filter(|&index| matches!(transcript.order[index], TranscriptEntry::Plan { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(cards.len(), 1);
+        cards[0]
+    };
+    assert!(plan_position(&transcript) > transcript.tools["read"]);
+    let mut director = None;
+    replace_root_transcript_history(&mut transcript, &mut director, false, &events);
+    assert!(plan_position(&transcript) > transcript.tools["read"]);
+}
+
 #[test]
 fn projected_stopped_child_plan_targets_only_the_selected_agent() {
     let child = Uuid::new_v4();
