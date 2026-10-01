@@ -835,7 +835,11 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
             .and_then(Value::as_str)
             .filter(|target| !target.is_empty())
     {
-        return (capability_action_title(target), concise_tool_input(input));
+        let arguments = input.get("arguments").unwrap_or(&Value::Null);
+        return (
+            capability_action_title(target),
+            tool_call_summary(target, arguments).1,
+        );
     }
 
     (humanize_tool_name(name), concise_tool_input(input))
@@ -1232,6 +1236,11 @@ fn is_git_label(label: &str) -> bool {
 
 fn tool_detail_rows(name: &str, input: &Value) -> Vec<String> {
     let leaf = tool_leaf_name(name);
+    if leaf == "capability"
+        && let Some(target) = string_field(input, "name").filter(|target| !target.is_empty())
+    {
+        return tool_detail_rows(target, input.get("arguments").unwrap_or(&Value::Null));
+    }
     if matches!(
         leaf.as_str(),
         "bash" | "command_execution" | "exec_command" | "exec"
@@ -3496,6 +3505,19 @@ all green"
         );
         assert_eq!(titled("list_instances"), "Instances");
         assert_eq!(titled("get_goal"), "Goal");
+        // The wrapper's own fields are not the action: the row shows what the
+        // wrapped call does, exactly as the direct call would.
+        assert_eq!(
+            tool_call_summary(
+                "capability",
+                &serde_json::json!({
+                    "action": "search web",
+                    "name": "web_search",
+                    "arguments": {"query": "ratatui wrap", "max_results": 5},
+                }),
+            ),
+            ("Web search".to_string(), "“ratatui wrap”".to_string())
+        );
         // Nothing to name falls back rather than rendering an empty title.
         assert_eq!(
             tool_call_summary("capability", &serde_json::json!({"search": "x"})).0,
