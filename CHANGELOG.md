@@ -5,6 +5,32 @@ Git comparison.
 
 ## Unreleased (since 0.13.4)
 
+### Terminal UI
+
+- Resumed sessions recover missing journal updates when the live connection
+  goes quiet, without reordering streamed previews. Host handoff preserves the
+  unsent composer draft and no longer flashes the underlying shell.
+- Expanded actions stay attached to the selected action across live updates
+  and history reloads, including child sessions. Removing that action closes
+  the inspector instead of switching it to another row.
+- File diffs appear beside the command that made them, even when it finishes
+  after later actions. Long diff lines wrap instead of clipping, wrapped copy
+  preserves spacing, and trailing padding no longer forms solid colour bars.
+- Status-only plan updates show one row instead of duplicating unchanged text.
+  Edits to the task text still show the before-and-after pair.
+- User messages keep composer-entered line breaks and paragraph gaps while
+  retaining Markdown formatting, including after history cache warm-up.
+
+### Reliability
+
+- Maintenance sweeps no longer starve provider output. Stopping a turn retains
+  output already received instead of dropping its cancellation tail.
+- Process completion and output notifications cannot be missed between a
+  status check and a wait, avoiding unnecessary waits for the full timeout.
+- PostgreSQL history search falls back to bounded canonical scanning when a
+  large payload exceeds the full-text index size limit. Payloads stay intact,
+  and event filters, sequence paging and payload expansion remain available.
+
 ### Models
 
 - Long screenshot sessions on Claude no longer exceed the API's 32 MB request
