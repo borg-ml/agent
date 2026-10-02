@@ -5,6 +5,29 @@ Git comparison.
 
 ## Unreleased (since 0.13.5)
 
+### Terminal UI
+
+- Plan cards return to the plain checklist with status markers, without diff
+  backgrounds or superseded task rows. Empty new-chat plans remain hidden.
+
+### Reliability
+
+- Large-session reverts reuse state checkpoints and bounded, indexed inherited
+  history reads instead of repeatedly decoding full ancestor histories. Fork
+  recovery respects compaction boundaries while preserving queued prompts and
+  team state.
+- Native sessions hold new tool calls until a visible reply to a human steer is
+  written. A response with no visible text triggers one corrective request; a
+  second miss ends the turn without executing those calls. Reasoning is not
+  treated as a reply.
+
+### Collaboration
+
+- Team members delegating work always get a fresh worker, preserving the
+  director's idle workers and the requester's own context. The new worker
+  receives the requester's address for questions and its final report;
+  directors can still reuse idle workers.
+
 ## 0.13.5 (2026-10-01)
 
 ### Terminal UI
