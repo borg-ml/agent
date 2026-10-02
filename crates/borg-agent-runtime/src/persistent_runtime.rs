@@ -699,10 +699,12 @@ import io
 import inspect
 import json
 import sys
+import threading
 import traceback
 import uuid
 
 PROTOCOL_OUT = sys.__stdout__
+HOST_CALL_LOCK = threading.Lock()
 NAMESPACE = {"__name__": "__borg_runtime__"}
 
 
@@ -737,24 +739,25 @@ class Borg:
         self.harness = Harness(self)
 
     def call(self, operation, arguments=None):
-        call_id = str(uuid.uuid4())
-        PROTOCOL_OUT.write(json.dumps({
-            "type": "host_call",
-            "id": call_id,
-            "operation": operation,
-            "arguments": {} if arguments is None else arguments,
-        }) + "\n")
-        PROTOCOL_OUT.flush()
-        while True:
-            line = sys.stdin.readline()
-            if not line:
-                raise RuntimeError("Borg host closed the runtime")
-            message = json.loads(line)
-            if message.get("type") != "host_result" or message.get("id") != call_id:
-                continue
-            if message.get("ok"):
-                return message.get("result")
-            raise BorgError(message.get("error", "Borg host call failed"))
+        with HOST_CALL_LOCK:
+            call_id = str(uuid.uuid4())
+            PROTOCOL_OUT.write(json.dumps({
+                "type": "host_call",
+                "id": call_id,
+                "operation": operation,
+                "arguments": {} if arguments is None else arguments,
+            }) + "\n")
+            PROTOCOL_OUT.flush()
+            while True:
+                line = sys.stdin.readline()
+                if not line:
+                    raise RuntimeError("Borg host closed the runtime")
+                message = json.loads(line)
+                if message.get("type") != "host_result" or message.get("id") != call_id:
+                    continue
+                if message.get("ok"):
+                    return message.get("result")
+                raise BorgError(message.get("error", "Borg host call failed"))
 
     def exec(self, command, **kwargs):
         arguments = {"cmd": command}
@@ -2073,6 +2076,36 @@ mod tests {
             .await
             .expect("Python semantic search host call execution");
         assert_eq!(semantic.value["hits"][0]["match_mode"], "semantic");
+        runtime.stop().await;
+    }
+
+    #[tokio::test]
+    async fn python_worker_round_trips_concurrent_host_calls() {
+        if !python_available().await {
+            return;
+        }
+        let root = tempdir().expect("temporary runtime root");
+        let runtime = PersistentRuntimeWorker::new(root.path().to_path_buf());
+        let result = runtime
+            .execute(
+                "from concurrent.futures import ThreadPoolExecutor\nwith ThreadPoolExecutor(max_workers=4) as pool:\n    replies = list(pool.map(lambda value: borg.call('echo', {'value': value}), range(16)))\nreplies",
+                Some(5_000),
+                Arc::new(TestHost),
+            )
+            .await
+            .expect("concurrent Python host calls retain each caller's reply");
+        assert_eq!(
+            result.value,
+            Value::Array((0..16).map(|value| json!({"value": value})).collect())
+        );
+        assert_eq!(
+            runtime
+                .execute("borg.call('echo', {'value': 42})", None, Arc::new(TestHost))
+                .await
+                .expect("runtime remains usable after concurrent calls")
+                .value,
+            json!({"value": 42})
+        );
         runtime.stop().await;
     }
 
