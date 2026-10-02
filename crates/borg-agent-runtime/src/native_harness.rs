@@ -632,7 +632,7 @@ impl NativeHarness {
             system_prompt.push_str(instruction);
         }
         messages.push(ModelMessage::System {
-            content: system_prompt,
+            content: turn.system_prompt_override.clone().unwrap_or(system_prompt),
         });
         let history = std::mem::take(&mut turn.conversation);
         let earlier_tool_calls = tool_call_ids(&history);
@@ -712,6 +712,8 @@ impl NativeHarness {
             None => false,
         };
 
+        let editor = turn.agent_tools.context_editor.clone();
+        let _active_context = editor.begin(&messages, turn.provider, &events).await;
         let mut usage = ProviderCallUsage::default();
         let outcome: Result<AgentTurnResult> = async {
         // A session adopted onto Borg's harness can arrive with a replay larger
@@ -737,7 +739,7 @@ impl NativeHarness {
             tools: tools.clone(),
             output_schema: turn.output_schema.clone(),
         };
-        let prefix = crate::NativeRequestPrefix {
+        let mut prefix = crate::NativeRequestPrefix {
             provider: turn.provider,
             model: model.clone(),
             system_prompt: match messages.first() {
@@ -819,6 +821,7 @@ impl NativeHarness {
                 )
                 .await?;
             }
+            editor.publish(&messages, true).await;
             let request = ModelTurnRequest {
                 request_id: Some(format!("{}:{model_round}", turn.message_id)),
                 messages: messages.clone(),
@@ -1001,6 +1004,7 @@ impl NativeHarness {
             };
             record_native_message(&events, turn.provider, &result.message).await?;
             messages.push(result.message.clone());
+            editor.publish(&messages, false).await;
             // Bind measured input/output to this exact prefix. Unsent tool results
             // are estimated only as a suffix on restart, including interrupted turns.
             let measured_tokens = result.usage.input_tokens
@@ -1246,6 +1250,7 @@ impl NativeHarness {
                 )
                 .await;
             }
+            editor.open_tools().await;
             let parallel_reads = tool_calls.len() > 1
                 && inputs.iter().all(|input| input.is_ok())
                 && tool_calls.iter().all(|call| {
@@ -1326,6 +1331,7 @@ impl NativeHarness {
                     } else {
                         match input {
                             Ok(input) => {
+                                editor.publish(&messages, false).await;
                                 execute_tool(
                                     self,
                                     &runtime,
@@ -1361,6 +1367,7 @@ impl NativeHarness {
                 }
             }
 
+            editor.close_tools().await;
             // The batch the model generated has now run. Steers queued during
             // that generation arrived before anything collected above, so they
             // lead the folded message. Admission is taken here, and only the
@@ -1384,6 +1391,23 @@ impl NativeHarness {
                 canonicalize_native_messages(&mut messages);
                 // Journaled and named to the session, so it is consumed now.
                 confirm_steers(acks);
+            }
+            if let Some(system_override) = editor.apply_pending(&mut messages).await {
+                canonicalize_native_messages(&mut messages);
+                let Some(ModelMessage::System { content }) = messages.first() else {
+                    bail!("edited context lost its leading system slot");
+                };
+                if let Some(system_prompt) = system_override {
+                    turn.system_prompt_override = Some(system_prompt);
+                }
+                prefix.system_prompt = content.clone();
+                events.send(SessionEventKind::ProviderEvent {
+                    provider: turn.provider, kind: "native_request_prefix".into(),
+                    payload: serde_json::to_value(&prefix)?,
+                }).await.context("record edited request prefix")?;
+                usage.context_tokens = Some(estimated_messages_tokens(&messages));
+                result.usage.context_tokens = None;
+                if let Some(warmer) = warmer.as_ref() { warmer.on_context_changed(); }
             }
             tool_round += 1;
             send(
@@ -2015,6 +2039,7 @@ impl NativeHarness {
                             "keep_recent_source": compaction_budget.keep_recent_source.as_str(),
                             "budget_clamped_to_window": compaction_budget.clamped_to_window,
                             "retained_messages": retained.len(),
+                            "retained_system_override": turn.system_prompt_override,
                             "retained_request_prefix": crate::NativeRequestPrefix {
                                 provider: turn.provider,
                                 model: model.to_string(),
@@ -2836,15 +2861,10 @@ struct NativeToolRuntimeConfig {
 }
 
 struct NativeToolRuntime {
-    session_id: Uuid,
-    root: PathBuf,
     permission: PermissionMode,
     agent_tools: crate::AgentToolDispatcher,
-    mcp: crate::native_mcp::NativeMcpRuntime,
-    execution_provider: Arc<dyn ExecutionProvider>,
-    workflow_process_manager: crate::native_process::ProcessManager,
-    session_store: Option<std::sync::Arc<dyn crate::SessionStore>>,
-    context: crate::native_context::NativeContext,
+    mcp: Arc<crate::native_mcp::NativeMcpRuntime>,
+    context: Arc<crate::native_context::NativeContext>,
     harness: HarnessMode,
 }
 
@@ -2866,24 +2886,31 @@ impl NativeToolRuntime {
                 .recover_session(config.session_id, store.clone())
                 .await?;
         }
-        let context = crate::native_context::NativeContext::load(
-            config.root.clone(),
-            config.extension_skill_roots,
-        )
-        .await?;
-        Ok(Self {
-            session_id: config.session_id,
-            root: config.root,
-            permission: config.permission,
-            agent_tools: config.agent_tools,
-            mcp: crate::native_mcp::NativeMcpRuntime::start(
+        let context = Arc::new(
+            crate::native_context::NativeContext::load(
+                config.root.clone(),
+                config.extension_skill_roots,
+            )
+            .await?,
+        );
+        config.agent_tools.configure_native_context(context.clone());
+        let mcp = Arc::new(
+            crate::native_mcp::NativeMcpRuntime::start(
                 config.session_id,
                 config.external_mcp_servers,
             )
             .await?,
-            execution_provider: config.execution_provider,
-            workflow_process_manager: config.workflow_process_manager,
-            session_store: config.session_store,
+        );
+        if config.harness == HarnessMode::Native {
+            config
+                .agent_tools
+                .configure_native_mcp_runtime(mcp.clone())
+                .await;
+        }
+        Ok(Self {
+            permission: config.permission,
+            agent_tools: config.agent_tools,
+            mcp,
             context,
             harness: config.harness,
         })
@@ -2945,94 +2972,13 @@ impl NativeToolRuntime {
     async fn call(
         &self,
         name: &str,
-        mut arguments: Value,
+        arguments: Value,
         workflow_approved: bool,
         cancellation: Option<CancellationToken>,
     ) -> Result<Value> {
-        if let Some(arguments) = arguments.as_object_mut() {
-            arguments.remove("action");
-        }
-        match name {
-            "write_file" | "edit_file" => {
-                self.agent_tools
-                    .mutate_workspace_tool(self.execution_provider.as_ref(), name, arguments)
-                    .await
-            }
-            "exec" | "exec_command" | "write_stdin" => {
-                self.agent_tools
-                    .shell_tool(name, arguments, cancellation)
-                    .await
-            }
-            "run_blu_workflow" => {
-                let args: RunBluWorkflowArgs = serde_json::from_value(arguments)?;
-                self.run_blu_workflow(
-                    args.workflow_id,
-                    args.name,
-                    args.source,
-                    workflow_approved,
-                    cancellation,
-                )
-                .await
-            }
-            "read_skill" => {
-                let args: ReadSkillArgs = serde_json::from_value(arguments)?;
-                self.context.read_skill(&args.name).await
-            }
-            other if self.mcp.contains(other) => self
-                .mcp
-                .call(other, arguments, cancellation.as_ref())
-                .await
-                .map(lift_mcp_image_blocks),
-            other => {
-                self.agent_tools
-                    .call_with_workflow_control(other, arguments, workflow_approved, cancellation)
-                    .await
-            }
-        }
-    }
-
-    async fn run_blu_workflow(
-        &self,
-        workflow_id: Uuid,
-        name: String,
-        source: String,
-        workflow_approved: bool,
-        workflow_cancel: Option<CancellationToken>,
-    ) -> Result<Value> {
-        let store = self
-            .session_store
-            .clone()
-            .context("durable session storage is unavailable to Blu workflows")?;
-        let autonomy = store
-            .autonomy_store()
-            .await?
-            .context("durable autonomy storage is unavailable to Blu workflows")?;
-        let permission = if workflow_approved {
-            PermissionMode::FullAccess
-        } else {
-            self.permission
-        };
-        let runner = crate::blu_workflow::BluWorkflowRunner::new(
-            self.session_id,
-            store,
-            autonomy,
-            Some(self.agent_tools.clone()),
-            self.workflow_process_manager.clone(),
-            self.root.clone(),
-            permission,
-        );
-        Ok(serde_json::to_value(
-            runner
-                .run_with_cancel(
-                    crate::BluWorkflowRequest {
-                        workflow_id,
-                        name,
-                        source,
-                    },
-                    workflow_cancel.unwrap_or_default(),
-                )
-                .await?,
-        )?)
+        self.agent_tools
+            .call_with_workflow_control(name, arguments, workflow_approved, cancellation)
+            .await
     }
 }
 
@@ -4726,7 +4672,7 @@ fn microcompact_native_messages(
     })
 }
 
-fn estimated_message_tokens(message: &ModelMessage) -> u64 {
+pub(crate) fn estimated_message_tokens(message: &ModelMessage) -> u64 {
     let (text_only, images) = match message {
         ModelMessage::User {
             content,
@@ -4832,7 +4778,7 @@ pub(crate) fn split_tool_result_attachments(output: String) -> (String, Vec<Mode
 /// MCP results carry images as `{"type": "image", "data", "mimeType"}`
 /// content blocks. Lift them into the tool attachment channel so they reach
 /// the model as pixels instead of a base64 string in the JSON text.
-fn lift_mcp_image_blocks(mut result: Value) -> Value {
+pub(crate) fn lift_mcp_image_blocks(mut result: Value) -> Value {
     let Some(Value::Array(blocks)) = result.get_mut("content") else {
         return result;
     };
@@ -4970,7 +4916,7 @@ pub(crate) async fn native_user_message(
 /// listing says when it is partial and how to find the rest.
 const CAPABILITY_LISTING_BUDGET_CHARS: usize = 8_000;
 
-fn builtin_tool_specs() -> Vec<Value> {
+pub(crate) fn builtin_tool_specs() -> Vec<Value> {
     let mut specs = crate::subagents::file_mutation_tool_specs();
     // The escape hatch onto everything without a tool of its own. The promoted
     // capabilities are not listed here: they are taken from the live catalog by
@@ -5103,20 +5049,6 @@ fn sort_tool_definitions(definitions: &mut [ModelToolDefinition]) {
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({ "name": name, "description": description, "inputSchema": input_schema })
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RunBluWorkflowArgs {
-    workflow_id: Uuid,
-    name: String,
-    source: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReadSkillArgs {
-    name: String,
 }
 
 #[cfg(test)]
@@ -6446,6 +6378,7 @@ mod tests {
                 system_prompt_appendix: String::new(),
                 declaration_base: None,
                 request_prefix_base: None,
+                system_prompt_override: None,
                 prompt_context_base: Default::default(),
                 answers_human: false,
                 volatile_system_prompt_appendix: String::new(),
@@ -8335,6 +8268,34 @@ mod tests {
         volatile: &str,
         system_prompt_appendix: &str,
     ) -> (Vec<SessionEventKind>, bool) {
+        run_turn_events_with_system_override(
+            model_client,
+            provider,
+            cwd,
+            session_id,
+            conversation,
+            prompt_context_base,
+            prompt,
+            volatile,
+            system_prompt_appendix,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_turn_events_with_system_override(
+        model_client: Arc<dyn NativeModelClient>,
+        provider: crate::CodingProvider,
+        cwd: PathBuf,
+        session_id: Uuid,
+        conversation: Vec<ModelMessage>,
+        prompt_context_base: HashMap<ContextSlot, String>,
+        prompt: &str,
+        volatile: &str,
+        system_prompt_appendix: &str,
+        system_prompt_override: Option<String>,
+    ) -> (Vec<SessionEventKind>, bool) {
         let harness = NativeHarness {
             model_client,
             harness: HarnessMode::Native,
@@ -8396,6 +8357,7 @@ mod tests {
             system_prompt_appendix: system_prompt_appendix.to_string(),
             declaration_base: None,
             request_prefix_base: None,
+            system_prompt_override,
             prompt_context_base,
             answers_human: false,
             volatile_system_prompt_appendix: volatile.to_string(),
@@ -8485,6 +8447,179 @@ mod tests {
             journal,
             completed,
         }
+    }
+
+    // A real model-tool edit must change the next request, remain lossless on
+    // replay, and retain the calls/results that submitted it without executing
+    // history again. A compiler check cannot protect that cross-round contract.
+    #[tokio::test]
+    async fn context_tool_edits_the_next_request_and_replays_the_same_view() {
+        struct EditingClient(Mutex<Vec<Vec<ModelMessage>>>);
+        #[async_trait]
+        impl NativeModelClient for EditingClient {
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                request: ModelTurnRequest,
+                _progress: Option<tokio::sync::mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                let mut rounds = self.0.lock().unwrap();
+                rounds.push(request.messages.clone());
+                let message = match rounds.len() {
+                    1 => ModelMessage::assistant(
+                        None,
+                        None,
+                        None,
+                        vec![ModelToolCall::function(
+                            "view".into(),
+                            "context".into(),
+                            json!({"op":"read", "max_chars":0}).to_string(),
+                        )],
+                    ),
+                    2 => {
+                        let ModelMessage::Tool { content, .. } = request.messages.last().unwrap()
+                        else {
+                            panic!("context read result missing");
+                        };
+                        let view: Value = serde_json::from_str(content).unwrap();
+                        ModelMessage::assistant(None, None, None, vec![ModelToolCall::function(
+                            "edit".into(), "context".into(), json!({"op":"edit", "revision":view["revision"], "edits":[
+                                {"op":"replace", "id":view["entries"][0]["id"], "text":"agent-selected system prompt"},
+                                {"op":"drop", "ids":[view["entries"][1]["id"], view["entries"][2]["id"]]}
+                            ]}).to_string(),
+                        )])
+                    }
+                    3 | 4 => {
+                        if rounds.len() == 3 {
+                            let ModelMessage::Tool { content, .. } =
+                                request.messages.last().unwrap()
+                            else {
+                                panic!("context edit result missing")
+                            };
+                            assert!(
+                                content.contains("next_model_request"),
+                                "context edit rejected: {content}"
+                            );
+                        }
+                        assert_eq!(
+                            request.messages.first(),
+                            Some(&ModelMessage::System {
+                                content: "agent-selected system prompt".into()
+                            })
+                        );
+                        assert!(
+                            !serde_json::to_string(&request.messages)
+                                .unwrap()
+                                .contains("discard this old context")
+                        );
+                        validate_native_messages(&request.messages).unwrap();
+                        ModelMessage::assistant(Some("done".into()), None, None, Vec::new())
+                    }
+                    _ => panic!("unexpected context round"),
+                };
+                let finish_reason = if rounds.len() < 3 {
+                    "tool_calls"
+                } else {
+                    "stop"
+                };
+                Ok(ModelTurnResult {
+                    message,
+                    finish_reason: finish_reason.into(),
+                    usage: Default::default(),
+                    raw_response: Value::Null,
+                    trace: Default::default(),
+                })
+            }
+        }
+        let cwd = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let client = Arc::new(EditingClient(Mutex::new(Vec::new())));
+        let history = vec![
+            ModelMessage::user("discard this old context"),
+            ModelMessage::assistant(Some("old reply".into()), None, None, Vec::new()),
+        ];
+        let (events, completed) = run_turn_events(
+            client.clone(),
+            crate::CodingProvider::OpenRouter,
+            cwd.path().into(),
+            session_id,
+            history.clone(),
+            Default::default(),
+            "continue",
+            "",
+            "",
+        )
+        .await;
+        assert!(completed);
+        let mut journal = history
+            .into_iter()
+            .map(|message| SessionEventKind::ProviderEvent {
+                provider: crate::CodingProvider::OpenRouter,
+                kind: "native_model_message".into(),
+                payload: serde_json::to_value(message).unwrap(),
+            })
+            .chain(events.into_iter().filter(|event| {
+                event.persistence() == crate::session_store::EventPersistence::Durable
+                    && event.is_context_relevant()
+            }))
+            .enumerate()
+            .map(|(index, kind)| SessionEvent::new(session_id, index as u64 + 1, kind))
+            .collect::<Vec<_>>();
+        let recovered_journal = journal.clone();
+        // The last model response is after the measured third request.
+        journal.retain(|event| !matches!(&event.kind, SessionEventKind::ProviderEvent { kind, payload, .. }
+            if kind == "native_model_message" && payload.get("content").and_then(Value::as_str) == Some("done")));
+        {
+            let rounds = client.0.lock().unwrap();
+            assert_eq!(
+                crate::session::native_conversation(&journal, crate::CodingProvider::OpenRouter)
+                    .unwrap(),
+                rounds[2][1..]
+            );
+            assert_eq!(
+                crate::session::native_system_override(journal.iter()).as_deref(),
+                Some("agent-selected system prompt")
+            );
+            let tool_ids = rounds[2]
+                .iter()
+                .filter_map(|message| match message {
+                    ModelMessage::Tool { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(tool_ids, ["view", "edit"]);
+        }
+        let override_text = crate::session::native_system_override(recovered_journal.iter());
+        let replayed = crate::session::native_conversation(
+            &recovered_journal,
+            crate::CodingProvider::OpenRouter,
+        )
+        .unwrap();
+        let (_, completed) = run_turn_events_with_system_override(
+            client.clone(),
+            crate::CodingProvider::OpenRouter,
+            cwd.path().into(),
+            session_id,
+            replayed.clone(),
+            Default::default(),
+            "next turn after recovery",
+            "",
+            "",
+            override_text,
+        )
+        .await;
+        assert!(completed);
+        let requests = client.0.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests[3][0],
+            ModelMessage::System {
+                content: "agent-selected system prompt".into()
+            }
+        );
+        assert_eq!(requests[3][1..1 + replayed.len()], replayed);
     }
 
     #[tokio::test]
@@ -9550,6 +9685,7 @@ mod tests {
                 system_prompt_appendix: String::new(),
                 declaration_base: None,
                 request_prefix_base: None,
+                system_prompt_override: None,
                 prompt_context_base: Default::default(),
                 answers_human,
                 volatile_system_prompt_appendix: String::new(),
@@ -9802,6 +9938,7 @@ mod tests {
                 system_prompt_appendix: String::new(),
                 declaration_base: None,
                 request_prefix_base: None,
+                system_prompt_override: None,
                 prompt_context_base: Default::default(),
                 answers_human: false,
                 volatile_system_prompt_appendix: String::new(),
@@ -10415,6 +10552,7 @@ mod tests {
                 system_prompt_appendix: String::new(),
                 declaration_base: None,
                 request_prefix_base: None,
+                system_prompt_override: None,
                 prompt_context_base: Default::default(),
                 answers_human: false,
                 volatile_system_prompt_appendix: String::new(),

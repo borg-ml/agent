@@ -159,7 +159,6 @@ async fn workspace_mutations_preserve_authorization_and_file_contents_on_failure
         root: root.clone(),
         allow_effects: false,
         dispatcher: dispatcher.clone(),
-        execution_provider: Arc::new(crate::LocalExecutionProvider::new()),
         host_calls: Arc::new(AtomicUsize::new(0)),
         session_store: None,
         runtime_worker_id: Uuid::new_v4(),
@@ -816,11 +815,19 @@ read _initialize
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}'
 read _initialized
 read _list
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"lookup","description":"Lookup","inputSchema":{"type":"object"}}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"lookup","description":"Lookup","inputSchema":{"type":"object"}},{"name":"private","description":"Not granted","inputSchema":{"type":"object"}}]}}'
 read _call
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"retrieved"}]}}'
 read _call
 printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"retrieved"}]}}'
+read _call
+printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"generic"}]}}'
+read _call
+printf '%s\n' '{"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"direct"}]}}'
+read _call
+printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"public-direct"}]}}'
+read _call
+printf '%s\n' '{"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"public-named"}]}}'
 "#;
     dispatcher
         .configure_runtime_mcp(vec![borg_provider::mcp::ExternalMcpServer {
@@ -871,6 +878,61 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text
         adapter_result["value"],
         json!({"query": "beta", "text": "retrieved"})
     );
+    // Generic tool and direct-call names must use the same granted MCP
+    // runtime, rather than falling through to the subagent dispatcher.
+    let generic = tokio::time::timeout(Duration::from_secs(5), dispatcher.call("runtime_exec", json!({"code":
+        "names = {tool['name'] for tool in borg.tools()}\nassert 'mcp__retrieval__lookup' in names and 'mcp__retrieval__private' not in names, names\nnamed = borg.mcp__retrieval__lookup(query='gamma', action='lookup')\ndirect = borg.call('mcp__retrieval__lookup', {'query': 'delta', 'action': 'lookup'})\n[named['content'][0]['text'], direct['content'][0]['text']]"
+    }))).await.unwrap().unwrap();
+    assert_eq!(generic["value"], json!(["generic", "direct"]));
+    let denied = dispatcher
+        .call(
+            "runtime_exec",
+            json!({"code":
+                "borg.call('mcp__retrieval__private', {})"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(!denied.to_string().is_empty());
+    #[cfg(unix)]
+    {
+        let _server = AgentToolServer::start(
+            directory.path(),
+            dispatcher.actor_session_id,
+            dispatcher.clone(),
+        )
+        .await
+        .unwrap();
+        let mut environment = _server.external_mcp_server().unwrap().env;
+        crate::command_clients::install(directory.path(), &mut environment).unwrap();
+        dispatcher.configure_command_environment(environment);
+        std::fs::write(directory.path().join("sdk_mcp.py"), r#"import borg
+names = {tool['name'] for tool in borg.tools()}
+assert 'mcp__retrieval__lookup' in names and 'mcp__retrieval__private' not in names, names
+assert borg.call('mcp__retrieval__lookup', query='sdk', action='lookup')['content'][0]['text'] == 'public-direct'
+assert borg.mcp__retrieval__lookup(query='sdk')['content'][0]['text'] == 'public-named'
+print('sdk-mcp-ok', flush=True)
+"#).unwrap();
+        let sdk = tokio::time::timeout(
+            Duration::from_secs(8),
+            dispatcher.call(
+                "exec",
+                json!({
+                    "cmd": format!("{} sdk_mcp.py", serde_json::to_string(&command).unwrap()),
+                    "yield_time_ms": 5000, "timeout_ms": 6000,
+                }),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(sdk["exit_code"], 0, "{sdk}");
+        assert_eq!(sdk["stdout"].as_str().unwrap().trim(), "sdk-mcp-ok");
+    }
+    dispatcher
+        .persistent_runtimes
+        .stop_session(dispatcher.actor_session_id)
+        .await;
 }
 
 #[tokio::test]
@@ -1012,7 +1074,6 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
         root: directory.path().to_path_buf(),
         allow_effects: false,
         dispatcher: dispatcher.clone(),
-        execution_provider: Arc::new(crate::LocalExecutionProvider::new()),
         host_calls: Arc::new(AtomicUsize::new(0)),
         session_store: None,
         runtime_worker_id: runtime.worker_id(),
@@ -6715,6 +6776,7 @@ async fn forwarded_image_reaches_the_recipient_model_as_pixels() {
         system_prompt_appendix: String::new(),
         declaration_base: None,
         request_prefix_base: None,
+        system_prompt_override: None,
         prompt_context_base: Default::default(),
         answers_human: false,
         volatile_system_prompt_appendix: String::new(),
@@ -7808,4 +7870,511 @@ async fn shared_work_pages_bound_batch_items_without_sequence_cursor_gaps() {
             .is_err()
     );
     scratch.discard().await;
+}
+
+// These tests protect the actual command/socket boundary: fake runtime hosts
+// cannot prove origin validation, installed SDK routing or disconnect cleanup.
+#[cfg(unix)]
+async fn code_client_socket_fixture(
+    root: &Path,
+    session_id: Uuid,
+    permission: PermissionMode,
+) -> (AgentToolDispatcher, AgentToolServer) {
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(root),
+        CodingProvider::Codex,
+        session_id,
+        false,
+        None,
+        None,
+        root.to_path_buf(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        permission,
+    );
+    let server = AgentToolServer::start(root, session_id, dispatcher.clone())
+        .await
+        .unwrap();
+    let mut environment = server.external_mcp_server().unwrap().env;
+    crate::command_clients::install(root, &mut environment).unwrap();
+    dispatcher.configure_command_environment(environment);
+    (dispatcher, server)
+}
+
+#[cfg(unix)]
+async fn code_client_managed_command(
+    dispatcher: &AgentToolDispatcher,
+    owner: Uuid,
+    command: &str,
+) -> (String, crate::native_process::ProcessSnapshot) {
+    let environment = dispatcher.environment_for_command();
+    let parent = environment["BORG_TOOL_CALL_ID"].clone();
+    let result = dispatcher
+        .execution_provider()
+        .command(crate::ExecutionCommandRequest {
+            owner_session_id: owner,
+            root: dispatcher.runtime_root.clone(),
+            command: command.to_string(),
+            workdir: None,
+            yield_time_ms: Some(0),
+            max_output_tokens: Some(1024),
+            timeout_ms: 10_000,
+            journal: None,
+            environment,
+            cancellation: None,
+        })
+        .await
+        .unwrap();
+    (parent, result)
+}
+
+#[cfg(unix)]
+async fn code_client_socket_request(server: &AgentToolServer, parent: &str) -> Value {
+    code_client_wire_request(server, json!({"name": "read_file", "arguments": {"path": "socket-evidence.txt", "action": "read"}, "parent": parent, "workflow_approved": true})).await
+}
+
+#[cfg(unix)]
+async fn code_client_wire_request(server: &AgentToolServer, request: Value) -> Value {
+    let mut socket = tokio::net::UnixStream::connect(&server.socket_path)
+        .await
+        .unwrap();
+    socket
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        BufReader::new(socket).read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn command_sdk_socket_rejects_forged_cross_session_and_stale_origins() {
+    let root = tempdir().unwrap();
+    std::fs::write(
+        root.path().join("socket-evidence.txt"),
+        "private socket fixture",
+    )
+    .unwrap();
+    let owner = Uuid::new_v4();
+    let (dispatcher, server) =
+        code_client_socket_fixture(root.path(), owner, PermissionMode::FullAccess).await;
+    let provider = dispatcher.execution_provider();
+    let (parent, live) = code_client_managed_command(&dispatcher, owner, "read gate").await;
+    assert!(live.running);
+    assert!(
+        provider
+            .command_context(owner, &parent)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        code_client_socket_request(&server, &parent)
+            .await
+            .get("error")
+            .is_none(),
+        "a live same-session command must remain callable"
+    );
+    let foreign_owner = Uuid::new_v4();
+    let (foreign_parent, foreign) =
+        code_client_managed_command(&dispatcher, foreign_owner, "read gate").await;
+    assert!(foreign.running);
+    for invalid in [Uuid::new_v4().to_string(), foreign_parent] {
+        let denied = code_client_socket_request(&server, &invalid).await;
+        assert!(
+            denied["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("originating command")),
+            "{denied}"
+        );
+        assert!(denied.get("result").is_none());
+    }
+    provider
+        .write_stdin(crate::ExecutionStdinRequest {
+            owner_session_id: owner,
+            process_id: live.session_id,
+            chars: None,
+            terminate: true,
+            yield_time_ms: Some(1000),
+            max_output_tokens: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        provider
+            .command_context(owner, &parent)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let stale = code_client_socket_request(&server, &parent).await;
+    assert!(
+        stale["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("originating command")),
+        "{stale}"
+    );
+    provider.terminate_session(foreign_owner).await.unwrap();
+    dispatcher.persistent_runtimes.stop_session(owner).await;
+}
+
+// A real live origin proves identity, not approval. Neither a mutable SDK
+// environment nor a wire boolean may upgrade its host-issued authority.
+#[tokio::test]
+#[cfg(unix)]
+async fn command_sdk_socket_approval_comes_only_from_host_command_context() {
+    let python = std::env::var("BORG_PYTHON_RUNTIME").unwrap_or_else(|_| "python3".to_string());
+    if !tokio::process::Command::new(python)
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let root = tempdir().unwrap();
+    let owner = Uuid::new_v4();
+    let (dispatcher, server) =
+        code_client_socket_fixture(root.path(), owner, PermissionMode::Manual).await;
+    let provider = dispatcher.execution_provider();
+    let (unapproved_parent, unapproved) =
+        code_client_managed_command(&dispatcher, owner, "read gate").await;
+    assert!(
+        !provider
+            .command_context(owner, &unapproved_parent)
+            .await
+            .unwrap()
+            .unwrap()
+            .approved
+    );
+    for parent in [None, Some(unapproved_parent.as_str())] {
+        let denied = code_client_wire_request(
+            &server,
+            json!({
+                "name": "runtime_exec", "arguments": {"code": "42"}, "parent": parent,
+                "workflow_approved": true,
+            }),
+        )
+        .await;
+        assert!(
+            denied["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("Full Access")),
+            "{denied}"
+        );
+        assert!(denied.get("result").is_none());
+    }
+    assert!(
+        provider
+            .command_context(owner, &unapproved_parent)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let mut environment = dispatcher.environment_for_command();
+    environment.insert("BORG_AGENT_TOOL_APPROVED".to_string(), "1".to_string());
+    let approved_parent = environment["BORG_TOOL_CALL_ID"].clone();
+    let approved = provider
+        .command(crate::ExecutionCommandRequest {
+            owner_session_id: owner,
+            root: root.path().to_path_buf(),
+            command: "read gate".to_string(),
+            workdir: None,
+            yield_time_ms: Some(0),
+            max_output_tokens: None,
+            timeout_ms: 10_000,
+            journal: None,
+            environment,
+            cancellation: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        provider
+            .command_context(owner, &approved_parent)
+            .await
+            .unwrap()
+            .unwrap()
+            .approved
+    );
+    let accepted = code_client_wire_request(
+        &server,
+        json!({
+            "name": "runtime_exec", "arguments": {"code": "42"}, "parent": approved_parent,
+            "workflow_approved": false,
+        }),
+    )
+    .await;
+    assert_eq!(
+        accepted["result"]["value"], 42,
+        "host-attested approval must not depend on a client flag: {accepted}"
+    );
+    for command in [unapproved, approved] {
+        provider
+            .write_stdin(crate::ExecutionStdinRequest {
+                owner_session_id: owner,
+                process_id: command.session_id,
+                chars: None,
+                terminate: true,
+                yield_time_ms: Some(1000),
+                max_output_tokens: None,
+            })
+            .await
+            .unwrap();
+    }
+    dispatcher.persistent_runtimes.stop_session(owner).await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn installed_python_sdk_refuses_runtime_reentry_and_preserves_native_routing() {
+    if !tokio::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let root = tempdir().unwrap();
+    let owner = Uuid::new_v4();
+    let (dispatcher, _server) =
+        code_client_socket_fixture(root.path(), owner, PermissionMode::FullAccess).await;
+    let skill = root.path().join(".agents/skills/sdk-origin-probe");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(skill.join("SKILL.md"), "---\nname: sdk-origin-probe\ndescription: Socket SDK fixture\n---\nSDK routing evidence.\n").unwrap();
+    std::fs::write(root.path().join("sdk_reentry.py"), r#"import borg
+names = {tool['name'] for tool in borg.tools()}
+assert {'runtime_exec', 'read_skill', 'exec_command', 'write_stdin', 'context', 'run_blu_workflow'} <= names, names
+assert 'SDK routing evidence.' in borg.read_skill(name='sdk-origin-probe', action='read')['content']
+result = borg.exec_command(cmd='printf routed', yield_time_ms=5000, timeout_ms=5000, action='route')
+assert result['exit_code'] == 0 and result['stdout'] == 'routed', result
+try:
+    borg.runtime_exec(code='marker = 0')
+    raise AssertionError('recursive execution was accepted')
+except borg.BorgError as error:
+    assert 'cannot re-enter its active worker' in str(error), str(error)
+print('refused', flush=True)
+"#).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(12), dispatcher.call("runtime_exec", json!({"code": r#"marker = 42
+names = {tool['name'] for tool in borg.tools()}
+assert {'runtime_exec', 'read_skill', 'exec_command', 'write_stdin', 'context'} <= names, names
+assert 'SDK routing evidence.' in borg.call('read_skill', {'name': 'sdk-origin-probe', 'action': 'read'})['content']
+command = borg.exec('python3 sdk_reentry.py', yield_time_ms=5000, timeout_ms=8000, action='sdk test')
+assert not command['running'] and command['exit_code'] == 0, command
+assert command['stdout'].strip() == 'refused', command
+marker"#}))).await.expect("SDK reentry must refuse without waiting on its caller").unwrap();
+    assert_eq!(result["value"], 42);
+    assert_eq!(
+        dispatcher
+            .call("runtime_exec", json!({"code": "marker"}))
+            .await
+            .unwrap()["value"],
+        42
+    );
+    if tokio::process::Command::new("bun")
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+    {
+        let cross = tokio::time::timeout(
+            Duration::from_secs(8),
+            dispatcher.call(
+                "runtime_exec",
+                json!({"code": "borg.runtime_exec(runtime='javascript', code='41 + 1')['value']"}),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cross["value"], 42,
+            "noncyclic cross-runtime calls must not have a blanket denial"
+        );
+    }
+    dispatcher.persistent_runtimes.stop_session(owner).await;
+    dispatcher
+        .execution_provider()
+        .terminate_session(owner)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn installed_sdk_disconnect_cancels_only_its_queued_runtime_request() {
+    if !tokio::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    struct HoldingHost {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl RuntimeHost for HoldingHost {
+        async fn call(&self, _: &str, _: Value) -> Result<Value> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(json!(42))
+        }
+    }
+    let root = tempdir().unwrap();
+    let owner = Uuid::new_v4();
+    let (dispatcher, _server) =
+        code_client_socket_fixture(root.path(), owner, PermissionMode::FullAccess).await;
+    let (events, mut notices) = tokio::sync::mpsc::channel(8);
+    dispatcher.set_turn_events(&events);
+    let worker = dispatcher
+        .persistent_runtimes
+        .python_for_session(owner, root.path(), None)
+        .await;
+    let holding = Arc::new(HoldingHost {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let runtime = worker.clone();
+    let host = holding.clone();
+    let active = tokio::spawn(async move {
+        runtime
+            .execute("marker = 42\nborg.call('hold', {})", None, host)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), holding.entered.notified())
+        .await
+        .unwrap();
+    std::fs::write(
+        root.path().join("sdk_queue.py"),
+        r#"import borg, socket, threading
+sockets, failures = [], []
+class SDKSocket(socket.socket):
+    def connect(self, address):
+        super().connect(address)
+        sockets.append(self)
+borg.socket.socket = SDKSocket
+def request():
+    try:
+        borg.runtime_exec(code='marker = 0')
+    except borg.BorgError as error:
+        failures.append(str(error))
+thread = threading.Thread(target=request)
+thread.start()
+input()
+sockets[0].shutdown(socket.SHUT_RDWR)
+thread.join(2)
+assert not thread.is_alive() and failures, failures
+print('disconnected', flush=True)
+input()
+"#,
+    )
+    .unwrap();
+    let (parent, command) =
+        code_client_managed_command(&dispatcher, owner, "python3 sdk_queue.py").await;
+    assert!(command.running);
+    let started = tokio::time::timeout(Duration::from_secs(5), notices.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let call_id = match started {
+        SessionEventKind::ToolStarted {
+            tool_call_id,
+            name,
+            parent_tool_call_id,
+            ..
+        } => {
+            assert_eq!(name, "runtime_exec");
+            assert_eq!(parent_tool_call_id.as_deref(), Some(parent.as_str()));
+            tool_call_id
+        }
+        other => panic!("expected queued SDK runtime request, got {other:?}"),
+    };
+    let provider = dispatcher.execution_provider();
+    provider
+        .write_stdin(crate::ExecutionStdinRequest {
+            owner_session_id: owner,
+            process_id: command.session_id,
+            chars: Some("disconnect\n".into()),
+            terminate: false,
+            yield_time_ms: Some(0),
+            max_output_tokens: None,
+        })
+        .await
+        .unwrap();
+    let completion = tokio::time::timeout(Duration::from_secs(5), notices.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match completion {
+        SessionEventKind::ToolCompleted {
+            tool_call_id,
+            is_error,
+            output,
+            ..
+        } => {
+            assert_eq!(tool_call_id, call_id);
+            assert!(is_error && output.contains("cancel"), "{output}");
+        }
+        other => panic!("expected cancelled SDK request, got {other:?}"),
+    }
+    assert!(
+        !active.is_finished(),
+        "disconnect must not cancel the independent active worker"
+    );
+    assert!(
+        provider
+            .command_context(owner, &parent)
+            .await
+            .unwrap()
+            .is_some(),
+        "request cancellation must not kill its originating command"
+    );
+    holding.release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), active)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .value,
+        42
+    );
+    assert_eq!(
+        dispatcher
+            .call("runtime_exec", json!({"code": "marker"}))
+            .await
+            .unwrap()["value"],
+        42,
+        "cancelled queued code must never execute later"
+    );
+    provider
+        .write_stdin(crate::ExecutionStdinRequest {
+            owner_session_id: owner,
+            process_id: command.session_id,
+            chars: None,
+            terminate: true,
+            yield_time_ms: Some(1000),
+            max_output_tokens: None,
+        })
+        .await
+        .unwrap();
+    dispatcher.persistent_runtimes.stop_session(owner).await;
 }

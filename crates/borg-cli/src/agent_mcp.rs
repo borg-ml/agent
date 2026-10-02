@@ -478,7 +478,7 @@ async fn handle_line_with_cancel(
             forward(
                 endpoint,
                 "__borg_tools",
-                json!({ "workspace_tools": workspace_tools }),
+                json!({ "workspace_tools": workspace_tools, "provider_surface": true }),
                 cancel,
             )
             .await

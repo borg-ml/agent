@@ -250,6 +250,7 @@ impl SessionEventKind {
                 if matches!(
                     kind.as_str(),
                     "native_model_message"
+                        | "native_context_edit"
                         | "native_model_request"
                         | "native_model_usage"
                         | "native_prompt_context"
@@ -473,6 +474,7 @@ impl SessionEventKind {
                 matches!(
                     kind.as_str(),
                     "native_model_message"
+                        | "native_context_edit"
                         | "native_prompt_context"
                         | "native_tool_round_completed"
                         | "native_declaration_base"
@@ -1217,6 +1219,17 @@ impl SessionState {
                 self.pending_provider_context_contract_version = None;
                 self.usage.context_tokens = Some(0);
                 self.context_generation = self.context_generation.saturating_add(1);
+            }
+            // An agent's edit of its own context replaces the conversation the
+            // way a completed compaction does, so continuations and the
+            // measured context of the old one no longer apply.
+            SessionEventKind::ProviderEvent { kind, .. } if kind == "native_context_edit" => {
+                self.context_generation = self.context_generation.saturating_add(1);
+                self.provider_session_id = None;
+                self.provider_turn_id = None;
+                self.pending_provider_turn_id = None;
+                self.pending_provider_turn_session_id = None;
+                self.usage.context_tokens = Some(0);
             }
             kind if kind.is_completed_context_compaction() => {
                 self.context_generation = self.context_generation.saturating_add(1);

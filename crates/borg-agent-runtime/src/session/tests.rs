@@ -22704,3 +22704,329 @@ async fn peer_receipts_survive_disabled_subagents_stop_and_replay() {
 }
 
 mod runtime_sync;
+
+#[test]
+fn native_context_edit_replaces_replay_and_keeps_later_tool_results() {
+    use borg_provider::provider::{ModelMessage, ModelToolCall};
+
+    let session_id = Uuid::new_v4();
+    let provider_event = |sequence, kind: &str, payload: serde_json::Value| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::OpenRouter,
+                kind: kind.to_string(),
+                payload,
+            },
+        )
+    };
+    let native = |sequence, message: ModelMessage| {
+        provider_event(
+            sequence,
+            "native_model_message",
+            serde_json::to_value(message).unwrap(),
+        )
+    };
+    let call = |id: &str| {
+        ModelMessage::assistant(
+            None,
+            None,
+            None,
+            vec![ModelToolCall::function(
+                id.to_string(),
+                "read_file".to_string(),
+                "{}".to_string(),
+            )],
+        )
+    };
+    let result = |id: &str| ModelMessage::Tool {
+        tool_call_id: id.to_string(),
+        content: format!("{id} done"),
+        attachments: Vec::new(),
+    };
+    let edited = vec![ModelMessage::user("kept summary"), call("two")];
+    let mut events = vec![
+        native(1, ModelMessage::user("original prompt")),
+        native(2, call("one")),
+        native(3, result("one")),
+        provider_event(4, "native_tool_round_completed", json!({ "round": 1 })),
+        native(5, call("two")),
+        // Accepted while batch "two" was in flight: its call is part of the edit.
+        provider_event(
+            6,
+            NATIVE_CONTEXT_EDIT_EVENT,
+            json!({ "system_prompt": "edited system", "messages": edited }),
+        ),
+        native(7, result("two")),
+        provider_event(8, "native_tool_round_completed", json!({ "round": 2 })),
+    ];
+
+    let replay = native_conversation(&events, CodingProvider::OpenRouter).unwrap();
+    let mut expected = edited.clone();
+    expected.push(result("two"));
+    assert_eq!(
+        serde_json::to_value(&replay).unwrap(),
+        serde_json::to_value(&expected).unwrap()
+    );
+    assert_eq!(
+        native_system_override(events.iter()).as_deref(),
+        Some("edited system")
+    );
+
+    events.push(SessionEvent::new(
+        session_id,
+        9,
+        SessionEventKind::ContextCleared,
+    ));
+    assert_eq!(native_system_override(events.iter()), None);
+}
+
+#[tokio::test]
+async fn context_edit_system_prompt_survives_compaction_recovery_and_fork() {
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let mut journal = RuntimeSessionStore::new(Arc::clone(&store), Vec::new(), true);
+    for kind in [
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "work".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::TurnStarted {
+            message_id,
+            provider: CodingProvider::OpenRouter,
+            model: None,
+            effort: None,
+            fast: false,
+            ultrafast: false,
+        },
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::OpenRouter,
+            kind: NATIVE_CONTEXT_EDIT_EVENT.to_string(),
+            payload: json!({
+                "system_prompt": "edited system",
+                "messages": [borg_provider::provider::ModelMessage::user("kept")],
+            }),
+        },
+        // Edits happen inside a turn; a later history-only one keeps the
+        // custom system prompt.
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::OpenRouter,
+            kind: NATIVE_CONTEXT_EDIT_EVENT.to_string(),
+            payload: json!({
+                "messages": [borg_provider::provider::ModelMessage::user("kept again")],
+            }),
+        },
+        SessionEventKind::TurnCompleted {
+            message_id,
+            provider_session_id: None,
+            final_text: String::new(),
+            error: None,
+        },
+        // Written by a compaction path that has no override of its own.
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::OpenRouter,
+            kind: "context_compaction".to_string(),
+            payload: json!({
+                "status": "completed",
+                "summary": "earlier work",
+                "retained_system_override": null,
+            }),
+        },
+    ] {
+        journal
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let recovered = store.recovery(session_id).await.unwrap().context_events;
+    assert!(
+        matches!(recovered.first().map(|event| &event.kind),
+            Some(SessionEventKind::ProviderEvent { kind, .. }) if kind == "context_compaction"),
+        "recovery must begin at the compaction boundary"
+    );
+    assert!(
+        !recovered.iter().any(|event| matches!(&event.kind,
+            SessionEventKind::ProviderEvent { kind, .. } if kind == NATIVE_CONTEXT_EDIT_EVENT)),
+        "recovery resumes after the last turn completed before the boundary, so \
+         only the boundary can carry the override"
+    );
+    assert_eq!(
+        native_system_override(recovered.iter()).as_deref(),
+        Some("edited system")
+    );
+
+    let fork = Uuid::new_v4();
+    let latest = store.state(session_id).await.unwrap().latest_sequence;
+    store
+        .fork_before(session_id, fork, latest + 1)
+        .await
+        .unwrap();
+    let forked = store.recovery(fork).await.unwrap().context_events;
+    assert_eq!(
+        native_system_override(forked.iter()).as_deref(),
+        Some("edited system")
+    );
+    scratch.discard().await;
+}
+
+#[test]
+fn prefix_context_edits_keep_results_journaled_after_the_tool_snapshot() {
+    use borg_provider::provider::{ModelMessage, ModelToolCall};
+
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let provider_event = |sequence, kind: &str, payload: serde_json::Value| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::OpenRouter,
+                kind: kind.to_string(),
+                payload,
+            },
+        )
+    };
+    let native = |sequence, message: ModelMessage| {
+        provider_event(
+            sequence,
+            "native_model_message",
+            serde_json::to_value(message).unwrap(),
+        )
+    };
+    let call = |id: &str| {
+        ModelMessage::assistant(
+            None,
+            None,
+            None,
+            vec![ModelToolCall::function(
+                id.to_string(),
+                "exec".to_string(),
+                "{}".to_string(),
+            )],
+        )
+    };
+    let result = |id: &str| ModelMessage::Tool {
+        tool_call_id: id.to_string(),
+        content: format!("{id} ran"),
+        attachments: Vec::new(),
+    };
+    let reply =
+        |text: &str| ModelMessage::assistant(Some(text.to_string()), None, None, Vec::new());
+    let events = vec![
+        native(1, ModelMessage::user("original prompt")),
+        native(2, call("one")),
+        native(3, result("one")),
+        provider_event(4, "native_tool_round_completed", json!({ "round": 1 })),
+        native(5, call("two")),
+        // Journaled before the edit marker but after the tool took its
+        // snapshot of the three-message editable prefix.
+        native(6, result("two")),
+        provider_event(
+            7,
+            NATIVE_CONTEXT_EDIT_EVENT,
+            json!({
+                "system_prompt": "first system",
+                "messages": [ModelMessage::user("summary")],
+                "preserve_tail_from": 3,
+            }),
+        ),
+        // A second edit in the same batch is anchored on the previous staged
+        // prefix, one message long.
+        provider_event(
+            8,
+            NATIVE_CONTEXT_EDIT_EVENT,
+            json!({
+                "system_prompt": "second system",
+                "messages": [ModelMessage::user("rewritten"), reply("noted")],
+                "preserve_tail_from": 1,
+            }),
+        ),
+        provider_event(9, "native_tool_round_completed", json!({ "round": 2 })),
+        native(10, reply("done")),
+        SessionEvent::new(
+            session_id,
+            11,
+            SessionEventKind::TurnCompleted {
+                message_id,
+                provider_session_id: None,
+                final_text: "done".to_string(),
+                error: None,
+            },
+        ),
+    ];
+
+    let replay = native_conversation(&events, CodingProvider::OpenRouter).unwrap();
+    let expected = vec![
+        ModelMessage::user("rewritten"),
+        reply("noted"),
+        call("two"),
+        result("two"),
+        reply("done"),
+    ];
+    // Exact equality also proves no call is replayed twice and no result is
+    // synthesized as "outcome unknown", so nothing is executed again.
+    assert_eq!(
+        serde_json::to_value(&replay).unwrap(),
+        serde_json::to_value(&expected).unwrap()
+    );
+    assert_eq!(
+        native_system_override(events.iter()).as_deref(),
+        Some("second system")
+    );
+}
+
+#[test]
+fn history_only_context_edits_keep_the_prior_system_prompt() {
+    let session_id = Uuid::new_v4();
+    let event = |sequence, kind: &str, payload: serde_json::Value| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::OpenRouter,
+                kind: kind.to_string(),
+                payload,
+            },
+        )
+    };
+    let history_only = |sequence| {
+        event(
+            sequence,
+            NATIVE_CONTEXT_EDIT_EVENT,
+            json!({ "messages": [], "preserve_tail_from": 0 }),
+        )
+    };
+    let mut events = vec![history_only(1)];
+    assert_eq!(native_system_override(events.iter()), None);
+
+    events.push(event(
+        2,
+        NATIVE_CONTEXT_EDIT_EVENT,
+        json!({ "system_prompt": "custom", "messages": [] }),
+    ));
+    events.push(history_only(3));
+    assert_eq!(
+        native_system_override(events.iter()).as_deref(),
+        Some("custom")
+    );
+
+    // Recovery from a completed compaction sees only the boundary.
+    let boundary = event(
+        4,
+        "context_compaction",
+        json!({ "status": "completed", "summary": "s", "retained_system_override": "custom" }),
+    );
+    assert_eq!(
+        native_system_override(std::iter::once(&boundary)).as_deref(),
+        Some("custom")
+    );
+}

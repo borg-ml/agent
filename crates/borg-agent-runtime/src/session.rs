@@ -900,10 +900,11 @@ impl RuntimeSessionStore {
     /// stays authoritative and still takes every event in order; the mirror is
     /// repairable by design (`repair` batches ordinary rows and runs from every
     /// turn boundary), and a person waiting at the keyboard is not.
-    async fn append_all(&mut self, events: Vec<SessionEvent>) -> Result<Vec<SessionEvent>> {
+    async fn append_all(&mut self, mut events: Vec<SessionEvent>) -> Result<Vec<SessionEvent>> {
         if events.is_empty() {
             return Ok(Vec::new());
         }
+        self.retain_system_override(&mut events).await?;
         let appended = self.store.append_batch(events).await?;
         let mut absorbed = Vec::with_capacity(appended.len());
         for event in appended {
@@ -945,7 +946,43 @@ impl RuntimeSessionStore {
         Ok(())
     }
 
-    async fn append(&mut self, event: SessionEvent) -> Result<SessionEvent> {
+    /// Carry a context edit's system prompt across every compaction boundary
+    /// journaled here, whichever writer produced it, so recovery from the
+    /// boundary restores it.
+    async fn retain_system_override(&mut self, events: &mut [SessionEvent]) -> Result<()> {
+        for index in 0..events.len() {
+            let SessionEventKind::ProviderEvent { payload, .. } = &events[index].kind else {
+                continue;
+            };
+            if !starts_context_generation(&events[index].kind)
+                || payload
+                    .get(COMPACTION_RETAINED_SYSTEM_OVERRIDE_FIELD)
+                    .is_some_and(|retained| !retained.is_null())
+            {
+                continue;
+            }
+            if !self.context_complete {
+                self.ensure_complete_context(events[index].session_id)
+                    .await?;
+            }
+            let retained =
+                native_system_override(self.context_events.iter().chain(&events[..index]));
+            if let Some(retained) = retained
+                && let SessionEventKind::ProviderEvent { payload, .. } = &mut events[index].kind
+                && let Some(payload) = payload.as_object_mut()
+            {
+                payload.insert(
+                    COMPACTION_RETAINED_SYSTEM_OVERRIDE_FIELD.to_string(),
+                    Value::String(retained),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn append(&mut self, mut event: SessionEvent) -> Result<SessionEvent> {
+        self.retain_system_override(std::slice::from_mut(&mut event))
+            .await?;
         let event = self.store.append(event).await?;
         if let Some(projection) = &self.workspace_projection
             && let Err(error) = projection.project(&event).await
@@ -2589,6 +2626,7 @@ async fn run_agent_session_store_kernel_inner(
     dispatcher
         .configure_runtime_mcp(runtime_mcp_servers.clone())
         .await?;
+    dispatcher.configure_native_skill_roots(launch.extension_skill_roots.clone());
     let workflow_autonomy_store = autonomy_store.clone();
     let workflow_session_store = dispatcher.session_store();
     let agent_tool_server =
@@ -3856,6 +3894,9 @@ async fn run_agent_session_store_kernel_inner(
                                             .unwrap_or_default(),
                                         declaration_base: None,
                                         request_prefix_base: None,
+                                        system_prompt_override: native_system_override(
+                                            journal.context_events().iter(),
+                                        ),
                                         prompt_context_base: Default::default(),
                                         answers_human: false,
                                         volatile_system_prompt_appendix:
@@ -5096,6 +5137,7 @@ async fn run_agent_session_store_kernel_inner(
                 .clone()
                 .unwrap_or_default(),
             request_prefix_base: native_request_prefix(journal.context_events()),
+            system_prompt_override: native_system_override(journal.context_events().iter()),
             declaration_base: native_provider
                 .then(|| native_declarations(journal.context_events()))
                 .flatten(),
@@ -7725,6 +7767,38 @@ fn native_conversation_with_images(
                 conversation.extend(unresolved_prompts);
                 native_structured_in_turn = false;
             }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == NATIVE_CONTEXT_EDIT_EVENT =>
+            {
+                // The agent's edit replaces the conversation; the turn stays
+                // native so its generic mirrors are dropped. With
+                // `preserve_tail_from` the edit is a prefix materialized
+                // against the journal: the canonical conversation at this
+                // marker keeps everything from that index on, so a result or
+                // steer journaled after the tool's snapshot is neither lost
+                // nor run again. Without it the edit is the full conversation.
+                let edited: Vec<borg_provider::provider::ModelMessage> =
+                    serde_json::from_value(payload.get("messages").cloned().unwrap_or_default())
+                        .context(
+                            "durable native context edit does not match the model-turn contract",
+                        )?;
+                let tail_from = payload
+                    .get("preserve_tail_from")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok());
+                let mut current = std::mem::take(&mut conversation);
+                current.append(&mut pending_native);
+                conversation = edited;
+                if let Some(tail_from) = tail_from {
+                    crate::native_harness::canonicalize_native_messages(&mut current);
+                    conversation.extend(current.split_off(tail_from.min(current.len())));
+                }
+                pending_native.clear();
+                pending_generic.clear();
+                failed_prompts.clear();
+                degraded_tail_copies = None;
+                native_structured_in_turn = true;
+            }
             SessionEventKind::ContextCleared => {
                 pending_native.clear();
                 pending_generic.clear();
@@ -8136,6 +8210,46 @@ fn compaction_restarts_replay(payload: &Value) -> bool {
 /// base rather than inheriting one from a generation that has ended.
 const COMPACTION_RETAINED_DECLARATIONS_FIELD: &str = "retained_declarations";
 
+/// An agent's replacement of its own native context: `system_prompt` and the
+/// full conversation after the leading system message.
+pub(crate) const NATIVE_CONTEXT_EDIT_EVENT: &str = "native_context_edit";
+
+/// Field on a completed `context_compaction` carrying the system prompt an
+/// earlier context edit put in force. Recovery starts at the boundary, so the
+/// edit itself is out of reach afterwards; `RuntimeSessionStore` fills the
+/// field on every boundary it journals where it is absent or null.
+const COMPACTION_RETAINED_SYSTEM_OVERRIDE_FIELD: &str = "retained_system_override";
+
+/// The system prompt a context edit put in force at the end of `events`.
+pub(crate) fn native_system_override<'a>(
+    events: impl DoubleEndedIterator<Item = &'a SessionEvent>,
+) -> Option<String> {
+    for event in events.rev() {
+        match &event.kind {
+            SessionEventKind::ContextCleared => return None,
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == NATIVE_CONTEXT_EDIT_EVENT =>
+            {
+                // A history-only edit leaves the system prompt as it was.
+                if let Some(system_prompt) = payload.get("system_prompt").and_then(Value::as_str) {
+                    return Some(system_prompt.to_string());
+                }
+            }
+            kind if starts_context_generation(kind) => {
+                let SessionEventKind::ProviderEvent { payload, .. } = kind else {
+                    return None;
+                };
+                return payload
+                    .get(COMPACTION_RETAINED_SYSTEM_OVERRIDE_FIELD)
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub(crate) fn restored_native_context_tokens(
     events: &[SessionEvent],
     provider: CodingProvider,
@@ -8165,7 +8279,9 @@ pub(crate) fn restored_native_context_tokens(
                 ));
             }
             SessionEventKind::ProviderEvent { kind, .. }
-                if kind == "context_compaction" || kind == "context_microcompaction" =>
+                if kind == "context_compaction"
+                    || kind == "context_microcompaction"
+                    || kind == NATIVE_CONTEXT_EDIT_EVENT =>
             {
                 return None;
             }
@@ -8814,6 +8930,7 @@ async fn run_retained_compaction(
             system_prompt_appendix: RETAINED_COMPACTION_SYSTEM_PROMPT.to_string(),
             declaration_base: None,
             request_prefix_base: None,
+            system_prompt_override: None,
             prompt_context_base: Default::default(),
             answers_human: false,
             volatile_system_prompt_appendix: crate::provider_capabilities_prompt(

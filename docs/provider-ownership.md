@@ -11,6 +11,21 @@ This is an ownership boundary, not a requirement to reimplement every library.
 Use provider-specific transport and authentication code where it serves this
 boundary without importing another agent loop.
 
+## Current routing (2026-10-02)
+
+Codex and Claude now run on Borg's native model loop by default. Anthropic,
+Kimi, GLM, Qwen, OpenRouter, Vercel and OpenAI-compatible routes also use that
+loop; selected OpenCode Go models are session-native. Other OpenCode routes,
+Grok Build and Muse Code retain compatibility CLI loops. The native routes
+support [agent-controlled model context](model-context.md), with runtime
+permissions and account/billing authority kept outside editable messages.
+
+See `LocalAgentTurnExecutor::uses_native_harness` / `for_session` in
+[agent.rs](../crates/borg-agent-runtime/src/agent.rs) and the provider defaults in
+[contract.rs](../crates/borg-agent-runtime/src/contract.rs). The dated migration
+evidence below records earlier stages; its historical descriptions do not
+supersede this current routing summary.
+
 ## Target boundary
 
 | Responsibility | Owner |

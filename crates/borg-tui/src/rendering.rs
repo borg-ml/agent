@@ -687,6 +687,7 @@ fn highlighted_diff_lines(
         .map(|mut line| {
             let gutter = gutter.take().unwrap_or_else(|| continuation.clone());
             line.spans.insert(0, gutter);
+            line.style = line.style.patch(base_style);
             line
         })
         .collect()
@@ -723,10 +724,8 @@ fn highlighted_source_spans(
         remaining = remaining.saturating_sub(UnicodeWidthStr::width(content.as_str()));
         spans.push(Span::styled(content, base_style.fg(fallback_color)));
     }
-    // Only the changed text carries its colour; a full-width bar on every
-    // row turns a rewritten section into one solid block.
     if remaining > 0 {
-        spans.push(Span::raw(" ".repeat(remaining)));
+        spans.push(Span::styled(" ".repeat(remaining), base_style));
     }
     spans
 }
@@ -933,7 +932,10 @@ fn split_diff_row(
         syntax.before.as_mut(),
         syntax.syntaxes,
     );
-    spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        " │ ",
+        Style::default().fg(Color::DarkGray).bg(Color::Reset),
+    ));
     spans.extend(split_diff_pane(
         after_number,
         '+',
@@ -944,7 +946,11 @@ fn split_diff_row(
         syntax.after.as_mut(),
         syntax.syntaxes,
     ));
-    Line::from(spans)
+    Line::from(spans).style(Style::default().bg(if before_number.is_some() {
+        DIFF_REMOVED_BG
+    } else {
+        DIFF_ADDED_BG
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -963,7 +969,7 @@ fn split_diff_pane(
     let Some(_) = number else {
         return vec![Span::styled(
             pad_cells(&prefix, width),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::DarkGray).bg(Color::Reset),
         )];
     };
     let base_style = Style::default().bg(background);

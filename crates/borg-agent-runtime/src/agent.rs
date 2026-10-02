@@ -232,6 +232,9 @@ pub struct AgentTurn {
     /// shown.
     pub(crate) declaration_base: Option<crate::prompt_context::Declarations>,
     pub(crate) request_prefix_base: Option<crate::NativeRequestPrefix>,
+    /// System prompt the agent set for itself with a context edit, in force
+    /// instead of the computed one until the context is cleared.
+    pub(crate) system_prompt_override: Option<String>,
     /// Each prompt-context slot's last recorded text in this context
     /// generation, so the turn appends a slot only when it changed.
     pub(crate) prompt_context_base:
@@ -2863,6 +2866,7 @@ mod tests {
             system_prompt_appendix: "extension context".to_string(),
             declaration_base: None,
             request_prefix_base: None,
+            system_prompt_override: None,
             prompt_context_base: Default::default(),
             answers_human: false,
             volatile_system_prompt_appendix: "usage: 5-hour 65% left".to_string(),
