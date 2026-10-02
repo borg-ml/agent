@@ -359,13 +359,40 @@ pub(crate) fn local_session_owner_is_active_with_pid(
         return owner_process_matches_metadata(&metadata);
     }
     // An existing but malformed owner record must not weaken identity checks.
-    if session_control_owner_path(sessions_dir, session_id).try_exists()? {
-        return Ok(false);
+    let owner_path = session_control_owner_path(sessions_dir, session_id);
+    match fs::symlink_metadata(&owner_path) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {}", owner_path.display()));
+        }
     }
-    Ok(recorded_pid
+    let Some(pid) = recorded_pid
         .and_then(|pid| u32::try_from(pid).ok())
         .filter(|pid| *pid > 0)
-        .is_some_and(process_is_alive))
+    else {
+        return Ok(false);
+    };
+    // A reused, unrelated PID is not evidence of a hosted child owner.
+    #[cfg(target_os = "linux")]
+    {
+        if !process_is_alive(pid) {
+            return Ok(false);
+        }
+        process_holds_lock(
+            pid,
+            &sessions_dir
+                .join("subagents")
+                .join(format!("{session_id}.lock")),
+        )
+    }
+    // Without process-level child lease evidence, retain the metadata-only rule.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        Ok(false)
+    }
 }
 
 fn read_local_session_owner_metadata(
@@ -2007,6 +2034,33 @@ mod tests {
             .prefix("borg-session-")
             .tempdir_in(temp_root)
             .expect("short Unix socket test directory")
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn hosted_child_fallback_requires_its_writer_lease_and_valid_metadata() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let pid = Some(i64::from(std::process::id()));
+        let active =
+            || local_session_owner_is_active_with_pid(root.path(), session_id, pid).unwrap();
+        assert!(!active()); // An alive but unrelated recorded PID is insufficient.
+        let path = root
+            .path()
+            .join("subagents")
+            .join(format!("{session_id}.lock"));
+        let writer = SessionWriterLease::try_acquire(&path).unwrap().unwrap();
+        assert!(active());
+        assert!(!local_session_owner_is_active(root.path(), session_id).unwrap());
+        let metadata = session_control_owner_path(root.path(), session_id);
+        fs::write(&metadata, b"malformed").unwrap();
+        assert!(!active()); // A held child lease must not bypass an existing bad record.
+        fs::remove_file(&metadata).unwrap();
+        std::os::unix::fs::symlink(root.path().join("absent.owner"), &metadata).unwrap();
+        assert!(!active()); // A dangling owner record is present, not absent.
+        fs::remove_file(metadata).unwrap();
+        drop(writer);
+        assert!(!active());
     }
 
     #[tokio::test]
