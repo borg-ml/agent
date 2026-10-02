@@ -6004,8 +6004,12 @@ impl SubagentCoordinator {
                 // reports its own reach. Rows whose owner is gone for good are
                 // tombstoned here as well, so repeated broadcasts converge on
                 // the live set instead of re-probing years of dead sessions.
-                if !crate::local_session_owner_is_active(&self.journal_root, participant_id)
-                    .unwrap_or(false)
+                if !crate::local_control::local_session_owner_is_active_with_pid(
+                    &self.journal_root,
+                    participant_id,
+                    instance.pid,
+                )
+                .unwrap_or(false)
                 {
                     reap.push(participant_id);
                 }
@@ -6093,6 +6097,18 @@ impl SubagentCoordinator {
             return Ok(());
         };
         let ours = instance.pid.is_some() || (own_host.is_some() && instance.host_id == own_host);
+        // Discovery in older owners retired hosted children without control
+        // metadata. A positively live supervisor overrides that stale tombstone;
+        // admission still goes through the recipient's normal stop/wake policy.
+        if ours
+            && crate::local_control::local_session_owner_is_active_with_pid(
+                &self.journal_root,
+                target,
+                instance.pid,
+            )?
+        {
+            return Ok(());
+        }
         let dead = instance.exited_at.is_some()
             || instance
                 .pid
@@ -7066,9 +7082,10 @@ impl SubagentCoordinator {
                     let live =
                         local && crate::session_control_socket_is_reachable(&socket_path).await;
                     let owner_running = local
-                        && crate::local_session_owner_is_active(
+                        && crate::local_control::local_session_owner_is_active_with_pid(
                             &self.journal_root,
                             instance.participant.id,
+                            instance.pid,
                         )
                         .unwrap_or(false);
                     // A local row whose owner is gone is dead for good: nothing

@@ -344,10 +344,28 @@ pub fn local_session_owner_uses_current_binary(
 /// Whether the recorded local session owner process is still alive, regardless
 /// of which Borg frontend binary is asking.
 pub fn local_session_owner_is_active(sessions_dir: &Path, session_id: Uuid) -> Result<bool> {
-    let Some(metadata) = read_local_session_owner_metadata(sessions_dir, session_id)? else {
+    local_session_owner_is_active_with_pid(sessions_dir, session_id, None)
+}
+
+/// In-process children publish their supervisor's pid in the instance registry,
+/// not a separate control server. Missing control metadata is not a dead owner.
+/// When metadata is present, retain its process identity/start-time checks.
+pub(crate) fn local_session_owner_is_active_with_pid(
+    sessions_dir: &Path,
+    session_id: Uuid,
+    recorded_pid: Option<i64>,
+) -> Result<bool> {
+    if let Some(metadata) = read_local_session_owner_metadata(sessions_dir, session_id)? {
+        return owner_process_matches_metadata(&metadata);
+    }
+    // An existing but malformed owner record must not weaken identity checks.
+    if session_control_owner_path(sessions_dir, session_id).try_exists()? {
         return Ok(false);
-    };
-    owner_process_matches_metadata(&metadata)
+    }
+    Ok(recorded_pid
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .is_some_and(process_is_alive))
 }
 
 fn read_local_session_owner_metadata(
