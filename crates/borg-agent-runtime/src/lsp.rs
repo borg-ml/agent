@@ -1417,7 +1417,9 @@ coverage was not determined",
         {
             status["sourceNewerThanDatabase"] = Value::Bool(true);
             status["staleAgainstSource"] = Value::Bool(true);
-            status["timestampCaveat"] = json!("Source mtime alone does not prove compilation flags are stale; source edits normally postdate the database.");
+            status["timestampCaveat"] = json!(
+                "Source mtime alone does not prove compilation flags are stale; source edits normally postdate the database."
+            );
         }
     }
     Some(status)
