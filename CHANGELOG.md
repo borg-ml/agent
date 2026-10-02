@@ -5,6 +5,16 @@ Git comparison.
 
 ## Unreleased (since 0.13.6)
 
+### Reliability
+
+- Local session hosts wait for working subagents, including child background
+  processes and watches, before idle shutdown or automatic upgrades. Losing
+  terminal input no longer cancels a busy team just because its director is idle.
+- GUI team rosters are restored separately from the bounded transcript history,
+  so quiet workers remain visible when reopening long sessions or viewing a child.
+- Open GUI windows count as attached viewers, keeping their session host alive.
+  Closing the view releases its presence without sending a stop command.
+
 ## 0.13.6 (2026-10-02)
 
 ### Terminal UI

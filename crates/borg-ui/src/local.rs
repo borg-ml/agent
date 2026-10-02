@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use borg_remote::{
-    EventActor, HostCommand, MessageStatus, SessionConfigAction, SessionEvent, SessionEventKind,
-    SessionStore, SubagentAction, default_host_config_path, local_session_owner_is_active,
-    login_provider_with_output, send_local_session_command, session_control_socket_path,
+    EventActor, HostCommand, MessageStatus, RecoveryParts, SessionConfigAction, SessionEvent,
+    SessionEventKind, SessionStore, SubagentAction, SubagentSnapshot, default_host_config_path,
+    local_session_owner_is_active, login_provider_with_output, send_local_session_command,
+    session_control_socket_path,
 };
 use uuid::Uuid;
 
@@ -454,6 +455,15 @@ pub struct LocalSessionClient {
     live_events: HashMap<String, borg_remote::SessionEvent>,
     live_revision: u64,
     root_session_id: Uuid,
+    /// Root journal sequence already merged into `view.agents`. The roster is
+    /// seeded from the complete team history, so later root events only move
+    /// it forward and bounded transcript trims never drop a child.
+    team_sequence: u64,
+    /// Held connection to the root owner's presence socket. The host counts
+    /// it as an attached viewer, so its idle TTL never stops a session the
+    /// GUI is showing; it is dropped with the client.
+    #[cfg(unix)]
+    presence: Option<tokio::net::UnixStream>,
     timeline: TimelineProjector,
     recalled_prompts: Vec<(String, Vec<PathBuf>)>,
     composer_history: Arc<Vec<String>>,
@@ -523,10 +533,27 @@ impl LocalSessionClient {
             agents: Vec::new(),
             cwd,
         };
-        if session_id != root_session_id {
-            view.overlay_agent_plan(&store.state(root_session_id).await?);
+        let root_state = if session_id == root_session_id {
+            view.state.clone()
+        } else {
+            let root_state = store.state(root_session_id).await?;
+            view.overlay_agent_plan(&root_state);
+            root_state
+        };
+        let fork_team = store.fork_team_events(root_session_id).await?;
+        let mut team = store
+            .recovery_parts(root_session_id, RecoveryParts::SUBAGENTS)
+            .await?
+            .subagent_events;
+        team.sort_by_key(|event| event.sequence);
+        for event in &fork_team {
+            if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind {
+                upsert_agent(&mut view.agents, agent);
+            }
         }
-        rebuild_agents(&mut view);
+        let mut team_sequence = 0;
+        merge_team_events(&mut view.agents, &mut team_sequence, &team);
+        let team_sequence = team_sequence.max(root_state.latest_sequence);
         let durable_history = view.history.as_ref().clone();
         let timeline = TimelineProjector::from_events(&durable_history);
         let composer_history = store
@@ -546,10 +573,14 @@ impl LocalSessionClient {
             live_events: HashMap::new(),
             live_revision: 0,
             root_session_id,
+            team_sequence,
+            #[cfg(unix)]
+            presence: None,
             timeline,
             recalled_prompts: Vec::new(),
             composer_history: Arc::new(composer_history),
         };
+        client.maintain_presence().await;
         client.refresh_live().await?;
         client.rebuild_history();
         Ok(Some(client))
@@ -573,11 +604,22 @@ impl LocalSessionClient {
     }
 
     pub async fn refresh(&mut self) -> Result<bool> {
+        self.maintain_presence().await;
         let events = self
             .store
             .events_after(self.view.session_id, self.view.state.latest_sequence, 1_024)
             .await?;
         let mut changed = !events.is_empty();
+        if self.view.session_id == self.root_session_id {
+            merge_team_events(&mut self.view.agents, &mut self.team_sequence, &events);
+        } else {
+            let root_events = self
+                .store
+                .events_after(self.root_session_id, self.team_sequence, 1_024)
+                .await?;
+            changed |=
+                merge_team_events(&mut self.view.agents, &mut self.team_sequence, &root_events);
+        }
         for event in events {
             if event.kind.is_recallable_user_message()
                 && let SessionEventKind::Message { text, .. } = &event.kind
@@ -623,8 +665,38 @@ impl LocalSessionClient {
         if let Some(configuration) = &self.view.state.configuration {
             self.view.cwd = configuration.cwd.clone();
         }
-        rebuild_agents(&mut self.view);
         Ok(true)
+    }
+
+    /// Keep one presence attachment to the current root owner, reconnecting
+    /// after the owner exits or is replaced (its end of the socket closes).
+    async fn maintain_presence(&mut self) {
+        #[cfg(unix)]
+        {
+            use tokio::io::AsyncReadExt;
+
+            if let Some(stream) = &self.presence {
+                let mut byte = [0_u8; 1];
+                match stream.try_read(&mut byte) {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                    Ok(1..) => return,
+                    Ok(0) | Err(_) => self.presence = None,
+                }
+            }
+            let path = borg_remote::session_control_presence_socket_path(
+                &self.sessions_dir,
+                self.root_session_id,
+            );
+            self.presence = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+                let mut stream = tokio::net::UnixStream::connect(path).await.ok()?;
+                let mut acknowledgement = [0_u8; 1];
+                stream.read_exact(&mut acknowledgement).await.ok()?;
+                Some(stream)
+            })
+            .await
+            .ok()
+            .flatten();
+        }
     }
 
     fn take_recalled_prompts(&mut self) -> Vec<(String, Vec<PathBuf>)> {
@@ -702,7 +774,6 @@ impl LocalSessionClient {
         self.durable_history = older;
         self.timeline = TimelineProjector::from_events(&self.durable_history);
         self.rebuild_history();
-        rebuild_agents(&mut self.view);
         Ok(true)
     }
 
@@ -1018,19 +1089,213 @@ pub fn peer_host_commands(
     }
 }
 
-fn rebuild_agents(view: &mut SessionView) {
-    view.agents.clear();
-    for event in view.history.iter() {
-        if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind {
-            if let Some(existing) = view
-                .agents
-                .iter_mut()
-                .find(|existing| existing.session_id == agent.session_id)
-            {
-                *existing = agent.clone();
-            } else {
-                view.agents.push(agent.clone());
-            }
+/// Apply root journal events past `sequence` to the team roster. Events at or
+/// below it (an older history page, a re-read window) were already reflected,
+/// so they can never roll a child back to an earlier snapshot. Returns whether
+/// the roster changed.
+fn merge_team_events(
+    agents: &mut Vec<SubagentSnapshot>,
+    sequence: &mut u64,
+    events: &[SessionEvent],
+) -> bool {
+    let mut changed = false;
+    for event in events {
+        if event.sequence <= *sequence {
+            continue;
         }
+        *sequence = event.sequence;
+        if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind {
+            upsert_agent(agents, agent);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn upsert_agent(agents: &mut Vec<SubagentSnapshot>, agent: &SubagentSnapshot) {
+    if let Some(existing) = agents
+        .iter_mut()
+        .find(|existing| existing.session_id == agent.session_id)
+    {
+        *existing = agent.clone();
+    } else {
+        agents.push(agent.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use borg_remote::session_store::postgres::testing;
+    use borg_remote::{CodingProvider, SubagentActivityKind, SubagentStatus, SubagentUsage};
+
+    fn short_sessions_dir() -> tempfile::TempDir {
+        // Unix socket paths are short; keep the presence socket under the limit.
+        #[cfg(unix)]
+        {
+            tempfile::Builder::new()
+                .prefix("bui")
+                .tempdir_in("/tmp")
+                .unwrap()
+        }
+        #[cfg(not(unix))]
+        {
+            tempfile::tempdir().unwrap()
+        }
+    }
+
+    fn agent(root: Uuid, child: Uuid, status: SubagentStatus) -> SessionEvent {
+        SessionEvent::new(
+            root,
+            0,
+            SessionEventKind::SubagentActivity {
+                activity: SubagentActivityKind::Updated,
+                agent: SubagentSnapshot {
+                    session_id: child,
+                    parent_session_id: root,
+                    task_name: "worker".into(),
+                    status,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: false,
+                    ultrafast: false,
+                    cwd: PathBuf::from("."),
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                    detail: None,
+                    final_text: None,
+                    usage: SubagentUsage::default(),
+                    interrupted_by: None,
+                },
+                event: None,
+            },
+        )
+    }
+
+    fn filler(root: Uuid, count: usize) -> Vec<SessionEvent> {
+        (0..count)
+            .map(|index| {
+                SessionEvent::new(
+                    root,
+                    0,
+                    SessionEventKind::Error {
+                        message: format!("filler {index}"),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn roster(client: &LocalSessionClient) -> Vec<(Uuid, SubagentStatus)> {
+        client
+            .view()
+            .agents
+            .iter()
+            .map(|agent| (agent.session_id, agent.status))
+            .collect()
+    }
+
+    async fn refresh_to_tail(client: &mut LocalSessionClient) {
+        while client.refresh().await.unwrap() {}
+    }
+
+    #[tokio::test]
+    async fn reopened_gui_keeps_children_older_than_the_transcript_window() {
+        let (scratch, store) = testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        let sessions = short_sessions_dir();
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        store.create_session(root).await.unwrap();
+        let mut events = vec![agent(root, child, SubagentStatus::Running)];
+        events.extend(filler(root, 2_500));
+        store.append_batch(events).await.unwrap();
+
+        let mut client = LocalSessionClient::open_from_store(
+            Arc::clone(&store),
+            sessions.path().into(),
+            root,
+            root,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(roster(&client), [(child, SubagentStatus::Running)]);
+
+        store.append_batch(filler(root, 2_500)).await.unwrap();
+        refresh_to_tail(&mut client).await;
+        assert_eq!(roster(&client), [(child, SubagentStatus::Running)]);
+
+        store
+            .append(agent(root, child, SubagentStatus::Ready))
+            .await
+            .unwrap();
+        refresh_to_tail(&mut client).await;
+        client.load_older_history().await.unwrap();
+        assert_eq!(roster(&client), [(child, SubagentStatus::Ready)]);
+
+        // Viewing the child still shows the root's team.
+        store.create_session(child).await.unwrap();
+        let focused = LocalSessionClient::open_from_store(
+            Arc::clone(&store),
+            sessions.path().into(),
+            child,
+            root,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(roster(&focused), [(child, SubagentStatus::Ready)]);
+        scratch.discard().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_gui_counts_as_an_attached_viewer_until_dropped() {
+        let (scratch, store) = testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        let sessions = short_sessions_dir();
+        let root = Uuid::new_v4();
+        store.create_session(root).await.unwrap();
+        let writer = borg_remote::SessionWriterLease::try_acquire(
+            &sessions.path().join(format!("{root}.lock")),
+        )
+        .unwrap()
+        .unwrap();
+        let (owner_tx, mut owner_rx) = tokio::sync::mpsc::channel(1);
+        let server = borg_remote::LocalSessionControlServer::start(
+            session_control_socket_path(sessions.path(), root),
+            root,
+            &writer,
+            owner_tx,
+        )
+        .unwrap();
+        assert!(!server.has_attached_viewers());
+
+        let client = LocalSessionClient::open_from_store(
+            Arc::clone(&store),
+            sessions.path().into(),
+            root,
+            root,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(server.has_attached_viewers());
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while server.has_attached_viewers() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("closing the GUI releases its presence");
+        assert!(
+            owner_rx.try_recv().is_err(),
+            "closing the GUI must not stop the host"
+        );
+        scratch.discard().await;
     }
 }

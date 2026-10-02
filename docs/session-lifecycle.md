@@ -24,10 +24,17 @@ durable journal.
 ## Idle shutdown
 
 A detached host remains alive while a turn is starting or running, an approval
-or provider response is pending, a prompt is being admitted, or any viewer is
-attached. When the session is ready, has no pending prompt, and has no viewers,
+or provider response is pending, a prompt is being admitted, any subagent is
+working or has a background process/watch, or any terminal/GUI viewer is
+attached. When the whole team is idle, has no pending prompt, and has no viewers,
 the host waits five minutes and then exits. Resuming the session starts a new
 host from its journal.
+
+Reopening with a newer Borg build does not replace an older session host while
+its children are working. Automatic host upgrades wait for the team to settle;
+installing a binary alone does not change the code running in that host.
+The GUI restores the team roster separately from its bounded transcript history,
+so a quiet worker does not disappear just because its last event is old.
 
 Ephemeral, JSON, print, and other non-interactive executions retain their
 bounded command lifetime and do not create this detached interactive host.

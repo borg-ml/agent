@@ -1903,8 +1903,38 @@ impl LocalSessionAccess {
     }
 }
 
-fn stale_local_owner_can_handoff(status: Option<SessionStatus>) -> bool {
-    matches!(status, Some(SessionStatus::Ready | SessionStatus::Stopped))
+fn stale_local_owner_can_handoff(status: Option<SessionStatus>, subagents_working: bool) -> bool {
+    !subagents_working && matches!(status, Some(SessionStatus::Ready | SessionStatus::Stopped))
+}
+
+async fn local_subagents_are_idle(store: &dyn SessionStore, session_id: Uuid) -> Result<bool> {
+    let agents = latest_subagent_snapshots(&restored_team_history(store, session_id).await?);
+    for agent in agents {
+        let state = store.state(agent.session_id).await?;
+        let status = state.status.unwrap_or(SessionStatus::Starting);
+        if matches!(
+            status,
+            SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval
+        ) || !state.active_processes.is_empty()
+            || state.watches.iter().any(|watch| watch.running)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn session_host_is_idle(
+    state: &SessionState,
+    prompt_submission_pending: bool,
+    subagents_working: bool,
+    viewers_attached: bool,
+) -> bool {
+    state.status == Some(SessionStatus::Ready)
+        && state.active_processes.is_empty()
+        && !prompt_submission_pending
+        && !subagents_working
+        && !viewers_attached
 }
 
 fn local_owner_rejected_newer_schema(event: &SessionEvent) -> bool {
@@ -1953,10 +1983,12 @@ fn owner_shutdown_should_handoff_to_viewer(
     access: LocalSessionAccess,
     status: SessionStatus,
     prompt_submission_pending: bool,
+    subagents_working: bool,
     control_server: Option<&LocalSessionControlServer>,
 ) -> bool {
     access == LocalSessionAccess::Owned
         && (prompt_submission_pending
+            || subagents_working
             || matches!(
                 status,
                 SessionStatus::Starting
@@ -2542,17 +2574,17 @@ async fn run_local_agent_session(
     } else {
         (Vec::new(), Vec::new())
     };
-    // The root transcript needs the complete child identity set before its
-    // first replay. Include a fork's takeover roster: child activity is not
-    // inherited with the root transcript.
-    let team_snapshots = if resuming && can_prompt && !fallback_terminal {
-        let team = restored_team_history(store.as_ref(), session_id)
-            .await
-            .context("failed to restore the team roster before transcript replay")?;
-        latest_subagent_snapshots(&team)
-    } else {
-        tail_team_snapshots
-    };
+    // Views need the complete roster before replay; headless hosts need it
+    // for idle/upgrade safety. Include the fork's takeover roster too.
+    let team_snapshots =
+        if resuming && ((can_prompt && !fallback_terminal) || args.session_host.is_some()) {
+            let team = restored_team_history(store.as_ref(), session_id)
+                .await
+                .context("failed to restore the team roster before transcript replay")?;
+            latest_subagent_snapshots(&team)
+        } else {
+            tail_team_snapshots
+        };
     // The initial host prompt keeps its admission key across startup retries.
     let request_id = if args.session_host.is_some() {
         session_id
@@ -3094,26 +3126,29 @@ async fn run_local_agent_session(
     let mut projection_tail_repair_task: Option<ProjectionGapRepairTask> = None;
     let mut projection_tail_tick = tokio::time::interval(std::time::Duration::from_millis(500));
     projection_tail_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut stale_owner_handoff_task: Option<StaleOwnerHandoffTask> =
-        if stale_local_owner && stale_local_owner_can_handoff(session_state.status) {
-            let lock_path = lock_path.clone();
-            let socket_path = control_socket_path.clone();
-            let store = Arc::clone(&store);
-            Some(tokio::spawn(async move {
-                // Prompt admission precedes the durable Starting event. Recheck
-                // after a scheduling window without delaying the first frame.
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if stale_local_owner_can_handoff(store.state(session_id).await?.status) {
-                    let _writer =
-                        stop_stale_local_owner_and_acquire(&lock_path, &socket_path, session_id)
-                            .await?;
-                    return Ok(true);
-                }
-                Ok(false)
-            }))
-        } else {
-            None
-        };
+    let mut stale_owner_handoff_task: Option<StaleOwnerHandoffTask> = if stale_local_owner
+        && stale_local_owner_can_handoff(session_state.status, !working_subagents.is_empty())
+    {
+        let lock_path = lock_path.clone();
+        let socket_path = control_socket_path.clone();
+        let store = Arc::clone(&store);
+        Some(tokio::spawn(async move {
+            // Prompt admission precedes the durable Starting event. Recheck
+            // after a scheduling window without delaying the first frame.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if stale_local_owner_can_handoff(store.state(session_id).await?.status, false)
+                && local_subagents_are_idle(store.as_ref(), session_id).await?
+            {
+                let _writer =
+                    stop_stale_local_owner_and_acquire(&lock_path, &socket_path, session_id)
+                        .await?;
+                return Ok(true);
+            }
+            Ok(false)
+        }))
+    } else {
+        None
+    };
     let mut ui_interaction_completions_open = true;
     let mut editor_preferences_errors_open = true;
     let mut payload_hydration_results_open = true;
@@ -3189,19 +3224,20 @@ async fn run_local_agent_session(
                 }
             }
             _ = session_host_tick.tick(), if args.session_host.is_some() => {
-                let unattended_idle = status == SessionStatus::Ready
-                    && delivered_projection.state().active_processes.is_empty()
-                    && !local_prompt_submission_pending(
-                        &pending_prompt_ids,
-                        &local_prompt_admissions,
-                    )
-                    && control_server
-                        .as_ref()
-                        .is_some_and(|server| !server.has_attached_viewers());
+                let unattended_idle = session_host_is_idle(
+                    delivered_projection.state(),
+                    local_prompt_submission_pending(&pending_prompt_ids, &local_prompt_admissions),
+                    !working_subagents.is_empty(),
+                    control_server.as_ref().is_none_or(|server| server.has_attached_viewers()),
+                );
                 if unattended_idle {
                     let idle_since = session_host_idle_since
                         .get_or_insert_with(tokio::time::Instant::now);
                     if idle_since.elapsed() >= SESSION_HOST_IDLE_TTL && !stop_sent {
+                        if !local_subagents_are_idle(store.as_ref(), session_id).await? {
+                            session_host_idle_since = None;
+                            continue;
+                        }
                         tracing::info!(%session_id, "detached session host reached its idle TTL");
                         stop_sent = true;
                         user_requested_exit = true;
@@ -4184,7 +4220,7 @@ async fn run_local_agent_session(
                                 SessionEventKind::StatusChanged {
                                     status: SessionStatus::Ready,
                                     ..
-                                }
+                                } | SessionEventKind::SubagentActivity { .. }
                             ));
                     if let Some(server) = control_server.as_ref() {
                         server.publish_live_event(&event);
@@ -4441,7 +4477,7 @@ async fn run_local_agent_session(
                     } else if !detached_from_terminal {
                         render_event(&event, args.json, args.print, &mut rendered)?;
                     }
-                    if handoff_stale_owner {
+                    if handoff_stale_owner && working_subagents.is_empty() {
                         let socket_path = control_socket_path.clone();
                         let lock_path = lock_path.clone();
                         let sessions_dir = sessions_dir.clone();
@@ -4453,7 +4489,8 @@ async fn run_local_agent_session(
                         stale_owner_handoff_task = Some(tokio::spawn(async move {
                             if local_session_owner_uses_current_binary(&sessions_dir, session_id)?
                                 || (!schema_rejected
-                                    && !stale_local_owner_can_handoff(store.state(session_id).await?.status))
+                                    && !stale_local_owner_can_handoff(store.state(session_id).await?.status, false))
+                                || !local_subagents_are_idle(store.as_ref(), session_id).await?
                             {
                                 return Ok(false);
                             }
@@ -4535,6 +4572,7 @@ async fn run_local_agent_session(
                     }
                     if handoff_on_safe_boundary
                         && status == SessionStatus::Ready
+                        && working_subagents.is_empty()
                         && !stop_sent
                     {
                         // The owner has been asked to leave, but a viewer is
@@ -5124,6 +5162,7 @@ async fn run_local_agent_session(
                                 &pending_prompt_ids,
                                 &local_prompt_admissions,
                             ),
+                            !working_subagents.is_empty(),
                             control_server.as_ref(),
                         ) {
                             handoff_on_safe_boundary = true;
@@ -5198,14 +5237,17 @@ async fn run_local_agent_session(
                             session_access,
                             status,
                             attached_prompt_pending,
+                            !working_subagents.is_empty(),
                             control_server.as_ref(),
                         );
                         let terminal_draft = terminal
                             .as_ref()
                             .and_then(BorgTerminal::composer_draft);
                         shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
-                        if should_detach_on_terminal_loss(status, attached_prompt_pending)
-                            || handoff_to_viewer
+                        if !session_access.is_attached()
+                            && (should_detach_on_terminal_loss(
+                                status, attached_prompt_pending, !working_subagents.is_empty(),
+                            ) || handoff_to_viewer)
                         {
                             if detached_prompt.is_none() {
                                 detached_prompt = terminal_draft;
@@ -6136,6 +6178,7 @@ async fn run_local_agent_session(
                                 &pending_prompt_ids,
                                 &local_prompt_admissions,
                             ),
+                            !working_subagents.is_empty(),
                             control_server.as_ref(),
                         ) {
                             handoff_on_safe_boundary = true;
@@ -7565,6 +7608,7 @@ async fn run_local_agent_session(
                                             &pending_prompt_ids,
                                             &local_prompt_admissions,
                                         ),
+                                        !working_subagents.is_empty(),
                                         control_server.as_ref(),
                                     ) {
                                         handoff_on_safe_boundary = true;
@@ -7829,16 +7873,18 @@ async fn run_local_agent_session(
                     session_access,
                     status,
                     attached_prompt_pending,
+                    !working_subagents.is_empty(),
                     control_server.as_ref(),
                 );
                 let terminal_draft = terminal
                     .as_ref()
                     .and_then(BorgTerminal::composer_draft);
                 shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
-                if should_detach_on_terminal_hangup(
+                if !session_access.is_attached() && should_detach_on_terminal_hangup(
                     signal,
                     status,
                     attached_prompt_pending,
+                    !working_subagents.is_empty(),
                 ) {
                     // A terminal emulator can disappear independently of Borg (for
                     // example, a GPU/renderer crash). Keep the durable actor and
@@ -8582,12 +8628,19 @@ fn should_detach_on_terminal_hangup(
     signal: &str,
     status: SessionStatus,
     prompt_submission_pending: bool,
+    subagents_working: bool,
 ) -> bool {
-    signal == "SIGHUP" && should_detach_on_terminal_loss(status, prompt_submission_pending)
+    signal == "SIGHUP"
+        && should_detach_on_terminal_loss(status, prompt_submission_pending, subagents_working)
 }
 
-fn should_detach_on_terminal_loss(status: SessionStatus, prompt_submission_pending: bool) -> bool {
+fn should_detach_on_terminal_loss(
+    status: SessionStatus,
+    prompt_submission_pending: bool,
+    subagents_working: bool,
+) -> bool {
     prompt_submission_pending
+        || subagents_working
         || matches!(
             status,
             SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval
