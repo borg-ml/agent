@@ -18483,7 +18483,7 @@ fn status_number_shortcuts_use_platform_modifier_not_generic_super() {
 }
 
 #[test]
-fn empty_projected_plan_stays_invisible_until_there_is_work() {
+fn empty_plans_stay_hidden_and_updates_render_the_current_checklist() {
     let session = Uuid::new_v4();
     let participant_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
@@ -18530,20 +18530,24 @@ fn empty_projected_plan_stays_invisible_until_there_is_work() {
         },
     ));
     let lines = transcript.lines(80);
-    for (content, background) in [
-        ("Old step", rendering::DIFF_REMOVED_BG),
-        ("New step", rendering::DIFF_ADDED_BG),
-    ] {
-        let line = lines
+    assert!(
+        !lines
             .iter()
-            .find(|line| line.to_string().contains(content))
-            .unwrap();
-        assert!(
-            line.spans
-                .iter()
-                .any(|span| span.style.bg == Some(background))
-        );
-    }
+            .any(|line| line.to_string().contains("Old step"))
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.to_string().contains("New step"))
+            .count(),
+        1
+    );
+    assert!(lines.iter().all(|line| line.spans.iter().all(|span| {
+        !matches!(
+            span.style.bg,
+            Some(rendering::DIFF_ADDED_BG | rendering::DIFF_REMOVED_BG)
+        )
+    })));
 }
 
 #[test]
