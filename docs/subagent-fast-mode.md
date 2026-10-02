@@ -19,8 +19,11 @@ explicitly first. New children inherit live speed only on the same provider/mode
 route and revalidate fast support before reservation. Idle-worker reuse respects
 fast mode; resumed children retain their own saved mode.
 
-The roster's `fast` field records requested configuration, not proof the server
-accepted priority or that latency improved. Inspect actual provider request/response
+The TUI subagent menu has a compact `Mode` column: ordinary mode is blank,
+`fast` is shown for fast mode, and `ultrafast` takes precedence when enabled.
+The column hides first on narrow terminals, preserving the existing roster columns.
+These labels reflect requested configuration, not proof the server accepted
+priority or that latency improved. Inspect actual provider request/response
 and usage evidence separately. A source update does not hot-replace a running
 host's compiled schemas; existing processes need a planned upgrade. Do not restart
 an active director or workers merely to expose this flag.

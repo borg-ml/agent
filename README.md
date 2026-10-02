@@ -92,7 +92,10 @@ capabilities are discovered from that shell with `borg tools` and invoked with
 (`borg.send_message(target=..., message=...)`) and `import borg from "borg"` in
 Bun. Every such call shows in the transcript as a step of the command that made
 it. `borg tools --search QUERY` and `borg.tools("query")` find capabilities by
-name or purpose, and a malformed call answers with the expected signature. Code
+name or purpose, and a malformed call answers with the expected signature.
+SDK discovery also includes native tools, available skills, extension workflows
+and configured MCP tools; computed names use `borg.call(name, arguments)`.
+These calls keep the host's approval, confirmation and cancellation checks. Code
 whose state should last between calls runs through `runtime_exec`, a
 persistent Python or Bun namespace with `borg` preloaded, and the `harness`
 capability keeps evidence-backed prompt, memory and skill refinements that Borg
@@ -238,6 +241,8 @@ contract. Blu workflow files may use `.blu`, `.lua`, or `.luau` entrypoints.
 
 ## Documentation
 
+- [`docs/model-context.md`](docs/model-context.md) — agent-controlled model
+  context inspection and text-first editing, safety boundaries and recovery
 - [`docs/customization.md`](docs/customization.md) — agent interface settings,
   keybindings, alerts, trust policy, and native extensions
 - [`docs/session-lifecycle.md`](docs/session-lifecycle.md) — detached hosts,

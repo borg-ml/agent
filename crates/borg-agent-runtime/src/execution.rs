@@ -27,6 +27,25 @@ pub struct ExecutionCommandRequest {
     pub cancellation: Option<tokio_util::sync::CancellationToken>,
 }
 
+/// Host-only context of a live command. Never reconstruct runtime ancestry
+/// from socket arguments or a serialized/recovered process record.
+#[derive(Clone, Debug)]
+pub struct ExecutionCommandContext {
+    pub(crate) chain: crate::persistent_runtime::RuntimeHostCallChain,
+    pub cancellation: tokio_util::sync::CancellationToken,
+    pub approved: bool,
+}
+
+impl ExecutionCommandContext {
+    pub fn capture(cancellation: tokio_util::sync::CancellationToken, approved: bool) -> Self {
+        Self {
+            chain: crate::persistent_runtime::capture_runtime_host_call_chain(),
+            cancellation,
+            approved,
+        }
+    }
+}
+
 /// One stdin interaction with a process in an agent's execution world.
 #[derive(Debug, Clone)]
 pub struct ExecutionStdinRequest {
@@ -111,6 +130,16 @@ pub trait ExecutionProvider: Send + Sync {
 
     async fn command(&self, request: ExecutionCommandRequest) -> Result<ProcessSnapshot>;
 
+    /// Validate a host-issued command parent against this owner's live
+    /// process registry. Unsupported or recovered origins fail closed.
+    async fn command_context(
+        &self,
+        _owner_session_id: Uuid,
+        _parent: &str,
+    ) -> Result<Option<ExecutionCommandContext>> {
+        Ok(None)
+    }
+
     async fn write_stdin(&self, request: ExecutionStdinRequest) -> Result<ProcessSnapshot>;
 
     async fn terminate_session(&self, session_id: Uuid) -> Result<()>;
@@ -167,6 +196,14 @@ impl ExecutionProvider for LocalExecutionProvider {
                 &request.environment,
             )
             .await
+    }
+
+    async fn command_context(
+        &self,
+        owner_session_id: Uuid,
+        parent: &str,
+    ) -> Result<Option<ExecutionCommandContext>> {
+        Ok(self.processes.command_context(owner_session_id, parent))
     }
 
     async fn write_stdin(&self, request: ExecutionStdinRequest) -> Result<ProcessSnapshot> {

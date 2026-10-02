@@ -26,6 +26,7 @@ mod imported_memory;
 mod lane_tools;
 mod local_control;
 mod lsp;
+mod model_context;
 mod model_fallback;
 mod native_context;
 mod native_harness;
@@ -84,8 +85,8 @@ pub use autonomy::{
 pub use blu_workflow::{BluWorkflowRequest, BluWorkflowResult};
 pub use contract::*;
 pub use execution::{
-    ExecutionCommandRequest, ExecutionProvider, ExecutionReadRequest, ExecutionSearchRequest,
-    ExecutionStdinRequest, LocalExecutionProvider,
+    ExecutionCommandContext, ExecutionCommandRequest, ExecutionProvider, ExecutionReadRequest,
+    ExecutionSearchRequest, ExecutionStdinRequest, LocalExecutionProvider,
 };
 pub use extension_api::{
     EXTENSION_API_VERSION, EXTENSION_HOOK_EVENTS, ExtensionApiCommand, ExtensionApiHook,

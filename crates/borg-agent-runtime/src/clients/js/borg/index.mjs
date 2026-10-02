@@ -1,4 +1,6 @@
-// Borg's capabilities as async functions, for code run through `exec`.
+// Borg's catalog/native/MCP tools as async functions, for `exec` commands.
+// In runtime_exec, use the preloaded borg object instead of importing.
+// Calls retain host permission, approval, and human-confirmation checks.
 //
 //   import borg from "borg"            // Bun; Node: const borg = require("borg")
 //   await borg.send_message({ target: "/root/worker", message: report })
@@ -12,6 +14,14 @@ import net from "node:net";
 
 export class BorgError extends Error {
   name = "BorgError";
+}
+
+function toolArguments(args = {}) {
+  if (args === null) return {};
+  if (typeof args !== "object" || Array.isArray(args)) {
+    throw new TypeError("Borg tool arguments must be an object");
+  }
+  return args;
 }
 
 function request(name, args) {
@@ -32,8 +42,13 @@ function request(name, args) {
   } else {
     return Promise.reject(new BorgError("not running inside a Borg session: BORG_AGENT_TOOL_SOCKET is unset"));
   }
+  let line;
+  try { line = JSON.stringify(body) + "\n"; }
+  catch (error) { return Promise.reject(new BorgError(`Borg tool ${name} failed: ${error.message}`)); }
   return new Promise((resolve, reject) => {
-    const socket = net.connect(address, () => socket.write(JSON.stringify(body) + "\n"));
+    let socket;
+    try { socket = net.connect(address, () => socket.write(line)); }
+    catch (error) { reject(new BorgError(error.message)); return; }
     let buffer = "";
     socket.setEncoding("utf8");
     socket.on("data", (chunk) => {
@@ -41,9 +56,16 @@ function request(name, args) {
       const end = buffer.indexOf("\n");
       if (end < 0) return;
       socket.end();
-      const response = JSON.parse(buffer.slice(0, end));
-      if ("error" in response) reject(new BorgError(response.error));
-      else resolve(response.result);
+      try {
+        const response = JSON.parse(buffer.slice(0, end));
+        if (response === null || typeof response !== "object" || Array.isArray(response)) {
+          throw new Error("Borg returned an invalid response object");
+        }
+        if ("error" in response) reject(new BorgError(response.error));
+        else resolve(response.result);
+      } catch (error) {
+        reject(new BorgError(`Borg tool ${name} failed: ${error.message}`));
+      }
     });
     socket.on("error", (error) => reject(new BorgError(error.message)));
     socket.on("end", () => {
@@ -52,15 +74,18 @@ function request(name, args) {
   });
 }
 
-/** Call the Borg capability `name` with an arguments object. */
-export const call = (name, args) => request(name, args);
+/** Call any host tool with its arguments object. */
+export const call = (name, args) => request(name, toolArguments(args));
+export const tool = call;
 
-/** Every capability with its input schema, or those ranked for `query` with a compact signature each. */
-export const tools = (query, limit = 10) => request("__borg_tools", query === undefined ? {} : { query, limit });
+/** All available catalog/native/MCP tools, or ranked matches with schemas. */
+export const tools = (query, limit = 10) => request("__borg_tools", {
+  workspace_tools: true, ...(query === undefined || query === null ? {} : { query, limit }),
+});
 
 const borg = new Proxy(
-  { call, tools, BorgError },
+  { call, tool, tools, BorgError },
   // `then` stays undefined so the object is never mistaken for a promise.
-  { get: (target, name) => (name in target || typeof name !== "string" || name === "then" ? target[name] : (args) => call(name, args)) },
+  { get: (target, name) => (Object.hasOwn(target, name) || typeof name !== "string" || name === "then" ? target[name] : (args) => call(name, args)) },
 );
 export default borg;

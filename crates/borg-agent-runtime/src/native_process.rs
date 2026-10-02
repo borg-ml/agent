@@ -92,6 +92,8 @@ impl Drop for ProcessStartupGuard {
 struct ProcessEntry {
     process_id: Uuid,
     session_id: Uuid,
+    origin_tool_call_id: Option<String>,
+    command_context: crate::execution::ExecutionCommandContext,
     command: String,
     cwd: PathBuf,
     pid: u32,
@@ -380,6 +382,16 @@ impl ProcessManager {
         let entry = Arc::new(ProcessEntry {
             process_id,
             session_id: owner_session_id,
+            origin_tool_call_id: environment.get("BORG_TOOL_CALL_ID").cloned(),
+            // This is the host-issued request environment, not the child's
+            // mutable SDK environment or its socket payload.
+            command_context: crate::execution::ExecutionCommandContext::capture(
+                cancel.clone(),
+                environment
+                    .get("BORG_AGENT_TOOL_APPROVED")
+                    .map(String::as_str)
+                    == Some("1"),
+            ),
             command,
             cwd,
             pid,
@@ -550,6 +562,29 @@ impl ProcessManager {
                 .remove(&process_id);
         }
         Ok(result)
+    }
+
+    pub(crate) fn command_context(
+        &self,
+        owner_session_id: Uuid,
+        parent: &str,
+    ) -> Option<crate::execution::ExecutionCommandContext> {
+        self.inner
+            .processes
+            .lock()
+            .expect("native process registry lock poisoned")
+            .values()
+            .find(|entry| {
+                entry.session_id == owner_session_id
+                    && entry.origin_tool_call_id.as_deref() == Some(parent)
+                    && entry
+                        .status
+                        .lock()
+                        .expect("native process status lock poisoned")
+                        .running
+                    && !entry.command_context.cancellation.is_cancelled()
+            })
+            .map(|entry| entry.command_context.clone())
     }
 
     fn entry(&self, owner_session_id: Uuid, process_id: Uuid) -> Result<Arc<ProcessEntry>> {

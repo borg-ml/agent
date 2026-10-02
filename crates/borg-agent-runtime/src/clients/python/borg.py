@@ -1,17 +1,18 @@
-"""Borg's capabilities as Python functions, for code run through `exec`.
+"""Borg's tools as Python functions, for code run through `exec`.
 
-`borg` is already a global here: it is preloaded into this process, so
-`import borg` raises ModuleNotFoundError and the library looks absent. Use it
-directly.
+Import this shipped library from a command. In `runtime_exec`, use its
+preloaded `borg` object instead; both surfaces reach the same host tools.
 
+    import borg
     borg.send_message(target="/root/worker", message=report)
     plan = borg.get_plan()
     borg.tools("message")  # find capabilities
     borg.call("create_goal", objective="...")
 
-Every capability is reachable as an attribute, so this surface does not fall
-behind the ones Borg adds: `borg.<capability>(...)` calls it, or
-`borg.call("<capability>", ...)` when the name is computed.
+Catalog capabilities, native tools, and configured MCP/extension tools are
+reachable as attributes, or through `borg.call(name, arguments)` when the
+name is computed. `borg.tools()` discovers all available names and schemas.
+Calls retain host permission, approval, and human-confirmation checks.
 
 Each call goes to the running session over its tool socket, exactly like
 `borg call NAME JSON`, and shows in the transcript as a step of the command
@@ -22,14 +23,14 @@ import json
 import os
 import socket
 
-__all__ = ["BorgError", "call", "tools"]
+__all__ = ["BorgError", "call", "tool", "tools"]
 
 
 class BorgError(Exception):
     """A Borg capability refused or failed the call."""
 
 
-def _request(name, arguments):
+def _request_unchecked(name, arguments):
     request = {
         "name": name,
         "arguments": arguments,
@@ -47,31 +48,47 @@ def _request(name, arguments):
         if not address:
             raise BorgError("not running inside a Borg session: BORG_AGENT_TOOL_SOCKET is unset")
         host, _, port = address.rpartition(":")
-        connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         address = (host, int(port))
+        connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         request["token"] = os.environ.get("BORG_AGENT_TOOL_TOKEN", "")
     with connection:
         connection.connect(address)
         connection.sendall(json.dumps(request).encode() + b"\n")
-        reader = connection.makefile("rb")
-        line = reader.readline()
+        with connection.makefile("rb") as reader:
+            line = reader.readline()
     if not line:
         raise BorgError(f"Borg closed the connection without answering {name}")
     response = json.loads(line)
+    if not isinstance(response, dict):
+        raise BorgError(f"Borg returned an invalid response object for {name}")
     if "error" in response:
         raise BorgError(response["error"])
     return response.get("result")
 
 
+def _request(name, arguments):
+    try:
+        return _request_unchecked(name, arguments)
+    except (OSError, ValueError, TypeError) as error:
+        raise BorgError(f"Borg tool {name!r} failed: {error}") from error
+
+
 def call(name, arguments=None, /, **fields):
-    """Call the Borg capability `name` with a dict and/or keyword fields."""
-    return _request(name, {**(arguments or {}), **fields})
+    """Call any host tool with a dict and/or keyword fields."""
+    if arguments is not None and not isinstance(arguments, dict):
+        raise TypeError("Borg tool arguments must be an object")
+    return _request(name, {**({} if arguments is None else arguments), **fields})
+
+
+tool = call
 
 
 def tools(query=None, limit=10):
-    """Every capability with its input schema, or those ranked for `query`
-    with a compact signature each."""
-    return _request("__borg_tools", {} if query is None else {"query": query, "limit": limit})
+    """All available catalog/native/MCP tools, or ranked matches with schemas."""
+    arguments: dict = {"workspace_tools": True}
+    if query is not None:
+        arguments.update(query=query, limit=limit)
+    return _request("__borg_tools", arguments)
 
 
 def __getattr__(name):

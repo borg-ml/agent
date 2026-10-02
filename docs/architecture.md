@@ -81,15 +81,15 @@ sequenceDiagram
     Note over C,S: Controls are handled during the turn, not only at completion.
 ```
 
-**D2:** Kimi, GLM, Qwen, OpenRouter and OpenAI-compatible use `NativeHarness`.
-Codex can use it via model-only/session routing. Other Codex, Claude, OpenCode,
-Grok and Muse turns use `run_borg_provider_turn`; Codex/Claude warm pools retain
-subscription continuity. Grok Build and Muse Code reach their subscription only
-through their own CLI, so they are compatibility routes like Claude/OpenCode.
-The compatibility route still delegates inner-loop
-behavior upstream. Borg manages outer-session recovery and usage-limit waits;
-there is no automatic subscription-to-API billing fallback. Continuation is
-account-scoped, not the authority for session identity.
+**D2:** Codex and Claude use `NativeHarness` by default, as do Anthropic,
+Kimi, GLM, Qwen, OpenRouter, Vercel and OpenAI-compatible routes. Selected
+OpenCode Go models also run on Borg's native loop; other OpenCode routes,
+Grok Build and Muse Code retain compatibility CLI execution through
+`run_borg_provider_turn`. Borg owns the loop and context on native routes;
+compatibility routes still delegate the inner loop upstream. Borg manages
+outer-session recovery and usage-limit waits in both cases. There is no
+automatic subscription-to-API billing fallback. Continuation is account-scoped,
+not the authority for session identity.
 
 **Source:** `LocalAgentTurnExecutor::execute` in [agent.rs](../crates/borg-agent-runtime/src/agent.rs),
 `run_bound` / `execute_tool` in [native_harness.rs](../crates/borg-agent-runtime/src/native_harness.rs),
@@ -129,6 +129,8 @@ selected by [factory.rs](../crates/borg-agent-runtime/src/session_store/factory.
 [jobs/checkpoints](../crates/borg-agent-runtime/src/autonomy.rs),
 [receipts](../crates/borg-agent-runtime/src/receipt.rs).
 [Lifecycle](session-lifecycle.md).
+[Agent-controlled model context](model-context.md) describes text-first
+inspection/editing of the projection without changing that journal.
 
 ## 4. Collaboration and remote delivery
 
@@ -190,3 +192,20 @@ Questions below are review prompts, not confirmed defects.
 
 When revising a decision, check the linked implementation and **both** turn
 routes. Intended ownership in design docs is not proof of current ownership.
+
+### Shared SDK and persistent-runtime dispatch
+
+The command Python/Bun clients and persistent workers use the dispatcher's
+complete catalog (native workspace tools, skills, capabilities, extension
+workflows and configured MCP tools), rather than a separate hard-coded tool
+allowlist. Provider-facing MCP definitions can remain curated. Native model
+tools use the same dispatcher and share their live skill/MCP context with it.
+
+Runtime ancestry is host-only, captured before watcher spawning and retained
+in the originating live command's process entry. Socket calls restore it only
+after validating the command parent and owning session; unknown, expired or
+recovered origins fail closed. Approval is attested by the host-issued command
+context, never by a socket flag or the child SDK's mutable environment. Request cancellation uses a child of the
+validated command token, so a disconnected queued SDK request does not kill
+an independent execution or its ancestor. Neither ancestry nor live worker
+IDs are reconstructed from code-authored arguments or persisted process data.

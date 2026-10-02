@@ -7,10 +7,29 @@ Git comparison.
 
 ### Terminal
 
+- Diff additions and deletions once again colour the full transcript row,
+  including its margins and scrollbar gutter. Edit previews and inline diffs
+  share the same paint path without changing wrapping, selection or copied text.
+- The subagent roster shows a compact Mode column: blank normally, `fast` or
+  `ultrafast` when configured, with ultrafast taking precedence.
+
 - Reverting a session preserves the position of native mid-turn steers and keeps
   batched prompts together before their replies, including in existing forks.
 - Collapsed plan updates reserve space for open steps, so completed leading rows
   cannot hide all remaining work. Expanded plans still show every item.
+
+### Agent runtime
+
+- Python/Bun SDK and persistent-code calls discover and invoke the same native,
+  skill, workflow, extension and configured MCP tools. Runtime ancestry survives
+  background watchers and validated command-to-SDK calls, permitting cross-
+  runtime calls while rejecting cycles without discarding the caller's state.
+
+- Agents on Borg-owned model loops can inspect and edit their model context
+  with message IDs and plain text: replace system/history text, insert notes,
+  or move/drop complete tool groups. Edits preserve in-flight results, opaque
+  state of untouched messages, canonical evidence and runtime permissions,
+  and survive recovery, forks and compaction.
 
 ### Reliability
 

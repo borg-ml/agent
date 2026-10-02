@@ -256,6 +256,7 @@ pub struct AgentToolDispatcher {
     journal: Option<Arc<dyn crate::SessionStore>>,
     provider_capabilities: Vec<crate::ProviderCapability>,
     blu_workflows: Option<BluWorkflowToolContext>,
+    workflow_processes: crate::native_process::ProcessManager,
     extension_workflows: Arc<RwLock<Vec<crate::BluWorkflowDefinition>>>,
     extension_api: Arc<RwLock<crate::ExtensionApiSnapshot>>,
     runtime_root: PathBuf,
@@ -279,7 +280,10 @@ pub struct AgentToolDispatcher {
     #[cfg(unix)]
     lanes: crate::lane_tools::LaneTools,
     runtime_mcp: Arc<Mutex<RuntimeMcpState>>,
+    native_context: Arc<RwLock<Option<Arc<crate::native_context::NativeContext>>>>,
+    native_skill_roots: Arc<RwLock<Vec<PathBuf>>>,
     harness_lock: Arc<Mutex<()>>,
+    pub(crate) context_editor: crate::model_context::ContextEditor,
     web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
     /// Whether human or team input is queued behind the running turn. A
     /// blocking `wait_agent` returns on it so the parent answers promptly.
@@ -292,7 +296,7 @@ struct RuntimeMcpState {
     base_servers: Option<Vec<borg_provider::mcp::ExternalMcpServer>>,
     extension_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
     configured_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
-    runtime: Option<crate::native_mcp::NativeMcpRuntime>,
+    runtime: Option<Arc<crate::native_mcp::NativeMcpRuntime>>,
 }
 
 fn same_mcp_server(
@@ -674,8 +678,6 @@ struct AgentToolWireRequest {
     #[serde(default)]
     token: Option<String>,
     #[serde(default)]
-    workflow_approved: bool,
-    #[serde(default)]
     parent: Option<String>,
 }
 
@@ -712,22 +714,35 @@ async fn serve_agent_tool_connection<S>(
                 json!({ "error": "agent tool authentication failed" })
             }
             Ok(request) if request.name == "__borg_tools" => {
-                let workspace_tools = request
+                let specs = if request
                     .arguments
-                    .get("workspace_tools")
+                    .get("provider_surface")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let specs = dispatcher.mcp_specs(workspace_tools);
-                match request.arguments.get("query").and_then(Value::as_str) {
-                    Some(query) => {
-                        let limit = request
+                    == Some(true)
+                {
+                    Ok(dispatcher.mcp_specs(
+                        request
                             .arguments
-                            .get("limit")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(10) as usize;
-                        json!({ "result": crate::capability_catalog::search(&specs, query, limit) })
-                    }
-                    None => json!({ "result": specs }),
+                            .get("workspace_tools")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    ))
+                } else {
+                    dispatcher.catalog_specs().await
+                };
+                match specs {
+                    Ok(specs) => match request.arguments.get("query").and_then(Value::as_str) {
+                        Some(query) => {
+                            let limit = request
+                                .arguments
+                                .get("limit")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(10) as usize;
+                            json!({ "result": crate::capability_catalog::search(&specs, query, limit) })
+                        }
+                        None => json!({ "result": specs }),
+                    },
+                    Err(error) => json!({ "error": format!("{error:#}") }),
                 }
             }
             Ok(request) => {
@@ -739,12 +754,11 @@ async fn serve_agent_tool_connection<S>(
                     match request.parent {
                         Some(parent) => {
                             dispatcher
-                                .call_from_command(
+                                .call_from_socket_command(
                                     parent,
                                     &request.name,
                                     request.arguments,
-                                    request.workflow_approved,
-                                    Some(call_cancel),
+                                    call_cancel,
                                 )
                                 .await
                         }
@@ -753,7 +767,7 @@ async fn serve_agent_tool_connection<S>(
                                 .call_with_workflow_control(
                                     &request.name,
                                     request.arguments,
-                                    request.workflow_approved,
+                                    false,
                                     Some(call_cancel),
                                 )
                                 .await
@@ -900,7 +914,7 @@ impl AgentToolDispatcher {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone()
                 }),
-                processes: workflow_processes,
+                processes: workflow_processes.clone(),
                 store: journal,
                 autonomy,
             });
@@ -924,6 +938,7 @@ impl AgentToolDispatcher {
             autonomy,
             provider_capabilities,
             blu_workflows,
+            workflow_processes,
             extension_workflows,
             extension_api: Arc::new(RwLock::new(crate::ExtensionApiSnapshot::default())),
             runtime_root,
@@ -939,7 +954,10 @@ impl AgentToolDispatcher {
             #[cfg(unix)]
             lanes: crate::lane_tools::LaneTools::default(),
             runtime_mcp: Arc::new(Mutex::new(RuntimeMcpState::default())),
+            native_context: Arc::new(RwLock::new(None)),
+            native_skill_roots: Arc::new(RwLock::new(Vec::new())),
             harness_lock: Arc::new(Mutex::new(())),
+            context_editor: crate::model_context::ContextEditor::default(),
             web_search,
             input_pending: Arc::new(tokio::sync::watch::Sender::new(false)),
             input_reported: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1047,6 +1065,43 @@ impl AgentToolDispatcher {
             .turn_events
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(events.downgrade());
+    }
+
+    async fn call_from_socket_command(
+        &self,
+        parent: String,
+        name: &str,
+        arguments: Value,
+        disconnect: CancellationToken,
+    ) -> Result<Value> {
+        let context = self
+            .execution_provider()
+            .command_context(self.actor_session_id, &parent)
+            .await?
+            .context("unknown, expired, or cross-session originating command")?;
+        let workflow_approved = context.approved;
+        let cancellation = context.cancellation.child_token();
+        let call = crate::persistent_runtime::with_runtime_host_call_chain(
+            context.chain,
+            self.call_from_command(
+                parent,
+                name,
+                arguments,
+                workflow_approved,
+                Some(cancellation.clone()),
+            ),
+        );
+        tokio::pin!(call);
+        tokio::select! {
+            result = &mut call => result,
+            _ = disconnect.cancelled() => {
+                cancellation.cancel();
+                match tokio::time::timeout(Duration::from_secs(2), &mut call).await {
+                    Ok(result) => result,
+                    Err(_) => bail!("command SDK request cancellation cleanup timed out"),
+                }
+            }
+        }
     }
 
     /// A capability called by a running command (`borg call`, or the Python
@@ -1189,6 +1244,15 @@ impl AgentToolDispatcher {
             return Ok(result);
         }
         let args = command.expect("a shell call is a command or a process write");
+        let output_token_limit = self.resource_limits.as_ref().map(|limits| {
+            usize::try_from((limits.max_workspace_command_output_bytes / 4).max(1))
+                .unwrap_or(usize::MAX)
+        });
+        let timeout_limit = self
+            .resource_limits
+            .as_ref()
+            .map(|limits| limits.max_workspace_command_timeout_ms)
+            .unwrap_or(RUNTIME_MAX_COMMAND_TIMEOUT_MS);
         let sleep_seconds = bare_sleep_seconds(&args.cmd);
         let environment = self.environment_for_command();
         let command_text = args.cmd.clone();
@@ -1205,10 +1269,18 @@ impl AgentToolDispatcher {
                     command,
                     workdir: args.workdir,
                     yield_time_ms: args.yield_time_ms,
-                    max_output_tokens: args.max_output_tokens,
+                    max_output_tokens: args
+                        .max_output_tokens
+                        .map(|tokens| {
+                            output_token_limit
+                                .map(|limit| tokens.min(limit))
+                                .unwrap_or(tokens)
+                        })
+                        .or(output_token_limit),
                     timeout_ms: args
                         .timeout_ms
                         .unwrap_or(RUNTIME_DEFAULT_COMMAND_TIMEOUT_MS)
+                        .min(timeout_limit)
                         .clamp(1, RUNTIME_MAX_COMMAND_TIMEOUT_MS),
                     journal: self.journal.clone(),
                     environment,
@@ -1376,51 +1448,124 @@ impl AgentToolDispatcher {
         Ok(())
     }
 
-    pub(crate) async fn runtime_mcp_tools(&self) -> Result<Value> {
+    pub(crate) async fn native_mcp_runtime(
+        &self,
+    ) -> Result<Arc<crate::native_mcp::NativeMcpRuntime>> {
         let mut state = self.runtime_mcp.lock().await;
-        ensure!(
-            !state.configured_servers.is_empty(),
-            "external MCP is unavailable for this session"
-        );
         if state.runtime.is_none() {
-            state.runtime = Some(
+            state.runtime = Some(Arc::new(
                 crate::native_mcp::NativeMcpRuntime::start(
                     self.actor_session_id,
                     state.configured_servers.clone(),
                 )
                 .await?,
-            );
+            ));
         }
+        Ok(state
+            .runtime
+            .as_ref()
+            .expect("runtime was initialized")
+            .clone())
+    }
+
+    pub(crate) async fn configure_native_mcp_runtime(
+        &self,
+        runtime: Arc<crate::native_mcp::NativeMcpRuntime>,
+    ) {
+        self.runtime_mcp.lock().await.runtime = Some(runtime);
+    }
+
+    pub(crate) async fn runtime_mcp_tools(&self) -> Result<Value> {
         Ok(serde_json::to_value(
-            state
-                .runtime
-                .as_ref()
-                .expect("runtime was initialized")
-                .definitions(),
+            self.native_mcp_runtime().await?.definitions(),
         )?)
     }
 
     pub(crate) async fn runtime_mcp_call(&self, name: &str, arguments: Value) -> Result<Value> {
-        let mut state = self.runtime_mcp.lock().await;
-        ensure!(
-            !state.configured_servers.is_empty(),
-            "external MCP is unavailable for this session"
-        );
-        if state.runtime.is_none() {
-            state.runtime = Some(
-                crate::native_mcp::NativeMcpRuntime::start(
-                    self.actor_session_id,
-                    state.configured_servers.clone(),
-                )
-                .await?,
-            );
-        }
-        state
-            .runtime
-            .as_ref()
-            .expect("runtime was initialized")
-            .call(name, arguments, None)
+        self.runtime_mcp_call_with_control(name, arguments, None)
             .await
+    }
+
+    async fn runtime_mcp_call_with_control(
+        &self,
+        name: &str,
+        arguments: Value,
+        cancellation: Option<CancellationToken>,
+    ) -> Result<Value> {
+        self.native_mcp_runtime()
+            .await?
+            .call(name, arguments, cancellation.as_ref())
+            .await
+            .map(crate::native_harness::lift_mcp_image_blocks)
+    }
+
+    pub(crate) fn configure_native_skill_roots(&self, roots: Vec<PathBuf>) {
+        *self
+            .native_skill_roots
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = roots;
+        *self
+            .native_context
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    pub(crate) fn configure_native_context(
+        &self,
+        context: Arc<crate::native_context::NativeContext>,
+    ) {
+        *self
+            .native_context
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = Some(context);
+    }
+
+    async fn native_context(&self) -> Result<Arc<crate::native_context::NativeContext>> {
+        let cached = self
+            .native_context
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(context) = cached {
+            return Ok(context);
+        }
+        let roots = self
+            .native_skill_roots
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let context = Arc::new(
+            crate::native_context::NativeContext::load(self.runtime_root.clone(), roots).await?,
+        );
+        self.configure_native_context(context.clone());
+        Ok(context)
+    }
+
+    /// One discoverable surface for command SDKs and code-mode workers. The
+    /// provider-facing MCP surface remains deliberately curated separately.
+    pub(crate) async fn catalog_specs(&self) -> Result<Vec<Value>> {
+        let mut by_name = BTreeMap::new();
+        let mut specs = crate::native_harness::builtin_tool_specs();
+        specs.extend(self.mcp_specs(true));
+        specs.push(runtime_exec_spec());
+        let context = self.native_context().await?;
+        if context.has_skills() {
+            specs.push(context.skill_tool_spec());
+        }
+        for definition in self.native_mcp_runtime().await?.definitions() {
+            specs.push(json!({
+                "name": definition.name,
+                "description": definition.description,
+                "inputSchema": definition.input_schema,
+            }));
+        }
+        add_action_metadata(&mut specs);
+        for spec in specs {
+            if let Some(name) = spec.get("name").and_then(Value::as_str) {
+                by_name.insert(name.to_string(), spec);
+            }
+        }
+        Ok(by_name.into_values().collect())
     }
 
     pub fn specs(&self) -> Vec<Value> {
@@ -1797,7 +1942,7 @@ impl AgentToolDispatcher {
         arguments: Value,
         workflow_cancel: Option<CancellationToken>,
     ) -> Result<Value> {
-        let specs = self.mcp_specs(false);
+        let specs = self.catalog_specs().await?;
         match self.classify_capability_call(&arguments, &specs) {
             CapabilityInvocation::Search { query, limit } => Ok(Value::Array(
                 crate::capability_catalog::search(&specs, query, limit),
@@ -1835,8 +1980,9 @@ impl AgentToolDispatcher {
         let workspace_effect = workspace_effect(name, &arguments);
         if (matches!(
             name,
-            "runtime_exec" | "computer_use" | "lane_job" | "lane_service"
-        ) || workspace_effect.is_some()
+            "runtime_exec" | "run_blu_workflow" | "computer_use" | "lane_job" | "lane_service"
+        ) || (name == "context" && arguments.get("op").and_then(Value::as_str) == Some("edit"))
+            || workspace_effect.is_some()
             || !trusted_settings.is_empty())
             && !workflow_approved
             && self.runtime_permission != crate::PermissionMode::FullAccess
@@ -2128,9 +2274,9 @@ impl AgentToolDispatcher {
                     )?;
                     for subject in &args.agents {
                         ensure!(
-                            team.get(*subject)
-                                .await
-                                .is_some_and(|agent| agent.parent_session_id == self.actor_session_id),
+                            team.get(*subject).await.is_some_and(
+                                |agent| agent.parent_session_id == self.actor_session_id
+                            ),
                             "watch cannot observe {subject}: it is not your child; use followup_task and wait_agent for peers"
                         );
                     }
@@ -2378,6 +2524,15 @@ impl AgentToolDispatcher {
                 }
                 Ok(result)
             }
+            "context" => {
+                self.context_editor
+                    .call(
+                        arguments,
+                        workflow_approved
+                            || self.runtime_permission == crate::PermissionMode::FullAccess,
+                    )
+                    .await
+            }
             "harness" => {
                 crate::harness::call(
                     arguments,
@@ -2606,6 +2761,34 @@ impl AgentToolDispatcher {
                     .context("durable autonomous runtime is unavailable")?;
                 call_autonomy_tool(store.as_ref(), self.actor_session_id, name, arguments).await
             }
+            "read_skill" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Args {
+                    name: String,
+                }
+                let args: Args = serde_json::from_value(arguments)?;
+                self.native_context().await?.read_skill(&args.name).await
+            }
+            "run_blu_workflow" => {
+                ensure!(
+                    workflow_approved
+                        || self.runtime_permission == crate::PermissionMode::FullAccess,
+                    "run_blu_workflow requires Full Access or an explicit approval"
+                );
+                self.run_blu_workflow(arguments, workflow_approved, workflow_cancel)
+                    .await
+            }
+            other if other.starts_with("mcp__") || other.starts_with("mcp_") => {
+                ensure!(
+                    workflow_approved
+                        || self.runtime_permission == crate::PermissionMode::FullAccess
+                        || other == "mcp__borg__search_documents",
+                    "external MCP requires Full Access or an explicit approval"
+                );
+                self.runtime_mcp_call_with_control(other, arguments, workflow_cancel)
+                    .await
+            }
             _ => {
                 if !self.subagents_enabled {
                     bail!(
@@ -2750,6 +2933,55 @@ impl AgentToolDispatcher {
         )?)
     }
 
+    async fn run_blu_workflow(
+        &self,
+        arguments: Value,
+        workflow_approved: bool,
+        cancellation: Option<CancellationToken>,
+    ) -> Result<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Args {
+            workflow_id: Uuid,
+            name: String,
+            source: String,
+        }
+        let args: Args = serde_json::from_value(arguments)?;
+        let store = self
+            .session_store()
+            .context("durable session storage is unavailable to Blu workflows")?;
+        let autonomy = store
+            .autonomy_store()
+            .await?
+            .context("durable autonomy storage is unavailable to Blu workflows")?;
+        let permission = if workflow_approved {
+            crate::PermissionMode::FullAccess
+        } else {
+            self.runtime_permission
+        };
+        let runner = crate::blu_workflow::BluWorkflowRunner::new(
+            self.actor_session_id,
+            store,
+            autonomy,
+            Some(self.clone()),
+            self.workflow_processes.clone(),
+            self.runtime_root.clone(),
+            permission,
+        );
+        Ok(serde_json::to_value(
+            runner
+                .run_with_cancel(
+                    crate::BluWorkflowRequest {
+                        workflow_id: args.workflow_id,
+                        name: args.name,
+                        source: args.source,
+                    },
+                    cancellation.unwrap_or_default(),
+                )
+                .await?,
+        )?)
+    }
+
     async fn run_persistent_runtime(
         &self,
         args: PersistentRuntimeArgs,
@@ -2793,6 +3025,9 @@ impl AgentToolDispatcher {
             }
             _ => unreachable!("persistent runtime was validated above"),
         };
+        // Reject synchronous reentry before spawning a watcher: Tokio task
+        // locals do not propagate into that new task.
+        runtime_worker.ensure_not_reentrant()?;
         let cancellation = cancellation.unwrap_or_default().child_token();
         let host: Arc<dyn RuntimeHost> = Arc::new(DispatcherRuntimeHost {
             parent_tool_call_id: Uuid::new_v4().to_string(),
@@ -2801,7 +3036,6 @@ impl AgentToolDispatcher {
             allow_effects: self.runtime_permission == crate::PermissionMode::FullAccess
                 || workflow_approved,
             dispatcher: self.clone(),
-            execution_provider: self.execution_provider(),
             host_calls: Arc::new(AtomicUsize::new(0)),
             session_store: self.session_store(),
             runtime_worker_id: runtime_worker.worker_id(),
@@ -2813,13 +3047,13 @@ impl AgentToolDispatcher {
             (requested, None) => requested,
         };
         let execution_cancel = cancellation.clone();
-        let execution = async move {
+        let execution = crate::persistent_runtime::inherit_runtime_host_call_chain(async move {
             Ok(serde_json::to_value(
                 runtime_worker
                     .execute_as(runtime, &args.code, timeout_ms, host, Some(cancellation))
                     .await?,
             )?)
-        };
+        });
         match &self.watches {
             Some(watches) => {
                 watches
@@ -2844,7 +3078,6 @@ struct DispatcherRuntimeHost {
     root: PathBuf,
     allow_effects: bool,
     dispatcher: AgentToolDispatcher,
-    execution_provider: Arc<dyn crate::ExecutionProvider>,
     host_calls: Arc<AtomicUsize>,
     session_store: Option<std::sync::Arc<dyn crate::SessionStore>>,
     runtime_worker_id: Uuid,
@@ -2852,6 +3085,18 @@ struct DispatcherRuntimeHost {
 }
 
 impl DispatcherRuntimeHost {
+    async fn call_catalog_tool(&self, name: &str, arguments: Value) -> Result<Value> {
+        self.dispatcher
+            .call_from_command(
+                self.parent_tool_call_id.clone(),
+                name,
+                arguments,
+                self.allow_effects,
+                Some(self.process_cancellation.clone()),
+            )
+            .await
+    }
+
     fn ensure_effects(&self) -> Result<()> {
         ensure!(
             self.allow_effects,
@@ -2870,114 +3115,12 @@ impl RuntimeHost for DispatcherRuntimeHost {
             "persistent runtime exceeded the per-execution limit of {MAX_RUNTIME_HOST_CALLS} host calls"
         );
         match operation {
-            "read_file" | "search_files" | "list_files" => {
-                self.dispatcher
-                    .read_workspace_tool(self.execution_provider.as_ref(), operation, arguments)
-                    .await
-            }
-            "write_file" | "edit_file" => {
-                self.ensure_effects()?;
-                self.dispatcher
-                    .mutate_workspace_tool(self.execution_provider.as_ref(), operation, arguments)
-                    .await
-            }
-            "exec_command" => {
-                self.ensure_effects()?;
-                let args: RuntimeExecCommandArgs = serde_json::from_value(arguments)?;
-                let output_token_limit = self.dispatcher.resource_limits.as_ref().map(|limits| {
-                    usize::try_from((limits.max_workspace_command_output_bytes / 4).max(1))
-                        .unwrap_or(usize::MAX)
-                });
-                let timeout_limit = self
-                    .dispatcher
-                    .resource_limits
-                    .as_ref()
-                    .map(|limits| limits.max_workspace_command_timeout_ms)
-                    .unwrap_or(RUNTIME_MAX_COMMAND_TIMEOUT_MS);
-                Ok(serde_json::to_value(
-                    self.execution_provider
-                        .command(crate::ExecutionCommandRequest {
-                            owner_session_id: self.session_id,
-                            root: self.root.clone(),
-                            command: args.cmd,
-                            workdir: args.workdir,
-                            yield_time_ms: args.yield_time_ms,
-                            max_output_tokens: args
-                                .max_output_tokens
-                                .map(|tokens| {
-                                    output_token_limit
-                                        .map(|limit| tokens.min(limit))
-                                        .unwrap_or(tokens)
-                                })
-                                .or(output_token_limit),
-                            timeout_ms: args
-                                .timeout_ms
-                                .unwrap_or(RUNTIME_DEFAULT_COMMAND_TIMEOUT_MS)
-                                .min(timeout_limit)
-                                .clamp(1, RUNTIME_MAX_COMMAND_TIMEOUT_MS),
-                            journal: self.session_store.clone(),
-                            // The session configures this with the tool socket,
-                            // the provider and the approval marker, so a command
-                            // can reach Borg's own capabilities. Passing an empty
-                            // map here discarded all of it and left `borg call`
-                            // unusable from the agent's own shell.
-                            environment: self.dispatcher.environment_for_command(),
-                            cancellation: Some(self.process_cancellation.clone()),
-                        })
-                        .await?,
-                )?)
-            }
-            "write_stdin" => {
-                let args: RuntimeWriteStdinArgs = serde_json::from_value(arguments)?;
-                Ok(serde_json::to_value(
-                    self.execution_provider
-                        .write_stdin(crate::ExecutionStdinRequest {
-                            owner_session_id: self.session_id,
-                            process_id: args.session_id,
-                            chars: args.chars,
-                            terminate: args.terminate.unwrap_or(false),
-                            yield_time_ms: args.yield_time_ms,
-                            max_output_tokens: args.max_output_tokens,
-                        })
-                        .await?,
-                )?)
-            }
             "borg_tool" => {
                 let args: RuntimeBorgToolArgs = serde_json::from_value(arguments)?;
-                ensure!(
-                    args.name != "runtime_exec",
-                    "nested runtime code calls are not supported"
-                );
-                if matches!(
-                    args.name.as_str(),
-                    "list_files"
-                        | "read_file"
-                        | "search_files"
-                        | "write_file"
-                        | "edit_file"
-                        | "exec_command"
-                        | "write_stdin"
-                ) {
-                    return self.call(&args.name, args.arguments).await;
-                }
-                if matches!(
-                    args.name.as_str(),
-                    "run_workflow" | "run_blu_workflow" | "run_blu_extension"
-                ) {
-                    self.ensure_effects()?;
-                }
-                self.dispatcher
-                    .call_from_command(
-                        self.parent_tool_call_id.clone(),
-                        &args.name,
-                        args.arguments,
-                        self.allow_effects,
-                        None,
-                    )
-                    .await
+                self.call_catalog_tool(&args.name, args.arguments).await
             }
             "capabilities" => {
-                let specs = self.dispatcher.mcp_specs(false);
+                let specs = self.dispatcher.catalog_specs().await?;
                 Ok(match arguments.get("query").and_then(Value::as_str) {
                     Some(query) => Value::Array(crate::capability_catalog::search(
                         &specs,
@@ -2994,7 +3137,11 @@ impl RuntimeHost for DispatcherRuntimeHost {
                     self.ensure_effects()?;
                 }
                 self.dispatcher
-                    .runtime_mcp_call(&args.name, args.arguments)
+                    .runtime_mcp_call_with_control(
+                        &args.name,
+                        args.arguments,
+                        Some(self.process_cancellation.clone()),
+                    )
                     .await
             }
             "history" => {
@@ -3050,7 +3197,7 @@ impl RuntimeHost for DispatcherRuntimeHost {
                         "harness",
                         arguments,
                         self.allow_effects,
-                        None,
+                        Some(self.process_cancellation.clone()),
                     )
                     .await
             }
@@ -3106,7 +3253,7 @@ impl RuntimeHost for DispatcherRuntimeHost {
                     })?;
                 Ok(serde_json::to_value(checkpoint)?)
             }
-            other => bail!("unknown persistent runtime host operation `{other}`"),
+            other => self.call_catalog_tool(other, arguments).await,
         }
     }
 }
@@ -8484,6 +8631,7 @@ pub fn agent_tool_specs_for_surface(
             }),
         ),
     ];
+    specs.push(crate::model_context::tool_spec());
     #[cfg(unix)]
     for (name, description, schema) in [
         crate::lane_tools::lane_job_spec(),
@@ -9936,6 +10084,15 @@ fn workspace_effect(name: &str, arguments: &Value) -> Option<(&'static str, Stri
                 bounded_text(cmd.to_string(), MAX_APPROVAL_DETAIL_BYTES),
             )
         }),
+        other
+            if (other.starts_with("mcp__") || other.starts_with("mcp_"))
+                && other != "mcp__borg__search_documents" =>
+        {
+            Some((
+                "Use external MCP tool",
+                bounded_text(format!("{name}: {arguments}"), MAX_APPROVAL_DETAIL_BYTES),
+            ))
+        }
         "write_file" => Some(("Write file", field("path"))),
         "edit_file" => Some((
             "Edit file",
@@ -9996,7 +10153,7 @@ pub(crate) fn exec_tool_spec() -> Value {
 /// The schemas are the catalog's own, taken by name rather than rewritten here.
 /// A second copy of a description is a second thing to forget to update, and
 /// these are descriptions the runtime already depends on.
-pub(crate) fn promoted_capability_tools() -> [&'static str; 11] {
+pub(crate) fn promoted_capability_tools() -> [&'static str; 12] {
     [
         "get_goal",
         "create_goal",
@@ -10009,6 +10166,7 @@ pub(crate) fn promoted_capability_tools() -> [&'static str; 11] {
         "query_history",
         "search_files",
         "computer_use",
+        "context",
     ]
 }
 
@@ -10036,6 +10194,30 @@ pub(crate) fn promoted_specs(specs: &[Value]) -> Vec<Value> {
         .collect();
     promoted.extend(capability_tool_specs());
     promoted
+}
+
+/// Test both code interfaces against the authoritative catalogs, never a
+/// second handwritten allowlist that could drift as tools are added.
+#[cfg(test)]
+pub(crate) fn all_tool_specs_for_tests() -> Vec<Value> {
+    let mut specs = agent_tool_specs_for_surface(
+        CodingProvider::Claude,
+        ToolSurface {
+            watcher_yield: true,
+            ..ToolSurface::director()
+        },
+        None,
+    );
+    specs.extend(crate::native_harness::builtin_tool_specs());
+    specs.extend(autonomy_tool_specs());
+    specs.extend([harness_tool_spec(), exec_tool_spec(), runtime_exec_spec()]);
+    let mut names = std::collections::HashSet::new();
+    specs.retain(|spec| {
+        spec.get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| names.insert(name.to_owned()))
+    });
+    specs
 }
 
 pub(crate) fn capability_tool_specs() -> Vec<Value> {

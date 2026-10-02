@@ -8,6 +8,7 @@
 //! while Borg remains the authority for host effects.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -31,6 +32,48 @@ const MAX_RUNTIME_RESULT_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_LINE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_EXECUTION_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const MAX_EXECUTION_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
+tokio::task_local! {
+    // Host calls can re-enter execute_as through another tool. Refuse cycles
+    // before taking the process lock, without cancelling the outer execution.
+    static RUNTIME_HOST_CALL_CHAIN: Vec<Uuid>;
+}
+
+/// Host-only execution ancestry. Keep this with a validated originating
+/// command, never deserialize it from code-authored socket arguments.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RuntimeHostCallChain(Vec<Uuid>);
+
+pub(crate) fn capture_runtime_host_call_chain() -> RuntimeHostCallChain {
+    RuntimeHostCallChain(
+        RUNTIME_HOST_CALL_CHAIN
+            .try_with(Clone::clone)
+            .unwrap_or_default(),
+    )
+}
+
+/// Restore the ancestry of a validated command in its new socket task. Also
+/// retain any current ancestry so a nested dispatch cannot erase its caller.
+pub(crate) fn with_runtime_host_call_chain<F: Future>(
+    chain: RuntimeHostCallChain,
+    execution: F,
+) -> impl Future<Output = F::Output> {
+    let mut current = capture_runtime_host_call_chain().0;
+    for worker_id in chain.0 {
+        if !current.contains(&worker_id) {
+            current.push(worker_id);
+        }
+    }
+    RUNTIME_HOST_CALL_CHAIN.scope(current, execution)
+}
+
+/// Capture ancestry before a watcher can move an execution's first poll (or
+/// a suspended pre-execution await) into a new Tokio task.
+pub(crate) fn inherit_runtime_host_call_chain<F: Future>(
+    execution: F,
+) -> impl Future<Output = F::Output> {
+    with_runtime_host_call_chain(capture_runtime_host_call_chain(), execution)
+}
 
 /// The common host-call boundary exposed to persistent language workers.
 ///
@@ -285,6 +328,18 @@ impl PersistentRuntimeWorker {
             .await
     }
 
+    // Call before spawning a runtime watcher too: task-local call chains do
+    // not propagate into a new Tokio task.
+    pub(crate) fn ensure_not_reentrant(&self) -> Result<()> {
+        ensure!(
+            !RUNTIME_HOST_CALL_CHAIN
+                .try_with(|chain| chain.contains(&self.worker_id))
+                .unwrap_or(false),
+            "nested runtime execution cannot re-enter its active worker; use the current namespace"
+        );
+        Ok(())
+    }
+
     pub(crate) async fn execute_as(
         &self,
         requested_runtime: &'static str,
@@ -293,6 +348,7 @@ impl PersistentRuntimeWorker {
         host: Arc<dyn RuntimeHost>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<PersistentRuntimeResult> {
+        self.ensure_not_reentrant()?;
         let cancellation = cancellation.unwrap_or_default();
         ensure!(
             !cancellation.is_cancelled(),
@@ -359,10 +415,14 @@ impl PersistentRuntimeWorker {
             }
 
             let request_id = Uuid::new_v4().to_string();
+            let mut chain = RUNTIME_HOST_CALL_CHAIN
+                .try_with(Clone::clone)
+                .unwrap_or_default();
+            chain.push(self.worker_id);
             let result = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => Err(anyhow::anyhow!("persistent runtime was cancelled")),
-                result = execute_request(
+                result = RUNTIME_HOST_CALL_CHAIN.scope(chain, execute_request(
                     process.as_mut().expect("persistent Python process exists"),
                     &request_id,
                     requested_runtime,
@@ -370,7 +430,7 @@ impl PersistentRuntimeWorker {
                     timeout,
                     checkpoint_state.as_ref(),
                     host,
-                ) => result,
+                )) => result,
             };
             let worker_failed = result
                 .as_ref()
@@ -731,6 +791,12 @@ class BorgError(RuntimeError):
     """A Borg capability refused or failed the call."""
 
 
+def _tool_arguments(arguments=None, fields=None):
+    if arguments is not None and not isinstance(arguments, dict):
+        raise TypeError("Borg tool arguments must be an object")
+    return {**({} if arguments is None else arguments), **(fields or {})}
+
+
 class Borg:
     BorgError = BorgError
 
@@ -738,7 +804,8 @@ class Borg:
         self.rlm = Rlm(self)
         self.harness = Harness(self)
 
-    def call(self, operation, arguments=None):
+    def call(self, operation, arguments=None, /, **fields):
+        arguments = _tool_arguments(arguments, fields)
         with HOST_CALL_LOCK:
             call_id = str(uuid.uuid4())
             PROTOCOL_OUT.write(json.dumps({
@@ -759,10 +826,11 @@ class Borg:
                     return message.get("result")
                 raise BorgError(message.get("error", "Borg host call failed"))
 
-    def exec(self, command, **kwargs):
-        arguments = {"cmd": command}
-        arguments.update(kwargs)
-        return self.call("exec_command", arguments)
+    def exec(self, command=None, **kwargs):
+        # Preserve the string shorthand, while accepting the exact exec schema
+        # (including session_id for stdin/polling) like every catalog method.
+        arguments = {"cmd": command} if isinstance(command, str) else command
+        return self.tool("exec", _tool_arguments(arguments, kwargs))
 
     def list(self, path=".", limit=200):
         return self.call("list_files", {"path": path, "limit": limit})
@@ -784,11 +852,12 @@ class Borg:
         arguments.update(kwargs)
         return self.call("history", arguments)
 
-    def history_index(self, after_sequence=0, limit=1000):
-        return self.call("history_index", {
-            "after_sequence": after_sequence,
-            "limit": limit,
-        })
+    def history_index(self, after_sequence=None, limit=None, **fields):
+        arguments = after_sequence if isinstance(after_sequence, dict) else {
+            **({} if after_sequence is None else {"after_sequence": after_sequence}),
+            **({} if limit is None else {"limit": limit}),
+        }
+        return self.tool("history_index", _tool_arguments(arguments, fields))
 
     def semantic_search(self, query, **kwargs):
         """Run read-only BorgSearch retrieval through the scoped Web MCP bridge.
@@ -857,18 +926,18 @@ class Borg:
         arguments.update(kwargs)
         return self.call("edit_file", arguments)
 
-    def tool(self, name, arguments=None):
-        return self.call("borg_tool", {"name": name, "arguments": {} if arguments is None else arguments})
+    def tool(self, name, arguments=None, /, **fields):
+        return self.call("borg_tool", {"name": name, "arguments": _tool_arguments(arguments, fields)})
 
     def tools(self, query=None, limit=10):
-        """Every Borg capability, or those ranked for `query` with signatures."""
+        """All available catalog/native tools, or ranked matches with schemas."""
         return self.call("capabilities", {} if query is None else {"query": query, "limit": limit})
 
     def __getattr__(self, name):
         # Any other attribute is a Borg capability. The bootstrap above installs `borg` in the namespace; it is not an importable module.
         if name.startswith("__"):
             raise AttributeError(name)
-        return lambda arguments=None, /, **fields: self.tool(name, {**(arguments or {}), **fields})
+        return lambda arguments=None, /, **fields: self.tool(name, _tool_arguments(arguments, fields))
 
     def mcp_tools(self):
         return self.call("mcp_tools", {})
@@ -887,8 +956,11 @@ class Harness:
     def __init__(self, borg):
         self.borg = borg
 
+    def __call__(self, arguments=None, /, **fields):
+        return self.borg.tool("harness", _tool_arguments(arguments, fields))
+
     def _call(self, op, **arguments):
-        return self.borg.call("harness", {"op": op, **arguments})
+        return self({"op": op, **arguments})
 
     def list(self, kind=None, scope=None, limit=128):
         arguments = {"limit": limit}
@@ -1250,6 +1322,18 @@ const runtimeConsole = {
   error: (...values) => { stderr += values.map(format).join(" ") + "\n"; },
 };
 
+class BorgError extends Error {
+  constructor(message) { super(message); this.name = "BorgError"; }
+}
+
+function toolArguments(arguments_ = {}) {
+  if (arguments_ === null) return {};
+  if (typeof arguments_ !== "object" || Array.isArray(arguments_)) {
+    throw new TypeError("Borg tool arguments must be an object");
+  }
+  return arguments_;
+}
+
 function hostCall(operation, arguments_) {
   const id = crypto.randomUUID();
   send({type: "host_call", id, operation, arguments: arguments_ ?? {}});
@@ -1257,17 +1341,22 @@ function hostCall(operation, arguments_) {
 }
 
 const borg = {
-  call: hostCall,
-  exec: (command, options = {}) => hostCall("exec_command", {cmd: command, ...options}),
+  BorgError,
+  call: (name, arguments_ = {}) => hostCall(name, toolArguments(arguments_)),
+  exec: (command = {}, options = {}) => borg.tool("exec", {
+    ...toolArguments(typeof command === "string" ? {cmd: command} : command), ...toolArguments(options),
+  }),
   list: (path = ".", limit = 200) => hostCall("list_files", {path, limit}),
   read: (path, options = {}) => hostCall("read_file", {path, ...options}),
   search: (pattern, options = {}) => hostCall("search_files", {pattern, ...options}),
   history: (text, options = {}) => hostCall("history", {
     ...(text === undefined || text === null ? {} : {text}), ...options,
   }),
-  history_index: (afterSequence = 0, limit = 1000) => hostCall("history_index", {
-    after_sequence: afterSequence, limit,
-  }),
+  history_index: (afterSequence = undefined, limit = undefined) => borg.tool("history_index",
+    typeof afterSequence === "object" ? toolArguments(afterSequence) : {
+      ...(afterSequence === undefined ? {} : {after_sequence: afterSequence}),
+      ...(limit === undefined ? {} : {limit}),
+    }),
   semantic_search: (query, options = {}) => hostCall("mcp_call", {
     name: "mcp__borg__search_documents",
     arguments: {query, ...options},
@@ -1280,21 +1369,21 @@ const borg = {
     }
     const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
     const runner = new AsyncFunction("borg", "query", `${spec.source}\nif (typeof retrieve !== "function") throw new Error("retrieve(query) entrypoint is required");\nreturn await retrieve(query);`);
-    return jsonSafe(await runner(borg, query));
+    return jsonSafe(await runner(context.borg, query));
   },
   test_retrieval_adapter: async (adapterId) => {
     const spec = await hostCall("retrieval_adapter", {id: adapterId});
     if (!spec.tests) return {id: adapterId, tested: false, reason: "no tests.source"};
     const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
     const runner = new AsyncFunction("borg", `${spec.source}\n${spec.tests}\nif (typeof retrieve !== "function" || typeof test !== "function") throw new Error("retrieve and test entrypoints are required");\nreturn await test(retrieve, borg);`);
-    return {id: adapterId, tested: true, passed: true, result: jsonSafe(await runner(borg))};
+    return {id: adapterId, tested: true, passed: true, result: jsonSafe(await runner(context.borg))};
   },
   runtime_status: () => hostCall("runtime_status", {}),
   checkpoint: (key, state) => hostCall("runtime_checkpoint", {key, state}),
   restore: (key) => hostCall("runtime_restore", key === undefined ? {} : {key}),
   write: (path, content, options = {}) => hostCall("write_file", {path, content, ...options}),
   edit: (path, oldText, newText, options = {}) => hostCall("edit_file", {path, old_text: oldText, new_text: newText, ...options}),
-  tool: (name, arguments_ = {}) => hostCall("borg_tool", {name, arguments: arguments_}),
+  tool: (name, arguments_ = {}) => hostCall("borg_tool", {name, arguments: toolArguments(arguments_)}),
   tools: (query = undefined, limit = 10) => hostCall("capabilities", query === undefined ? {} : {query, limit}),
   mcp_tools: () => hostCall("mcp_tools", {}),
   mcp: (name, arguments_ = {}) => hostCall("mcp_call", {name, arguments: arguments_}),
@@ -1308,7 +1397,7 @@ function normalizeEnvironmentToolName(value) {
   return String(value).replace(/[^A-Za-z0-9_-]/g, "_");
 }
 
-borg.harness = {
+borg.harness = Object.assign((arguments_ = {}) => borg.tool("harness", arguments_), {
   list: async (kind = undefined, scope = undefined, limit = 128) => {
     const result = await hostCall("harness", {op: "list", ...(kind === undefined ? {} : {kind}), ...(scope === undefined ? {} : {scope}), limit});
     return result.entries || [];
@@ -1321,7 +1410,7 @@ borg.harness = {
   refine: async (trigger, changes = [], options = {}) => (await hostCall("harness", {op: "refine", trigger, changes: typeof changes === "string" ? [changes] : changes, evidence: options.evidence || "", outcome: options.outcome || "", scope: options.scope || "local"})).refinement,
   plan_refinement: async observation => (await hostCall("harness", {op: "plan_refinement", content: observation})).steps || [],
   rollback: async (steps = 1) => (await hostCall("harness", {op: "rollback", steps})).state,
-};
+});
 
 borg.environment = (extensionId, server = undefined) => {
   const prefix = `mcp__${normalizeEnvironmentPart(extensionId)}__${server === undefined ? "" : `${normalizeEnvironmentPart(server)}__`}`;
@@ -1401,7 +1490,7 @@ rlm.list_subagents = rlm.list;
 borg.rlm = rlm;
 // Any other property is a Borg capability. The bootstrap above installs `borg` on the context; it is not an importable module.
 context.borg = new Proxy(borg, {
-  get: (target, name) => (name in target || typeof name !== "string" || name === "then" ? target[name] : (arguments_ = {}) => target.tool(name, arguments_)),
+  get: (target, name) => (Object.hasOwn(target, name) || typeof name !== "string" || name === "then" ? target[name] : (arguments_ = {}) => target.tool(name, arguments_)),
 });
 const cua = (op, arguments_ = {}) => borg.tool("computer_use", {...arguments_, op});
 cua.capabilities = () => cua("capabilities");
@@ -1440,7 +1529,12 @@ async function execute(source, runtime) {
   context.resultSlot = null;
   let compiled = source;
   if (runtime === "typescript" && typeof Bun !== "undefined" && Bun.Transpiler) {
-    compiled = new Bun.Transpiler({loader: "tsx"}).transformSync(source);
+    // Bun can remove a bare final identifier/property read as unused code.
+    // Make the completion value observable before transpilation, just as it
+    // is in JavaScript mode, so discovery/data expressions retain their value.
+    const parts = finalExpressionParts(source);
+    const observable = parts ? `${parts.body}\n;resultSlot = (${parts.expression});` : source;
+    compiled = new Bun.Transpiler({loader: "tsx"}).transformSync(observable);
   }
   const parts = finalExpressionParts(compiled);
   const synchronous = parts ? `${parts.body}\n;(${parts.expression})` : compiled;
@@ -1467,7 +1561,7 @@ input.on("line", async (line) => {
     if (!waiter) return;
     pending.delete(message.id);
     if (message.ok) waiter.resolve(message.result);
-    else waiter.reject(new Error(message.error || "Borg host call failed"));
+    else waiter.reject(new BorgError(message.error || "Borg host call failed"));
     return;
   }
   if (message.type !== "execute") return;
@@ -1599,6 +1693,12 @@ mod tests {
                         "status": "starting"
                     })),
                     Some("list_agents") => Ok(json!({"agents": []})),
+                    Some("get_goal") => Ok(json!({"source": "adapter"})),
+                    Some("history_index") => {
+                        self.call("history_index", arguments["arguments"].clone())
+                            .await
+                    }
+                    Some("harness") => self.call("harness", arguments["arguments"].clone()).await,
                     other => bail!("unknown test Borg tool {other:?}"),
                 },
                 "harness" => Ok(json!({"counts": {"memory": 1}})),
@@ -1606,8 +1706,8 @@ mod tests {
                     if arguments.get("id").and_then(Value::as_str) == Some("js-ranker") {
                         Ok(json!({
                             "manifest": {"language": "javascript"},
-                            "source": "function retrieve(query) { return {query, source: 'adapter'}; }",
-                            "tests": "function test(retrieve, borg) { if (retrieve('test').source !== 'adapter') throw new Error('bad adapter'); return {ok: true}; }"
+                            "source": "async function retrieve(query) { return {query, source: (await borg.get_goal()).source}; }",
+                            "tests": "async function test(retrieve, borg) { if ((await retrieve('test')).source !== 'adapter' || (await borg.get_goal()).source !== 'adapter') throw new Error('bad adapter'); return {ok: true}; }"
                         }))
                     } else {
                         Ok(json!({
@@ -1620,6 +1720,733 @@ mod tests {
                 other => bail!("unknown test operation `{other}`"),
             }
         }
+    }
+
+    // The catalog contract crosses Rust and two embedded languages. Generated
+    // fake-host calls catch omissions, helper-name collisions and argument loss
+    // without performing effects; compiling Rust cannot validate these proxies.
+    struct CatalogHost {
+        specs: Vec<Value>,
+        calls: Mutex<Vec<Value>>,
+    }
+
+    #[async_trait]
+    impl RuntimeHost for CatalogHost {
+        async fn call(&self, operation: &str, arguments: Value) -> Result<Value> {
+            if operation == "capabilities" {
+                return Ok(match arguments["query"].as_str() {
+                    Some(query) => Value::Array(
+                        self.specs
+                            .iter()
+                            .filter(|spec| spec["name"].as_str() == Some(query))
+                            .take(arguments["limit"].as_u64().unwrap_or(10) as usize)
+                            .cloned()
+                            .collect(),
+                    ),
+                    None => Value::Array(self.specs.clone()),
+                });
+            }
+            let (name, arguments) = if operation == "borg_tool" {
+                (
+                    arguments["name"]
+                        .as_str()
+                        .context("missing tool name")?
+                        .to_owned(),
+                    arguments["arguments"].clone(),
+                )
+            } else {
+                (operation.to_owned(), arguments)
+            };
+            ensure!(
+                self.specs.iter().any(|spec| spec["name"] == name),
+                "unknown catalog tool `{name}`"
+            );
+            let call = json!({"name": name, "arguments": arguments});
+            self.calls.lock().await.push(call.clone());
+            ensure!(arguments["__refuse"] != true, "host refused test call");
+            if name == "computer_use" && arguments["op"] == "click" {
+                ensure!(
+                    arguments["confirmed"] == true,
+                    "human confirmation required"
+                );
+            }
+            // Approval is host state, never granted by a field supplied in code.
+            ensure!(
+                arguments["workflow_approved"] != true,
+                "host approval required"
+            );
+            Ok(call)
+        }
+    }
+
+    fn catalog_argument(schema: &Value) -> Value {
+        if let Some(value) = schema.get("const") {
+            return value.clone();
+        }
+        if let Some(value) = schema["enum"].as_array().and_then(|values| values.first()) {
+            return value.clone();
+        }
+        match schema["type"].as_str() {
+            Some("object") => Value::Object(
+                schema["properties"]
+                    .as_object()
+                    .map(|properties| {
+                        properties
+                            .iter()
+                            .map(|(name, field)| (name.clone(), catalog_argument(field)))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            ),
+            Some("array") => json!([catalog_argument(&schema["items"])]),
+            Some("boolean") => json!(false),
+            Some("integer" | "number") => schema.get("minimum").cloned().unwrap_or(json!(1)),
+            Some("string") if schema["format"] == "uuid" => json!(Uuid::nil()),
+            Some("string") => json!("probe"),
+            _ => Value::Null,
+        }
+    }
+
+    fn catalog_cases(specs: &[Value]) -> Vec<Value> {
+        specs
+            .iter()
+            .map(|spec| {
+                let mut arguments = catalog_argument(&spec["inputSchema"]);
+                arguments["action"] = json!("probe");
+                json!({"name": spec["name"], "arguments": arguments})
+            })
+            .collect()
+    }
+
+    async fn assert_catalog_proxy(
+        runtime: &PersistentRuntimeWorker,
+        language: &'static str,
+        specs: Vec<Value>,
+    ) {
+        let host = Arc::new(CatalogHost {
+            specs: specs.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let cases = catalog_cases(&specs);
+        let encoded = serde_json::to_string(&serde_json::to_string(&cases).unwrap()).unwrap();
+        let code = if language == "python" {
+            format!(
+                r#"import json
+proxy_cases = json.loads({encoded})
+assert borg.tools() == json.loads({specs})
+assert borg.tools('exec_command', limit=1) == [spec for spec in borg.tools() if spec['name'] == 'exec_command']
+for case in proxy_cases:
+    name, arguments = case['name'], case['arguments']
+    assert borg.tool(name, arguments) == case, name
+    assert getattr(borg, name)(arguments) == case, name
+    assert getattr(borg, name)(**arguments) == case, name
+    assert borg.call(name, arguments) == case, name
+    assert borg.call(name, **arguments) == case, name
+    assert borg.tool(name, **arguments) == case, name
+proxy_marker = 42
+len(proxy_cases)"#,
+                specs = serde_json::to_string(&serde_json::to_string(&specs).unwrap()).unwrap()
+            )
+        } else {
+            format!(
+                r#"proxyCases = JSON.parse({encoded});
+if (JSON.stringify(await borg.tools()) !== JSON.stringify({specs})) throw new Error('catalog mismatch');
+if (JSON.stringify(await borg.tools('exec_command', 1)) !== JSON.stringify((await borg.tools()).filter(spec => spec.name === 'exec_command'))) throw new Error('native discovery mismatch');
+for (const case_ of proxyCases) {{
+  const {{name, arguments: arguments_}} = case_;
+  for (const result of [await borg.tool(name, arguments_), await borg[name](arguments_), await borg.call(name, arguments_)]) {{
+    if (JSON.stringify(result) !== JSON.stringify(case_)) throw new Error('argument loss: ' + name);
+  }}
+}}
+proxyMarker = 42;
+proxyCases.length"#,
+                specs = serde_json::to_string(&specs).unwrap()
+            )
+        };
+        let result = runtime
+            .execute_as(language, &code, Some(15_000), host.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.value, json!(cases.len()));
+        let calls_per_tool = if language == "python" { 6 } else { 3 };
+        let calls = host.calls.lock().await;
+        assert_eq!(calls.len(), cases.len() * calls_per_tool);
+        for (actual, expected) in calls.chunks(calls_per_tool).zip(&cases) {
+            assert!(actual.iter().all(|call| call == expected), "{expected}");
+        }
+        drop(calls);
+
+        // Invalid argument containers must not turn into empty argument objects,
+        // and host errors must retain the typed API in both languages.
+        let code = if language == "python" {
+            r#"for invalid in [False, 7, 'bad', []]:
+    try:
+        borg.get_goal(invalid)
+        raise AssertionError('invalid arguments accepted')
+    except TypeError:
+        pass
+for arguments in [dict(__refuse=True), dict(op='click', confirmed=False), dict(op='click', confirmed=True, workflow_approved=True)]:
+    try:
+        borg.computer_use(arguments)
+        raise AssertionError('refusal bypassed')
+    except borg.BorgError:
+        pass
+borg.computer_use(op='click', confirmed=True, action='probe')
+proxy_marker"#
+        } else {
+            r#"for (const invalid of [false, 7, 'bad', []]) {
+  try { await borg.get_goal(invalid); throw new Error('invalid arguments accepted'); }
+  catch (error) { if (error.name !== 'TypeError') throw error; }
+}
+for (const arguments_ of [{__refuse: true}, {op: 'click', confirmed: false}, {op: 'click', confirmed: true, workflow_approved: true}]) {
+  try { await borg.computer_use(arguments_); throw new Error('refusal bypassed'); }
+  catch (error) { if (!(error instanceof borg.BorgError)) throw error; }
+}
+await borg.computer_use({op: 'click', confirmed: true, action: 'probe'});
+proxyMarker"#
+        };
+        let result = runtime
+            .execute_as(language, code, Some(15_000), host.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.value, json!(42));
+        let calls = host.calls.lock().await;
+        assert_eq!(calls.len(), cases.len() * calls_per_tool + 4);
+        assert_eq!(
+            calls.last().unwrap()["arguments"],
+            json!({"op": "click", "confirmed": true, "action": "probe"})
+        );
+        drop(calls);
+        let code = if language == "python" {
+            "borg.get_goal(__refuse=True)"
+        } else {
+            "borg.get_goal({__refuse: true})"
+        };
+        let error = runtime
+            .execute_as(language, code, Some(15_000), host.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(error.is::<RuntimeExecutionError>(), "{error:#}");
+        assert!(error.to_string().contains("BorgError"));
+        let marker = if language == "python" {
+            "proxy_marker"
+        } else {
+            "proxyMarker"
+        };
+        assert_eq!(
+            runtime
+                .execute_as(language, marker, None, host, None)
+                .await
+                .unwrap()
+                .value,
+            42
+        );
+    }
+
+    fn all_tool_catalog() -> Vec<Value> {
+        let mut specs = crate::subagents::all_tool_specs_for_tests();
+        specs.push(crate::native_context::NativeContext::default().skill_tool_spec());
+        // Dynamic MCP and extension names use the same call boundary, without
+        // starting an external server or installing a real extension.
+        for name in ["mcp__fake__probe", "ext__fake__run", "constructor"] {
+            specs.push(json!({"name": name, "inputSchema": {
+                "type": "object", "properties": {
+                    "arguments": {"type": "object", "properties": {
+                        "enabled": {"type": "boolean"},
+                        "items": {"type": "array", "items": {"type": "integer"}}
+                    }},
+                    "name": {"type": "string"}
+                }
+            }}));
+        }
+        for name in [
+            "context",
+            "runtime_exec",
+            "harness",
+            "exec",
+            "exec_command",
+            "write_stdin",
+            "read_skill",
+            "enqueue_runtime_job",
+        ] {
+            assert!(
+                specs.iter().any(|spec| spec["name"] == name),
+                "missing catalog tool {name}"
+            );
+        }
+        specs
+    }
+
+    #[tokio::test]
+    async fn python_proxy_reaches_every_catalog_and_native_tool() {
+        if !python_available().await {
+            return;
+        }
+        let root = tempdir().unwrap();
+        let runtime = PersistentRuntimeWorker::new(root.path().to_path_buf());
+        assert_catalog_proxy(&runtime, "python", all_tool_catalog()).await;
+        runtime.stop().await;
+    }
+
+    #[tokio::test]
+    async fn bun_proxy_reaches_every_catalog_and_native_tool_in_js_and_ts() {
+        if !bun_available().await {
+            return;
+        }
+        let root = tempdir().unwrap();
+        let runtime =
+            PersistentRuntimeWorker::for_bun(Uuid::new_v4(), root.path().to_path_buf(), None);
+        for language in ["javascript", "typescript"] {
+            assert_catalog_proxy(&runtime, language, all_tool_catalog()).await;
+        }
+        runtime.stop().await;
+    }
+
+    #[tokio::test]
+    async fn shipped_python_sdk_reaches_every_catalog_and_native_tool_over_its_socket() {
+        if !python_available().await {
+            return;
+        }
+        let root = tempdir().unwrap();
+        let runtime = PersistentRuntimeWorker::new(root.path().to_path_buf());
+        load_shipped_python_sdk(&runtime).await;
+        assert_catalog_proxy(&runtime, "python", all_tool_catalog()).await;
+        // Refused/malformed transports have the same typed error contract as
+        // host refusals; no real session socket or token enters this worker.
+        runtime.execute("for reply in ['array', 'invalid']:\n    try:\n        borg.get_goal(__wire_reply=reply)\n        raise AssertionError('bad response accepted')\n    except borg.BorgError:\n        pass", None, Arc::new(TestHost)).await.unwrap();
+        runtime.execute("os.environ['BORG_AGENT_TOOL_TCP'] = '127.0.0.1:0'\ntry:\n    borg.get_goal()\n    raise AssertionError('connection failure ignored')\nexcept borg.BorgError:\n    pass", None, Arc::new(TestHost)).await.unwrap();
+        runtime.stop().await;
+    }
+
+    #[tokio::test]
+    async fn shipped_js_sdk_reaches_every_catalog_and_native_tool_over_its_socket() {
+        if !python_available().await || !bun_available().await {
+            return;
+        }
+        let root = tempdir().unwrap();
+        let runtime = PersistentRuntimeWorker::new(root.path().to_path_buf());
+        load_shipped_python_sdk(&runtime).await;
+        let specs = all_tool_catalog();
+        let cases = catalog_cases(&specs);
+        let host = Arc::new(CatalogHost {
+            specs: specs.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let sdk_path = root.path().join("borg-sdk.mjs");
+        std::fs::write(&sdk_path, include_str!("clients/js/borg/index.mjs")).unwrap();
+        let script = format!(
+            r#"import borg from {path};
+const cases = {cases};
+if (JSON.stringify(await borg.tools()) !== JSON.stringify({specs})) throw new Error('catalog mismatch');
+if ((await borg.tools('exec_command', 1))[0].name !== 'exec_command') throw new Error('native discovery');
+for (const case_ of cases) {{
+  const {{name, arguments: arguments_}} = case_;
+  for (const result of [await borg.tool(name, arguments_), await borg[name](arguments_), await borg.call(name, arguments_)]) {{
+    if (JSON.stringify(result) !== JSON.stringify(case_)) throw new Error('argument loss: ' + name);
+  }}
+}}
+for (const invalid of [false, 7, 'bad', []]) {{
+  try {{ await borg.get_goal(invalid); throw new Error('invalid arguments accepted'); }}
+  catch (error) {{ if (error.name !== 'TypeError') throw error; }}
+}}
+for (const arguments_ of [{{__refuse: true}}, {{op: 'click', confirmed: false}}, {{op: 'click', confirmed: true, workflow_approved: true}}]) {{
+  try {{ await borg.computer_use(arguments_); throw new Error('refusal bypassed'); }}
+  catch (error) {{ if (!(error instanceof borg.BorgError)) throw error; }}
+}}
+await borg.computer_use({{op: 'click', confirmed: true, action: 'probe'}});
+for (const reply of ['array', 'invalid']) {{
+  try {{ await borg.get_goal({{__wire_reply: reply}}); throw new Error('bad response accepted'); }}
+  catch (error) {{ if (!(error instanceof borg.BorgError)) throw error; }}
+}}
+const circular = {{}}; circular.self = circular;
+try {{ await borg.get_goal(circular); throw new Error('circular arguments accepted'); }}
+catch (error) {{ if (!(error instanceof borg.BorgError)) throw error; }}
+process.env.BORG_AGENT_TOOL_TCP = '127.0.0.1:0';
+try {{ await borg.get_goal(); throw new Error('connection failure ignored'); }}
+catch (error) {{ if (!(error instanceof borg.BorgError)) throw error; }}
+console.log(cases.length);"#,
+            path = serde_json::to_string(&sdk_path.to_string_lossy()).unwrap(),
+            cases = serde_json::to_string(&cases).unwrap(),
+            specs = serde_json::to_string(&specs).unwrap(),
+        );
+        let program = crate::process_environment::resolve_runtime_program(&bun_command());
+        let code = format!(
+            "import subprocess\n_sdk_process = subprocess.run([{program}, '--eval', {script}], capture_output=True, text=True, timeout=15)\nassert _sdk_process.returncode == 0, _sdk_process.stderr\nint(_sdk_process.stdout)",
+            program = serde_json::to_string(&program.to_string_lossy()).unwrap(),
+            script = serde_json::to_string(&script).unwrap()
+        );
+        assert_eq!(
+            runtime
+                .execute(&code, Some(20_000), host.clone())
+                .await
+                .unwrap()
+                .value,
+            json!(cases.len())
+        );
+        let calls = host.calls.lock().await;
+        assert_eq!(calls.len(), cases.len() * 3 + 4);
+        for (actual, expected) in calls[..cases.len() * 3].chunks(3).zip(&cases) {
+            assert!(actual.iter().all(|call| call == expected), "{expected}");
+        }
+        assert_eq!(
+            calls.last().unwrap()["arguments"],
+            json!({"op": "click", "confirmed": true, "action": "probe"})
+        );
+        drop(calls);
+        runtime.stop().await;
+    }
+
+    async fn load_shipped_python_sdk(runtime: &PersistentRuntimeWorker) {
+        let source = serde_json::to_string(include_str!("clients/python/borg.py")).unwrap();
+        // A private fake socket exercises the installed client protocol, not a
+        // monkeypatched _request. The runtime host remains a safe echo/refuser.
+        let code = format!(
+            r#"import json, os, socket, threading, types
+_sdk_transport = borg
+_sdk_module = types.ModuleType('borg_sdk_test')
+exec({source}, _sdk_module.__dict__)
+_sdk_listener = socket.socket()
+_sdk_listener.bind(('127.0.0.1', 0))
+_sdk_listener.listen()
+os.environ.pop('BORG_AGENT_TOOL_SOCKET', None)
+os.environ.pop('BORG_AGENT_TOOL_APPROVED', None)
+os.environ['BORG_AGENT_TOOL_TCP'] = '127.0.0.1:' + str(_sdk_listener.getsockname()[1])
+os.environ['BORG_AGENT_TOOL_TOKEN'] = 'fake-token'
+os.environ['BORG_TOOL_CALL_ID'] = 'fake-parent'
+def _sdk_serve():
+    while True:
+        connection, _ = _sdk_listener.accept()
+        with connection, connection.makefile('rb') as reader:
+            request = json.loads(reader.readline())
+            try:
+                assert request['token'] == 'fake-token'
+                assert request['parent'] == 'fake-parent'
+                assert request['workflow_approved'] is False
+                wire_reply = request['arguments'].get('__wire_reply')
+                if wire_reply:
+                    connection.sendall(b'[]\n' if wire_reply == 'array' else b'not-json\n')
+                    continue
+                name = request['name']
+                if name == '__borg_tools':
+                    assert request['arguments']['workspace_tools'] is True
+                    name = 'capabilities'
+                value = _sdk_transport.call(name, request['arguments'])
+                reply = {{'result': value}}
+            except Exception as error:
+                reply = {{'error': str(error)}}
+            connection.sendall(json.dumps(reply).encode() + b'\n')
+threading.Thread(target=_sdk_serve, daemon=True).start()
+borg = _sdk_module"#
+        );
+        runtime
+            .execute(&code, None, Arc::new(TestHost))
+            .await
+            .unwrap();
+    }
+
+    // A reentrant host otherwise deadlocks on the process mutex and eventually
+    // destroys the caller's namespace. Exercise the real registry worker, not
+    // a proxy string check, and verify that the next execution still has state.
+    #[tokio::test]
+    async fn reentrant_host_calls_refuse_cycles_without_dropping_the_worker() {
+        if !python_available().await {
+            return;
+        }
+        struct ReentrantHost {
+            runtime: Arc<PersistentRuntimeWorker>,
+            nested_language: &'static str,
+        }
+        #[async_trait]
+        impl RuntimeHost for ReentrantHost {
+            async fn call(&self, _: &str, _: Value) -> Result<Value> {
+                self.runtime
+                    .execute_as(
+                        self.nested_language,
+                        "marker = 0",
+                        None,
+                        Arc::new(TestHost),
+                        None,
+                    )
+                    .await?;
+                bail!("recursive execution unexpectedly succeeded")
+            }
+        }
+        let root = tempdir().unwrap();
+        for language in ["python", "javascript", "typescript"] {
+            if language != "python" && !bun_available().await {
+                continue;
+            }
+            let runtime = Arc::new(if language == "python" {
+                PersistentRuntimeWorker::new(root.path().to_path_buf())
+            } else {
+                PersistentRuntimeWorker::for_bun(Uuid::new_v4(), root.path().to_path_buf(), None)
+            });
+            let host = Arc::new(ReentrantHost {
+                runtime: runtime.clone(),
+                nested_language: language,
+            });
+            let code = if language == "python" {
+                "marker = 42\nborg.tool('runtime_exec', {'code': 'marker = 0'})"
+            } else {
+                "marker = 42;\nawait borg.runtime_exec({code: 'marker = 0'})"
+            };
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                runtime.execute(code, None, host.clone()),
+            )
+            .await
+            .expect("recursive calls must refuse before blocking")
+            .unwrap_err();
+            assert!(error.is::<RuntimeExecutionError>(), "{error:#}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot re-enter its active worker")
+            );
+            assert_eq!(
+                runtime.execute("marker", None, host).await.unwrap().value,
+                42
+            );
+            runtime.stop().await;
+        }
+    }
+
+    // The production watcher may move the execution to tokio::spawn before
+    // execute_as reaches its ancestry capture (e.g. while waiting on storage).
+    // Force that ordering through the real watcher, not a synthetic scope test.
+    #[tokio::test]
+    async fn runtime_ancestry_survives_watcher_spawn_and_preserves_both_namespaces() {
+        if !python_available().await {
+            return;
+        }
+        struct SpawnedHost {
+            target: Arc<PersistentRuntimeWorker>,
+            code: &'static str,
+            nested_host: Arc<dyn RuntimeHost>,
+        }
+        #[async_trait]
+        impl RuntimeHost for SpawnedHost {
+            async fn call(&self, _: &str, _: Value) -> Result<Value> {
+                let target = self.target.clone();
+                let nested_host = self.nested_host.clone();
+                let code = self.code;
+                let begin = Arc::new(tokio::sync::Notify::new());
+                let gate = begin.clone();
+                let (finished, result) = tokio::sync::oneshot::channel();
+                let execution = inherit_runtime_host_call_chain(async move {
+                    gate.notified().await;
+                    let output = target
+                        .execute(code, None, nested_host)
+                        .await
+                        .map(|output| output.value);
+                    let _ = finished.send(output);
+                    Ok(Value::Null)
+                });
+                let (events, mut notices) = tokio::sync::mpsc::channel(1);
+                let watches = crate::watch::Watches::new(
+                    crate::native_process::ProcessManager::default(),
+                    events,
+                    Uuid::new_v4(),
+                );
+                let background = watches
+                    .run_runtime(
+                        "test",
+                        execution,
+                        tokio_util::sync::CancellationToken::new(),
+                        Duration::ZERO,
+                    )
+                    .await?;
+                ensure!(
+                    background["background"] == true,
+                    "test execution must cross the spawn boundary"
+                );
+                begin.notify_one();
+                notices
+                    .recv()
+                    .await
+                    .context("watcher exited without notice")?;
+                result.await.context("watcher dropped execution")?
+            }
+        }
+        let root = tempdir().unwrap();
+        let python = Arc::new(PersistentRuntimeWorker::new(root.path().to_path_buf()));
+        let same_runtime = Arc::new(SpawnedHost {
+            target: python.clone(),
+            code: "marker = 0",
+            nested_host: Arc::new(TestHost),
+        });
+        let caller = "marker = 42\nborg.runtime_exec(code='marker = 0')";
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            python.execute(caller, None, same_runtime),
+        )
+        .await
+        .expect("spawned recursion must refuse before blocking")
+        .unwrap_err();
+        assert!(error.is::<RuntimeExecutionError>(), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot re-enter its active worker")
+        );
+        assert_eq!(
+            python
+                .execute("marker", None, Arc::new(TestHost))
+                .await
+                .unwrap()
+                .value,
+            42
+        );
+        if bun_available().await {
+            let bun = Arc::new(PersistentRuntimeWorker::for_bun(
+                Uuid::new_v4(),
+                root.path().to_path_buf(),
+                None,
+            ));
+            let cross_runtime = Arc::new(SpawnedHost {
+                target: bun.clone(),
+                code: "marker = 43;\nmarker",
+                nested_host: Arc::new(TestHost),
+            });
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    python.execute(caller, None, cross_runtime)
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+                43,
+                "non-cyclic cross-runtime calls remain available"
+            );
+            let back_to_python = Arc::new(SpawnedHost {
+                target: python.clone(),
+                code: "marker = 0",
+                nested_host: Arc::new(TestHost),
+            });
+            let cycle = Arc::new(SpawnedHost {
+                target: bun.clone(),
+                code: "marker = 43;\nawait borg.runtime_exec({code: 'marker = 0'})",
+                nested_host: back_to_python,
+            });
+            let error =
+                tokio::time::timeout(Duration::from_secs(10), python.execute(caller, None, cycle))
+                    .await
+                    .expect("A -> B -> A must refuse after watcher spawning")
+                    .unwrap_err();
+            assert!(error.is::<RuntimeExecutionError>(), "{error:#}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot re-enter its active worker")
+            );
+            assert_eq!(
+                python
+                    .execute("marker", None, Arc::new(TestHost))
+                    .await
+                    .unwrap()
+                    .value,
+                42
+            );
+            assert_eq!(
+                bun.execute("marker", None, Arc::new(TestHost))
+                    .await
+                    .unwrap()
+                    .value,
+                43
+            );
+            bun.stop().await;
+        }
+        python.stop().await;
+    }
+
+    // SDK socket connections run in a fresh host task, unlike a nested call
+    // on the runtime protocol. Only host-captured, validated command context
+    // may restore their ancestry; doing so must leave the current worker live.
+    #[tokio::test]
+    async fn validated_command_ancestry_survives_a_fresh_socket_task() {
+        if !python_available().await {
+            return;
+        }
+        struct SocketHost(Arc<PersistentRuntimeWorker>);
+        #[async_trait]
+        impl RuntimeHost for SocketHost {
+            async fn call(&self, _: &str, _: Value) -> Result<Value> {
+                let ancestry = capture_runtime_host_call_chain();
+                let worker = self.0.clone();
+                tokio::spawn(async move {
+                    // A new connection gets no implicit Tokio task-local state.
+                    assert!(capture_runtime_host_call_chain().0.is_empty());
+                    let request = with_runtime_host_call_chain(
+                        ancestry,
+                        worker.execute("marker = 0", None, Arc::new(TestHost)),
+                    );
+                    request.await.map(|output| output.value)
+                })
+                .await?
+            }
+        }
+        let root = tempdir().unwrap();
+        let worker = Arc::new(PersistentRuntimeWorker::new(root.path().to_path_buf()));
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            worker.execute(
+                "marker = 42\nborg.runtime_exec(code='marker = 0')",
+                None,
+                Arc::new(SocketHost(worker.clone())),
+            ),
+        )
+        .await
+        .expect("restored socket ancestry must refuse before blocking")
+        .unwrap_err();
+        assert!(error.is::<RuntimeExecutionError>(), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot re-enter its active worker")
+        );
+        assert_eq!(
+            worker
+                .execute("marker", None, Arc::new(TestHost))
+                .await
+                .unwrap()
+                .value,
+            42
+        );
+        // An explicit empty context must not erase an already-active caller.
+        let error = RUNTIME_HOST_CALL_CHAIN
+            .scope(vec![worker.worker_id()], async {
+                with_runtime_host_call_chain(
+                    RuntimeHostCallChain::default(),
+                    worker.execute("marker = 0", None, Arc::new(TestHost)),
+                )
+                .await
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot re-enter its active worker")
+        );
+        assert_eq!(
+            worker
+                .execute("marker", None, Arc::new(TestHost))
+                .await
+                .unwrap()
+                .value,
+            42
+        );
+        worker.stop().await;
+    }
+
+    async fn bun_available() -> bool {
+        tokio::process::Command::new(bun_command())
+            .arg("--version")
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success())
     }
 
     async fn python_available() -> bool {
@@ -1982,6 +2809,14 @@ mod tests {
             .expect("Bun TypeScript execution");
         assert_eq!(typescript.runtime, "typescript");
         assert_eq!(typescript.value, json!(42));
+        assert_eq!(
+            runtime
+                .execute_as("typescript", "typedAnswer", None, Arc::new(TestHost), None)
+                .await
+                .unwrap()
+                .value,
+            41
+        );
         let retrieved = runtime
             .execute(
                 "borg.retrieval_adapter('js-ranker', 'needle')",

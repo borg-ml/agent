@@ -9163,22 +9163,12 @@ impl BorgTerminal {
                         selection_end,
                     );
                 }
-                frame.render_widget(Paragraph::new(visible_transcript), content_area);
-                // Message backgrounds and diff bars reach the screen edge: carry
-                // each row's trailing background through the scrollbar gutter,
-                // which the thin scrollbar is then drawn over.
-                if content_area.right() < transcript_area.right() {
-                    let buffer = frame.buffer_mut();
-                    for y in content_area.y..content_area.bottom() {
-                        let bg = buffer[(content_area.right() - 1, y)].bg;
-                        if bg == Color::Reset {
-                            continue;
-                        }
-                        for x in content_area.right()..transcript_area.right() {
-                            buffer[(x, y)].set_bg(bg);
-                        }
-                    }
-                }
+                render_transcript_lines(
+                    visible_transcript,
+                    content_area,
+                    transcript_area,
+                    frame.buffer_mut(),
+                );
                 if let Some(picker) = self.image_picker.as_ref() {
                     for slot in image_preview_slots(link_rows) {
                         let first = slot.first_row.max(scroll_start);
@@ -9761,7 +9751,11 @@ impl BorgTerminal {
             {
                 let (visible_roster, inactive_header_index) =
                     visible_team_roster(&agent_roster_entries, self.inactive_team_expanded);
-                let tooltip_width = team_roster_table_width(&visible_roster)
+                let team_transcript = self
+                    .director_transcript
+                    .as_deref()
+                    .unwrap_or(&self.transcript);
+                let tooltip_width = team_roster_table_width(&visible_roster, team_transcript)
                     .saturating_add(2)
                     .clamp(30, status_area.width.min(96));
                 let tooltip_height = (visible_roster.len() as u16)
@@ -9780,6 +9774,7 @@ impl BorgTerminal {
                 frame.render_widget(Clear, tooltip);
                 let roster_lines = team_roster_table_lines(
                     &visible_roster,
+                    team_transcript,
                     tooltip.width.saturating_sub(2) as usize,
                     self.focused_child,
                     self.hovered_team_roster,
@@ -12182,29 +12177,55 @@ struct AgentRosterColumns {
     name: usize,
     model: usize,
     effort: Option<usize>,
+    mode: Option<usize>,
     state: Option<usize>,
     usage: Option<usize>,
 }
 
-fn team_roster_table_width(entries: &[AgentRosterEntry]) -> u16 {
-    let columns = team_roster_table_columns(entries, usize::MAX);
+fn team_roster_mode(entry: &AgentRosterEntry, transcript: &Transcript) -> &'static str {
+    let (fast, ultrafast) = if let Some(child_id) = entry.child_id {
+        transcript
+            .subagent_snapshots
+            .get(&child_id)
+            .map(|agent| (agent.fast, agent.ultrafast))
+            .unwrap_or_default()
+    } else {
+        transcript
+            .config
+            .as_ref()
+            .map(|config| (config.fast, config.ultrafast))
+            .unwrap_or_default()
+    };
+    if ultrafast {
+        "ultrafast"
+    } else if fast {
+        "fast"
+    } else {
+        ""
+    }
+}
+
+fn team_roster_table_width(entries: &[AgentRosterEntry], transcript: &Transcript) -> u16 {
+    let columns = team_roster_table_columns(entries, transcript, usize::MAX);
     roster_columns_width(columns).min(u16::MAX as usize) as u16
 }
 
 fn team_roster_table_lines(
     entries: &[AgentRosterEntry],
+    transcript: &Transcript,
     width: usize,
     focused_child: Option<Uuid>,
     hovered_row: Option<usize>,
     inactive_header_index: Option<usize>,
     language: UiLanguage,
 ) -> Vec<Line<'static>> {
-    let columns = team_roster_table_columns(entries, width);
+    let columns = team_roster_table_columns(entries, transcript, width);
     let header = roster_table_row(
         "  ",
         ui_text(language, "AGENT"),
         ui_text(language, "MODEL NOW"),
         ui_text(language, "EFFORT"),
+        ui_text(language, "MODE"),
         ui_text(language, "STATE"),
         ui_text(language, "LIFETIME TOKENS · COST"),
         columns,
@@ -12227,6 +12248,7 @@ fn team_roster_table_lines(
             &entry.name,
             &entry.model,
             ui_text(language, &entry.effort),
+            team_roster_mode(entry, transcript),
             ui_text(language, &entry.state),
             &entry.usage,
             columns,
@@ -12236,7 +12258,11 @@ fn team_roster_table_lines(
     .collect()
 }
 
-fn team_roster_table_columns(entries: &[AgentRosterEntry], width: usize) -> AgentRosterColumns {
+fn team_roster_table_columns(
+    entries: &[AgentRosterEntry],
+    transcript: &Transcript,
+    width: usize,
+) -> AgentRosterColumns {
     let column_width = |header: &str, value: fn(&AgentRosterEntry) -> &str, cap: usize| {
         entries
             .iter()
@@ -12251,6 +12277,14 @@ fn team_roster_table_columns(entries: &[AgentRosterEntry], width: usize) -> Agen
         name: column_width("AGENT", |entry| &entry.name, 34),
         model: column_width("MODEL NOW", |entry| &entry.model, 20),
         effort: Some(column_width("EFFORT", |entry| &entry.effort, 8)),
+        mode: Some(
+            entries
+                .iter()
+                .map(|entry| team_roster_mode(entry, transcript).width())
+                .chain(std::iter::once("MODE".width()))
+                .max()
+                .unwrap_or(4),
+        ),
         state: Some(column_width("STATE", |entry| &entry.state, 17)),
         usage: Some(column_width(
             "LIFETIME TOKENS · COST",
@@ -12260,6 +12294,9 @@ fn team_roster_table_columns(entries: &[AgentRosterEntry], width: usize) -> Agen
     };
     while roster_columns_width(columns) > width && columns.name > 12 {
         columns.name -= 1;
+    }
+    if roster_columns_width(columns) > width {
+        columns.mode = None;
     }
     if roster_columns_width(columns) > width {
         columns.effort = None;
@@ -12279,11 +12316,13 @@ fn team_roster_table_columns(entries: &[AgentRosterEntry], width: usize) -> Agen
 fn roster_columns_width(columns: AgentRosterColumns) -> usize {
     let visible = 2
         + usize::from(columns.effort.is_some())
+        + usize::from(columns.mode.is_some())
         + usize::from(columns.state.is_some())
         + usize::from(columns.usage.is_some());
     2 + columns.name
         + columns.model
         + columns.effort.unwrap_or(0)
+        + columns.mode.unwrap_or(0)
         + columns.state.unwrap_or(0)
         + columns.usage.unwrap_or(0)
         + visible.saturating_sub(1) * 2
@@ -12295,6 +12334,7 @@ fn roster_table_row(
     name: &str,
     model: &str,
     effort: &str,
+    mode: &str,
     state: &str,
     usage: &str,
     columns: AgentRosterColumns,
@@ -12305,6 +12345,9 @@ fn roster_table_row(
     ];
     if let Some(width) = columns.effort {
         cells.push(roster_table_cell(effort, width));
+    }
+    if let Some(width) = columns.mode {
+        cells.push(roster_table_cell(mode, width));
     }
     if let Some(width) = columns.state {
         cells.push(roster_table_cell(state, width));
@@ -14448,6 +14491,12 @@ impl TranscriptEntry {
 }
 
 fn apply_line_background(line: &mut Line<'static>, width: usize, background: Color) {
+    if matches!(
+        line.style.bg,
+        Some(rendering::DIFF_ADDED_BG | rendering::DIFF_REMOVED_BG)
+    ) {
+        return;
+    }
     for span in &mut line.spans {
         if span.style.bg.is_none() {
             span.style = span.style.bg(background);
@@ -16406,6 +16455,67 @@ fn viewport_hit_area(
         y: area.y + row,
         width: area.width,
         height,
+    }
+}
+
+fn render_transcript_lines(
+    lines: Vec<Line<'static>>,
+    content_area: Rect,
+    viewport_area: Rect,
+    buffer: &mut ratatui::buffer::Buffer,
+) {
+    use ratatui::widgets::Widget;
+
+    if content_area.is_empty() {
+        return;
+    }
+    let diff_edges = lines
+        .iter()
+        .map(|line| {
+            let background = line.style.bg.filter(|color| {
+                matches!(
+                    *color,
+                    rendering::DIFF_ADDED_BG | rendering::DIFF_REMOVED_BG
+                )
+            })?;
+            // Keep split-pane colours at the edge, not a text-selection tint.
+            let trailing = line
+                .spans
+                .iter()
+                .rev()
+                .find_map(|span| {
+                    span.style.bg.filter(|color| {
+                        matches!(
+                            *color,
+                            rendering::DIFF_ADDED_BG | rendering::DIFF_REMOVED_BG | Color::Reset
+                        )
+                    })
+                })
+                .unwrap_or(background);
+            Some((
+                line.width().min(content_area.width as usize) as u16,
+                trailing,
+            ))
+        })
+        .collect::<Vec<_>>();
+    Paragraph::new(lines).render(content_area, buffer);
+    for y in content_area.y..content_area.bottom() {
+        let (start, background) = diff_edges
+            .get((y - content_area.y) as usize)
+            .copied()
+            .flatten()
+            .map(|(width, background)| (content_area.x + width, background))
+            .unwrap_or_else(|| {
+                (
+                    content_area.right(),
+                    buffer[(content_area.right() - 1, y)].bg,
+                )
+            });
+        if background != Color::Reset || start < content_area.right() {
+            for x in start..viewport_area.right() {
+                buffer[(x, y)].set_bg(background);
+            }
+        }
     }
 }
 

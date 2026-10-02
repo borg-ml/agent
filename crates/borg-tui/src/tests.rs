@@ -3068,7 +3068,10 @@ fn structured_user_message_lines_preserve_column_spacing() {
     let rendered = structured_user_message_lines(text, 80, Some(Color::White));
 
     assert_eq!(
-        rendered.iter().map(Line::to_string).collect::<Vec<_>>(),
+        rendered
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>(),
         vec!["NAME      VALUE", "alpha     10", "beta      20"]
     );
 }
@@ -8100,10 +8103,18 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
         },
     ];
 
-    let rows = team_roster_table_lines(&entries, 90, None, None, None, UiLanguage::English)
-        .into_iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>();
+    let rows = team_roster_table_lines(
+        &entries,
+        &Transcript::default(),
+        90,
+        None,
+        None,
+        None,
+        UiLanguage::English,
+    )
+    .into_iter()
+    .map(|line| line.to_string())
+    .collect::<Vec<_>>();
     let column = |row: &str, value: &str| {
         row.find(value)
             .map(|offset| UnicodeWidthStr::width(&row[..offset]))
@@ -8112,17 +8123,130 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
     assert_eq!(column(&rows[1], "gpt-5.6-sol"), Some(model_column));
     assert_eq!(column(&rows[2], "gpt-5.6-luna"), Some(model_column));
     assert!(rows[0].contains("LIFETIME TOKENS · COST"));
+    let mode_column = rows[0].find("MODE  ").expect("mode header");
+    let state_column = rows[0].find("STATE").expect("state header");
+    assert!(rows[1..].iter().all(|row| {
+        row.chars()
+            .skip(mode_column)
+            .take(state_column - mode_column)
+            .all(|character| character == ' ')
+    }));
     assert!(rows[1].contains("~$133.11 (sub eq.)"));
     assert!(rows.iter().all(|row| row.width() <= 90));
 
-    let narrow = team_roster_table_lines(&entries, 28, None, None, None, UiLanguage::English)
-        .into_iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>();
+    let narrow = team_roster_table_lines(
+        &entries,
+        &Transcript::default(),
+        28,
+        None,
+        None,
+        None,
+        UiLanguage::English,
+    )
+    .into_iter()
+    .map(|line| line.to_string())
+    .collect::<Vec<_>>();
     assert!(narrow[0].contains("AGENT"));
     assert!(narrow[0].contains("MODEL NOW"));
     assert!(!narrow[0].contains("STATE"));
+    assert!(!narrow[0].contains("  MODE "));
     assert!(narrow.iter().all(|row| row.width() <= 28));
+}
+
+#[test]
+fn team_roster_mode_cells_render_requested_speed_with_ultrafast_precedence() {
+    let now = Utc::now();
+    let mut agent = SubagentSnapshot {
+        session_id: Uuid::new_v4(),
+        parent_session_id: Uuid::new_v4(),
+        task_name: "/root/worker".to_string(),
+        status: SubagentStatus::Running,
+        provider: CodingProvider::Codex,
+        model: Some("gpt-6-sol".to_string()),
+        effort: Some("high".to_string()),
+        fast: false,
+        ultrafast: false,
+        cwd: PathBuf::from("/workspace"),
+        created_at: now,
+        updated_at: now,
+        detail: None,
+        final_text: None,
+        usage: borg_remote::SubagentUsage {
+            total_tokens: 800_000,
+            ..Default::default()
+        },
+        interrupted_by: None,
+    };
+    let mut transcript = Transcript::default();
+    transcript.seed_session_state(&SessionState {
+        configuration: Some(borg_remote::SessionConfiguration {
+            cwd: PathBuf::from("/workspace"),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-6-sol".to_string()),
+            effort: Some("high".to_string()),
+            fast: true,
+            ultrafast: true,
+            response_language: ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+            speed_support: Default::default(),
+        }),
+        ..Default::default()
+    });
+
+    for (fast, ultrafast, expected) in [
+        (false, false, ""),
+        (true, false, "fast"),
+        (false, true, "ultrafast"),
+        (true, true, "ultrafast"),
+    ] {
+        agent.fast = fast;
+        agent.ultrafast = ultrafast;
+        transcript.upsert_subagent_snapshot(&agent);
+        let entries = transcript.agent_roster_entries();
+        let lines = team_roster_table_lines(
+            &entries,
+            &transcript,
+            94,
+            Some(agent.session_id),
+            Some(1),
+            None,
+            UiLanguage::English,
+        );
+        let rows = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let mode_column = rows[0].find("MODE  ").expect("mode header");
+        let state_column = rows[0].find("STATE").expect("state header");
+        let mode_cell = |row: &str| {
+            row.chars()
+                .skip(mode_column)
+                .take(state_column - mode_column)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+        assert_eq!(mode_cell(&rows[1]), "ultrafast");
+        assert_eq!(mode_cell(&rows[2]), expected);
+        assert!(rows[2].starts_with("› "));
+        assert!(rows[2].contains("running"));
+        assert!(rows[2].contains("800.0k · cost unavailable"));
+        assert_eq!(lines[2].style, team_roster_row_style(true, true));
+        assert!(rows.iter().all(|row| row.width() <= 94));
+
+        let narrow = team_roster_table_lines(
+            &entries,
+            &transcript,
+            28,
+            Some(agent.session_id),
+            None,
+            None,
+            UiLanguage::English,
+        );
+        assert!(!narrow[0].to_string().contains("  MODE "));
+        assert!(narrow[0].to_string().contains("MODEL NOW"));
+        assert!(narrow.iter().all(|row| row.width() <= 28));
+    }
 }
 
 #[test]
@@ -16861,6 +16985,244 @@ fn fullscreen_non_tool_details_expand_without_mutating_inline_state() {
     assert!(!inline.contains("ACTION_BODY"));
     assert!(!inline.contains("COMPACTION_TAIL"));
     assert!(!inline.contains("plan item 19"));
+}
+
+// Span-only checks missed unpainted message margins and viewport gutters.
+// Exercise the real event routes and shared painter, including wrapped/split
+// rows, so a full-row tint cannot be replaced by copy-altering text padding.
+#[test]
+fn diff_backgrounds_cover_edit_and_inline_viewport_edges_without_changing_copy() {
+    use ratatui::buffer::Buffer;
+
+    let is_diff_bg = |color| matches!(color, rendering::DIFF_ADDED_BG | rendering::DIFF_REMOVED_BG);
+    for padding in [String::new(), "x".repeat(110)] {
+        let old = format!("    let old_value = \"{padding}\"; OLD_TAIL");
+        let new = format!("    let new_value = \"{padding}\"; NEW_TAIL");
+        let diff = format!("@@ -1,2 +1,2 @@\n context\n-{old}\n+{new}\n");
+        for native_edit in [true, false] {
+            let session = Uuid::new_v4();
+            let mut transcript = Transcript::default();
+            if native_edit {
+                let input = serde_json::json!({
+                    "path": "src/main.rs",
+                    "old_text": format!("{old}\n"),
+                    "new_text": format!("{new}\n"),
+                });
+                transcript.apply(&SessionEvent::new(
+                    session,
+                    1,
+                    SessionEventKind::ToolStarted {
+                        tool_call_id: "native-edit".into(),
+                        name: "edit_file".into(),
+                        input: input.clone(),
+                        input_ref: None,
+                        parent_tool_call_id: None,
+                    },
+                ));
+                transcript.apply(&SessionEvent::new(
+                    session,
+                    2,
+                    SessionEventKind::ToolCompleted {
+                        tool_call_id: "native-edit".into(),
+                        output: r#"{"type":"mutated","operation":"edit_file","path":"src/main.rs","changed":true}"#.into(),
+                        output_ref: None,
+                        is_error: false,
+                        input: Some(input),
+                        input_ref: None,
+                        parent_tool_call_id: None,
+                    },
+                ));
+                let TranscriptEntry::Tool {
+                    code_view: Some((_, source)),
+                    ..
+                } = &transcript.order[0]
+                else {
+                    panic!("native edit must project its replacement diff");
+                };
+                assert_eq!(
+                    transcript.order[0].copy_text_owned().as_deref(),
+                    Some(source.as_str())
+                );
+            }
+            transcript.apply(&SessionEvent::new(
+                session,
+                3,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: format!(
+                        "{}\n```rust\n+literal_code\n```\nnormal prose",
+                        if native_edit {
+                            String::new()
+                        } else {
+                            format!("```diff:rs\n{diff}```\n")
+                        },
+                    ),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ));
+            transcript.apply(&SessionEvent::new(
+                session,
+                4,
+                SessionEventKind::PlanProjected {
+                    participant_id: Uuid::new_v4(),
+                    items: vec![PlanItem {
+                        id: Uuid::new_v4(),
+                        content: "normal plan".into(),
+                        status: PlanItemStatus::Pending,
+                    }],
+                    workspace_revision: 1,
+                },
+            ));
+
+            if native_edit {
+                assert!(transcript.tool_is_expandable(0));
+                if !transcript.tool_is_expanded(0) {
+                    transcript.toggle_tool(0);
+                }
+                assert!(transcript.tool_is_expanded(0));
+            }
+
+            let raw_entry_copy = transcript
+                .order
+                .iter()
+                .map(TranscriptEntry::copy_text_owned)
+                .collect::<Vec<_>>();
+            for width in [52, 96, 180, 181] {
+                for message_bg in [MESSAGE_BG, MESSAGE_HOVER_BG] {
+                    let mut rendered =
+                        transcript.render_for_cache(width, DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT);
+                    let copy_start = TranscriptPoint { row: 0, column: 0 };
+                    let copy_end = TranscriptPoint {
+                        row: rendered.0.len() - 1,
+                        column: usize::MAX,
+                    };
+                    let copy_before_background =
+                        selected_transcript_text(&rendered.0, copy_start, copy_end);
+                    for (_, start, end) in &rendered.3 {
+                        apply_viewport_background(
+                            &mut rendered.0,
+                            *start,
+                            *end,
+                            0,
+                            width,
+                            message_bg,
+                        );
+                    }
+                    let lines = rendered.0;
+                    assert!(lines.iter().all(|line| line.width() <= width));
+                    let text = lines
+                        .iter()
+                        .map(Line::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(
+                        text.contains("OLD_TAIL") && text.contains("NEW_TAIL"),
+                        "{text}"
+                    );
+                    assert!(text.contains("normal plan") && text.contains("+literal_code"));
+                    let viewport = Rect::new(0, 0, width as u16 + 2, lines.len() as u16);
+                    let content = Rect {
+                        width: width as u16,
+                        ..viewport
+                    };
+                    let mut buffer = Buffer::empty(viewport);
+                    render_transcript_lines(lines.clone(), content, viewport, &mut buffer);
+                    let mut changed = Vec::new();
+                    for (row, line) in lines.iter().enumerate() {
+                        let backgrounds = line
+                            .spans
+                            .iter()
+                            .filter_map(|span| span.style.bg.filter(|color| is_diff_bg(*color)))
+                            .collect::<Vec<_>>();
+                        if let (Some(left), Some(right)) = (backgrounds.first(), backgrounds.last())
+                        {
+                            changed.push(line.clone());
+                            assert_eq!(
+                                buffer[(0, row as u16)].bg,
+                                *left,
+                                "native={native_edit}, width={width}, row={row}"
+                            );
+                            assert_eq!(
+                                buffer[(viewport.right() - 1, row as u16)].bg,
+                                *right,
+                                "native={native_edit}, width={width}, row={row}"
+                            );
+                            if left == right {
+                                assert!(
+                                    (0..viewport.width)
+                                        .all(|column| buffer[(column, row as u16)].bg == *left)
+                                );
+                            }
+                        } else {
+                            assert!(!is_diff_bg(buffer[(0, row as u16)].bg));
+                            assert!(!is_diff_bg(buffer[(viewport.right() - 1, row as u16)].bg));
+                        }
+                    }
+                    assert!(
+                        !changed.is_empty(),
+                        "real route must include changed diff rows"
+                    );
+                    let start = TranscriptPoint { row: 0, column: 0 };
+                    let end = TranscriptPoint {
+                        row: changed.len() - 1,
+                        column: usize::MAX,
+                    };
+                    if !native_edit {
+                        assert_eq!(
+                            selected_transcript_text(&changed, start, end),
+                            Some(format!("{old}\n{new}").trim().to_string())
+                        );
+                    }
+                    let unselected = changed.clone();
+                    apply_text_selection(&mut changed, 0, start, end);
+
+                    let selected_viewport = Rect {
+                        height: changed.len() as u16,
+                        ..viewport
+                    };
+                    let selected_content = Rect {
+                        height: changed.len() as u16,
+                        ..content
+                    };
+                    let mut selected_buffer = Buffer::empty(selected_viewport);
+                    render_transcript_lines(
+                        changed,
+                        selected_content,
+                        selected_viewport,
+                        &mut selected_buffer,
+                    );
+                    // Copy reads the original render, not the highlight clone.
+                    assert_eq!(
+                        selected_transcript_text(&lines, copy_start, copy_end),
+                        copy_before_background
+                    );
+                    assert_eq!(
+                        transcript
+                            .order
+                            .iter()
+                            .map(TranscriptEntry::copy_text_owned)
+                            .collect::<Vec<_>>(),
+                        raw_entry_copy
+                    );
+                    for (row, line) in unselected.iter().enumerate() {
+                        assert_eq!(selected_buffer[(0, row as u16)].bg, line.style.bg.unwrap());
+                        assert!(is_diff_bg(
+                            selected_buffer[(viewport.right() - 1, row as u16)].bg
+                        ));
+                    }
+                    assert!(
+                        selected_buffer
+                            .content()
+                            .iter()
+                            .any(|cell| cell.bg == Color::Rgb(45, 83, 120))
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
