@@ -226,7 +226,7 @@ impl ClaudeModelProvider {
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::new();
         let mut received = 0usize;
-        let mut state = AnthropicStreamState::default();
+        let mut state = AnthropicStreamState::claude_summaries();
         let mut complete = false;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -272,6 +272,13 @@ impl ClaudeModelProvider {
                         let kind = event["type"]
                             .as_str()
                             .context("Claude event omitted its type")?;
+                        if let Some(indexes) = frame.get("narration_block_indexes") {
+                            ensure!(
+                                kind == "content_block_stop",
+                                "unexpected native narration metadata"
+                            );
+                            state.set_narration_block_indexes(indexes);
+                        }
                         apply_stream_event(&mut state, kind, event, progress.as_ref());
                         if matches!(kind, "message_start" | "message_delta") {
                             publish_usage(&progress, &id, &state, false);
@@ -384,8 +391,9 @@ fn subscription_request_body(
         !disabled || !capabilities.thinking_required,
         "the selected Claude model requires thinking"
     );
-    // Newer models omit thinking text unless a display is requested; the
-    // summaries are what the transcript shows as Reasoned rows.
+    // Native summaries include both reasoning and between-tool narration.
+    // The connector's native classification, not `type=thinking` alone,
+    // selects the display channel; the signed blocks remain intact for replay.
     if disabled || !capabilities.thinking {
         body["thinking"] = json!({"type": "disabled"});
     } else if capabilities.adaptive_thinking {

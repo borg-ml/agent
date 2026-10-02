@@ -689,6 +689,8 @@ pub(crate) struct AnthropicStreamState {
     blocks: Vec<Value>,
     input_json: HashMap<usize, String>,
     open_blocks: HashSet<usize>,
+    defer_thinking: bool,
+    narration_blocks: HashSet<usize>,
     started: bool,
     finished: bool,
     stop_reason: Option<String>,
@@ -696,6 +698,36 @@ pub(crate) struct AnthropicStreamState {
 }
 
 impl AnthropicStreamState {
+    /// Claude's native classifier distinguishes public narration summaries from
+    /// reasoning only once the complete block signature has arrived.
+    pub(crate) fn claude_summaries() -> Self {
+        Self {
+            defer_thinking: true,
+            ..Self::default()
+        }
+    }
+
+    /// Display metadata from the pinned native runtime, never replay content.
+    pub(crate) fn set_narration_block_indexes(&mut self, indexes: &Value) {
+        let Some(indexes) = indexes.as_array().filter(|_| self.defer_thinking) else {
+            self.protocol_error("invalid native narration metadata");
+            return;
+        };
+        for value in indexes {
+            let Some(index) = value.as_u64().and_then(|n| usize::try_from(n).ok()) else {
+                self.protocol_error("invalid native narration index");
+                return;
+            };
+            if self.blocks.get(index).and_then(|b| b["type"].as_str()) != Some("thinking")
+                || (!self.open_blocks.contains(&index) && !self.narration_blocks.contains(&index))
+            {
+                self.protocol_error("native narration index is not a pending thinking block");
+                return;
+            }
+            self.narration_blocks.insert(index);
+        }
+    }
+
     pub(crate) fn usage(&self, duration_ms: u64) -> ProviderCallUsage {
         let tokens = |name: &str| {
             self.message
@@ -725,17 +757,21 @@ impl AnthropicStreamState {
         let text = self
             .blocks
             .iter()
-            .filter_map(|block| {
-                (block["type"] == "text")
-                    .then(|| block["text"].as_str())
-                    .flatten()
+            .enumerate()
+            .filter_map(|(index, block)| match block["type"].as_str() {
+                Some("text") => block["text"].as_str(),
+                Some("thinking") if self.narration_blocks.contains(&index) => {
+                    block["thinking"].as_str()
+                }
+                _ => None,
             })
             .collect::<String>();
         let thinking = self
             .blocks
             .iter()
-            .filter_map(|block| {
-                (block["type"] == "thinking")
+            .enumerate()
+            .filter_map(|(index, block)| {
+                (block["type"] == "thinking" && !self.narration_blocks.contains(&index))
                     .then(|| block["thinking"].as_str())
                     .flatten()
             })
@@ -903,7 +939,7 @@ pub(crate) fn apply_stream_event(
             let block = &payload["content_block"];
             match block["type"].as_str() {
                 Some("text") => send_text(progress, block["text"].as_str().unwrap_or_default()),
-                Some("thinking") => {
+                Some("thinking") if !state.defer_thinking => {
                     send_reasoning(progress, block["thinking"].as_str().unwrap_or_default())
                 }
                 Some("tool_use") => {
@@ -943,7 +979,7 @@ pub(crate) fn apply_stream_event(
                     block[field] = json!(value);
                     match field {
                         "text" => send_text(progress, text),
-                        "thinking" => send_reasoning(progress, text),
+                        "thinking" if !state.defer_thinking => send_reasoning(progress, text),
                         _ => {}
                     }
                 }
@@ -996,6 +1032,14 @@ pub(crate) fn apply_stream_event(
                     return;
                 };
                 block["input"] = input;
+            }
+            if state.defer_thinking && block["type"] == "thinking" {
+                let summary = block["thinking"].as_str().unwrap_or_default();
+                if state.narration_blocks.contains(&index) {
+                    send_text(progress, summary);
+                } else {
+                    send_reasoning(progress, summary);
+                }
             }
             if block["type"] == "tool_use" {
                 let (Some(id), Some(name)) = (block["id"].as_str(), block["name"].as_str()) else {
@@ -1721,6 +1765,191 @@ mod tests {
         assert_eq!(tool_calls[0].function.name, "read_file");
         assert_eq!(tool_calls[0].function.arguments, "{\"path\":\"a\"}");
         assert_eq!(state.finish_reason(), "tool_calls");
+    }
+
+    #[test]
+    fn native_narration_is_public_text_not_reasoning_and_replay_is_unchanged() {
+        for classified in [true, false] {
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let mut state = AnthropicStreamState::claude_summaries();
+            apply_stream_event(
+                &mut state,
+                "message_start",
+                &json!({"message":{"content":[]}}),
+                Some(&sender),
+            );
+            for (index, prefix, tail) in [
+                (0, "Private ", "plan."),
+                (1, "Off ", "keeps the old lighting."),
+            ] {
+                apply_stream_event(
+                    &mut state,
+                    "content_block_start",
+                    &json!({"index":index,"content_block":{"type":"thinking","thinking":prefix,"signature":""}}),
+                    Some(&sender),
+                );
+                apply_stream_event(
+                    &mut state,
+                    "content_block_delta",
+                    &json!({"index":index,"delta":{"type":"thinking_delta","thinking":tail}}),
+                    Some(&sender),
+                );
+                apply_stream_event(
+                    &mut state,
+                    "content_block_delta",
+                    &json!({"index":index,"delta":{"type":"signature_delta","signature":format!("opaque-{index}")}}),
+                    Some(&sender),
+                );
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "do not select a channel before native classification"
+                );
+                state.set_narration_block_indexes(&if index == 1 && classified {
+                    json!([1])
+                } else {
+                    json!([])
+                });
+                apply_stream_event(
+                    &mut state,
+                    "content_block_stop",
+                    &json!({"index":index}),
+                    Some(&sender),
+                );
+                let mut public = String::new();
+                let mut reasoning = String::new();
+                while let Ok(event) = receiver.try_recv() {
+                    match event {
+                        ProviderProgress::Bytes { chunk, .. } => {
+                            public.push_str(&String::from_utf8_lossy(&chunk))
+                        }
+                        ProviderProgress::ProviderEvent {
+                            kind, content_text, ..
+                        } if kind == "reasoning_delta" => {
+                            reasoning.push_str(content_text.as_deref().unwrap_or_default())
+                        }
+                        _ => {}
+                    }
+                }
+                let expected = format!("{prefix}{tail}");
+                if index == 1 && classified {
+                    assert_eq!(public, expected);
+                    assert!(reasoning.is_empty());
+                } else {
+                    assert!(public.is_empty());
+                    assert_eq!(reasoning, expected);
+                }
+            }
+            apply_stream_event(
+                &mut state,
+                "content_block_start",
+                &json!({"index":2,"content_block":{"type":"tool_use","id":"toolu_next","name":"exec","input":{}}}),
+                None,
+            );
+            apply_stream_event(&mut state, "content_block_stop", &json!({"index":2}), None);
+            apply_stream_event(
+                &mut state,
+                "message_delta",
+                &json!({"delta":{"stop_reason":"tool_use"}}),
+                None,
+            );
+            apply_stream_event(&mut state, "message_stop", &json!({}), None);
+            state.validate_complete().expect("complete native response");
+            let message = state.assistant_message();
+            let ModelMessage::Assistant {
+                content,
+                reasoning_content,
+                ..
+            } = &message
+            else {
+                panic!("assistant")
+            };
+            assert_eq!(
+                content.as_deref(),
+                classified.then_some("Off keeps the old lighting.")
+            );
+            assert_eq!(
+                reasoning_content.as_deref(),
+                Some(if classified {
+                    "Private plan."
+                } else {
+                    "Private plan.Off keeps the old lighting."
+                })
+            );
+            let replay = messages_request_body(
+                "claude-opus-5-5",
+                None,
+                &request(
+                    vec![
+                        ModelMessage::user("question"),
+                        message,
+                        ModelMessage::tool("toolu_next", "ok"),
+                    ],
+                    vec![],
+                ),
+            );
+            assert_eq!(
+                replay["messages"][1]["content"],
+                state.raw_response()["content"]
+            );
+            assert!(
+                replay["messages"][1]["content"][1]
+                    .get("narration_block_indexes")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a private native-classified Claude capture"]
+    fn captured_native_narration_is_routed_without_changing_signed_blocks() {
+        let path = std::env::var("BORG_TEST_CLAUDE_CLASSIFIED_CAPTURE")
+            .expect("set the private classified NDJSON capture path");
+        let capture = std::fs::read_to_string(path).expect("read private fixture");
+        let mut state = AnthropicStreamState::claude_summaries();
+        for line in capture.lines() {
+            let frame: Value = serde_json::from_str(line).expect("native frame JSON");
+            if let Some(indexes) = frame.get("narration_block_indexes") {
+                state.set_narration_block_indexes(indexes);
+            }
+            let event = &frame["event"];
+            apply_stream_event(&mut state, event["type"].as_str().unwrap(), event, None);
+        }
+        state.validate_complete().expect("complete native response");
+        let message = state.assistant_message();
+        let ModelMessage::Assistant {
+            content,
+            reasoning_content,
+            ..
+        } = &message
+        else {
+            panic!("assistant")
+        };
+        // Avoid printing captured private text on failure.
+        assert!(
+            content.as_deref() == state.blocks[1]["thinking"].as_str(),
+            "native narration must be public"
+        );
+        assert!(
+            reasoning_content.as_deref() == state.blocks[0]["thinking"].as_str(),
+            "only actual reasoning belongs in reasoning"
+        );
+        let tool_id = state.blocks[2]["id"].as_str().unwrap().to_string();
+        let replay = messages_request_body(
+            "claude-opus-5-5",
+            None,
+            &request(
+                vec![
+                    ModelMessage::user("question"),
+                    message,
+                    ModelMessage::tool(tool_id, "not executed in diagnostic"),
+                ],
+                vec![],
+            ),
+        );
+        assert!(
+            replay["messages"][1]["content"] == state.raw_response()["content"],
+            "signed blocks must replay unchanged"
+        );
     }
 
     #[test]

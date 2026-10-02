@@ -641,8 +641,6 @@ impl NativeHarness {
         let user_message = native_user_message(&turn.cwd, &turn.prompt, &turn.attachments).await?;
         record_native_message(&events, turn.provider, &user_message).await?;
         messages.push(user_message);
-        // A human steer owes visible text; Some(true) has spent its one retry.
-        let mut steer_reply_retry = None;
         // One message each, as before. Admission is taken per steer and only
         // confirmed once that steer's message is recorded.
         for captured in steers {
@@ -653,9 +651,6 @@ impl NativeHarness {
             record_folded_steer(&events, turn.provider, None, &message, &steer).await?;
             messages.push(message);
             confirm_steers(acks);
-            if steer.human {
-                steer_reply_retry = Some(false);
-            }
         }
         // Runtime context that varies between turns (usage percentages, MCP
         // availability, harness state) trails the prompt instead of sitting in
@@ -863,7 +858,6 @@ impl NativeHarness {
                     if steer.human {
                         reply_owed = true;
                         reply_round_spent = false;
-                        steer_reply_retry = Some(false);
                     }
                     parked_reply_unsent_tokens = None;
                     // A human spoke, which is what makes a parked wait
@@ -1035,7 +1029,6 @@ impl NativeHarness {
                     .await;
                     truncated_text.push_str(&partial);
                     reply_owed = false;
-                    steer_reply_retry = None;
                 }
                 assistant_message_id = Uuid::new_v4();
                 let nudge = ModelMessage::user(LENGTH_CONTINUATION_PROMPT);
@@ -1054,39 +1047,6 @@ impl NativeHarness {
                     },
                 )
                 .await;
-                continue;
-            }
-            // A human steer must be answered before work resumes. A model can
-            // put the whole answer in thinking and return only tool calls;
-            // waiting until a watcher yield to check loses that answer again.
-            if let Some(retried) = steer_reply_retry
-                && content.as_ref().is_none_or(|text| text.trim().is_empty())
-            {
-                let mut preparing = tool_calls.iter().map(|call| Some(call.id.clone())).collect();
-                cancel_preparing_tool_calls(&events, turn.provider, &mut preparing).await;
-                for call in tool_calls {
-                    record_native_tool_result(
-                        &events, turn.provider, &mut messages, &call.id,
-                        json!({"error": "Tool not executed: a visible reply to the human's steer is required before continuing."}).to_string(),
-                        true,
-                    ).await?;
-                }
-                if retried {
-                    bail!("native provider failed to write a visible reply to the human's steer after one retry; reasoning is not a reply and no further tools were executed");
-                }
-                steer_reply_retry = Some(true);
-                let nudge = ModelMessage::user(
-                    "The human's latest message has not received a visible reply. Your previous response contained no assistant text; reasoning blocks are not shown as replies. Write a concise reply or acknowledgement as visible assistant text before any more tool calls. State whether their message changes the plan, then continue only the work they still authorize. The preceding tool calls were not executed; reissue them only if still needed."
-                );
-                record_native_message(&events, turn.provider, &nudge).await?;
-                messages.push(nudge);
-                canonicalize_native_messages(&mut messages);
-                send(&events, SessionEventKind::ProviderEvent {
-                    provider: turn.provider,
-                    kind: "native_steer_reply_recovery".into(),
-                    payload: json!({"model_round": model_round}),
-                }).await;
-                assistant_message_id = Uuid::new_v4();
                 continue;
             }
             if tool_calls.is_empty() {
@@ -1123,7 +1083,6 @@ impl NativeHarness {
                 )
                 .await;
                 reply_owed = false;
-                steer_reply_retry = None;
                 if let Some((steer, acks)) = admit_steers(std::mem::take(&mut queued_steer)) {
                     // The answer above is already recorded and on screen, so
                     // nothing the model wrote is lost. Ending the turn here
@@ -1145,7 +1104,6 @@ impl NativeHarness {
                     if steer.human {
                         reply_owed = true;
                         reply_round_spent = false;
-                        steer_reply_retry = Some(false);
                     }
                     truncated_text.clear();
                     assistant_message_id = Uuid::new_v4();
@@ -1231,7 +1189,6 @@ impl NativeHarness {
                 )
                 .await;
                 reply_owed = false;
-                steer_reply_retry = None;
             }
             assistant_message_id = Uuid::new_v4();
 
@@ -1406,7 +1363,6 @@ impl NativeHarness {
                 if steer.human {
                     reply_owed = true;
                     reply_round_spent = false;
-                    steer_reply_retry = Some(false);
                 }
                 let message =
                     native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
@@ -1471,7 +1427,6 @@ impl NativeHarness {
                         if steer.human {
                             reply_owed = true;
                             reply_round_spent = false;
-                            steer_reply_retry = Some(false);
                         }
                     }
                 }
@@ -10527,241 +10482,6 @@ mod tests {
                 Some(expected.as_str()),
                 "the marker names the durable message the session is waiting on"
             );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_human_steer_requires_visible_text_before_more_tools() {
-        struct Client {
-            rounds: std::sync::atomic::AtomicUsize,
-            controls: mpsc::Sender<AgentTurnControl>,
-            marker: PathBuf,
-            retry_visible: bool,
-        }
-        #[async_trait]
-        impl NativeModelClient for Client {
-            async fn model_turn(
-                &self,
-                _provider: crate::CodingProvider,
-                _model: &str,
-                _effort: Option<&str>,
-                request: ModelTurnRequest,
-                _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
-            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
-                let round = self
-                    .rounds
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if round == 0 {
-                    let (ack, _acked) = tokio::sync::oneshot::channel();
-                    self.controls
-                        .send(AgentTurnControl::Steer {
-                            message_id: Uuid::new_v4(),
-                            text: "What's LookPass2 off?".into(),
-                            attachments: Vec::new(),
-                            admission: borg_provider::provider::SteerAdmission::pending(),
-                            preempt: false,
-                            human: true,
-                            ack,
-                        })
-                        .await
-                        .unwrap();
-                    // Capacity one: this send finishes only after the steer is captured.
-                    self.controls
-                        .send(AgentTurnControl::Approval {
-                            approval_id: "capture-sync".into(),
-                            decision: ApprovalDecision::Deny,
-                        })
-                        .await
-                        .unwrap();
-                }
-                if round == 2 {
-                    assert_eq!(
-                        std::fs::read_to_string(&self.marker).unwrap(),
-                        "original\n",
-                        "reasoning-only replies must not resume tools"
-                    );
-                    assert!(
-                        request.messages.iter().any(|message| matches!(message,
-                        ModelMessage::Tool { tool_call_id, content, .. }
-                        if tool_call_id == "call-1" && content.contains("not executed"))),
-                        "the held call needs a durable tool result for replay"
-                    );
-                }
-                assert!(round <= 3, "a reasoning-only retry must not loop");
-                let visible = match round {
-                    2 if self.retry_visible => {
-                        Some("Off means the old lighting stays in use.".into())
-                    }
-                    3 => Some("Work continued.".into()),
-                    _ => None,
-                };
-                let calls = if round < 3 {
-                    vec![ModelToolCall::function(
-                        format!("call-{round}"), "exec".into(),
-                        json!({"action": "continue", "cmd": format!("echo {} >> {}",
-                            if round == 0 { "original" } else { "resumed" }, self.marker.display())}).to_string(),
-                    )]
-                } else {
-                    Vec::new()
-                };
-                Ok(ModelTurnResult {
-                    message: ModelMessage::assistant(
-                        visible,
-                        (round > 0)
-                            .then(|| "PRIVATE reasoning; off keeps the old lighting.".into()),
-                        None,
-                        calls,
-                    ),
-                    finish_reason: if round < 3 { "tool_calls" } else { "stop" }.into(),
-                    usage: ProviderCallUsage::default(),
-                    raw_response: Value::Null,
-                    trace: ProviderAttemptTrace::default(),
-                })
-            }
-        }
-        for retry_visible in [true, false] {
-            let root = tempfile::tempdir().unwrap();
-            let cwd = root.path().to_path_buf();
-            let marker = cwd.join("ran.txt");
-            let session_id = Uuid::new_v4();
-            let (controls_tx, controls_rx) = mpsc::channel(1);
-            let client = Arc::new(Client {
-                rounds: std::sync::atomic::AtomicUsize::new(0),
-                controls: controls_tx,
-                marker: marker.clone(),
-                retry_visible,
-            });
-            let harness = NativeHarness {
-                model_client: client.clone(),
-                harness: HarnessMode::Borg,
-                ..NativeHarness::default()
-            };
-            let turn = AgentTurn {
-                session_id,
-                prompt_cache_session_id: Some(Uuid::new_v4()),
-                message_id: Uuid::new_v4(),
-                context_generation: 0,
-                prior_native_context_tokens: None,
-                provider: crate::CodingProvider::OpenRouter,
-                provider_session_id: None,
-                provider_fork_turn_id: None,
-                cwd: cwd.clone(),
-                prompt_delta: "build it".to_string(),
-                prompt: "build it".to_string(),
-                attachments: Vec::new(),
-                output_schema: None,
-                model: Some("test-model".to_string()),
-                effort: None,
-                fast: Some(true),
-                ultrafast: None,
-                response_language: crate::ResponseLanguage::Auto,
-                permission_mode: PermissionMode::FullAccess,
-                conversation: Vec::new(),
-                agent_mcp_server: borg_provider::mcp::ExternalMcpServer {
-                    name: "test".to_string(),
-                    command: "test".to_string(),
-                    args: Vec::new(),
-                    env: BTreeMap::new(),
-                    allowed_tools: Vec::new(),
-                },
-                agent_tools: crate::AgentToolDispatcher::new(
-                    crate::session::SessionGoalTools::disconnected(),
-                    crate::session::SessionTodoTools::disconnected(),
-                    None,
-                    crate::LspService::new(&cwd),
-                    crate::CodingProvider::OpenRouter,
-                    session_id,
-                    false,
-                    None,
-                    None,
-                    cwd.clone(),
-                    None,
-                    None,
-                    None,
-                    Vec::new(),
-                    None,
-                    crate::native_process::ProcessManager::default(),
-                    PermissionMode::FullAccess,
-                ),
-                external_mcp_servers: Vec::new(),
-                runtime_mcp_context: Default::default(),
-                runtime_provider_context: None,
-                extension_skill_roots: Vec::new(),
-                extension_workflows: Vec::new(),
-                extension_api: Default::default(),
-                system_prompt_appendix: String::new(),
-                declaration_base: None,
-                request_prefix_base: None,
-                prompt_context_base: Default::default(),
-                answers_human: false,
-                volatile_system_prompt_appendix: String::new(),
-            };
-            let (events_tx, mut events_rx) = mpsc::channel(512);
-            let outcome = tokio::time::timeout(
-                Duration::from_secs(30),
-                harness.run(turn, events_tx, Some(controls_rx)),
-            )
-            .await
-            .expect("bounded reply recovery");
-            assert_eq!(outcome.is_ok(), retry_visible);
-            assert_eq!(
-                std::fs::read_to_string(&marker).unwrap(),
-                if retry_visible {
-                    "original\nresumed\n"
-                } else {
-                    "original\n"
-                }
-            );
-            let mut events = Vec::new();
-            while let Ok(event) = events_rx.try_recv() {
-                events.push(event);
-            }
-            let visible: Vec<_> = events
-                .iter()
-                .filter_map(|event| match event {
-                    SessionEventKind::Message {
-                        actor: EventActor::Assistant,
-                        text,
-                        ..
-                    } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect();
-            assert!(
-                visible.iter().all(|text| !text.contains("PRIVATE")),
-                "reasoning stays private"
-            );
-            if retry_visible {
-                assert_eq!(
-                    visible,
-                    [
-                        "Off means the old lighting stays in use.",
-                        "Work continued."
-                    ]
-                );
-                let reply = events
-                    .iter()
-                    .position(|event| {
-                        matches!(event,
-                    SessionEventKind::Message { actor: EventActor::Assistant, text, .. }
-                    if text == "Off means the old lighting stays in use.")
-                    })
-                    .unwrap();
-                let resumed = events
-                    .iter()
-                    .position(|event| {
-                        matches!(event,
-                    SessionEventKind::ToolStarted { tool_call_id, .. } if tool_call_id == "call-2")
-                    })
-                    .unwrap();
-                assert!(
-                    reply < resumed,
-                    "the reply must be visible before work resumes"
-                );
-            } else {
-                assert!(visible.is_empty());
-                assert_eq!(client.rounds.load(std::sync::atomic::Ordering::SeqCst), 3);
-            }
         }
     }
 }

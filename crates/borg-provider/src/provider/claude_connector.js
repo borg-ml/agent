@@ -19,7 +19,7 @@ const forbidden = [
   'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
 ];
 const hash = text => createHash('sha256').update(text).digest('hex');
-let core, model, billing, secret, identity, accountUuid, verifiedToken, verification;
+let core, model, billing, summaries, secret, identity, accountUuid, verifiedToken, verification;
 let heldBytes = 0;
 let lastActivity = Date.now();
 const active = new Map();
@@ -198,9 +198,23 @@ async function infer(request, response, value) {
             overage !== 'allowed' && overage !== 'allowed_warning') {
           await emit(response, { type: 'grace', id, five_hour: grace[0], weekly: grace[1] });
         }
+        const blocks = [];
         for await (const event of stream) {
           receivedEvent = true;
-          await emit(response, { type: 'event', id, event });
+          if (event.type === 'content_block_start') {
+            blocks[event.index] = { ...event.content_block };
+          } else if (event.type === 'content_block_delta') {
+            const block = blocks[event.index];
+            if (block?.type === 'thinking') {
+              if (event.delta.type === 'thinking_delta') block.thinking = (block.thinking ?? '') + event.delta.thinking;
+              if (event.delta.type === 'signature_delta') block.signature = (block.signature ?? '') + event.delta.signature;
+            }
+          }
+          // The pinned runtime supplies this same display-only classification
+          // on SDK assistant frames. Never decode signatures or guess from prose.
+          const display = event.type === 'content_block_stop'
+            ? { narration_block_indexes: summaries.Ayo(blocks) } : {};
+          await emit(response, { type: 'event', id, event, ...display });
         }
         break;
       } catch (error) {
@@ -265,11 +279,13 @@ try {
   secret = options.secret;
   if (!/^[a-f0-9]{64}$/.test(secret) || options.protocol !== PROTOCOL ||
       !/^[a-f0-9]{64}$/.test(options.revision) || typeof options.endpoint_path !== 'string') throw Error('Invalid connector bootstrap');
-  [core, model, billing] = await Promise.all([
+  [core, model, billing, summaries] = await Promise.all([
     import('/$bunfs/root/chunk-f74xvn8g.js'),
     import('/$bunfs/root/chunk-9v35ka7v.js'),
     import('/$bunfs/root/chunk-t5hhxe3x.js'),
+    import('/$bunfs/root/chunk-qazw855w.js'),
   ]);
+  if (typeof summaries.Ayo !== 'function') throw Error('Pinned Claude runtime lacks native narration classification');
   await core.f8e();
   await verifyIdentity();
   const server = http.createServer({ requestTimeout: 30000, headersTimeout: 10000, maxHeaderSize: 8192 }, (request, response) => {
