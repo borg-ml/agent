@@ -3789,7 +3789,10 @@ fn preparing_a_new_action_does_not_invent_a_background_process() {
 #[test]
 fn composer_cursor_shapes_are_steady() {
     for (shape, command) in [
-        (ComposerCursorStyle::Underline, SetCursorStyle::SteadyUnderScore),
+        (
+            ComposerCursorStyle::Underline,
+            SetCursorStyle::SteadyUnderScore,
+        ),
         (ComposerCursorStyle::Bar, SetCursorStyle::SteadyBar),
         (ComposerCursorStyle::Block, SetCursorStyle::SteadyBlock),
     ] {
