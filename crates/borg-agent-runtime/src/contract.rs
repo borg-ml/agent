@@ -1637,6 +1637,14 @@ pub enum SessionConfigAction {
         provider: CodingProvider,
         model: Option<String>,
     },
+    /// Atomic child control; rejection leaves the prior configuration intact.
+    SetAgent {
+        request_id: Uuid,
+        provider: Option<CodingProvider>,
+        model: Option<String>,
+        effort: Option<String>,
+        fast: Option<bool>,
+    },
     SetEffort {
         effort: String,
     },
@@ -1729,6 +1737,7 @@ pub enum SubagentAction {
         provider: Option<CodingProvider>,
         model: Option<String>,
         effort: Option<String>,
+        fast: Option<bool>,
     },
     Interrupt {
         request_id: Uuid,
@@ -3144,6 +3153,7 @@ mod tests {
                 provider: Some(CodingProvider::Codex),
                 model: Some("gpt-6-sol".into()),
                 effort: Some("max".into()),
+                fast: Some(true),
             },
         };
         let wire = serde_json::to_value(&command).unwrap();
@@ -3153,6 +3163,7 @@ mod tests {
         assert_eq!(wire["action"]["provider"], "codex");
         assert_eq!(wire["action"]["model"], "gpt-6-sol");
         assert_eq!(wire["action"]["effort"], "max");
+        assert_eq!(wire["action"]["fast"], true);
         let decoded: HostCommand = serde_json::from_value(wire).unwrap();
         assert_eq!(decoded.session_id(), Some(parent_session_id));
         assert!(matches!(

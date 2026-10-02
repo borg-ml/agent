@@ -723,6 +723,10 @@ impl CodexModelProvider {
         capabilities: Option<&ModelCapabilities>,
         subscription_only: bool,
     ) -> Result<Value> {
+        ensure!(
+            !request.fast || subscription_only,
+            "fast mode requires subscription admission; API-key billing is not allowed"
+        );
         for message in &mut request.messages {
             if let ModelMessage::Assistant { provider_state, .. } = message
                 && let Some(ModelProviderState::OpenAiResponses {
@@ -2765,8 +2769,17 @@ mod tests {
                 .is_none()
         );
         request.fast = true;
+        assert!(
+            provider
+                .request_body_for_account(&mut request, "api-account", None, false)
+                .unwrap_err()
+                .to_string()
+                .contains("API-key billing is not allowed")
+        );
         assert_eq!(
-            provider.request_body(&request).unwrap()["service_tier"],
+            provider
+                .request_body_for_account(&mut request, "subscription-account", None, true)
+                .unwrap()["service_tier"],
             "priority"
         );
         request.fast = false;

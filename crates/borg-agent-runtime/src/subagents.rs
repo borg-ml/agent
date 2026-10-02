@@ -150,6 +150,9 @@ pub struct SubagentSnapshot {
     pub provider: CodingProvider,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Requested mode, not proof the provider accepted priority on a request.
+    #[serde(default)]
+    pub fast: bool,
     pub cwd: PathBuf,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -3476,6 +3479,7 @@ impl SubagentTable {
             provider: launch.provider,
             model: launch.model.clone(),
             effort: launch.effort.clone(),
+            fast: launch.fast.unwrap_or(false),
             cwd: launch.cwd.clone(),
             created_at: now,
             updated_at: now,
@@ -4472,7 +4476,7 @@ impl SubagentCoordinator {
         // never asked to know the pair -- naming the provider is enough, and
         // naming neither inherits both from the parent.
         let inherits_parent = launch.provider == parent_provider;
-        let inherited_model = inherits_parent.then_some(parent_model).flatten();
+        let inherited_model = inherits_parent.then_some(parent_model.clone()).flatten();
         launch.model = request
             .model
             .clone()
@@ -4504,6 +4508,27 @@ impl SubagentCoordinator {
              spawn_agent, or leave provider and model unset to inherit this session's lane",
             launch.provider.label()
         );
+        // Inherit live speed only on the same route, not the director's stale
+        // launch preference or a different model's priority admission.
+        if inherits_parent && launch.model == parent_model {
+            launch.fast = parent.as_ref().map(|config| config.fast).or(launch.fast);
+            launch.ultrafast = parent
+                .as_ref()
+                .map(|config| config.ultrafast)
+                .or(launch.ultrafast);
+        } else {
+            launch.fast = None;
+            launch.ultrafast = None;
+        }
+        if launch.fast.unwrap_or(false) {
+            crate::session::confirmed_speed_support(
+                self.executor.as_ref(),
+                &launch,
+                "fast",
+                |support| support.fast,
+            )
+            .await?;
+        }
         launch.name = Some(canonical_task_name(&request.task_name)?);
         Ok(launch)
     }
@@ -4583,6 +4608,7 @@ impl SubagentCoordinator {
                         && entry.snapshot.provider == launch.provider
                         && entry.snapshot.model == launch.model
                         && entry.snapshot.effort == launch.effort
+                        && entry.snapshot.fast == launch.fast.unwrap_or(false)
                 })
                 .min_by_key(|entry| entry.snapshot.updated_at)
                 .map(|entry| {
@@ -4815,6 +4841,13 @@ impl SubagentCoordinator {
                 launch.provider = snapshot.provider;
                 launch.model = snapshot.model.clone();
                 launch.effort = snapshot.effort.clone();
+                launch.fast = Some(snapshot.fast);
+                launch.ultrafast = self
+                    .store
+                    .state(snapshot.session_id)
+                    .await?
+                    .configuration
+                    .map(|config| config.ultrafast);
                 launch.cwd = snapshot.cwd.clone();
                 launch.name = Some(snapshot.task_name.clone());
                 {
@@ -5457,6 +5490,13 @@ impl SubagentCoordinator {
                 launch.provider = snapshot.provider;
                 launch.model = snapshot.model.clone();
                 launch.effort = snapshot.effort.clone();
+                launch.fast = Some(snapshot.fast);
+                launch.ultrafast = self
+                    .store
+                    .state(snapshot.session_id)
+                    .await?
+                    .configuration
+                    .map(|config| config.ultrafast);
                 launch.cwd = snapshot.cwd.clone();
                 launch.name = Some(snapshot.task_name.clone());
                 if let Err(error) = self.start_reserved(snapshot.clone(), launch, false).await {
@@ -6552,10 +6592,11 @@ impl SubagentCoordinator {
         provider: Option<CodingProvider>,
         model: Option<String>,
         effort: Option<String>,
+        fast: Option<bool>,
     ) -> Result<SubagentSnapshot> {
         ensure!(
-            provider.is_some() || model.is_some() || effort.is_some(),
-            "specify at least one of provider, model, or effort"
+            provider.is_some() || model.is_some() || effort.is_some() || fast.is_some(),
+            "specify at least one of provider, model, effort, or fast"
         );
         let _guard = self.configure_lock.lock().await;
         let current = self.resolve_snapshot(target).await?;
@@ -6569,10 +6610,6 @@ impl SubagentCoordinator {
             "model cannot be empty"
         );
         let effort = effort.map(|effort| effort.trim().to_ascii_lowercase());
-        ensure!(
-            effort.as_deref().is_none_or(|effort| !effort.is_empty()),
-            "effort cannot be empty"
-        );
         if let Some(effort) = effort.as_deref() {
             ensure!(
                 matches!(
@@ -6581,8 +6618,8 @@ impl SubagentCoordinator {
                 ),
                 "effort must be one of none, low, medium, high, xhigh, max, or ultra"
             );
-            validate_subagent_overrides(selected, None, Some(effort))?;
         }
+        validate_subagent_overrides(selected, model.as_deref(), effort.as_deref())?;
         let expected_model = if selected != current.provider {
             model.clone().or_else(|| {
                 selected
@@ -6597,71 +6634,71 @@ impl SubagentCoordinator {
             "{} requires a model; pass model=<id>",
             selected.label()
         );
-        let mut events = self.subscribe();
-        let id = current.session_id;
-        let lane_change = if selected != current.provider {
-            Some(crate::SessionConfigAction::SetProvider {
-                provider: selected,
-                model,
-            })
-        } else {
-            model.map(|model| crate::SessionConfigAction::SetModel { model })
+        // Configuration must never wake a parked or human-stopped worker.
+        let sender = {
+            let table = self.table.lock().await;
+            let entry = table
+                .entries
+                .get(&current.session_id)
+                .context("not a child agent")?;
+            ensure!(
+                !entry.dormant && !entry.snapshot.status.is_terminal(),
+                "child is paused or stopped; configuration does not resume it"
+            );
+            entry
+                .commands
+                .clone()
+                .context("child has no live control channel")?
         };
-        if let Some(action) = lane_change {
-            self.send_command(target, |session_id| HostCommand::Configure {
-                session_id,
-                action,
-            })
-            .await?;
-            self.wait_for_child_config(&mut events, id, selected, expected_model.as_deref(), None)
-                .await?;
-        }
-        if let Some(effort) = effort {
-            self.send_command(target, |session_id| HostCommand::Configure {
-                session_id,
-                action: crate::SessionConfigAction::SetEffort {
+        let mut events = self.subscribe();
+        let request_id = Uuid::new_v4();
+        sender
+            .send(HostCommand::Configure {
+                session_id: current.session_id,
+                action: crate::SessionConfigAction::SetAgent {
+                    request_id,
+                    provider,
+                    model,
                     effort: effort.clone(),
+                    fast,
                 },
             })
-            .await?;
-            self.wait_for_child_config(
-                &mut events,
-                id,
-                selected,
-                expected_model.as_deref(),
-                Some(&effort),
-            )
-            .await?;
-        }
-        self.resolve_snapshot(target).await
-    }
-
-    async fn wait_for_child_config(
-        &self,
-        events: &mut broadcast::Receiver<SubagentActivity>,
-        session_id: Uuid,
-        provider: CodingProvider,
-        model: Option<&str>,
-        effort: Option<&str>,
-    ) -> Result<()> {
+            .await
+            .context("subagent command channel closed")?;
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 match events.recv().await {
                     Ok(SubagentActivity::SessionEvent { event, .. })
-                        if event.session_id == session_id =>
+                        if event.session_id == current.session_id =>
                     {
-                        if let SessionEventKind::SessionConfigured {
-                            provider: actual_provider,
-                            model: actual_model,
-                            effort: actual_effort,
-                            ..
-                        } = event.kind
-                            && actual_provider == provider
-                            && actual_model.as_deref() == model
-                            && effort
-                                .is_none_or(|expected| actual_effort.as_deref() == Some(expected))
-                        {
-                            return Ok(());
+                        match event.kind {
+                            SessionEventKind::SessionConfigured {
+                                provider,
+                                model,
+                                effort: actual_effort,
+                                fast: actual_fast,
+                                ..
+                            } if provider == selected
+                                && model == expected_model
+                                && effort.as_ref().is_none_or(|expected| {
+                                    actual_effort.as_ref() == Some(expected)
+                                })
+                                && fast.is_none_or(|expected| actual_fast == expected) =>
+                            {
+                                return Ok(());
+                            }
+                            SessionEventKind::ProviderEvent { kind, payload, .. }
+                                if kind == "child_configuration_rejected"
+                                    && payload["request_id"] == request_id.to_string() =>
+                            {
+                                bail!(
+                                    "{}",
+                                    payload["message"]
+                                        .as_str()
+                                        .unwrap_or("child configuration rejected")
+                                );
+                            }
+                            _ => {}
                         }
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -6672,9 +6709,8 @@ impl SubagentCoordinator {
             }
         })
         .await
-        .with_context(|| {
-            format!("child {session_id} did not confirm its configuration within 30 seconds")
-        })?
+        .context("child did not confirm its configuration within 30 seconds")??;
+        self.resolve_snapshot(target).await
     }
 
     /// Interrupt as the human (the UI path). `interrupt_agent` records its
@@ -6888,7 +6924,13 @@ impl SubagentCoordinator {
                 );
                 let args: ConfigureAgentArgs = serde_json::from_value(arguments)?;
                 let agent = self
-                    .configure_child(&args.target, args.provider, args.model, args.effort)
+                    .configure_child(
+                        &args.target,
+                        args.provider,
+                        args.model,
+                        args.effort,
+                        args.fast,
+                    )
                     .await?;
                 Ok(json!({ "agent": agent }))
             }
@@ -7469,14 +7511,15 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "configure_agent",
-            "Change a child agent's live provider, model, or effort without rotating, replacing its session, or losing its conversation. Takes effect on the next turn when a turn is running; returns only after the child records its new configuration. Use a target from list_agents. The director alone may call this; get_provider_capabilities before switching providers.",
+            "Change a child agent's live provider, model, effort, or fast mode without rotating, replacing its session, or losing its conversation. Fast mode takes effect at the next native model boundary without cancelling tools; other changes take effect next turn. Paused/stopped workers are never woken. Omitted fast retains the mode, false disables it. Fast requires confirmed subscription model support and may consume additional quota; no API-key fallback. A requested mode is not evidence of priority acceptance; returns only after the child records its new configuration. Use a target from list_agents. The director alone may call this; get_provider_capabilities before switching providers.",
             json!({
                 "type": "object",
                 "properties": {
                     "target": { "type": "string", "minLength": 1 },
                     "provider": { "type": "string", "enum": provider_choices },
                     "model": { "type": "string", "minLength": 1 },
-                    "effort": { "type": "string", "enum": ["none", "low", "medium", "high", "xhigh", "max", "ultra"] }
+                    "effort": { "type": "string", "enum": ["none", "low", "medium", "high", "xhigh", "max", "ultra"] },
+                    "fast": { "type": "boolean" }
                 },
                 "required": ["target"],
                 "additionalProperties": false
@@ -7616,7 +7659,7 @@ fn subagent_model_override_description() -> String {
         .join("; ")
 }
 
-fn validate_subagent_overrides(
+pub(crate) fn validate_subagent_overrides(
     provider: CodingProvider,
     model: Option<&str>,
     effort: Option<&str>,
@@ -9346,6 +9389,7 @@ struct ConfigureAgentArgs {
     provider: Option<CodingProvider>,
     model: Option<String>,
     effort: Option<String>,
+    fast: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -10615,6 +10659,9 @@ async fn update_from_session_event(
             entry.snapshot.provider = *provider;
             entry.snapshot.model = model.clone();
             entry.snapshot.effort = effort.clone();
+            if let SessionEventKind::SessionConfigured { fast, .. } = &event.kind {
+                entry.snapshot.fast = *fast;
+            }
             if matches!(event.kind, SessionEventKind::TurnStarted { .. }) {
                 // A new turn by any route ends that interrupt. Not a Running
                 // status: the interrupt itself records Running ("cancelling").
@@ -10748,6 +10795,7 @@ fn project_child_state(snapshot: &mut SubagentSnapshot, state: &crate::SessionSt
         snapshot.provider = config.provider;
         snapshot.model = config.model.clone();
         snapshot.effort = config.effort.clone();
+        snapshot.fast = config.fast;
     }
     snapshot.final_text = state.latest_response.clone();
     snapshot.usage = SubagentUsage {

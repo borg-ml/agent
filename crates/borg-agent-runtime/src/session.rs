@@ -3475,11 +3475,13 @@ async fn run_agent_session_store_kernel_inner(
                         continue;
                     }
                     Some(HostCommand::Configure { action, .. }) => {
-                        let retry_selection = matches!(
-                            action,
-                            crate::SessionConfigAction::SetModel { .. }
-                                | crate::SessionConfigAction::SetProvider { .. }
-                        );
+                        let retry_selection = config_selection_changed(&action);
+                        let rejected_request = match &action {
+                            crate::SessionConfigAction::SetAgent { request_id, .. } => {
+                                Some(*request_id)
+                            }
+                            _ => None,
+                        };
                         let previous_provider = launch.provider;
                         match apply_session_config(
                             &mut journal,
@@ -3538,9 +3540,11 @@ async fn run_agent_session_store_kernel_inner(
                                     &mut journal,
                                     &events,
                                     session_id,
-                                    SessionEventKind::Error {
-                                        message: error.to_string(),
-                                    },
+                                    configuration_error(
+                                        launch.provider,
+                                        rejected_request,
+                                        error.to_string(),
+                                    ),
                                 )
                                 .await?;
                             }
@@ -6342,11 +6346,11 @@ async fn run_agent_session_store_kernel_inner(
                             deferred_commands.push_back(command);
                         }
                         HostCommand::Configure { action, .. } => {
-                            let context_selection_changed = matches!(
-                                action,
-                                crate::SessionConfigAction::SetModel { .. }
-                                    | crate::SessionConfigAction::SetProvider { .. }
-                            );
+                            let context_selection_changed = config_selection_changed(&action);
+                            let rejected_request = match &action {
+                                crate::SessionConfigAction::SetAgent { request_id, .. } => Some(*request_id),
+                                _ => None,
+                            };
                             match apply_session_config(
                                 &mut journal,
                                 &events,
@@ -6374,9 +6378,7 @@ async fn run_agent_session_store_kernel_inner(
                                         &mut journal,
                                         &events,
                                         session_id,
-                                        SessionEventKind::Error {
-                                            message: error.to_string(),
-                                        },
+                                        configuration_error(launch.provider, rejected_request, error.to_string()),
                                     )
                                     .await?;
                                 }
@@ -11715,6 +11717,34 @@ async fn fall_back_on_usage_limit(
     Ok(Some(switch))
 }
 
+fn config_selection_changed(action: &crate::SessionConfigAction) -> bool {
+    matches!(
+        action,
+        crate::SessionConfigAction::SetModel { .. }
+            | crate::SessionConfigAction::SetProvider { .. }
+            | crate::SessionConfigAction::SetAgent {
+                provider: Some(_),
+                ..
+            }
+            | crate::SessionConfigAction::SetAgent { model: Some(_), .. }
+    )
+}
+
+fn configuration_error(
+    provider: CodingProvider,
+    request_id: Option<Uuid>,
+    message: String,
+) -> SessionEventKind {
+    match request_id {
+        Some(request_id) => SessionEventKind::ProviderEvent {
+            provider,
+            kind: "child_configuration_rejected".into(),
+            payload: serde_json::json!({ "request_id": request_id, "message": message }),
+        },
+        None => SessionEventKind::Error { message },
+    }
+}
+
 async fn apply_session_config(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
@@ -11723,14 +11753,13 @@ async fn apply_session_config(
     executor: &dyn AgentTurnExecutor,
     action: crate::SessionConfigAction,
 ) -> Result<bool> {
+    let mut candidate = launch.clone();
+    let next = &mut candidate;
     let mut provider_switched = false;
     // Only a change of model is a reason to ask again; any other setting
     // keeps the tiers last confirmed, so a failed probe cannot cost them.
-    let selection_changed = matches!(
-        action,
-        crate::SessionConfigAction::SetModel { .. }
-            | crate::SessionConfigAction::SetProvider { .. }
-    );
+    let selection_changed = config_selection_changed(&action);
+    let atomic_child = matches!(action, crate::SessionConfigAction::SetAgent { .. });
     let mut speed_support = journal
         .state(session_id)
         .await?
@@ -11741,7 +11770,7 @@ async fn apply_session_config(
         crate::SessionConfigAction::SetModel { model } => {
             let model = model.trim();
             anyhow::ensure!(!model.is_empty(), "model cannot be empty");
-            launch.model = Some(model.to_string());
+            next.model = Some(model.to_string());
         }
         crate::SessionConfigAction::SetProvider { provider, model } => {
             let model = model.map(|model| model.trim().to_string());
@@ -11749,31 +11778,74 @@ async fn apply_session_config(
                 model.as_deref().is_none_or(|model| !model.is_empty()),
                 "model cannot be empty"
             );
-            if provider != launch.provider {
+            if provider != next.provider {
                 provider_switched = true;
-                launch.provider = provider;
+                next.provider = provider;
                 // Effort and fast vocabularies are per provider; anything the
                 // new provider does not understand is dropped rather than
                 // forwarded and rejected at turn time.
                 if provider != CodingProvider::Codex {
-                    launch.ultrafast = None;
+                    next.ultrafast = None;
                 }
                 if !provider.supports_fast() {
-                    launch.fast = None;
+                    next.fast = None;
                 }
-                if let Some(effort) = launch.effort.take() {
-                    launch.effort = provider
+                if let Some(effort) = next.effort.take() {
+                    next.effort = provider
                         .model_catalog()
                         .filter(|catalog| catalog.supports_effort(&effort))
                         .map(|_| effort);
                 }
             }
-            launch.model = model.or_else(|| {
-                launch
-                    .provider
+            next.model = model.or_else(|| {
+                next.provider
                     .model_catalog()
                     .map(|catalog| catalog.default_model.to_string())
             });
+        }
+        crate::SessionConfigAction::SetAgent {
+            provider,
+            model,
+            effort,
+            fast,
+            ..
+        } => {
+            if let Some(provider) = provider {
+                provider_switched = provider != next.provider;
+                next.provider = provider;
+                if provider_switched && model.is_none() {
+                    next.model = provider
+                        .model_catalog()
+                        .map(|catalog| catalog.default_model.to_string());
+                }
+            }
+            if let Some(model) = model {
+                let model = model.trim();
+                anyhow::ensure!(!model.is_empty(), "model cannot be empty");
+                next.model = Some(model.to_string());
+            }
+            if let Some(effort) = effort {
+                next.effort = Some(effort.trim().to_ascii_lowercase());
+            }
+            crate::subagents::validate_subagent_overrides(
+                next.provider,
+                next.model.as_deref(),
+                next.effort.as_deref(),
+            )?;
+            if let Some(fast) = fast {
+                next.fast = Some(fast);
+                if fast {
+                    next.ultrafast = Some(false);
+                }
+            }
+            if next.fast.unwrap_or(false) && (fast == Some(true) || selection_changed) {
+                speed_support =
+                    confirmed_speed_support(executor, next, "fast", |support| support.fast).await?;
+            } else if selection_changed {
+                speed_support = probe_speed_support(executor, next)
+                    .await
+                    .unwrap_or_default();
+            }
         }
         crate::SessionConfigAction::SetEffort { effort } => {
             let effort = effort.trim().to_ascii_lowercase();
@@ -11784,48 +11856,47 @@ async fn apply_session_config(
                 ),
                 "effort must be one of none, low, medium, high, xhigh, max, or ultra"
             );
-            launch.effort = Some(effort);
+            next.effort = Some(effort);
         }
         crate::SessionConfigAction::SetPermissionMode { permission_mode } => {
-            launch.permission_mode = permission_mode;
+            next.permission_mode = permission_mode;
         }
         crate::SessionConfigAction::SetFast { enabled } => {
             if enabled {
                 speed_support =
-                    confirmed_speed_support(executor, launch, "fast", |support| support.fast)
-                        .await?;
+                    confirmed_speed_support(executor, next, "fast", |support| support.fast).await?;
             }
-            launch.fast = Some(enabled);
-            launch.ultrafast = Some(false);
+            next.fast = Some(enabled);
+            next.ultrafast = Some(false);
         }
         crate::SessionConfigAction::SetUltrafast { enabled } => {
             if enabled {
-                speed_support = confirmed_speed_support(executor, launch, "ultrafast", |support| {
+                speed_support = confirmed_speed_support(executor, next, "ultrafast", |support| {
                     support.ultrafast
                 })
                 .await?;
             }
-            launch.ultrafast = Some(enabled);
-            launch.fast = Some(false);
+            next.ultrafast = Some(enabled);
+            next.fast = Some(false);
         }
         crate::SessionConfigAction::SetResponseLanguage { language } => {
-            launch.response_language = language;
+            next.response_language = language;
         }
     }
-    if launch.provider == CodingProvider::Claude && launch.effort.is_none() {
-        launch.effort = Some(borg_provider::claude_default_effort().to_string());
+    if next.provider == CodingProvider::Claude && next.effort.is_none() {
+        next.effort = Some(borg_provider::claude_default_effort().to_string());
     }
-    if selection_changed {
+    if selection_changed && !atomic_child {
         // A tier the new model does not offer is dropped, never carried over
         // to fail at turn time; an unconfirmed one counts as not offered.
-        speed_support = probe_speed_support(executor, launch)
+        speed_support = probe_speed_support(executor, next)
             .await
             .unwrap_or_default();
         if !speed_support.fast {
-            launch.fast = None;
+            next.fast = None;
         }
         if !speed_support.ultrafast {
-            launch.ultrafast = None;
+            next.ultrafast = None;
         }
     }
     record(
@@ -11833,18 +11904,19 @@ async fn apply_session_config(
         events,
         session_id,
         SessionEventKind::SessionConfigured {
-            cwd: launch.cwd.clone(),
-            provider: launch.provider,
-            model: launch.model.clone(),
-            effort: launch.effort.clone(),
-            fast: launch.fast.unwrap_or(false),
-            ultrafast: launch.ultrafast.unwrap_or(false),
-            response_language: launch.response_language,
-            permission_mode: launch.permission_mode,
+            cwd: next.cwd.clone(),
+            provider: next.provider,
+            model: next.model.clone(),
+            effort: next.effort.clone(),
+            fast: next.fast.unwrap_or(false),
+            ultrafast: next.ultrafast.unwrap_or(false),
+            response_language: next.response_language,
+            permission_mode: next.permission_mode,
             speed_support,
         },
     )
     .await?;
+    *launch = candidate;
     Ok(provider_switched)
 }
 
@@ -11916,7 +11988,7 @@ async fn probe_speed_support(
 
 /// Confirm `tier` before it is selected, so an unsupported request changes
 /// nothing.
-async fn confirmed_speed_support(
+pub(crate) async fn confirmed_speed_support(
     executor: &dyn AgentTurnExecutor,
     launch: &LaunchSession,
     tier: &str,
@@ -12843,11 +12915,12 @@ async fn apply_subagent_action(
                 provider,
                 model,
                 effort,
+                fast,
                 ..
             } => Ok(SubagentControlOutcome::Accepted {
                 agent: Box::new(
                     subagents
-                        .configure_child(&target, provider, model, effort)
+                        .configure_child(&target, provider, model, effort, fast)
                         .await?,
                 ),
             }),

@@ -2142,6 +2142,32 @@ async fn a_member_delegation_spawns_fresh_and_names_the_requester() {
     scratch.discard().await;
 }
 
+struct FastPeerExecutor(RecordingPeerExecutor);
+
+#[async_trait::async_trait]
+impl crate::AgentTurnExecutor for FastPeerExecutor {
+    async fn execute(
+        &self,
+        turn: crate::AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
+    ) -> Result<crate::AgentTurnResult> {
+        self.0.execute(turn, events, controls).await
+    }
+
+    async fn speed_support(
+        &self,
+        provider: CodingProvider,
+        model: &str,
+        _context: Option<&crate::RuntimeProviderContext>,
+    ) -> Result<crate::SpeedSupport> {
+        Ok(crate::SpeedSupport {
+            fast: provider == CodingProvider::Codex && model == "gpt-6-sol",
+            ultrafast: false,
+        })
+    }
+}
+
 /// A model switch must not rotate the worker, lose its conversation, or
 /// revert to the launch lane when that child is resumed after a stop.
 #[tokio::test]
@@ -2158,7 +2184,7 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
         root,
         root_launch,
         2,
-        Arc::new(RecordingPeerExecutor::default()),
+        Arc::new(FastPeerExecutor(RecordingPeerExecutor::default())),
         store.clone(),
     )
     .unwrap();
@@ -2192,7 +2218,7 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
     assert!(unauthorized.to_string().contains("only the director"));
     assert!(
         coordinator
-            .configure_child("/root", Some(CodingProvider::Codex), None, None)
+            .configure_child("/root", Some(CodingProvider::Codex), None, None, None)
             .await
             .unwrap_err()
             .to_string()
@@ -2200,7 +2226,7 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
     );
     assert!(
         coordinator
-            .configure_child(target, None, None, Some("invalid".into()))
+            .configure_child(target, None, None, Some("invalid".into()), None)
             .await
             .is_err()
     );
@@ -2209,7 +2235,7 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
         .call_tool_as(
             root,
             "configure_agent",
-            json!({ "target": target, "provider": "codex", "model": "gpt-6-sol", "effort": "max" }),
+            json!({ "target": target, "provider": "codex", "model": "gpt-6-sol", "effort": "max", "fast": true }),
         )
         .await
         .unwrap();
@@ -2230,6 +2256,43 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
         Some("Remember this original prompt.")
     );
 
+    assert!(config.fast);
+    assert!(coordinator.get(child.session_id).await.unwrap().fast);
+    // An unsupported combined change must reject promptly and atomically.
+    let before = store.state(child.session_id).await.unwrap().configuration;
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(5),
+        coordinator.call_tool(
+            "configure_agent",
+            json!({"target": target, "model": "gpt-6-luna", "effort": "xhigh", "fast": true}),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(rejected.to_string().contains("does not offer fast"));
+    assert_eq!(
+        store.state(child.session_id).await.unwrap().configuration,
+        before
+    );
+    let retained = coordinator
+        .call_tool(
+            "configure_agent",
+            json!({"target": target, "effort": "xhigh"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retained["agent"]["fast"], true);
+    let disabled = coordinator
+        .call_tool("configure_agent", json!({"target": target, "fast": false}))
+        .await
+        .unwrap();
+    assert_eq!(disabled["agent"]["fast"], false);
+    coordinator
+        .call_tool("configure_agent", json!({"target": target, "fast": true}))
+        .await
+        .unwrap();
+
     coordinator.stop(target).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while coordinator.get(child.session_id).await.unwrap().status != SubagentStatus::Stopped {
@@ -2238,6 +2301,18 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
     })
     .await
     .unwrap();
+    assert!(
+        coordinator
+            .call_tool("configure_agent", json!({"target": target, "fast": false}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("paused or stopped")
+    );
+    assert_eq!(
+        coordinator.get(child.session_id).await.unwrap().status,
+        SubagentStatus::Stopped
+    );
     coordinator
         .ensure_child_actor(child.session_id)
         .await
@@ -2246,7 +2321,8 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
     assert_eq!(revived.session_id, child.session_id);
     assert_eq!(revived.provider, CodingProvider::Codex);
     assert_eq!(revived.model.as_deref(), Some("gpt-6-sol"));
-    assert_eq!(revived.effort.as_deref(), Some("max"));
+    assert_eq!(revived.effort.as_deref(), Some("xhigh"));
+    assert!(revived.fast);
     coordinator.stop_all().await;
     scratch.discard().await;
 }
@@ -4196,6 +4272,7 @@ async fn durable_parent_activity_restores_child_topology() {
         provider: CodingProvider::Codex,
         model: Some("gpt-test".into()),
         effort: Some("high".into()),
+        fast: false,
         cwd: PathBuf::from("/workspace"),
         created_at: now,
         updated_at: now,
@@ -4567,6 +4644,7 @@ async fn a_child_restored_after_a_host_crash_is_still_addressable_in_the_team_wo
                 provider: CodingProvider::Codex,
                 model: Some("gpt-test".into()),
                 effort: Some("high".into()),
+                fast: false,
                 cwd: PathBuf::from("/workspace"),
                 created_at: now,
                 updated_at: now,
@@ -4650,6 +4728,7 @@ async fn restore_mirrors_a_child_stop_journaled_before_the_parent_crashed() {
                 provider: CodingProvider::Codex,
                 model: Some("gpt-test".into()),
                 effort: Some("high".into()),
+                fast: false,
                 cwd: workspace.clone(),
                 created_at: now,
                 updated_at: now,
@@ -4740,6 +4819,7 @@ async fn restored_live_child_stays_dormant_and_parks_with_its_root() {
         provider: CodingProvider::Codex,
         model: Some("gpt-test".into()),
         effort: Some("high".into()),
+        fast: false,
         cwd: workspace.clone(),
         created_at: now,
         updated_at: now,
