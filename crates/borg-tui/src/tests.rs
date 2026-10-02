@@ -14994,6 +14994,44 @@ fn a_collapsed_plan_card_shows_the_update_not_the_first_rows() {
 }
 
 #[test]
+fn a_collapsed_plan_card_keeps_open_steps_behind_completed_leading_rows() {
+    // The reported card: 15 steps, the first 11 done. Clipping to the leading
+    // rows hid all the remaining work and made the plan look finished.
+    let mut transcript = Transcript::default();
+    let items = (0..15)
+        .map(|index| PlanItem {
+            id: Uuid::new_v4(),
+            content: format!("Task {index:02}"),
+            status: if index < 11 {
+                PlanItemStatus::Completed
+            } else {
+                PlanItemStatus::Pending
+            },
+        })
+        .collect::<Vec<_>>();
+    transcript.upsert_plan(items, "12:00".to_string());
+    let render = |transcript: &Transcript| {
+        transcript
+            .lines(80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let collapsed = render(&transcript);
+    for shown in ["Task 00", "Task 01", "Task 11", "Task 12", "Task 13"] {
+        assert!(collapsed.contains(shown), "{shown} missing from {collapsed}");
+    }
+    assert!(!collapsed.contains("Task 02"), "{collapsed}");
+    assert!(collapsed.contains("+ 10 more"), "{collapsed}");
+
+    transcript.toggle_plan_expansion(transcript.order.len() - 1);
+    let expanded = render(&transcript);
+    assert!(expanded.contains("Task 05"), "{expanded}");
+    assert!(expanded.contains("Task 14"), "{expanded}");
+}
+
+#[test]
 fn upserting_a_plan_preserves_its_expansion_state() {
     let mut transcript = Transcript::default();
     let items = |count: usize| {

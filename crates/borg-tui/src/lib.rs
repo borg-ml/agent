@@ -2526,7 +2526,21 @@ fn plan_card_rows<'a>(
         ordered_plan_items(items)
     };
     if collapsed {
-        rows.truncate(MAX_COLLAPSED_PLAN_ITEMS);
+        // Leading rows must not crowd out every open step: a plan whose first
+        // rows are all done would otherwise read as finished.
+        let open = items
+            .iter()
+            .filter(|item| item.status != PlanItemStatus::Completed)
+            .count();
+        let shown_open = rows
+            .iter()
+            .take(MAX_COLLAPSED_PLAN_ITEMS)
+            .filter(|item| item.status != PlanItemStatus::Completed)
+            .count();
+        let reserve = open
+            .min(MAX_COLLAPSED_PLAN_OPEN_ITEMS)
+            .saturating_sub(shown_open);
+        rows.truncate(MAX_COLLAPSED_PLAN_ITEMS - reserve);
         // The changed row stays on top: it is why the card updated, and that
         // holds when the change is a step being completed. What it cannot say
         // is what remains, so follow it with the work that is still open.

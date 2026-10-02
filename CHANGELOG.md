@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.13.6)
 
+### Terminal
+
+- Collapsed plan updates reserve space for open steps, so completed leading rows
+  cannot hide all remaining work. Expanded plans still show every item.
+
 ### Reliability
 
 - Local session hosts wait for working subagents, including child background
