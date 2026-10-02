@@ -1637,6 +1637,15 @@ pub enum SessionConfigAction {
         provider: CodingProvider,
         model: Option<String>,
     },
+    /// Atomic child control; rejection leaves the prior configuration intact.
+    SetAgent {
+        request_id: Uuid,
+        provider: Option<CodingProvider>,
+        model: Option<String>,
+        effort: Option<String>,
+        fast: Option<bool>,
+        ultrafast: Option<bool>,
+    },
     SetEffort {
         effort: String,
     },

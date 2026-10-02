@@ -726,7 +726,7 @@ impl NativeHarness {
             .await;
         // Every request this turn sends, compaction included, shares these
         // fields, so each one extends the prefix the previous one cached.
-        let request_template = ModelTurnRequest {
+        let mut request_template = ModelTurnRequest {
             fast: turn.fast.unwrap_or(false),
             ultrafast: turn.ultrafast.unwrap_or(false),
             request_id: None,
@@ -777,6 +777,16 @@ impl NativeHarness {
         // not seen, for the usage anchor if the turn settles without a reply.
         let mut parked_reply_unsent_tokens: Option<u64> = None;
         loop {
+            // Read only speed at a model boundary. The request and side-effectful
+            // tools already in flight keep their context and are never cancelled.
+            if let Some(store) = turn.agent_tools.session_store()
+                && let Some(config) = store.state(turn.session_id).await?.configuration
+                && config.provider == turn.provider && config.model.as_deref() == Some(model.as_str())
+                && config.effort == turn.effort
+            {
+                request_template.fast = config.fast;
+                request_template.ultrafast = config.ultrafast;
+            }
             model_round += 1;
             if grace_wrapup.load(std::sync::atomic::Ordering::Relaxed) && !grace_prompted {
                 messages.push(ModelMessage::user("Claude's 5-hour subscription limit has entered its server-reported wrap-up allowance. Finish only the work already in progress, save a recoverable checkpoint if needed, and report what remains. Do not start new tasks or spawn agents."));
@@ -6353,10 +6363,18 @@ mod tests {
 
     #[tokio::test]
     async fn native_batch_records_results_before_honoring_controls_and_skips_queued_actions() {
-        for (interrupt, tool_rounds) in [(false, 1), (true, 1), (false, 40)] {
+        for (interrupt, tool_rounds, speed_toggle) in [
+            (false, 1, false),
+            (true, 1, false),
+            (false, 40, false),
+            (false, 1, true),
+        ] {
             let root = tempfile::tempdir().unwrap();
             let cwd = root.path().to_path_buf();
             let session_id = Uuid::new_v4();
+            let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+            let store: Arc<dyn crate::SessionStore> = Arc::new(store);
+            store.create_session(session_id).await.unwrap();
             let cache_root = Uuid::new_v4();
             let client = Arc::new(BatchClient {
                 tool_rounds,
@@ -6408,7 +6426,7 @@ mod tests {
                     cwd.clone(),
                     None,
                     None,
-                    None,
+                    Some(store.clone()),
                     Vec::new(),
                     None,
                     crate::native_process::ProcessManager::default(),
@@ -6454,6 +6472,15 @@ mod tests {
                     {
                         assert!(!controlled);
                         controlled = true;
+                        if speed_toggle {
+                            store.append(SessionEvent::new(session_id, 0, SessionEventKind::SessionConfigured {
+                                cwd: cwd.clone(), provider: crate::CodingProvider::OpenRouter,
+                                model: Some("test-model".into()), effort: None,
+                                fast: false, ultrafast: false, response_language: crate::ResponseLanguage::Auto,
+                                permission_mode: PermissionMode::FullAccess, speed_support: Default::default(),
+                            })).await.unwrap();
+                            continue;
+                        }
                         let control = if interrupt {
                             AgentTurnControl::Interrupt
                         } else {
@@ -6484,8 +6511,9 @@ mod tests {
                 "first result must be emitted while the batch is active"
             );
             assert_eq!(std::fs::read_to_string(cwd.join("first")).unwrap(), "first");
+            assert_eq!(cwd.join("second").exists(), speed_toggle);
             assert!(
-                !cwd.join("second").exists(),
+                speed_toggle || !cwd.join("second").exists(),
                 "queued action must not execute"
             );
             let result = task.await.unwrap();
@@ -6506,14 +6534,26 @@ mod tests {
                     && request.session_id.as_deref() == Some(expected_session.as_str()))
             );
 
+            let requests = client.requests.lock().unwrap();
+            assert!(requests[0].fast);
             assert!(
-                client
-                    .requests
-                    .lock()
-                    .unwrap()
+                requests
                     .iter()
-                    .all(|request| request.fast)
+                    .skip(1)
+                    .all(|request| request.fast != speed_toggle)
             );
+            drop(requests);
+            if speed_toggle {
+                result.unwrap();
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                for id in ["first", "second"] {
+                    assert!(requests[1].messages.iter().any(|message| matches!(message, ModelMessage::Tool { tool_call_id, content, .. } if tool_call_id == id && !content.contains("not executed"))));
+                }
+                drop(requests);
+                scratch.discard().await;
+                continue;
+            }
             if interrupt {
                 assert!(result.unwrap_err().to_string().contains("interrupted"));
                 assert_eq!(client.requests.lock().unwrap().len(), 1);
@@ -6528,6 +6568,7 @@ mod tests {
                 assert!(requests[1].messages.iter().any(|message| matches!(message,
                     ModelMessage::User { content, .. } if content.contains("stop writing"))));
             }
+            scratch.discard().await;
         }
     }
 

@@ -1793,6 +1793,7 @@ async fn a_child_without_a_lane_inherits_the_parent_live_lane() {
     // provider it has since switched to.
     let mut root_launch = launch();
     root_launch.capabilities.multiplayer = false;
+    root_launch.fast = Some(true);
     root_launch.cwd = directory.path().to_path_buf();
     root_launch
         .capabilities
@@ -1859,6 +1860,11 @@ async fn a_child_without_a_lane_inherits_the_parent_live_lane() {
         "the launch lane is not the parent live lane"
     );
     assert_eq!(defaulted.provider, CodingProvider::OpenCode);
+    assert_eq!(
+        defaulted.fast,
+        Some(false),
+        "inherit live speed, not stale launch mode"
+    );
     assert_eq!(
         defaulted.model.as_deref(),
         Some("opencode-go/deepseek-v4.1-flash")
@@ -2158,6 +2164,32 @@ async fn a_member_delegation_spawns_fresh_and_names_the_requester() {
     scratch.discard().await;
 }
 
+struct FastPeerExecutor(RecordingPeerExecutor);
+
+#[async_trait::async_trait]
+impl crate::AgentTurnExecutor for FastPeerExecutor {
+    async fn execute(
+        &self,
+        turn: crate::AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
+    ) -> Result<crate::AgentTurnResult> {
+        self.0.execute(turn, events, controls).await
+    }
+
+    async fn speed_support(
+        &self,
+        provider: CodingProvider,
+        model: &str,
+        _context: Option<&crate::RuntimeProviderContext>,
+    ) -> Result<crate::SpeedSupport> {
+        Ok(crate::SpeedSupport {
+            fast: provider == CodingProvider::Codex && model == "gpt-6-sol",
+            ultrafast: provider == CodingProvider::Codex && model == "gpt-6-sol",
+        })
+    }
+}
+
 #[tokio::test]
 async fn subagent_speed_overrides_live_inheritance_and_controls_worker_reuse() {
     let directory = tempdir().unwrap();
@@ -2286,7 +2318,7 @@ async fn director_configures_live_child_speed_and_reuses_its_new_lane_after_wake
         root,
         root_launch,
         2,
-        Arc::new(RecordingPeerExecutor::default()),
+        Arc::new(FastPeerExecutor(RecordingPeerExecutor::default())),
         store.clone(),
     )
     .unwrap();
@@ -2364,6 +2396,43 @@ async fn director_configures_live_child_speed_and_reuses_its_new_lane_after_wake
         Some("Remember this original prompt.")
     );
 
+    assert!(config.fast);
+    assert!(coordinator.get(child.session_id).await.unwrap().fast);
+    // An unsupported combined change must reject promptly and atomically.
+    let before = store.state(child.session_id).await.unwrap().configuration;
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(5),
+        coordinator.call_tool(
+            "configure_agent",
+            json!({"target": target, "model": "gpt-6-luna", "effort": "xhigh", "fast": true}),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(rejected.to_string().contains("does not offer fast"));
+    assert_eq!(
+        store.state(child.session_id).await.unwrap().configuration,
+        before
+    );
+    let retained = coordinator
+        .call_tool(
+            "configure_agent",
+            json!({"target": target, "effort": "xhigh"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retained["agent"]["fast"], true);
+    let disabled = coordinator
+        .call_tool("configure_agent", json!({"target": target, "fast": false}))
+        .await
+        .unwrap();
+    assert_eq!(disabled["agent"]["fast"], false);
+    coordinator
+        .call_tool("configure_agent", json!({"target": target, "fast": true}))
+        .await
+        .unwrap();
+
     coordinator.stop(target).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while coordinator.get(child.session_id).await.unwrap().status != SubagentStatus::Stopped {
@@ -2372,6 +2441,18 @@ async fn director_configures_live_child_speed_and_reuses_its_new_lane_after_wake
     })
     .await
     .unwrap();
+    assert!(
+        coordinator
+            .call_tool("configure_agent", json!({"target": target, "fast": false}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("paused or stopped")
+    );
+    assert_eq!(
+        coordinator.get(child.session_id).await.unwrap().status,
+        SubagentStatus::Stopped
+    );
     coordinator
         .ensure_child_actor(child.session_id)
         .await
@@ -2380,7 +2461,7 @@ async fn director_configures_live_child_speed_and_reuses_its_new_lane_after_wake
     assert_eq!(revived.session_id, child.session_id);
     assert_eq!(revived.provider, CodingProvider::Codex);
     assert_eq!(revived.model.as_deref(), Some("gpt-6-sol"));
-    assert_eq!(revived.effort.as_deref(), Some("max"));
+    assert_eq!(revived.effort.as_deref(), Some("xhigh"));
     assert!(revived.fast);
     assert!(!revived.ultrafast);
     let standard = coordinator
