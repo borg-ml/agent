@@ -263,30 +263,30 @@ impl PostgresSessionStore {
                 .query_history_composed(session_id, &query, text.as_deref())
                 .await;
         }
-        if text.is_some() {
-            if let Err(error) = self.ensure_history_projection(session_id).await {
-                // PostgreSQL caps a tsvector at 1 MiB. One large tool payload
-                // must not poison recall of the whole journal; keep it intact
-                // and use the existing bounded canonical scanner instead.
-                let vector_limit = error.chain().any(|cause| {
-                    cause.downcast_ref::<sqlx::Error>().is_some_and(|error| {
-                        error.as_database_error().is_some_and(|database| {
-                            database.code().as_deref() == Some("54000")
-                                && database.message().contains("tsvector")
-                        })
+        if text.is_some()
+            && let Err(error) = self.ensure_history_projection(session_id).await
+        {
+            // PostgreSQL caps a tsvector at 1 MiB. One large tool payload
+            // must not poison recall of the whole journal; keep it intact
+            // and use the existing bounded canonical scanner instead.
+            let vector_limit = error.chain().any(|cause| {
+                cause.downcast_ref::<sqlx::Error>().is_some_and(|error| {
+                    error.as_database_error().is_some_and(|database| {
+                        database.code().as_deref() == Some("54000")
+                            && database.message().contains("tsvector")
                     })
-                });
-                if !vector_limit {
-                    return Err(error);
-                }
-                let mut page = self
-                    .query_history_composed(session_id, &query, text.as_deref())
-                    .await?;
-                // The fallback uses the lineage scanner's literal-term matching,
-                // not tsvector ranking; expose that distinction to the caller.
-                page.backend = "postgres_unindexed_scan".to_string();
-                return Ok(page);
+                })
+            });
+            if !vector_limit {
+                return Err(error);
             }
+            let mut page = self
+                .query_history_composed(session_id, &query, text.as_deref())
+                .await?;
+            // The fallback uses the lineage scanner's literal-term matching,
+            // not tsvector ranking; expose that distinction to the caller.
+            page.backend = "postgres_unindexed_scan".to_string();
+            return Ok(page);
         }
         match (text.as_deref(), query.mode) {
             (None, _) => self.query_history_exact(Some(session_id), &query).await,
