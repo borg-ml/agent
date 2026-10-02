@@ -1,3 +1,4 @@
+mod team_harness;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -2395,6 +2396,16 @@ impl AgentToolDispatcher {
                     .await
                     .map(lift_runtime_value_attachments)
             }
+            "get_tool_context" => {
+                let _: NoArgs = serde_json::from_value(arguments)?;
+                Ok(
+                    json!({"session_id": self.actor_session_id, "assigned_directory": self.runtime_root,
+                    "default_tool_directory": self.runtime_root,
+                    "shell_directory": self.shell_directory.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone().unwrap_or_else(|| self.runtime_root.clone()),
+                    "source": "session launch and explicit shell cd tracking", "observed_at": Utc::now(),
+                    "caveat": "A literal leading shell cd changes shell commands only, not the assigned root of runtime/read/search/LSP. Explicit paths override defaults within existing path policy; no automatic worktree takeover."}),
+                )
+            }
             "query_history" => {
                 let query: crate::SessionHistoryQuery = serde_json::from_value(arguments)?;
                 let store = self
@@ -3588,6 +3599,8 @@ pub struct TeamMessageOptions {
     pub reply_to_message_id: Option<Uuid>,
     /// Durable references to images captured from the sender before routing.
     pub attachments: Vec<MessageAttachment>,
+    /// Stable sender-scoped key for durable batch message retries.
+    pub idempotency_key: Option<String>,
 }
 
 struct RoutedTeamMessage {
@@ -4045,7 +4058,9 @@ impl SubagentCoordinator {
                 mode: delivery_mode,
                 thread_id: None,
                 reply_to_message_id: options.reply_to_message_id,
-                idempotency_key: format!("team-message:{idempotency_id}"),
+                idempotency_key: options
+                    .idempotency_key
+                    .unwrap_or_else(|| format!("team-message:{idempotency_id}")),
             })
             .await?;
         Ok((
@@ -4580,13 +4595,39 @@ impl SubagentCoordinator {
     /// `fresh` always spawns: an idle worker may be holding context or
     /// unlanded work its parent means to follow up on, and reusing it renames
     /// it and drops its last answer.
-    async fn assign_task_as(
+    async fn assign_task_in_directory_as(
         &self,
         actor_session_id: Uuid,
         request: SpawnSubagent,
         fresh: bool,
+        directory: Option<PathBuf>,
     ) -> Result<Value> {
         let mut launch = self.subagent_launch(&request).await?;
+        let explicit_directory = directory.is_some();
+        if let Some(directory) = directory {
+            let base = if actor_session_id == self.root_session_id {
+                self.root_launch.cwd.clone()
+            } else {
+                self.get(actor_session_id)
+                    .await
+                    .context("unknown assignment author")?
+                    .cwd
+            };
+            let directory = base
+                .join(directory)
+                .canonicalize()
+                .context("resolve assigned tool directory")?;
+            ensure!(
+                directory.is_dir(),
+                "assigned tool directory must be an existing directory"
+            );
+            ensure!(
+                launch.permission_mode == crate::PermissionMode::FullAccess
+                    || directory.starts_with(base.canonicalize()?),
+                "assigning a directory outside the session workspace requires Full Access"
+            );
+            launch.cwd = directory;
+        }
         let assignment_name = launch
             .name
             .as_deref()
@@ -4602,7 +4643,7 @@ impl SubagentCoordinator {
         // member was between turns. A member always gets a fresh worker, told
         // who asked, because the worker's reports otherwise go to the director.
         let member = (actor_session_id != self.root_session_id).then_some(actor_session_id);
-        let may_reuse = !fresh && member.is_none();
+        let may_reuse = !fresh && !explicit_directory && member.is_none();
         if let Some(member) = member {
             let requester = self
                 .get(member)
@@ -6960,7 +7001,7 @@ impl SubagentCoordinator {
         match name {
             "spawn_agent" => {
                 let args: SpawnAgentArgs = serde_json::from_value(arguments)?;
-                self.assign_task_as(
+                self.assign_task_in_directory_as(
                     actor_session_id,
                     SpawnSubagent {
                         task_name: args.task_name,
@@ -6972,9 +7013,14 @@ impl SubagentCoordinator {
                         ultrafast: args.ultrafast,
                     },
                     args.fresh,
+                    args.cwd,
                 )
                 .await
             }
+            "team_snapshot" => self.team_snapshot(actor_session_id, arguments).await,
+            "inspect_agent" => self.inspect_agent(actor_session_id, arguments).await,
+            "team_batch" => self.team_batch(actor_session_id, arguments).await,
+            "get_team_operation" => self.get_team_operation(actor_session_id, arguments).await,
             "list_agents" => {
                 let args: ListAgentsArgs = serde_json::from_value(arguments)?;
                 Ok(json!({ "agents": self.list(args.path_prefix.as_deref()).await }))
@@ -7338,17 +7384,33 @@ impl SubagentCoordinator {
                     "unknown message id {}",
                     args.message_id
                 );
-                Ok(json!({
-                    "message_id": args.message_id,
-                    "deliveries": deliveries.iter().map(|delivery| json!({
-                        "recipient_id": delivery.recipient_id,
-                        "workspace_id": delivery.workspace_id,
-                        "mode": delivery.mode,
-                        "state": delivery.state,
-                        "attempts": delivery.attempts,
-                        "last_attempt": delivery.last_attempt,
-                    })).collect::<Vec<_>>(),
-                }))
+                let mut receipts = Vec::new();
+                for delivery in &deliveries {
+                    let canonical_present = self
+                        .store
+                        .contains_message(delivery.recipient_id, args.message_id)
+                        .await
+                        .ok();
+                    let mut receipt = serde_json::to_value(delivery)?;
+                    receipt["evidence"] = json!({
+                        "queued": true,
+                        "eligible_for_delivery": !matches!(delivery.state, crate::DeliveryState::Failed | crate::DeliveryState::Recalled),
+                        "dispatched": null,
+                        "durably_admitted": if matches!(delivery.state, crate::DeliveryState::Admitted | crate::DeliveryState::Acknowledged) { Some(true) } else { None },
+                        "canonical_message_present": canonical_present,
+                        "acknowledged": if delivery.state == crate::DeliveryState::Acknowledged { Some(true) } else { None },
+                        "acknowledgment_recorded": delivery.state == crate::DeliveryState::Acknowledged,
+                        "read": null, "acted_on": null,
+                        "projection_may_lag": canonical_present == Some(true) && delivery.state == crate::DeliveryState::Pending,
+                    });
+                    team_harness::scrub_value(&mut receipt);
+                    receipts.push(receipt);
+                }
+                Ok(
+                    json!({"message_id": args.message_id, "deliveries": receipts, "observed_at": Utc::now(),
+                    "source": "workspace delivery projection plus read-only canonical message presence",
+                    "caveat": "Unknown evidence stays null. Pending may already be dispatched locally; canonical presence is not proof of read or action. Attempts count recorded delivery-attempt receipts, not every dispatch. ACK is not business approval or task completion. Reads never repair projections."}),
+                )
             }
             "interrupt_agent" => {
                 let args: TargetArgs = serde_json::from_value(arguments)?;
@@ -7557,6 +7619,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
                     "reasoning_effort": { "type": "string" },
                     "fast": { "type": "boolean", "description": "Select fast mode for this child. Omit speed fields to inherit the live parent's tier on the same provider; explicit false selects standard mode. Only supported models/accounts can enable it." },
                     "ultrafast": { "type": "boolean", "description": "Select the Codex/OpenAI premium tier when supported. Mutually exclusive with fast; explicit speed settings override inheritance." },
+                    "cwd": {"type":"string", "description":"Explicit existing worktree/default tool directory for a NEW child. Relative to the author workspace. Never takes over or rewrites existing sessions; specifying cwd disables idle-worker reuse. Exec/runtime/read/search/LSP start here; later explicit shell cd or path overrides remain deliberate. Outside-workspace assignment requires Full Access."},
                     "fresh": {
                         "type": "boolean",
                         "description": "Always start a new child session instead of reusing an idle worker with the same profile. Use it when idle workers hold context or pending work you will follow up on, or the task needs a clean context."
@@ -7565,6 +7628,26 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
                 "required": ["task_name", "message"],
                 "additionalProperties": false
             }),
+        ),
+        tool(
+            "team_snapshot",
+            "Read a bounded authoritative descendant team view: execution observations, canonical goal/accounting, assigned plan, pending approval IDs and recent actual messages remain separate. Never wakes actors; discovery is not liveness or permission. Pages are non-atomic and timestamped with revisions and explicit unknown/stale caveats.",
+            json!({"type":"object","properties":{"after":{"type":"string","format":"uuid"},"limit":{"type":"integer","minimum":1,"maximum":100},"recent_messages":{"type":"integer","minimum":0,"maximum":10},"max_bytes":{"type":"integer","minimum":1024,"maximum":1048576}},"additionalProperties":false}),
+        ),
+        tool(
+            "inspect_agent",
+            "Read an authorized descendant's canonical goal and bounded journal/message page. Denies unrelated sessions. Excludes private reasoning, provider payloads and tool inputs/outputs; sanitizes exposed text. Returns exact event IDs/sequences/timestamps and a next cursor; never mutates or starts the target.",
+            json!({"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"after_sequence":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":200},"max_bytes":{"type":"integer","minimum":1024,"maximum":1048576}},"required":["session_id"],"additionalProperties":false}),
+        ),
+        tool(
+            "team_batch",
+            "Durably batch existing send_message/followup_task/configure_agent/interrupt_agent operations for owned descendants. Stable idempotency_key returns the same operation; successful or uncertain effects are never blindly replayed. Per-target admission receipts and progress survive interruption. Retry resumes only unsent targets. No session rotation, goal changes, permission expansion or stop/approval/budget bypass. Submission/admission is not business completion.",
+            json!({"type":"object","properties":{"cancel":{"type":"boolean","description":"Cancel remaining unsent targets of this same batch; does not recall admitted messages or stop workers."},"idempotency_key":{"type":"string","minLength":1,"maxLength":256},"operations":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"operation":{"type":"string","enum":["send_message","followup_task","configure_agent","interrupt_agent"]},"message":{"type":"string","minLength":1,"maxLength":8192},"configuration":{"type":"object","properties":{"provider":{"type":"string"},"model":{"type":"string"},"effort":{"type":"string"},"fast":{"type":"boolean"},"ultrafast":{"type":"boolean"}},"additionalProperties":false}},"required":["session_id","operation"],"additionalProperties":false}}},"required":["idempotency_key","operations"],"additionalProperties":false}),
+        ),
+        tool(
+            "get_team_operation",
+            "Read a durable batch receipt by operation ID. This read never retries side effects. Partial/in-flight results are not success; acknowledged delivery is not approval or completed work.",
+            json!({"type":"object","properties":{"operation_id":{"type":"string","format":"uuid"}},"required":["operation_id"],"additionalProperties":false}),
         ),
         tool(
             "list_agents",
@@ -7644,7 +7727,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "get_message_status",
-            "Per-recipient delivery state of a message you sent: pending (not yet handed to the relay), relayed (accepted by the remote relay; the recipient host admits it on its next sync), admitted, acknowledged, or failed with the last attempt detail.",
+            "Recorded per-recipient delivery state of a message you sent: pending (no admission/relay receipt yet; local dispatch may already have occurred), relayed, admitted, acknowledged, recalled or failed. Returns timestamped evidence with unknown read/acted-on fields; projection can lag canonical recipient events. Attempts count recorded attempt receipts, not every dispatch. ACK is not business approval or task completion. This read never repairs state.",
             json!({"type":"object","properties":{"message_id":{"type":"string"}},"required":["message_id"],"additionalProperties":false}),
         ),
         tool(
@@ -8286,6 +8369,11 @@ pub fn agent_tool_specs_for_surface(
                 "properties": {},
                 "additionalProperties": false
             }),
+        ),
+        tool(
+            "get_tool_context",
+            "Read this agent's explicit assigned/default tool directory and separate tracked shell directory. Does not change any context, runtime, worker or worktree.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
         tool(
             "get_goal",
@@ -9443,6 +9531,7 @@ struct SpawnAgentArgs {
     ultrafast: Option<bool>,
     #[serde(default)]
     fresh: bool,
+    cwd: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -9485,6 +9574,7 @@ impl MessageArgs {
             mentions: self.mentions.clone(),
             reply_to_message_id: self.reply_to_message_id,
             attachments: Vec::new(),
+            idempotency_key: None,
         }
     }
 }

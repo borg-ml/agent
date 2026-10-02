@@ -1366,6 +1366,7 @@ async fn compilation_context_status(
     let Some(database) = find_compilation_database(&search_start, workspace_root).await else {
         return Some(json!({
             "status": "missing",
+            "diagnosticTrust": "fallback_flags_not_code_error_proof",
             "searchedFrom": search_start,
             "warning": "no compile_commands.json or compile_flags.txt was found; \
         clangd is using fallback flags, so missing-include and unknown-type diagnostics \
@@ -1390,6 +1391,7 @@ async fn compilation_context_status(
                 status["coversFile"] = Value::Bool(true);
             }
             Coverage::Absent => {
+                status["diagnosticTrust"] = json!("inferred_flags_not_code_error_proof");
                 status["coversFile"] = Value::Bool(false);
                 status["status"] = Value::String("stale".to_string());
                 status["warning"] = Value::String(format!(
@@ -1413,7 +1415,9 @@ coverage was not determined",
             && let (Ok(source_time), Ok(database_time)) = (source.modified(), metadata.modified())
             && source_time > database_time
         {
+            status["sourceNewerThanDatabase"] = Value::Bool(true);
             status["staleAgainstSource"] = Value::Bool(true);
+            status["timestampCaveat"] = json!("Source mtime alone does not prove compilation flags are stale; source edits normally postdate the database.");
         }
     }
     Some(status)
@@ -1547,6 +1551,7 @@ async fn workspace_diagnostics_tool_report(report: Value, directory: &Path) -> R
                 let mut metadata = serde_json::Map::new();
                 for key in [
                     "kind",
+                    "unavailable",
                     "partial",
                     "partialReason",
                     "failedDocuments",
@@ -2040,7 +2045,8 @@ mod tests {
         );
         let full = json!({"clangd": {"partial": true, "partialReason": "budget exhausted",
             "compilationContext": {"coverage": "partial"},
-            "items": [{"uri": "file:///broken.cpp", "kind": "full", "items": diagnostics}]}});
+            "items": [{"uri": "file:///broken.cpp", "kind": "full", "items": diagnostics}]},
+            "offline": {"unavailable": true, "error": "server unavailable"}});
         let projected = workspace_diagnostics_tool_report(full.clone(), directory.path())
             .await
             .expect("projection");
@@ -2050,6 +2056,7 @@ mod tests {
         assert_eq!(projected["samples"][0]["message"], "late error");
         assert_eq!(projected["samples"].as_array().unwrap().len(), 2);
         assert_eq!(projected["servers"]["clangd"]["partial"], true);
+        assert_eq!(projected["servers"]["offline"]["unavailable"], true);
         assert_eq!(
             projected["servers"]["clangd"]["compilationContext"],
             full["clangd"]["compilationContext"]

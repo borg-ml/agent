@@ -1618,6 +1618,31 @@ impl SessionStore for PostgresSessionStore {
         PostgresSessionStore::register_child_session(self, owner_session_id, session_id).await
     }
 
+    async fn is_descendant(&self, parent: Uuid, target: Uuid) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "with recursive owned(id) as (select id from sessions where owner_session_id = $1 \
+             union select s.id from sessions s join owned o on s.owner_session_id = o.id) \
+             select exists(select 1 from owned where id = $2 and id <> $1)",
+        )
+        .bind(parent)
+        .bind(target)
+        .fetch_one(self.pool())
+        .await?)
+    }
+
+    async fn descendant_sessions(
+        &self,
+        parent: Uuid,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<Uuid>> {
+        Ok(sqlx::query_scalar(
+            "with recursive owned(id) as (select id from sessions where owner_session_id = $1 \
+             union select s.id from sessions s join owned o on s.owner_session_id = o.id) \
+             select id from owned where id <> $1 and ($2::uuid is null or id > $2) order by id limit $3"
+        ).bind(parent).bind(after).bind(limit.clamp(1, 101) as i64).fetch_all(self.pool()).await?)
+    }
+
     async fn host_workspace_cursors(
         &self,
         host_id: Uuid,

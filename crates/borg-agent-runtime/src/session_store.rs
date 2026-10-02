@@ -1458,6 +1458,20 @@ pub trait SessionStore: Send + Sync {
         cursors: &HashMap<Uuid, u64>,
     ) -> Result<()>;
     async fn register_child_session(&self, owner_session_id: Uuid, session_id: Uuid) -> Result<()>;
+    /// Read-only ownership scope, not fork lineage or workspace membership.
+    async fn is_descendant(&self, _parent: Uuid, _target: Uuid) -> Result<bool> {
+        Ok(false)
+    }
+    /// Canonical owned descendants, UUID-cursored and bounded. Never starts actors.
+    async fn descendant_sessions(
+        &self,
+        _parent: Uuid,
+        _after: Option<Uuid>,
+        _limit: usize,
+    ) -> Result<Vec<Uuid>> {
+        bail!("canonical descendant inspection unavailable for this store")
+    }
+
     async fn append(&self, event: SessionEvent) -> Result<SessionEvent>;
     /// Durably accept a user prompt exactly once before any in-memory routing
     /// or caller acknowledgement. Repeating the same admission is a no-op;

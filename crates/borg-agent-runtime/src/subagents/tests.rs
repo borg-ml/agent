@@ -4079,6 +4079,10 @@ fn tool_catalog_exposes_one_complete_lifecycle() {
         names,
         [
             "spawn_agent",
+            "team_snapshot",
+            "inspect_agent",
+            "team_batch",
+            "get_team_operation",
             "list_agents",
             "configure_agent",
             "list_workspace_participants",
@@ -4115,6 +4119,7 @@ fn shared_work_tools_are_absent_when_the_capability_is_disabled() {
 #[test]
 fn every_execution_lane_exposes_the_same_borg_control_plane() {
     let common = [
+        "get_tool_context",
         "consult_model",
         "get_goal",
         "get_plan",
@@ -4675,7 +4680,7 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
     // The ordinary path: no provider, model or effort override, so the claim
     // filter selects this worker instead of spawning a fresh one.
     let assigned = coordinator
-        .assign_task_as(
+        .assign_task_in_directory_as(
             root,
             SpawnSubagent {
                 task_name: "materials".to_string(),
@@ -4687,6 +4692,7 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
                 ultrafast: None,
             },
             false,
+            None,
         )
         .await
         .expect("a default-profile assignment must not fail on a stale reuse candidate");
@@ -7808,4 +7814,452 @@ async fn shared_work_pages_bound_batch_items_without_sequence_cursor_gaps() {
             .is_err()
     );
     scratch.discard().await;
+}
+
+// A compiler cannot protect authorization, canonical text pagination or a
+// lagging delivery projection; exercise the public read-only API against PG.
+#[tokio::test]
+async fn team_harness_inspection_is_scoped_paginated_and_non_mutating() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let grandchild = Uuid::new_v4();
+    let unrelated = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    store.register_child_session(root, child).await.unwrap();
+    store
+        .register_child_session(child, grandchild)
+        .await
+        .unwrap();
+    store.create_session(unrelated).await.unwrap();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        2,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+    let goal = crate::SessionGoal::new("canonical unfinished assignment".into(), Some(12345));
+    for kind in [
+        SessionEventKind::GoalUpdated { goal: goal.clone() },
+        SessionEventKind::ReasoningDelta {
+            text: "PRIVATE REASONING MUST NOT CROSS".into(),
+        },
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: format!(
+                "{} FINAL FULL TAIL sk-{}",
+                "actual assistant prose ".repeat(100),
+                "s".repeat(25)
+            ),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    ] {
+        store
+            .append(SessionEvent::new(child, 0, kind))
+            .await
+            .unwrap();
+    }
+    let revision = store.state(child).await.unwrap().latest_sequence;
+    let denied = coordinator
+        .call_tool_as(root, "inspect_agent", json!({"session_id": unrelated}))
+        .await;
+    assert!(denied.unwrap_err().to_string().contains("descendant"));
+    assert!(
+        coordinator
+            .call_tool_as(child, "inspect_agent", json!({"session_id": root}))
+            .await
+            .is_err()
+    );
+    assert!(
+        coordinator
+            .call_tool_as(unrelated, "inspect_agent", json!({"session_id": child}))
+            .await
+            .is_err()
+    );
+    let mut cursor = 0;
+    let mut messages = Vec::new();
+    loop {
+        let page = coordinator
+            .call_tool_as(
+                root,
+                "inspect_agent",
+                json!({"session_id": child, "after_sequence": cursor, "limit": 1}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page["canonical"]["goal"]["id"], goal.id.to_string());
+        assert_eq!(page["canonical"]["goal"]["token_budget"], 12345);
+        assert!(!page.to_string().contains("PRIVATE REASONING"));
+        assert!(!page.to_string().contains(&"s".repeat(25)));
+        for event in page["events"].as_array().unwrap() {
+            if event["body"]["type"] == "message" {
+                messages.push(event.clone());
+            }
+        }
+        if page["has_more"] == false {
+            break;
+        }
+        let next = page["next_after_sequence"].as_u64().unwrap();
+        assert!(next > cursor);
+        cursor = next;
+    }
+    assert_eq!(messages.len(), 1);
+    assert!(
+        messages[0]["body"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("FINAL FULL TAIL")
+    );
+    assert!(messages[0]["event_id"].is_string());
+    let first = coordinator
+        .call_tool_as(
+            root,
+            "team_snapshot",
+            json!({"limit": 1, "recent_messages": 0}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(first["has_more"], true);
+    assert_eq!(
+        first["agents"][0]["execution_observation"]["status"],
+        Value::Null
+    );
+    let second = coordinator
+        .call_tool_as(
+            root,
+            "team_snapshot",
+            json!({"limit": 1, "after": first["next_after"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["has_more"], false);
+    assert_ne!(
+        first["agents"][0]["session_id"],
+        second["agents"][0]["session_id"]
+    );
+    assert_eq!(
+        store.state(child).await.unwrap().latest_sequence,
+        revision,
+        "inspection must not mutate journal"
+    );
+    scratch.discard().await;
+}
+
+// Crash-window regression: the message may already be admitted when the
+// parent disappears. All-target retry must recover its ID without resending.
+#[tokio::test]
+async fn team_harness_batch_recovers_partial_receipts_without_duplicate_followups() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let mut root_launch = launch();
+    root_launch.cwd = directory.path().to_path_buf();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        root_launch,
+        2,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+    let (child, child2, mut rx) = {
+        let mut table = coordinator.table.lock().await;
+        let child = table.reserve("one", &launch()).unwrap().session_id;
+        let child2 = table.reserve("two", &launch()).unwrap().session_id;
+        let (tx, rx) = mpsc::channel(1);
+        let entry = table.entries.get_mut(&child).unwrap();
+        entry.snapshot.status = SubagentStatus::Running;
+        entry.commands = Some(tx.clone());
+        let entry = table.entries.get_mut(&child2).unwrap();
+        entry.snapshot.status = SubagentStatus::Running;
+        entry.commands = Some(tx);
+        (child, child2, rx)
+    };
+    bind_test_team(directory.path(), &store, root, &[child, child2]).await;
+    let request = json!({"idempotency_key": "interruption", "operations": [
+        {"session_id": child, "operation": "followup_task", "message": "first"},
+        {"session_id": child2, "operation": "followup_task", "message": "second"}]});
+    let batch = coordinator.call_tool_as(root, "team_batch", request.clone());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), batch)
+            .await
+            .is_err(),
+        "second send must block with first still buffered"
+    );
+    let id = Uuid::new_v5(&root, b"team-batch:interruption");
+    let partial = coordinator
+        .call_tool_as(root, "get_team_operation", json!({"operation_id": id}))
+        .await
+        .unwrap();
+    assert_eq!(partial["receipt"]["results"][0]["state"], "submitted");
+    assert_eq!(partial["receipt"]["results"][1]["state"], "sending");
+    let first_command = rx.recv().await.unwrap();
+    assert!(
+        matches!(first_command, HostCommand::TeamPrompt { session_id, .. } if session_id == child)
+    );
+    let replay = coordinator
+        .call_tool_as(root, "team_batch", request.clone())
+        .await
+        .unwrap();
+    assert_eq!(replay["operation_id"], id.to_string());
+    assert_eq!(
+        replay["receipt"]["results"][0]["message_id"],
+        partial["receipt"]["results"][0]["message_id"]
+    );
+    assert_eq!(
+        replay["receipt"]["results"][1]["state"],
+        "submitted_recovered"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "retry must not replay either followup"
+    );
+    let message_id = replay["receipt"]["results"][0]["message_id"]
+        .as_str()
+        .unwrap();
+    let status_before = coordinator
+        .call_tool_as(
+            root,
+            "get_message_status",
+            json!({"message_id": message_id}),
+        )
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::parse_str(message_id).unwrap(),
+                actor: EventActor::System,
+                text: "first".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        ))
+        .await
+        .unwrap();
+    let status = coordinator
+        .call_tool_as(
+            root,
+            "get_message_status",
+            json!({"message_id": message_id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        status["deliveries"][0]["state"],
+        status_before["deliveries"][0]["state"]
+    );
+    assert_eq!(
+        status["deliveries"][0]["evidence"]["projection_may_lag"],
+        true
+    );
+    assert_eq!(status["deliveries"][0]["evidence"]["read"], Value::Null);
+    assert_eq!(status["deliveries"][0]["evidence"]["acted_on"], Value::Null);
+    let mut changed = request.clone();
+    changed["operations"][0]["message"] = json!("different");
+    assert!(
+        coordinator
+            .call_tool_as(root, "team_batch", changed)
+            .await
+            .is_err()
+    );
+    assert!(
+        coordinator
+            .call_tool_as(child, "get_team_operation", json!({"operation_id": id}))
+            .await
+            .is_err()
+    );
+    store
+        .append(SessionEvent::new(
+            root,
+            0,
+            SessionEventKind::UserStopChanged { engaged: true },
+        ))
+        .await
+        .unwrap();
+    let mut gated = request.clone();
+    gated["idempotency_key"] = json!("stopped-caller");
+    let pending = coordinator
+        .call_tool_as(root, "team_batch", gated.clone())
+        .await
+        .unwrap();
+    assert_eq!(pending["receipt"]["results"][0]["state"], "pending");
+    assert_eq!(pending["progress"]["submitted"], 0);
+    assert!(rx.try_recv().is_err(), "human stop must prevent submission");
+    gated["cancel"] = json!(true);
+    let cancelled_pending = coordinator
+        .call_tool_as(root, "team_batch", gated)
+        .await
+        .unwrap();
+    assert_eq!(cancelled_pending["receipt"]["cancelled"], true);
+    assert_eq!(cancelled_pending["progress"]["submitted"], 0);
+    let mut cancelled = request;
+    cancelled["cancel"] = json!(true);
+    assert_eq!(
+        coordinator
+            .call_tool_as(root, "team_batch", cancelled)
+            .await
+            .unwrap()["receipt"]["cancelled"],
+        true
+    );
+    assert!(
+        coordinator
+            .call_tool_as(
+                child,
+                "team_batch",
+                json!({"idempotency_key":"forbidden-config", "operations":[
+        {"session_id":child2,"operation":"configure_agent","configuration":{"fast":true}}]})
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("director")
+    );
+    store
+        .append(SessionEvent::new(
+            root,
+            0,
+            SessionEventKind::UserStopChanged { engaged: false },
+        ))
+        .await
+        .unwrap();
+    let interrupt = json!({"idempotency_key":"interrupt-once", "operations":[{"session_id":child,"operation":"interrupt_agent"}]});
+    let interrupted = coordinator
+        .call_tool_as(root, "team_batch", interrupt.clone())
+        .await
+        .unwrap();
+    assert_eq!(interrupted["progress"]["submitted"], 1);
+    assert!(
+        matches!(rx.recv().await.unwrap(), HostCommand::Interrupt { session_id } if session_id == child)
+    );
+    assert_eq!(
+        coordinator
+            .call_tool_as(root, "team_batch", interrupt)
+            .await
+            .unwrap()["operation_id"],
+        interrupted["operation_id"]
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "successful control side effects must not repeat"
+    );
+    scratch.discard().await;
+}
+
+// Explicit worktree assignment must not rename/reuse an idle session with
+// unrelated context. Exercise the launch path, not inferred Git ownership.
+#[tokio::test]
+async fn team_harness_explicit_directory_starts_a_new_worker_and_preserves_existing_context() {
+    let directory = tempdir().unwrap();
+    let worktree = directory.path().join("owned-worktree");
+    std::fs::create_dir(&worktree).unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let prompts = Arc::new(StdMutex::new(Vec::new()));
+    let mut root_launch = launch();
+    root_launch.cwd = directory.path().to_path_buf();
+    root_launch.capabilities.multiplayer = false;
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        root_launch.clone(),
+        2,
+        Arc::new(RecordingPeerExecutor { prompts }),
+        store.clone(),
+    )
+    .unwrap();
+    let existing = {
+        let mut table = coordinator.table.lock().await;
+        let existing = table.reserve("existing", &root_launch).unwrap();
+        let entry = table.entries.get_mut(&existing.session_id).unwrap();
+        entry.snapshot.status = SubagentStatus::Ready;
+        entry.snapshot.final_text = Some("preserved user context".into());
+        existing.session_id
+    };
+    let spawned = coordinator.call_tool("spawn_agent", json!({"task_name": "assigned", "message": "bounded harness task", "cwd": "owned-worktree"})).await.unwrap();
+    let child = Uuid::parse_str(spawned["session_id"].as_str().unwrap()).unwrap();
+    assert_ne!(child, existing);
+    assert_eq!(coordinator.get(child).await.unwrap().cwd, worktree);
+    let preserved = coordinator.get(existing).await.unwrap();
+    assert_eq!(preserved.task_name, "/root/existing");
+    assert_eq!(
+        preserved.final_text.as_deref(),
+        Some("preserved user context")
+    );
+    assert_eq!(preserved.cwd, directory.path());
+    assert!(
+        coordinator
+            .call_tool(
+                "spawn_agent",
+                json!({"task_name":"invalid", "message":"task", "cwd":"/tmp"})
+            )
+            .await
+            .is_err(),
+        "manual workspace permission must deny external cwd"
+    );
+    coordinator.stop(&child.to_string()).await.unwrap();
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn team_harness_tool_context_keeps_literal_shell_cd_separate_from_assigned_root() {
+    let directory = tempdir().unwrap();
+    let nested = directory.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        Uuid::new_v4(),
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    dispatcher
+        .call("exec", json!({"cmd":"cd nested; pwd"}))
+        .await
+        .unwrap();
+    let context = dispatcher
+        .call("get_tool_context", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        context["default_tool_directory"],
+        directory.path().to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        context["shell_directory"],
+        nested.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        dispatcher.call("exec", json!({"cmd":"pwd"})).await.unwrap()["cwd"],
+        nested.to_string_lossy().as_ref()
+    );
 }
