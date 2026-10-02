@@ -1744,6 +1744,8 @@ fn initial_subagent_state_uses_only_the_loaded_root_tail() {
         provider: CodingProvider::Codex,
         model: Some("gpt-test".to_string()),
         effort: Some("low".to_string()),
+        fast: false,
+        ultrafast: false,
         cwd: PathBuf::from("/workspace"),
         created_at: now,
         updated_at: now,
@@ -1786,6 +1788,8 @@ fn resumed_roster_never_claims_an_unowned_child_is_running() {
         provider: CodingProvider::Codex,
         model: Some("gpt-test".to_string()),
         effort: Some("low".to_string()),
+        fast: false,
+        ultrafast: false,
         cwd: PathBuf::from("/workspace"),
         created_at: now,
         updated_at: now,
@@ -1845,6 +1849,8 @@ async fn resumed_roster_prefers_the_child_terminal_ledger_over_a_stale_parent_mi
         provider: CodingProvider::Codex,
         model: Some("gpt-test".to_string()),
         effort: Some("low".to_string()),
+        fast: false,
+        ultrafast: false,
         cwd: PathBuf::from("/workspace"),
         created_at: now,
         updated_at: now,
@@ -2068,6 +2074,8 @@ fn team_history_restores_every_agent_and_child_approval() {
         provider: CodingProvider::Codex,
         model: Some("gpt-test".to_string()),
         effort: Some("low".to_string()),
+        fast: false,
+        ultrafast: false,
         cwd: PathBuf::from("/workspace"),
         created_at: now,
         updated_at: now,
@@ -3828,6 +3836,42 @@ fn speed_commands_select_the_explicit_host_configuration_action() {
         );
     }
     assert!(parse_speed_action("/ultrafast maybe").is_none());
+}
+
+#[test]
+fn speed_selection_targets_the_focused_child_without_changing_the_director() {
+    let root = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    for (action, fast, ultrafast) in [
+        (
+            SessionConfigAction::SetFast { enabled: true },
+            Some(true),
+            None,
+        ),
+        (
+            SessionConfigAction::SetFast { enabled: false },
+            Some(false),
+            None,
+        ),
+        (
+            SessionConfigAction::SetUltrafast { enabled: true },
+            None,
+            Some(true),
+        ),
+    ] {
+        assert!(matches!(
+            speed_selection_command(root, None, action.clone()),
+            HostCommand::Configure { session_id, .. } if session_id == root
+        ));
+        assert!(matches!(
+            speed_selection_command(root, Some(child), action),
+            HostCommand::Subagent { session_id, action: SubagentAction::Configure {
+                target, fast: actual_fast, ultrafast: actual_ultrafast,
+                provider: None, model: None, effort: None, ..
+            }} if session_id == root && target == child.to_string()
+                && actual_fast == fast && actual_ultrafast == ultrafast
+        ));
+    }
 }
 
 #[test]

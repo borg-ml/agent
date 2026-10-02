@@ -82,6 +82,8 @@ pub(super) fn subagent_activity(
             provider: CodingProvider::Claude,
             model: None,
             effort: None,
+            fast: false,
+            ultrafast: false,
             cwd: std::path::PathBuf::from("/tmp"),
             created_at: Utc::now(),
             updated_at: Utc::now(),

@@ -2489,6 +2489,8 @@ async fn run_local_agent_session(
             provider: Some(peer_provider),
             model: args.peer_model.clone(),
             effort: args.peer_effort.clone(),
+            fast: None,
+            ultrafast: None,
         }]
     } else {
         Vec::new()
@@ -5643,19 +5645,21 @@ async fn run_local_agent_session(
                     UiAction::SetFast(enabled) => {
                         dispatch_ui_command(
                             &ui_interaction_tx,
-                            HostCommand::Configure {
+                            speed_selection_command(
                                 session_id,
-                                action: SessionConfigAction::SetFast { enabled },
-                            },
+                                terminal.as_ref().and_then(BorgTerminal::focused_child),
+                                SessionConfigAction::SetFast { enabled },
+                            ),
                         );
                     }
                     UiAction::SetUltrafast(enabled) => {
                         dispatch_ui_command(
                             &ui_interaction_tx,
-                            HostCommand::Configure {
+                            speed_selection_command(
                                 session_id,
-                                action: SessionConfigAction::SetUltrafast { enabled },
-                            },
+                                terminal.as_ref().and_then(BorgTerminal::focused_child),
+                                SessionConfigAction::SetUltrafast { enabled },
+                            ),
                         );
                     }
                     UiAction::SetRefreshRate(fps) => {
@@ -6506,7 +6510,7 @@ async fn run_local_agent_session(
                                 .expect("terminal")
                                 .open_ui_language_picker();
                         } else if line == "/fast" && attachments.is_empty() {
-                            terminal.as_mut().expect("terminal").open_fast_picker(current_fast, current_ultrafast);
+                            terminal.as_mut().expect("terminal").open_fast_picker();
                         } else if line == "/refresh" && attachments.is_empty() {
                             terminal
                                 .as_mut()
@@ -6861,7 +6865,14 @@ async fn run_local_agent_session(
                             && attachments.is_empty()
                         {
                             if let Some(action) = parse_speed_action(line) {
-                                dispatch_ui_command(&ui_interaction_tx, HostCommand::Configure { session_id, action });
+                                dispatch_ui_command(
+                                    &ui_interaction_tx,
+                                    speed_selection_command(
+                                        session_id,
+                                        terminal.as_ref().and_then(BorgTerminal::focused_child),
+                                        action,
+                                    ),
+                                );
                             } else {
                                 terminal.as_mut().expect("terminal").set_notice(
                                     "Choose /fast on|off|ultrafast or /ultrafast on|off (Codex/OpenAI premium, access-dependent)",
@@ -8124,6 +8135,33 @@ fn model_selection_command(
         }
     };
     HostCommand::Configure { session_id, action }
+}
+
+fn speed_selection_command(
+    session_id: Uuid,
+    target: Option<Uuid>,
+    action: SessionConfigAction,
+) -> HostCommand {
+    let Some(target) = target else {
+        return HostCommand::Configure { session_id, action };
+    };
+    let (fast, ultrafast) = match action {
+        SessionConfigAction::SetFast { enabled } => (Some(enabled), None),
+        SessionConfigAction::SetUltrafast { enabled } => (None, Some(enabled)),
+        _ => unreachable!("speed selection requires a speed action"),
+    };
+    HostCommand::Subagent {
+        session_id,
+        action: SubagentAction::Configure {
+            request_id: Uuid::new_v4(),
+            target: target.to_string(),
+            provider: None,
+            model: None,
+            effort: None,
+            fast,
+            ultrafast,
+        },
+    }
 }
 
 /// Reads an API key from the terminal without echoing it and stores it in the

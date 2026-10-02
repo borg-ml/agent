@@ -12843,11 +12843,13 @@ async fn apply_subagent_action(
                 provider,
                 model,
                 effort,
+                fast,
+                ultrafast,
                 ..
             } => Ok(SubagentControlOutcome::Accepted {
                 agent: Box::new(
                     subagents
-                        .configure_child(&target, provider, model, effort)
+                        .configure_child(&target, provider, model, effort, fast, ultrafast)
                         .await?,
                 ),
             }),

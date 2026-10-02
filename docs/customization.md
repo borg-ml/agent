@@ -381,6 +381,14 @@ Use `/fast` in the TUI or GUI to select **Standard**, **Fast** (provider
 priority mode), or **Ultrafast**. `/fast on` selects fast; `/fast off` selects
 standard. `/ultrafast` or `/ultrafast on` enables ultrafast, and
 `/ultrafast off` returns to standard. `/fast ultrafast` is an alias.
+
+Select a child agent's thread before using `/fast` to change that child's
+speed tier rather than the director's. The director can set `fast: true`
+(or `false` for standard) on `spawn_agent` and `configure_agent`; `ultrafast`
+is also available for supported Codex/OpenAI accounts. With no speed override,
+a new child inherits the parent's current tier only on the same provider.
+Speed changes apply on the next turn and keep the child's conversation intact.
+
 New sessions can request `--fast` or `--ultrafast` (not both).
 
 Ultrafast is an explicit **Codex/OpenAI-only premium, access-dependent tier**

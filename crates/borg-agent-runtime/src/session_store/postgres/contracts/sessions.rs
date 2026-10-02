@@ -647,6 +647,8 @@ fn persistence_and_fork_rules_are_typed_rust_contracts() {
         provider: CodingProvider::Codex,
         model: None,
         effort: None,
+        fast: false,
+        ultrafast: false,
         cwd: std::path::PathBuf::from("/tmp"),
         created_at: Utc::now(),
         updated_at: Utc::now(),

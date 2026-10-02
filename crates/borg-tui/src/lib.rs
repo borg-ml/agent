@@ -5776,7 +5776,13 @@ impl BorgTerminal {
         });
     }
 
-    pub fn open_fast_picker(&mut self, enabled: bool, ultrafast: bool) {
+    pub fn open_fast_picker(&mut self) {
+        let (enabled, ultrafast) = self
+            .transcript
+            .config
+            .as_ref()
+            .map(|config| (config.fast, config.ultrafast))
+            .unwrap_or_default();
         let support = self
             .transcript
             .config
@@ -6703,13 +6709,7 @@ impl BorgTerminal {
                             .fast_status_area
                             .is_some_and(|area| area.contains(pointer))
                         {
-                            let (fast, ultrafast) = self
-                                .transcript
-                                .config
-                                .as_ref()
-                                .map(|config| (config.fast, config.ultrafast))
-                                .unwrap_or_default();
-                            self.open_fast_picker(fast, ultrafast);
+                            self.open_fast_picker();
                             return Ok(UiAction::None);
                         }
                         if self
