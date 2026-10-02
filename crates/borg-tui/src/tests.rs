@@ -15020,7 +15020,10 @@ fn a_collapsed_plan_card_keeps_open_steps_behind_completed_leading_rows() {
     };
     let collapsed = render(&transcript);
     for shown in ["Task 00", "Task 01", "Task 11", "Task 12", "Task 13"] {
-        assert!(collapsed.contains(shown), "{shown} missing from {collapsed}");
+        assert!(
+            collapsed.contains(shown),
+            "{shown} missing from {collapsed}"
+        );
     }
     assert!(!collapsed.contains("Task 02"), "{collapsed}");
     assert!(collapsed.contains("+ 10 more"), "{collapsed}");
@@ -18958,4 +18961,174 @@ fn replay_parent_cancellation_settles_nested_wait_not_parallel_tool() {
             ..
         }
     ));
+}
+
+fn display_message_order(events: &[SessionEvent]) -> Vec<Uuid> {
+    let mut seen = HashSet::new();
+    transcript_history_in_display_order(events)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            SessionEventKind::Message { message_id, .. } if seen.insert(message_id) => {
+                Some(message_id)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn reverted_fork_keeps_a_native_steer_where_the_live_session_showed_it() {
+    let session_id = Uuid::new_v4();
+    let prompt = Uuid::new_v4();
+    let steer = Uuid::new_v4();
+    let first_reply = Uuid::new_v4();
+    let second_reply = Uuid::new_v4();
+    let message = |sequence, message_id, actor, status, delivery| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id,
+                actor,
+                text: format!("message {sequence}"),
+                attachments: Vec::new(),
+                status,
+                delivery,
+            },
+        )
+    };
+    let turn_completed = |sequence| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::TurnCompleted {
+                message_id: prompt,
+                provider_session_id: None,
+                final_text: String::new(),
+                error: None,
+            },
+        )
+    };
+    let live = vec![
+        turn_completed(1),
+        message(2, prompt, EventActor::User, MessageStatus::InProgress, None),
+        SessionEvent::new(
+            session_id,
+            3,
+            SessionEventKind::TurnStarted {
+                message_id: prompt,
+                provider: borg_remote::CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+                ultrafast: false,
+            },
+        ),
+        message(
+            4,
+            first_reply,
+            EventActor::Assistant,
+            MessageStatus::Complete,
+            None,
+        ),
+        message(
+            5,
+            steer,
+            EventActor::User,
+            MessageStatus::InProgress,
+            Some(PromptDelivery::Steer),
+        ),
+        SessionEvent::new(
+            session_id,
+            6,
+            SessionEventKind::ProviderEvent {
+                provider: borg_remote::CodingProvider::Codex,
+                kind: "native_steer_applied".into(),
+                payload: serde_json::json!({ "model_round": 1, "message_ids": [steer] }),
+            },
+        ),
+        message(
+            7,
+            second_reply,
+            EventActor::Assistant,
+            MessageStatus::Complete,
+            None,
+        ),
+        message(8, prompt, EventActor::User, MessageStatus::Complete, None),
+        message(
+            9,
+            steer,
+            EventActor::User,
+            MessageStatus::Complete,
+            Some(PromptDelivery::Steer),
+        ),
+        turn_completed(10),
+    ];
+    // What a revert fork inherits: no admission rows and no turn starts.
+    let fork = live
+        .iter()
+        .filter(|event| event.kind.is_fork_inheritable())
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let expected = vec![prompt, first_reply, steer, second_reply];
+    assert_eq!(display_message_order(&live), expected);
+    assert_eq!(display_message_order(&fork), expected);
+}
+
+#[test]
+fn reverted_fork_keeps_a_batched_turn_prompts_together_before_its_output() {
+    let session_id = Uuid::new_v4();
+    let user = |sequence| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: format!("prompt {sequence}"),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        )
+    };
+    let turn_completed = |sequence| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::TurnCompleted {
+                message_id: Uuid::new_v4(),
+                provider_session_id: None,
+                final_text: String::new(),
+                error: None,
+            },
+        )
+    };
+    let reply = SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "reply".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+    let history = transcript_history_in_display_order(&[
+        turn_completed(1),
+        reply,
+        user(3),
+        user(4),
+        turn_completed(5),
+    ]);
+    assert_eq!(
+        history
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 3, 4, 2, 5]
+    );
 }

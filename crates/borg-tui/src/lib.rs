@@ -11649,6 +11649,8 @@ fn transcript_history_in_display_order(events: &[SessionEvent]) -> Vec<SessionEv
     let events = reorder_queued_user_completions(events);
     let mut ordered = Vec::with_capacity(events.len());
     let mut turn = Vec::new();
+    // Terminal user rows with no admission row in the buffered turn.
+    let mut orphans: Vec<SessionEvent> = Vec::new();
 
     for event in &events {
         // Agent lifecycle has its own roster and child-transcript recovery.
@@ -11657,22 +11659,18 @@ fn transcript_history_in_display_order(events: &[SessionEvent]) -> Vec<SessionEv
         if matches!(event.kind, SessionEventKind::SubagentActivity { .. }) {
             continue;
         }
-        let is_terminal_user_message = matches!(
-            event.kind,
+        let message_id = match &event.kind {
             SessionEventKind::Message {
+                message_id,
                 actor: EventActor::User,
                 status: MessageStatus::Complete | MessageStatus::Failed,
                 ..
+            } => *message_id,
+            _ => {
+                place_orphan_user_messages(&mut ordered, &mut turn, &mut orphans);
+                turn.push(event.clone());
+                continue;
             }
-        );
-        if !is_terminal_user_message {
-            turn.push(event.clone());
-            continue;
-        }
-
-        let message_id = match &event.kind {
-            SessionEventKind::Message { message_id, .. } => *message_id,
-            _ => unreachable!("terminal user message match must be a message event"),
         };
         let has_lifecycle_start = turn.iter().any(|candidate| {
             matches!(
@@ -11685,40 +11683,73 @@ fn transcript_history_in_display_order(events: &[SessionEvent]) -> Vec<SessionEv
                 } if candidate_id == message_id
             )
         });
-
         if has_lifecycle_start {
+            place_orphan_user_messages(&mut ordered, &mut turn, &mut orphans);
             ordered.append(&mut turn);
             ordered.push(event.clone());
-            continue;
-        }
-
-        // Fork projections deliberately omit in-progress user messages so a
-        // discarded prompt cannot be recovered and run again. The surviving
-        // terminal event is still durable, but it was appended after the
-        // assistant/tool output. Put that orphaned user boundary before the
-        // visible turn output so a partial projection reads like the original
-        // conversation instead of looking reversed.
-        let turn_start = turn
-            .iter()
-            .rposition(transcript_turn_has_terminal_boundary)
-            .map_or(0, |index| index + 1);
-        if let Some(output_start) = turn
-            .iter()
-            .enumerate()
-            .skip(turn_start)
-            .find_map(|(index, event)| transcript_turn_output(event).then_some(index))
-        {
-            ordered.extend(turn.drain(..output_start));
-            ordered.push(event.clone());
-            ordered.append(&mut turn);
         } else {
-            ordered.append(&mut turn);
-            ordered.push(event.clone());
+            orphans.push(event.clone());
         }
     }
 
+    place_orphan_user_messages(&mut ordered, &mut turn, &mut orphans);
     ordered.extend(turn);
     ordered
+}
+
+/// Fork projections deliberately omit queued and in-progress user messages so
+/// a discarded prompt cannot be recovered and run again. A turn's surviving
+/// terminal rows are all written together after its output, so place them
+/// back as one group: a native steer right after the durable marker that
+/// recorded where it entered the turn, every other prompt before the turn's
+/// first output, keeping their relative order.
+fn place_orphan_user_messages(
+    ordered: &mut Vec<SessionEvent>,
+    turn: &mut Vec<SessionEvent>,
+    orphans: &mut Vec<SessionEvent>,
+) {
+    if orphans.is_empty() {
+        return;
+    }
+    let turn_start = turn
+        .iter()
+        .rposition(transcript_turn_has_terminal_boundary)
+        .map_or(0, |index| index + 1);
+    let output_start = turn
+        .iter()
+        .enumerate()
+        .skip(turn_start)
+        .find_map(|(index, event)| transcript_turn_output(event).then_some(index))
+        .unwrap_or(turn.len());
+    let mut placed = orphans
+        .drain(..)
+        .map(|orphan| {
+            let SessionEventKind::Message { message_id, .. } = &orphan.kind else {
+                unreachable!("orphans are terminal user messages");
+            };
+            let message_id = message_id.to_string();
+            let steer_marker = turn.iter().rposition(|event| {
+                matches!(&event.kind, SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "native_steer_applied"
+                    && payload
+                        .get("message_ids")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|ids| {
+                            ids.iter().any(|id| id.as_str() == Some(message_id.as_str()))
+                        }))
+            });
+            (steer_marker.map_or(output_start, |index| index + 1), orphan)
+        })
+        .collect::<Vec<_>>();
+    placed.sort_by_key(|(index, _)| *index);
+    let mut placed = placed.into_iter().peekable();
+    for (index, event) in std::mem::take(turn).into_iter().enumerate() {
+        while let Some((_, orphan)) = placed.next_if(|(at, _)| *at <= index) {
+            ordered.push(orphan);
+        }
+        ordered.push(event);
+    }
+    ordered.extend(placed.map(|(_, orphan)| orphan));
 }
 
 fn reorder_queued_user_completions(events: &[SessionEvent]) -> Vec<SessionEvent> {

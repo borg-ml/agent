@@ -7,6 +7,8 @@ Git comparison.
 
 ### Terminal
 
+- Reverting a session preserves the position of native mid-turn steers and keeps
+  batched prompts together before their replies, including in existing forks.
 - Collapsed plan updates reserve space for open steps, so completed leading rows
   cannot hide all remaining work. Expanded plans still show every item.
 
