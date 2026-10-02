@@ -22704,3 +22704,96 @@ async fn peer_receipts_survive_disabled_subagents_stop_and_replay() {
 }
 
 mod runtime_sync;
+
+// The actor can outlive one repair pass. A later lag must rearm without
+// replaying provider calls or reviving terminal message deliveries.
+#[tokio::test]
+async fn team_harness_projection_repair_rearms_after_a_completed_pass() {
+    let (scratch, session_id, store, workspace, binding, projection) =
+        team_delivery_fixture().await;
+    let store: Arc<dyn SessionStore> = store;
+    let mut task = None;
+    start_workspace_projection_repair(&mut task, Some(&projection), &store, session_id);
+    tokio::time::timeout(Duration::from_secs(5), task.as_mut().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(task.as_ref().unwrap().is_finished());
+    let message_id = append_team_message(
+        &workspace,
+        &binding,
+        "later delivery",
+        crate::DeliveryMode::Boundary,
+    )
+    .await;
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::System,
+                text: "later delivery".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        workspace.message_deliveries(message_id).await.unwrap()[0].state,
+        crate::DeliveryState::Pending
+    );
+    start_workspace_projection_repair(&mut task, Some(&projection), &store, session_id);
+    tokio::time::timeout(Duration::from_secs(5), task.as_mut().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        workspace.message_deliveries(message_id).await.unwrap()[0].state,
+        crate::DeliveryState::Admitted
+    );
+    let recalled = append_team_message(
+        &workspace,
+        &binding,
+        "recalled",
+        crate::DeliveryMode::Boundary,
+    )
+    .await;
+    workspace
+        .transition_message_delivery(
+            binding.workspace_id,
+            recalled,
+            binding.participant_id,
+            crate::DeliveryState::Recalled,
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: recalled,
+                actor: EventActor::System,
+                text: "recalled".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        ))
+        .await
+        .unwrap();
+    start_workspace_projection_repair(&mut task, Some(&projection), &store, session_id);
+    tokio::time::timeout(Duration::from_secs(5), task.as_mut().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        workspace.message_deliveries(recalled).await.unwrap()[0].state,
+        crate::DeliveryState::Recalled
+    );
+    scratch.discard().await;
+}

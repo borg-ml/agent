@@ -757,20 +757,19 @@ impl WorkspaceProjection {
 }
 
 fn start_workspace_projection_repair(
-    started: &mut bool,
+    task: &mut Option<tokio::task::JoinHandle<()>>,
     projection: Option<&WorkspaceProjection>,
     store: &Arc<dyn SessionStore>,
     session_id: Uuid,
 ) {
-    if *started {
+    if task.as_ref().is_some_and(|task| !task.is_finished()) {
         return;
     }
-    *started = true;
     let Some(projection) = projection.cloned() else {
         return;
     };
     let store = Arc::clone(store);
-    tokio::spawn(async move {
+    *task = Some(tokio::spawn(async move {
         if let Err(error) = projection.repair(store, session_id).await {
             tracing::warn!(
                 %session_id,
@@ -778,7 +777,7 @@ fn start_workspace_projection_repair(
                 "workspace projection repair stopped; the source session remains authoritative"
             );
         }
-    });
+    }));
 }
 
 impl RuntimeSessionStore {
@@ -2426,7 +2425,7 @@ async fn run_agent_session_store_kernel_inner(
     }
     let mut auth_lookup_retries = 0_usize;
     let mut at_turn_boundary = !pending.is_empty();
-    let mut projection_repair_started = false;
+    let mut projection_repair_task = None;
     let mut next_ready_detail = (!fresh).then(|| "Resumed".to_string());
     // Whether the current watcher wait has already been journalled, so a wait
     // is recorded once rather than on every pass through the idle select.
@@ -2888,7 +2887,7 @@ async fn run_agent_session_store_kernel_inner(
             )
             .await?;
             start_workspace_projection_repair(
-                &mut projection_repair_started,
+                &mut projection_repair_task,
                 workspace_projection.as_ref(),
                 &store,
                 session_id,
@@ -4930,7 +4929,7 @@ async fn run_agent_session_store_kernel_inner(
         )
         .await?;
         start_workspace_projection_repair(
-            &mut projection_repair_started,
+            &mut projection_repair_task,
             workspace_projection.as_ref(),
             &store,
             session_id,
