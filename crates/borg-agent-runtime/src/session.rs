@@ -6902,6 +6902,10 @@ async fn run_agent_session_store_kernel_inner(
                         session_id,
                         &mut goal,
                         &mut goal_active_since,
+                        !user_stop
+                            && retry_not_before.is_none()
+                            && usage_wait_prompts.is_none()
+                            && usage_limit_continuation_id.is_none(),
                         request.request,
                     )
                     .await
@@ -12549,6 +12553,7 @@ async fn apply_model_goal_request(
     session_id: Uuid,
     goal: &mut Option<SessionGoal>,
     active_since: &mut Option<Instant>,
+    resume_allowed: bool,
     request: SessionGoalToolRequest,
 ) -> Result<SessionGoalToolResponse> {
     match request {
@@ -12580,14 +12585,41 @@ async fn apply_model_goal_request(
             )
             .await?;
         }
-        SessionGoalToolRequest::Update { status } => {
-            let status = match status {
-                ModelGoalStatus::Complete => GoalStatus::Complete,
-                ModelGoalStatus::Blocked => GoalStatus::Blocked,
-            };
-            set_terminal_goal_status(journal, events, session_id, goal, active_since, status)
+        SessionGoalToolRequest::Update { status } => match status {
+            ModelGoalStatus::Active => {
+                anyhow::ensure!(
+                    resume_allowed,
+                    "cannot reactivate a goal during an explicit user stop or pending retry/usage wait"
+                );
+                let current = require_goal(goal)?;
+                anyhow::ensure!(
+                    current.status != GoalStatus::UsageLimited,
+                    "usage-limited goals cannot be reactivated by a model tool"
+                );
+                anyhow::ensure!(
+                    current.remaining_tokens() != Some(0),
+                    "goal token budget is exhausted"
+                );
+                apply_goal_action(
+                    journal,
+                    events,
+                    session_id,
+                    goal,
+                    active_since,
+                    GoalAction::Resume,
+                )
                 .await?;
-        }
+            }
+            ModelGoalStatus::Complete | ModelGoalStatus::Blocked => {
+                let status = if status == ModelGoalStatus::Complete {
+                    GoalStatus::Complete
+                } else {
+                    GoalStatus::Blocked
+                };
+                set_terminal_goal_status(journal, events, session_id, goal, active_since, status)
+                    .await?;
+            }
+        },
     }
     Ok(SessionGoalToolResponse {
         remaining_tokens: goal.as_ref().and_then(SessionGoal::remaining_tokens),

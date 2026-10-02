@@ -8311,11 +8311,11 @@ pub fn agent_tool_specs_for_surface(
         ),
         tool(
             "update_goal",
-            "Mark the current goal complete with {\"status\":\"complete\"}, or blocked with {\"status\":\"blocked\"} only after the same blocker prevents progress for three consecutive goal turns.",
+            "Mark the current goal complete with {\"status\":\"complete\"}, or blocked with {\"status\":\"blocked\"} only after the same blocker prevents progress for three consecutive goal turns. Reactivate the same unfinished goal with {\"status\":\"active\"} only after explicit human resume authorization and resolution of the blocker. This preserves identity and accounting, cannot override an explicit user stop or usage/budget limits, and does not approve held gameplay edits.",
             json!({
                 "type": "object",
                 "properties": {
-                    "status": { "type": "string", "enum": ["complete", "blocked"] }
+                    "status": { "type": "string", "enum": ["active", "complete", "blocked"] }
                 },
                 "required": ["status"],
                 "additionalProperties": false

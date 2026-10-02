@@ -9363,12 +9363,14 @@ fn automatic_goal_continuation_supports_unbudgeted_goals() {
 }
 
 #[tokio::test]
-async fn model_can_mark_an_active_goal_blocked() {
+async fn model_goal_tools_preserve_identity_and_refuse_unsafe_reactivation() {
     let session_id = Uuid::new_v4();
     let (scratch, store, mut journal) = runtime_store(session_id).await;
     let (event_tx, _event_rx) = mpsc::channel(16);
-    let mut goal = Some(SessionGoal::new("Need user input".to_string(), None));
-    let mut active_since = Some(Instant::now());
+    let mut goal = Some(SessionGoal::new("Need user input".to_string(), Some(100)));
+    goal.as_mut().unwrap().tokens_used = 17;
+    goal.as_mut().unwrap().time_used_seconds = 41;
+    let mut active_since = None;
 
     let response = apply_model_goal_request(
         &mut journal,
@@ -9376,6 +9378,7 @@ async fn model_can_mark_an_active_goal_blocked() {
         session_id,
         &mut goal,
         &mut active_since,
+        true,
         SessionGoalToolRequest::Update {
             status: ModelGoalStatus::Blocked,
         },
@@ -9392,6 +9395,94 @@ async fn model_can_mark_an_active_goal_blocked() {
         store.state(session_id).await.unwrap().goal.unwrap().status,
         GoalStatus::Blocked
     );
+    let blocked = goal.clone().unwrap();
+    for status in [GoalStatus::Blocked, GoalStatus::Paused] {
+        goal.as_mut().unwrap().status = status;
+        active_since = None;
+        let response = apply_model_goal_request(
+            &mut journal,
+            &event_tx,
+            session_id,
+            &mut goal,
+            &mut active_since,
+            true,
+            serde_json::from_value(serde_json::json!({"type": "update", "status": "active"}))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let resumed = response.goal.unwrap();
+        assert_eq!(resumed.status, GoalStatus::Active);
+        let mut expected = blocked.clone();
+        expected.status = GoalStatus::Active;
+        expected.updated_at = resumed.updated_at;
+        assert_eq!(resumed, expected);
+        assert!(active_since.is_some());
+        assert_eq!(store.state(session_id).await.unwrap().goal, goal);
+        assert_eq!(
+            SessionState::reduce(&store.read(session_id).await.unwrap())
+                .unwrap()
+                .goal,
+            goal
+        );
+    }
+    for (status, tokens_used, resume_allowed) in [
+        (GoalStatus::Complete, 17, true),
+        (GoalStatus::BudgetLimited, 17, true),
+        (GoalStatus::UsageLimited, 17, true),
+        (GoalStatus::Blocked, 100, true),
+        (GoalStatus::Blocked, 17, false),
+    ] {
+        let current = goal.as_mut().unwrap();
+        current.status = status;
+        current.tokens_used = tokens_used;
+        active_since = None;
+        record_goal(&mut journal, &event_tx, session_id, &goal)
+            .await
+            .unwrap();
+        let before = goal.clone();
+        assert!(
+            apply_model_goal_request(
+                &mut journal,
+                &event_tx,
+                session_id,
+                &mut goal,
+                &mut active_since,
+                resume_allowed,
+                SessionGoalToolRequest::Update {
+                    status: ModelGoalStatus::Active
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(goal, before);
+        assert!(active_since.is_none());
+        assert_eq!(store.state(session_id).await.unwrap().goal, before);
+        assert_eq!(
+            SessionState::reduce(&store.read(session_id).await.unwrap())
+                .unwrap()
+                .goal,
+            before
+        );
+    }
+    goal = None;
+    assert!(
+        apply_model_goal_request(
+            &mut journal,
+            &event_tx,
+            session_id,
+            &mut goal,
+            &mut active_since,
+            true,
+            SessionGoalToolRequest::Update {
+                status: ModelGoalStatus::Active
+            },
+        )
+        .await
+        .is_err()
+    );
+    assert!(goal.is_none());
     scratch.discard().await;
 }
 
