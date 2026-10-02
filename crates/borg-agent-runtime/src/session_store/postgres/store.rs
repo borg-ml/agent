@@ -608,25 +608,12 @@ impl PostgresSessionStore {
             else {
                 return Ok(false);
             };
-            // A cut inside the inherited prefix is uncommon; resolve that
-            // bounded prefix through the composed view rather than guessing a
-            // sequence bound in the parent's space, which is a different
-            // numbering from this session's.
-            if inherited_limit < session.inherited_event_count {
-                return Ok(self
-                    .composed_events(session_id, Some(inherited_limit))
+            let cut = if inherited_limit < session.inherited_event_count {
+                self.inherited_sequence(parent, cut, inherited_limit)
                     .await?
-                    .iter()
-                    .any(|event| {
-                        matches!(
-                            event.kind,
-                            SessionEventKind::Message {
-                                message_id: existing,
-                                ..
-                            } if existing == message_id
-                        )
-                    }));
-            }
+            } else {
+                cut
+            };
             self.contains_message_in(parent, message_id, Some(cut), true)
                 .await
         })
@@ -694,34 +681,20 @@ impl PostgresSessionStore {
                 }
             }
 
-            // A cut that lands INSIDE the inherited prefix cannot be expressed
-            // as a bound in the parent's sequence space: the parent numbers its
-            // own events, and this session renumbers what it inherited. Asking
-            // the parent for its latest checkpoint up to the FULL cut can
-            // therefore only answer with one that lies beyond this bound, and
-            // the older checkpoint that IS visible here would be discarded as
-            // out of range -- reporting no boundary at all, so a resume replays
-            // a conversation that was already compacted.
-            //
-            // Resolve the bounded prefix through the composed view instead. It
-            // is already projected into this session's numbering and already
-            // truncated to the bound, so the newest completed checkpoint left in
-            // it is the answer. This is the same fallback `contains_message_in`
-            // uses, for the same reason.
-            if logical_limit < session.inherited_event_count {
-                return Ok(self
-                    .composed_events(session_id, Some(logical_limit))
-                    .await?
-                    .into_iter()
-                    .rev()
-                    .find(|event| event.kind.is_completed_context_compaction()));
+            let inherited_limit = logical_limit.min(session.inherited_event_count);
+            if inherited_limit == 0 {
+                return Ok(None);
             }
-
-            let (Some(parent_session_id), Some(parent_cut_sequence)) =
+            let (Some(parent_session_id), Some(mut parent_cut_sequence)) =
                 (session.parent_session_id, session.parent_cut_sequence)
             else {
                 return Ok(None);
             };
+            if inherited_limit < session.inherited_event_count {
+                parent_cut_sequence = self
+                    .inherited_sequence(parent_session_id, parent_cut_sequence, inherited_limit)
+                    .await?;
+            }
             let Some(mut event) = self
                 .latest_completed_context_compaction_before(
                     parent_session_id,
@@ -731,8 +704,8 @@ impl PostgresSessionStore {
             else {
                 return Ok(None);
             };
-            let (sequence, _) = self
-                .fork_projection(parent_session_id, event.sequence.saturating_add(1))
+            let sequence = self
+                .fork_event_count(parent_session_id, event.sequence)
                 .await?;
             if sequence == 0 || sequence > logical_limit.min(session.inherited_event_count) {
                 return Ok(None);
@@ -815,13 +788,11 @@ impl SessionStore for PostgresSessionStore {
                 )
                 .await;
         }
-        Ok(self
-            .composed_events(session_id, None)
-            .await?
-            .into_iter()
-            .filter(|event| event.sequence > sequence)
-            .take(limit)
-            .collect())
+        let until = sequence
+            .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
+            .min(session.next_sequence.saturating_sub(1));
+        self.composed_events_range(session_id, sequence, until, false)
+            .await
     }
 
     async fn latest_completed_context_compaction(

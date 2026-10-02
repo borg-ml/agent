@@ -11,7 +11,6 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use sqlx::Row;
 use std::future::Future;
 use std::pin::Pin;
 use uuid::Uuid;
@@ -46,17 +45,8 @@ impl PostgresSessionStore {
                     let parent_until = if inherited_limit == session.inherited_event_count {
                         cut
                     } else {
-                        self.composed_events(parent, Some(cut))
+                        self.inherited_sequence(parent, cut, inherited_limit)
                             .await?
-                            .into_iter()
-                            .filter(|event| event.kind.is_fork_inheritable())
-                            .nth(usize::try_from(inherited_limit - 1).unwrap_or(usize::MAX))
-                            .map(|event| event.sequence)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "fork {session_id} has no inherited event {inherited_limit}"
-                                )
-                            })?
                     };
                     self.team_events_at(parent, parent_until).await?
                 } else {
@@ -84,90 +74,160 @@ impl PostgresSessionStore {
         })
     }
 
-    /// Every event this session authored itself, within bounds.
-    async fn local_events(
+    /// Count inherited events without fetching their bodies.
+    pub(super) async fn fork_event_count(&self, session_id: Uuid, until: u64) -> Result<u64> {
+        let session = self.session_row(session_id).await?;
+        let local: i64 = sqlx::query_scalar(
+            "select count(*) from session_events \
+             where session_id = $1 and sequence <= $2 and fork_inheritable",
+        )
+        .bind(session_id)
+        .bind(i64::try_from(until).unwrap_or(i64::MAX))
+        .fetch_one(self.pool())
+        .await?;
+        Ok(until.min(session.inherited_event_count) + u64::try_from(local)?)
+    }
+
+    /// Map an inherited ordinal back to the parent's sequence space using the
+    /// fork index, not a decode of the parent's entire history.
+    pub(super) async fn inherited_sequence(
         &self,
+        parent: Uuid,
+        cut: u64,
+        ordinal: u64,
+    ) -> Result<u64> {
+        if ordinal == 0 {
+            return Ok(0);
+        }
+        let session = self.session_row(parent).await?;
+        if ordinal <= session.inherited_event_count {
+            anyhow::ensure!(
+                ordinal <= cut,
+                "inherited event {ordinal} is beyond cut {cut}"
+            );
+            return Ok(ordinal);
+        }
+        let sequence: Option<i64> = sqlx::query_scalar(
+            "select sequence from session_events \
+             where session_id = $1 and sequence <= $2 and fork_inheritable \
+             order by sequence limit 1 offset $3",
+        )
+        .bind(parent)
+        .bind(i64::try_from(cut).unwrap_or(i64::MAX))
+        .bind(i64::try_from(ordinal - session.inherited_event_count - 1).unwrap_or(i64::MAX))
+        .fetch_optional(self.pool())
+        .await?;
+        let sequence = sequence.ok_or_else(|| {
+            anyhow::anyhow!("session {parent} has no inherited event {ordinal} before cut {cut}")
+        })?;
+        Ok(u64::try_from(sequence)?)
+    }
+
+    /// A bounded slice in this session's contiguous sequence space. Ancestors
+    /// supply only inheritable rows in the mapped range, including for a fork
+    /// of a fork; excluded bodies are never fetched or decoded.
+    pub(super) fn composed_events_range<'a>(
+        &'a self,
         session_id: Uuid,
         after: u64,
         until: u64,
-    ) -> Result<Vec<(SessionEvent, bool)>> {
-        let rows = sqlx::query(
-            "select event_json, event_body, dict_id, fork_inheritable from session_events \
-             where session_id = $1 and sequence > $2 and sequence <= $3 order by sequence",
-        )
-        .bind(session_id)
-        .bind(i64::try_from(after).unwrap_or(i64::MAX))
-        .bind(i64::try_from(until).unwrap_or(i64::MAX))
-        .fetch_all(self.pool())
-        .await?;
-        let mut events = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let json: Option<serde_json::Value> = row.try_get("event_json")?;
-            let bytes: Option<Vec<u8>> = row.try_get("event_body")?;
-            let dict_id: Option<i32> = row.try_get("dict_id")?;
-            let value = self.decode_body(json, bytes, dict_id).await?;
-            let event: SessionEvent = serde_json::from_value(value)?;
-            events.push((event, row.try_get::<bool, _>("fork_inheritable")?));
-        }
-        Ok(events)
-    }
-
-    /// A session's full history: its inherited prefix followed by its own
-    /// events, all in one contiguous sequence space.
-    pub(super) fn composed_events<'a>(
-        &'a self,
-        session_id: Uuid,
-        before_or_at: Option<u64>,
+        inheritable_only: bool,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<SessionEvent>>> + Send + 'a>> {
         Box::pin(async move {
+            if until <= after {
+                return Ok(Vec::new());
+            }
             let session = self.session_row(session_id).await?;
-            let logical_limit = before_or_at.unwrap_or(session.next_sequence.saturating_sub(1));
+            let inherited_after = after.min(session.inherited_event_count);
+            let inherited_until = until.min(session.inherited_event_count);
             let mut events = Vec::new();
-            if let (Some(parent), Some(cut)) =
-                (session.parent_session_id, session.parent_cut_sequence)
+            if inherited_until > inherited_after
+                && let (Some(parent), Some(cut)) =
+                    (session.parent_session_id, session.parent_cut_sequence)
             {
-                // The prefix is whatever the parent would itself read up to the
-                // cut, so a fork of a fork composes correctly through the whole
-                // lineage rather than only one generation.
-                let inherited = self.composed_events(parent, Some(cut)).await?;
-                let inherited_limit = logical_limit.min(session.inherited_event_count);
-                for (index, mut event) in inherited
-                    .into_iter()
-                    .filter(|event| event.kind.is_fork_inheritable())
-                    .take(usize::try_from(inherited_limit).unwrap_or(usize::MAX))
-                    .enumerate()
-                {
+                let parent_after = self
+                    .inherited_sequence(parent, cut, inherited_after)
+                    .await?;
+                let parent_until = if inherited_until == session.inherited_event_count {
+                    cut
+                } else {
+                    self.inherited_sequence(parent, cut, inherited_until)
+                        .await?
+                };
+                let inherited = self
+                    .composed_events_range(parent, parent_after, parent_until, true)
+                    .await?;
+                for (index, mut event) in inherited.into_iter().enumerate() {
                     event.id = inherited_event_id(session_id, event.id);
                     event.session_id = session_id;
-                    event.sequence = index as u64 + 1;
+                    event.sequence = inherited_after + index as u64 + 1;
                     events.push(event);
                 }
             }
-            if logical_limit > session.inherited_event_count {
-                let local = self
-                    .local_events(session_id, session.inherited_event_count, logical_limit)
-                    .await?;
-                events.extend(local.into_iter().map(|(event, _)| event));
+            if until > session.inherited_event_count {
+                let rows = sqlx::query(
+                    "select event_json, event_body, dict_id from session_events \
+                     where session_id = $1 and sequence > $2 and sequence <= $3 \
+                       and (not $4 or fork_inheritable) order by sequence",
+                )
+                .bind(session_id)
+                .bind(i64::try_from(after.max(session.inherited_event_count)).unwrap_or(i64::MAX))
+                .bind(i64::try_from(until).unwrap_or(i64::MAX))
+                .bind(inheritable_only)
+                .fetch_all(self.pool())
+                .await?;
+                events.extend(self.decode_events(&rows).await?);
             }
             Ok(events)
         })
     }
 
-    /// The parent's state at the cut, and how many of its events the fork
-    /// inherits.
+    pub(super) async fn composed_events(
+        &self,
+        session_id: Uuid,
+        before_or_at: Option<u64>,
+    ) -> Result<Vec<SessionEvent>> {
+        let until = match before_or_at {
+            Some(until) => until,
+            None => self
+                .session_row(session_id)
+                .await?
+                .next_sequence
+                .saturating_sub(1),
+        };
+        self.composed_events_range(session_id, 0, until, false)
+            .await
+    }
+
+    /// Restore state from the closest durable checkpoint, then replay at most
+    /// 255 local events. Older sessions without checkpoints still replay.
     pub(super) async fn fork_projection(
         &self,
         parent_session_id: Uuid,
         sequence: u64,
     ) -> Result<(u64, SessionState)> {
-        let events = self
-            .composed_events(parent_session_id, sequence.checked_sub(1))
-            .await?;
-        let inherited_event_count = events
-            .iter()
-            .filter(|event| event.kind.is_fork_inheritable())
-            .count() as u64;
-        Ok((inherited_event_count, SessionState::reduce(&events)?))
+        let until = sequence.saturating_sub(1);
+        let inherited_event_count = self.fork_event_count(parent_session_id, until).await?;
+        let checkpoint: Option<String> = sqlx::query_scalar(
+            "select projection_json from session_events \
+             where session_id = $1 and sequence <= $2 and projection_json <> '' \
+             order by sequence desc limit 1",
+        )
+        .bind(parent_session_id)
+        .bind(i64::try_from(until).unwrap_or(i64::MAX))
+        .fetch_optional(self.pool())
+        .await?;
+        let mut state = checkpoint
+            .map(|json| serde_json::from_str::<SessionState>(&json))
+            .transpose()?
+            .unwrap_or_default();
+        for event in self
+            .composed_events_range(parent_session_id, state.latest_sequence, until, false)
+            .await?
+        {
+            state.apply(&event)?;
+        }
+        Ok((inherited_event_count, state))
     }
 
     pub(super) async fn fork_session_before(
@@ -641,6 +701,77 @@ mod tests {
             texts(&store.read(grandchild).await.unwrap()),
             vec!["reply 0", "reply 1", "reply 2", "child reply"],
             "a nested fork must compose through every generation"
+        );
+        scratch.discard().await;
+    }
+
+    #[tokio::test]
+    async fn revert_and_tail_paging_do_not_decode_history_before_the_checkpoint() {
+        let Some(url) = test_url() else {
+            return;
+        };
+        let (scratch, store, parent) = conversation(&url).await;
+        for _ in 0..260 {
+            store
+                .append(SessionEvent::new(
+                    parent,
+                    0,
+                    SessionEventKind::StatusChanged {
+                        status: crate::SessionStatus::Ready,
+                        detail: None,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        let tail = store
+            .append(SessionEvent::new(
+                parent,
+                0,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: "newest reply".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let state = store.state(parent).await.unwrap();
+        // An unreadable old body makes a full-history regression deterministic
+        // without a timing assertion or a hundreds-of-thousands-row fixture.
+        sqlx::query(
+            "update session_events set event_json = '{}'::jsonb \
+             where session_id = $1 and sequence = 2",
+        )
+        .bind(parent)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let fork = Uuid::new_v4();
+        let result = store
+            .fork_before(parent, fork, tail.sequence + 1)
+            .await
+            .unwrap();
+        assert_eq!(result.inherited_event_count, 6);
+        assert_eq!(store.state(fork).await.unwrap(), state.for_fork(6));
+        let page = store.events_after(fork, 4, 2).await.unwrap();
+        assert_eq!(texts(&page), ["reply 3", "newest reply"]);
+        assert_eq!(
+            page.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            [5, 6]
+        );
+        store
+            .append(SessionEvent::new(fork, 0, SessionEventKind::SessionStarted))
+            .await
+            .unwrap();
+        let nested = Uuid::new_v4();
+        store.fork_before(fork, nested, 8).await.unwrap();
+        assert_eq!(
+            texts(&store.events_after(nested, 4, 2).await.unwrap()),
+            texts(&page)
         );
         scratch.discard().await;
     }

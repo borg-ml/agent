@@ -29,10 +29,10 @@ pub(super) struct StoredSession {
     pub next_sequence: u64,
 }
 
-/// One stored event plus the flag deciding whether a fork inherits it.
+/// Queue and team events may survive a boundary without returning to context.
 struct StoredEvent {
     event: SessionEvent,
-    fork_inheritable: bool,
+    context_visible: bool,
 }
 
 /// A forked session renumbers its inherited prefix into its own space, so an
@@ -133,13 +133,23 @@ impl PostgresSessionStore {
         after: u64,
         until: u64,
         parts: RecoveryParts,
+        context_start: u64,
+        inheritable_only: bool,
     ) -> Result<Vec<StoredEvent>> {
         let predicate = recovery_scan_predicate(parts, "e.");
+        let survivors = recovery_scan_predicate(
+            RecoveryParts {
+                context: false,
+                ..parts
+            },
+            "e.",
+        );
         let sql = format!(
-            "select e.event_json, e.event_body, e.dict_id, e.fork_inheritable \
+            "select e.event_json, e.event_body, e.dict_id \
              from session_events e \
              where e.session_id = $1 and e.sequence > $2 and e.sequence <= $3 \
-               and {predicate} \
+               and {predicate} and (e.sequence >= $4 or {survivors}) \
+               and (not $5 or e.fork_inheritable) \
                and (e.event_kind <> 'subagent_activity' or {LATEST_SUBAGENT_ROWS}) \
              order by e.sequence"
         );
@@ -147,14 +157,16 @@ impl PostgresSessionStore {
             .bind(session_id)
             .bind(i64::try_from(after).unwrap_or(i64::MAX))
             .bind(i64::try_from(until).unwrap_or(i64::MAX))
+            .bind(i64::try_from(context_start).unwrap_or(i64::MAX))
+            .bind(inheritable_only)
             .fetch_all(self.pool())
             .await?;
         let events = self.decode_events(&rows).await?;
         let mut stored = Vec::with_capacity(events.len());
-        for (row, event) in rows.iter().zip(events) {
+        for event in events {
             stored.push(StoredEvent {
+                context_visible: parts.context && event.sequence >= context_start,
                 event,
-                fork_inheritable: row.try_get("fork_inheritable")?,
             });
         }
         Ok(stored)
@@ -171,34 +183,34 @@ impl PostgresSessionStore {
         session_id: Uuid,
         before_or_at: Option<u64>,
         parts: RecoveryParts,
+        inheritable_only: bool,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<StoredEvent>>> + Send + 'a>> {
         Box::pin(async move {
             let session = self.session_row(session_id).await?;
             let logical_limit = before_or_at.unwrap_or(session.next_sequence.saturating_sub(1));
             let inherited_limit = logical_limit.min(session.inherited_event_count);
+            let context_start = if parts.context {
+                self.recovery_boundary_before(session_id, logical_limit)
+                    .await?
+                    .and_then(|sequence| u64::try_from(sequence).ok())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             let mut events = match (session.parent_session_id, session.parent_cut_sequence) {
-                (Some(parent), Some(cut)) => {
-                    let narrowed = if inherited_limit < session.inherited_event_count {
-                        // A cut inside the inherited prefix has to be counted in
-                        // the parent's own terms, so the parent is asked for
-                        // every slice and the narrowing is applied after.
-                        RecoveryParts::ALL
+                (Some(parent), Some(cut)) if inherited_limit > 0 => {
+                    let cut = if inherited_limit < session.inherited_event_count {
+                        self.inherited_sequence(parent, cut, inherited_limit)
+                            .await?
                     } else {
-                        parts
+                        cut
                     };
-                    let mut inherited = self
-                        .composed_recovery_events(parent, Some(cut), narrowed)
-                        .await?;
-                    inherited.retain(|stored| stored.fork_inheritable);
-                    if inherited_limit < session.inherited_event_count {
-                        inherited.truncate(usize::try_from(inherited_limit).unwrap_or(usize::MAX));
-                        inherited.retain(|stored| {
-                            (parts.context && stored.event.kind.is_context_relevant())
-                                || (parts.queue && stored.event.kind.is_queue_relevant())
-                                || (parts.subagents && stored.event.kind.is_subagent_relevant())
-                        });
-                    }
-                    inherited
+                    let inherited_parts = RecoveryParts {
+                        context: parts.context && context_start <= session.inherited_event_count,
+                        ..parts
+                    };
+                    self.composed_recovery_events(parent, Some(cut), inherited_parts, true)
+                        .await?
                 }
                 _ => Vec::new(),
             };
@@ -209,6 +221,8 @@ impl PostgresSessionStore {
                         session.inherited_event_count,
                         logical_limit,
                         parts,
+                        context_start,
+                        inheritable_only,
                     )
                     .await?;
                 events.append(&mut local);
@@ -310,13 +324,14 @@ impl PostgresSessionStore {
     /// compaction is implicit, and only counts when the provider's own context
     /// was NOT preserved (or it is an explicit recovery checkpoint) -- a
     /// compaction that preserved provider context is not a replay boundary.
-    async fn recovery_boundary(&self, session_id: Uuid) -> Result<Option<i64>> {
+    async fn recovery_boundary_before(&self, session_id: Uuid, until: u64) -> Result<Option<i64>> {
         let context_clear_sequence: Option<i64> = sqlx::query_scalar(
             "select sequence from session_events \
-             where session_id = $1 and event_kind = 'context_cleared' \
+             where session_id = $1 and sequence <= $2 and event_kind = 'context_cleared' \
              order by sequence desc limit 1",
         )
         .bind(session_id)
+        .bind(i64::try_from(until).unwrap_or(i64::MAX))
         .fetch_optional(self.pool())
         .await?
         .flatten();
@@ -325,7 +340,7 @@ impl PostgresSessionStore {
         // the qualifying predicate is applied in Rust, so an aged row is
         // examined rather than skipped.
         let mut compaction_sequence = None;
-        let mut before = i64::MAX;
+        let mut before = i64::try_from(until.saturating_add(1)).unwrap_or(i64::MAX);
         'outer: loop {
             let rows = sqlx::query(
                 "select sequence, event_json, event_body, dict_id from session_events \
@@ -422,14 +437,17 @@ impl PostgresSessionStore {
         // history; a fork's sequence space spans its parent's, so it takes the
         // composed path.
         if session.inherited_event_count == 0
-            && let Some(recovery_start_sequence) = self.recovery_boundary(session_id).await?
+            && let Some(recovery_start_sequence) = self
+                .recovery_boundary_before(session_id, session.next_sequence.saturating_sub(1))
+                .await?
         {
             return self
                 .recovery_projection_from_sequence(session_id, recovery_start_sequence, None, parts)
                 .await;
         }
+        let mut context_events = Vec::new();
         let events = self
-            .composed_recovery_events(session_id, None, parts)
+            .composed_recovery_events(session_id, None, parts, false)
             .await?
             .into_iter()
             .map(|stored| {
@@ -438,10 +456,29 @@ impl PostgresSessionStore {
                     event.id = inherited_event_id(session_id, event.id);
                     event.session_id = session_id;
                 }
+                if stored.context_visible {
+                    context_events.push(event.clone());
+                }
                 event
             })
             .collect();
-        Ok(SessionRecovery::from_events(events, parts))
+        let mut recovery = SessionRecovery::from_events(
+            events,
+            RecoveryParts {
+                context: false,
+                ..parts
+            },
+        );
+        recovery.context_events = SessionRecovery::from_events(
+            context_events,
+            RecoveryParts {
+                context: parts.context,
+                queue: false,
+                subagents: false,
+            },
+        )
+        .context_events;
+        Ok(recovery)
     }
 
     /// Recovery anchored on a provider's own checkpoint, when one exists.

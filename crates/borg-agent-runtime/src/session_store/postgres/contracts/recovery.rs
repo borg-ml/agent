@@ -86,7 +86,7 @@ async fn context_clear_resets_provider_projection_and_recovery_prefix() {
 #[tokio::test]
 async fn compacted_recovery_keeps_the_unresolved_prompt_tail() {
     let (scratch, store) = store().await;
-    let session_id = Uuid::new_v4();
+    let mut session_id = Uuid::new_v4();
     let summarized_id = Uuid::new_v4();
     let failed_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
@@ -163,6 +163,30 @@ async fn compacted_recovery_keeps_the_unresolved_prompt_tail() {
                 && payload.get("summary").and_then(serde_json::Value::as_str)
                     == Some("summary of the old context")
     )));
+    for _ in 0..2 {
+        let fork = Uuid::new_v4();
+        let cut = store.state(session_id).await.unwrap().latest_sequence + 1;
+        store.fork_before(session_id, fork, cut).await.unwrap();
+        let inherited = store.recovery(fork).await.unwrap();
+        assert_eq!(
+            inherited
+                .context_events
+                .iter()
+                .map(|event| serde_json::to_value(&event.kind).unwrap())
+                .collect::<Vec<_>>(),
+            recovery
+                .context_events
+                .iter()
+                .filter(|event| event.kind.is_fork_inheritable())
+                .map(|event| serde_json::to_value(&event.kind).unwrap())
+                .collect::<Vec<_>>(),
+            "a revert must recover the same compacted context and failed prompt"
+        );
+        assert!(inherited.queue_events.iter().any(|event| matches!(
+            &event.kind, SessionEventKind::Message { message_id, .. } if *message_id == failed_id
+        )));
+        session_id = fork;
+    }
     scratch.discard().await;
 }
 
