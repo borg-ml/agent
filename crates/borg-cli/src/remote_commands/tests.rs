@@ -2333,6 +2333,7 @@ async fn owner_shutdown_hands_active_turn_to_an_attached_viewer() {
         LocalSessionAccess::Owned,
         SessionStatus::Running,
         false,
+        false,
         Some(&server),
     ));
     let mut presence = tokio::net::UnixStream::connect(presence_path)
@@ -2344,11 +2345,20 @@ async fn owner_shutdown_hands_active_turn_to_an_attached_viewer() {
         LocalSessionAccess::Owned,
         SessionStatus::Running,
         false,
+        false,
+        Some(&server),
+    ));
+    assert!(owner_shutdown_should_handoff_to_viewer(
+        LocalSessionAccess::Owned,
+        SessionStatus::Ready,
+        false,
+        true,
         Some(&server),
     ));
     assert!(!owner_shutdown_should_handoff_to_viewer(
         LocalSessionAccess::Attached,
         SessionStatus::Running,
+        false,
         false,
         Some(&server),
     ));
@@ -2356,16 +2366,36 @@ async fn owner_shutdown_hands_active_turn_to_an_attached_viewer() {
 
 #[test]
 fn obsolete_owner_handoff_waits_for_a_safe_turn_boundary() {
-    assert!(stale_local_owner_can_handoff(Some(SessionStatus::Ready)));
-    assert!(stale_local_owner_can_handoff(Some(SessionStatus::Stopped)));
-    assert!(!stale_local_owner_can_handoff(Some(
-        SessionStatus::Starting
-    )));
-    assert!(!stale_local_owner_can_handoff(Some(SessionStatus::Running)));
-    assert!(!stale_local_owner_can_handoff(Some(
-        SessionStatus::WaitingForApproval
-    )));
-    assert!(!stale_local_owner_can_handoff(None));
+    assert!(stale_local_owner_can_handoff(
+        Some(SessionStatus::Ready),
+        false
+    ));
+    assert!(stale_local_owner_can_handoff(
+        Some(SessionStatus::Stopped),
+        false
+    ));
+    assert!(!stale_local_owner_can_handoff(
+        Some(SessionStatus::Starting),
+        false
+    ));
+    assert!(!stale_local_owner_can_handoff(
+        Some(SessionStatus::Running),
+        false
+    ));
+    assert!(!stale_local_owner_can_handoff(
+        Some(SessionStatus::WaitingForApproval),
+        false
+    ));
+    assert!(!stale_local_owner_can_handoff(None, false));
+
+    assert!(!stale_local_owner_can_handoff(
+        Some(SessionStatus::Ready),
+        true
+    ));
+    assert!(!stale_local_owner_can_handoff(
+        Some(SessionStatus::Stopped),
+        true
+    ));
 
     let rejection = |reason: &str| {
         SessionEvent::new(
@@ -2614,32 +2644,59 @@ async fn obsolete_owner_handoff_waits_for_a_lease_after_connection_refused() {
 fn active_session_survives_terminal_hangup_but_idle_session_stops() {
     assert!(should_detach_on_terminal_loss(
         SessionStatus::Running,
+        false,
         false
     ));
-    assert!(!should_detach_on_terminal_loss(SessionStatus::Ready, false));
+    assert!(!should_detach_on_terminal_loss(
+        SessionStatus::Ready,
+        false,
+        false
+    ));
     assert!(should_detach_on_terminal_hangup(
         "SIGHUP",
         SessionStatus::Running,
+        false,
         false
     ));
     assert!(should_detach_on_terminal_hangup(
         "SIGHUP",
         SessionStatus::WaitingForApproval,
+        false,
         false
     ));
     assert!(!should_detach_on_terminal_hangup(
         "SIGHUP",
         SessionStatus::Ready,
+        false,
         false
     ));
     assert!(!should_detach_on_terminal_hangup(
         "SIGTERM",
         SessionStatus::Running,
+        true,
+        false
+    ));
+    assert!(should_detach_on_terminal_hangup(
+        "SIGHUP",
+        SessionStatus::Ready,
+        true,
+        false
+    ));
+    assert!(should_detach_on_terminal_loss(
+        SessionStatus::Ready,
+        false,
         true
     ));
     assert!(should_detach_on_terminal_hangup(
         "SIGHUP",
         SessionStatus::Ready,
+        false,
+        true
+    ));
+    assert!(!should_detach_on_terminal_hangup(
+        "SIGTERM",
+        SessionStatus::Ready,
+        false,
         true
     ));
 }
@@ -3946,5 +4003,156 @@ async fn resume_bootstrap_stops_at_the_live_cursor() {
         &event.kind,
         SessionEventKind::Message { text, .. } if text == "seen"
     )));
+    scratch.discard().await;
+}
+
+// Closing every viewer must not let an idle root shut down a busy team. The
+// predicate test covers the five-minute decision without a wall-clock wait.
+#[test]
+fn detached_host_remains_alive_for_children_prompts_processes_and_viewers() {
+    let mut state = SessionState {
+        status: Some(SessionStatus::Ready),
+        ..Default::default()
+    };
+    assert!(session_host_is_idle(&state, false, false, false));
+    assert!(!session_host_is_idle(&state, false, true, false));
+    assert!(!session_host_is_idle(&state, true, false, false));
+    assert!(!session_host_is_idle(&state, false, false, true));
+    state.active_processes.insert(Uuid::new_v4());
+    assert!(!session_host_is_idle(&state, false, false, false));
+    state.active_processes.clear();
+    for status in [
+        SessionStatus::Starting,
+        SessionStatus::Running,
+        SessionStatus::WaitingForApproval,
+    ] {
+        state.status = Some(status);
+        assert!(!session_host_is_idle(&state, false, false, false));
+    }
+}
+
+// A reattaching newer viewer must consult the child ledger, not just a Ready
+// root or a stale Ready parent mirror, before replacing the execution host.
+#[tokio::test]
+async fn owner_upgrade_waits_for_child_work_and_background_processes() {
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
+    let root = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let now = Utc::now();
+    store.create_session(root).await.unwrap();
+    store.create_session(child).await.unwrap();
+    let snapshot = SubagentSnapshot {
+        session_id: child,
+        parent_session_id: root,
+        task_name: "/root/worker".into(),
+        status: SubagentStatus::Ready,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        fast: false,
+        ultrafast: false,
+        cwd: PathBuf::from("/workspace"),
+        created_at: now,
+        updated_at: now,
+        detail: None,
+        final_text: None,
+        usage: Default::default(),
+        interrupted_by: None,
+    };
+    store
+        .append(SessionEvent::new(
+            root,
+            0,
+            SessionEventKind::SubagentActivity {
+                activity: borg_remote::SubagentActivityKind::Updated,
+                agent: snapshot,
+                event: None,
+            },
+        ))
+        .await
+        .unwrap();
+    for status in [
+        SessionStatus::Running,
+        SessionStatus::WaitingForApproval,
+        SessionStatus::Ready,
+    ] {
+        store
+            .append(SessionEvent::new(
+                child,
+                0,
+                SessionEventKind::StatusChanged {
+                    status,
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            local_subagents_are_idle(&store, root).await.unwrap(),
+            status == SessionStatus::Ready
+        );
+    }
+    let process_id = Uuid::new_v4();
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::RuntimeProcessStarted {
+                process_id,
+                pid: 123,
+                command: "test child process".into(),
+                cwd: PathBuf::from("/workspace"),
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(!local_subagents_are_idle(&store, root).await.unwrap());
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::RuntimeProcessCompleted {
+                process_id,
+                pid: 123,
+                status: borg_remote::RuntimeProcessStatus::Exited,
+                exit_code: Some(0),
+                timed_out: false,
+                stdout: String::new(),
+                stderr: String::new(),
+                stdout_omitted_bytes: 0,
+                stderr_omitted_bytes: 0,
+                error: None,
+                changes: Vec::new(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(local_subagents_are_idle(&store, root).await.unwrap());
+    let mut watch = borg_remote::WatchSummary {
+        watch_id: Uuid::new_v4(),
+        label: "child wait".into(),
+        command: "test child watch".into(),
+        running: true,
+        started_at: now,
+        last_event_at: None,
+        event_count: 0,
+    };
+    for running in [true, false] {
+        watch.running = running;
+        store
+            .append(SessionEvent::new(
+                child,
+                0,
+                SessionEventKind::WatchesChanged {
+                    watches: vec![watch.clone()],
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            local_subagents_are_idle(&store, root).await.unwrap(),
+            !running
+        );
+    }
     scratch.discard().await;
 }

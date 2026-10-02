@@ -1327,6 +1327,7 @@ version = "0.13.6"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
+ "borg-agent-runtime",
  "borg-provider",
  "borg-remote",
  "chrono",
