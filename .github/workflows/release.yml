@@ -16,6 +16,7 @@ run-name: Release ${{ github.event_name == 'workflow_dispatch' && inputs.tag || 
 env:
   BORG_TEST_SESSIONS_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
   BORG_SESSIONS_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+  CARGO_PROFILE_RELEASE_OPT_LEVEL: s
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 permissions:
@@ -191,13 +192,9 @@ jobs:
           Copy-Item "configs/ghostty-borg.conf" "$packageDir/configs/"
           Copy-Item "include/borg_extension.h" "$packageDir/include/"
           Copy-Item LICENSE, NOTICE.md, README.md, CHANGELOG.md $packageDir
-          if ("${{ matrix.target }}" -eq "x86_64-pc-windows-msvc") {
-            $sevenZip = (Get-Command 7z -ErrorAction Stop).Source
-            & $sevenZip a -tzip -mx=9 -mfb=258 -mpass=10 -mmt=2 $asset "$packageDir/*"
-            if ($LASTEXITCODE -ne 0) { throw "7-Zip packaging failed" }
-          } else {
-            Compress-Archive -Path "$packageDir/*" -DestinationPath $asset
-          }
+          $sevenZip = (Get-Command 7z -ErrorAction Stop).Source
+          & $sevenZip a -tzip -mx=9 -mfb=258 -mpass=10 -mmt=2 $asset "$packageDir/*"
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip packaging failed" }
           # Old Borg clients refuse larger archives before reading their checksum.
           if ((Get-Item $asset).Length -gt 134217728) { throw "Release archive exceeds the old updater limit" }
           $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
