@@ -1514,6 +1514,10 @@ pub enum HostCommand {
         session_id: Uuid,
         action: GoalAction,
     },
+    AgentGoal {
+        session_id: Uuid,
+        action: GoalAction,
+    },
     Todo {
         session_id: Uuid,
         action: TodoAction,
@@ -1601,6 +1605,7 @@ impl HostCommand {
             | Self::Approve { session_id, .. }
             | Self::RespondToProviderInteraction { session_id, .. }
             | Self::Goal { session_id, .. }
+            | Self::AgentGoal { session_id, .. }
             | Self::Todo { session_id, .. }
             | Self::AgentTodo { session_id, .. }
             | Self::ExtensionCommand { session_id, .. }

@@ -3587,10 +3587,37 @@ async fn run_agent_session_store_kernel_inner(
                             }
                         }
                     }
-                    Some(HostCommand::Goal {
-                        session_id: command_session_id,
-                        action,
-                    }) if command_session_id == session_id => {
+                    Some(
+                        command @ (HostCommand::Goal {
+                            session_id: command_session_id,
+                            ..
+                        }
+                        | HostCommand::AgentGoal {
+                            session_id: command_session_id,
+                            ..
+                        }),
+                    ) if command_session_id == session_id => {
+                        let (action, from_agent) = match command {
+                            HostCommand::Goal { action, .. } => (action, false),
+                            HostCommand::AgentGoal { action, .. } => (action, true),
+                            _ => unreachable!(),
+                        };
+                        if from_agent
+                            && user_stop
+                            && matches!(action, GoalAction::Set { .. } | GoalAction::Resume)
+                        {
+                            record(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                SessionEventKind::Error {
+                                    message: "Agent goal change rejected: explicit human stop"
+                                        .into(),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
                         apply_goal_action(
                             &mut journal,
                             &events,
@@ -6491,7 +6518,18 @@ async fn run_agent_session_store_kernel_inner(
                                 .await
                                 .ok();
                         }
-                        HostCommand::Goal { action, .. } => {
+                        command @ (HostCommand::Goal { .. } | HostCommand::AgentGoal { .. }) => {
+                            let (action, from_agent) = match command {
+                                HostCommand::Goal { action, .. } => (action, false),
+                                HostCommand::AgentGoal { action, .. } => (action, true),
+                                _ => unreachable!(),
+                            };
+                            if from_agent && user_stop && matches!(action, GoalAction::Set { .. } | GoalAction::Resume) {
+                                record(&mut journal, &events, session_id, SessionEventKind::Error {
+                                    message: "Agent goal change rejected: explicit human stop".into(),
+                                }).await?;
+                                continue;
+                            }
                             let objective_changed = matches!(action, GoalAction::Set { .. });
                             apply_goal_action(
                                 &mut journal,

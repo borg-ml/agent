@@ -4140,6 +4140,8 @@ fn tool_catalog_exposes_one_complete_lifecycle() {
         names,
         [
             "spawn_agent",
+            "get_agent_goal",
+            "control_agent_goal",
             "team_snapshot",
             "inspect_agent",
             "team_batch",
@@ -8847,4 +8849,99 @@ input()
         .await
         .unwrap();
     dispatcher.persistent_runtimes.stop_session(owner).await;
+}
+
+#[tokio::test]
+async fn parent_goal_control_routes_real_actions_and_denies_unrelated_callers() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        2,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+    let (child, mut rx) = {
+        let mut table = coordinator.table.lock().await;
+        let child = table.reserve("worker", &launch()).unwrap().session_id;
+        let (tx, rx) = mpsc::channel(8);
+        let entry = table.entries.get_mut(&child).unwrap();
+        entry.snapshot.status = SubagentStatus::Running;
+        entry.commands = Some(tx);
+        (child, rx)
+    };
+    bind_test_team(directory.path(), &store, root, &[child]).await;
+    let goal = crate::SessionGoal::new("original".into(), None);
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::GoalUpdated { goal: goal.clone() },
+        ))
+        .await
+        .unwrap();
+    let before = coordinator
+        .call_tool_as(root, "get_agent_goal", json!({"target":"worker"}))
+        .await
+        .unwrap();
+    assert_eq!(before["goal"]["id"], json!(goal.id));
+    for action in [
+        json!({"type":"set","objective":"revised"}),
+        json!({"type":"pause"}),
+        json!({"type":"resume"}),
+        json!({"type":"clear"}),
+    ] {
+        let request = json!({"target":"worker","goal_action":action});
+        assert!(
+            coordinator
+                .call_tool_as(Uuid::new_v4(), "control_agent_goal", request.clone())
+                .await
+                .is_err()
+        );
+        let result = coordinator
+            .call_tool_as(root, "control_agent_goal", request)
+            .await
+            .unwrap();
+        assert_eq!(result["accepted"], true);
+        assert!(result["applied"].is_null());
+        match rx.recv().await.unwrap() {
+            HostCommand::AgentGoal {
+                session_id,
+                action: received,
+            } => {
+                assert_eq!(session_id, child);
+                assert_eq!(
+                    serde_json::to_value(received).unwrap()["type"],
+                    action["type"]
+                );
+            }
+            other => panic!("wrong command: {other:?}"),
+        }
+    }
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::UserStopChanged { engaged: true },
+        ))
+        .await
+        .unwrap();
+    assert!(
+        coordinator
+            .call_tool_as(
+                root,
+                "control_agent_goal",
+                json!({"target":"worker","goal_action":{"type":"resume"}})
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(store.state(child).await.unwrap().goal.unwrap().id, goal.id);
+    scratch.discard().await;
 }

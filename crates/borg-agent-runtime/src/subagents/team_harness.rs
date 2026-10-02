@@ -19,6 +19,13 @@ struct InspectArgs {
     max_bytes: Option<usize>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentGoalArgs {
+    target: String,
+    goal_action: Option<crate::GoalAction>,
+}
+
 // Deliberate allowlist: no provider events, nested child events, reasoning,
 // tool payloads, attachments, environment or interaction payloads cross this API.
 fn public_event(event: &SessionEvent) -> Option<Value> {
@@ -112,6 +119,93 @@ impl SubagentCoordinator {
             "session is not an owned descendant of the caller"
         );
         Ok(())
+    }
+
+    pub(super) async fn agent_goal(
+        &self,
+        actor: Uuid,
+        arguments: Value,
+        change: bool,
+    ) -> Result<Value> {
+        let args: AgentGoalArgs = serde_json::from_value(arguments)?;
+        let id = self.table.lock().await.resolve(&args.target)?;
+        self.authorize_inspection(actor, id).await?;
+        if !change {
+            ensure!(
+                args.goal_action.is_none(),
+                "get_agent_goal does not accept goal_action"
+            );
+            let state = self.store.state(id).await?;
+            return Ok(
+                json!({"session_id": id, "goal": public_goal(state.goal.as_ref()),
+                "revision": state.latest_sequence, "user_stopped": state.user_stopped,
+                "source": "canonical session store", "observed_at": Utc::now()}),
+            );
+        }
+        ensure!(
+            actor == self.root_session_id,
+            "only the director may control child goals"
+        );
+        let action = args.goal_action.context("goal_action is required")?;
+        if let crate::GoalAction::Set {
+            objective,
+            token_budget,
+        } = &action
+        {
+            ensure!(
+                !objective.trim().is_empty() && objective.chars().count() <= 4096,
+                "goal objective must contain 1..4096 characters"
+            );
+            ensure!(
+                token_budget.is_none_or(|budget| budget > 0),
+                "token budget must be positive"
+            );
+        }
+        let state = self.store.state(id).await?;
+        match &action {
+            crate::GoalAction::Pause => {
+                ensure!(state.goal.is_some(), "child has no goal");
+            }
+            crate::GoalAction::Resume => {
+                let goal = state.goal.as_ref().context("child has no goal")?;
+                ensure!(
+                    !state.user_stopped,
+                    "explicit human stop requires human resume authorization"
+                );
+                ensure!(
+                    state.pending_approval_id.is_none()
+                        && state.pending_provider_interaction_id.is_none(),
+                    "child has a pending approval or decision"
+                );
+                ensure!(
+                    !matches!(
+                        goal.status,
+                        crate::GoalStatus::Complete | crate::GoalStatus::BudgetLimited
+                    ),
+                    "completed or budget-limited goals cannot be resumed"
+                );
+            }
+            crate::GoalAction::Set { .. } => {
+                ensure!(
+                    !state.user_stopped,
+                    "explicit human stop requires human resume authorization"
+                );
+                ensure!(
+                    state.pending_approval_id.is_none()
+                        && state.pending_provider_interaction_id.is_none(),
+                    "child has a pending approval or decision"
+                );
+            }
+            crate::GoalAction::Clear => (),
+        }
+        self.send_command(&id.to_string(), |session_id| HostCommand::AgentGoal {
+            session_id,
+            action,
+        })
+        .await?;
+        Ok(json!({"session_id": id, "accepted": true, "applied": null,
+            "before_revision": state.latest_sequence,
+            "caveat": "Queued to the owning child actor, not proof of application. Read get_agent_goal to verify. Pause/clear do not interrupt a running turn; interrupt_agent is separate. Use only for explicit human-authorized goal management."}))
     }
 
     pub(super) async fn team_snapshot(&self, actor: Uuid, arguments: Value) -> Result<Value> {

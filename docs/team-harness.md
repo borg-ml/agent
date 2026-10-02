@@ -88,3 +88,16 @@ inferred compilation flags separately from diagnostics; source timestamps alone
 do not prove the flags are stale. Large diagnostic summaries retain unavailable
 and partial caveats. Source tests/commits do not prove an installed binary has
 these capabilities.
+
+## Parent goal controls
+
+`get_agent_goal({target})` reads the owned child's canonical goal/accounting and revision.
+`control_agent_goal({target, goal_action: {type: "set", objective, token_budget}})`
+sets a goal through its owning actor. Use `type: "pause"`, `"resume"`, or `"clear"`
+for the other actions. Only the director can mutate descendant goals, and only
+under explicit human authorization. Resume/set cannot release a human stop.
+Clear detaches the goal while retaining journal history. Pause/clear do not
+interrupt a running turn: use `interrupt_agent` separately when stopping work.
+A control receipt confirms queuing, not application; read the goal again to
+verify the durable transition. Unfinished goal edits retain identity/accounting
+under existing host semantics; a new objective after completion starts a new goal.

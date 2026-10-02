@@ -11074,6 +11074,7 @@ fn remote_command_name(command: &HostCommand) -> &'static str {
         HostCommand::CancelWorkspaceCommand { .. } => "cancel workspace command",
         HostCommand::ShellCommand { .. } => "shell command",
         HostCommand::OpenTerminal { .. } => "open terminal",
+        HostCommand::AgentGoal { .. } => "agent goal",
     }
 }
 
