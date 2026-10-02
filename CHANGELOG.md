@@ -26,6 +26,8 @@ Git comparison.
   the pinned upstream runtime's classification; actual or unclassified thinking
   stays in Reasoning. Signed content and raw event payloads remain unchanged for
   replay, without extra model retries or tool-execution guards.
+- Persistent Python host-tool calls are serialized across threads, preventing
+  background callers from consuming each other's replies.
 
 ### Collaboration
 
