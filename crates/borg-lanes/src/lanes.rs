@@ -2622,7 +2622,15 @@ impl LaneStore {
             command = scoped;
             self.hook_env(&mut command, spec, id, phase, end);
         }
-        let mut child = command.stdin(Stdio::null()).spawn()?;
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.job_dir(id).join("output.log"))?;
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log))
+            .spawn()?;
         if !sync {
             return Ok(());
         }
@@ -5102,7 +5110,11 @@ mod tests {
                 disk_path: dir.path().into(),
             },
             pre_hook: Some(Hook {
-                argv: vec!["true".into()],
+                argv: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "echo fixture-stdout; echo fixture-stderr >&2".into(),
+                ],
                 timeout_ms: 1000,
             }),
             post_hook: None,
@@ -5131,6 +5143,9 @@ mod tests {
             store.ticket_state(&job.ticket).unwrap(),
             TicketState::Granted(_)
         ));
+        let log = fs::read_to_string(store.job_dir(job.id).join("output.log")).unwrap();
+        assert!(log.contains("fixture-stdout"));
+        assert!(log.contains("fixture-stderr"));
         store.finish(job.id, 125, "failed yield").unwrap();
         store.release_lease(&held).unwrap();
     }
