@@ -371,6 +371,18 @@ struct RecordingPeerExecutor {
 
 #[async_trait::async_trait]
 impl crate::AgentTurnExecutor for RecordingPeerExecutor {
+    async fn speed_support(
+        &self,
+        provider: CodingProvider,
+        _model: &str,
+        _provider_context: Option<&crate::RuntimeProviderContext>,
+    ) -> Result<crate::SpeedSupport> {
+        Ok(crate::SpeedSupport {
+            fast: provider.supports_fast(),
+            ultrafast: provider == CodingProvider::Codex,
+        })
+    }
+
     async fn execute(
         &self,
         turn: crate::AgentTurn,
@@ -1838,6 +1850,8 @@ async fn a_child_without_a_lane_inherits_the_parent_live_lane() {
             provider: None,
             model: None,
             effort: None,
+            fast: None,
+            ultrafast: None,
         })
         .await
         .expect("a child with no lane named resolves the parent lane");
@@ -1865,6 +1879,8 @@ async fn a_child_without_a_lane_inherits_the_parent_live_lane() {
             provider: Some(CodingProvider::OpenCode),
             model: None,
             effort: None,
+            fast: None,
+            ultrafast: None,
         })
         .await
         .expect("a provider named without a model still resolves a lane");
@@ -2169,15 +2185,113 @@ impl crate::AgentTurnExecutor for FastPeerExecutor {
     ) -> Result<crate::SpeedSupport> {
         Ok(crate::SpeedSupport {
             fast: provider == CodingProvider::Codex && model == "gpt-6-sol",
-            ultrafast: false,
+            ultrafast: provider == CodingProvider::Codex && model == "gpt-6-sol",
         })
     }
+}
+
+#[tokio::test]
+async fn subagent_speed_overrides_live_inheritance_and_controls_worker_reuse() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let mut root_launch = launch();
+    root_launch.capabilities.multiplayer = false;
+    root_launch.cwd = directory.path().to_path_buf();
+    store
+        .append(SessionEvent::new(
+            root,
+            0,
+            SessionEventKind::SessionConfigured {
+                cwd: root_launch.cwd.clone(),
+                provider: root_launch.provider,
+                model: root_launch.model.clone(),
+                effort: root_launch.effort.clone(),
+                fast: true,
+                ultrafast: false,
+                response_language: root_launch.response_language,
+                permission_mode: root_launch.permission_mode,
+                speed_support: crate::SpeedSupport {
+                    fast: true,
+                    ultrafast: true,
+                },
+            },
+        ))
+        .await
+        .unwrap();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        root_launch,
+        2,
+        Arc::new(RecordingPeerExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+
+    let mut first_fast = None;
+    for (task_name, speed, reused) in [
+        ("inherited_fast", None, false),
+        ("standard", Some(false), false),
+        ("explicit_fast", Some(true), true),
+    ] {
+        let mut args = json!({ "task_name": task_name, "message": "Complete this bounded task." });
+        if let Some(fast) = speed {
+            args["fast"] = json!(fast);
+        }
+        let mut activity = coordinator.subscribe();
+        let result = coordinator.call_tool("spawn_agent", args).await.unwrap();
+        let id = Uuid::parse_str(result["session_id"].as_str().unwrap()).unwrap();
+        assert_eq!(result["reused"], reused);
+        assert_eq!(result["fast"], speed.unwrap_or(true));
+        if task_name == "inherited_fast" {
+            first_fast = Some(id);
+        }
+        if reused {
+            assert_eq!(Some(id), first_fast);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if coordinator.get(id).await.unwrap().status == SubagentStatus::Ready {
+                    break;
+                }
+                activity.recv().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let config = store.state(id).await.unwrap().configuration.unwrap();
+        assert_eq!(config.fast, speed.unwrap_or(true));
+        assert!(!config.ultrafast);
+    }
+    let cross_provider = coordinator
+        .subagent_launch(&SpawnSubagent {
+            task_name: "cross_provider".into(),
+            message: "Complete this task.".into(),
+            provider: Some(CodingProvider::Claude),
+            model: None,
+            effort: None,
+            fast: None,
+            ultrafast: None,
+        })
+        .await
+        .unwrap();
+    assert!(!cross_provider.fast.unwrap_or(false));
+    assert!(!cross_provider.ultrafast.unwrap_or(false));
+    let conflict = coordinator.call_tool("spawn_agent", json!({
+        "task_name": "conflicting", "message": "Complete this task.", "fast": true, "ultrafast": true,
+    })).await.unwrap_err();
+    assert!(conflict.to_string().contains("choose either"));
+    coordinator.stop_all().await;
+    scratch.discard().await;
 }
 
 /// A model switch must not rotate the worker, lose its conversation, or
 /// revert to the launch lane when that child is resumed after a stop.
 #[tokio::test]
-async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
+async fn director_configures_live_child_speed_and_reuses_its_new_lane_after_wake() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
     let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
@@ -2185,6 +2299,20 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
     store.create_session(root).await.unwrap();
     let mut root_launch = launch();
     root_launch.cwd = directory.path().to_path_buf();
+    root_launch
+        .capabilities
+        .provider_capabilities
+        .push(crate::ProviderCapability {
+            provider: CodingProvider::OpenCode,
+            installed: true,
+            version: None,
+            authenticated: true,
+            auth_detail: None,
+            auth_methods: vec![crate::ProviderAuthMethod::Subscription],
+            can_spawn: true,
+            usage: None,
+            billing: None,
+        });
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
         root,
@@ -2201,6 +2329,8 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
             provider: Some(CodingProvider::Claude),
             model: Some("claude-opus-5-5".into()),
             effort: Some("high".into()),
+            fast: None,
+            ultrafast: None,
         })
         .await
         .unwrap();
@@ -2224,7 +2354,7 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
     assert!(unauthorized.to_string().contains("only the director"));
     assert!(
         coordinator
-            .configure_child("/root", Some(CodingProvider::Codex), None, None, None)
+            .configure_child("/root", Some(CodingProvider::Codex), None, None, None, None)
             .await
             .unwrap_err()
             .to_string()
@@ -2232,7 +2362,7 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
     );
     assert!(
         coordinator
-            .configure_child(target, None, None, Some("invalid".into()), None)
+            .configure_child(target, None, None, Some("invalid".into()), None, None)
             .await
             .is_err()
     );
@@ -2252,11 +2382,15 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
     assert_eq!(configured["agent"]["provider"], "codex");
     assert_eq!(configured["agent"]["model"], "gpt-6-sol");
     assert_eq!(configured["agent"]["effort"], "max");
+    assert_eq!(configured["agent"]["fast"], true);
+    assert_eq!(configured["agent"]["ultrafast"], false);
     let state = store.state(child.session_id).await.unwrap();
     let config = state.configuration.unwrap();
     assert_eq!(config.provider, CodingProvider::Codex);
     assert_eq!(config.model.as_deref(), Some("gpt-6-sol"));
     assert_eq!(config.effort.as_deref(), Some("max"));
+    assert!(config.fast);
+    assert!(!config.ultrafast);
     assert_eq!(
         state.latest_prompt.as_deref(),
         Some("Remember this original prompt.")
@@ -2329,6 +2463,38 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
     assert_eq!(revived.model.as_deref(), Some("gpt-6-sol"));
     assert_eq!(revived.effort.as_deref(), Some("xhigh"));
     assert!(revived.fast);
+    assert!(!revived.ultrafast);
+    let standard = coordinator
+        .call_tool("configure_agent", json!({"target": target, "fast": false}))
+        .await
+        .unwrap();
+    assert_eq!(standard["agent"]["fast"], false);
+    let premium = coordinator
+        .call_tool(
+            "configure_agent",
+            json!({"target": target, "ultrafast": true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(premium["agent"]["fast"], false);
+    assert_eq!(premium["agent"]["ultrafast"], true);
+    let refused = coordinator
+        .call_tool(
+            "configure_agent",
+            json!({"target": target, "fast": true, "ultrafast": true}),
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("choose either"));
+    let unsupported = coordinator
+        .call_tool("configure_agent", json!({"target": target, "provider": "open_code", "model": "opencode-go/deepseek-v4.1-flash", "fast": true}))
+        .await
+        .unwrap_err();
+    assert!(
+        unsupported.to_string().contains("does not offer fast mode"),
+        "{unsupported:#}"
+    );
+    assert!(!coordinator.get(child.session_id).await.unwrap().fast);
     coordinator.stop_all().await;
     scratch.discard().await;
 }
@@ -4279,6 +4445,7 @@ async fn durable_parent_activity_restores_child_topology() {
         model: Some("gpt-test".into()),
         effort: Some("high".into()),
         fast: false,
+        ultrafast: false,
         cwd: PathBuf::from("/workspace"),
         created_at: now,
         updated_at: now,
@@ -4516,6 +4683,8 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
                 provider: None,
                 model: None,
                 effort: None,
+                fast: None,
+                ultrafast: None,
             },
             false,
         )
@@ -4651,6 +4820,7 @@ async fn a_child_restored_after_a_host_crash_is_still_addressable_in_the_team_wo
                 model: Some("gpt-test".into()),
                 effort: Some("high".into()),
                 fast: false,
+                ultrafast: false,
                 cwd: PathBuf::from("/workspace"),
                 created_at: now,
                 updated_at: now,
@@ -4735,6 +4905,7 @@ async fn restore_mirrors_a_child_stop_journaled_before_the_parent_crashed() {
                 model: Some("gpt-test".into()),
                 effort: Some("high".into()),
                 fast: false,
+                ultrafast: false,
                 cwd: workspace.clone(),
                 created_at: now,
                 updated_at: now,
@@ -4826,6 +4997,7 @@ async fn restored_live_child_stays_dormant_and_parks_with_its_root() {
         model: Some("gpt-test".into()),
         effort: Some("high".into()),
         fast: false,
+        ultrafast: false,
         cwd: workspace.clone(),
         created_at: now,
         updated_at: now,

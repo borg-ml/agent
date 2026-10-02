@@ -11808,6 +11808,7 @@ async fn apply_session_config(
             model,
             effort,
             fast,
+            ultrafast,
             ..
         } => {
             if let Some(provider) = provider {
@@ -11832,15 +11833,24 @@ async fn apply_session_config(
                 next.model.as_deref(),
                 next.effort.as_deref(),
             )?;
-            if let Some(fast) = fast {
-                next.fast = Some(fast);
-                if fast {
-                    next.ultrafast = Some(false);
-                }
+            anyhow::ensure!(
+                !(fast == Some(true) && ultrafast == Some(true)),
+                "choose either fast or ultrafast mode"
+            );
+            if fast.is_some() || ultrafast.is_some() {
+                next.fast = Some(fast.unwrap_or(false));
+                next.ultrafast = Some(ultrafast.unwrap_or(false));
             }
             if next.fast.unwrap_or(false) && (fast == Some(true) || selection_changed) {
                 speed_support =
                     confirmed_speed_support(executor, next, "fast", |support| support.fast).await?;
+            } else if next.ultrafast.unwrap_or(false)
+                && (ultrafast == Some(true) || selection_changed)
+            {
+                speed_support = confirmed_speed_support(executor, next, "ultrafast", |support| {
+                    support.ultrafast
+                })
+                .await?;
             } else if selection_changed {
                 speed_support = probe_speed_support(executor, next)
                     .await
@@ -12916,11 +12926,12 @@ async fn apply_subagent_action(
                 model,
                 effort,
                 fast,
+                ultrafast,
                 ..
             } => Ok(SubagentControlOutcome::Accepted {
                 agent: Box::new(
                     subagents
-                        .configure_child(&target, provider, model, effort, fast)
+                        .configure_child(&target, provider, model, effort, fast, ultrafast)
                         .await?,
                 ),
             }),

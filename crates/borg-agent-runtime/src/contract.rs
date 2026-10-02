@@ -1644,6 +1644,7 @@ pub enum SessionConfigAction {
         model: Option<String>,
         effort: Option<String>,
         fast: Option<bool>,
+        ultrafast: Option<bool>,
     },
     SetEffort {
         effort: String,
@@ -1737,7 +1738,10 @@ pub enum SubagentAction {
         provider: Option<CodingProvider>,
         model: Option<String>,
         effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         fast: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ultrafast: Option<bool>,
     },
     Interrupt {
         request_id: Uuid,
@@ -3142,7 +3146,7 @@ mod tests {
     }
 
     #[test]
-    fn child_configuration_control_has_a_correlated_cross_process_shape() {
+    fn child_configuration_control_has_a_correlated_speed_cross_process_shape() {
         let parent_session_id = Uuid::nil();
         let request_id = Uuid::from_u128(3);
         let command = HostCommand::Subagent {
@@ -3154,6 +3158,7 @@ mod tests {
                 model: Some("gpt-6-sol".into()),
                 effort: Some("max".into()),
                 fast: Some(true),
+                ultrafast: Some(false),
             },
         };
         let wire = serde_json::to_value(&command).unwrap();
@@ -3164,6 +3169,24 @@ mod tests {
         assert_eq!(wire["action"]["model"], "gpt-6-sol");
         assert_eq!(wire["action"]["effort"], "max");
         assert_eq!(wire["action"]["fast"], true);
+        assert_eq!(wire["action"]["ultrafast"], false);
+        let mut legacy = wire.clone();
+        legacy["action"].as_object_mut().unwrap().remove("fast");
+        legacy["action"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ultrafast");
+        assert!(matches!(
+            serde_json::from_value::<HostCommand>(legacy).unwrap(),
+            HostCommand::Subagent {
+                action: SubagentAction::Configure {
+                    fast: None,
+                    ultrafast: None,
+                    ..
+                },
+                ..
+            }
+        ));
         let decoded: HostCommand = serde_json::from_value(wire).unwrap();
         assert_eq!(decoded.session_id(), Some(parent_session_id));
         assert!(matches!(

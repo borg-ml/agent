@@ -153,6 +153,8 @@ pub struct SubagentSnapshot {
     /// Requested mode, not proof the provider accepted priority on a request.
     #[serde(default)]
     pub fast: bool,
+    #[serde(default)]
+    pub ultrafast: bool,
     pub cwd: PathBuf,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -209,6 +211,8 @@ pub struct SpawnSubagent {
     pub provider: Option<CodingProvider>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub fast: Option<bool>,
+    pub ultrafast: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -3480,6 +3484,7 @@ impl SubagentTable {
             model: launch.model.clone(),
             effort: launch.effort.clone(),
             fast: launch.fast.unwrap_or(false),
+            ultrafast: launch.ultrafast.unwrap_or(false),
             cwd: launch.cwd.clone(),
             created_at: now,
             updated_at: now,
@@ -4508,9 +4513,11 @@ impl SubagentCoordinator {
              spawn_agent, or leave provider and model unset to inherit this session's lane",
             launch.provider.label()
         );
-        // Inherit live speed only on the same route, not the director's stale
-        // launch preference or a different model's priority admission.
-        if inherits_parent && launch.model == parent_model {
+        // Explicit tier overrides are resolved before same-route inheritance.
+        if request.fast.is_some() || request.ultrafast.is_some() {
+            launch.fast = Some(request.fast.unwrap_or(false));
+            launch.ultrafast = Some(request.ultrafast.unwrap_or(false));
+        } else if inherits_parent && launch.model == parent_model {
             launch.fast = parent.as_ref().map(|config| config.fast).or(launch.fast);
             launch.ultrafast = parent
                 .as_ref()
@@ -4520,12 +4527,25 @@ impl SubagentCoordinator {
             launch.fast = None;
             launch.ultrafast = None;
         }
+        ensure!(
+            !(launch.fast.unwrap_or(false) && launch.ultrafast.unwrap_or(false)),
+            "choose either fast or ultrafast mode"
+        );
         if launch.fast.unwrap_or(false) {
             crate::session::confirmed_speed_support(
                 self.executor.as_ref(),
                 &launch,
                 "fast",
                 |support| support.fast,
+            )
+            .await?;
+        }
+        if launch.ultrafast.unwrap_or(false) {
+            crate::session::confirmed_speed_support(
+                self.executor.as_ref(),
+                &launch,
+                "ultrafast",
+                |support| support.ultrafast,
             )
             .await?;
         }
@@ -4609,6 +4629,7 @@ impl SubagentCoordinator {
                         && entry.snapshot.model == launch.model
                         && entry.snapshot.effort == launch.effort
                         && entry.snapshot.fast == launch.fast.unwrap_or(false)
+                        && entry.snapshot.ultrafast == launch.ultrafast.unwrap_or(false)
                 })
                 .min_by_key(|entry| entry.snapshot.updated_at)
                 .map(|entry| {
@@ -4842,12 +4863,7 @@ impl SubagentCoordinator {
                 launch.model = snapshot.model.clone();
                 launch.effort = snapshot.effort.clone();
                 launch.fast = Some(snapshot.fast);
-                launch.ultrafast = self
-                    .store
-                    .state(snapshot.session_id)
-                    .await?
-                    .configuration
-                    .map(|config| config.ultrafast);
+                launch.ultrafast = Some(snapshot.ultrafast);
                 launch.cwd = snapshot.cwd.clone();
                 launch.name = Some(snapshot.task_name.clone());
                 {
@@ -5491,12 +5507,7 @@ impl SubagentCoordinator {
                 launch.model = snapshot.model.clone();
                 launch.effort = snapshot.effort.clone();
                 launch.fast = Some(snapshot.fast);
-                launch.ultrafast = self
-                    .store
-                    .state(snapshot.session_id)
-                    .await?
-                    .configuration
-                    .map(|config| config.ultrafast);
+                launch.ultrafast = Some(snapshot.ultrafast);
                 launch.cwd = snapshot.cwd.clone();
                 launch.name = Some(snapshot.task_name.clone());
                 if let Err(error) = self.start_reserved(snapshot.clone(), launch, false).await {
@@ -6593,10 +6604,19 @@ impl SubagentCoordinator {
         model: Option<String>,
         effort: Option<String>,
         fast: Option<bool>,
+        ultrafast: Option<bool>,
     ) -> Result<SubagentSnapshot> {
         ensure!(
-            provider.is_some() || model.is_some() || effort.is_some() || fast.is_some(),
-            "specify at least one of provider, model, effort, or fast"
+            provider.is_some()
+                || model.is_some()
+                || effort.is_some()
+                || fast.is_some()
+                || ultrafast.is_some(),
+            "specify at least one of provider, model, effort, fast, or ultrafast"
+        );
+        ensure!(
+            !(fast == Some(true) && ultrafast == Some(true)),
+            "choose either fast or ultrafast mode"
         );
         let _guard = self.configure_lock.lock().await;
         let current = self.resolve_snapshot(target).await?;
@@ -6610,6 +6630,10 @@ impl SubagentCoordinator {
             "model cannot be empty"
         );
         let effort = effort.map(|effort| effort.trim().to_ascii_lowercase());
+        ensure!(
+            effort.as_deref().is_none_or(|effort| !effort.is_empty()),
+            "effort cannot be empty"
+        );
         if let Some(effort) = effort.as_deref() {
             ensure!(
                 matches!(
@@ -6661,6 +6685,7 @@ impl SubagentCoordinator {
                     model,
                     effort: effort.clone(),
                     fast,
+                    ultrafast,
                 },
             })
             .await
@@ -6677,13 +6702,16 @@ impl SubagentCoordinator {
                                 model,
                                 effort: actual_effort,
                                 fast: actual_fast,
+                                ultrafast: actual_ultrafast,
                                 ..
                             } if provider == selected
                                 && model == expected_model
                                 && effort.as_ref().is_none_or(|expected| {
                                     actual_effort.as_ref() == Some(expected)
                                 })
-                                && fast.is_none_or(|expected| actual_fast == expected) =>
+                                && fast.is_none_or(|expected| actual_fast == expected)
+                                && ultrafast
+                                    .is_none_or(|expected| actual_ultrafast == expected) =>
                             {
                                 return Ok(());
                             }
@@ -6699,6 +6727,9 @@ impl SubagentCoordinator {
                                 );
                             }
                             _ => {}
+                        }
+                        if let SessionEventKind::Error { message } = event.kind {
+                            bail!("child configuration failed: {message}");
                         }
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -6908,6 +6939,8 @@ impl SubagentCoordinator {
                         provider: args.provider,
                         model: args.model,
                         effort: args.reasoning_effort,
+                        fast: args.fast,
+                        ultrafast: args.ultrafast,
                     },
                     args.fresh,
                 )
@@ -6930,6 +6963,7 @@ impl SubagentCoordinator {
                         args.model,
                         args.effort,
                         args.fast,
+                        args.ultrafast,
                     )
                     .await?;
                 Ok(json!({ "agent": agent }))
@@ -7491,6 +7525,8 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
                         "examples": model_examples
                     },
                     "reasoning_effort": { "type": "string" },
+                    "fast": { "type": "boolean", "description": "Select fast mode for this child. Omit speed fields to inherit the live parent's tier on the same provider; explicit false selects standard mode. Only supported models/accounts can enable it." },
+                    "ultrafast": { "type": "boolean", "description": "Select the Codex/OpenAI premium tier when supported. Mutually exclusive with fast; explicit speed settings override inheritance." },
                     "fresh": {
                         "type": "boolean",
                         "description": "Always start a new child session instead of reusing an idle worker with the same profile. Use it when idle workers hold context or pending work you will follow up on, or the task needs a clean context."
@@ -7519,7 +7555,8 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
                     "provider": { "type": "string", "enum": provider_choices },
                     "model": { "type": "string", "minLength": 1 },
                     "effort": { "type": "string", "enum": ["none", "low", "medium", "high", "xhigh", "max", "ultra"] },
-                    "fast": { "type": "boolean" }
+                    "fast": { "type": "boolean", "description": "Enable fast mode when the child's model/account supports it, or disable speed tiers with false." },
+                    "ultrafast": { "type": "boolean", "description": "Enable the supported Codex/OpenAI premium tier. Mutually exclusive with fast; false selects standard mode." }
                 },
                 "required": ["target"],
                 "additionalProperties": false
@@ -9372,6 +9409,8 @@ struct SpawnAgentArgs {
     provider: Option<CodingProvider>,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    fast: Option<bool>,
+    ultrafast: Option<bool>,
     #[serde(default)]
     fresh: bool,
 }
@@ -9390,6 +9429,7 @@ struct ConfigureAgentArgs {
     model: Option<String>,
     effort: Option<String>,
     fast: Option<bool>,
+    ultrafast: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -10659,8 +10699,12 @@ async fn update_from_session_event(
             entry.snapshot.provider = *provider;
             entry.snapshot.model = model.clone();
             entry.snapshot.effort = effort.clone();
-            if let SessionEventKind::SessionConfigured { fast, .. } = &event.kind {
+            if let SessionEventKind::SessionConfigured {
+                fast, ultrafast, ..
+            } = &event.kind
+            {
                 entry.snapshot.fast = *fast;
+                entry.snapshot.ultrafast = *ultrafast;
             }
             if matches!(event.kind, SessionEventKind::TurnStarted { .. }) {
                 // A new turn by any route ends that interrupt. Not a Running
@@ -10796,6 +10840,7 @@ fn project_child_state(snapshot: &mut SubagentSnapshot, state: &crate::SessionSt
         snapshot.model = config.model.clone();
         snapshot.effort = config.effort.clone();
         snapshot.fast = config.fast;
+        snapshot.ultrafast = config.ultrafast;
     }
     snapshot.final_text = state.latest_response.clone();
     snapshot.usage = SubagentUsage {
