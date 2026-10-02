@@ -1259,7 +1259,7 @@ mod tests {
         let root = Uuid::new_v4();
         store.create_session(root).await.unwrap();
         let writer = borg_remote::SessionWriterLease::try_acquire(
-            &sessions.path().join(format!("{root}.lock")),
+            sessions.path().join(format!("{root}.lock")),
         )
         .unwrap()
         .unwrap();

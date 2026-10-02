@@ -6467,23 +6467,25 @@ mod tests {
                     && request.session_id.as_deref() == Some(expected_session.as_str()))
             );
 
-            let requests = client.requests.lock().unwrap();
-            assert!(requests[0].fast);
-            assert!(
-                requests
-                    .iter()
-                    .skip(1)
-                    .all(|request| request.fast != speed_toggle)
-            );
-            drop(requests);
+            {
+                let requests = client.requests.lock().unwrap();
+                assert!(requests[0].fast);
+                assert!(
+                    requests
+                        .iter()
+                        .skip(1)
+                        .all(|request| request.fast != speed_toggle)
+                );
+            }
             if speed_toggle {
                 result.unwrap();
-                let requests = client.requests.lock().unwrap();
-                assert_eq!(requests.len(), 2);
-                for id in ["first", "second"] {
-                    assert!(requests[1].messages.iter().any(|message| matches!(message, ModelMessage::Tool { tool_call_id, content, .. } if tool_call_id == id && !content.contains("not executed"))));
+                {
+                    let requests = client.requests.lock().unwrap();
+                    assert_eq!(requests.len(), 2);
+                    for id in ["first", "second"] {
+                        assert!(requests[1].messages.iter().any(|message| matches!(message, ModelMessage::Tool { tool_call_id, content, .. } if tool_call_id == id && !content.contains("not executed"))));
+                    }
                 }
-                drop(requests);
                 scratch.discard().await;
                 continue;
             }
