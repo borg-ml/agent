@@ -29,9 +29,15 @@ fn public_event(event: &SessionEvent) -> Option<Value> {
             text,
             status,
             ..
-        } => json!({
+        } if matches!(
+            actor,
+            EventActor::User | EventActor::Assistant | EventActor::System
+        ) =>
+        {
+            json!({
             "type": "message", "message_id": message_id, "actor": actor,
-            "text": crate::secret_scrub::scrub_secrets(text), "status": status}),
+            "text": crate::secret_scrub::scrub_secrets(text), "status": status})
+        }
         SessionEventKind::AgentMessageReceived {
             message_id,
             sender_id,

@@ -7867,6 +7867,21 @@ async fn team_harness_inspection_is_scoped_paginated_and_non_mutating() {
             .await
             .unwrap();
     }
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Tool,
+                text: "PRIVATE TOOL PAYLOAD".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ))
+        .await
+        .unwrap();
     let revision = store.state(child).await.unwrap().latest_sequence;
     let denied = coordinator
         .call_tool_as(root, "inspect_agent", json!({"session_id": unrelated}))
@@ -7898,6 +7913,7 @@ async fn team_harness_inspection_is_scoped_paginated_and_non_mutating() {
         assert_eq!(page["canonical"]["goal"]["id"], goal.id.to_string());
         assert_eq!(page["canonical"]["goal"]["token_budget"], 12345);
         assert!(!page.to_string().contains("PRIVATE REASONING"));
+        assert!(!page.to_string().contains("PRIVATE TOOL PAYLOAD"));
         assert!(!page.to_string().contains(&"s".repeat(25)));
         for event in page["events"].as_array().unwrap() {
             if event["body"]["type"] == "message" {
