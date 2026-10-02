@@ -279,12 +279,16 @@ jobs:
           printf '\n[Full changelog](https://github.com/%s/compare/%s...%s)\n' "$GITHUB_REPOSITORY" "$previous_tag" "$RELEASE_TAG" >>release-notes.md
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          path: artifacts
+          path: ${{ runner.temp }}/borg-release-assets
           merge-multiple: true
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          files: artifacts/*
+          files: |
+            ${{ runner.temp }}/borg-release-assets/borg-*.tar.gz
+            ${{ runner.temp }}/borg-release-assets/borg-*.zip
+            ${{ runner.temp }}/borg-release-assets/borg-*.sha256
+          fail_on_unmatched_files: true
           body_path: release-notes.md
           draft: true
       - name: Publish release
