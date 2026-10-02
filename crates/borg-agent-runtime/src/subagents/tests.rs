@@ -1781,6 +1781,7 @@ async fn a_child_without_a_lane_inherits_the_parent_live_lane() {
     // provider it has since switched to.
     let mut root_launch = launch();
     root_launch.capabilities.multiplayer = false;
+    root_launch.fast = Some(true);
     root_launch.cwd = directory.path().to_path_buf();
     root_launch
         .capabilities
@@ -1845,6 +1846,11 @@ async fn a_child_without_a_lane_inherits_the_parent_live_lane() {
         "the launch lane is not the parent live lane"
     );
     assert_eq!(defaulted.provider, CodingProvider::OpenCode);
+    assert_eq!(
+        defaulted.fast,
+        Some(false),
+        "inherit live speed, not stale launch mode"
+    );
     assert_eq!(
         defaulted.model.as_deref(),
         Some("opencode-go/deepseek-v4.1-flash")
