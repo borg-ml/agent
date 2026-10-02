@@ -1,0 +1,184 @@
+   Compiling borg-provider v0.13.5 (/home/shulgin/agent/crates/borg-provider)
+    Finished `test` profile [unoptimized] target(s) in 3.24s
+     Running unittests src/lib.rs (target/debug/deps/borg_provider-eba2fc061b46e3b6)
+
+running 1 test
+test provider::anthropic_messages::tests::captured_native_narration_is_routed_without_changing_signed_blocks ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 159 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized] target(s) in 0.23s
+     Running unittests src/lib.rs (target/debug/deps/borg_provider-eba2fc061b46e3b6)
+
+running 1 test
+test provider::anthropic_messages::tests::captured_native_narration_is_routed_without_changing_signed_blocks ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 159 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized] target(s) in 0.25s
+     Running unittests src/lib.rs (target/debug/deps/borg_provider-eba2fc061b46e3b6)
+
+running 160 tests
+test bounded_io::tests::bounded_reader_rejects_oversized_stream ... ok
+test bounded_io::tests::bounded_open_file_reader_rejects_oversized_sparse_file ... ok
+test env::tests::nonempty_var_trims_and_discards_empty_values ... ok
+test credentials::tests::stored_key_round_trips_and_env_wins ... ok
+test local::gguf::tests::parses_real_fixture_headers_when_available ... ok
+test local::gguf::tests::parses_typed_metadata_and_stops_at_metadata ... ok
+test local::gguf::tests::rejects_bad_magic_and_truncation_with_typed_errors ... ok
+test local::sources::tests::native_source_skips_invalid_files_and_discovers_nested_gguf ... ok
+test local::sources::tests::ollama_source_resolves_only_safe_model_digest ... ok
+test local::sources::tests::real_fixture_models_report_metadata_without_loading_weights ... ok
+test mcp::tests::borg_agent_provider_config_allows_long_running_peer_tools ... ok
+test mcp::tests::provider_config_preserves_mcp_allowlists_and_namespaces ... ok
+test openai_subscription::tests::concurrent_recovery_reloads_and_persists_one_rotation ... ok
+test openai_subscription::tests::rejected_or_foreign_refresh_preserves_saved_credentials ... ok
+test provider::anthropic_messages::tests::a_tool_result_run_and_following_user_text_share_one_turn ... ok
+test provider::anthropic_messages::tests::an_attachment_becomes_an_image_block_next_to_the_text ... ok
+test provider::anthropic_messages::tests::captured_native_narration_is_routed_without_changing_signed_blocks ... ignored, requires a private native-classified Claude capture
+test provider::anthropic_messages::tests::effort_enables_thinking_and_raises_the_budget ... ok
+test provider::anthropic_messages::tests::empty_tool_delta_preserves_the_initial_input_object ... ok
+test provider::anthropic_messages::tests::frame_splitting_survives_a_chunk_boundary ... ok
+test provider::anthropic_messages::tests::incomplete_or_corrupt_streams_cannot_commit_an_assistant_message ... ok
+test provider::anthropic_messages::tests::large_screenshot_is_tiled_and_small_image_stays_whole ... ok
+test provider::anthropic_messages::tests::native_blocks_replay_only_the_tool_calls_that_survived_repair ... ok
+test provider::anthropic_messages::tests::native_narration_is_public_text_not_reasoning_and_replay_is_unchanged ... ok
+test provider::anthropic_messages::tests::refusals_are_classified_by_their_own_error_type ... ok
+test provider::anthropic_messages::tests::replayed_images_stay_under_the_request_size_limit ... ok
+test provider::anthropic_messages::tests::stream_events_carry_text_thinking_tools_and_usage ... ok
+test provider::anthropic_messages::tests::the_cache_marker_budget_holds_for_every_tail_shape ... ok
+test provider::anthropic_messages::tests::the_request_hoists_system_and_encodes_tools_and_tool_results ... ok
+test provider::chat_stream::grok_stream::tests::non_event_and_unknown_lines_are_ignored ... ok
+test provider::chat_stream::grok_stream::tests::streaming_events_map_to_text_thought_and_end ... ok
+test provider::chat_stream::grok_stream::tests::tool_call_events_carry_identity_input_and_content ... ok
+test provider::chat_stream::grok_stream::tests::tool_call_without_an_id_is_ignored ... ok
+test provider::chat_stream::grok_stream::tests::usage_accepts_common_counter_spellings_and_ignores_absent_ones ... ok
+test provider::chat_stream::muse_stream::tests::output_deltas_carry_streamed_text ... ok
+test provider::chat_stream::muse_stream::tests::prose_tool_results_keep_their_text_and_failure ... ok
+test provider::chat_stream::muse_stream::tests::terminal_records_carry_state_and_final_text ... ok
+test provider::chat_stream::muse_stream::tests::tool_results_render_the_command_and_its_output ... ok
+test provider::chat_stream::muse_stream::tests::unknown_payloads_and_junk_are_ignored ... ok
+test provider::chat_stream::opencode_stream::tests::a_dropped_event_stream_reconnects_and_recovers_the_turn ... ok
+test provider::chat_stream::opencode_stream::tests::late_tool_snapshots_never_invent_generation_or_reopen_it ... ok
+test provider::chat_stream::opencode_stream::tests::pending_tool_generation_is_visible_until_opencode_starts_it ... ok
+test provider::chat_stream::opencode_stream::tests::provider_native_subagent_tool_is_blocked_in_every_permission_mode ... ok
+test provider::chat_stream::opencode_stream::tests::question_tool_is_blocked_in_every_permission_mode ... ok
+test provider::chat_stream::opencode_stream::tests::step_finish_usage_preserves_cache_tokens_and_cost ... ok
+test provider::chat_stream::tests::a_context_length_refusal_classifies_as_recoverable_not_unknown ... ok
+test provider::chat_stream::tests::claude_account_rate_limits_parse_control_response_shape ... ok
+test provider::chat_stream::tests::claude_agent_events_map_to_borg_contract ... ok
+test provider::chat_stream::tests::claude_command_lifecycle_correlates_steers_at_the_provider_boundary ... ok
+test provider::chat_stream::tests::claude_command_preserves_subscription_flags ... ok
+test provider::chat_stream::tests::claude_compaction_frames_map_to_borg_context_compaction_events ... ok
+test provider::chat_stream::tests::claude_subscription_status_uses_explicit_login_not_api_auth ... ok
+test provider::chat_stream::tests::claude_tool_input_stream_generates_then_refines_one_action ... ok
+test provider::chat_stream::tests::codex_account_rate_limits_parse_native_usage_shape ... ok
+test provider::chat_stream::tests::pooled_claude_done_event_reports_the_running_total_delta ... ok
+test provider::chat_stream::tests::steer_admission_has_exactly_one_winner ... ok
+test provider::chat_stream::tests::subscription_and_api_key_usage_have_distinct_billing_bases ... ok
+test provider::chat_stream::tests::subscription_commands_attach_provider_mcp_config ... ok
+test provider::openai_compatible::tests::a_declared_server_error_is_retryable_but_a_genuine_refusal_is_not ... ok
+test provider::openai_compatible::tests::a_mandatory_model_still_gets_reasoning_when_no_effort_was_chosen ... ok
+test provider::openai_compatible::tests::a_midstream_error_object_is_reported_instead_of_a_truncated_stream ... ok
+test provider::openai_compatible::tests::a_midstream_refusal_is_fatal_rather_than_a_lost_connection ... ok
+test provider::openai_compatible::tests::an_empty_upstream_response_is_retried_rather_than_fatal ... ok
+test provider::openai_compatible::tests::anthropic_cache_markers_follow_a_declared_dialect_and_model_family ... ok
+test provider::openai_compatible::tests::anthropic_cache_markers_mark_system_conversation_end_and_tools ... ok
+test provider::openai_compatible::tests::compatible_retries_only_rate_limits_and_server_failures ... ok
+test provider::openai_compatible::tests::compatible_retry_event_carries_structured_attempt_and_backoff ... ok
+test provider::openai_compatible::tests::compatible_sse_framing_profile ... ignored, explicit compatible SSE framing performance gate
+test provider::openai_compatible::tests::compatible_stream_preserves_reasoning_and_incremental_tool_calls ... ok
+test provider::openai_compatible::tests::configured_gateway_body_cannot_replace_core_request_fields ... ok
+test provider::openai_compatible::tests::deepseek_replays_empty_reasoning_for_assistant_tool_rounds ... ok
+test provider::openai_compatible::tests::every_route_writes_reasoning_through_one_declared_wire ... ok
+test provider::openai_compatible::tests::kimi_cost_uses_each_models_own_list_price ... ok
+test provider::openai_compatible::tests::kimi_profile_uses_the_canonical_native_wire_contract ... ok
+test provider::openai_compatible::tests::native_images_use_chat_completions_multimodal_blocks ... ok
+test provider::openai_compatible::tests::openrouter_arbitrary_model_runs_the_complete_native_wire_contract ... ok
+test provider::openai_compatible::tests::openrouter_is_model_neutral_and_only_requests_reasoning_explicitly ... ok
+test provider::openai_compatible::tests::openrouter_model_metadata_exposes_effective_context_reserves ... ok
+test provider::openai_compatible::tests::openrouter_requires_endpoint_support_for_agent_parameters ... ok
+test provider::openai_compatible::tests::refusal_shape_records_nested_image_urls_without_leaking_image_data ... ok
+test provider::openai_compatible::tests::stream_termination_requires_a_finish_reason_or_done_marker_not_both ... ok
+test provider::openai_compatible::tests::streamed_action_is_early_even_when_reordered ... ok
+test provider::openai_compatible::tests::the_catalog_decides_the_vocabulary_and_which_control_a_route_uses ... ok
+test provider::openai_compatible::tests::tool_images_are_carried_in_a_follow_up_user_message ... ok
+test provider::opencode_model::tests::a_blank_subscription_key_is_refused ... ok
+test provider::opencode_model::tests::context_windows_are_read_from_the_models_dev_catalog ... ok
+test provider::opencode_model::tests::gateway_carries_the_required_session_routing_header ... ok
+test provider::opencode_model::tests::go_aliases_map_to_their_upstream_model_id ... ok
+test provider::opencode_model::tests::non_go_routes_are_refused_rather_than_assumed ... ok
+test provider::opencode_model::tests::prices_are_read_from_the_models_dev_catalog ... ok
+test provider::opencode_model::tests::session_header_is_stable_per_session_and_distinct_across_sessions ... ok
+test provider::opencode_model::tests::the_subscription_key_is_never_rendered ... ok
+test provider::tests::action_stream_handles_fragmentation_and_ignores_nested_or_quoted_decoys ... ok
+test provider::tests::chat_completion_json_text_parses_fenced_and_balanced_json ... ok
+test provider::tests::chat_completions_usage_extracts_tokens_and_provider_cost ... ok
+test provider::tests::claude_catalog_contains_only_current_selectable_models ... ok
+test provider::tests::deepseek_chat_usage_extracts_native_cache_hit_and_miss_fields ... ok
+test provider::tests::provider_error_body_limit_allows_exact_boundary ... ok
+test provider::tests::provider_reported_cost_usd_conversion_rejects_invalid_values ... ok
+test provider::tests::provider_text_truncation_preserves_utf8_boundaries ... ok
+test provider::tests::token_cost_estimate_saturates_when_rounded_cost_exceeds_u64 ... ok
+test provider_auth::tests::bundle_requires_expected_paths ... ok
+test provider_auth::tests::codex_home_chatgpt_session_detection_reads_tokens ... ok
+test provider_auth::tests::codex_home_chatgpt_session_detection_rejects_invalid_auth_json ... ok
+test provider_auth::tests::codex_home_chatgpt_session_detection_treats_missing_auth_as_false ... ok
+test provider_auth::tests::decodes_openai_identity_from_jwt_payload ... ok
+test provider_auth::tests::jwt_payload_decode_rejects_oversized_payloads ... ok
+test provider_auth::tests::openai_auth_json_reader_rejects_invalid_existing_file ... ok
+test provider_auth::tests::openai_auth_json_reader_rejects_oversized_file ... ok
+test provider_auth::tests::openai_validation_checks_credentials_without_a_provider_executable ... ok
+test provider_auth::tests::provider_auth_bundles_must_match_expected_file_contract ... ok
+test provider_auth::tests::provider_auth_file_decode_rejects_oversized_payloads ... ok
+test provider_auth::tests::provider_auth_file_reader_rejects_oversized_file ... ok
+test provider_auth::tests::provider_auth_status_command_times_out_hanging_process ... ok
+test provider_auth::tests::provider_auth_validation_timeout_rejects_invalid_config ... ok
+test provider_auth::tests::refresh_window_revalidates_old_or_expiring_credentials ... ok
+test provider_auth::tests::rejects_unsafe_restore_paths ... ok
+test provider_auth::tests::restore_bundle_restricts_provider_auth_file_permissions ... ok
+test provider_bin::tests::auto_install_parses_falsey_values ... ok
+test provider_bin::tests::candidates_are_deduplicated ... ok
+test provider_bin::tests::directory_is_not_executable ... ok
+test provider_bin::tests::each_runtime_suggests_its_own_installer ... ok
+test provider_bin::tests::every_runtime_has_distinct_identity ... ok
+test provider_bin::tests::missing_file_is_not_executable ... ok
+test provider_bin::tests::probe_accepts_a_command_that_exits_zero ... ok
+test provider_bin::tests::probe_rejects_a_command_that_exits_non_zero ... ok
+test provider_bin::tests::unresolved_message_names_every_rejected_candidate ... ok
+test runtime::an_uncatalogued_model_offers_no_levels ... ok
+test runtime::gateway_effort_levels_follow_the_model_not_the_provider ... ok
+test runtime::tests::codex_defaults_use_sol_6_1_at_medium_effort ... ok
+test runtime::tests::dynamic_models_claude_backend_returns_empty ... ok
+test runtime::tests::dynamic_models_codex_backend_returns_empty ... ok
+test runtime::tests::dynamic_models_dedup_repeated_discovered_ids_and_keeps_current_details ... ok
+test runtime::tests::dynamic_models_dedup_when_current_in_discovered ... ok
+test runtime::tests::dynamic_models_openai_compatible_current_first ... ok
+test runtime::tests::dynamic_models_openai_compatible_no_current ... ok
+test runtime::tests::dynamic_models_openrouter_current_and_catalog_are_available ... ok
+test runtime::tests::dynamic_models_unknown_backend_returns_empty ... ok
+test runtime::tests::openrouter_catalog_response_preserves_model_details ... ok
+test runtime::tests::vercel_backend_lists_discovered_models ... ok
+test runtime::tests::vercel_catalog_keeps_only_language_models ... ok
+test runtime::ultra_is_never_synthesized_from_max ... ok
+test subprocess::tests::child_that_ignores_stdin_reports_its_own_status ... ok
+test subprocess::tests::hanging_command_is_killed ... ok
+test subprocess::tests::large_stdin_to_a_chatty_child_does_not_deadlock ... ok
+test subprocess::tests::non_utf8_output_is_preserved_lossily ... ok
+test subprocess::tests::non_zero_status_reports_failure ... ok
+test subprocess::tests::pipe_reader_rejects_oversized_output ... ok
+test subprocess::tests::process_tree_cleanup_kills_the_group_after_its_leader_exits ... ok
+test subprocess::tests::quick_command_succeeds ... ok
+test subprocess::tests::require_success_wraps_failures_with_label ... ok
+test subprocess::tests::responsive_provider_timeout_cleanup_profile ... ignored, explicit provider timeout cleanup performance gate
+test subprocess::tests::short_provider_subprocess_completion_profile ... ignored, explicit short provider subprocess performance gate
+test subprocess::tests::stdin_is_piped_through ... ok
+test subscription::tests::base_urls_are_absolute_https_without_a_trailing_slash ... ok
+test subscription::tests::each_plan_uses_a_distinct_credential ... ok
+test subscription::tests::plan_hosts_are_the_subscription_hosts_not_the_payg_ones ... ok
+test subscription::tests::plan_ids_are_unique_and_parse_round_trip ... ok
+test subscription::tests::unknown_plans_do_not_parse ... ok
+test image_tiles::tests::tiles_cover_the_image_within_the_model_limit ... ok
+
+test result: ok. 156 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 4.53s
+

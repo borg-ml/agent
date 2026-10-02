@@ -1,0 +1,83 @@
+   Compiling borg-agent-runtime v0.13.5 (/home/shulgin/agent/crates/borg-agent-runtime)
+    Finished `test` profile [unoptimized] target(s) in 30.58s
+     Running unittests src/lib.rs (target/debug/deps/borg_agent_runtime-bb997ce1c1f07d87)
+
+running 1 test
+test native_harness::tests::a_human_steer_requires_visible_text_before_more_tools ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1063 filtered out; finished in 0.04s
+
+    Finished `test` profile [unoptimized] target(s) in 0.18s
+     Running unittests src/lib.rs (target/debug/deps/borg_agent_runtime-bb997ce1c1f07d87)
+
+running 67 tests
+test native_harness::tests::a_durable_history_is_repaired_into_a_request_the_provider_accepts ... ok
+test native_harness::tests::a_context_length_refusal_compacts_and_retries_instead_of_failing ... ok
+test native_harness::tests::a_human_steer_requires_visible_text_before_more_tools ... ok
+test native_harness::tests::a_queued_steer_keeps_the_tool_call_the_model_was_generating ... ok
+test native_harness::tests::a_retained_tail_never_opens_with_an_unanswered_tool_call ... ok
+test native_harness::tests::a_retried_model_attempt_cancels_preparation_before_final_tools ... ok
+test native_harness::tests::a_steer_during_generation_still_runs_the_tool_once_before_folding ... ok
+test native_harness::tests::a_thinking_anthropic_route_refuses_a_cache_refresh ... ok
+test native_harness::tests::a_usage_tick_never_rewrites_the_replayed_request_prefix ... ok
+test native_harness::tests::a_user_attachment_is_typed_by_its_bytes_not_its_name ... ok
+test native_harness::tests::a_human_steer_retires_the_yield_for_the_rest_of_the_turn ... ok
+test native_harness::tests::an_interrupt_closes_the_tool_call_row_it_abandons ... ok
+test native_harness::tests::an_oversized_replay_is_compacted_before_the_first_model_call ... ok
+test native_harness::tests::borg_harness_has_one_polyglot_exec_tool ... ok
+test native_harness::tests::bounded_tool_results_preserve_utf8_boundaries ... ok
+test native_harness::tests::claude_grace_wraps_the_existing_tool_turn_once ... ok
+test native_harness::tests::command_diff_is_journaled_for_the_ui_without_entering_model_context ... ok
+test native_harness::tests::commentary_is_flushed_before_tool_generation_without_duplicate_snapshots ... ok
+test native_harness::tests::commentary_tail_is_published_without_a_following_event ... ok
+test native_harness::tests::commentary_tail_precedes_the_reasoning_that_follows_it ... ok
+test native_harness::tests::a_watcher_yield_ends_the_turn_once_any_owed_reply_is_written ... ok
+test native_harness::tests::compaction_keeps_transcript_system_instructions_out_of_live_policy ... ok
+test native_harness::tests::compaction_reuses_the_durable_request_prefix_and_does_not_retry_auth_or_transport_errors ... ok
+test native_harness::tests::controller_subscription_authorities_are_persistent_and_never_restored_from_stale_bundles ... ok
+test native_harness::tests::compaction_extends_the_request_the_provider_cached ... ok
+test native_harness::tests::failed_later_compaction_fold_retains_completed_fold_usage ... ok
+test native_harness::tests::failed_native_compaction_preserves_the_durable_history ... ok
+test native_harness::tests::failed_native_turn_records_completed_model_usage_once ... ok
+test native_harness::tests::final_answer_compaction_replays_once_and_failure_keeps_the_answer ... ok
+test native_harness::tests::image_attachments_are_estimated_as_vision_tokens_not_text ... ok
+test native_harness::tests::live_text_updates_use_a_smooth_cadence ... ok
+test native_harness::tests::mcp_image_blocks_are_lifted_into_the_attachment_channel ... ok
+test native_harness::tests::microcompaction_clears_only_old_tool_results_from_before_this_turn ... ok
+test native_harness::tests::microcompaction_declines_small_savings_and_keeps_attached_results ... ok
+test native_harness::tests::missing_or_zero_usage_falls_back_to_a_local_estimate ... ok
+test native_harness::tests::model_admission_is_cancellable_and_keeps_steers_pending_until_success ... ok
+test native_harness::tests::mutating_builtins_are_gated_read_only_builtins_are_not ... ok
+test native_harness::tests::foreground_result_waits_for_provider_progress_to_close ... ok
+test native_harness::tests::native_action_metadata_is_first_but_not_an_execution_requirement ... ok
+test native_harness::tests::native_cache_identity_stays_stable_as_the_prefix_grows ... ok
+test native_harness::tests::native_compaction_folds_large_cross_provider_context_with_bounded_requests ... ok
+test native_harness::tests::native_reasoning_snapshots_are_reduced_before_live_delivery ... ok
+test native_harness::tests::native_request_canonicalization_merges_adjacent_users_without_crossing_roles ... ok
+test native_harness::tests::native_tool_definitions_have_deterministic_wire_order ... ok
+test native_harness::tests::native_usage_events_preserve_cost_provenance_across_rounds ... ok
+test native_harness::tests::only_explicitly_read_only_tools_are_parallelizable ... ok
+test native_harness::tests::opaque_provider_state_does_not_inflate_context_estimates ... ok
+test native_harness::tests::pending_approval_review_honors_controls_and_drops_the_model_request ... ok
+test native_harness::tests::quiet_reasoning_tail_reaches_live_state_before_model_finishes ... ok
+test native_harness::tests::repeated_output_limit_stops_stay_bounded ... ok
+test native_harness::tests::native_batch_records_results_before_honoring_controls_and_skips_queued_actions ... ok
+test native_harness::tests::request_image_budget_keeps_recent_images_and_identifies_older_ones ... ok
+test native_harness::tests::resolved_route_window_survives_usage_without_window_metadata ... ok
+test native_harness::tests::retained_tail_fits_the_budget_and_never_leads_with_a_tool_result ... ok
+test native_harness::tests::running_tool_keeps_controls_live_after_steering ... ok
+test native_harness::tests::server_grace_signal_marks_only_an_active_claude_turn ... ok
+test native_harness::tests::request_image_budget_counts_tiled_screenshots ... ok
+test native_harness::tests::steering_drains_received_commentary_before_returning ... ok
+test native_harness::tests::subscription_cache_refresh_stays_on_the_selected_route ... ok
+test native_harness::tests::throttled_reasoning_precedes_the_prose_that_follows_it ... ok
+test native_harness::tests::tool_arguments_require_an_object ... ok
+test native_harness::tests::tool_result_images_are_split_into_attachments_with_bounds ... ok
+test native_harness::tests::tool_round_auto_compaction_keeps_fifteen_percent_headroom ... ok
+test native_harness::tests::truncated_compaction_checkpoint_is_rejected_with_usage_preserved ... ok
+test native_harness::tests::turn_start_prefers_valid_provider_usage_over_inflated_replay_estimate ... ok
+test native_harness::tests::varying_instructions_ride_in_conversation_position_not_the_system_head ... ok
+test native_harness::tests::shell_command_is_cancelled_by_interrupt_but_not_by_steering ... ok
+
+test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 997 filtered out; finished in 0.88s
+

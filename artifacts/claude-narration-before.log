@@ -1,0 +1,23 @@
+    Blocking waiting for file lock on package cache
+   Compiling borg-provider v0.13.5 (/home/shulgin/agent/crates/borg-provider)
+    Finished `test` profile [unoptimized] target(s) in 1.86s
+     Running unittests src/lib.rs (target/debug/deps/borg_provider-eba2fc061b46e3b6)
+
+running 1 test
+test provider::anthropic_messages::tests::native_narration_is_public_text_not_reasoning_and_replay_is_unchanged ... FAILED
+
+failures:
+
+---- provider::anthropic_messages::tests::native_narration_is_public_text_not_reasoning_and_replay_is_unchanged stdout ----
+
+thread 'provider::anthropic_messages::tests::native_narration_is_public_text_not_reasoning_and_replay_is_unchanged' (3264390) panicked at crates/borg-provider/src/provider/anthropic_messages.rs:1791:17:
+do not select a channel before native classification
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    provider::anthropic_messages::tests::native_narration_is_public_text_not_reasoning_and_replay_is_unchanged
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 158 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p borg-provider --lib`

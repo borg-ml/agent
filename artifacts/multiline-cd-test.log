@@ -1,0 +1,23 @@
+   Compiling ring v0.17.14
+   Compiling borg-core v0.13.1 (/home/shulgin/agent/crates/borg-core)
+   Compiling borg-lanes v0.13.1 (/home/shulgin/agent/crates/borg-lanes)
+   Compiling rustls-webpki v0.103.15
+   Compiling rustls v0.23.45
+   Compiling tokio-rustls v0.26.4
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling sqlx-core v0.9.0
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.13.4
+   Compiling borg-search v0.13.1 (/home/shulgin/agent/crates/borg-search)
+   Compiling borg-provider v0.13.1 (/home/shulgin/agent/crates/borg-provider)
+   Compiling sqlx-postgres v0.9.0
+   Compiling sqlx v0.9.0
+   Compiling borg-agent-runtime v0.13.1 (/home/shulgin/agent/crates/borg-agent-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 24s
+     Running unittests src/lib.rs (target/debug/deps/borg_agent_runtime-f4093e7f21c24188)
+
+running 1 test
+test tool_presentation::tests::a_leading_cd_is_split_from_the_command_it_prefixes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1042 filtered out; finished in 0.00s
+

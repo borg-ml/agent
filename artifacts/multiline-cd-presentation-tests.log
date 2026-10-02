@@ -1,0 +1,47 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.53s
+     Running unittests src/lib.rs (target/debug/deps/borg_agent_runtime-f4093e7f21c24188)
+
+running 40 tests
+test tool_presentation::tests::classifies_instant_and_long_running_action_labels ... ok
+test tool_presentation::tests::a_capability_row_is_titled_by_the_capability_it_invokes ... ok
+test tool_presentation::tests::empty_resource_probe_results_have_a_small_summary ... ok
+test tool_presentation::tests::does_not_present_unmarked_file_contents_as_a_diff ... ok
+test tool_presentation::tests::a_failed_edit_shows_the_request_and_claims_no_change ... ok
+test tool_presentation::tests::goal_controls_hide_empty_json_input_and_use_the_compact_result ... ok
+test tool_presentation::tests::an_empty_old_string_renders_insertions_rather_than_a_removal ... ok
+test tool_presentation::tests::an_edit_that_changes_nothing_says_so_instead_of_showing_a_diff ... ok
+test tool_presentation::tests::generic_code_view_unwraps_structured_mcp_results ... ok
+test tool_presentation::tests::folds_product_specific_context_into_the_shared_projection ... ok
+test tool_presentation::tests::background_process_helpers_share_provider_handle_and_output_contracts ... ok
+test tool_presentation::tests::humanizes_underscored_mcp_server_names ... ok
+test tool_presentation::tests::presents_claude_edit_replacements_as_a_diff ... ok
+test tool_presentation::tests::names_files_in_native_multi_edit_envelopes ... ok
+test tool_presentation::tests::presents_image_tools_with_action_labels_across_provider_name_variants ... ok
+test tool_presentation::tests::presents_model_consultation_as_an_agent_action ... ok
+test tool_presentation::tests::presents_native_edit_file_replacements_as_a_diff ... ok
+test tool_presentation::tests::presents_native_new_file_writes_as_addition_diffs ... ok
+test tool_presentation::tests::presents_open_code_camel_case_replacement_as_a_diff ... ok
+test tool_presentation::tests::presents_persistent_peer_consultation_without_exposing_raw_thread_ids ... ok
+test tool_presentation::tests::preserves_real_tool_errors_without_rendering_null_as_a_result ... ok
+test tool_presentation::tests::projects_provider_subagent_activity_without_raw_identifiers ... ok
+test tool_presentation::tests::projects_completed_file_creation_from_edit_result ... ok
+test tool_presentation::tests::presents_tool_search_and_read_line_ranges_compactly ... ok
+test tool_presentation::tests::resource_probes_are_compact_and_hide_transport_payloads ... ok
+test tool_presentation::tests::strips_unmarked_file_contents_before_the_first_real_hunk ... ok
+test tool_presentation::tests::wait_agent_timeout_is_labeled_as_a_limit_not_elapsed_time ... ok
+test tool_presentation::tests::projects_wrapped_file_change_envelope_as_diff ... ok
+test tool_presentation::tests::presents_direct_git_and_mcp_tool_names ... ok
+test tool_presentation::tests::composed_git_commands_keep_each_operation_visible ... ok
+test tool_presentation::tests::a_leading_cd_is_split_from_the_command_it_prefixes ... ok
+test tool_presentation::tests::git_results_report_observed_output_and_preserve_errors ... ok
+test tool_presentation::tests::projects_cli_command_search_and_diff_contracts ... ok
+test tool_presentation::tests::presents_common_git_shell_commands_with_raw_commands_intact ... ok
+test tool_presentation::tests::a_command_that_changed_nothing_is_presented_as_it_always_was ... ok
+test tool_presentation::tests::keeps_mutating_or_composed_shell_commands_as_execution ... ok
+test tool_presentation::tests::mixed_shell_chains_are_not_searches ... ok
+test tool_presentation::tests::presents_safe_read_only_shell_commands_as_reads ... ok
+test tool_presentation::tests::a_command_that_changed_files_shows_the_change_and_keeps_its_own_name ... ok
+test tool_presentation::tests::command_rows_name_what_the_command_did_and_how_it_went ... ok
+
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 1003 filtered out; finished in 0.01s
+

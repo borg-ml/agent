@@ -22,10 +22,10 @@ Git comparison.
   history reads instead of repeatedly decoding full ancestor histories. Fork
   recovery respects compaction boundaries while preserving queued prompts and
   team state.
-- Native sessions hold new tool calls until a visible reply to a human steer is
-  written. A response with no visible text triggers one corrective request; a
-  second miss ends the turn without executing those calls. Reasoning is not
-  treated as a reply.
+- Native Claude narration summaries are routed to visible assistant text using
+  the pinned upstream runtime's classification; actual or unclassified thinking
+  stays in Reasoning. Signed content and raw event payloads remain unchanged for
+  replay, without extra model retries or tool-execution guards.
 
 ### Collaboration
 

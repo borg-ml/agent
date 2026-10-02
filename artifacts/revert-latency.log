@@ -1,0 +1,11 @@
+test session_store::postgres::fork::tests::measure_large_revert_read_paths ... BENCH checkpoint_projection ms=224 inherited=147505 latest=467067
+BENCH inherited_tail ms=30 events=256
+BENCH compaction_lookup ms=18 sequence=Some(147215)
+BENCH fork_recovery ms=899 context=477 queue=3316 subagents=23043
+BENCH old_full_projection ms=27757 decoded=467067
+BENCH changed_state_fields=["context_generation"]
+BENCH old_inherited_tail ms=26266 events=256
+
+PostgreSQL suite:132 passed,0 failed (fresh owned fixture).
+
+Combined CLI build includes 0e535126 and 570ed21b; installed atomically without restarting sessions.

@@ -1,0 +1,23 @@
+   Compiling borg-core v0.13.5 (/home/shulgin/agent/crates/borg-core)
+   Compiling borg-provider v0.13.5 (/home/shulgin/agent/crates/borg-provider)
+    Finished `test` profile [unoptimized] target(s) in 7.51s
+     Running unittests src/lib.rs (target/debug/deps/borg_provider-eba2fc061b46e3b6)
+
+running 1 test
+test provider::anthropic_messages::tests::content_deltas_must_match_the_declared_block_type ... FAILED
+
+failures:
+
+---- provider::anthropic_messages::tests::content_deltas_must_match_the_declared_block_type stdout ----
+
+thread 'provider::anthropic_messages::tests::content_deltas_must_match_the_declared_block_type' (2490713) panicked at crates/borg-provider/src/provider/anthropic_messages.rs:1768:17:
+text_delta must be rejected for a thinking block
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    provider::anthropic_messages::tests::content_deltas_must_match_the_declared_block_type
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 158 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p borg-provider --lib`
