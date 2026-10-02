@@ -9,6 +9,12 @@ Git comparison.
 
 - Plan cards return to the plain checklist with status markers, without diff
   backgrounds or superseded task rows. Empty new-chat plans remain hidden.
+- Pasting a PNG from a Wayland clipboard preserves its encoded bytes instead
+  of decoding and re-encoding the image. Image validation and size limits stay
+  in place, with existing clipboard fallbacks retained.
+- The composer caret stays steady instead of blinking. Redraws and cursor
+  placement use synchronized terminal updates to prevent intermediate flashes
+  under load; underline, bar and block shapes remain available.
 
 ### Reliability
 

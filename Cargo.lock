@@ -1318,6 +1318,7 @@ dependencies = [
  "unicode-width",
  "url",
  "uuid",
+ "wl-clipboard-rs",
 ]
 
 [[package]]

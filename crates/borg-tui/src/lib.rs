@@ -1836,7 +1836,6 @@ pub struct BorgTerminal {
     pending_transcript_anchor: Option<TranscriptViewportAnchor>,
     event_redraw_needed: bool,
     last_tool_timer_refresh_tick: Option<i64>,
-    cursor_blink_started_at: Instant,
     splash_started_at: Instant,
     splash_glitch_seed: u64,
     terminal_restored: bool,
@@ -2973,7 +2972,7 @@ impl BorgTerminal {
             stdout,
             EnableMouseCapture,
             EnableFocusChange,
-            SetCursorStyle::BlinkingUnderScore
+            composer_terminal_cursor_style(ComposerCursorStyle::Underline)
         ) {
             let _ = execute!(stdout, DisableBracketedPaste);
             if mode == ScreenMode::Alternate {
@@ -3215,7 +3214,6 @@ impl BorgTerminal {
             pending_transcript_anchor: None,
             event_redraw_needed: false,
             last_tool_timer_refresh_tick: None,
-            cursor_blink_started_at: Instant::now(),
             splash_started_at: Instant::now(),
             splash_glitch_seed: Uuid::new_v4().as_u128() as u64,
             terminal_restored: false,
@@ -3371,7 +3369,6 @@ impl BorgTerminal {
         self.pending_scroll_anchor_height = None;
         self.pending_transcript_anchor = None;
         self.event_redraw_needed = true;
-        self.cursor_blink_started_at = Instant::now();
         Ok(())
     }
 
@@ -5945,11 +5942,7 @@ impl BorgTerminal {
 
     pub fn set_composer_cursor_style(&mut self, style: ComposerCursorStyle) {
         self.composer_cursor_style = style;
-        let terminal_style = match style {
-            ComposerCursorStyle::Underline => SetCursorStyle::BlinkingUnderScore,
-            ComposerCursorStyle::Bar => SetCursorStyle::BlinkingBar,
-            ComposerCursorStyle::Block => SetCursorStyle::BlinkingBlock,
-        };
+        let terminal_style = composer_terminal_cursor_style(style);
         let _ = execute!(io::stdout(), terminal_style);
     }
 
@@ -6341,11 +6334,6 @@ impl BorgTerminal {
             event,
             scroll_repetitions,
         } = input;
-        if matches!(&event, Event::Paste(_))
-            || matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release)
-        {
-            self.cursor_blink_started_at = Instant::now();
-        }
         self.event_redraw_needed = !matches!(
             &event,
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved)
@@ -8795,14 +8783,10 @@ impl BorgTerminal {
             self.pending_transcript_anchor.take()
         };
         let mut restored_scroll_from_bottom = None;
-        let cursor_visible = cursor_blink_visible(self.cursor_blink_started_at.elapsed());
-        // Ratatui flushes changed cells, then shows the cursor where the last
-        // cell was written before moving it. Keep the cursor out of the frame
-        // and place it while hidden, so animated transcript diffs cannot flash
-        // a caret through action rows.
-        self.terminal.hide_cursor()?;
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
         let mut frame_cursor = None;
-        self.terminal.draw(|frame| {
+        let draw_result = self.terminal.try_draw(|frame| -> io::Result<()> {
             let mut hint_occlusions = Vec::new();
             let area = centered_content_area_with_margin(frame.area(), self.horizontal_margin);
             let chunks = terminal_vertical_chunks(
@@ -9536,7 +9520,6 @@ impl BorgTerminal {
             }
             if self.picker.is_none()
                 && self.status_focus.is_none()
-                && cursor_visible
                 && let Some(cursor) = composer_frame_cursor(
                     composer_area,
                     composer_cursor,
@@ -10527,11 +10510,27 @@ impl BorgTerminal {
                 self.key_hints
                     .render(frame, hint_candidates, &hint_occlusions);
             }
-        })?;
-        if let Some(cursor) = frame_cursor {
-            self.terminal.set_cursor_position(cursor)?;
-            self.terminal.show_cursor()?;
-        }
+            // Generate the frame before hiding the caret or starting the
+            // terminal's synchronized-update timeout. Present cells and the
+            // correctly positioned steady caret as one atomic update.
+            execute!(
+                output,
+                crossterm::terminal::BeginSynchronizedUpdate,
+                crossterm::cursor::Hide
+            )?;
+            Ok(())
+        });
+        let draw_result = draw_result.map(|_| ());
+        let cursor_result = draw_result.and_then(|()| {
+            if let Some(cursor) = frame_cursor {
+                self.terminal.set_cursor_position(cursor)?;
+                self.terminal.show_cursor()?;
+            }
+            Ok(())
+        });
+        let end_result = execute!(output, crossterm::terminal::EndSynchronizedUpdate);
+        cursor_result?;
+        end_result?;
         if !input_fast_path {
             self.last_committed_viewport_render = Some((
                 transcript_width,
@@ -17755,8 +17754,12 @@ fn spinner_frame_index() -> usize {
     frame as usize % 8
 }
 
-fn cursor_blink_visible(elapsed: Duration) -> bool {
-    (elapsed.as_millis() / 500).is_multiple_of(2)
+fn composer_terminal_cursor_style(style: ComposerCursorStyle) -> SetCursorStyle {
+    match style {
+        ComposerCursorStyle::Underline => SetCursorStyle::SteadyUnderScore,
+        ComposerCursorStyle::Bar => SetCursorStyle::SteadyBar,
+        ComposerCursorStyle::Block => SetCursorStyle::SteadyBlock,
+    }
 }
 
 /// One attachment tile in the rendered transcript: consecutive link rows that

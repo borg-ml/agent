@@ -243,6 +243,21 @@ impl AttachmentStore {
                 attachments: vec![self.stage_path(&path)?],
             });
         }
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            use wl_clipboard_rs::paste::{ClipboardType, MimeType, Seat, get_contents};
+
+            if let Ok((png, _)) = get_contents(
+                ClipboardType::Regular,
+                Seat::Unspecified,
+                MimeType::Specific("image/png"),
+            ) {
+                return Ok(PasteOutcome {
+                    text: String::new(),
+                    attachments: vec![self.stage_clipboard_png(png)?],
+                });
+            }
+        }
         if let Ok(image) = clipboard.get_image() {
             let width = u32::try_from(image.width).context("clipboard image is too wide")?;
             let height = u32::try_from(image.height).context("clipboard image is too tall")?;
@@ -263,6 +278,17 @@ impl AttachmentStore {
         self.stage_paste(&text, cwd)
     }
 
+    #[cfg(target_os = "linux")]
+    fn stage_clipboard_png(&self, png: impl std::io::Read) -> Result<PathBuf> {
+        use std::io::Read;
+
+        let mut bytes = Vec::new();
+        png.take(MAX_INLINE_IMAGE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .context("failed to read clipboard image")?;
+        self.write_image_bytes(&bytes, "png")
+    }
+
     #[cfg(target_os = "android")]
     pub fn capture_clipboard_paste(&self, _cwd: &Path) -> Result<PasteOutcome> {
         bail!("clipboard paste is unavailable on Android/Termux")
@@ -275,7 +301,10 @@ impl AttachmentStore {
                 bytes.len()
             );
         }
-        image::load_from_memory(bytes).context("pasted terminal payload is not a valid image")?;
+        let format =
+            ImageFormat::from_extension(extension).context("unsupported pasted image format")?;
+        image::load_from_memory_with_format(bytes, format)
+            .context("pasted terminal payload is not a valid image")?;
         let path = self.root.join(format!("{}.{extension}", Uuid::new_v4()));
         fs::write(&path, bytes)
             .with_context(|| format!("failed to persist pasted image {}", path.display()))?;
@@ -426,6 +455,45 @@ mod tests {
             fs::read(&outcome.attachments[0]).unwrap(),
             fs::read(source).unwrap()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clipboard_png_keeps_encoded_bytes_and_bounds_reads() {
+        use image::ImageEncoder;
+        use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+        use std::io::Read;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::for_session(temp.path(), Uuid::nil()).unwrap();
+        let pixels = RgbaImage::from_pixel(2, 3, image::Rgba([12, 34, 56, 78]));
+        let mut original = Vec::new();
+        PngEncoder::new_with_quality(
+            &mut original,
+            CompressionType::Uncompressed,
+            FilterType::NoFilter,
+        )
+        .write_image(pixels.as_raw(), 2, 3, image::ExtendedColorType::Rgba8)
+        .unwrap();
+        let path = store.stage_clipboard_png(Cursor::new(&original)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(image::open(path).unwrap().into_rgba8(), pixels);
+        assert!(
+            store
+                .stage_clipboard_png(Cursor::new(b"not a PNG"))
+                .is_err()
+        );
+
+        let mut jpeg = Vec::new();
+        DynamicImage::new_rgb8(2, 3)
+            .write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
+            .unwrap();
+        assert!(store.stage_clipboard_png(Cursor::new(jpeg)).is_err());
+
+        let mut oversized = std::io::repeat(0).take(MAX_INLINE_IMAGE_BYTES as u64 + 1024);
+        let error = store.stage_clipboard_png(&mut oversized).unwrap_err();
+        assert!(error.to_string().contains("pasted image is too large"));
+        assert_eq!(oversized.limit(), 1023, "only one excess byte is needed");
     }
 
     #[test]

@@ -3787,12 +3787,14 @@ fn preparing_a_new_action_does_not_invent_a_background_process() {
 }
 
 #[test]
-fn composer_cursor_has_a_stable_software_blink_phase() {
-    assert!(cursor_blink_visible(Duration::ZERO));
-    assert!(cursor_blink_visible(Duration::from_millis(499)));
-    assert!(!cursor_blink_visible(Duration::from_millis(500)));
-    assert!(!cursor_blink_visible(Duration::from_millis(999)));
-    assert!(cursor_blink_visible(Duration::from_millis(1_000)));
+fn composer_cursor_shapes_are_steady() {
+    for (shape, command) in [
+        (ComposerCursorStyle::Underline, SetCursorStyle::SteadyUnderScore),
+        (ComposerCursorStyle::Bar, SetCursorStyle::SteadyBar),
+        (ComposerCursorStyle::Block, SetCursorStyle::SteadyBlock),
+    ] {
+        assert_eq!(composer_terminal_cursor_style(shape), command);
+    }
 }
 
 #[test]
