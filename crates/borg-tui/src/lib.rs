@@ -4207,11 +4207,11 @@ impl BorgTerminal {
                 self.remap_selection_after_entry_insertion(inserted);
             }
         }
-        if self.focused_child.is_none() {
-            if inspector_anchor.is_some() || matches!(event.kind, SessionEventKind::ContextCleared)
-            {
-                self.restore_action_inspector(inspector_anchor);
-            }
+        if self.focused_child.is_none()
+            && (inspector_anchor.is_some()
+                || matches!(event.kind, SessionEventKind::ContextCleared))
+        {
+            self.restore_action_inspector(inspector_anchor);
         }
         if transcript_changed {
             if should_preserve_transcript_viewport(self.transcript.follow_tail)
