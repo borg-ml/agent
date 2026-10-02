@@ -4979,7 +4979,7 @@ fn builtin_tool_specs() -> Vec<Value> {
     specs.extend([
         tool(
             "exec_command",
-            "Run a shell command in the workspace. Returns promptly with a session_id when it is still running; use write_stdin to poll, interact, or terminate it. The shell keeps its directory between commands like one terminal: after `cd DIR`, later commands run in DIR, so do not repeat `cd DIR &&`; the result's `cwd` shows where a command ran.",
+            "Run a shell command in the workspace. Returns promptly with a session_id when it is still running; use write_stdin to poll, interact, or terminate it. A leading literal `cd DIR` remembers DIR for later commands, so do not repeat `cd DIR &&`. Directory changes later in a command or inside conditionals/subshells are not remembered; the result's `cwd` reports the tracked directory.",
             json!({
                 "type": "object",
                 "properties": {
