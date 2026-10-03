@@ -160,6 +160,7 @@ struct LspClient {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    compilation_configuration: Vec<(PathBuf, u64, std::time::SystemTime)>,
     opened_versions: HashMap<PathBuf, i32>,
     // Retain generations after close so late publications cannot match a reopen.
     last_versions: HashMap<PathBuf, i32>,
@@ -820,6 +821,7 @@ impl LspClient {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
+            compilation_configuration: compilation_configuration_stamp(spec, root).await,
             opened_versions: HashMap::new(),
             last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
@@ -1232,11 +1234,40 @@ async fn discard_dead_client(client: &SharedLspClient) {
 /// racing, while other servers stay reachable.
 /// A previous failure is recorded but not sticky: installing the server and
 /// retrying is the normal fix, so the next caller attempts a fresh start.
+// clangd caches fallback compile commands for already open documents. A newly
+// supplied database/config must restart the owned server, not merely relabel
+// old diagnostics as having a present compilation context.
+async fn compilation_configuration_stamp(
+    spec: &ServerSpec,
+    root: &Path,
+) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+    if spec.id != "clangd" {
+        return Vec::new();
+    }
+    let mut stamp = Vec::new();
+    for relative in ["compile_commands.json", "build/compile_commands.json", "compile_flags.txt", ".clangd"] {
+        let path = root.join(relative);
+        if let Ok(metadata) = tokio::fs::metadata(&path).await {
+            stamp.push((path, metadata.len(), metadata.modified().unwrap_or(std::time::UNIX_EPOCH)));
+        }
+    }
+    stamp
+}
+
 async fn ready_client<'a>(
     slot: &'a mut LspClientState,
     spec: &'static ServerSpec,
     root: &Path,
 ) -> Result<&'a mut LspClient> {
+    let configuration = compilation_configuration_stamp(spec, root).await;
+    let changed = slot.ready_mut().is_some_and(|client| {
+        client.compilation_configuration != configuration
+    });
+    if changed {
+        // Dropping only this slot kills its own child (kill_on_drop). Other
+        // workspaces, providers and user-owned language servers are untouched.
+        *slot = LspClientState::NotStarted;
+    }
     if !matches!(slot, LspClientState::Ready(_)) {
         match LspClient::start(spec, root).await {
             Ok(client) => *slot = LspClientState::Ready(Box::new(client)),
@@ -2672,6 +2703,7 @@ mod tests {
             stdout: BufReader::new(child.stdout.take().expect("stdout")),
             child,
             next_id: 1,
+            compilation_configuration: compilation_configuration_stamp(spec, root).await,
             opened_versions: HashMap::new(),
             last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
@@ -2744,6 +2776,7 @@ mod tests {
             stdout: BufReader::new(child.stdout.take().expect("stdout")),
             child,
             next_id: 1,
+            compilation_configuration: compilation_configuration_stamp(spec, root).await,
             opened_versions: HashMap::new(),
             last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
