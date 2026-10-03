@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.14.0)
 
+### Terminal
+
+- Expanding sent-message details no longer crashes when the status bar clips
+  an off-screen status target.
+
 ## 0.14.0 (2026-10-02)
 
 ### Terminal
