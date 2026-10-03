@@ -1743,7 +1743,7 @@ fn claude_credentials_path() -> Option<PathBuf> {
         .map(|directory| directory.join(".credentials.json"))
         .or_else(|| {
             nonempty_path_env("HOME")
-                .or_else(|| {
+                .or({
                     #[cfg(windows)]
                     {
                         nonempty_path_env("USERPROFILE")

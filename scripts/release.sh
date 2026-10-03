@@ -301,6 +301,7 @@ run_release_checks() (
   trap 'rm -rf -- "$test_tmp"' EXIT
   cargo fmt --all -- --check
   TMPDIR="$test_tmp" run_build cargo test --workspace --exclude borg-gui --locked -- --test-threads=1
+  run_build cargo clippy --workspace --exclude borg-gui --all-targets --locked -- -D warnings
   git diff --check -- Cargo.toml Cargo.lock CHANGELOG.md
 )
 

@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.14.2)
 
+### Release reliability
+
+- Fix the cross-platform lint failure in Windows Claude login discovery.
+- Local release checks now run the strict Clippy gate before creating a tag.
+
 ## 0.14.2 (2026-10-03)
 
 ### Windows and cross-platform reliability
