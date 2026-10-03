@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.14.3)
 
+### Release reliability
+
+- Update release-tooling smoke tests for the strict Clippy preflight so validated
+  platform archives can proceed to publication.
+
 ## 0.14.3 (2026-10-03)
 
 ### Release reliability

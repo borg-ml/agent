@@ -319,7 +319,7 @@ chmod +x "$fake_bin/df"
     fi
 FAKE_CARGO
   echo '    ;;'
-  echo '  fmt)'
+  echo '  fmt|clippy)'
   echo '    ;;'
   echo '  test)'
   echo '    [[ "${FAKE_CARGO_FAIL:-}" != "test" ]] || exit 42'
