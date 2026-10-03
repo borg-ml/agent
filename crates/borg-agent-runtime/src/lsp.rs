@@ -433,7 +433,7 @@ impl LspService {
         let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
         let shared = self.lease_client(spec, &workspace_root).await;
         let mut slot = shared.lock().await;
-        let client = ready_client(&mut slot, spec, &workspace_root).await?;
+        let client = ready_client(&mut slot, spec, &workspace_root, &path).await?;
         let mut report = client
             .document_diagnostics(&path, &uri, spec.language_id, None)
             .await?;
@@ -665,7 +665,7 @@ impl LspService {
             let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
             let shared = self.lease_client(spec, &workspace_root).await;
             let mut slot = shared.lock().await;
-            let client = ready_client(&mut slot, spec, &workspace_root).await?;
+            let client = ready_client(&mut slot, spec, &workspace_root, &path).await?;
             client.open_document(&path, &uri, spec.language_id).await?;
         }
 
@@ -713,7 +713,7 @@ impl LspService {
         let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
         let shared = self.lease_client(spec, &workspace_root).await;
         let mut slot = shared.lock().await;
-        let client = ready_client(&mut slot, spec, &workspace_root).await?;
+        let client = ready_client(&mut slot, spec, &workspace_root, &path).await?;
         client.open_document(&path, &uri, spec.language_id).await?;
         let mut params = extra.as_object().cloned().unwrap_or_default();
         params.insert("textDocument".to_string(), json!({ "uri": uri }));
@@ -731,7 +731,7 @@ impl LspService {
         let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
         let shared = self.lease_client(spec, &workspace_root).await;
         let mut slot = shared.lock().await;
-        let client = ready_client(&mut slot, spec, &workspace_root).await?;
+        let client = ready_client(&mut slot, spec, &workspace_root, &path).await?;
         let text = client.open_document(&path, &uri, spec.language_id).await?;
         // Callers count columns in characters; the wire position is UTF-16
         // code units (the encoding negotiated in `initialize`).
@@ -1286,8 +1286,30 @@ async fn ready_client<'a>(
     slot: &'a mut LspClientState,
     spec: &'static ServerSpec,
     root: &Path,
+    document: &Path,
 ) -> Result<&'a mut LspClient> {
-    let configuration = compilation_configuration_stamp(spec, root).await;
+    let mut configuration = compilation_configuration_stamp(spec, root).await;
+    // A document may use a nearer .clangd/compile_flags.txt than the workspace
+    // root. Refresh those configurations too; otherwise old fallback errors
+    // can be returned alongside metadata claiming the new flags are present.
+    if spec.id == "clangd" {
+        let mut directories = std::collections::BTreeSet::new();
+        let mut documents = vec![document.to_path_buf()];
+        if let Some(client) = slot.ready_mut() {
+            documents.extend(client.opened_versions.keys().cloned());
+        }
+        for path in documents {
+            let mut parent = path.parent();
+            while let Some(directory) = parent {
+                if directory == root || !directory.starts_with(root) { break; }
+                directories.insert(directory.to_path_buf());
+                parent = directory.parent();
+            }
+        }
+        for directory in directories {
+            configuration.extend(compilation_configuration_stamp(spec, &directory).await);
+        }
+    }
     let changed = slot
         .ready_mut()
         .is_some_and(|client| client.compilation_configuration != configuration);
@@ -1298,7 +1320,10 @@ async fn ready_client<'a>(
     }
     if !matches!(slot, LspClientState::Ready(_)) {
         match LspClient::start(spec, root).await {
-            Ok(client) => *slot = LspClientState::Ready(Box::new(client)),
+            Ok(mut client) => {
+                client.compilation_configuration = configuration;
+                *slot = LspClientState::Ready(Box::new(client));
+            }
             Err(error) => {
                 *slot = LspClientState::Failed(format!("{error:#}"));
                 return Err(error);
