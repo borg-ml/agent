@@ -934,6 +934,12 @@ impl LspClient {
                 maximum.min(end.saturating_duration_since(Instant::now()))
             })
         };
+        // clangd can suppress an identical diagnostic payload even with
+        // wantDiagnostics=true. Reopen for an explicit diagnostic request so
+        // the publication carries this generation instead of timing out.
+        if spec_for_path(path).is_some_and(|spec| spec.id == "clangd") {
+            self.close_document(path, uri).await?;
+        }
         self.open_document(path, uri, language_id).await?;
         let pull_timeout = remaining(REQUEST_TIMEOUT);
         if pull_timeout.is_zero() {
@@ -1269,9 +1275,9 @@ async fn ready_client<'a>(
     root: &Path,
 ) -> Result<&'a mut LspClient> {
     let configuration = compilation_configuration_stamp(spec, root).await;
-    let changed = slot.ready_mut().is_some_and(|client| {
-        client.compilation_configuration != configuration
-    });
+    let changed = slot
+        .ready_mut()
+        .is_some_and(|client| client.compilation_configuration != configuration);
     if changed {
         // Dropping only this slot kills its own child (kill_on_drop). Other
         // workspaces, providers and user-owned language servers are untouched.
@@ -2548,6 +2554,14 @@ mod tests {
                 .is_some_and(|items| !items.is_empty())
         );
 
+        // Repeating an unchanged-buffer request must still publish the current
+        // generation; clangd otherwise suppresses it and the call times out.
+        let repeated = service
+            .diagnostics(Path::new("broken.c"))
+            .await
+            .expect("repeated unchanged clangd diagnostics");
+        assert_eq!(repeated["items"], result["items"]);
+
         service
             .workspace_diagnostics(Some(Path::new("broken.c")))
             .await
@@ -2643,7 +2657,10 @@ mod tests {
         tokio::fs::write(root.path().join("main.cpp"), "int value;\n")
             .await
             .expect("write source");
-        assert_eq!(after, compilation_configuration_stamp(clangd, root.path()).await);
+        assert_eq!(
+            after,
+            compilation_configuration_stamp(clangd, root.path()).await
+        );
     }
 
     #[tokio::test]
