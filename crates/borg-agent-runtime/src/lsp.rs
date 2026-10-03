@@ -2562,6 +2562,15 @@ mod tests {
             .expect("repeated unchanged clangd diagnostics");
         assert_eq!(repeated["items"], result["items"]);
 
+        tokio::fs::write(root.path().join("compile_flags.txt"), "-Dmissing=0\n")
+            .await
+            .expect("replace fallback compilation flags");
+        let configured = service
+            .diagnostics(Path::new("broken.c"))
+            .await
+            .expect("diagnostics after configuration change");
+        assert_eq!(configured["items"], json!([]));
+
         service
             .workspace_diagnostics(Some(Path::new("broken.c")))
             .await
