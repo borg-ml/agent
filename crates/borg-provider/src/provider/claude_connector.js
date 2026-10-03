@@ -6,6 +6,17 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { writeFileSync, renameSync } from 'node:fs';
 
 const VERSION = '2.1.285';
+const bindings = {
+  'linux-x64': { chunks: ["f74xvn8g", "9v35ka7v", "t5hhxe3x", "qazw855w"], exports: [["ln", "nl", "A6", "EFe", "Ot", "$r", "E6", "Wx", "Wg", "xNo", "t_e", "FJ", "ID", "p_", "f8e"], ["IX", "rF"], ["ZNr"], ["Ayo"]] },
+  'linux-arm64': { chunks: ["n1qqpa0t", "fyx76j6w", "jbjxxgng", "c5bt9apn"], exports: [["ln", "nl", "R5", "kUe", "Ot", "$r", "k5", "Wx", "Wg", "xFo", "t_e", "UJ", "PD", "p_", "f9e"], ["PX", "rU"], ["ZFr"], ["Ryo"]] },
+  'linux-x64-musl': { chunks: ["mk39sqgr", "n1zb52wr", "72cj3ybs", "rn2adyzh"], exports: [["ln", "nl", "A6", "EFe", "Ot", "$r", "E6", "Wx", "Wg", "xNo", "t_e", "FJ", "ID", "p_", "f8e"], ["IX", "rF"], ["ZNr"], ["Ayo"]] },
+  'linux-arm64-musl': { chunks: ["5h2sqjrp", "egn7b3gm", "9cfgxtyc", "bg38ztnn"], exports: [["ln", "nl", "R5", "kUe", "Ot", "$r", "k5", "Wx", "Wg", "xFo", "t_e", "UJ", "PD", "p_", "f9e"], ["PX", "rU"], ["ZFr"], ["Ryo"]] },
+  'darwin-x64': { chunks: ["j4z1kmsa", "2gvzrb6k", "r19p4sp7", "w88w7chq"], exports: [["ln", "rl", "M5", "x$e", "Pt", "Fr", "P5", "Kx", "Gg", "pFo", "a_e", "K7", "NL", "f_", "w8e"], ["FX", "h$"], ["TFr"], ["c_o"]] },
+  'darwin-arm64': { chunks: ["er6f56rj", "jfbsd9e8", "8gjexfse", "59zy4j10"], exports: [["ln", "rl", "M5", "x$e", "Ht", "Fr", "H5", "qx", "Gg", "pFo", "a_e", "q7", "ND", "f_", "w8e"], ["FX", "h$"], ["kFr"], ["c_o"]] },
+  'win32-x64': { chunks: ["bh4cnjbq", "xy4kc5a6", "cgpdnaye", "3pm6j019"], exports: [["ln", "nl", "AY", "k$e", "Ot", "Fr", "TY", "Wx", "zg", "MHo", "n_e", "jJ", "MD", "m_", "m8e"], ["nJ", "S$"], ["iFr"], ["Oyo"]] },
+  'win32-arm64': { chunks: ["cs1p8dpb", "jc4mffyh", "py1hs3a1", "ngk77gkd"], exports: [["ln", "nl", "A3", "EUe", "Ot", "$r", "T3", "Wx", "zg", "MFo", "n_e", "jJ", "MD", "m_", "m8e"], ["nJ", "SU"], ["i$r"], ["Oyo"]] },
+};
+const bindingNames = [["ln", "nl", "A6", "EFe", "Ot", "$r", "E6", "Wx", "Wg", "xNo", "t_e", "FJ", "ID", "p_", "f8e"], ["IX", "rF"], ["ZNr"], ["Ayo"]];
 const PROTOCOL = 1;
 const MAX_BODY = 64 * 1024 * 1024;
 const MAX_HELD = 256 * 1024 * 1024;
@@ -279,13 +290,17 @@ try {
   secret = options.secret;
   if (!/^[a-f0-9]{64}$/.test(secret) || options.protocol !== PROTOCOL ||
       !/^[a-f0-9]{64}$/.test(options.revision) || typeof options.endpoint_path !== 'string') throw Error('Invalid connector bootstrap');
-  [core, model, billing, summaries] = await Promise.all([
-    import('/$bunfs/root/chunk-f74xvn8g.js'),
-    import('/$bunfs/root/chunk-9v35ka7v.js'),
-    import('/$bunfs/root/chunk-t5hhxe3x.js'),
-    import('/$bunfs/root/chunk-qazw855w.js'),
-  ]);
-  if (typeof summaries.Ayo !== 'function') throw Error('Pinned Claude runtime lacks native narration classification');
+  const binding = bindings[options.platform];
+  if (!binding) throw Error('Unsupported pinned Claude runtime platform');
+  const root = options.platform.startsWith('win32-') ? 'B:/~BUN/root/' : '/$bunfs/root/';
+  [core, model, billing, summaries] = await Promise.all(binding.chunks.map(async (chunk, index) => {
+    const module = await import(`${root}chunk-${chunk}.js`);
+    return Object.fromEntries(bindingNames[index].map((name, offset) => {
+      const value = module[binding.exports[index][offset]];
+      if (typeof value !== 'function') throw Error('Pinned Claude runtime lacks a required model binding');
+      return [name, value];
+    }));
+  }));
   await core.f8e();
   await verifyIdentity();
   const server = http.createServer({ requestTimeout: 30000, headersTimeout: 10000, maxHeaderSize: 8192 }, (request, response) => {

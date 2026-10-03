@@ -451,7 +451,7 @@ impl Connector {
             .context("missing Claude connector input")?;
         input
             .write_all(&serde_json::to_vec(
-                &json!({"protocol": PROTOCOL, "secret": secret, "revision": revision, "endpoint_path": endpoint_path}),
+                &json!({"protocol": PROTOCOL, "secret": secret, "revision": revision, "endpoint_path": endpoint_path, "platform": platform_release()?.0}),
             )?)
             .await?;
         input.shutdown().await?;
