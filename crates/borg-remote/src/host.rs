@@ -1742,7 +1742,18 @@ fn claude_credentials_path() -> Option<PathBuf> {
         .or_else(|| nonempty_path_env("CLAUDE_CONFIG_DIR"))
         .map(|directory| directory.join(".credentials.json"))
         .or_else(|| {
-            nonempty_path_env("HOME").map(|home| home.join(".claude").join(".credentials.json"))
+            nonempty_path_env("HOME")
+                .or_else(|| {
+                    #[cfg(windows)]
+                    {
+                        nonempty_path_env("USERPROFILE")
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        None
+                    }
+                })
+                .map(|home| home.join(".claude").join(".credentials.json"))
         })
 }
 
@@ -14731,6 +14742,42 @@ connection: close
 
     #[test]
     fn local_auth_json_requires_typed_nonempty_credentials() {
+        #[cfg(windows)]
+        {
+            const CHILD: &str = "BORG_TEST_WINDOWS_CLAUDE_PROFILE";
+            if std::env::var_os(CHILD).is_some() {
+                let profile = nonempty_path_env("USERPROFILE").unwrap();
+                assert_eq!(
+                    claude_credentials_path(),
+                    Some(profile.join(".claude/.credentials.json"))
+                );
+                assert!(provider_subscription_credentials_present(
+                    CodingProvider::Claude
+                ));
+                return;
+            }
+            let profile = tempdir().unwrap();
+            fs::create_dir(profile.path().join(".claude")).unwrap();
+            fs::write(
+                profile.path().join(".claude/.credentials.json"),
+                r#"{"claudeAiOauth":{"accessToken":"access","subscriptionType":"pro"}}"#,
+            )
+            .unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "local_auth_json_requires_typed_nonempty_credentials",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("USERPROFILE", profile.path())
+                .env_remove("HOME")
+                .env_remove("CLAUDE_CONFIG_DIR")
+                .env_remove("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+                .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
         assert!(codex_auth_json_authenticated(&serde_json::json!({
             "tokens": {"refresh_token": "refresh"}
         })));
