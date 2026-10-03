@@ -160,6 +160,7 @@ struct LspClient {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    supports_pull_diagnostics: bool,
     compilation_configuration: Vec<(PathBuf, u64, std::time::SystemTime)>,
     opened_versions: HashMap<PathBuf, i32>,
     // Retain generations after close so late publications cannot match a reopen.
@@ -821,6 +822,7 @@ impl LspClient {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
+            supports_pull_diagnostics: false,
             compilation_configuration: compilation_configuration_stamp(spec, root).await,
             opened_versions: HashMap::new(),
             last_versions: HashMap::new(),
@@ -848,9 +850,12 @@ impl LspClient {
         if let Some(options) = server_initialization_options(spec) {
             initialize["initializationOptions"] = options;
         }
-        client
+        let initialized = client
             .request_with_timeout("initialize", initialize, INITIALIZE_TIMEOUT)
             .await?;
+        client.supports_pull_diagnostics = initialized
+            .pointer("/capabilities/diagnosticProvider")
+            .is_some_and(Value::is_object);
         client.notify("initialized", json!({})).await?;
         Ok(client)
     }
@@ -941,6 +946,14 @@ impl LspClient {
             self.close_document(path, uri).await?;
         }
         self.open_document(path, uri, language_id).await?;
+        // Push-only servers (including clangd) do not implement this request.
+        // Preserve the publication timeout/error instead of hiding it behind
+        // an expected MethodNotFound from an unadvertised pull capability.
+        if !self.supports_pull_diagnostics {
+            return self
+                .wait_for_published_diagnostics(uri, remaining(publish_timeout))
+                .await;
+        }
         let pull_timeout = remaining(REQUEST_TIMEOUT);
         if pull_timeout.is_zero() {
             bail!("workspace diagnostic time budget exhausted");
@@ -2363,6 +2376,7 @@ mod tests {
                 stdin,
                 stdout: BufReader::new(stdout),
                 next_id: 1,
+                supports_pull_diagnostics: false,
                 compilation_configuration: Vec::new(),
                 opened_versions: HashMap::new(),
                 last_versions: HashMap::new(),
@@ -2755,6 +2769,7 @@ mod tests {
             stdout: BufReader::new(child.stdout.take().expect("stdout")),
             child,
             next_id: 1,
+            supports_pull_diagnostics: false,
             compilation_configuration: Vec::new(),
             opened_versions: HashMap::new(),
             last_versions: HashMap::new(),
@@ -2828,6 +2843,7 @@ mod tests {
             stdout: BufReader::new(child.stdout.take().expect("stdout")),
             child,
             next_id: 1,
+            supports_pull_diagnostics: false,
             compilation_configuration: Vec::new(),
             opened_versions: HashMap::new(),
             last_versions: HashMap::new(),
