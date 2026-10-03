@@ -18017,6 +18017,17 @@ async fn back_to_actions_never_covers_compaction_status() {
         },
     ));
     terminal.open_tool_inspector(terminal.transcript.tools["selected-tool"]);
+    terminal.transcript.config = Some(SessionDisplayConfig {
+        cwd: directory.path().to_path_buf(),
+        provider: CodingProvider::Codex,
+        model: Some("model".repeat(100)),
+        effort: None,
+        response_language: ResponseLanguage::default(),
+        fast: false,
+        ultrafast: false,
+        permission_mode: PermissionMode::FullAccess,
+        speed_support: Default::default(),
+    });
     terminal.transcript.context_known = true;
     terminal.transcript.context_remaining_percent = 20;
     terminal.draw().unwrap();
@@ -18025,12 +18036,13 @@ async fn back_to_actions_never_covers_compaction_status() {
         .expect("return button visible");
     let status = terminal.status_area.expect("status row visible");
     assert!(
-        button.bottom() <= status.y,
+        !button.intersects(status),
         "button {button:?} overlaps status {status:?}"
     );
     if let Some(compaction) = terminal.context_status_area {
         assert!(!button.intersects(compaction));
     }
+    assert!(terminal.context_status_area.is_none());
     terminal.shutdown().await;
 }
 

@@ -9711,7 +9711,7 @@ impl BorgTerminal {
                     .saturating_add(alignment_offset)
                     .saturating_add(start as u16);
                 let right = x.saturating_add(width as u16).min(status_line_right);
-                (right > x).then_some(Rect {
+                (right > x).then(|| Rect {
                     x,
                     y: status_area.y,
                     width: right - x,
