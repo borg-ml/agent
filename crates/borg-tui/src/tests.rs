@@ -19528,3 +19528,40 @@ fn reverted_fork_keeps_a_batched_turn_prompts_together_before_its_output() {
         vec![1, 3, 4, 2, 5]
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a PTY; verifies approval waits do not consume draft editing"]
+async fn pending_approval_preserves_composer_typing() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        Uuid::new_v4(),
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    terminal.pending_approval = true;
+    for character in "any new draft".chars() {
+        assert!(matches!(
+            terminal
+                .handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap(),
+            UiAction::None
+        ));
+    }
+    terminal
+        .handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(terminal.composer.text, "any new draf");
+    terminal.composer.clear();
+    assert!(matches!(
+        terminal
+            .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap(),
+        UiAction::Approve {
+            decision: ApprovalDecision::AllowOnce,
+            ..
+        }
+    ));
+    terminal.shutdown().await;
+}

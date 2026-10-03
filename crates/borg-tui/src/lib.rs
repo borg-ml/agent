@@ -10993,20 +10993,21 @@ impl BorgTerminal {
         if self.rewind_primed {
             self.rewind_primed = false;
         }
-        if self.pending_approval {
-            return Ok(if self.keymap.matches(KeyAction::Approve, &key) {
-                UiAction::Approve {
+        if self.active_pending_approval()
+            && !(composer_inserts_character(&key) && !self.composer.text.is_empty())
+        {
+            if self.keymap.matches(KeyAction::Approve, &key) {
+                return Ok(UiAction::Approve {
                     target: self.focused_child,
                     decision: ApprovalDecision::AllowOnce,
-                }
-            } else if self.keymap.matches(KeyAction::Deny, &key) {
-                UiAction::Approve {
+                });
+            }
+            if self.keymap.matches(KeyAction::Deny, &key) {
+                return Ok(UiAction::Approve {
                     target: self.focused_child,
                     decision: ApprovalDecision::Deny,
-                }
-            } else {
-                UiAction::None
-            });
+                });
+            }
         }
         if deletes_line_prefix(&key) {
             self.composer_selection = None;
