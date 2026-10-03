@@ -272,6 +272,7 @@ mod linux {
             .arg(format!("--what={SYSTEMD_INHIBITION_SCOPE}"))
             .args([
                 "--mode=block",
+                "--no-ask-password",
                 "--who=Borg",
                 "--why",
                 INHIBITION_REASON,
@@ -311,10 +312,14 @@ mod linux {
         // inhibitor process behind. This mirrors the parent-death guard used
         // by Codex CLI's sleep inhibitor.
         let parent_pid = unsafe { libc::getpid() };
-        // SAFETY: the hook only installs a child-process death signal and
-        // checks the parent PID between fork and exec.
+        // SAFETY: the hook only detaches the controlling terminal, installs a
+        // child-process death signal, and checks the parent PID before exec.
         unsafe {
             command.pre_exec(move || {
+                // Redirected stdin does not stop helpers from opening /dev/tty.
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
                     return Err(io::Error::last_os_error());
                 }
@@ -339,6 +344,17 @@ mod linux {
         use super::*;
 
         #[test]
+        fn background_inhibitor_cannot_share_the_composer_terminal() {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            quiet(&mut command);
+            let guard = ChildGuard(spawn_backend(command).unwrap());
+            let pid = guard.0.id() as libc::pid_t;
+            // A new session has no controlling terminal, even when Borg does.
+            assert_eq!(unsafe { libc::getsid(pid) }, pid);
+        }
+
+        #[test]
         fn systemd_inhibits_idle_and_lid_switch_handling() {
             let command = systemd_command();
             let args = command
@@ -348,6 +364,7 @@ mod linux {
 
             assert!(args.contains(&format!("--what={SYSTEMD_INHIBITION_SCOPE}")));
             assert!(args.contains(&"--mode=block".to_string()));
+            assert!(args.contains(&"--no-ask-password".to_string()));
             assert!(args.contains(&"--".to_string()));
         }
     }

@@ -405,7 +405,7 @@ async fn run_provider_auth_status_command_with_timeout(
     label: &str,
     timeout: Duration,
 ) -> Result<Output> {
-    command.kill_on_drop(true);
+    command.stdin(Stdio::null()).kill_on_drop(true);
     tokio::time::timeout(timeout, command.output())
         .await
         .map_err(|_| anyhow!("{label} timed out after {}s", timeout.as_secs_f64()))?
@@ -697,6 +697,27 @@ mod tests {
             std::fs::write(directory.join("auth.json"), document.to_string()).unwrap();
             assert!(!validate_openai_home(home.path()).await.unwrap().ok);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_auth_status_command_never_consumes_composer_input() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(input.path(), "unsent composer text").unwrap();
+        let mut command = Command::new("cat");
+        command.stdin(Stdio::from(std::fs::File::open(input.path()).unwrap()));
+        let output = run_provider_auth_status_command_with_timeout(
+            &mut command,
+            "test noninteractive auth status",
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(output.status.success());
+        assert!(
+            output.stdout.is_empty(),
+            "auth probes must not read user input"
+        );
     }
 
     #[cfg(unix)]

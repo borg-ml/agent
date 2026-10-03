@@ -160,6 +160,7 @@ async fn run_install_script(runtime: Runtime, url: &str) -> Result<()> {
 async fn installed_version(executable: &Path) -> String {
     tokio::process::Command::new(executable)
         .arg("--version")
+        .stdin(std::process::Stdio::null())
         .output()
         .await
         .ok()
