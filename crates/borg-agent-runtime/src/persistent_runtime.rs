@@ -625,14 +625,28 @@ async fn execute_request(
                     .and_then(Value::as_bool)
                     .context("persistent runtime response has no execution status")?;
                 if !ok {
-                    return Err(RuntimeExecutionError(
+                    let per_field = MAX_RUNTIME_RESULT_BYTES / 4;
+                    let mut error = bounded_head_tail(
                         message
                             .get("error")
                             .and_then(Value::as_str)
                             .unwrap_or("persistent runtime execution failed")
                             .to_string(),
-                    )
-                    .into());
+                        per_field,
+                    );
+                    // Execution is not a transaction: preserve evidence of
+                    // output/host calls that happened before the exception.
+                    for field in ["stdout", "stderr"] {
+                        if let Some(output) = message.get(field).and_then(Value::as_str)
+                            && !output.is_empty()
+                        {
+                            error.push_str(&format!(
+                                "\n\nCaptured {field} before failure:\n{}",
+                                bounded_head_tail(output.to_string(), per_field),
+                            ));
+                        }
+                    }
+                    return Err(RuntimeExecutionError(error).into());
                 }
                 let result = PersistentRuntimeResult {
                     runtime,
@@ -1206,10 +1220,8 @@ NAMESPACE["borg"] = Borg()
 NAMESPACE["cua"] = ComputerUse()
 
 
-def _run_code(source):
+def _run_code(source, stdout, stderr):
     tree = ast.parse(source, filename="<borg-runtime>", mode="exec")
-    stdout = io.StringIO()
-    stderr = io.StringIO()
     value = None
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
         if tree.body and isinstance(tree.body[-1], ast.Expr):
@@ -1232,7 +1244,8 @@ def _run_code(source):
             value = eval(compiled, NAMESPACE, NAMESPACE)
         if inspect.iscoroutine(value):
             value = asyncio.run(value)
-    return _json_safe(value), stdout.getvalue(), stderr.getvalue()
+        value = _json_safe(value)
+    return value
 
 
 for line in sys.stdin:
@@ -1240,17 +1253,19 @@ for line in sys.stdin:
         message = json.loads(line)
         if message.get("type") != "execute":
             continue
+        stdout = io.StringIO()
+        stderr = io.StringIO()
         try:
             if message.get("bootstrap") is not None:
                 _restore_namespace(message["bootstrap"])
-            value, stdout, stderr = _run_code(message.get("code", ""))
+            value = _run_code(message.get("code", ""), stdout, stderr)
             response = {
                 "type": "result",
                 "id": message.get("id"),
                 "ok": True,
                 "value": value,
-                "stdout": stdout,
-                "stderr": stderr,
+                "stdout": stdout.getvalue(),
+                "stderr": stderr.getvalue(),
             }
         except BaseException as error:
             response = {
@@ -1258,6 +1273,8 @@ for line in sys.stdin:
                 "id": message.get("id"),
                 "ok": False,
                 "error": "".join(traceback.format_exception(error)),
+                "stdout": stdout.getvalue(),
+                "stderr": stderr.getvalue(),
             }
         PROTOCOL_OUT.write(json.dumps(response, default=_json_safe) + "\n")
         PROTOCOL_OUT.flush()
@@ -1566,11 +1583,13 @@ input.on("line", async (line) => {
   }
   if (message.type !== "execute") return;
   try {
+    stdout = "";
+    stderr = "";
     if (message.bootstrap !== undefined && message.bootstrap !== null) restoreNamespace(message.bootstrap);
     const output = await execute(message.code || "", message.runtime || "javascript");
     send({type: "result", id: message.id, ok: true, ...output});
   } catch (error) {
-    send({type: "result", id: message.id, ok: false, error: String(error && error.stack || error)});
+    send({type: "result", id: message.id, ok: false, error: String(error && error.stack || error), stdout, stderr});
   }
 });
 "#;
@@ -2488,21 +2507,26 @@ borg = _sdk_module"#
             PersistentRuntimeWorker::for_python(Uuid::new_v4(), root.path().to_path_buf(), None);
         runtime
             .execute(
-                "import math\nvalues = [40]\ndef answer(): return math.floor(values[0]) + 2",
+                "import math, sys\nvalues = [40]\ndef answer(): return math.floor(values[0]) + 2",
                 None,
                 Arc::new(TestHost),
             )
             .await
             .unwrap();
         for code in [
-            "values[0] += 1; raise ValueError('example')",
-            "borg.call('missing', {})",
+            "values[0] += 1; print('receipt before error'); print('warning before error', file=sys.stderr); raise ValueError('example')",
+            "print('receipt before error'); print('warning before error', file=sys.stderr); borg.call('missing', {})",
         ] {
             let error = runtime
                 .execute(code, None, Arc::new(TestHost))
                 .await
                 .unwrap_err();
             assert!(error.is::<RuntimeExecutionError>(), "{error:#}");
+            // A compiler check cannot cover this worker-protocol/host error
+            // path; callers must see receipts even when later code fails.
+            let text = error.to_string();
+            assert!(text.contains("receipt before error"), "{text}");
+            assert!(text.contains("warning before error"), "{text}");
             assert_eq!(
                 runtime
                     .execute("answer()", None, Arc::new(TestHost))
