@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.14.1)
 
+### Windows and cross-platform reliability
+
+- Claude subscription login is detected on Windows when the home directory is
+  supplied by `USERPROFILE` rather than `HOME`.
+- The pinned Claude model connector loads the correct embedded modules and
+  bindings for each supported platform, including Windows' Bun virtual paths.
+- Terminal status paths and window titles hide Windows extended-path prefixes;
+  home-directory shortening also works when only `USERPROFILE` is set.
+
 ## 0.14.1 (2026-10-03)
 
 ### Terminal
