@@ -6631,6 +6631,28 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
     assert!(plan.contains("◇ Updating plan…"), "{plan}");
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_status_paths_hide_extended_prefixes() {
+    let cwd = Path::new(r"\\?\C:\Users\diamo\Documents\Agentic consciousness");
+    assert_eq!(
+        fish_style_path_with_home(cwd, None),
+        r"C:\U\d\D\Agentic consciousness"
+    );
+    assert_eq!(
+        fish_style_path_with_home(cwd, Some(Path::new(r"C:\Users\diamo"))),
+        r"~\D\Agentic consciousness"
+    );
+    assert_eq!(
+        fish_style_path_with_home(Path::new(r"\\?\UNC\server\share\projects\borg"), None),
+        r"\\server\share\p\borg"
+    );
+    assert_eq!(
+        terminal_title(cwd, None),
+        r"Borg Agent • C:\Users\diamo\Documents\Agentic consciousness"
+    );
+}
+
 #[test]
 fn status_path_uses_fish_style_parent_abbreviations() {
     let separator = std::path::MAIN_SEPARATOR;

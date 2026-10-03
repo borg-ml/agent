@@ -15569,12 +15569,46 @@ fn parse_git_worktree_status(output: &str) -> Option<GitWorktreeStatus> {
     })
 }
 
+fn readable_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut components = path.components();
+        let prefix = match components.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::VerbatimDisk(drive) => Some(format!("{}:", drive as char)),
+                Prefix::VerbatimUNC(server, share) => Some(format!(
+                    r"\\{}\{}",
+                    server.to_string_lossy(),
+                    share.to_string_lossy()
+                )),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(prefix) = prefix {
+            let mut readable = PathBuf::from(prefix);
+            for component in components {
+                readable.push(component.as_os_str());
+            }
+            return readable;
+        }
+    }
+    path.to_path_buf()
+}
+
 fn fish_style_path(path: &Path) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
     fish_style_path_with_home(path, home.as_deref())
 }
 
 fn fish_style_path_with_home(path: &Path, home: Option<&Path>) -> String {
+    let path = readable_path(path);
+    let home = home.map(readable_path);
+    let path = path.as_path();
+    let home = home.as_deref();
     if let Some(relative) = home
         .filter(|home| !home.as_os_str().is_empty())
         .and_then(|home| path.strip_prefix(home).ok())
@@ -17554,6 +17588,10 @@ fn permission_status_color(permission: &str) -> Color {
 }
 
 fn terminal_title(cwd: &Path, home: Option<&Path>) -> String {
+    let cwd = readable_path(cwd);
+    let home = home.map(readable_path);
+    let cwd = cwd.as_path();
+    let home = home.as_deref();
     let path = match home
         .filter(|home| !home.as_os_str().is_empty())
         .and_then(|home| cwd.strip_prefix(home).ok())
