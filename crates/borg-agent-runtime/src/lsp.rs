@@ -1245,10 +1245,19 @@ async fn compilation_configuration_stamp(
         return Vec::new();
     }
     let mut stamp = Vec::new();
-    for relative in ["compile_commands.json", "build/compile_commands.json", "compile_flags.txt", ".clangd"] {
+    for relative in [
+        "compile_commands.json",
+        "build/compile_commands.json",
+        "compile_flags.txt",
+        ".clangd",
+    ] {
         let path = root.join(relative);
         if let Ok(metadata) = tokio::fs::metadata(&path).await {
-            stamp.push((path, metadata.len(), metadata.modified().unwrap_or(std::time::UNIX_EPOCH)));
+            stamp.push((
+                path,
+                metadata.len(),
+                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+            ));
         }
     }
     stamp
@@ -2348,6 +2357,7 @@ mod tests {
                 stdin,
                 stdout: BufReader::new(stdout),
                 next_id: 1,
+                compilation_configuration: Vec::new(),
                 opened_versions: HashMap::new(),
                 last_versions: HashMap::new(),
                 published_diagnostics: HashMap::new(),
@@ -2621,6 +2631,22 @@ mod tests {
     /// Without a compilation database clangd answers from fallback flags, so
     /// its confident errors describe build configuration, not the code.
     #[tokio::test]
+    async fn clangd_configuration_stamp_changes_when_fallback_flags_are_replaced() {
+        let root = tempfile::tempdir().expect("workspace");
+        let clangd = spec_for_id("clangd").expect("clangd");
+        let before = compilation_configuration_stamp(clangd, root.path()).await;
+        tokio::fs::write(root.path().join("compile_flags.txt"), "-std=c++20\n")
+            .await
+            .expect("write flags");
+        let after = compilation_configuration_stamp(clangd, root.path()).await;
+        assert_ne!(before, after);
+        tokio::fs::write(root.path().join("main.cpp"), "int value;\n")
+            .await
+            .expect("write source");
+        assert_eq!(after, compilation_configuration_stamp(clangd, root.path()).await);
+    }
+
+    #[tokio::test]
     async fn clangd_diagnostics_report_their_compilation_context() {
         let root = tempfile::tempdir().expect("workspace");
         let source = root.path().join("main.cpp");
@@ -2703,7 +2729,7 @@ mod tests {
             stdout: BufReader::new(child.stdout.take().expect("stdout")),
             child,
             next_id: 1,
-            compilation_configuration: compilation_configuration_stamp(spec, root).await,
+            compilation_configuration: Vec::new(),
             opened_versions: HashMap::new(),
             last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
@@ -2776,7 +2802,7 @@ mod tests {
             stdout: BufReader::new(child.stdout.take().expect("stdout")),
             child,
             next_id: 1,
-            compilation_configuration: compilation_configuration_stamp(spec, root).await,
+            compilation_configuration: Vec::new(),
             opened_versions: HashMap::new(),
             last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
