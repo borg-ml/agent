@@ -16336,9 +16336,17 @@ impl AgentTurnExecutor for NetworkThenSuccessExecutor {
             })
             .await?;
         tokio::time::sleep(Duration::from_millis(20)).await;
-        if self.failures > 10 {
+        let current = turn.agent_tools.call("get_goal", json!({})).await?;
+        if current["goal"].is_null() {
             turn.agent_tools
-                .call("update_goal", serde_json::json!({"status": "complete"}))
+                .call("create_goal", json!({"objective": "Finish recovered work"}))
+                .await?;
+        }
+        // A recovered turn may resume a goal blocked on human permission.
+        // Its expired connection backoff must no longer deny that request.
+        for status in ["blocked", "active", "complete"] {
+            turn.agent_tools
+                .call("update_goal", json!({"status": status}))
                 .await?;
         }
         Ok(AgentTurnResult {

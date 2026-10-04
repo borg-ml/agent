@@ -4282,6 +4282,13 @@ async fn run_agent_session_store_kernel_inner(
             stop(&mut journal, &events, session_id).await?;
             return Ok(());
         };
+        // Prompt selection may have released the retry timer inside the idle
+        // wait, after the boundary cleanup above. Do not carry that finished
+        // wait into the running turn's goal tools.
+        if retry_not_before.is_none_or(|deadline| deadline <= Instant::now()) {
+            retry_not_before = None;
+            usage_wait_prompts = None;
+        }
         // Queue batching adopts the newest message's id. Keep a retry tied to
         // the batch containing its original prompt so continuation framing and
         // retry accounting survive a follow-up arriving during reconnection.
