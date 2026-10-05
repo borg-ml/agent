@@ -53,6 +53,18 @@ of what you named:
 
 `await_watches` is a compatibility alias for the same tool.
 
+## Completion and notification delivery
+
+A command watcher releases its active slot when the process finishes, even if
+its exit notification is waiting for space in the session's event queue.
+`list_watchers` can therefore show `running: false` with `event_count: 0` until
+that notification is accepted. The exit report is still retried and delivered
+once; pending delivery is not a running command.
+
+Stopping a watcher attached through `session_id` stops observation only, not the
+shell started by `exec`. A watcher that started its own `command` owns that
+process and stops it too.
+
 ## What wakes you
 
 Wake-capable input ends the wait:
