@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.14.4)
 
+### Terminal
+
+- Clicking a sent-message or follow-up card opens the recipient's agent thread
+  with its history and a Back button, rather than only the tool details.
+  Unavailable recipients retain the inspector; right-click still copies details.
+
 ## 0.14.4 (2026-10-03)
 
 ### Release reliability
