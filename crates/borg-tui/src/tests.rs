@@ -15498,6 +15498,31 @@ fn copying_code_keeps_its_trailing_whitespace_and_drops_hover_padding() {
 }
 
 #[test]
+fn wrapped_numbered_diff_copy_excludes_the_continuous_gutter() {
+    let row = "const value = original_value + another_value + a_final_value;";
+    for marker in ["+", "-", " "] {
+        let lines = rendering::tool_body_lines(
+            "diff:rs",
+            &format!("@@ -12345 +67890 @@\n{marker}{row}"),
+            40,
+            "  │ ",
+        );
+        assert!(lines.len() > 1);
+        assert!(lines[1..].iter().all(is_wrapped_code_continuation));
+        let copied = selected_transcript_text(
+            &lines,
+            TranscriptPoint { row: 0, column: 0 },
+            TranscriptPoint {
+                row: lines.len() - 1,
+                column: usize::MAX,
+            },
+        )
+        .unwrap();
+        assert_eq!(copied, row);
+    }
+}
+
+#[test]
 fn transcript_selection_skips_headers_and_diff_line_number_gutters() {
     let header = Line::from(vec![
         Span::raw("  ▌ borg"),

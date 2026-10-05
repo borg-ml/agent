@@ -14773,7 +14773,9 @@ fn apply_composer_selection(
 /// or the clipboard gets a line break in the middle of a path.
 ///
 /// Only the gutter `syntax_lines` actually draws counts: blanks, then the
-/// dashed bar, then one space, in the gutter's own colour. Matching the
+/// dashed bar, then one space, in the gutter's own colour. Wrapped numbered
+/// diffs also retain the solid number-column separator before the dashed bar.
+/// Matching the
 /// character in unrelated message text would let it be read as a
 /// continuation, dropping content and splicing the line onto the one above.
 /// A message margin may precede the actual gutter span.
@@ -14794,6 +14796,7 @@ fn is_wrapped_code_continuation(line: &Line<'static>) -> bool {
     let Some(indent) = gutter.content.strip_suffix("┊ ") else {
         return false;
     };
+    let indent = indent.strip_suffix("│ ").unwrap_or(indent);
     !indent.is_empty() && indent.chars().all(|character| character == ' ')
 }
 

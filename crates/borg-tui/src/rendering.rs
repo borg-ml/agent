@@ -679,7 +679,16 @@ fn highlighted_diff_lines(
     ));
     // Continuations use the code view's `┊` gutter, which copy rejoins.
     let continuation = Span::styled(
-        format!("{}┊ ", " ".repeat(gutter_width.saturating_sub(2))),
+        if show_line_numbers {
+            // Keep the number-column separator in place on every visual row.
+            format!(
+                "{} {} │ ┊ ",
+                " ".repeat(number_width),
+                " ".repeat(number_width)
+            )
+        } else {
+            "┊ ".into()
+        },
         base_style.fg(Color::DarkGray),
     );
     super::markdown::wrap_markdown_spans(&source, width.saturating_sub(gutter_width).max(1))
@@ -1230,6 +1239,37 @@ mod tests {
         let wide = diff_lines(diff, 180, None);
         assert_eq!(narrow[0].to_string().matches('│').count(), 1);
         assert_eq!(wide[0].to_string().matches('│').count(), 3);
+    }
+
+    #[test]
+    fn wrapped_diff_rows_keep_the_number_gutter_aligned() {
+        let text = "const value = original_value + another_value + a_final_value;";
+        for (marker, background) in [
+            ("+", Some(DIFF_ADDED_BG)),
+            ("-", Some(DIFF_REMOVED_BG)),
+            (" ", None),
+        ] {
+            for width in [28, 40, 60] {
+                let lines = unified_diff_lines(
+                    &format!("@@ -12345 +67890 @@\n{marker}{text}"),
+                    width,
+                    Some("rs"),
+                    true,
+                );
+                assert!(lines.len() > 1, "fixture must wrap");
+                let divider = lines[0].spans[0].content.find('│').unwrap();
+                let gutter_width = lines[0].spans[0].width();
+                for line in &lines {
+                    assert_eq!(line.spans[0].content.find('│'), Some(divider));
+                    assert_eq!(line.spans[0].width(), gutter_width);
+                    assert_eq!(line.spans[0].style.bg, background);
+                }
+                for line in &lines[1..] {
+                    assert!(line.spans[0].content.ends_with("│ ┊ "));
+                    assert!(!line.spans[0].content.chars().any(|c| c.is_ascii_digit()));
+                }
+            }
+        }
     }
 
     #[test]
