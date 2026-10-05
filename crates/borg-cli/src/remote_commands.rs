@@ -2828,7 +2828,7 @@ async fn run_local_agent_session(
             terminal.set_notice(notice);
         } else if stale_local_owner {
             terminal.set_notice(
-                "This turn is owned by an older Borg build · upgrading automatically when it finishes"
+                "Older Borg worker · upgrades automatically when this turn and all active subagents are idle"
                     .to_string(),
             );
         } else if extension_catalog.has_errors() {
