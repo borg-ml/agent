@@ -2165,6 +2165,14 @@ async fn a_member_delegation_spawns_fresh_and_names_the_requester() {
     settle(member).await;
     let idle_answer = coordinator.get(idle).await.unwrap().final_text;
 
+    // The member must not be promised a nested/owned helper when delegation
+    // deliberately creates a fresh director-owned worker below.
+    let member_identity = coordinator.identity_prompt(member).await.unwrap();
+    assert!(member_identity.contains("Delegation remains owned by the team director /root"));
+    assert!(!member_identity.contains("Your children are /root/member/<name>"));
+    let director_identity = coordinator.identity_prompt(root).await.unwrap();
+    assert!(director_identity.contains("Your children are /root/<name>"));
+
     // Both workers are idle and compatible, so the claim filter would have
     // matched either of them.
     let helper = coordinator

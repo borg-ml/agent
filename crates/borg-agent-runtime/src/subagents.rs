@@ -5887,10 +5887,20 @@ impl SubagentCoordinator {
             Some(parent) => format!("Your parent is {parent}."),
             None => "You are the top-level session of this team.".to_string(),
         };
+        let delegation = if session_id == table.root_session_id {
+            format!("Your children are {path}/<name>; list_agents shows them.")
+        } else {
+            let director = table.task_name(table.root_session_id).ok()?;
+            format!(
+                "Delegation remains owned by the team director {director}; spawn_agent does not \
+                 create children owned by this member. Helpers receive the requester's address \
+                 for questions and final reports; list_agents shows the director's roster."
+            )
+        };
         Some(format!(
             "Your identity: team path {path}, session {session_id} (address: \
-             participant:{session_id}). {parent} Your children are {path}/<name>; list_agents \
-             shows them. Other top-level sessions are /root of their own trees, so a message \
+             participant:{session_id}). {parent} {delegation} \
+             Other top-level sessions are /root of their own trees, so a message \
              labelled \"from /root of another session\" is never you."
         ))
     }
