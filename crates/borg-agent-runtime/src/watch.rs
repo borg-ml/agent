@@ -718,6 +718,17 @@ impl Watches {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             if let Some(text) = report.take() {
+                // Completion releases capacity even while exit delivery is
+                // backpressured. Keep retrying the same notification below.
+                {
+                    let mut entries = self.entries.lock().await;
+                    if let Some(entry) = entries.get_mut(&info.watch_id)
+                        && entry.info.running
+                    {
+                        entry.info.running = false;
+                        self.changed.notify_one();
+                    }
+                }
                 match self.events.try_send(text) {
                     Ok(()) => {
                         self.note_event(info.watch_id).await;
@@ -1204,6 +1215,98 @@ mod tests {
             .write_stdin(session_id, server, None, true, Some(0), None)
             .await
             .unwrap();
+        watches.cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn finished_shell_releases_watch_slot_before_exit_delivery() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let processes = ProcessManager::default();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send("occupied".into()).await.unwrap();
+        let watches = Watches::new(processes.clone(), tx, session_id);
+        let build = processes
+            .exec(
+                session_id,
+                root.path(),
+                "read gate; echo built; exit 3".into(),
+                None,
+                Some(0),
+                None,
+                5000,
+                None,
+            )
+            .await
+            .unwrap()
+            .session_id;
+        let environment = BTreeMap::new();
+        let info = watches
+            .start(
+                session_id,
+                root.path(),
+                WatchArgs {
+                    session_id: Some(build),
+                    label: "Backpressured shell".into(),
+                    ..Default::default()
+                },
+                None,
+                5000,
+                &environment,
+            )
+            .await
+            .unwrap();
+        processes
+            .write_stdin(session_id, build, Some("go\n"), false, Some(0), None)
+            .await
+            .unwrap();
+        // Wait on state changes, not on the deliberately blocked event queue.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let changed = watches.changed.notified();
+                if !watches
+                    .list()
+                    .await
+                    .iter()
+                    .any(|entry| entry.watch_id == info.watch_id && entry.running)
+                {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("finished shell must not occupy a watcher slot");
+        let entry = watches.list().await.remove(0);
+        assert!(!entry.running);
+        assert_eq!(entry.event_count, 0, "exit notification is still pending");
+        for _ in 0..MAX_WATCHES {
+            watches
+                .start(
+                    session_id,
+                    root.path(),
+                    WatchArgs {
+                        command: "read gate".into(),
+                        label: "Replacement".into(),
+                        ..Default::default()
+                    },
+                    None,
+                    5000,
+                    &environment,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(rx.recv().await.unwrap(), "occupied");
+        let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            event.contains("built") && event.contains("Some(3)"),
+            "{event}"
+        );
+        assert!(rx.try_recv().is_err(), "exit must be delivered once");
         watches.cancel.cancel();
     }
 
