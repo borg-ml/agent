@@ -177,14 +177,6 @@ impl ContextEditor {
         Some(state.pending_system_override.take())
     }
 
-    pub(crate) async fn call_read_only(&self, arguments: Value) -> Result<Value> {
-        ensure!(
-            arguments.get("op").and_then(Value::as_str) != Some("edit"),
-            "context is read-only; conversation history can only be reduced through compaction"
-        );
-        self.call(arguments, false).await
-    }
-
     pub(crate) async fn call(&self, mut arguments: Value, allow_edit: bool) -> Result<Value> {
         if let Some(arguments) = arguments.as_object_mut() {
             arguments.remove("action");
@@ -230,7 +222,7 @@ impl ContextEditor {
                 }).collect::<Vec<_>>();
                 let next = args.offset + rows.len();
                 Ok(
-                    json!({"revision":revision, "entries":rows, "message_count":entries.len(), "next_offset":if args.id.is_none() && next < entries.len() { Some(next) } else { None }, "locked_tail_messages":state.entries.len()-state.visible, "estimated_tokens":entries_tokens(&state.entries)}),
+                    json!({"revision":revision, "entries":rows, "message_count":entries.len(), "next_offset":if args.id.is_none() && next < entries.len() { Some(next) } else { None }, "locked_tail_messages":state.entries.len()-state.visible}),
                 )
             }
             "edit" => {
@@ -319,19 +311,12 @@ impl ContextEditor {
                 state.entries = complete;
                 state.revision += 1;
                 Ok(
-                    json!({"revision":format!("{epoch}:{}", state.revision), "operations":args.edits.len(), "applies":"next_model_request", "journal_preserved":true, "cache_prefix_changed":system_changed, "estimated_tokens":entries_tokens(&state.entries)}),
+                    json!({"revision":format!("{epoch}:{}", state.revision), "operations":args.edits.len(), "applies":"next_model_request", "journal_preserved":true, "cache_prefix_changed":system_changed}),
                 )
             }
             other => bail!("unknown context operation {other}; use read or edit"),
         }
     }
-}
-
-fn entries_tokens(entries: &[Entry]) -> u64 {
-    entries
-        .iter()
-        .map(|entry| crate::native_harness::estimated_message_tokens(&entry.message))
-        .fold(0, u64::saturating_add)
 }
 
 fn reuse_entries(previous: &[Entry], messages: &[ModelMessage]) -> Vec<Entry> {
@@ -610,15 +595,27 @@ fn validate_entries(entries: &[Entry], allow_pending_tail: bool) -> Result<()> {
 pub(crate) fn tool_spec() -> Value {
     json!({
         "name":"context",
-        "description":"Inspect your model context without modifying it. Read returns stable message IDs and bounded text, with opaque replay/images retained internally. Conversation history is reduced only through compaction, never by selective edits or dropping replies. Read again after restart or compaction.",
+        "description":"Inspect and edit your own model context on Borg's loop. The harness manages context capacity and automatic compaction; do not trim or rewrite history to manage context size. Read returns stable message IDs and editable text, with opaque replay/images retained internally. Edit applies an atomic batch to the latest request's context while preserving the in-flight tool batch and newly appended messages. Supply the revision from read; edits require Full Access or approval. Replace system text, including an empty string; insert/drop/move history. Moving or dropping a tool call/result selects its whole group. Replacing assistant text clears its stale signed reasoning. A raw provider-neutral message is an optional escape hatch instead of text. Submit edits from a model tool batch; the API rejects edits during model requests or compaction. The append-only journal and tool permissions are unchanged. Edits are durable and affect the next model request; auto-compaction may subsequently reshape the view. Read again after restart or compaction. When editing history, preserve whether retained human requests were already answered or completed (keep the reply or a concise status summary), so old requests do not become new obligations.",
         "inputSchema":{
             "type":"object", "properties":{
-                "op":{"type":"string","enum":["read"]},
+                "op":{"type":"string","enum":["read","edit"]},
                 "offset":{"type":"integer","minimum":0},
                 "limit":{"type":"integer","minimum":1,"maximum":100},
                 "max_chars":{"type":"integer","minimum":0,"maximum":64000},
                 "text_offset":{"type":"integer","minimum":0,"description":"Character offset within message text; use id to page a long message."},
-                "id":{"type":"string","format":"uuid"}
+                "id":{"type":"string","format":"uuid"},
+                "revision":{"type":"string"},
+                "edits":{"type":"array","minItems":1,"maxItems":100,"items":{
+                    "type":"object","properties":{
+                        "op":{"type":"string","enum":["replace","drop","insert","move"]},
+                        "id":{"type":"string","format":"uuid"},
+                        "ids":{"type":"array","items":{"type":"string","format":"uuid"}},
+                        "before":{"type":"string","format":"uuid"},
+                        "after":{"type":"string","format":"uuid"},
+                        "role":{"type":"string","enum":["system","user","assistant"]},
+                        "text":{"type":"string"}, "message":{"type":"object"}
+                    },"required":["op"],"additionalProperties":false
+                }}
             },"required":["op"],"additionalProperties":false
         }
     })

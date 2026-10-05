@@ -2542,7 +2542,15 @@ impl AgentToolDispatcher {
                 }
                 Ok(result)
             }
-            "context" => self.context_editor.call_read_only(arguments).await,
+            "context" => {
+                self.context_editor
+                    .call(
+                        arguments,
+                        workflow_approved
+                            || self.runtime_permission == crate::PermissionMode::FullAccess,
+                    )
+                    .await
+            }
             "harness" => {
                 crate::harness::call(
                     arguments,

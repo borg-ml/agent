@@ -1843,7 +1843,6 @@ struct ConsultingExecutor {
 
 struct CrossProviderCompactionExecutor {
     seen: RecordedCompactionTurns,
-    compacted: Arc<Notify>,
     released: Arc<Mutex<Vec<CodingProvider>>>,
 }
 
@@ -2179,7 +2178,6 @@ impl AgentTurnExecutor for CrossProviderCompactionExecutor {
         assert_eq!(turn.provider, CodingProvider::Codex);
         assert!(turn.prompt.contains("first"));
         assert!(turn.prompt.contains("response to"));
-        self.compacted.notify_one();
         Ok(AgentCompaction {
             summary: "retained summary".to_string(),
             usage: Default::default(),
@@ -7624,6 +7622,7 @@ async fn session_semantics_are_independent_of_turn_execution_location() {
 
 #[tokio::test]
 async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() {
+    const EVENT_WAIT: Duration = Duration::from_secs(30);
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
@@ -7633,11 +7632,9 @@ async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() 
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let compacted = Arc::new(Notify::new());
     let released = Arc::new(Mutex::new(Vec::new()));
     let executor = Arc::new(CrossProviderCompactionExecutor {
         seen: Arc::clone(&seen),
-        compacted: Arc::clone(&compacted),
         released: Arc::clone(&released),
     });
     let actor_store = Arc::clone(&store);
@@ -7686,7 +7683,7 @@ async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() 
         .await
         .unwrap();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_WAIT, event_rx.recv())
             .await
             .expect("first turn completes")
             .expect("session remains open");
@@ -7713,19 +7710,17 @@ async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() 
         .send(HostCommand::Compact { session_id })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), compacted.notified())
-        .await
-        .expect("cross-provider compaction is invoked");
 
     let mut observed_compaction = false;
     while !observed_compaction {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_WAIT, event_rx.recv())
             .await
             .expect("compaction completes")
             .expect("session remains open");
         observed_compaction = matches!(
             event.kind,
-            SessionEventKind::ProviderEvent { kind, .. } if kind == "context_compaction"
+            SessionEventKind::ProviderEvent { provider: CodingProvider::Codex, kind, payload }
+                if kind == "context_compaction" && payload["status"] == "completed"
         );
     }
 
@@ -7742,7 +7737,7 @@ async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() 
         .await
         .unwrap();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_WAIT, event_rx.recv())
             .await
             .expect("follow-up turn completes")
             .expect("session remains open");

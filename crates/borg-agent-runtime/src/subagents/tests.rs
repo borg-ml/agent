@@ -6,9 +6,9 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::tempdir;
 
-// Full Access must not let a model bypass compaction by selectively editing history.
+// Context correction remains available without exposing a context-budget signal.
 #[tokio::test]
-async fn context_tool_is_read_only_even_with_full_access() {
+async fn context_tool_allows_edits_without_exposing_capacity() {
     let directory = tempdir().unwrap();
     let dispatcher = AgentToolDispatcher::new(
         SessionGoalTools::disconnected(),
@@ -51,29 +51,23 @@ async fn context_tool_is_read_only_even_with_full_access() {
         .call("context", json!({"op":"read"}))
         .await
         .unwrap();
-    for op in ["drop", "replace", "move", "insert"] {
-        let error = dispatcher
-            .call(
-                "context",
-                json!({
-                    "op":"edit", "revision":before["revision"],
-                    "edits":[{"op":op,"ids":[before["entries"][2]["id"]]}]
-                }),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("read-only"), "{error}");
-    }
-    assert_eq!(
-        before,
-        dispatcher
-            .call("context", json!({"op":"read"}))
-            .await
-            .unwrap()
-    );
+    assert!(before.get("estimated_tokens").is_none());
+    let edited = dispatcher
+        .call("context", json!({
+            "op":"edit", "revision":before["revision"],
+            "edits":[{"op":"replace", "id":before["entries"][2]["id"], "text":"corrected answer"}]
+        }))
+        .await
+        .unwrap();
+    assert!(edited.get("estimated_tokens").is_none());
+    let after = dispatcher
+        .call("context", json!({"op":"read"}))
+        .await
+        .unwrap();
+    assert_eq!(after["entries"][2]["text"], "corrected answer");
+    assert!(after.get("estimated_tokens").is_none());
     assert!(
-        rx.try_recv().is_err(),
-        "rejected edits must not journal a mutation"
+        matches!(rx.try_recv().unwrap(), SessionEventKind::ProviderEvent { kind, .. } if kind == "native_context_edit")
     );
 }
 
