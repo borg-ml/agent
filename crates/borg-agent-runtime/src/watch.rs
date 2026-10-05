@@ -111,6 +111,7 @@ struct WatchEntry {
     /// A shell started by `exec`: the watch reports its exit but never owns it,
     /// so stopping the watch leaves the shell running.
     attached: bool,
+    pending_report: bool,
 }
 
 #[derive(Clone)]
@@ -324,7 +325,7 @@ impl Watches {
                 "runtime could not background: session watchers stopped or watcher limit reached"
             );
         }
-        entries.retain(|_, entry| entry.info.running || entry.runtime);
+        entries.retain(|_, entry| entry.info.running || entry.runtime || entry.pending_report);
         let mut completed: Vec<_> = entries
             .values()
             .filter(|entry| entry.runtime && !entry.info.running)
@@ -358,6 +359,7 @@ impl Watches {
                 agent: None,
                 runtime: true,
                 attached: false,
+                pending_report: false,
             },
         );
         drop(entries);
@@ -439,7 +441,7 @@ impl Watches {
             entries.values().filter(|entry| entry.info.running).count() < MAX_WATCHES,
             "at most {MAX_WATCHES} watchers can run; stop one first"
         );
-        entries.retain(|_, entry| entry.info.running || entry.runtime);
+        entries.retain(|_, entry| entry.info.running || entry.runtime || entry.pending_report);
         if let Some(process) = attached {
             ensure!(
                 !entries
@@ -498,6 +500,7 @@ impl Watches {
                 agent: None,
                 runtime: false,
                 attached: attached.is_some(),
+                pending_report: false,
             },
         );
         let terminal_snapshot = (!snapshot.running).then_some(snapshot);
@@ -517,6 +520,7 @@ impl Watches {
                 .await;
             if let Some(entry) = watches.entries.lock().await.get_mut(&task_info.watch_id) {
                 entry.info.running = false;
+                entry.pending_report = false;
             }
             watches.changed.notify_one();
             stopped.cancel();
@@ -557,7 +561,7 @@ impl Watches {
             entries.values().filter(|entry| entry.info.running).count() < MAX_WATCHES,
             "at most {MAX_WATCHES} watchers can run; stop one first"
         );
-        entries.retain(|_, entry| entry.info.running || entry.runtime);
+        entries.retain(|_, entry| entry.info.running || entry.runtime || entry.pending_report);
         let info = WatchInfo {
             watch_id: Uuid::new_v4(),
             label: args.label,
@@ -581,6 +585,7 @@ impl Watches {
                 agent: Some(subjects),
                 runtime: false,
                 attached: false,
+                pending_report: false,
             },
         );
         drop(entries);
@@ -653,6 +658,7 @@ impl Watches {
 
     async fn note_event(&self, watch_id: Uuid) {
         if let Some(entry) = self.entries.lock().await.get_mut(&watch_id) {
+            entry.pending_report = false;
             entry.info.last_event_at = Some(chrono::Utc::now());
             entry.info.event_count = entry.info.event_count.saturating_add(1);
         }
@@ -717,6 +723,16 @@ impl Watches {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            if finished {
+                let mut entries = self.entries.lock().await;
+                if let Some(entry) = entries.get_mut(&info.watch_id)
+                    && entry.info.running
+                {
+                    entry.info.running = false;
+                    entry.pending_report = true;
+                    self.changed.notify_one();
+                }
+            }
             if let Some(text) = report.take() {
                 match self.events.try_send(text) {
                     Ok(()) => {
@@ -1204,6 +1220,121 @@ mod tests {
             .write_stdin(session_id, server, None, true, Some(0), None)
             .await
             .unwrap();
+        watches.cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn adopted_shell_exit_releases_capacity_before_backpressured_report_delivery() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = Uuid::new_v4();
+        let processes = ProcessManager::default();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send("busy session".to_string()).await.unwrap();
+        let watches = Watches::new(processes.clone(), tx, owner);
+        let environment = BTreeMap::new();
+        let process = processes
+            .exec(
+                owner,
+                root.path(),
+                "read gate; echo built; exit 3".into(),
+                None,
+                Some(0),
+                None,
+                60_000,
+                None,
+            )
+            .await
+            .unwrap()
+            .session_id;
+        let watch = watches
+            .start(
+                owner,
+                root.path(),
+                WatchArgs {
+                    session_id: Some(process),
+                    label: "Adopted build".into(),
+                    ..Default::default()
+                },
+                None,
+                60_000,
+                &environment,
+            )
+            .await
+            .unwrap();
+        let mut output = processes.subscribe_output();
+        processes
+            .write_stdin(owner, process, Some("go\n"), false, Some(0), None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while output.recv().await.unwrap() != (process, None) {}
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let changed = watches.changed.notified();
+                if !watches
+                    .list()
+                    .await
+                    .iter()
+                    .find(|entry| entry.watch_id == watch.watch_id)
+                    .unwrap()
+                    .running
+                {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("exited shell retained a running watcher while its report queue was full");
+        for _ in 0..MAX_WATCHES {
+            watches
+                .start_agents(agent_args(
+                    vec![Uuid::new_v4()],
+                    Some(NotifyOn::Exit),
+                    Aggregate::All,
+                ))
+                .await
+                .unwrap();
+        }
+        let terminal = watches
+            .list()
+            .await
+            .into_iter()
+            .find(|entry| entry.watch_id == process)
+            .expect("pending report metadata was discarded");
+        assert_eq!(terminal.event_count, 0);
+        assert_eq!(rx.recv().await.unwrap(), "busy session");
+        let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            event.contains("built") && event.contains("Some(3)"),
+            "{event}"
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let changed = watches.changed.notified();
+                let info = watches
+                    .list()
+                    .await
+                    .into_iter()
+                    .find(|entry| entry.watch_id == process)
+                    .unwrap();
+                if info.event_count == 1 {
+                    assert!(!info.running);
+                    assert!(info.last_event_at.is_some());
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_err(), "duplicate terminal report");
         watches.cancel.cancel();
     }
 

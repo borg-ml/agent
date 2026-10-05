@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.14.5)
 
+### Watchers
+
+- Completed command watchers release their active slot even when the session's
+  notification queue is full. Pending exit reports remain available and are
+  delivered once the session can receive them.
+
 ## 0.14.5 (2026-10-05)
 
 ### Terminal
