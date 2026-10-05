@@ -19565,3 +19565,71 @@ async fn pending_approval_preserves_composer_typing() {
     ));
     terminal.shutdown().await;
 }
+
+#[test]
+fn message_cards_resolve_team_threads_after_replay() {
+    let director = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let now = Utc::now();
+    let agent = SubagentSnapshot {
+        session_id: child,
+        parent_session_id: director,
+        task_name: "/root/worker".into(),
+        status: SubagentStatus::Running,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        fast: false,
+        ultrafast: false,
+        cwd: PathBuf::from("/workspace"),
+        created_at: now,
+        updated_at: now,
+        detail: None,
+        final_text: None,
+        usage: Default::default(),
+        interrupted_by: None,
+    };
+    let agents = HashMap::from([(child, agent)]);
+    for name in [
+        "send_message",
+        "functions.followup_task",
+        "mcp__borg_agent__send_message",
+    ] {
+        for (target, expected) in [
+            ("worker".into(), Some(TeamRosterTarget::Child(child))),
+            ("/root/worker".into(), Some(TeamRosterTarget::Child(child))),
+            (
+                format!("session:{child}"),
+                Some(TeamRosterTarget::Child(child)),
+            ),
+            (
+                format!("participant:{child}"),
+                Some(TeamRosterTarget::Child(child)),
+            ),
+            ("/root".into(), Some(TeamRosterTarget::Director)),
+            (
+                format!("participant:{director}"),
+                Some(TeamRosterTarget::Director),
+            ),
+            ("unknown".into(), None),
+        ] {
+            let mut transcript = Transcript::default();
+            transcript.apply_history(&SessionEvent::new(
+                director,
+                1,
+                SessionEventKind::ToolStarted {
+                    tool_call_id: "message".into(),
+                    name: name.into(),
+                    input: serde_json::json!({"target":target,"message":"Please check"}),
+                    input_ref: None,
+                    parent_tool_call_id: None,
+                },
+            ));
+            let index = transcript.tools["message"];
+            assert_eq!(
+                message_thread_target(&transcript, index, director, &agents),
+                expected
+            );
+        }
+    }
+}

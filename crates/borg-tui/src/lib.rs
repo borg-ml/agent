@@ -1613,6 +1613,7 @@ impl GitStatusCache {
 }
 
 pub struct BorgTerminal {
+    session_id: Uuid,
     terminal: Terminal<CrosstermBackend<Stdout>>,
     input: TerminalInput,
     mode: ScreenMode,
@@ -1782,6 +1783,7 @@ pub struct BorgTerminal {
     composer_selection: Option<ComposerSelection>,
     pending_transcript_click: Option<PendingTranscriptClick>,
     pending_tool_copy: Option<usize>,
+    pending_message_thread: Option<String>,
     activity_clock: ActivityClock,
     notice: Option<String>,
     copy_notice_expires_at: Option<Instant>,
@@ -3039,6 +3041,7 @@ impl BorgTerminal {
         // previews, which say so rather than pretending to be legible.
         transcript.set_image_cell(image_preview_cell(image_picker.as_ref()));
         Ok(Self {
+            session_id,
             terminal,
             input: TerminalInput::spawn(),
             mode,
@@ -3192,6 +3195,7 @@ impl BorgTerminal {
             composer_selection: None,
             pending_transcript_click: None,
             pending_tool_copy: None,
+            pending_message_thread: None,
             activity_clock: ActivityClock::default(),
             notice: None,
             copy_notice_expires_at: None,
@@ -3244,6 +3248,7 @@ impl BorgTerminal {
         cwd: PathBuf,
         keybindings: &KeybindingConfig,
     ) -> Result<()> {
+        self.session_id = session_id;
         self.attachment_store = AttachmentStore::for_session(sessions_dir, session_id)?;
         self.composer_draft_store = ComposerDraftStore::for_session(sessions_dir, session_id);
         self.persisted_draft = None;
@@ -4801,6 +4806,7 @@ impl BorgTerminal {
         self.composer_selection = None;
         self.pending_transcript_click = None;
         self.pending_tool_copy = None;
+        self.pending_message_thread = None;
         self.hovered_entry = None;
         self.hovered_message = None;
         self.hovered_tool = None;
@@ -4908,6 +4914,7 @@ impl BorgTerminal {
     }
 
     fn close_tool_inspector(&mut self) {
+        self.pending_message_thread = None;
         if self.focused_tool.take().is_none() {
             return;
         }
@@ -5199,6 +5206,13 @@ impl BorgTerminal {
         {
             self.pending_tool_copy = None;
             return Ok(self.copy_transcript_entry_request(index));
+        }
+        if let Some(id) = self.pending_message_thread.as_ref()
+            && let Some(index) = self.transcript.tools.get(id).copied()
+            && self.transcript.tool_payloads(index).is_empty()
+        {
+            self.pending_message_thread = None;
+            self.open_message_thread(index);
         }
         Ok(None)
     }
@@ -7315,7 +7329,29 @@ impl BorgTerminal {
         }
     }
 
+    fn open_message_thread(&mut self, index: usize) -> bool {
+        let roster = self
+            .director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript);
+        let Some(target) = message_thread_target(
+            &self.transcript,
+            index,
+            self.session_id,
+            &roster.subagent_snapshots,
+        ) else {
+            return false;
+        };
+        match target {
+            TeamRosterTarget::Child(child_id) => self.focus_child_transcript(child_id),
+            TeamRosterTarget::Director => self.focus_director_transcript(),
+            TeamRosterTarget::Inactive => unreachable!(),
+        }
+        true
+    }
+
     fn run_pending_transcript_click(&mut self, click: PendingTranscriptClick) -> UiAction {
+        self.pending_message_thread = None;
         match click {
             PendingTranscriptClick::Link(target) => {
                 return match resolve_link(&target, self.session_cwd(), self.local_file_links) {
@@ -7335,6 +7371,16 @@ impl BorgTerminal {
                 self.invalidate_transcript_render_cache();
             }
             PendingTranscriptClick::Tool { index, run } => {
+                if self.open_message_thread(index) {
+                    return UiAction::None;
+                }
+                if !self.transcript.tool_payloads(index).is_empty() {
+                    self.pending_message_thread = self
+                        .transcript
+                        .tools
+                        .iter()
+                        .find_map(|(id, row)| (*row == index).then(|| id.clone()));
+                }
                 self.nested_scroll_motion = None;
                 if let Some((start, max_offset)) = run {
                     self.transcript.anchor_tool_run(start, max_offset);
@@ -8438,7 +8484,24 @@ impl BorgTerminal {
             !showing_slash_suggestions && notice.is_none() && cold_cache_guidance.is_none();
         let transcript_interaction_hint = self.link_hint().or_else(|| {
             self.hovered_tool
-                .and_then(|index| self.transcript.tool_copy_hint(index))
+                .and_then(|index| {
+                    let roster = self
+                        .director_transcript
+                        .as_deref()
+                        .unwrap_or(&self.transcript);
+                    if message_thread_target(
+                        &self.transcript,
+                        index,
+                        self.session_id,
+                        &roster.subagent_snapshots,
+                    )
+                    .is_some()
+                    {
+                        Some("click open agent thread · right-click copy tool details")
+                    } else {
+                        self.transcript.tool_copy_hint(index)
+                    }
+                })
                 .or_else(|| {
                     self.hovered_tool_run_header
                         .map(|start| self.transcript.tool_run_header_hint(start))
@@ -12148,6 +12211,52 @@ fn track_child_activity(
         .entry(child_id)
         .or_default()
         .observe(status, observed_at);
+}
+
+fn message_thread_target(
+    transcript: &Transcript,
+    index: usize,
+    director_id: Uuid,
+    agents: &HashMap<Uuid, SubagentSnapshot>,
+) -> Option<TeamRosterTarget> {
+    let TranscriptEntry::Tool {
+        source_name,
+        code_view: Some((language, input)),
+        ..
+    } = transcript.order.get(index)?
+    else {
+        return None;
+    };
+    let name = source_name.rsplit('.').next()?.rsplit("__").next()?;
+    if !matches!(name, "send_message" | "followup_task") || language != "json" {
+        return None;
+    }
+    let input: serde_json::Value = serde_json::from_str(input).ok()?;
+    let target = input.get("target")?.as_str()?;
+    if target == "/root" {
+        return Some(TeamRosterTarget::Director);
+    }
+    let id = target
+        .strip_prefix("session:")
+        .or_else(|| target.strip_prefix("participant:"))
+        .unwrap_or(target);
+    if let Ok(id) = Uuid::parse_str(id) {
+        return if id == director_id {
+            Some(TeamRosterTarget::Director)
+        } else {
+            agents
+                .contains_key(&id)
+                .then_some(TeamRosterTarget::Child(id))
+        };
+    }
+    let mut matches = agents.values().filter(|agent| {
+        agent.task_name == target || agent.task_name.strip_prefix("/root/") == Some(target)
+    });
+    let agent = matches.next()?;
+    matches
+        .next()
+        .is_none()
+        .then_some(TeamRosterTarget::Child(agent.session_id))
 }
 
 fn display_agent_name(task_name: &str) -> String {
