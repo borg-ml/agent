@@ -7,6 +7,11 @@ Git comparison.
 
 ### Terminal
 
+- The agent roster groups every non-running descendant under an expandable,
+  scrollable Inactive section, including normally completed Ready agents.
+  Delegated agents retain their requesting parent and nested team path across
+  restarts; assignment badges show the originating agent instead of director.
+
 - Clicking a sent-message or follow-up card opens the recipient's agent thread
   with its history and a Back button, rather than only the tool details.
   Unavailable recipients retain the inspector; right-click still copies details.

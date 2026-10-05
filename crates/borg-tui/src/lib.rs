@@ -1640,6 +1640,7 @@ pub struct BorgTerminal {
     sidecar_focus_request: Option<String>,
     team_switcher_open: bool,
     inactive_team_expanded: bool,
+    team_roster_scroll: usize,
     team_roster_hit_areas: Vec<(Rect, TeamRosterTarget)>,
     hovered_team_roster: Option<usize>,
     back_to_director_area: Option<Rect>,
@@ -3065,6 +3066,7 @@ impl BorgTerminal {
             sidecar_focus_request: None,
             team_switcher_open: false,
             inactive_team_expanded: false,
+            team_roster_scroll: 0,
             team_roster_hit_areas: Vec::new(),
             hovered_team_roster: None,
             back_to_director_area: None,
@@ -4432,10 +4434,27 @@ impl BorgTerminal {
         }
     }
 
+    fn assignment_sender(&self, child_id: Uuid) -> String {
+        let director = self
+            .director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript);
+        director
+            .subagent_snapshots
+            .get(&child_id)
+            .and_then(|child| director.subagent_snapshots.get(&child.parent_session_id))
+            .map(|parent| display_agent_name(&parent.task_name))
+            .unwrap_or_else(|| "director".to_string())
+    }
+
     fn child_transcript_mut(&mut self, child_id: Uuid) -> &mut Transcript {
-        self.child_transcripts
+        let sender = self.assignment_sender(child_id);
+        let transcript = self
+            .child_transcripts
             .entry(child_id)
-            .or_insert_with(new_child_transcript)
+            .or_insert_with(new_child_transcript);
+        transcript.assignment_sender = sender;
+        transcript
     }
 
     fn focus_child_transcript(&mut self, child_id: Uuid) {
@@ -4458,6 +4477,7 @@ impl BorgTerminal {
                 child_id,
             );
         }
+        self.transcript.assignment_sender = self.assignment_sender(child_id);
         self.focused_child = Some(child_id);
         self.interrupt_requested = false;
         self.team_switcher_open = false;
@@ -4620,6 +4640,7 @@ impl BorgTerminal {
             &events,
             optimistic_pending,
         );
+        transcript.assignment_sender = self.assignment_sender(child_id);
         if self.focused_child == Some(child_id) {
             let inspector_anchor = self.action_inspector_anchor();
             self.transcript = transcript;
@@ -4999,7 +5020,7 @@ impl BorgTerminal {
         match focus {
             StatusFocus::Agents => {
                 self.agents_status_hovered = visible;
-                self.hovered_team_roster = row;
+                self.hovered_team_roster = row.map(|row| row + self.team_roster_scroll);
             }
             StatusFocus::Goal => self.goal_status_hovered = visible,
             StatusFocus::Model => self.model_status_hovered = visible,
@@ -6522,7 +6543,7 @@ impl BorgTerminal {
                     .find_map(|(area, index)| area.contains(pointer).then_some(*index));
                 self.hovered_team_roster = if self.picker.is_none() && !self.keybindings_open {
                     team_roster_target_at(&self.team_roster_hit_areas, pointer)
-                        .map(|(index, _)| index)
+                        .map(|(index, _)| index + self.team_roster_scroll)
                 } else {
                     None
                 };
@@ -6585,6 +6606,7 @@ impl BorgTerminal {
                             TeamRosterTarget::Director => self.focus_director_transcript(),
                             TeamRosterTarget::Inactive => {
                                 self.inactive_team_expanded = !self.inactive_team_expanded;
+                                self.team_roster_scroll = 0;
                             }
                         }
                         return Ok(UiAction::None);
@@ -6823,6 +6845,21 @@ impl BorgTerminal {
                     ) {
                         return Ok(UiAction::None);
                     }
+                }
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) && self
+                    .team_roster_hit_areas
+                    .iter()
+                    .any(|(area, _)| area.contains(pointer))
+                {
+                    self.team_roster_scroll = if mouse.kind == MouseEventKind::ScrollUp {
+                        self.team_roster_scroll.saturating_sub(scroll_repetitions)
+                    } else {
+                        self.team_roster_scroll.saturating_add(scroll_repetitions)
+                    };
+                    return Ok(UiAction::None);
                 }
                 if background_hover_suppressed {
                     return Ok(UiAction::None);
@@ -8423,17 +8460,10 @@ impl BorgTerminal {
             .as_deref()
             .unwrap_or(&self.transcript);
         let active_subagents = team_transcript.active_subagent_count();
-        // Children that stopped or failed keep the team label up, so the roster
-        // that resumes them stays one hover away.
-        let stopped_subagents = team_transcript
+        let inactive_subagents = team_transcript
             .subagent_snapshots
             .values()
-            .filter(|agent| {
-                matches!(
-                    agent.status,
-                    SubagentStatus::Stopped | SubagentStatus::Failed
-                )
-            })
+            .filter(|agent| agent.status != SubagentStatus::Running)
             .count();
         let agent_roster_entries = team_transcript.agent_roster_entries();
         let focused_agent_name = self.focused_child.and_then(|child| {
@@ -9614,7 +9644,7 @@ impl BorgTerminal {
             }
             let status_width = status_spans.iter().map(|span| span.width()).sum::<usize>();
             let agents_status = agents_status_label(active_subagents).or_else(|| {
-                (stopped_subagents > 0).then(|| format!("{stopped_subagents} inactive"))
+                (inactive_subagents > 0).then(|| format!("{inactive_subagents} inactive"))
             });
             let agents_status_width = agents_status
                 .as_ref()
@@ -9835,7 +9865,12 @@ impl BorgTerminal {
                 };
                 hint_occlusions.push(tooltip);
                 frame.render_widget(Clear, tooltip);
-                let roster_lines = team_roster_table_lines(
+                let row_capacity = tooltip.height.saturating_sub(3) as usize;
+                self.team_roster_scroll = self
+                    .team_roster_scroll
+                    .min(visible_roster.len().saturating_sub(row_capacity));
+                let row_offset = self.team_roster_scroll;
+                let mut roster_lines = team_roster_table_lines(
                     &visible_roster,
                     team_transcript,
                     tooltip.width.saturating_sub(2) as usize,
@@ -9844,6 +9879,7 @@ impl BorgTerminal {
                     inactive_header_index,
                     ui_language,
                 );
+                roster_lines.drain(1..1 + row_offset);
                 frame.render_widget(
                     Paragraph::new(roster_lines)
                         .style(Style::default().fg(Color::White).bg(COMMAND_PANEL_BG))
@@ -9860,7 +9896,12 @@ impl BorgTerminal {
                         ),
                     tooltip,
                 );
-                for (index, entry) in visible_roster.iter().enumerate() {
+                for (index, entry) in visible_roster
+                    .iter()
+                    .enumerate()
+                    .skip(row_offset)
+                    .take(row_capacity)
+                {
                     let target = if inactive_header_index == Some(index) {
                         TeamRosterTarget::Inactive
                     } else if let Some(child_id) = entry.child_id {
@@ -9871,7 +9912,7 @@ impl BorgTerminal {
                     next_team_roster_hit_areas.push((
                         Rect {
                             x: tooltip.x.saturating_add(1),
-                            y: tooltip.y.saturating_add(2 + index as u16),
+                            y: tooltip.y.saturating_add(2 + (index - row_offset) as u16),
                             width: tooltip.width.saturating_sub(2),
                             height: 1,
                         },
@@ -12501,10 +12542,9 @@ fn visible_team_roster(
     entries: &[AgentRosterEntry],
     inactive_expanded: bool,
 ) -> (Vec<AgentRosterEntry>, Option<usize>) {
-    let inactive_start = entries.iter().position(|entry| {
-        entry.child_id.is_some()
-            && (entry.state.starts_with("stopped") || entry.state.starts_with("failed"))
-    });
+    let inactive_start = entries
+        .iter()
+        .position(|entry| entry.child_id.is_some() && entry.state != "running");
     let Some(inactive_start) = inactive_start else {
         return (entries.to_vec(), None);
     };
@@ -18017,13 +18057,6 @@ fn agents_status_label(active_agents: usize) -> Option<String> {
             if active_agents == 1 { "" } else { "s" }
         )
     })
-}
-
-fn subagent_is_working(status: SubagentStatus) -> bool {
-    matches!(
-        status,
-        SubagentStatus::Starting | SubagentStatus::Running | SubagentStatus::WaitingForApproval
-    )
 }
 
 fn agents_status_spinner_style(hovered: bool) -> Style {

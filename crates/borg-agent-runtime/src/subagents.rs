@@ -1260,7 +1260,10 @@ impl AgentToolDispatcher {
         // exactly like omitting workdir. Keep native root containment for all
         // other explicit paths; this is not admission of arbitrary workdirs.
         let execution_root = {
-            let remembered = self.shell_directory.read().unwrap_or_else(|p| p.into_inner());
+            let remembered = self
+                .shell_directory
+                .read()
+                .unwrap_or_else(|p| p.into_inner());
             match (args.workdir.as_deref(), remembered.as_ref()) {
                 (Some(workdir), Some(current))
                     if Path::new(workdir).is_absolute()
@@ -3646,7 +3649,21 @@ const RESUME_AFTER_RESTART: &str = "Borg restarted while you were working on you
 
 impl SubagentTable {
     fn reserve(&mut self, task_name: &str, launch: &LaunchSession) -> Result<SubagentSnapshot> {
-        let task_name = canonical_task_name(task_name)?;
+        self.reserve_as(self.root_session_id, task_name, launch)
+    }
+
+    fn reserve_as(
+        &mut self,
+        parent_session_id: Uuid,
+        task_name: &str,
+        launch: &LaunchSession,
+    ) -> Result<SubagentSnapshot> {
+        let name = canonical_task_name(task_name)?;
+        let task_name = format!(
+            "{}/{}",
+            self.task_name(parent_session_id)?,
+            name.strip_prefix("/root/").unwrap()
+        );
         if self.task_names.contains_key(&task_name) {
             bail!(
                 "subagent task name already exists: {task_name}; use followup_task to give it more work"
@@ -3663,7 +3680,7 @@ impl SubagentTable {
         let now = Utc::now();
         let snapshot = SubagentSnapshot {
             session_id: Uuid::new_v4(),
-            parent_session_id: self.root_session_id,
+            parent_session_id,
             task_name: task_name.clone(),
             status: SubagentStatus::Starting,
             provider: launch.provider,
@@ -4456,8 +4473,20 @@ impl SubagentCoordinator {
         *self.projected_root_messages.lock().await = projected_root_messages;
         let mut recovery_updates = Vec::new();
         let root_session_id = self.table.lock().await.root_session_id;
+        let mut descendants = HashSet::from([root_session_id]);
+        loop {
+            let before = descendants.len();
+            for snapshot in latest.values() {
+                if descendants.contains(&snapshot.parent_session_id) {
+                    descendants.insert(snapshot.session_id);
+                }
+            }
+            if descendants.len() == before {
+                break;
+            }
+        }
         for mut snapshot in latest.into_values() {
-            if snapshot.parent_session_id != root_session_id {
+            if !descendants.contains(&snapshot.session_id) {
                 continue;
             }
             let mirrored_status = snapshot.status;
@@ -4472,7 +4501,7 @@ impl SubagentCoordinator {
                             format!("subagent session {} is already active", snapshot.session_id)
                         })?;
                     self.store
-                        .register_child_session(root_session_id, snapshot.session_id)
+                        .register_child_session(snapshot.parent_session_id, snapshot.session_id)
                         .await?;
                     self.store.state(snapshot.session_id).await
                 }
@@ -4622,8 +4651,9 @@ impl SubagentCoordinator {
     }
 
     pub async fn spawn(&self, request: SpawnSubagent) -> Result<SubagentSnapshot> {
-        let launch = self.subagent_launch(&request).await?;
-        self.spawn_with_launch(&request.task_name, launch).await
+        let launch = self.subagent_launch(self.root_session_id, &request).await?;
+        self.spawn_with_launch(self.root_session_id, &request.task_name, launch)
+            .await
     }
 
     /// Resolve the lane a child runs on: the parent's own, unless the caller
@@ -4634,16 +4664,32 @@ impl SubagentCoordinator {
     /// provider or model since then would otherwise hand its children the lane
     /// it was launched on, and a fan-out then dies on a route the spawning
     /// parent is not even using, with a refusal it cannot act on.
-    async fn subagent_launch(&self, request: &SpawnSubagent) -> Result<LaunchSession> {
+    async fn subagent_launch(
+        &self,
+        parent_session_id: Uuid,
+        request: &SpawnSubagent,
+    ) -> Result<LaunchSession> {
         let message = required_message(&request.message)?;
         let mut launch = self.root_launch.clone();
+        if parent_session_id != self.root_session_id {
+            let parent = self
+                .get(parent_session_id)
+                .await
+                .context("unknown spawning parent")?;
+            launch.cwd = parent.cwd;
+            launch.provider = parent.provider;
+            launch.model = parent.model;
+            launch.effort = parent.effort;
+            launch.fast = Some(parent.fast);
+            launch.ultrafast = Some(parent.ultrafast);
+        }
         launch.request_id = Uuid::new_v4();
         launch.initial_prompt = Some(message);
         // A session that has not recorded a configuration yet, or a store that
         // cannot answer, keeps the launch it was started with.
         let parent = self
             .store
-            .state(self.root_session_id)
+            .state(parent_session_id)
             .await
             .ok()
             .and_then(|state| state.configuration);
@@ -4745,10 +4791,15 @@ impl SubagentCoordinator {
 
     async fn spawn_with_launch(
         &self,
+        parent_session_id: Uuid,
         task_name: &str,
         launch: LaunchSession,
     ) -> Result<SubagentSnapshot> {
-        let snapshot = self.table.lock().await.reserve(task_name, &launch)?;
+        let snapshot = self
+            .table
+            .lock()
+            .await
+            .reserve_as(parent_session_id, task_name, &launch)?;
         self.start_reserved(snapshot.clone(), launch, true).await?;
         Ok(snapshot)
     }
@@ -4764,7 +4815,7 @@ impl SubagentCoordinator {
         fresh: bool,
         directory: Option<PathBuf>,
     ) -> Result<Value> {
-        let mut launch = self.subagent_launch(&request).await?;
+        let mut launch = self.subagent_launch(actor_session_id, &request).await?;
         let explicit_directory = directory.is_some();
         if let Some(directory) = directory {
             let base = if actor_session_id == self.root_session_id {
@@ -4790,20 +4841,19 @@ impl SubagentCoordinator {
             );
             launch.cwd = directory;
         }
+        let parent_path = self.task_name_for_session(actor_session_id).await?;
+        launch.name = Some(format!(
+            "{parent_path}/{}",
+            canonical_task_name(&request.task_name)?
+                .strip_prefix("/root/")
+                .unwrap()
+        ));
         let assignment_name = launch
             .name
             .as_deref()
             .expect("subagent launch has a canonical task name")
             .to_string();
-        // Every worker on the roster is the director's: its snapshot's parent
-        // is always the root session, whoever asked for it. Only the director
-        // can know whether an idle worker holds context or unlanded work it
-        // means to follow up on, so only the director hands one a new task.
-        // A member that delegated used to claim whichever compatible worker
-        // was idle -- a worker of the director's, with unrelated context and
-        // a last answer the claim dropped, or the member's own seat when the
-        // member was between turns. A member always gets a fresh worker, told
-        // who asked, because the worker's reports otherwise go to the director.
+        // Members get fresh children; never repurpose another branch's context.
         let member = (actor_session_id != self.root_session_id).then_some(actor_session_id);
         let may_reuse = !fresh && !explicit_directory && member.is_none();
         if let Some(member) = member {
@@ -4833,11 +4883,18 @@ impl SubagentCoordinator {
             // the old identity. Holding the lock across both steps also makes
             // the uniqueness check above authoritative: two concurrent
             // assignments cannot reserve the same name.
+            let parents = table
+                .entries
+                .values()
+                .map(|entry| entry.snapshot.parent_session_id)
+                .collect::<HashSet<_>>();
             let claimed = table
                 .entries
                 .values_mut()
                 .filter(|entry| {
                     may_reuse
+                        && entry.snapshot.parent_session_id == actor_session_id
+                        && !parents.contains(&entry.snapshot.session_id)
                         && entry.snapshot.status == SubagentStatus::Ready
                         && !entry.assignment_claimed
                         && !is_persistent_peer_lane(&entry.snapshot.task_name)
@@ -4979,7 +5036,9 @@ impl SubagentCoordinator {
             }
         }
 
-        let agent = self.spawn_with_launch(&request.task_name, launch).await?;
+        let agent = self
+            .spawn_with_launch(actor_session_id, &request.task_name, launch)
+            .await?;
         let mut value = serde_json::to_value(agent)?;
         value["reused"] = Value::Bool(false);
         value["assignment_task_name"] = Value::String(assignment_name);
@@ -5902,16 +5961,8 @@ impl SubagentCoordinator {
             Some(parent) => format!("Your parent is {parent}."),
             None => "You are the top-level session of this team.".to_string(),
         };
-        let delegation = if session_id == table.root_session_id {
-            format!("Your children are {path}/<name>; list_agents shows them.")
-        } else {
-            let director = table.task_name(table.root_session_id).ok()?;
-            format!(
-                "Delegation remains owned by the team director {director}; spawn_agent does not \
-                 create children owned by this member. Helpers receive the requester's address \
-                 for questions and final reports; list_agents shows the director's roster."
-            )
-        };
+        let delegation =
+            format!("Your children are {path}/<name>; list_agents shows the whole director tree.");
         Some(format!(
             "Your identity: team path {path}, session {session_id} (address: \
              participant:{session_id}). {parent} {delegation} \

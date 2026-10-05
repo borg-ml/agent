@@ -1239,6 +1239,17 @@ fn a_child_badges_its_director_assignment_and_leaves_later_prompts_alone() {
         "{root_prompt:?}"
     );
     assert!(!root_prompt.contains(&SUBAGENT_PURPLE), "{root_prompt:?}");
+
+    transcript.assignment_sender = "member/helper".to_string();
+    let header = row_color(&transcript, "▌ member/helper ▐");
+    assert!(header.contains(&SUBAGENT_PURPLE), "{header:?}");
+    assert!(
+        transcript
+            .render(100, None, None, None)
+            .0
+            .iter()
+            .all(|line| !line.to_string().contains("▌ director ▐"))
+    );
 }
 
 #[test]
@@ -8044,7 +8055,7 @@ fn wait_spawn_and_lsp_diagnostics_use_compact_stable_result_shapes() {
 }
 
 #[test]
-fn active_subagent_count_tracks_only_working_children() {
+fn active_subagent_count_tracks_only_running_children() {
     let mut transcript = Transcript::default();
     assert_eq!(transcript.active_subagent_count(), 0);
 
@@ -8061,7 +8072,7 @@ fn active_subagent_count_tracks_only_working_children() {
         .subagents
         .insert(Uuid::new_v4(), SubagentStatus::Ready);
 
-    assert_eq!(transcript.active_subagent_count(), 2);
+    assert_eq!(transcript.active_subagent_count(), 1);
 
     transcript
         .subagents
@@ -8461,7 +8472,7 @@ fn persistent_peers_follow_ordinary_agent_visibility() {
 
     let ready_rows = transcript.agent_roster_entries();
 
-    assert_eq!(ready_rows.len(), 1);
+    assert_eq!(ready_rows.len(), 2);
     assert_eq!(transcript.active_subagent_count(), 0);
     assert_eq!(
         agents_status_label(transcript.active_subagent_count()),
@@ -8497,7 +8508,7 @@ fn persistent_peers_follow_ordinary_agent_visibility() {
 }
 
 #[test]
-fn agent_roster_lists_working_children_then_resumable_stopped_ones() {
+fn agent_roster_lists_running_children_then_all_inactive_states() {
     let parent_id = Uuid::new_v4();
     let now = chrono::Utc::now();
     let snapshot = |name: &str, status, age_minutes| SubagentSnapshot {
@@ -8535,30 +8546,26 @@ fn agent_roster_lists_working_children_then_resumable_stopped_ones() {
 
     let rows = transcript.agent_roster_entries();
 
-    // Working children first; stopped and failed ones stay listed so they can
-    // be resumed; idle ready workers are left out.
-    assert_eq!(rows.len(), 6);
-    assert_eq!(rows[1].name, "a_starting");
-    assert_eq!(rows[2].name, "b_waiting");
-    assert_eq!(rows[3].name, "z_live");
-    assert_eq!(rows[4].name, "older");
-    assert_eq!(rows[4].state, "stopped · click to resume");
-    assert_eq!(rows[5].name, "oldest");
-    assert_eq!(rows[5].state, "failed · click to resume");
-    assert!(!rows.iter().any(|row| row.name == "idle"));
+    assert_eq!(rows.len(), 7);
+    assert_eq!(rows[1].name, "z_live");
+    assert_eq!(rows[2].name, "a_starting");
+    assert_eq!(rows[3].name, "b_waiting");
+    assert_eq!(rows[4].name, "idle");
+    assert_eq!(rows[5].state, "stopped · click to resume");
+    assert_eq!(rows[6].state, "failed · click to resume");
 
     let (collapsed, header) = visible_team_roster(&rows, false);
-    assert_eq!(header, Some(4));
-    assert_eq!(collapsed.len(), 5);
-    assert_eq!(collapsed[4].name, "▸ Inactive · 2");
-    assert!(collapsed.iter().all(|row| row.name != "older"));
+    assert_eq!(header, Some(2));
+    assert_eq!(collapsed.len(), 3);
+    assert_eq!(collapsed[2].name, "▸ Inactive · 5");
     let (expanded, header) = visible_team_roster(&rows, true);
-    assert_eq!(header, Some(4));
-    assert_eq!(expanded.len(), 7);
-    assert_eq!(expanded[4].name, "▾ Inactive · 2");
-    assert_eq!(expanded[5].child_id, rows[4].child_id);
-    assert_eq!(expanded[6].child_id, rows[5].child_id);
-    assert_eq!(visible_team_roster(&rows[..4], false).1, None);
+    assert_eq!(header, Some(2));
+    assert_eq!(expanded.len(), 8);
+    assert_eq!(expanded[2].name, "▾ Inactive · 5");
+    for (visible, original) in expanded[3..].iter().zip(&rows[2..]) {
+        assert_eq!(visible.child_id, original.child_id);
+    }
+    assert_eq!(visible_team_roster(&rows[..2], false).1, None);
 }
 
 #[test]

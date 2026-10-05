@@ -242,8 +242,9 @@ struct Transcript {
     order: TranscriptEntries,
     messages: HashMap<Uuid, usize>,
     /// Whether this transcript projects a delegated child session, whose
-    /// opening prompt came from the director agent rather than the operator.
+    /// opening prompt came from its parent agent rather than the operator.
     child_transcript: bool,
+    assignment_sender: String,
     director_prompt: DirectorPrompt,
     tools: HashMap<String, usize>,
     tool_parents: HashMap<String, String>,
@@ -388,6 +389,7 @@ impl Default for Transcript {
             order: TranscriptEntries::default(),
             messages: HashMap::new(),
             child_transcript: false,
+            assignment_sender: "director".to_string(),
             director_prompt: DirectorPrompt::Unknown,
             tools: HashMap::new(),
             tool_parents: HashMap::new(),
@@ -522,6 +524,7 @@ struct RenderInputs {
     today: NaiveDate,
     user_label: String,
     assistant_label: String,
+    assignment_sender: String,
     colors: [Color; 4],
     image_cell: Option<(u16, u16)>,
     tool_click_behavior: ToolClickBehavior,
@@ -4735,7 +4738,7 @@ impl Transcript {
     fn active_subagent_count(&self) -> usize {
         self.subagents
             .values()
-            .filter(|status| subagent_is_working(**status))
+            .filter(|status| **status == SubagentStatus::Running)
             .count()
     }
 
@@ -4766,20 +4769,10 @@ impl Transcript {
                 child_id: None,
             });
         }
-        // Working children first, then any that stopped or failed: a child that
-        // died with a restart must stay visible so it can be resumed. Idle
-        // ready workers finished normally and stay out of the way.
-        let mut agents = self
-            .subagent_snapshots
-            .values()
-            .filter(|agent| {
-                subagent_is_working(agent.status)
-                    || matches!(agent.status, SubagentStatus::Stopped | SubagentStatus::Failed)
-            })
-            .collect::<Vec<_>>();
+        let mut agents = self.subagent_snapshots.values().collect::<Vec<_>>();
         agents.sort_by(|left, right| {
-            (!subagent_is_working(left.status), &left.task_name)
-                .cmp(&(!subagent_is_working(right.status), &right.task_name))
+            (left.status != SubagentStatus::Running, &left.task_name)
+                .cmp(&(right.status != SubagentStatus::Running, &right.task_name))
         });
         rows.extend(agents.into_iter().map(|agent| {
             let name = display_agent_name(&agent.task_name);
@@ -5169,6 +5162,7 @@ impl Transcript {
             today: Local::now().date_naive(),
             user_label: self.user_label.clone(),
             assistant_label: self.assistant_label.clone(),
+            assignment_sender: self.assignment_sender.clone(),
             colors: [
                 self.user_label_color,
                 self.user_message_color,
@@ -5577,7 +5571,7 @@ impl Transcript {
                     let from_director = director_prompt_row == Some(index);
                     let (label, color) = match actor {
                         EventActor::User if from_director => {
-                            ("director".to_string(), SUBAGENT_PURPLE)
+                            (self.assignment_sender.clone(), SUBAGENT_PURPLE)
                         }
                         EventActor::User => (self.user_label.clone(), self.user_label_color),
                         EventActor::Assistant => {

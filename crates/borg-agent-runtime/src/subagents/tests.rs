@@ -1905,15 +1905,18 @@ async fn a_child_without_a_lane_inherits_the_parent_live_lane() {
     .unwrap();
 
     let defaulted = coordinator
-        .subagent_launch(&SpawnSubagent {
-            task_name: "defaulted".to_string(),
-            message: "Complete the bounded task.".to_string(),
-            provider: None,
-            model: None,
-            effort: None,
-            fast: None,
-            ultrafast: None,
-        })
+        .subagent_launch(
+            coordinator.root_session_id,
+            &SpawnSubagent {
+                task_name: "defaulted".to_string(),
+                message: "Complete the bounded task.".to_string(),
+                provider: None,
+                model: None,
+                effort: None,
+                fast: None,
+                ultrafast: None,
+            },
+        )
         .await
         .expect("a child with no lane named resolves the parent lane");
     assert_ne!(
@@ -1934,15 +1937,18 @@ async fn a_child_without_a_lane_inherits_the_parent_live_lane() {
     // Naming the provider without a model resolves the model with it, rather
     // than handing the child a provider it cannot run on.
     let named = coordinator
-        .subagent_launch(&SpawnSubagent {
-            task_name: "named_provider".to_string(),
-            message: "Complete the bounded task.".to_string(),
-            provider: Some(CodingProvider::OpenCode),
-            model: None,
-            effort: None,
-            fast: None,
-            ultrafast: None,
-        })
+        .subagent_launch(
+            coordinator.root_session_id,
+            &SpawnSubagent {
+                task_name: "named_provider".to_string(),
+                message: "Complete the bounded task.".to_string(),
+                provider: Some(CodingProvider::OpenCode),
+                model: None,
+                effort: None,
+                fast: None,
+                ultrafast: None,
+            },
+        )
         .await
         .expect("a provider named without a model still resolves a lane");
     assert_eq!(named.provider, CodingProvider::OpenCode);
@@ -2165,11 +2171,8 @@ async fn a_member_delegation_spawns_fresh_and_names_the_requester() {
     settle(member).await;
     let idle_answer = coordinator.get(idle).await.unwrap().final_text;
 
-    // The member must not be promised a nested/owned helper when delegation
-    // deliberately creates a fresh director-owned worker below.
     let member_identity = coordinator.identity_prompt(member).await.unwrap();
-    assert!(member_identity.contains("Delegation remains owned by the team director /root"));
-    assert!(!member_identity.contains("Your children are /root/member/<name>"));
+    assert!(member_identity.contains("Your children are /root/member/<name>"));
     let director_identity = coordinator.identity_prompt(root).await.unwrap();
     assert!(director_identity.contains("Your children are /root/<name>"));
 
@@ -2184,10 +2187,22 @@ async fn a_member_delegation_spawns_fresh_and_names_the_requester() {
         .await
         .unwrap();
     assert_eq!(helper["reused"], false);
-    assert_eq!(helper["assignment_task_name"], "/root/helper");
+    assert_eq!(helper["assignment_task_name"], "/root/member/helper");
     let helper = Uuid::parse_str(helper["session_id"].as_str().unwrap()).unwrap();
     assert_ne!(helper, idle);
     assert_ne!(helper, member);
+    assert_eq!(
+        coordinator.get(helper).await.unwrap().parent_session_id,
+        member
+    );
+    assert_eq!(
+        coordinator
+            .resolve_snapshot("/root/member/helper")
+            .await
+            .unwrap()
+            .session_id,
+        helper
+    );
 
     // Neither idle worker was renamed or lost its answer.
     let director_worker = coordinator.get(idle).await.unwrap();
@@ -2336,15 +2351,18 @@ async fn subagent_speed_overrides_live_inheritance_and_controls_worker_reuse() {
         assert!(!config.ultrafast);
     }
     let cross_provider = coordinator
-        .subagent_launch(&SpawnSubagent {
-            task_name: "cross_provider".into(),
-            message: "Complete this task.".into(),
-            provider: Some(CodingProvider::Claude),
-            model: None,
-            effort: None,
-            fast: None,
-            ultrafast: None,
-        })
+        .subagent_launch(
+            coordinator.root_session_id,
+            &SpawnSubagent {
+                task_name: "cross_provider".into(),
+                message: "Complete this task.".into(),
+                provider: Some(CodingProvider::Claude),
+                model: None,
+                effort: None,
+                fast: None,
+                ultrafast: None,
+            },
+        )
         .await
         .unwrap();
     assert!(!cross_provider.fast.unwrap_or(false));
@@ -4562,8 +4580,33 @@ async fn durable_parent_activity_restores_child_topology() {
         store,
     )
     .unwrap();
+    let mut nested = snapshot.clone();
+    nested.session_id = Uuid::new_v4();
+    nested.parent_session_id = child_id;
+    nested.task_name = "/root/review_api/helper".into();
+    let nested_event = SessionEvent::new(
+        root,
+        3,
+        SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Stopped,
+            agent: nested.clone(),
+            event: None,
+        },
+    );
+    let mut unrelated = nested.clone();
+    unrelated.session_id = Uuid::new_v4();
+    unrelated.parent_session_id = Uuid::new_v4();
+    let unrelated_event = SessionEvent::new(
+        root,
+        4,
+        SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Stopped,
+            agent: unrelated,
+            event: None,
+        },
+    );
     coordinator
-        .restore_from_events(&[started, stopped])
+        .restore_from_events(&[started, stopped, nested_event, unrelated_event])
         .await
         .unwrap();
 
@@ -4575,7 +4618,15 @@ async fn durable_parent_activity_restores_child_topology() {
             .status,
         SubagentStatus::Stopped
     );
-    assert_eq!(coordinator.list(None).await.len(), 1);
+    assert_eq!(coordinator.list(None).await.len(), 2);
+    assert_eq!(
+        coordinator
+            .resolve_snapshot("/root/review_api/helper")
+            .await
+            .unwrap()
+            .parent_session_id,
+        child_id
+    );
 
     let message_id = Uuid::new_v4();
     let partial = SessionEvent::new(
