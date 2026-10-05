@@ -11164,7 +11164,9 @@ pub(crate) fn frame_mid_turn_human_message(text: &str) -> String {
         "A message from the human arrived while you were working. Address it in your next \
          visible response before continuing: answer it briefly (if that needs a check, say \
          what you will check), and adapt your plan if it changes what you should do. Do not \
-         merely acknowledge receipt.\n\nHuman message:\n{text}"
+         merely acknowledge receipt. This is a one-time reply obligation: after answering, \
+         continue the active task and do not treat this historical message as a new request \
+         on later progress updates.\n\nHuman message:\n{text}"
     )
 }
 async fn dispatch_steer(
