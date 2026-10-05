@@ -4707,7 +4707,7 @@ impl SubagentCoordinator {
             .and_then(|parent| parent.effort.clone())
             .or_else(|| launch.effort.clone());
         launch.provider = request.provider.unwrap_or(parent_provider);
-        ensure_provider_can_spawn(&launch, launch.provider)?;
+        ensure_provider_can_spawn(&launch, launch.provider).await?;
         validate_subagent_overrides(
             launch.provider,
             request.model.as_deref(),
@@ -5092,7 +5092,7 @@ impl SubagentCoordinator {
         model: Option<String>,
         effort: Option<String>,
     ) -> Result<SubagentSnapshot> {
-        ensure_provider_can_spawn(&self.root_launch, provider)?;
+        ensure_provider_can_spawn(&self.root_launch, provider).await?;
         let task_name = canonical_task_name(task_name)?;
         let existing = {
             let table = self.table.lock().await;
@@ -5226,7 +5226,7 @@ impl SubagentCoordinator {
         model: Option<String>,
         effort: Option<String>,
     ) -> Result<PeerRotation> {
-        ensure_provider_can_spawn(&self.root_launch, provider)?;
+        ensure_provider_can_spawn(&self.root_launch, provider).await?;
         let task_name = canonical_sidecar_task_name(task_name)?;
         let launch = self.sidecar_launch(&task_name, provider, model, effort)?;
         let existing = {
@@ -6971,7 +6971,7 @@ impl SubagentCoordinator {
             .context("session has no recorded configuration")?;
         let selected = provider.unwrap_or(current.provider);
         if selected != current.provider {
-            ensure_provider_can_spawn(&self.root_launch, selected)?;
+            ensure_provider_can_spawn(&self.root_launch, selected).await?;
         }
         let model = model.map(|model| model.trim().to_string());
         ensure!(
@@ -8124,13 +8124,17 @@ pub(crate) fn validate_subagent_overrides(
     Ok(())
 }
 
-pub(crate) fn ensure_provider_can_spawn(
+pub(crate) async fn ensure_provider_can_spawn(
     launch: &LaunchSession,
     provider: CodingProvider,
 ) -> Result<()> {
-    let capability = launch
-        .capabilities
-        .provider_capabilities
+    // Login and quota can change after launch. Admission must use the same
+    // refreshed authority as get_provider_capabilities, not the startup snapshot.
+    let capabilities = crate::provider_usage::refresh_provider_capability_usage(
+        &launch.capabilities.provider_capabilities,
+    )
+    .await;
+    let capability = capabilities
         .iter()
         .find(|capability| capability.provider == provider)
         .with_context(|| {

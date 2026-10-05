@@ -6953,7 +6953,7 @@ async fn run_agent_session_store_kernel_inner(
                             resolve_consultation_profile(&request.profile).map_err(|error| {
                                 anyhow::anyhow!("invalid consultation profile: {error}")
                             })?;
-                        crate::subagents::ensure_provider_can_spawn(&launch, provider)?;
+                        crate::subagents::ensure_provider_can_spawn(&launch, provider).await?;
                         let effort = requested_effort.or_else(|| if provider == launch.provider {
                             launch.effort.clone()
                         } else {
