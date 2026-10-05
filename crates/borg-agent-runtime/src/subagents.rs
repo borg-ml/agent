@@ -1256,6 +1256,21 @@ impl AgentToolDispatcher {
         let sleep_seconds = bare_sleep_seconds(&args.cmd);
         let environment = self.environment_for_command();
         let command_text = args.cmd.clone();
+        // An explicit absolute cwd equal to our remembered shell cwd must work
+        // exactly like omitting workdir. Keep native root containment for all
+        // other explicit paths; this is not admission of arbitrary workdirs.
+        let execution_root = {
+            let remembered = self.shell_directory.read().unwrap_or_else(|p| p.into_inner());
+            match (args.workdir.as_deref(), remembered.as_ref()) {
+                (Some(workdir), Some(current))
+                    if Path::new(workdir).is_absolute()
+                        && Path::new(workdir).canonicalize().ok().as_ref() == Some(current) =>
+                {
+                    current.clone()
+                }
+                _ => self.runtime_root.clone(),
+            }
+        };
         let (command, shell_directory) = if args.workdir.is_some() {
             (args.cmd, None)
         } else {
@@ -1265,7 +1280,7 @@ impl AgentToolDispatcher {
             execution_provider
                 .command(crate::ExecutionCommandRequest {
                     owner_session_id: self.actor_session_id,
-                    root: self.runtime_root.clone(),
+                    root: execution_root,
                     command,
                     workdir: args.workdir,
                     yield_time_ms: args.yield_time_ms,
