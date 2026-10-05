@@ -193,15 +193,12 @@ const SUBSCRIPTION_CONTEXT_HEADER: &str = "Borg canonical provider context v2. T
 // boundary rather than an unrelated serialized-byte threshold. The journal
 // remains complete; this is only the input shape sent on a full replay.
 const SUBSCRIPTION_INPUT_BUDGET_CHARS: usize = 1 << 20;
-#[cfg(test)]
-const SUBSCRIPTION_REPLAY_BUDGET_QUANTUM_CHARS: usize = 64 * 1024;
 /// Share of the subscription input budget kept verbatim after a compaction
 /// summary, so the model keeps the evidence it was just reasoning about rather
 /// than only a prose recollection of it. The native harness keeps the same
 /// share of the context window (`NATIVE_COMPACT_RETAIN_PERCENT`); this is the
 /// character-budgeted equivalent for providers Borg turns around itself.
 const SUBSCRIPTION_COMPACT_RETAIN_PERCENT: usize = 10;
-const SUBSCRIPTION_CONTEXT_SEPARATOR_CHARS: usize = 1;
 const COMPACTION_CONTEXT_ELISION: &str =
     "\n\n[... middle of retained context elided for compaction ...]\n\n";
 // Match the useful shape of Pi/OpenCode compaction: old tool output is the
@@ -216,7 +213,6 @@ const COMPACTION_HIGH_VALUE_TOOL_RESULT_MAX_CHARS: usize = 8_000;
 const COMPACTION_RUNNING_SUMMARY_BUDGET_CHARS: usize = 128 * 1024;
 const COMPACTION_OLD_TOOL_RESULT_MARKER: &str =
     "[Old tool result content cleared for compaction; tool call retained]";
-const COMPACTION_OLD_ASSISTANT_MARKER: &str = "[Earlier assistant narrative retained in the durable journal but omitted from this compaction input]";
 
 struct SessionAutonomyDispatch {
     job: crate::AutonomyJob,
@@ -9082,27 +9078,6 @@ fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
     retained_conversation_context_with_tool_limit(events, None)
 }
 
-#[cfg(test)]
-fn retained_compaction_context_with_budget(
-    events: &[SessionEvent],
-    max_chars: usize,
-) -> Option<CompactionProjection> {
-    let conversation = provider_neutral_conversation(events)?;
-    Some(fit_compaction_context(&conversation, max_chars))
-}
-
-#[cfg(test)]
-fn subscription_replay_context_budget(actor: EventActor, current_prompt: &str) -> usize {
-    let budget = SUBSCRIPTION_INPUT_BUDGET_CHARS
-        .saturating_sub(subscription_prompt_chars(None, actor, current_prompt))
-        .saturating_sub(SUBSCRIPTION_CONTEXT_SEPARATOR_CHARS);
-    if budget < SUBSCRIPTION_REPLAY_BUDGET_QUANTUM_CHARS {
-        budget
-    } else {
-        budget - budget % SUBSCRIPTION_REPLAY_BUDGET_QUANTUM_CHARS
-    }
-}
-
 pub(crate) fn truncate_compaction_context(context: &str, max_chars: usize) -> String {
     if context.chars().count() <= max_chars {
         return context.to_string();
@@ -9349,157 +9324,6 @@ fn compaction_failure_is_provider_side(error: &anyhow::Error) -> bool {
     )
 }
 
-/// A provider-replay projection plus what it had to drop to fit the budget.
-///
-/// The journal records this summary on `context_replay_projected`, so a reader
-/// can see that a replay silently dropped durable history without re-running
-/// the projection in code.
-struct CompactionProjection {
-    context: String,
-    messages_before: usize,
-    messages_omitted: usize,
-}
-
-fn fit_compaction_context(
-    conversation: &[borg_provider::provider::ModelMessage],
-    max_chars: usize,
-) -> CompactionProjection {
-    let messages_before = conversation.len();
-    let mut projected = prune_conversation_for_compaction(conversation);
-    let mut rendered = format_subscription_conversation_with_tool_limit(&projected, None);
-    if rendered.chars().count() <= max_chars {
-        return CompactionProjection {
-            context: rendered,
-            messages_before,
-            messages_omitted: 0,
-        };
-    }
-
-    // The live exchange -- the assistant reply the newest prompt is answering,
-    // plus the recent user turns -- must survive both the marker replacement
-    // below and the message drop further down. The window is otherwise measured
-    // in user turns, which ignores a trailing assistant tail: the reply the
-    // human is about to answer sits after the newest user message, falls outside
-    // the window, and was erased from the provider request. A steer can also
-    // place several user messages after that reply, so the anchor is the last
-    // assistant text before the newest user message, not simply the previous
-    // message or the newest two user turns.
-    let recent_turn_start = recent_user_turn_indices(&projected, 2)
-        .iter()
-        .copied()
-        .min()
-        .unwrap_or(projected.len());
-    let reply_start = projected
-        .iter()
-        .rposition(|message| matches!(message, borg_provider::provider::ModelMessage::User { .. }))
-        .map(|newest_user| {
-            projected[..newest_user]
-                .iter()
-                .rposition(|message| {
-                    matches!(
-                        message,
-                        borg_provider::provider::ModelMessage::Assistant {
-                            content: Some(content),
-                            ..
-                        } if !content.trim().is_empty()
-                    )
-                })
-                .unwrap_or(newest_user)
-        })
-        .unwrap_or(projected.len());
-    let live_tail_start = reply_start.min(recent_turn_start);
-    // If non-tool messages themselves are unusually large, reduce them at
-    // message boundaries. This keeps the user/system records identifiable and
-    // avoids a blind cut through the middle of the whole transcript.
-    for (index, message) in projected.iter_mut().enumerate() {
-        if index >= live_tail_start {
-            continue;
-        }
-        if let borg_provider::provider::ModelMessage::Assistant {
-            content,
-            reasoning_content,
-            reasoning_details,
-            provider_state,
-            tool_calls,
-        } = message
-        {
-            if content.is_some() || reasoning_content.is_some() || reasoning_details.is_some() {
-                *content = Some(COMPACTION_OLD_ASSISTANT_MARKER.to_string());
-            }
-            *reasoning_content = None;
-            *reasoning_details = None;
-            *provider_state = None;
-            for call in tool_calls {
-                call.function.arguments = truncate_compaction_context(
-                    &call.function.arguments,
-                    COMPACTION_HIGH_VALUE_TOOL_RESULT_MAX_CHARS,
-                );
-            }
-        }
-    }
-    let mut content_limit = 64_000;
-    while rendered.chars().count() > max_chars && content_limit > 1_024 {
-        for message in &mut projected {
-            compact_message_for_budget(message, content_limit);
-        }
-        rendered = format_subscription_conversation_with_tool_limit(&projected, None);
-        content_limit /= 2;
-    }
-    if rendered.chars().count() <= max_chars {
-        return CompactionProjection {
-            context: rendered,
-            messages_before,
-            messages_omitted: 0,
-        };
-    }
-
-    // A pathological transcript can contain more non-tool text than the
-    // provider accepts. Keep every system/user message for intent, plus the
-    // live exchange for continuity, with an explicit durable-history marker for
-    // the omitted middle. The final bounded cut below is defense-in-depth only;
-    // ordinary tool-heavy histories are handled by the semantic pruning above.
-    // `live_tail_start` was computed above so the marker replacement and this
-    // drop agree on exactly which messages are load-bearing.
-    let mut selected = Vec::with_capacity(projected.len());
-    let mut omitted = false;
-    let mut messages_omitted = 0usize;
-    for (index, message) in projected.into_iter().enumerate() {
-        let keep = index >= live_tail_start
-            || matches!(
-                message,
-                borg_provider::provider::ModelMessage::System { .. }
-                    | borg_provider::provider::ModelMessage::User { .. }
-            );
-        if keep {
-            if omitted {
-                selected.push(borg_provider::provider::ModelMessage::user(
-                    "[Older conversation messages omitted from compaction input; durable journal retained]",
-                ));
-                omitted = false;
-            }
-            selected.push(message);
-        } else {
-            omitted = true;
-            messages_omitted += 1;
-        }
-    }
-    if omitted {
-        selected.push(borg_provider::provider::ModelMessage::user(
-            "[Older conversation messages omitted from compaction input; durable journal retained]",
-        ));
-    }
-    rendered = format_subscription_conversation_with_tool_limit(&selected, None);
-    CompactionProjection {
-        context: if rendered.chars().count() > max_chars {
-            truncate_compaction_context(&rendered, max_chars)
-        } else {
-            rendered
-        },
-        messages_before,
-        messages_omitted,
-    }
-}
-
 fn compact_message_for_budget(
     message: &mut borg_provider::provider::ModelMessage,
     content_limit: usize,
@@ -9532,29 +9356,6 @@ fn compact_message_for_budget(
             *content = truncate_compaction_tool_result(content, content_limit);
         }
     }
-}
-
-fn recent_user_turn_indices(
-    conversation: &[borg_provider::provider::ModelMessage],
-    turns_to_keep: usize,
-) -> HashSet<usize> {
-    let mut indices = HashSet::new();
-    let mut turns = 0;
-    for index in (0..conversation.len()).rev() {
-        if matches!(
-            conversation[index],
-            borg_provider::provider::ModelMessage::User { .. }
-        ) {
-            turns += 1;
-            if turns > turns_to_keep {
-                break;
-            }
-        }
-        if turns > 0 && turns <= turns_to_keep {
-            indices.insert(index);
-        }
-    }
-    indices
 }
 
 fn format_subscription_conversation_with_tool_limit(

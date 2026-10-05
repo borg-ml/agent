@@ -13221,10 +13221,11 @@ fn subscription_compaction_projection_truncates_large_tool_results() {
     ];
 
     let full_context = retained_conversation_context(&events).unwrap();
-    let compaction_context =
-        retained_compaction_context_with_budget(&events, SUBSCRIPTION_INPUT_BUDGET_CHARS)
-            .unwrap()
-            .context;
+    let conversation = provider_neutral_conversation(&events).unwrap();
+    let compaction_context = format_subscription_conversation_with_tool_limit(
+        &prune_conversation_for_compaction(&conversation),
+        None,
+    );
 
     assert!(compaction_context.contains("recent-tool-output-"));
     assert!(!compaction_context.contains(&tool_output));
@@ -13249,34 +13250,6 @@ fn subscription_compaction_projection_has_a_hard_total_bound() {
     assert!(bounded.starts_with("head-α"));
     assert!(bounded.ends_with("tail-🛠️"));
     assert!(bounded.contains(COMPACTION_CONTEXT_ELISION));
-}
-
-#[test]
-fn deterministic_recovery_projection_fits_the_complete_provider_request() {
-    let session_id = Uuid::new_v4();
-    let events = vec![SessionEvent::new(
-        session_id,
-        1,
-        SessionEventKind::Message {
-            message_id: Uuid::new_v4(),
-            actor: EventActor::User,
-            text: "x".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS * 2),
-            attachments: Vec::new(),
-            status: MessageStatus::Complete,
-            delivery: None,
-        },
-    )];
-    let current_prompt = "continue safely";
-    let projection = retained_compaction_context_with_budget(
-        &events,
-        subscription_replay_context_budget(EventActor::User, current_prompt),
-    )
-    .unwrap();
-
-    assert!(
-        subscription_prompt_chars(Some(&projection.context), EventActor::User, current_prompt)
-            <= SUBSCRIPTION_INPUT_BUDGET_CHARS
-    );
 }
 
 /// Compaction failing because the provider refused -- a revoked token, an
@@ -13311,112 +13284,6 @@ fn a_provider_side_compaction_failure_does_not_license_dropping_history() {
         !compaction_failure_is_provider_side(&structural),
         "structural failure classification is telemetry only"
     );
-}
-
-/// A pathological replay drops whole messages. The projection must report how
-/// many, so the durable `context_replay_projected` event explains the omission
-/// marker instead of leaving a reader to re-derive the projection in code.
-#[test]
-fn replay_projection_reports_the_messages_it_omitted() {
-    use borg_provider::provider::ModelMessage;
-
-    let filler = "u".repeat(2_000);
-    let mut conversation = Vec::new();
-    for index in 0..6 {
-        conversation.push(ModelMessage::user(format!("user turn {index} {filler}")));
-        conversation.push(ModelMessage::assistant(
-            Some(format!("assistant turn {index}")),
-            None,
-            None,
-            Vec::new(),
-        ));
-    }
-    conversation.push(ModelMessage::user("the newest request".to_string()));
-
-    let projection = fit_compaction_context(&conversation, 2_048);
-
-    assert_eq!(projection.messages_before, conversation.len());
-    assert!(projection.messages_omitted > 0);
-    assert!(projection.messages_omitted < projection.messages_before);
-    assert!(projection.context.chars().count() <= 2_048);
-}
-
-/// The projection's message-dropping backstop must never elide the assistant
-/// reply that the next prompt answers.
-///
-/// The conversation ends on the assistant reply: the human is about to answer
-/// it, so the reply is not followed by any user message yet. A window measured
-/// in user turns never covers that trailing assistant tail, so the reply was
-/// marker-replaced and then dropped -- the model could no longer see what the
-/// human was responding to, re-read stale history, and re-asked questions it had
-/// already put to the human. The live exchange is anchored on the reply itself,
-/// so it survives however the tail is shaped.
-#[test]
-fn replay_projection_keeps_the_trailing_reply_the_next_prompt_answers() {
-    use borg_provider::provider::ModelMessage;
-
-    let filler = "u".repeat(2_000);
-    let mut conversation = Vec::new();
-    for index in 0..6 {
-        conversation.push(ModelMessage::user(format!("user turn {index} {filler}")));
-        conversation.push(ModelMessage::assistant(
-            Some(format!("assistant turn {index}")),
-            None,
-            None,
-            Vec::new(),
-        ));
-    }
-    conversation.push(ModelMessage::user(format!(
-        "the request being answered {filler}"
-    )));
-    conversation.push(ModelMessage::assistant(
-        Some("the reply the human is answering".to_string()),
-        None,
-        None,
-        Vec::new(),
-    ));
-
-    let projection = fit_compaction_context(&conversation, 2_048);
-
-    assert!(projection.messages_omitted > 0);
-    assert!(
-        projection
-            .context
-            .contains("the reply the human is answering"),
-        "the trailing assistant reply must survive the projection"
-    );
-}
-
-#[test]
-fn subscription_replay_budget_accounts_for_the_context_separator() {
-    let current_prompt = "continue safely";
-    let context_budget = subscription_replay_context_budget(EventActor::User, current_prompt);
-    let context = "x".repeat(context_budget);
-
-    assert_eq!(context_budget % SUBSCRIPTION_REPLAY_BUDGET_QUANTUM_CHARS, 0);
-    assert!(
-        subscription_prompt_chars(Some(&context), EventActor::User, current_prompt)
-            <= SUBSCRIPTION_INPUT_BUDGET_CHARS
-    );
-    assert!(
-        subscription_prompt_chars(
-            Some(&format!(
-                "{context}{}",
-                "x".repeat(SUBSCRIPTION_REPLAY_BUDGET_QUANTUM_CHARS)
-            )),
-            EventActor::User,
-            current_prompt,
-        ) > SUBSCRIPTION_INPUT_BUDGET_CHARS
-    );
-}
-
-#[test]
-fn subscription_replay_budget_keeps_projection_boundaries_stable() {
-    let short = subscription_replay_context_budget(EventActor::User, "short");
-    let longer =
-        subscription_replay_context_budget(EventActor::User, &"longer prompt ".repeat(1024));
-
-    assert_eq!(short, longer);
 }
 
 #[tokio::test]
