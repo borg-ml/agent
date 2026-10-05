@@ -177,6 +177,14 @@ impl ContextEditor {
         Some(state.pending_system_override.take())
     }
 
+    pub(crate) async fn call_read_only(&self, arguments: Value) -> Result<Value> {
+        ensure!(
+            arguments.get("op").and_then(Value::as_str) != Some("edit"),
+            "context is read-only; conversation history can only be reduced through compaction"
+        );
+        self.call(arguments, false).await
+    }
+
     pub(crate) async fn call(&self, mut arguments: Value, allow_edit: bool) -> Result<Value> {
         if let Some(arguments) = arguments.as_object_mut() {
             arguments.remove("action");
@@ -602,27 +610,15 @@ fn validate_entries(entries: &[Entry], allow_pending_tail: bool) -> Result<()> {
 pub(crate) fn tool_spec() -> Value {
     json!({
         "name":"context",
-        "description":"Inspect and arbitrarily edit your own model context on Borg's loop. Read returns stable message IDs and editable text, with opaque replay/images retained internally. Edit applies an atomic batch to the latest request's context while preserving the in-flight tool batch and newly appended messages. Supply the revision from read; edits require Full Access or approval. Replace system text, including an empty string; insert/drop/move history. Moving or dropping a tool call/result selects its whole group. Replacing assistant text clears its stale signed reasoning. A raw provider-neutral message is an optional escape hatch instead of text. Submit edits from a model tool batch; the API rejects edits during model requests or compaction. The append-only journal and tool permissions are unchanged. Edits are durable and affect the next model request; auto-compaction may subsequently reshape the view. Read again after restart or compaction. When trimming history, preserve whether retained human requests were already answered or completed (keep the reply or a concise status summary), so old requests do not become new obligations.",
+        "description":"Inspect your model context without modifying it. Read returns stable message IDs and bounded text, with opaque replay/images retained internally. Conversation history is reduced only through compaction, never by selective edits or dropping replies. Read again after restart or compaction.",
         "inputSchema":{
             "type":"object", "properties":{
-                "op":{"type":"string","enum":["read","edit"]},
+                "op":{"type":"string","enum":["read"]},
                 "offset":{"type":"integer","minimum":0},
                 "limit":{"type":"integer","minimum":1,"maximum":100},
                 "max_chars":{"type":"integer","minimum":0,"maximum":64000},
                 "text_offset":{"type":"integer","minimum":0,"description":"Character offset within message text; use id to page a long message."},
-                "id":{"type":"string","format":"uuid"},
-                "revision":{"type":"string"},
-                "edits":{"type":"array","minItems":1,"maxItems":100,"items":{
-                    "type":"object","properties":{
-                        "op":{"type":"string","enum":["replace","drop","insert","move"]},
-                        "id":{"type":"string","format":"uuid"},
-                        "ids":{"type":"array","items":{"type":"string","format":"uuid"}},
-                        "before":{"type":"string","format":"uuid"},
-                        "after":{"type":"string","format":"uuid"},
-                        "role":{"type":"string","enum":["system","user","assistant"]},
-                        "text":{"type":"string"}, "message":{"type":"object"}
-                    },"required":["op"],"additionalProperties":false
-                }}
+                "id":{"type":"string","format":"uuid"}
             },"required":["op"],"additionalProperties":false
         }
     })

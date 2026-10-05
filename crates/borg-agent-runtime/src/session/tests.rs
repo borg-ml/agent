@@ -13288,7 +13288,7 @@ fn deterministic_recovery_projection_fits_the_complete_provider_request() {
 /// expired OAuth session, a dropped connection -- must never license dropping
 /// durable history. The turn that follows fails on that same cause whatever the
 /// context looks like, so truncating it destroys the user's conversation and
-/// buys nothing. Only a structural failure keeps the backstop.
+/// buys nothing. Classification is now telemetry only; all failures preserve history.
 #[test]
 fn a_provider_side_compaction_failure_does_not_license_dropping_history() {
     use borg_provider::provider::{ProviderErrorKind, ProviderStreamError};
@@ -13314,7 +13314,7 @@ fn a_provider_side_compaction_failure_does_not_license_dropping_history() {
     let structural = anyhow::anyhow!("retained context is empty");
     assert!(
         !compaction_failure_is_provider_side(&structural),
-        "a structural failure still permits the bounded backstop"
+        "structural failure classification is telemetry only"
     );
 }
 

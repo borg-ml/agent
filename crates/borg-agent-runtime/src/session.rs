@@ -193,6 +193,7 @@ const SUBSCRIPTION_CONTEXT_HEADER: &str = "Borg canonical provider context v2. T
 // boundary rather than an unrelated serialized-byte threshold. The journal
 // remains complete; this is only the input shape sent on a full replay.
 const SUBSCRIPTION_INPUT_BUDGET_CHARS: usize = 1 << 20;
+#[cfg(test)]
 const SUBSCRIPTION_REPLAY_BUDGET_QUANTUM_CHARS: usize = 64 * 1024;
 /// Share of the subscription input budget kept verbatim after a compaction
 /// summary, so the model keeps the evidence it was just reasoning about rather
@@ -4627,18 +4628,9 @@ async fn run_agent_session_store_kernel_inner(
             retained_context = retained_conversation_context(journal.context_events());
         }
 
-        // The replay no longer fits the provider input budget. For a
-        // subscription turnaround Borg owns, the one lossy step must be an LLM
-        // summary with a durable `context_compaction` boundary that restarts
-        // replay — the same shape Pi and the native auto-compaction path use.
-        // The deterministic projection that drops whole messages is only a
-        // defensive backstop when compaction itself cannot run.
-        //
-        // Every provider Borg turns around gets this, not a named pair. A
-        // provider left out of compaction silently fell through to the
-        // message-dropping backstop on its very first oversized replay, which
-        // is the one outcome this path exists to prevent.
-        let mut compaction_unavailable = false;
+        // Oversized replay may only be reduced by an LLM summary with a durable
+        // compaction boundary. On failure retain the complete replay, never a
+        // deterministic message-dropping substitute.
         if !native_provider
             && retained_context.as_deref().is_some_and(|context| {
                 subscription_context_needs_projection(
@@ -4731,17 +4723,8 @@ async fn run_agent_session_store_kernel_inner(
                     }
                     // Compaction could not run; restore the oversized context.
                     retained_context = Some(full_context);
-                    // Why it failed decides what may happen next. A provider
-                    // failure -- revoked OAuth, an expired session, a dropped
-                    // connection -- says nothing about the size of the history,
-                    // and the turn that follows will fail on the same cause. So
-                    // discarding thousands of durable messages to "fit" buys
-                    // nothing and destroys the context the user gets back after
-                    // re-authenticating. Only a structural failure, where
-                    // compaction genuinely cannot reduce this transcript, still
-                    // licenses the deterministic backstop.
+                    // A failed summary never authorizes selective history loss.
                     let provider_failure = compaction_failure_is_provider_side(&error);
-                    compaction_unavailable = provider_failure;
                     tracing::warn!(
                         session_id = %session_id,
                         %error,
@@ -4761,7 +4744,7 @@ async fn run_agent_session_store_kernel_inner(
                                 "error": format!("{error:#}"),
                                 // The client renders these: history was kept
                                 // whole, and the turn fails on the real cause.
-                                "history_preserved": provider_failure,
+                                "history_preserved": true,
                                 "provider_failure": provider_failure,
                             }),
                         },
@@ -4769,64 +4752,6 @@ async fn run_agent_session_store_kernel_inner(
                     .await?;
                 }
             }
-        }
-
-        // `compaction_unavailable` means the summary failed for a provider
-        // reason, not a size one. Keep the durable replay intact and let the
-        // turn surface that cause; dropping history here would be silent damage
-        // in exchange for a request that fails identically either way.
-        if !native_provider
-            && !compaction_unavailable
-            && retained_context.as_deref().is_some_and(|context| {
-                subscription_context_needs_projection(
-                    context,
-                    prompt.actor,
-                    &prompt.text,
-                    reuse_subscription_context,
-                )
-            })
-        {
-            let full_context = retained_context
-                .take()
-                .expect("oversized subscription context was present");
-            let replay_budget = subscription_replay_context_budget(prompt.actor, &prompt.text);
-            let projection =
-                retained_compaction_context_with_budget(journal.context_events(), replay_budget);
-            let (projected_context, messages_before, messages_omitted) = match projection {
-                Some(projection) => (
-                    projection.context,
-                    projection.messages_before,
-                    projection.messages_omitted,
-                ),
-                None => (
-                    truncate_compaction_context(&full_context, replay_budget),
-                    0,
-                    0,
-                ),
-            };
-            let context_chars = full_context.chars().count();
-            let projected_chars = projected_context.chars().count();
-            retained_context = Some(projected_context);
-            record(
-                &mut journal,
-                &events,
-                session_id,
-                SessionEventKind::ProviderEvent {
-                    provider: launch.provider,
-                    kind: "context_replay_projected".to_string(),
-                    payload: serde_json::json!({
-                        "status": "completed",
-                        "automatic": true,
-                        "trigger": "provider_input_size",
-                        "context_chars_before": context_chars,
-                        "context_chars_after": projected_chars,
-                        "input_budget_chars": SUBSCRIPTION_INPUT_BUDGET_CHARS,
-                        "messages_before": messages_before,
-                        "messages_omitted": messages_omitted,
-                    }),
-                },
-            )
-            .await?;
         }
 
         let (provider_events_tx, mut provider_events) = mpsc::channel(128);
@@ -9157,6 +9082,7 @@ fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
     retained_conversation_context_with_tool_limit(events, None)
 }
 
+#[cfg(test)]
 fn retained_compaction_context_with_budget(
     events: &[SessionEvent],
     max_chars: usize,
@@ -9165,6 +9091,7 @@ fn retained_compaction_context_with_budget(
     Some(fit_compaction_context(&conversation, max_chars))
 }
 
+#[cfg(test)]
 fn subscription_replay_context_budget(actor: EventActor, current_prompt: &str) -> usize {
     let budget = SUBSCRIPTION_INPUT_BUDGET_CHARS
         .saturating_sub(subscription_prompt_chars(None, actor, current_prompt))
@@ -9414,16 +9341,7 @@ fn compaction_tool_is_high_value(tool_name: Option<&str>, content: &str) -> bool
     .any(|needle| lower.contains(needle))
 }
 
-/// Whether a failed compaction failed for a provider-side reason rather than a
-/// structural one.
-///
-/// This decides whether the deterministic message-dropping backstop is allowed
-/// to run. A revoked token, an expired session or a dropped connection says
-/// nothing about how large the history is, and the turn that follows fails on
-/// the identical cause -- so discarding thousands of durable messages to "fit"
-/// destroys context and buys the user nothing. Only a structural failure, where
-/// compaction genuinely cannot reduce this transcript, still justifies the
-/// backstop.
+/// Classify compaction failures for telemetry; all failures preserve history.
 fn compaction_failure_is_provider_side(error: &anyhow::Error) -> bool {
     !matches!(
         borg_provider::provider::classify_provider_error(error),

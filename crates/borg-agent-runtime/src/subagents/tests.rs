@@ -6,6 +6,77 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::tempdir;
 
+// Full Access must not let a model bypass compaction by selectively editing history.
+#[tokio::test]
+async fn context_tool_is_read_only_even_with_full_access() {
+    let directory = tempdir().unwrap();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        Uuid::new_v4(),
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    let (tx, mut rx) = mpsc::channel(16);
+    let messages = vec![
+        borg_provider::provider::ModelMessage::System {
+            content: "system".into(),
+        },
+        borg_provider::provider::ModelMessage::user("question already answered"),
+        borg_provider::provider::ModelMessage::assistant(
+            Some("the answer".into()),
+            None,
+            None,
+            Vec::new(),
+        ),
+    ];
+    let _active = dispatcher
+        .context_editor
+        .begin(&messages, CodingProvider::Codex, &tx)
+        .await;
+    dispatcher.context_editor.open_tools().await;
+    let before = dispatcher
+        .call("context", json!({"op":"read"}))
+        .await
+        .unwrap();
+    for op in ["drop", "replace", "move", "insert"] {
+        let error = dispatcher
+            .call(
+                "context",
+                json!({
+                    "op":"edit", "revision":before["revision"],
+                    "edits":[{"op":op,"ids":[before["entries"][2]["id"]]}]
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("read-only"), "{error}");
+    }
+    assert_eq!(
+        before,
+        dispatcher
+            .call("context", json!({"op":"read"}))
+            .await
+            .unwrap()
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "rejected edits must not journal a mutation"
+    );
+}
+
 #[tokio::test]
 #[cfg(unix)]
 async fn mcp_disconnect_and_shutdown_reap_the_active_runtime_worker() {
