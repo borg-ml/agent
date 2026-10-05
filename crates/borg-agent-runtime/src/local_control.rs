@@ -341,6 +341,22 @@ pub fn local_session_owner_uses_current_binary(
     Ok(metadata.executable_identity == current_executable_identity()?)
 }
 
+/// Compare a live owner with the worker executable selected by a frontend.
+/// A GUI executable is not the worker image and must never be used for this check.
+pub fn local_session_owner_uses_binary(
+    sessions_dir: &Path,
+    session_id: Uuid,
+    executable: &Path,
+) -> Result<bool> {
+    let Some(metadata) = read_local_session_owner_metadata(sessions_dir, session_id)? else {
+        return Ok(false);
+    };
+    if !owner_process_matches_metadata(&metadata)? {
+        return Ok(false);
+    }
+    Ok(metadata.executable_identity == executable_identity(&fs::metadata(executable)?))
+}
+
 /// Whether the recorded local session owner process is still alive, regardless
 /// of which Borg frontend binary is asking.
 pub fn local_session_owner_is_active(sessions_dir: &Path, session_id: Uuid) -> Result<bool> {
@@ -2078,6 +2094,18 @@ mod tests {
         let _server =
             LocalSessionControlServer::start(socket_path, session_id, &writer, commands).unwrap();
         assert!(local_session_owner_uses_current_binary(root.path(), session_id).unwrap());
+        assert!(
+            local_session_owner_uses_binary(
+                root.path(),
+                session_id,
+                &std::env::current_exe().unwrap(),
+            )
+            .unwrap()
+        );
+        let replacement = root.path().join("updated-borg");
+        fs::write(&replacement, b"different worker image").unwrap();
+        assert!(!local_session_owner_uses_binary(root.path(), session_id, &replacement).unwrap());
+        assert!(local_session_owner_is_active(root.path(), session_id).unwrap());
 
         let stale = LocalSessionOwnerMetadata {
             schema_version: 1,

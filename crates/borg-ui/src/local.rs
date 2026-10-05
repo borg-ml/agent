@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use borg_remote::{
     EventActor, HostCommand, MessageStatus, RecoveryParts, SessionConfigAction, SessionEvent,
     SessionEventKind, SessionStore, SubagentAction, SubagentSnapshot, default_host_config_path,
-    local_session_owner_is_active, login_provider_with_output, send_local_session_command,
-    session_control_socket_path,
+    local_session_owner_is_active, local_session_owner_uses_binary, login_provider_with_output,
+    send_local_session_command, session_control_socket_path,
 };
 use uuid::Uuid;
 
@@ -330,10 +330,14 @@ async fn ensure_session_owner(
     session_id: Uuid,
 ) -> Result<Option<tokio::process::Child>> {
     let socket = session_control_socket_path(sessions_dir, session_id);
+    let borg = borg_executable()?;
     if local_session_owner_is_active(sessions_dir, session_id)? {
+        anyhow::ensure!(
+            local_session_owner_uses_binary(sessions_dir, session_id, &borg)?,
+            "Session {session_id} is still running an older Borg worker. Restart the session worker with the updated Borg binary before reconnecting; restarting only the GUI does not upgrade it. Existing work has not been stopped."
+        );
         return Ok(None);
     }
-    let borg = borg_executable()?;
     let mut child = tokio::process::Command::new(&borg)
         .arg("--session-host")
         .arg(session_id.to_string())
