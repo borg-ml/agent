@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.14.5)
 
+### Live settings
+
+- `configure_agent` now handles self, the current session UUID, and managed
+  children through the same validated, persisted live configuration path.
+  Self-configuration preserves the conversation; only the director may
+  configure another agent, and parked children are not implicitly resumed.
+
 ### Watchers
 
 - Completed command watchers release their active slot even when the session's

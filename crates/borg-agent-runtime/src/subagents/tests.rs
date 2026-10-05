@@ -2378,6 +2378,194 @@ async fn subagent_speed_overrides_live_inheritance_and_controls_worker_reuse() {
 /// A model switch must not rotate the worker, lose its conversation, or
 /// revert to the launch lane when that child is resumed after a stop.
 #[tokio::test]
+#[cfg(unix)]
+async fn configure_agent_self_and_current_uuid_apply_inside_the_live_root_turn() {
+    struct SelfConfiguring;
+    #[async_trait::async_trait]
+    impl crate::AgentTurnExecutor for SelfConfiguring {
+        async fn speed_support(
+            &self,
+            _: CodingProvider,
+            _: &str,
+            _: Option<&crate::RuntimeProviderContext>,
+        ) -> Result<crate::SpeedSupport> {
+            Ok(crate::SpeedSupport {
+                fast: true,
+                ultrafast: false,
+            })
+        }
+        async fn execute(
+            &self,
+            turn: crate::AgentTurn,
+            _: mpsc::Sender<SessionEventKind>,
+            _: Option<mpsc::Receiver<crate::AgentTurnControl>>,
+        ) -> Result<crate::AgentTurnResult> {
+            if turn.prompt_delta.contains("configure self") {
+                let result = turn
+                    .agent_tools
+                    .call(
+                        "configure_agent",
+                        json!({"target":"self","fast":true,"effort":"medium"}),
+                    )
+                    .await
+                    .expect("self configuration must succeed inside its own turn");
+                assert_eq!(result["agent"]["session_id"], turn.session_id.to_string());
+                assert_eq!(result["agent"]["fast"], true);
+                assert_eq!(result["agent"]["effort"], "medium");
+            } else {
+                assert_eq!(turn.fast, Some(false));
+                assert_eq!(turn.effort.as_deref(), Some("high"));
+                assert!(
+                    turn.prompt.contains("configure self"),
+                    "configuration lost the conversation"
+                );
+            }
+            Ok(crate::AgentTurnResult {
+                provider_session_id: Some("same-live-session".into()),
+                final_text: "configured without restart".into(),
+            })
+        }
+    }
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    let mut request = launch();
+    request.cwd = directory.path().to_path_buf();
+    request.model = Some(
+        CodingProvider::Codex
+            .model_catalog()
+            .unwrap()
+            .default_model
+            .to_string(),
+    );
+    request.initial_prompt = Some("configure self and preserve this conversation".into());
+    let executor = Arc::new(SelfConfiguring);
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        request.clone(),
+        2,
+        executor.clone(),
+        store.clone(),
+    )
+    .unwrap();
+    let writer = crate::SessionWriterLease::try_acquire(child_lock_path(directory.path(), root))
+        .unwrap()
+        .unwrap();
+    let (commands, receiver) = mpsc::channel(16);
+    let (events, mut output) = mpsc::channel(128);
+    let server = crate::LocalSessionControlServer::start(
+        crate::session_control_socket_path(directory.path(), root),
+        root,
+        &writer,
+        commands.clone(),
+    )
+    .unwrap();
+    let actor = tokio::spawn(boxed_agent_store_session(
+        directory.path().to_path_buf(),
+        root,
+        request,
+        receiver,
+        events,
+        executor,
+        store.clone(),
+        writer,
+        coordinator.clone(),
+    ));
+    async fn ready(output: &mut mpsc::Receiver<SessionEvent>) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut completed = false;
+            loop {
+                let event = output.recv().await.expect("root actor ended");
+                if let SessionEventKind::Error { message } = &event.kind {
+                    panic!("root self-config error: {message}");
+                }
+                completed |= matches!(event.kind, SessionEventKind::TurnCompleted { .. });
+                if completed
+                    && matches!(
+                        event.kind,
+                        SessionEventKind::StatusChanged {
+                            status: SessionStatus::Ready,
+                            ..
+                        }
+                    )
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+    ready(&mut output).await;
+    let initial = store.state(root).await.unwrap();
+    assert!(initial.configuration.as_ref().unwrap().fast);
+    assert_eq!(
+        initial.configuration.as_ref().unwrap().effort.as_deref(),
+        Some("medium")
+    );
+    for target in [
+        "/root".to_string(),
+        format!("session:{root}"),
+        root.to_string(),
+    ] {
+        let value = coordinator
+            .call_tool(
+                "configure_agent",
+                json!({"target":target,"fast":false,"effort":"high"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(value["agent"]["fast"], false);
+        assert_eq!(value["agent"]["effort"], "high");
+    }
+    let before = store.state(root).await.unwrap().configuration;
+    assert!(
+        coordinator
+            .call_tool(
+                "configure_agent",
+                json!({"target":format!("session:{}",Uuid::new_v4()),"fast":true})
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        coordinator
+            .call_tool(
+                "configure_agent",
+                json!({"target":"self","fast":true,"ultrafast":true})
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(store.state(root).await.unwrap().configuration, before);
+    commands
+        .send(HostCommand::Prompt {
+            session_id: root,
+            message_id: Uuid::new_v4(),
+            text: "check roundtrip".into(),
+            attachments: vec![],
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    ready(&mut output).await;
+    commands
+        .send(HostCommand::Stop { session_id: root })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), actor)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(server);
+    scratch.discard().await;
+}
+
+#[tokio::test]
 async fn director_configures_live_child_speed_and_reuses_its_new_lane_after_wake() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
@@ -2434,7 +2622,7 @@ async fn director_configures_live_child_speed_and_reuses_its_new_lane_after_wake
         .call_tool_as(
             child.session_id,
             "configure_agent",
-            json!({ "target": target, "provider": "codex" }),
+            json!({ "target": "/root", "provider": "codex" }),
         )
         .await
         .unwrap_err();
@@ -2582,6 +2770,26 @@ async fn director_configures_live_child_speed_and_reuses_its_new_lane_after_wake
         "{unsupported:#}"
     );
     assert!(!coordinator.get(child.session_id).await.unwrap().fast);
+    let own = coordinator
+        .call_tool_as(
+            child.session_id,
+            "configure_agent",
+            json!({"target":"self","effort":"medium"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(own["agent"]["session_id"], child.session_id.to_string());
+    assert_eq!(own["agent"]["effort"], "medium");
+    assert_eq!(
+        coordinator
+            .get(child.session_id)
+            .await
+            .unwrap()
+            .effort
+            .as_deref(),
+        Some("medium")
+    );
+
     coordinator.stop_all().await;
     scratch.discard().await;
 }
@@ -7197,7 +7405,6 @@ fn a_child_surface_is_the_director_surface_minus_the_documented_exceptions() {
         "consult_peer",
         "rotate_peer",
         "update_agent_settings",
-        "configure_agent",
         "watch",
         "list_watchers",
         "await_watchers",

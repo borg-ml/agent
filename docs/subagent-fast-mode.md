@@ -1,7 +1,14 @@
-# Per-child fast mode
+# Live agent settings and fast mode
 
-The director can request `configure_agent({"target":"/root/worker","fast":true})`.
-Use `false` to disable it; omitting `fast` retains that child's mode. Provider,
+An agent can configure itself with
+`configure_agent({"target":"self","fast":true,"effort":"medium"})`.
+Its current session UUID (bare or `session:<UUID>`) is equivalent; the director
+can also use `/root`. Changes are confirmed only after the live session actor
+validates and records them, without replacing the conversation or restarting
+that actor. A foreign session UUID is not an authorized target.
+
+Only the director may configure another agent. It can request `configure_agent({"target":"/root/worker","fast":true})`.
+Use `false` to disable it; omitting `fast` retains the target's mode. Provider,
 model, effort, session identity, conversation, goals and queued tools are retained
 unless explicitly changed. Combined settings are admitted atomically: an
 unsupported or unconfirmed fast request leaves the previous configuration intact.

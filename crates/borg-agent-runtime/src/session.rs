@@ -3520,13 +3520,14 @@ async fn run_agent_session_store_kernel_inner(
                             _ => None,
                         };
                         let previous_provider = launch.provider;
-                        match apply_session_config(
+                        match apply_live_session_config(
                             &mut journal,
                             &events,
                             session_id,
                             &mut launch,
                             executor.as_ref(),
                             action,
+                            subagents.as_ref(),
                         )
                         .await
                         {
@@ -6426,13 +6427,14 @@ async fn run_agent_session_store_kernel_inner(
                                 crate::SessionConfigAction::SetAgent { request_id, .. } => Some(*request_id),
                                 _ => None,
                             };
-                            match apply_session_config(
+                            match apply_live_session_config(
                                 &mut journal,
                                 &events,
                                 session_id,
                                 &mut launch,
                                 executor.as_ref(),
                                 action,
+                                subagents.as_ref(),
                             )
                             .await
                             {
@@ -11908,6 +11910,33 @@ fn configuration_error(
         },
         None => SessionEventKind::Error { message },
     }
+}
+
+async fn apply_live_session_config(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    launch: &mut LaunchSession,
+    executor: &dyn AgentTurnExecutor,
+    action: crate::SessionConfigAction,
+    subagents: Option<&SubagentCoordinator>,
+) -> Result<bool> {
+    let request_id = match &action {
+        crate::SessionConfigAction::SetAgent { request_id, .. } => Some(*request_id),
+        _ => None,
+    };
+    let result = apply_session_config(journal, events, session_id, launch, executor, action).await;
+    if let (Some(subagents), Some(request_id)) = (subagents, request_id) {
+        subagents.configuration_applied(
+            session_id,
+            request_id,
+            result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+        );
+    }
+    result
 }
 
 async fn apply_session_config(

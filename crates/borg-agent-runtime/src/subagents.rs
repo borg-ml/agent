@@ -3827,6 +3827,7 @@ pub struct SubagentCoordinator {
     awaiting_reply: Arc<std::sync::Mutex<HashSet<Uuid>>>,
     consultation_lock: Arc<Mutex<()>>,
     configure_lock: Arc<Mutex<()>>,
+    configuration_tx: broadcast::Sender<(Uuid, Uuid, std::result::Result<(), String>)>,
     wait_cursors: Arc<Mutex<HashMap<Uuid, wait::WaitCursor>>>,
 }
 
@@ -3879,6 +3880,7 @@ impl SubagentCoordinator {
             awaiting_reply: Arc::new(std::sync::Mutex::new(HashSet::new())),
             consultation_lock: Arc::new(Mutex::new(())),
             configure_lock: Arc::new(Mutex::new(())),
+            configuration_tx: broadcast::channel(16).0,
             wait_cursors: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -6899,6 +6901,41 @@ impl SubagentCoordinator {
         fast: Option<bool>,
         ultrafast: Option<bool>,
     ) -> Result<SubagentSnapshot> {
+        self.resolve_snapshot(target).await?;
+        let value = self
+            .configure_agent_as(
+                self.root_session_id,
+                target,
+                provider,
+                model,
+                effort,
+                fast,
+                ultrafast,
+            )
+            .await?;
+        serde_json::from_value(value).context("target is not a child agent")
+    }
+
+    pub(crate) fn configuration_applied(
+        &self,
+        session_id: Uuid,
+        request_id: Uuid,
+        result: std::result::Result<(), String>,
+    ) {
+        let _ = self.configuration_tx.send((session_id, request_id, result));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn configure_agent_as(
+        &self,
+        actor_session_id: Uuid,
+        target: &str,
+        provider: Option<CodingProvider>,
+        model: Option<String>,
+        effort: Option<String>,
+        fast: Option<bool>,
+        ultrafast: Option<bool>,
+    ) -> Result<Value> {
         ensure!(
             provider.is_some()
                 || model.is_some()
@@ -6912,7 +6949,26 @@ impl SubagentCoordinator {
             "choose either fast or ultrafast mode"
         );
         let _guard = self.configure_lock.lock().await;
-        let current = self.resolve_snapshot(target).await?;
+        let session_id = {
+            let table = self.table.lock().await;
+            let id = if target.trim() == "self" {
+                actor_session_id
+            } else {
+                table.resolve(target)?
+            };
+            ensure!(
+                id == actor_session_id || actor_session_id == table.root_session_id,
+                "only the director may configure another agent"
+            );
+            table.task_name(id)?;
+            id
+        };
+        let current = self
+            .store
+            .state(session_id)
+            .await?
+            .configuration
+            .context("session has no recorded configuration")?;
         let selected = provider.unwrap_or(current.provider);
         if selected != current.provider {
             ensure_provider_can_spawn(&self.root_launch, selected)?;
@@ -6951,90 +7007,82 @@ impl SubagentCoordinator {
             "{} requires a model; pass model=<id>",
             selected.label()
         );
-        // Configuration must never wake a parked or human-stopped worker.
-        let sender = {
+        // Configuration never starts a parked actor or clears a human stop.
+        let sender = if session_id == self.root_session_id {
+            None
+        } else {
             let table = self.table.lock().await;
             let entry = table
                 .entries
-                .get(&current.session_id)
-                .context("not a child agent")?;
+                .get(&session_id)
+                .context("not a managed agent")?;
             ensure!(
                 !entry.dormant && !entry.snapshot.status.is_terminal(),
                 "child is paused or stopped; configuration does not resume it"
             );
-            entry
-                .commands
-                .clone()
-                .context("child has no live control channel")?
+            Some(
+                entry
+                    .commands
+                    .clone()
+                    .context("child has no live control channel")?,
+            )
         };
-        let mut events = self.subscribe();
+        let mut confirmations = self.configuration_tx.subscribe();
         let request_id = Uuid::new_v4();
-        sender
-            .send(HostCommand::Configure {
-                session_id: current.session_id,
-                action: crate::SessionConfigAction::SetAgent {
-                    request_id,
-                    provider,
-                    model,
-                    effort: effort.clone(),
-                    fast,
-                    ultrafast,
-                },
-            })
-            .await
-            .context("subagent command channel closed")?;
+        let command = HostCommand::Configure {
+            session_id,
+            action: crate::SessionConfigAction::SetAgent {
+                request_id,
+                provider,
+                model,
+                effort,
+                fast,
+                ultrafast,
+            },
+        };
+        if let Some(sender) = sender {
+            sender
+                .send(command)
+                .await
+                .context("agent command channel closed")?;
+        } else {
+            let socket = crate::session_control_socket_path(&self.journal_root, session_id);
+            crate::send_local_session_command(&socket, session_id, command).await?;
+        }
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                match events.recv().await {
-                    Ok(SubagentActivity::SessionEvent { event, .. })
-                        if event.session_id == current.session_id =>
-                    {
-                        match event.kind {
-                            SessionEventKind::SessionConfigured {
-                                provider,
-                                model,
-                                effort: actual_effort,
-                                fast: actual_fast,
-                                ultrafast: actual_ultrafast,
-                                ..
-                            } if provider == selected
-                                && model == expected_model
-                                && effort.as_ref().is_none_or(|expected| {
-                                    actual_effort.as_ref() == Some(expected)
-                                })
-                                && fast.is_none_or(|expected| actual_fast == expected)
-                                && ultrafast
-                                    .is_none_or(|expected| actual_ultrafast == expected) =>
-                            {
-                                return Ok(());
-                            }
-                            SessionEventKind::ProviderEvent { kind, payload, .. }
-                                if kind == "child_configuration_rejected"
-                                    && payload["request_id"] == request_id.to_string() =>
-                            {
-                                bail!(
-                                    "{}",
-                                    payload["message"]
-                                        .as_str()
-                                        .unwrap_or("child configuration rejected")
-                                );
-                            }
-                            _ => {}
-                        }
-                        if let SessionEventKind::Error { message } = event.kind {
-                            bail!("child configuration failed: {message}");
-                        }
+                match confirmations.recv().await {
+                    Ok((id, request, result)) if id == session_id && request == request_id => {
+                        return result.map_err(anyhow::Error::msg);
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => {
-                        bail!("child activity channel closed before configuration was confirmed")
+                        bail!("configuration confirmation channel closed")
                     }
                 }
             }
         })
         .await
-        .context("child did not confirm its configuration within 30 seconds")??;
-        self.resolve_snapshot(target).await
+        .context("agent did not confirm its configuration within 30 seconds")??;
+        let config = self
+            .store
+            .state(session_id)
+            .await?
+            .configuration
+            .context("configured session has no configuration")?;
+        let mut table = self.table.lock().await;
+        if let Some(entry) = table.entries.get_mut(&session_id) {
+            entry.snapshot.provider = config.provider;
+            entry.snapshot.model = config.model;
+            entry.snapshot.effort = config.effort;
+            entry.snapshot.fast = config.fast;
+            entry.snapshot.ultrafast = config.ultrafast;
+            return Ok(serde_json::to_value(&entry.snapshot)?);
+        }
+        let mut value = serde_json::to_value(config)?;
+        value["session_id"] = json!(session_id);
+        value["task_name"] = json!(table.task_name(session_id)?);
+        Ok(value)
     }
 
     /// Interrupt as the human (the UI path). `interrupt_agent` records its
@@ -7251,13 +7299,10 @@ impl SubagentCoordinator {
                 Ok(json!({ "agents": self.list(args.path_prefix.as_deref()).await }))
             }
             "configure_agent" => {
-                ensure!(
-                    actor_session_id == self.root_session_id,
-                    "only the director may configure child agents"
-                );
                 let args: ConfigureAgentArgs = serde_json::from_value(arguments)?;
                 let agent = self
-                    .configure_child(
+                    .configure_agent_as(
+                        actor_session_id,
                         &args.target,
                         args.provider,
                         args.model,
@@ -7895,7 +7940,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "configure_agent",
-            "Change a child agent's live provider, model, effort, or fast mode without rotating, replacing its session, or losing its conversation. Fast mode takes effect at the next native model boundary without cancelling tools; other changes take effect next turn. Paused/stopped workers are never woken. Omitted fast retains the mode, false disables it. Fast requires confirmed subscription model support and may consume additional quota; no API-key fallback. A requested mode is not evidence of priority acceptance; returns only after the child records its new configuration. Use a target from list_agents. The director alone may call this; get_provider_capabilities before switching providers.",
+            "Change your own or a director-managed agent's live provider, model, effort, or fast mode without rotating, replacing its session, or losing its conversation. Fast mode takes effect at the next native model boundary without cancelling tools; other changes take effect next turn. Paused/stopped workers are never woken. Omitted fast retains the mode, false disables it. Fast requires confirmed subscription model support and may consume additional quota; no API-key fallback. A requested mode is not evidence of priority acceptance; returns only after the target records its new configuration. Target accepts self, your current session UUID, /root, or a managed agent path/UUID. An agent may configure itself; only the director may configure other agents; get_provider_capabilities before switching providers.",
             json!({
                 "type": "object",
                 "properties": {
@@ -8847,13 +8892,7 @@ pub fn agent_tool_specs_for_surface(
         specs.retain(|spec| {
             !matches!(
                 spec["name"].as_str(),
-                Some(
-                    "watch"
-                        | "list_watchers"
-                        | "await_watchers"
-                        | "stop_watcher"
-                        | "configure_agent"
-                )
+                Some("watch" | "list_watchers" | "await_watchers" | "stop_watcher")
             )
         });
     }
