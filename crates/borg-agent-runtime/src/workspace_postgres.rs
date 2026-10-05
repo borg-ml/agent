@@ -299,23 +299,28 @@ impl PostgresWorkspaceStore {
         mode: &DeliveryMode,
         is_message: bool,
     ) -> Result<()> {
+        if recipients.is_empty() {
+            return Ok(());
+        }
         let mode_json = serde_json::to_string(mode)?;
         let pending = serde_json::to_string(&DeliveryState::Pending)?;
-        for recipient in recipients {
-            sqlx::query(
-                "insert into workspace_deliveries \
-                 (workspace_id, sequence, recipient_id, mode, state, is_message) \
-                 values ($1, $2, $3, $4, $5, $6)",
-            )
-            .bind(workspace_id.to_string())
-            .bind(sequence)
-            .bind(recipient.to_string())
-            .bind(&mode_json)
-            .bind(&pending)
-            .bind(is_message)
-            .execute(&mut **transaction)
-            .await?;
-        }
+        let recipient_ids: Vec<String> = recipients.iter().map(Uuid::to_string).collect();
+        // One statement, not one round trip per member: this runs under the
+        // workspace row lock on a pool connection shared with the session
+        // journal, so a team-sized loop here starves every other writer.
+        sqlx::query(
+            "insert into workspace_deliveries \
+             (workspace_id, sequence, recipient_id, mode, state, is_message) \
+             select $1::text, $2::bigint, recipient, $4::text, $5::text, $6::boolean from unnest($3::text[]) as recipient",
+        )
+        .bind(workspace_id.to_string())
+        .bind(sequence)
+        .bind(&recipient_ids)
+        .bind(&mode_json)
+        .bind(&pending)
+        .bind(is_message)
+        .execute(&mut **transaction)
+        .await?;
         Ok(())
     }
 

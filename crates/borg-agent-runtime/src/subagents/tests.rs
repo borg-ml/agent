@@ -3461,6 +3461,40 @@ async fn an_idle_child_releases_retained_context_and_a_stop_still_stops() {
 }
 
 #[tokio::test]
+async fn a_store_pool_timeout_parks_a_child_but_other_errors_still_fail_it() {
+    let table = Arc::new(Mutex::new(SubagentTable {
+        root_session_id: Uuid::new_v4(),
+        max_children: 4,
+        entries: HashMap::new(),
+        task_names: HashMap::new(),
+        parking: None,
+        resume_after_restore: Vec::new(),
+    }));
+    let (busy, broken) = {
+        let mut table = table.lock().await;
+        let busy = table.reserve("busy", &launch()).unwrap().session_id;
+        let broken = table.reserve("broken", &launch()).unwrap().session_id;
+        (busy, broken)
+    };
+    let pool_timeout = anyhow::Error::from(sqlx::Error::PoolTimedOut);
+    assert!(matches!(
+        finish_agent(&table, busy, Some(pool_timeout)).await,
+        Some(SubagentActivity::Completed { .. })
+    ));
+    assert!(matches!(
+        finish_agent(&table, broken, Some(anyhow::anyhow!("provider rejected"))).await,
+        Some(SubagentActivity::Failed { .. })
+    ));
+    let table = table.lock().await;
+    assert_eq!(table.entries[&busy].snapshot.status, SubagentStatus::Ready);
+    assert!(table.entries[&busy].dormant, "a parked child can be woken");
+    assert_eq!(
+        table.entries[&broken].snapshot.status,
+        SubagentStatus::Failed
+    );
+}
+
+#[tokio::test]
 async fn child_messages_are_team_scoped_and_can_report_to_root() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
@@ -5583,6 +5617,116 @@ async fn restored_live_child_stays_dormant_and_parks_with_its_root() {
         "revived child owns its writer again"
     );
     coordinator.stop_all().await;
+    scratch.discard().await;
+}
+
+/// An owner that dies without parking its children (here, a store failure took
+/// its host down) leaves them mirrored as running. The child's own journal says
+/// whether it was cut off mid-turn or had itself stopped.
+#[tokio::test]
+async fn restore_wakes_a_child_cut_off_mid_turn_but_never_a_stopped_one() {
+    let directory = tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let mut parent_events = Vec::new();
+    let mut children = Vec::new();
+    for (name, journaled_status) in [
+        ("/root/cut_off", SessionStatus::Running),
+        ("/root/stopped", SessionStatus::Stopped),
+    ] {
+        let child_id = Uuid::new_v4();
+        let now = Utc::now();
+        let snapshot = SubagentSnapshot {
+            session_id: child_id,
+            parent_session_id: root,
+            task_name: name.into(),
+            status: SubagentStatus::Running,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-test".into()),
+            effort: Some("high".into()),
+            fast: false,
+            ultrafast: false,
+            cwd: workspace.clone(),
+            created_at: now,
+            updated_at: now,
+            detail: None,
+            final_text: None,
+            usage: SubagentUsage::default(),
+            interrupted_by: None,
+        };
+        let parent_event = SessionEvent::new(
+            root,
+            0,
+            SessionEventKind::SubagentActivity {
+                activity: SubagentActivityKind::Started,
+                agent: snapshot,
+                event: None,
+            },
+        );
+        parent_events.push(store.append(parent_event).await.unwrap());
+        store.create_session(child_id).await.unwrap();
+        for kind in [
+            SessionEventKind::SessionStarted,
+            SessionEventKind::SessionConfigured {
+                cwd: workspace.clone(),
+                provider: CodingProvider::Codex,
+                model: Some("gpt-test".into()),
+                effort: Some("high".into()),
+                fast: false,
+                ultrafast: false,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                speed_support: Default::default(),
+            },
+            SessionEventKind::StatusChanged {
+                status: journaled_status,
+                detail: None,
+            },
+        ] {
+            store
+                .append(SessionEvent::new(child_id, 0, kind))
+                .await
+                .unwrap();
+        }
+        children.push(child_id);
+    }
+    let session_store: Arc<dyn SessionStore> = store.clone();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        3,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        session_store,
+    )
+    .unwrap();
+    coordinator
+        .restore_from_events(&parent_events)
+        .await
+        .unwrap();
+    let [cut_off, stopped] = [children[0], children[1]];
+    let restored = coordinator
+        .resolve_snapshot(&cut_off.to_string())
+        .await
+        .unwrap();
+    assert_eq!(restored.status, SubagentStatus::Ready);
+    assert_eq!(restored.detail.as_deref(), Some(PARKED_MID_TASK));
+    assert_eq!(
+        coordinator
+            .resolve_snapshot(&stopped.to_string())
+            .await
+            .unwrap()
+            .status,
+        SubagentStatus::Stopped
+    );
+    assert_eq!(
+        coordinator.table.lock().await.resume_after_restore,
+        vec![cut_off]
+    );
     scratch.discard().await;
 }
 

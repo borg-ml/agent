@@ -3645,6 +3645,9 @@ struct SubagentTable {
 const PARKED_WITH_PARENT: &str = "Paused with the parent session; follow up to wake";
 /// A child parked in the middle of a task; restore wakes it to continue.
 const PARKED_MID_TASK: &str = "Paused mid-task with the parent session; resumes when it restarts";
+/// A child whose actor stopped because the session store pool timed out.
+const PARKED_STORE_BUSY: &str =
+    "Paused: the session store was busy (pool timed out); follow up to wake";
 const RESUME_AFTER_RESTART: &str = "Borg restarted while you were working on your assigned task, which cut off your last turn. Continue the task from where you left off; your conversation and workspace are intact.";
 
 impl SubagentTable {
@@ -4492,7 +4495,7 @@ impl SubagentCoordinator {
                 continue;
             }
             let mirrored_status = snapshot.status;
-            let parked_mid_task = mirrored_status == SubagentStatus::Ready
+            let mut parked_mid_task = mirrored_status == SubagentStatus::Ready
                 && snapshot.detail.as_deref() == Some(PARKED_MID_TASK);
             let actor_path = child_lock_path(&self.journal_root, snapshot.session_id);
             let mut recovery_failed = false;
@@ -4511,6 +4514,19 @@ impl SubagentCoordinator {
                 match recovered {
                     Ok(state) if state.latest_sequence > 0 => {
                         project_child_state(&mut snapshot, &state);
+                        // The owner can die without parking its children (a
+                        // crash, or its host failing on a store error). A child
+                        // whose own journal still ends in flight was cut off
+                        // mid-turn, not idle and not stopped: wake it like one
+                        // parked mid-task. Anything the child journaled as
+                        // stopped or idle keeps that state, so an explicit
+                        // stop is never undone here.
+                        parked_mid_task |= matches!(
+                            snapshot.status,
+                            SubagentStatus::Starting
+                                | SubagentStatus::Running
+                                | SubagentStatus::WaitingForApproval
+                        );
                         // A child the parent parked on shutdown journals its own
                         // exit as stopped; the parent's record is the authority.
                         let parked_by_parent = snapshot.status == SubagentStatus::Stopped
@@ -4530,7 +4546,10 @@ impl SubagentCoordinator {
                     Ok(_) => {
                         snapshot.status = SubagentStatus::Failed;
                         snapshot.updated_at = Utc::now();
-                        snapshot.detail = Some("child session is unavailable after restart".into());
+                        snapshot.detail = Some(
+                            "child session had not started before the restart; spawn it again"
+                                .into(),
+                        );
                         recovery_failed = true;
                     }
                     Err(error) => {
@@ -11289,6 +11308,18 @@ fn project_child_state(snapshot: &mut SubagentSnapshot, state: &crate::SessionSt
     };
 }
 
+fn is_store_pool_timeout(error: &anyhow::Error) -> bool {
+    // Matched by text too: the error can cross a task boundary as a message.
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<sqlx::Error>(),
+            Some(sqlx::Error::PoolTimedOut)
+        ) || cause
+            .to_string()
+            .starts_with("pool timed out while waiting for an open connection")
+    })
+}
+
 async fn finish_agent(
     table: &Arc<Mutex<SubagentTable>>,
     session_id: Uuid,
@@ -11300,13 +11331,18 @@ async fn finish_agent(
         .as_ref()
         .map(|busy| busy.contains(&session_id));
     let entry = table.entries.get_mut(&session_id)?;
+    // A store pool timeout says the journal was momentarily saturated, not
+    // that this child's work is wrong. Park it wakeable instead of failing it
+    // for good; its journal still ends in flight, so a restore resumes it too.
+    let store_busy = error.as_ref().is_some_and(is_store_pool_timeout);
     entry.snapshot.status = match (&error, parked_mid_task) {
-        (Some(_), _) => SubagentStatus::Failed,
-        (None, Some(_)) => SubagentStatus::Ready,
+        (Some(_), _) if !store_busy => SubagentStatus::Failed,
+        (Some(_), _) | (None, Some(_)) => SubagentStatus::Ready,
         (None, None) => SubagentStatus::Stopped,
     };
     entry.snapshot.detail = match (error, parked_mid_task) {
-        (Some(error), _) => Some(format!("{error:#}")),
+        (Some(error), _) if !store_busy => Some(format!("{error:#}")),
+        (Some(_), _) => Some(PARKED_STORE_BUSY.to_string()),
         (None, Some(true)) => Some(PARKED_MID_TASK.to_string()),
         (None, Some(false)) => Some(PARKED_WITH_PARENT.to_string()),
         (None, None) => None,

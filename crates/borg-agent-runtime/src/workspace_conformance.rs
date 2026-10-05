@@ -1967,3 +1967,65 @@ portable_cases!(
     legacy_plans_migrate_once_and_preserve_work_identity,
     work_assignment_permissions_and_parent_cycles_are_enforced_by_store,
 );
+
+#[cfg(test)]
+#[tokio::test]
+async fn large_team_concurrent_fanout_preserves_every_delivery() {
+    let url = crate::session_store::postgres::testing::required_test_url();
+    let scratch = ScratchDatabase::create(&url).await;
+    let session = PostgresSessionStore::connect_with_pool_size(&scratch.url, 8)
+        .await
+        .expect("bootstrap scratch schema");
+    let store = std::sync::Arc::new(PostgresWorkspaceStore::from_pool(session.pool().clone()));
+    let (workspace, author, _, _) = workspace_with_members(store.as_ref()).await;
+    for i in 0..80 {
+        let id = Uuid::new_v4();
+        store
+            .create_participant(participant(id, &format!("worker-{i}")))
+            .await
+            .unwrap();
+        store
+            .add_member(WorkspaceMembership {
+                workspace_id: workspace,
+                participant_id: id,
+                role: WorkspaceRole::Editor,
+                joined_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
+    let mut writes = tokio::task::JoinSet::new();
+    for i in 0..16 {
+        let store = store.clone();
+        writes.spawn(async move {
+            store
+                .append(message_event(
+                    workspace,
+                    author,
+                    "burst",
+                    Audience::Workspace,
+                    &format!("burst-{i}"),
+                ))
+                .await
+                .expect("concurrent fanout")
+        });
+    }
+    let mut sequences = std::collections::HashSet::new();
+    while let Some(result) = writes.join_next().await {
+        assert!(sequences.insert(result.unwrap().sequence));
+    }
+    assert_eq!(sequences.len(), 16);
+    let deliveries: i64 =
+        sqlx::query_scalar("select count(*) from workspace_deliveries where workspace_id=$1")
+            .bind(workspace.to_string())
+            .fetch_one(session.pool())
+            .await
+            .unwrap();
+    // Authors replay their own events without a delivery row.
+    assert_eq!(deliveries, 82 * 16);
+    let replay = store.replay(workspace, author, 0, 50).await.unwrap();
+    assert_eq!(replay.len(), 16);
+    drop(store);
+    session.pool().close().await;
+    scratch.discard().await;
+}
