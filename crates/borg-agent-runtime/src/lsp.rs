@@ -1267,6 +1267,7 @@ async fn compilation_configuration_stamp(
     for relative in [
         "compile_commands.json",
         "build/compile_commands.json",
+        "build/compile_flags.txt",
         "compile_flags.txt",
         ".clangd",
     ] {
@@ -1301,7 +1302,9 @@ async fn ready_client<'a>(
         for path in documents {
             let mut parent = path.parent();
             while let Some(directory) = parent {
-                if directory == root || !directory.starts_with(root) { break; }
+                if directory == root || !directory.starts_with(root) {
+                    break;
+                }
                 directories.insert(directory.to_path_buf());
                 parent = directory.parent();
             }
@@ -1530,6 +1533,10 @@ async fn find_compilation_database(start: &Path, root: &Path) -> Option<Compilat
                 "compile_commands.json",
             ),
             (PathBuf::from("compile_flags.txt"), "compile_flags.txt"),
+            (
+                PathBuf::from("build").join("compile_flags.txt"),
+                "compile_flags.txt",
+            ),
         ] {
             let candidate = directory.join(relative);
             if tokio::fs::metadata(&candidate).await.is_ok() {
@@ -2707,6 +2714,31 @@ mod tests {
             .expect("write source");
         assert_eq!(
             after,
+            compilation_configuration_stamp(clangd, root.path()).await
+        );
+    }
+
+    // Prevent false fallback warnings and stale diagnostics when clangd reads
+    // flags in the standard build directory (also selected by .clangd).
+    #[tokio::test]
+    async fn clangd_build_directory_flags_are_reported_and_invalidate_cache() {
+        let root = tempfile::tempdir().expect("workspace");
+        let clangd = spec_for_id("clangd").expect("clangd");
+        let before = compilation_configuration_stamp(clangd, root.path()).await;
+        tokio::fs::create_dir(root.path().join("build"))
+            .await
+            .expect("build directory");
+        let flags = root.path().join("build/compile_flags.txt");
+        tokio::fs::write(&flags, "-std=c++20\n")
+            .await
+            .expect("flags");
+        let status = compilation_context_status(root.path(), clangd, None)
+            .await
+            .expect("context");
+        assert_eq!(status["status"], json!("present"));
+        assert_eq!(status["path"], json!(flags));
+        assert_ne!(
+            before,
             compilation_configuration_stamp(clangd, root.path()).await
         );
     }
