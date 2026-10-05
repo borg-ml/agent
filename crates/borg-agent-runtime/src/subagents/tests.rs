@@ -2426,7 +2426,10 @@ async fn configure_agent_self_and_current_uuid_apply_inside_the_live_root_turn()
             })
         }
     }
-    let directory = tempdir().unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("borg-config-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let root = Uuid::new_v4();
     let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
     let store = Arc::new(store);
