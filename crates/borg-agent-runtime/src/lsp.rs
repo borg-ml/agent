@@ -1438,6 +1438,30 @@ fn uses_compilation_database(spec: &ServerSpec) -> bool {
     spec.id == "clangd"
 }
 
+// clangd configuration may choose a different database per path. Finding a
+// nearby database is not proof that clangd uses it; avoid a false "present" /
+// coversFile claim until configuration selection can be resolved faithfully.
+async fn clangd_database_override(search_start: &Path, workspace_root: &Path) -> Option<PathBuf> {
+    for directory in search_start.ancestors() {
+        if !directory.starts_with(workspace_root) {
+            break;
+        }
+        let path = directory.join(".clangd");
+        if let Ok(contents) = tokio::fs::read_to_string(&path).await
+            && contents.lines().any(|line| {
+                let line = line.trim();
+                !line.starts_with('#')
+                    && line.split_once(':').is_some_and(|(key, _)| {
+                        key.trim().trim_matches(['\'', '"']) == "CompilationDatabase"
+                    })
+            })
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
 async fn compilation_context_status(
     workspace_root: &Path,
     spec: &ServerSpec,
@@ -1450,6 +1474,17 @@ async fn compilation_context_status(
         .and_then(Path::parent)
         .unwrap_or(workspace_root)
         .to_path_buf();
+    if let Some(configuration) = clangd_database_override(&search_start, workspace_root).await {
+        return Some(json!({
+            "status": "unverified",
+            "diagnosticTrust": "clangd_database_override_not_code_error_proof",
+            "clangdConfiguration": configuration,
+            "coversFile": "unknown",
+            "warning": "clangd configuration overrides CompilationDatabase (possibly per path); \
+                a nearby database does not establish which flags clangd actually used. \
+                Configuration selection must be verified before treating these diagnostics as code-error proof"
+        }));
+    }
     let Some(database) = find_compilation_database(&search_start, workspace_root).await else {
         return Some(json!({
             "status": "missing",
@@ -2791,6 +2826,22 @@ mod tests {
             .expect("clangd reports compilation context");
         assert_eq!(covered["status"], json!("present"));
         assert_eq!(covered["coversFile"], json!(true));
+
+        tokio::fs::write(
+            root.path().join(".clangd"),
+            "CompileFlags:\n  CompilationDatabase: build\n---\nIf:\n  PathMatch: Source/Engine/.*\nCompileFlags:\n  CompilationDatabase: Intermediate/ClangDatabase\n",
+        )
+        .await
+        .expect("write per-path clangd configuration");
+        let overridden = compilation_context_status(root.path(), clangd, Some(&source))
+            .await
+            .expect("clangd reports uncertain configuration selection");
+        assert_eq!(overridden["status"], json!("unverified"));
+        assert_eq!(overridden["coversFile"], json!("unknown"));
+        assert_eq!(
+            overridden["diagnosticTrust"],
+            json!("clangd_database_override_not_code_error_proof")
+        );
 
         let rust = spec_for_id("rust-analyzer").expect("rust-analyzer spec");
         assert!(
