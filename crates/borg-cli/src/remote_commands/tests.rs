@@ -928,6 +928,47 @@ fn older_history_pages_end_immediately_before_the_loaded_tail() {
     assert_eq!(older_tui_history_limit(37, 0), 36);
 }
 
+#[tokio::test]
+async fn older_history_pages_preserve_prompt_admission_order() {
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let mut sequences = Vec::new();
+    for (message_id, status) in [
+        (first, MessageStatus::Queued),
+        (second, MessageStatus::Queued),
+        (second, MessageStatus::Complete),
+        (first, MessageStatus::Complete),
+    ] {
+        let event = store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::User,
+                    text: message_id.to_string(),
+                    attachments: Vec::new(),
+                    status,
+                    delivery: Some(PromptDelivery::Steer),
+                },
+            ))
+            .await
+            .unwrap();
+        sequences.push(event.sequence);
+    }
+    let page = older_tui_history(&store, session_id, sequences[3] + 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+        sequences
+    );
+    scratch.discard().await;
+}
+
 #[test]
 fn older_history_pages_merge_around_a_checkpoint_without_duplicate_rows() {
     let session_id = Uuid::new_v4();

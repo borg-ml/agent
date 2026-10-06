@@ -9330,15 +9330,7 @@ async fn older_tui_history(
         .events_after(session_id, after_sequence, limit)
         .await?
         .into_iter()
-        .filter(|event| {
-            !matches!(
-                event.kind,
-                SessionEventKind::Message {
-                    status: MessageStatus::Queued,
-                    ..
-                }
-            )
-        })
+        .filter(|event| event.sequence < before_sequence)
         .collect())
 }
 
