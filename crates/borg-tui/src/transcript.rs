@@ -2366,9 +2366,10 @@ impl Transcript {
             SessionEventKind::ReasoningTextDelta { delta } => {
                 let key = format!("reasoning:{}", event.id);
                 if !self.tools.contains_key(&key) {
-                    let was_active = self.active_reasoning;
                     self.append_reasoning_text_delta(delta, event.created_at, local_event_time(event));
-                    if was_active.is_none() && let Some(index) = self.active_reasoning {
+                    if let Some(index) = self.active_reasoning
+                        && !self.tools.iter().any(|(key, stored)| key.starts_with("reasoning:") && *stored == index)
+                    {
                         self.tools.insert(key, index);
                     }
                 }
@@ -6984,6 +6985,32 @@ impl Transcript {
 #[cfg(test)]
 mod parallel_preparation_tests {
     use super::*;
+
+    #[test]
+    fn finalized_reasoning_reuses_a_live_lifecycle_row() {
+        let session_id = Uuid::new_v4();
+        let mut transcript = Transcript::default();
+        transcript.apply(&SessionEvent::new(session_id, 0, SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "item/started:reasoning".into(),
+            payload: serde_json::json!({}),
+        }));
+        let first = SessionEvent::new(session_id, 0, SessionEventKind::ReasoningTextDelta {
+            delta: "Checking replay".into(),
+        });
+        transcript.apply(&first);
+        transcript.apply(&SessionEvent::new(session_id, 1, SessionEventKind::ReasoningCompleted));
+        transcript.apply(&SessionEvent::new(session_id, 2, SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "reasoning_snapshot".into(),
+            payload: serde_json::json!({"reasoning_id":first.id,"started_at":first.created_at,
+                "text":"Checking replay safely","complete":true}),
+        }));
+        assert_eq!(transcript.order.len(), 1);
+        assert!(matches!(&transcript.order[0], TranscriptEntry::Tool {
+            code_view: Some((_, text)), complete: true, ..
+        } if text == "Checking replay safely"));
+    }
 
     #[test]
     fn archived_reasoning_updates_its_original_row_after_intervening_output() {
