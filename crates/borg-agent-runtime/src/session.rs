@@ -5427,7 +5427,10 @@ async fn run_agent_session_store_kernel_inner(
                             // With a fallback chain any usage limit, including a
                             // weekly or billing one, moves the turn to the next
                             // route instead of stopping it.
-                            let chain_fallback = !launch.capabilities.model_fallback.is_empty()
+                            // Managed workers must keep the director-selected route, not inherit
+                            // the interactive session's fallback providers/models/efforts.
+                            let chain_fallback = dispatcher.parent_session_id().await.is_none()
+                                && !launch.capabilities.model_fallback.is_empty()
                                 && provider_error_is_usage_limited(&error)
                                 && !interrupted;
                             let usage_limit_retry = chain_fallback
@@ -5479,6 +5482,7 @@ async fn run_agent_session_store_kernel_inner(
                             // state, so it has to win. Reading a limit as a connection first is how
                             // something the user could plan around becomes a silent resend loop instead.
                             let network_retry = !interrupted
+                                && !provider_error_is_usage_limited(&error)
                                 && !usage_limit_retry
                                 && (turn_error_is_connection_lost(&turn_error, &error)
                                     || provider_error_is_transient_api_failure(&error)
@@ -5549,10 +5553,11 @@ async fn run_agent_session_store_kernel_inner(
                                     )
                                 } else if network_retry {
                                     format!(
-                                        "Provider temporarily unavailable · attempt {}/{} · retrying in {}s · Esc to cancel. Your work is saved.",
+                                        "Provider temporarily unavailable · attempt {}/{} · retrying in {}s · Esc to cancel. Your work is saved. Last error: {}",
                                         network_retry_attempts.saturating_add(1),
                                         NETWORK_RETRY_MAX_ATTEMPTS,
-                                        network_retry_delay.as_secs()
+                                        network_retry_delay.as_secs(),
+                                        compact_provider_error(&error)
                                     )
                                 } else if let Some(switch) = &fallback_switch {
                                     switch.status(usage_limit_wait.unwrap_or_default())
@@ -13377,6 +13382,7 @@ fn provider_error_is_usage_limited(error: &str) -> bool {
         || compact.contains(r#""status":429"#)
         || compact.contains("ratelimit")
         || compact.contains("usagelimit")
+        || compact.contains("usagecreditsarerequired")
         || compact.contains("quotaexceeded")
         || compact.contains("toomanyrequests")
         || compact.contains("hityourlimit")
@@ -13452,7 +13458,8 @@ fn format_reset_delay(delay: Duration) -> String {
 }
 
 fn provider_error_is_temporary_usage_limited(error: &str) -> bool {
-    provider_error_is_usage_limited(error)
+    !error.to_ascii_lowercase().contains("usage credits are required")
+        && provider_error_is_usage_limited(error)
         && !error
             .chars()
             .filter(|character| !character.is_ascii_whitespace())

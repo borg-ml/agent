@@ -9497,6 +9497,10 @@ fn goal_turn_failure_audit_reaches_three_only_for_the_same_blocker() {
 
 #[test]
 fn structured_rate_and_billing_errors_are_usage_limited() {
+    // A fast-credit refusal requires billing action, not a network/reset wait.
+    let credits = "Usage credits are required for fast mode.";
+    assert!(provider_error_is_usage_limited(credits));
+    assert!(!provider_error_is_temporary_usage_limited(credits));
     assert!(provider_error_is_usage_limited(
         r#"claude SDK API error: limit reached "kind":"rate_limit" "status":429"#
     ));
