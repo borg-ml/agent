@@ -1024,6 +1024,12 @@ fn parse_claude_account_rate_limits(value: &Value) -> Result<ClaudeAccountRateLi
 }
 
 /// Check Claude's current local login without starting a model turn or changing credentials.
+/// A bounded failure observation from the selected native subscription route;
+/// this neither launches software nor reads or rewrites credential contents.
+pub fn claude_native_account_verification_failed_recently() -> Result<bool> {
+    super::claude_connector::recent_account_verification_failure(None)
+}
+
 pub async fn read_claude_subscription_status() -> Result<bool> {
     let output = tokio::time::timeout(Duration::from_secs(8), async {
         // Capability reads must not install software or trust an old resolver cache.

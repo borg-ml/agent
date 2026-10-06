@@ -159,6 +159,23 @@ fn apply_spawn_admission(capability: &mut ProviderCapability) {
             Some(crate::BillingLane::ApiKey | crate::BillingLane::Endpoint)
         );
     capability.can_spawn = capability.installed && capability.authenticated && !quota_blocks;
+    if capability.provider == CodingProvider::Claude
+        && capability.billing == Some(crate::BillingLane::Subscription)
+        && borg_provider::provider::claude_native_account_verification_failed_recently()
+            .unwrap_or(false)
+    {
+        hold_unverified_claude_transport(capability);
+    }
+}
+
+fn hold_unverified_claude_transport(capability: &mut ProviderCapability) {
+    if capability.provider == CodingProvider::Claude
+        && capability.billing == Some(crate::BillingLane::Subscription)
+    {
+        capability.can_spawn = false;
+        capability.auth_detail =
+            Some("Claude login present; native model account verification unavailable".to_string());
+    }
 }
 
 async fn probe_provider_usage(provider: CodingProvider) -> Option<ProviderUsage> {
@@ -293,6 +310,36 @@ fn apply_claude_subscription_status(capability: &mut ProviderCapability, authent
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A confirmed native startup refusal must not repeatedly admit zero-token
+    // children merely because CLI login reports success; billing stays selected.
+    #[test]
+    fn unverified_claude_transport_holds_spawn_without_logout_or_billing_switch() {
+        let mut capability = ProviderCapability {
+            provider: CodingProvider::Claude,
+            installed: true,
+            version: None,
+            authenticated: true,
+            auth_detail: None,
+            auth_methods: vec![ProviderAuthMethod::Subscription],
+            can_spawn: true,
+            usage: None,
+            billing: Some(crate::BillingLane::Subscription),
+        };
+        hold_unverified_claude_transport(&mut capability);
+        assert!(!capability.can_spawn);
+        assert!(capability.authenticated);
+        assert_eq!(capability.billing, Some(crate::BillingLane::Subscription));
+        assert_eq!(
+            capability.auth_methods,
+            vec![ProviderAuthMethod::Subscription]
+        );
+        capability.billing = Some(crate::BillingLane::ApiKey);
+        capability.can_spawn = true;
+        hold_unverified_claude_transport(&mut capability);
+        assert!(capability.can_spawn);
+        assert_eq!(capability.billing, Some(crate::BillingLane::ApiKey));
+    }
 
     // Regression: an exhausted base allowance must not block credit-backed
     // Codex subscription attempts or silently switch them to API-key billing.

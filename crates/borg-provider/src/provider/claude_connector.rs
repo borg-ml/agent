@@ -81,6 +81,37 @@ pub(super) fn auth_directory(selected: Option<&Path>) -> Result<PathBuf> {
     })
 }
 
+// A local CLI login is not proof that the native model transport can verify
+// that account. Remember only the explicit startup-verification failure, never
+// credentials/profile values, and expire the hold so login/recovery can retry.
+fn account_failure_path(selected: Option<&Path>) -> Result<PathBuf> {
+    let authority = auth_directory(selected)?;
+    let revision = hex::encode(Sha256::digest(SCRIPT.as_bytes()));
+    let key = hex::encode(Sha256::digest(
+        format!("{}\0{VERSION}\0{revision}", authority.display()).as_bytes(),
+    ));
+    Ok(host_root()?
+        .join("authorities")
+        .join(key)
+        .join("account-verification-failed"))
+}
+
+pub(super) fn recent_account_verification_failure(selected: Option<&Path>) -> Result<bool> {
+    let path = account_failure_path(selected)?;
+    let Ok(metadata) = fs::metadata(&path) else {
+        return Ok(false);
+    };
+    let modified = metadata.modified()?;
+    // A new native login/refresh supersedes the failed authority observation.
+    if fs::metadata(auth_directory(selected)?.join(".credentials.json"))
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|login| login > modified)
+    {
+        return Ok(false);
+    }
+    Ok(modified.elapsed().unwrap_or_default() < Duration::from_secs(90))
+}
+
 fn host_root() -> Result<PathBuf> {
     Ok(crate::provider_bin::home_directory()
         .context("cannot locate the host's Claude connector directory")?
@@ -325,7 +356,12 @@ impl Connector {
                 );
                 let connector = Self::new(endpoint);
                 match connector.info(None).await {
-                    Ok(_) => return Ok(Some(connector)),
+                    Ok(_) => {
+                        let _ = fs::remove_file(
+                            endpoint_path.with_file_name("account-verification-failed"),
+                        );
+                        return Ok(Some(connector));
+                    }
                     // Only an unreachable listener permits replacement. An
                     // auth or compatibility error must not create a peer helper.
                     Err(error)
@@ -333,6 +369,15 @@ impl Connector {
                             .downcast_ref::<reqwest::Error>()
                             .is_some_and(|error| error.is_connect()) => {}
                     Err(error) => {
+                        if error
+                            .to_string()
+                            .contains("Cannot verify the selected Claude subscription account")
+                        {
+                            let _ = write_private(
+                                &endpoint_path.with_file_name("account-verification-failed"),
+                                b"unverified\n",
+                            );
+                        }
                         return Err(error).context("shared Claude connector handshake failed");
                     }
                 }
@@ -399,6 +444,7 @@ impl Connector {
         .await
         .context("timed out waiting for the shared Claude connector")??;
         if let Some(connector) = existing {
+            let _ = fs::remove_file(account_failure_path(selected)?);
             return Ok(connector);
         }
         let binary = match pinned {
@@ -469,11 +515,20 @@ impl Connector {
         .context("Claude connector startup timed out")??;
         let ready: Value = serde_json::from_str(&line)
             .context("Claude connector exited before its ready handshake")?;
+        if ready["type"] != "ready"
+            && ready["message"].as_str().is_some_and(|message| {
+                message.contains("Cannot verify the selected Claude subscription account")
+            })
+        {
+            // Best-effort diagnostic must never hide the original startup error.
+            let _ = write_private(&account_failure_path(selected)?, b"unverified\n");
+        }
         ensure!(
             ready["type"] == "ready",
             "Claude connector could not start: {}",
             ready["message"].as_str().unwrap_or("incompatible runtime")
         );
+        let _ = fs::remove_file(account_failure_path(selected)?);
         let endpoint = Endpoint {
             port: ready["port"]
                 .as_u64()
