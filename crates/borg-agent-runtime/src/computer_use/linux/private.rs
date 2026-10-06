@@ -35,7 +35,73 @@ const DISPLAY_MISSING: &str = "the private display needs borg-display, which is 
 /// Headless-capable compositors another backend could drive; reported only.
 const ALTERNATIVE_BACKENDS: &[&str] = &["sway", "cage", "labwc", "weston"];
 
-pub(super) type PrivateApp = Child;
+pub(super) struct PrivateApp {
+    child: std::sync::Arc<std::sync::Mutex<Child>>,
+    #[cfg(test)]
+    reaped: std::sync::mpsc::Receiver<()>,
+}
+impl PrivateApp {
+    fn new(child: Child) -> Self {
+        let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+        let reaper = child.clone();
+        #[cfg(test)]
+        let (done, reaped) = std::sync::mpsc::channel();
+        // Reap independently of desktop requests. try_wait retains the status
+        // for the foreground API; the lock is never held while sleeping.
+        std::thread::spawn(move || {
+            loop {
+                let status = reaper.lock().unwrap_or_else(|e| e.into_inner()).try_wait();
+                if !matches!(status, Ok(None)) {
+                    #[cfg(test)]
+                    let _ = done.send(());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        Self {
+            child,
+            #[cfg(test)]
+            reaped,
+        }
+    }
+    fn id(&self) -> u32 {
+        self.child.lock().unwrap_or_else(|e| e.into_inner()).id()
+    }
+}
+trait ManagedChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+    fn signal_group(&mut self, signal: i32);
+}
+impl ManagedChild for Child {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        Child::try_wait(self)
+    }
+    fn signal_group(&mut self, signal: i32) {
+        if matches!(self.try_wait(), Ok(None)) {
+            unsafe {
+                libc::killpg(self.id() as i32, signal);
+            }
+        }
+    }
+}
+impl ManagedChild for PrivateApp {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_wait()
+    }
+    fn signal_group(&mut self, signal: i32) {
+        let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        // The lock prevents reaping/pid reuse between this check and killpg.
+        if matches!(child.try_wait(), Ok(None)) {
+            unsafe {
+                libc::killpg(child.id() as i32, signal);
+            }
+        }
+    }
+}
 
 pub(in crate::computer_use) struct PrivateWindow {
     /// The compositor's own window id.
@@ -68,13 +134,10 @@ fn detach(command: &mut Command, die_with_helper: bool) {
 }
 
 /// SIGTERM each child's process group, wait once for all, then SIGKILL.
-fn terminate_groups(processes: &mut [&mut Child], grace: Duration) {
-    let signal = |processes: &[&mut Child], signal| {
-        for process in processes {
-            // SAFETY: signalling a process group this helper started.
-            unsafe {
-                libc::killpg(process.id() as i32, signal);
-            }
+fn terminate_groups<T: ManagedChild>(processes: &mut [&mut T], grace: Duration) {
+    let signal = |processes: &mut [&mut T], signal| {
+        for process in processes.iter_mut() {
+            process.signal_group(signal);
         }
     };
     signal(processes, libc::SIGTERM);
@@ -95,7 +158,7 @@ fn terminate_groups(processes: &mut [&mut Child], grace: Duration) {
     }
 }
 
-fn running(child: &mut Child) -> bool {
+fn running<T: ManagedChild>(child: &mut T) -> bool {
     matches!(child.try_wait(), Ok(None))
 }
 
@@ -541,7 +604,7 @@ impl Helper {
     pub(super) fn stop_display(&mut self) -> Value {
         let mut terminated: Vec<u32> = self.private_apps.keys().copied().collect();
         terminated.sort_unstable();
-        let mut apps: Vec<Child> = self.private_apps.drain().map(|(_, app)| app).collect();
+        let mut apps: Vec<PrivateApp> = self.private_apps.drain().map(|(_, app)| app).collect();
         terminate_groups(
             &mut apps.iter_mut().collect::<Vec<_>>(),
             Duration::from_secs(3),
@@ -679,6 +742,7 @@ impl Helper {
         let app = command
             .spawn()
             .map_err(|error| anyhow!("cannot launch {}: {error}", argv[0]))?;
+        let app = PrivateApp::new(app);
         let pid = app.id();
         // Detached apps are not killed at teardown; still reap them here.
         self.private_apps.insert(pid, app);
@@ -1185,5 +1249,30 @@ impl Helper {
             merge(&mut status, running);
         }
         Ok(status)
+    }
+}
+
+#[cfg(test)]
+mod reaping_tests {
+    use super::*;
+    #[test]
+    fn private_app_teardown_keeps_reaper_lock_available() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 60"]);
+        detach(&mut command, true);
+        let mut app = PrivateApp::new(command.spawn().unwrap());
+        terminate_groups(&mut [&mut app], Duration::from_millis(100));
+        assert!(app.try_wait().unwrap().is_some());
+        app.reaped.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    #[test]
+    fn private_app_is_reaped_without_another_request() {
+        let child = Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap();
+        let mut app = PrivateApp::new(child);
+        let pid = app.id();
+        app.reaped.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert_eq!(app.try_wait().unwrap().unwrap().code(), Some(7));
+        assert_eq!(app.try_wait().unwrap().unwrap().code(), Some(7));
     }
 }
