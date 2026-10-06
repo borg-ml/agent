@@ -999,13 +999,6 @@ fn older_history_pages_merge_around_a_checkpoint_without_duplicate_rows() {
     );
 }
 
-#[test]
-fn first_resume_scan_is_bounded_before_history_is_selected() {
-    assert_eq!(recent_tui_history_after(10), 0);
-    assert_eq!(recent_tui_history_after(100), 0);
-    assert_eq!(recent_tui_history_after(60_000), 59_488);
-}
-
 #[tokio::test]
 async fn first_resume_frame_keeps_latest_updates_from_a_long_autonomous_turn() {
     let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
@@ -1026,7 +1019,7 @@ async fn first_resume_frame_keeps_latest_updates_from_a_long_autonomous_turn() {
         ))
         .await
         .unwrap();
-    for _ in 0..RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT {
+    for _ in 0..REPLAY_STRESS_EVENT_COUNT {
         store
             .append(SessionEvent::new(
                 session_id,
@@ -1052,7 +1045,7 @@ async fn first_resume_frame_keeps_latest_updates_from_a_long_autonomous_turn() {
         .await
         .unwrap();
 
-    let history = recent_tui_history(&store, session_id, latest.sequence)
+    let history = complete_tui_history(&store, session_id, latest.sequence)
         .await
         .unwrap();
 
@@ -1111,7 +1104,7 @@ async fn first_resume_frame_reaches_a_conversation_end_buried_behind_a_long_even
         ))
         .await
         .unwrap();
-    for _ in 0..(RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT * 2) {
+    for _ in 0..(REPLAY_STRESS_EVENT_COUNT * 2) {
         store
             .append(SessionEvent::new(
                 session_id,
@@ -1123,7 +1116,7 @@ async fn first_resume_frame_reaches_a_conversation_end_buried_behind_a_long_even
     }
 
     let latest_sequence = store.state(session_id).await.unwrap().latest_sequence;
-    let history = recent_tui_history(&store, session_id, latest_sequence)
+    let history = complete_tui_history(&store, session_id, latest_sequence)
         .await
         .unwrap();
 
@@ -1150,19 +1143,13 @@ async fn first_resume_frame_reaches_a_conversation_end_buried_behind_a_long_even
             .all(|pair| pair[0].sequence < pair[1].sequence),
         "spliced conversation rows must stay in sequence order"
     );
-    // The reply is spliced from outside the scan window, so it must not become
-    // the paging cursor: everything between it and the retained tail is still
-    // unloaded and only pages in from a cursor inside that window.
-    assert!(history.page_before > reply.sequence);
-    assert!(history.page_before > recent_tui_history_after(latest_sequence));
-    let older = older_tui_history(&store, session_id, history.page_before)
-        .await
-        .unwrap();
+    assert_eq!(history.page_before, 1);
+    assert_eq!(history.events.len() as u64, latest_sequence);
     assert!(
-        older
+        history
+            .events
             .iter()
-            .any(|event| event.sequence > reply.sequence && event.sequence < history.page_before),
-        "paging up must load the interval the splice skipped"
+            .any(|event| event.sequence == reply.sequence + 1)
     );
     scratch.discard().await;
 }
@@ -1233,7 +1220,7 @@ async fn first_resume_frame_reaches_a_forked_conversation_end_in_logical_sequenc
         ))
         .await
         .unwrap();
-    for _ in 0..(RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT * 2) {
+    for _ in 0..(REPLAY_STRESS_EVENT_COUNT * 2) {
         store
             .append(SessionEvent::new(
                 fork_id,
@@ -1244,10 +1231,7 @@ async fn first_resume_frame_reaches_a_forked_conversation_end_in_logical_sequenc
             .unwrap();
     }
 
-    let spliced = store
-        .recent_messages(fork_id, RICH_TUI_HISTORY_MESSAGE_LIMIT)
-        .await
-        .unwrap();
+    let spliced = store.recent_messages(fork_id, 8).await.unwrap();
     assert!(
         spliced
             .iter()
@@ -1270,7 +1254,7 @@ async fn first_resume_frame_reaches_a_forked_conversation_end_in_logical_sequenc
     );
 
     let latest_sequence = store.state(fork_id).await.unwrap().latest_sequence;
-    let history = recent_tui_history(&store, fork_id, latest_sequence)
+    let history = complete_tui_history(&store, fork_id, latest_sequence)
         .await
         .unwrap();
     assert!(
@@ -1287,10 +1271,13 @@ async fn first_resume_frame_reaches_a_forked_conversation_end_in_logical_sequenc
             .windows(2)
             .all(|pair| pair[0].sequence < pair[1].sequence)
     );
-    assert!(history.page_before > forked_reply.sequence);
-    // The inherited prefix is not spliced, so it must remain reachable the
-    // normal way: paging walks down into the projection that renumbers it.
-    assert!(history.page_before > fork.inherited_event_count);
+    assert!(history.page_before <= fork.inherited_event_count);
+    assert!(
+        history
+            .events
+            .iter()
+            .any(|event| event.sequence == forked_reply.sequence + 1)
+    );
     scratch.discard().await;
 }
 
@@ -1315,102 +1302,8 @@ fn extensions_view_keeps_a_rejected_reload_visible() {
     assert!(summary.contains("revision 0123456789ab"));
 }
 
-#[test]
-fn first_resume_frame_keeps_real_recent_conversation_before_lazy_pages() {
-    let session_id = Uuid::new_v4();
-    let mut events = (1..=200)
-        .map(|sequence| {
-            SessionEvent::new(
-                session_id,
-                sequence,
-                SessionEventKind::UsageUpdated {
-                    provider_duration_ms: 0,
-                    turn_id: None,
-                    provider_context_reused: None,
-                    input_tokens: 1,
-                    output_tokens: 0,
-                    total_tokens: 1,
-                    cached_input_tokens: 0,
-                    cache_creation_input_tokens: 0,
-                    cost_usd: None,
-                    cost_microusd: None,
-                    cost_basis: String::new(),
-                    context_tokens: None,
-                    context_window_tokens: None,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    events[20] = SessionEvent::new(
-        session_id,
-        21,
-        SessionEventKind::Message {
-            message_id: Uuid::new_v4(),
-            actor: EventActor::User,
-            text: "meaningful resume context".to_string(),
-            attachments: Vec::new(),
-            status: MessageStatus::Complete,
-            delivery: None,
-        },
-    );
-
-    let selected = select_resume_bootstrap_history(events);
-    assert_eq!(selected.events.first().unwrap().sequence, 21);
-    assert_eq!(selected.events.len(), RICH_TUI_HISTORY_EVENT_LIMIT + 1);
-    assert!(selected.events.iter().any(|event| matches!(
-        &event.kind,
-        SessionEventKind::Message { text, .. } if text == "meaningful resume context"
-    )));
-}
-
-#[test]
-fn trimmed_resume_tail_keeps_paging_contiguous() {
-    let session_id = Uuid::new_v4();
-    let mut events = (1..=1_024)
-        .map(|sequence| {
-            SessionEvent::new(session_id, sequence, SessionEventKind::ReasoningCompleted)
-        })
-        .collect::<Vec<_>>();
-    events[949] = SessionEvent::new(
-        session_id,
-        950,
-        SessionEventKind::Message {
-            message_id: Uuid::new_v4(),
-            actor: EventActor::Assistant,
-            text: "latest response shown by the resume picker".to_string(),
-            attachments: Vec::new(),
-            status: MessageStatus::Complete,
-            delivery: None,
-        },
-    );
-    events[999] = SessionEvent::new(
-        session_id,
-        1_000,
-        SessionEventKind::Message {
-            message_id: Uuid::new_v4(),
-            actor: EventActor::User,
-            text: "later user boundary".to_string(),
-            attachments: Vec::new(),
-            status: MessageStatus::Complete,
-            delivery: None,
-        },
-    );
-
-    let selected = select_resume_bootstrap_history(events);
-
-    assert_eq!(selected.events.first().unwrap().sequence, 1_000);
-    assert_eq!(selected.page_before, Some(1_000));
-    let after = older_tui_history_after(selected.page_before.unwrap()).unwrap();
-    let limit = older_tui_history_limit(selected.page_before.unwrap(), after);
-    assert_eq!(after + limit as u64, 999);
-    assert!(
-        after < 950,
-        "the next page must recover the latest response"
-    );
-}
-
 #[tokio::test]
-async fn first_resume_frame_splices_in_the_latest_completed_compaction() {
+async fn resume_replays_completed_compaction_and_all_intervening_events() {
     let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
@@ -1435,7 +1328,7 @@ async fn first_resume_frame_splices_in_the_latest_completed_compaction() {
             .await
             .unwrap();
     }
-    for _ in 0..=RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT {
+    for _ in 0..=REPLAY_STRESS_EVENT_COUNT {
         store
             .append(SessionEvent::new(
                 session_id,
@@ -1488,151 +1381,19 @@ async fn first_resume_frame_splices_in_the_latest_completed_compaction() {
         .unwrap();
 
     let latest_sequence = store.state(session_id).await.unwrap().latest_sequence;
-    let history = recent_tui_history(&store, session_id, latest_sequence)
+    let history = complete_tui_history(&store, session_id, latest_sequence)
         .await
         .unwrap();
 
-    assert!(history.page_before > history.events[0].sequence);
-    assert!(history.page_before <= history.events.last().unwrap().sequence);
-    let older = older_tui_history(&store, session_id, history.page_before)
-        .await
-        .unwrap();
-    assert!(older.iter().any(|event| {
-        event.sequence > history.events[0].sequence && event.sequence < history.page_before
-    }));
-    assert!(history.events[0].kind.is_completed_context_compaction());
-    assert!(matches!(
-        &history.events[0].kind,
-        SessionEventKind::ProviderEvent { payload, .. }
-            if payload.get("summary").and_then(serde_json::Value::as_str)
-                == Some("durable resume summary")
-    ));
-    assert_eq!(
+    assert_eq!(history.page_before, history.events[0].sequence);
+    assert!(
         history
             .events
             .iter()
-            .filter(|event| matches!(
-                &event.kind,
-                SessionEventKind::ProviderEvent { kind, .. }
-                    if kind == "context_compaction"
-            ))
-            .count(),
-        1
+            .any(|event| event.kind.is_completed_context_compaction())
     );
-    assert!(history.events.iter().any(|event| matches!(
-        &event.kind,
-        SessionEventKind::Message { text, .. } if text == "current request"
-    )));
+    assert_eq!(history.events.len() as u64, latest_sequence);
     scratch.discard().await;
-}
-
-#[test]
-fn first_resume_frame_drops_orphaned_output_and_queued_input() {
-    let session_id = Uuid::new_v4();
-    let current_user_id = Uuid::new_v4();
-    let mut events = (1..=160)
-        .map(|sequence| {
-            SessionEvent::new(
-                session_id,
-                sequence,
-                SessionEventKind::UsageUpdated {
-                    provider_duration_ms: 0,
-                    turn_id: None,
-                    provider_context_reused: None,
-                    input_tokens: 1,
-                    output_tokens: 0,
-                    total_tokens: 1,
-                    cached_input_tokens: 0,
-                    cache_creation_input_tokens: 0,
-                    cost_usd: None,
-                    cost_microusd: None,
-                    cost_basis: String::new(),
-                    context_tokens: None,
-                    context_window_tokens: None,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    events[100] = SessionEvent::new(
-        session_id,
-        101,
-        SessionEventKind::Message {
-            message_id: Uuid::new_v4(),
-            actor: EventActor::Assistant,
-            text: "orphaned old response".to_string(),
-            attachments: Vec::new(),
-            status: MessageStatus::Complete,
-            delivery: None,
-        },
-    );
-    events[110] = SessionEvent::new(
-        session_id,
-        111,
-        SessionEventKind::Message {
-            message_id: Uuid::new_v4(),
-            actor: EventActor::User,
-            text: "old queued input".to_string(),
-            attachments: Vec::new(),
-            status: MessageStatus::Queued,
-            delivery: Some(PromptDelivery::Queue),
-        },
-    );
-    events[149] = SessionEvent::new(
-        session_id,
-        150,
-        SessionEventKind::Message {
-            message_id: current_user_id,
-            actor: EventActor::User,
-            text: "current user request".to_string(),
-            attachments: Vec::new(),
-            status: MessageStatus::Complete,
-            delivery: Some(PromptDelivery::Queue),
-        },
-    );
-    events[150] = SessionEvent::new(
-        session_id,
-        151,
-        SessionEventKind::Message {
-            message_id: Uuid::new_v4(),
-            actor: EventActor::Assistant,
-            text: "current response".to_string(),
-            attachments: Vec::new(),
-            status: MessageStatus::Complete,
-            delivery: None,
-        },
-    );
-
-    let selected = select_resume_bootstrap_history(events);
-    assert!(selected.events.iter().any(|event| matches!(
-        &event.kind,
-        SessionEventKind::Message { text, .. } if text == "current user request"
-    )));
-    assert!(selected.events.iter().any(|event| matches!(
-        &event.kind,
-        SessionEventKind::Message { text, .. } if text == "current response"
-    )));
-    assert!(!selected.events.iter().any(|event| matches!(
-        &event.kind,
-        SessionEventKind::Message { text, .. } if text == "orphaned old response"
-    )));
-    assert!(!selected.events.iter().any(|event| matches!(
-        &event.kind,
-        SessionEventKind::Message {
-            status: MessageStatus::Queued,
-            ..
-        }
-    )));
-    assert_eq!(
-        selected.events.iter().find_map(|event| match &event.kind {
-            SessionEventKind::Message {
-                actor: EventActor::User,
-                text,
-                ..
-            } => Some(text.as_str()),
-            _ => None,
-        }),
-        Some("current user request")
-    );
 }
 
 #[test]
@@ -1763,13 +1524,6 @@ async fn delivered_projection_repairs_durable_workflow_events_missing_from_live_
     assert_eq!(delivered.state().latest_sequence, final_sequence);
     assert_eq!(delivered.state().status, Some(SessionStatus::Running));
     scratch.discard().await;
-}
-
-#[test]
-fn child_history_tail_stays_bounded_after_long_runs_and_forks() {
-    assert_eq!(recent_child_history_after(0, 100), 0);
-    assert_eq!(recent_child_history_after(0, 60_000), 59_872);
-    assert_eq!(recent_child_history_after(59_980, 60_000), 59_980);
 }
 
 #[test]
@@ -3738,7 +3492,7 @@ fn usage_screen_keeps_account_limits_and_session_usage_distinct() {
 /// Run against a database copy: opening the store may apply schema updates.
 #[tokio::test]
 #[ignore = "explicit real-session resume performance benchmark"]
-async fn resume_hydration_over_a_real_session_store_is_bounded() {
+async fn resume_hydration_replays_the_complete_saved_journal() {
     let path = std::env::var_os("BORG_RESUME_BENCH_DB")
         .expect("set BORG_RESUME_BENCH_DB to a database copy");
     let session =
@@ -3757,7 +3511,7 @@ async fn resume_hydration_over_a_real_session_store_is_bounded() {
         .latest_sequence;
 
     let bootstrap_started = Instant::now();
-    let bootstrap = recent_tui_history(&store, session_id, events)
+    let bootstrap = complete_tui_history(&store, session_id, events)
         .await
         .expect("bootstrap history");
     eprintln!(
@@ -3781,12 +3535,7 @@ async fn resume_hydration_over_a_real_session_store_is_bounded() {
         .queue_events;
     let queue_elapsed = queue_started.elapsed();
 
-    // Tail + spliced conversation turns + the latest prompt + the compaction
-    // checkpoint. The conversation splice is what puts the end of the thread
-    // on the first frame when the stream ends in subagent traffic.
-    assert!(
-        bootstrap.events.len() <= RICH_TUI_HISTORY_EVENT_LIMIT + RICH_TUI_HISTORY_MESSAGE_LIMIT + 2
-    );
+    assert_eq!(bootstrap.events.len() as u64, events);
     assert!(
         bootstrap.events.iter().any(|event| matches!(
             &event.kind,
@@ -3802,9 +3551,9 @@ async fn resume_hydration_over_a_real_session_store_is_bounded() {
         snapshots.len()
     );
     assert!(
-        child_histories
-            .values()
-            .all(|events| events.len() <= RICH_TUI_HISTORY_EVENT_LIMIT),
+        child_histories.values().all(|events| events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)),
         "child transcripts must stay bounded"
     );
     eprintln!(
@@ -4037,7 +3786,7 @@ async fn resume_bootstrap_stops_at_the_live_cursor() {
         .await
         .unwrap();
 
-    let history = recent_tui_history(&store, session_id, cursor)
+    let history = complete_tui_history(&store, session_id, cursor)
         .await
         .unwrap();
 

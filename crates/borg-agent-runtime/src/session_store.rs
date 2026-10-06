@@ -249,7 +249,8 @@ impl SessionEventKind {
             Self::ProviderEvent { kind, .. }
                 if matches!(
                     kind.as_str(),
-                    "native_model_message"
+                    "reasoning_snapshot"
+                        | "native_model_message"
                         | "native_context_edit"
                         | "native_model_request"
                         | "native_model_usage"
@@ -417,7 +418,12 @@ impl SessionEventKind {
                 // recover it as pending and immediately re-run the very prompt
                 // the rewind discarded. Only admitted history is inheritable.
                 | Self::Message {
-                    status: MessageStatus::Queued | MessageStatus::InProgress,
+                    status: MessageStatus::Queued,
+                    ..
+                }
+                | Self::Message {
+                    actor: crate::EventActor::User | crate::EventActor::System,
+                    status: MessageStatus::InProgress,
                     ..
                 }
                 | Self::MessageDelta { .. }

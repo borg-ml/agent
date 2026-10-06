@@ -73,14 +73,8 @@ const LOCAL_RESUME_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::f
 const SESSION_HOST_START_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 const SESSION_HOST_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const EXTENSION_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-/// Keep first paint bounded while retaining enough context to include a real
-/// recent exchange instead of an empty shell made only of projection events.
-const RICH_TUI_HISTORY_EVENT_LIMIT: usize = 128;
-// Keep first paint from deserializing a whole tool-heavy turn. The visible
-// tail is still capped separately; this scan only supplies a few recent real
-// conversation messages that may sit behind tool activity.
-const RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT: usize = 512;
-const RICH_TUI_HISTORY_MESSAGE_LIMIT: usize = 8;
+#[cfg(test)]
+const REPLAY_STRESS_EVENT_COUNT: usize = 512;
 const RICH_TUI_HISTORY_PAGE_SIZE: usize = 512;
 const RICH_TUI_PROMPT_HISTORY_LIMIT: usize = 64;
 /// Bounded fan-out for per-child resume reads.
@@ -2551,17 +2545,9 @@ async fn run_local_agent_session(
         // recovery projection after publishing control; never replay the entire
         // journal here before a terminal can attach.
         (Vec::new(), session_state.latest_sequence.saturating_add(1))
-    } else if can_prompt && !fallback_terminal {
-        let bootstrap =
-            recent_tui_history(store.as_ref(), session_id, session_state.latest_sequence).await?;
-        (bootstrap.events, bootstrap.page_before)
     } else {
-        let history = store.read(session_id).await?;
-        let page_before = history
-            .first()
-            .map(|event| event.sequence)
-            .unwrap_or_else(|| session_state.latest_sequence.saturating_add(1));
-        (history, page_before)
+        let history = complete_tui_history(store.as_ref(), session_id, session_state.latest_sequence).await?;
+        (history.events, history.page_before)
     };
     let history_ms = history_started.elapsed().as_millis() as u64;
     if can_prompt && !fallback_terminal {
@@ -5597,7 +5583,7 @@ async fn run_local_agent_session(
                             }
                             if interactive {
                                 let latest_state = store.state(session_id).await?;
-                                let latest = recent_tui_history(
+                                let latest = complete_tui_history(
                                     store.as_ref(),
                                     session_id,
                                     latest_state.latest_sequence,
@@ -7547,7 +7533,7 @@ async fn run_local_agent_session(
                                             remote_open = true;
                                         }
                                         let latest_state = store.state(session_id).await?;
-                                        let latest = recent_tui_history(
+                                        let latest = complete_tui_history(
                                             store.as_ref(),
                                             session_id,
                                             latest_state.latest_sequence,
@@ -9046,73 +9032,15 @@ fn prompt_summary(value: &str, limit: usize) -> String {
     }
 }
 
-async fn recent_tui_history(
+async fn complete_tui_history(
     store: &dyn SessionStore,
     session_id: Uuid,
     latest_sequence: u64,
 ) -> Result<ResumeBootstrapHistory> {
-    let scan_after = recent_tui_history_after(latest_sequence);
-    let (checkpoint, latest_user_messages, latest_messages, scanned) = tokio::try_join!(
-        store.latest_completed_context_compaction(session_id),
-        store.recent_user_messages(session_id, 1),
-        store.recent_messages(session_id, RICH_TUI_HISTORY_MESSAGE_LIMIT),
-        store.events_after(
-            session_id,
-            scan_after,
-            RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT,
-        ),
-    )?;
-    // The tail scan is keyed on the latest sequence, so it only reaches the
-    // conversation when the newest events are conversation events. After a
-    // long autonomous turn the stream ends in thousands of subagent and tool
-    // events and the scan contains no message at all, which is why resume
-    // could open on an old prompt instead of the last reply. Splice the
-    // newest turns back in by sequence; raising the scan cap cannot fix this
-    // because the gap is unbounded.
-    // The live cursor starts at `latest_sequence`, so an attached viewer is
-    // redelivered every later row. Seeding one here as well would render it
-    // twice and show a transcript ahead of the seeded status.
-    let mut scanned = scanned;
-    scanned.retain(|event| event.sequence <= latest_sequence);
-    for message in latest_messages
-        .into_iter()
-        .chain(latest_user_messages.into_iter().next())
-        .filter(|message| message.sequence <= latest_sequence)
-    {
-        if scanned.iter().any(|event| event.id == message.id) {
-            continue;
-        }
-        let index = scanned.partition_point(|event| event.sequence < message.sequence);
-        scanned.insert(index, message);
-    }
-    let selection = select_resume_bootstrap_history(scanned);
-    let mut selected = selection.events;
-    if let Some(checkpoint) = checkpoint
-        && checkpoint.sequence <= latest_sequence
-        && !selected.iter().any(|event| event.id == checkpoint.id)
-    {
-        let index = selected.partition_point(|event| event.sequence < checkpoint.sequence);
-        selected.insert(index, checkpoint);
-    }
-    // Spliced rows sit below the scan window, so they must never become the
-    // paging cursor: paging only walks older, and a cursor pinned to a
-    // spliced sequence would strand the whole interval between it and the
-    // contiguous tail. Keep the cursor inside the scanned window, which is
-    // the first region actually known to be complete.
-    let page_before = selection
-        .page_before
-        .filter(|sequence| *sequence > scan_after)
-        .or_else(|| {
-            selected
-                .iter()
-                .map(|event| event.sequence)
-                .find(|sequence| *sequence > scan_after)
-        })
-        .unwrap_or_else(|| latest_sequence.saturating_add(1));
-    Ok(ResumeBootstrapHistory {
-        events: selected,
-        page_before,
-    })
+    let mut events = store.read(session_id).await?;
+    events.retain(|event| event.sequence <= latest_sequence);
+    let page_before = events.first().map_or(latest_sequence.saturating_add(1), |event| event.sequence);
+    Ok(ResumeBootstrapHistory { events, page_before })
 }
 
 fn coalesced_transcript_event(kind: &SessionEventKind) -> bool {
@@ -9132,171 +9060,10 @@ fn coalesced_transcript_event(kind: &SessionEventKind) -> bool {
     }
 }
 
-fn recent_tui_history_after(latest_sequence: u64) -> u64 {
-    latest_sequence.saturating_sub(RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT as u64)
-}
-
 #[derive(Debug)]
 struct ResumeBootstrapHistory {
     events: Vec<SessionEvent>,
     page_before: u64,
-}
-
-#[derive(Debug)]
-struct ResumeBootstrapSelection {
-    events: Vec<SessionEvent>,
-    page_before: Option<u64>,
-}
-
-fn select_resume_bootstrap_history(events: Vec<SessionEvent>) -> ResumeBootstrapSelection {
-    // Queued input is not rendered as a conversation row, but its durable
-    // admission marker is part of the ordering contract. A later completion
-    // can arrive out of order when several steer prompts are pending; the
-    // transcript uses these markers to restore the order in which the user
-    // submitted them. Applying a queued event only updates that projection;
-    // it never wakes or re-runs the prompt.
-    let terminal_user_ids = events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            SessionEventKind::Message {
-                message_id,
-                actor: EventActor::User,
-                status: MessageStatus::Complete | MessageStatus::Failed,
-                ..
-            } => Some(*message_id),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    let events = events
-        .into_iter()
-        .filter(|event| match &event.kind {
-            SessionEventKind::Message {
-                message_id,
-                status: MessageStatus::Queued,
-                ..
-            } => terminal_user_ids.contains(message_id),
-            kind @ SessionEventKind::ProviderEvent {
-                kind: event_kind, ..
-            } if event_kind == "context_compaction" && !kind.is_completed_context_compaction() => {
-                false
-            }
-            _ => true,
-        })
-        .collect::<Vec<_>>();
-    if events.len() <= RICH_TUI_HISTORY_EVENT_LIMIT {
-        let events = trim_resume_bootstrap_to_user_boundary(events);
-        return ResumeBootstrapSelection {
-            page_before: events
-                .iter()
-                .map(|event| event.sequence)
-                .filter(|sequence| *sequence > 0)
-                .min(),
-            events,
-        };
-    }
-    let floor = events.len() - RICH_TUI_HISTORY_EVENT_LIMIT;
-    let tail_start = events.get(floor).map(|event| event.sequence);
-    let message_indices = events
-        .iter()
-        .enumerate()
-        .filter(|(_, event)| {
-            matches!(
-                event.kind,
-                SessionEventKind::Message {
-                    actor: EventActor::User | EventActor::Assistant,
-                    status: MessageStatus::Complete | MessageStatus::InProgress,
-                    ..
-                }
-            )
-        })
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    let mut retained_messages = message_indices
-        .into_iter()
-        .rev()
-        .take(RICH_TUI_HISTORY_MESSAGE_LIMIT)
-        .collect::<HashSet<_>>();
-    if let Some(latest_user) = events.iter().rposition(|event| {
-        matches!(
-            event.kind,
-            SessionEventKind::Message {
-                actor: EventActor::User,
-                status: MessageStatus::Complete | MessageStatus::Failed | MessageStatus::InProgress,
-                ..
-            }
-        )
-    }) {
-        retained_messages.insert(latest_user);
-    }
-
-    // Keep a bounded event tail for current lifecycle/tool state and splice in
-    // the latest real conversation messages even when a high-volume child or
-    // tool stream pushed them outside that tail. A contiguous slice starting
-    // at the eighth message can contain thousands of irrelevant events and
-    // makes the first render just as unusable as loading the whole history.
-    let selected = events
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, event)| {
-            (index >= floor || retained_messages.contains(&index)).then_some(event)
-        })
-        .collect::<Vec<_>>();
-    let selected = trim_resume_bootstrap_to_user_boundary(selected);
-    // Trimming can move the first contiguous tail event forward. Paging must
-    // end immediately before that retained event, or the removed interval is
-    // never loaded and completed messages/tools silently disappear on resume.
-    let page_before = tail_start.and_then(|tail_start| {
-        selected
-            .iter()
-            .find(|event| event.sequence >= tail_start)
-            .map(|event| event.sequence)
-    });
-    ResumeBootstrapSelection {
-        events: selected,
-        page_before,
-    }
-}
-
-fn trim_resume_bootstrap_to_user_boundary(events: Vec<SessionEvent>) -> Vec<SessionEvent> {
-    let retained_user_ids = events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            SessionEventKind::Message {
-                message_id,
-                actor: EventActor::User,
-                status: MessageStatus::Complete | MessageStatus::Failed | MessageStatus::InProgress,
-                ..
-            } => Some(*message_id),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    let Some(first_user) = events.iter().position(|event| {
-        matches!(
-            event.kind,
-            SessionEventKind::Message {
-                actor: EventActor::User,
-                status: MessageStatus::Complete | MessageStatus::Failed | MessageStatus::InProgress,
-                ..
-            }
-        )
-    }) else {
-        return Vec::new();
-    };
-    let first_admission_marker = events.iter().position(|event| {
-        matches!(
-            &event.kind,
-            SessionEventKind::Message {
-                message_id,
-                actor: EventActor::User,
-                status: MessageStatus::Queued,
-                ..
-            } if retained_user_ids.contains(message_id)
-        )
-    });
-    events
-        .into_iter()
-        .skip(first_admission_marker.unwrap_or(first_user))
-        .collect()
 }
 
 fn merge_tui_history_page(history: &mut Vec<SessionEvent>, older: Vec<SessionEvent>) {
@@ -9565,14 +9332,9 @@ async fn child_authored_history(
 ) -> Result<Vec<SessionEvent>> {
     let inherited = store.inherited_event_count(child_id).await?;
     let latest = store.state(child_id).await?.latest_sequence;
-    let after = recent_child_history_after(inherited, latest);
-    store
-        .events_after(child_id, after, RICH_TUI_HISTORY_EVENT_LIMIT)
-        .await
-}
-
-fn recent_child_history_after(inherited: u64, latest: u64) -> u64 {
-    inherited.max(latest.saturating_sub(RICH_TUI_HISTORY_EVENT_LIMIT as u64))
+    let limit = usize::try_from(latest.saturating_sub(inherited))
+        .context("child history exceeds addressable event count")?;
+    store.events_after(child_id, inherited, limit).await
 }
 
 async fn recent_sessions_summary(

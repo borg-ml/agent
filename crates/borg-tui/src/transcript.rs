@@ -2359,9 +2359,22 @@ impl Transcript {
             }
             SessionEventKind::ReasoningDelta { text } => {
                 self.append_reasoning(text, event.created_at, local_event_time(event));
+                if let Some(index) = self.active_reasoning {
+                    self.tools.entry(format!("reasoning:{}", event.id)).or_insert(index);
+                }
             }
             SessionEventKind::ReasoningTextDelta { delta } => {
-                self.append_reasoning_text_delta(delta, event.created_at, local_event_time(event));
+                let key = format!("reasoning:{}", event.id);
+                if !self.tools.contains_key(&key) {
+                    let was_active = self.active_reasoning;
+                    self.append_reasoning_text_delta(delta, event.created_at, local_event_time(event));
+                    if was_active.is_none() && let Some(index) = self.active_reasoning {
+                        self.tools.insert(key, index);
+                    }
+                }
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "reasoning_snapshot" => {
+                self.apply_reasoning_snapshot(payload, event);
             }
             SessionEventKind::ReasoningCompleted => {
                 self.finish_reasoning(event.created_at);
@@ -3774,6 +3787,50 @@ impl Transcript {
             for message_id in live {
                 self.hold_back_unfinished(message_id);
             }
+        }
+    }
+
+    fn apply_reasoning_snapshot(&mut self, payload: &serde_json::Value, event: &SessionEvent) {
+        let (Some(id), Some(text)) = (
+            payload.get("reasoning_id").and_then(serde_json::Value::as_str),
+            payload.get("text").and_then(serde_json::Value::as_str),
+        ) else { return; };
+        let key = format!("reasoning:{id}");
+        let index = if let Some(index) = self.tools.get(&key).copied() {
+            index
+        } else {
+            let started_at = payload.get("started_at")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc))
+                .unwrap_or(event.created_at);
+            self.start_reasoning(started_at, local_event_time(event));
+            let Some(index) = self.active_reasoning else { return; };
+            self.tools.insert(key, index);
+            index
+        };
+        let finalized = payload.get("complete").and_then(serde_json::Value::as_bool) == Some(true);
+        if let Some(TranscriptEntry::Tool {
+            code_view: Some((language, source)), detail, name, complete,
+            completed_at, expanded, ..
+        }) = self.order.get_mut(index) && language == "reasoning" {
+            if finalized {
+                source.clear();
+                source.push_str(text);
+            } else if !*complete {
+                Self::merge_reasoning_snapshot(source, text);
+            }
+            *detail = reasoning_preview(source);
+            if finalized {
+                *name = "Reasoned".to_string();
+                *complete = true;
+                *completed_at = Some(event.created_at);
+                *expanded = false;
+            }
+        }
+        if finalized && self.active_reasoning == Some(index) {
+            self.active_reasoning = None;
+            self.reasoning_has_preview = false;
         }
     }
 
@@ -6927,6 +6984,34 @@ impl Transcript {
 #[cfg(test)]
 mod parallel_preparation_tests {
     use super::*;
+
+    #[test]
+    fn archived_reasoning_updates_its_original_row_after_intervening_output() {
+        let session_id = Uuid::new_v4();
+        let reasoning_id = Uuid::new_v4();
+        let started_at = Utc::now();
+        let snapshot = |sequence, text, complete| SessionEvent::new(session_id, sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "reasoning_snapshot".into(),
+                payload: serde_json::json!({"reasoning_id":reasoning_id,
+                    "started_at":started_at,"text":text,"complete":complete}),
+            });
+        let mut transcript = Transcript::default();
+        transcript.apply_history(&snapshot(1, "Checking", false));
+        transcript.apply_history(&SessionEvent::new(session_id, 2,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(), actor: EventActor::Assistant,
+                text: "I found the issue.".into(), attachments: Vec::new(),
+                status: MessageStatus::Complete, delivery: None,
+            }));
+        transcript.apply_history(&snapshot(3, "Checking the persisted order.", true));
+        assert_eq!(transcript.order.len(), 2);
+        assert!(matches!(&transcript.order[0], TranscriptEntry::Tool {
+            code_view: Some((language, text)), complete: true, ..
+        } if language == "reasoning" && text == "Checking the persisted order."));
+        assert!(matches!(&transcript.order[1], TranscriptEntry::Message { .. }));
+    }
 
     #[test]
     fn completed_reasoning_summary_is_static_and_keeps_full_expandable_text() {

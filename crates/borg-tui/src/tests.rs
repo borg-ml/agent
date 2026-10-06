@@ -980,6 +980,13 @@ fn child_history_merge_prefers_completion_over_a_late_partial_snapshot() {
     );
     stale_partial.created_at = now + chrono::Duration::seconds(1);
 
+    let mut anchor = stale_partial.clone();
+    anchor.id = Uuid::new_v4();
+    anchor.sequence = 7;
+    anchor.created_at = now - chrono::Duration::seconds(1);
+    let anchored = merge_child_history(&[anchor, complete.clone()], vec![stale_partial.clone()]);
+    assert_eq!(anchored.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![7, 8]);
+
     let merged = merge_child_history(&[complete], vec![stale_partial]);
 
     assert_eq!(merged.len(), 1);

@@ -4049,6 +4049,7 @@ impl BorgTerminal {
                     || kind == "network_retry"
                     || kind == "network_recovered"
                     || kind == "mcp_server_unavailable"
+                || kind == "reasoning_snapshot"
                     || Transcript::provider_reasoning_lifecycle(kind, payload).is_some()
             }
             _ => true,
@@ -12066,8 +12067,8 @@ fn merge_child_history(
         .filter(|event| seen.insert(event.id))
         .collect::<Vec<_>>();
 
-    // A completed message supersedes all transport snapshots of the same
-    // message. This remains true even if a delayed coalesced snapshot carries
+    // A completed message supersedes transport snapshots, but the durable
+    // first-row anchor still determines its position. This remains true even if a delayed coalesced snapshot carries
     // a later timestamp than the durable terminal event.
     let completed_messages = events
         .iter()
@@ -12089,6 +12090,9 @@ fn merge_child_history(
                     | MessageStatus::Queued,
                 ..
             } if completed_messages.contains(message_id)
+                && !matches!(&event.kind, SessionEventKind::Message {
+                    actor: EventActor::Assistant, status: MessageStatus::InProgress, ..
+                } if event.sequence > 0)
         )
     });
     // Keep sequence-zero live snapshots near their observed time, then put
@@ -13613,6 +13617,7 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
                 || kind == "action/generation_status"
                 || kind == "action/preparing_cancelled"
                 || kind == "mcp_server_unavailable"
+                || kind == "reasoning_snapshot"
                 // `reasoning/started` opens the Thinking row. Without this the
                 // row only materialises on `reasoning_completed`, i.e. in the
                 // same frame as the tool call it precedes.

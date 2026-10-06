@@ -160,8 +160,7 @@ async fn persistence_classes_agree_across_backends() {
             .await
             .expect("running");
 
-        // Coalesced live frames collapse into one row and never take a
-        // sequence; durable events do.
+        // Live frames collapse into one row after the first durable display anchor.
         for text in ["think", "thinking", "thinking hard"] {
             store
                 .append(SessionEvent::new(
@@ -185,8 +184,8 @@ async fn persistence_classes_agree_across_backends() {
         assert_eq!(text, "thinking hard", "[{name}]");
         assert_eq!(
             store.read(session_id).await.expect("read").len(),
-            2,
-            "[{name}] live frames must not enter the durable sequence"
+            3,
+            "[{name}] reasoning must have one durable display anchor, not one row per frame"
         );
         assert!(
             store

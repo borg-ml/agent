@@ -455,6 +455,7 @@ pub(crate) struct RuntimeSessionStore {
     projection_diagnostics: VecDeque<SessionEvent>,
     plan_projection_generation: u64,
     received_agent_messages: HashSet<Uuid>,
+    assistant_row_anchors: HashSet<Uuid>,
 }
 
 #[derive(Clone)]
@@ -791,6 +792,7 @@ impl RuntimeSessionStore {
             projection_diagnostics: VecDeque::new(),
             plan_projection_generation: 0,
             received_agent_messages: HashSet::new(),
+            assistant_row_anchors: HashSet::new(),
         }
     }
 
@@ -1010,6 +1012,21 @@ impl RuntimeSessionStore {
             self.projection_diagnostics.push_back(diagnostic_event);
         }
         self.absorb_appended(&event).await?;
+        match &event.kind {
+            SessionEventKind::MessageDelta { message_id, delta } if !delta.is_empty() => {
+                self.assistant_row_anchors.insert(*message_id);
+            }
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::Assistant,
+                text,
+                ..
+            } if !text.trim().is_empty() => {
+                self.assistant_row_anchors.insert(*message_id);
+            }
+            SessionEventKind::TurnStarted { .. } => self.assistant_row_anchors.clear(),
+            _ => {}
+        }
         Ok(event)
     }
 }
@@ -11226,16 +11243,29 @@ async fn record_provider_event(
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
 ) -> Result<()> {
-    // The provider's cumulative snapshots are the recovery record. Deliver
-    // these fragments only to the live observer, without touching the store.
+    // Assistant fragments need only their first display anchor. Reasoning
+    // fragments also update the coalesced state archived at the next boundary.
     if matches!(
         kind,
         SessionEventKind::MessageDelta { .. } | SessionEventKind::ReasoningTextDelta { .. }
     ) {
+        let event = SessionEvent::new(session_id, 0, kind);
+        let needs_store = match &event.kind {
+            SessionEventKind::MessageDelta { message_id, delta } => {
+                !delta.is_empty() && !journal.assistant_row_anchors.contains(message_id)
+            }
+            SessionEventKind::ReasoningTextDelta { .. } => true,
+            _ => false,
+        };
+        let event = if needs_store {
+            journal.append(event).await?
+        } else {
+            event
+        };
         deliver_recorded_event(
             events,
             session_id,
-            SessionEvent::new(session_id, 0, kind),
+            event,
             crate::EventPersistence::Ephemeral,
         )
         .await;

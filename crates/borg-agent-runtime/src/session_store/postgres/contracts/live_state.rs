@@ -4,11 +4,11 @@
 //! A streaming turn produces a frame per token, and writing each one as an
 //! event would make the durable sequence a function of network chatter rather
 //! than of what happened. So these snapshots coalesce into one row per live
-//! key, carry no sequence, and are erased at the boundaries that end the thing
-//! they were describing.
+//! key and carry no sequence. Durable display anchors preserve first position;
+//! reasoning is finalized before the boundaries that clear its live state.
 //!
-//! The contracts below pin the two halves of that bargain: coalescing must not
-//! consume durable sequences or leak into `read`, and every boundary -- a tool
+//! The contracts below pin that bargain: intermediate frames must not grow the
+//! journal, and every boundary -- a tool
 //! starting, a thought completing, a turn ending, a session going idle -- must
 //! clear the state it invalidates while leaving the context window, which
 //! describes the session rather than the turn, in place.
@@ -105,7 +105,7 @@ async fn parallel_generation_status_survives_reconnect_and_clears_per_call() {
 }
 
 #[tokio::test]
-async fn live_state_coalesces_without_consuming_durable_sequences() {
+async fn live_state_coalesces_between_durable_anchors_and_boundaries() {
     let (scratch, store) = store().await;
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
@@ -196,7 +196,7 @@ async fn live_state_coalesces_without_consuming_durable_sequences() {
         .await
         .unwrap();
 
-    assert_eq!(store.read(session_id).await.unwrap().len(), 3);
+    assert_eq!(store.read(session_id).await.unwrap().len(), 5);
     let live = store.live_events_after(session_id, 0).await.unwrap();
     assert_eq!(live.len(), 2);
     assert!(live.iter().any(|live| matches!(
@@ -223,7 +223,7 @@ async fn live_state_coalesces_without_consuming_durable_sequences() {
         ))
         .await
         .unwrap();
-    assert_eq!(completed.sequence, 4);
+    assert_eq!(completed.sequence, 7);
     assert!(
         store
             .live_events_after(session_id, 0)
@@ -594,5 +594,201 @@ async fn reopening_leaves_the_live_state_of_a_running_session_alone() {
         "opening a second store must not disturb a turn that is still running"
     );
 
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn first_visible_assistant_message_keeps_its_position_after_read() {
+    let (scratch, store) = store().await;
+    for delta_first in [false, true] {
+        let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Running,
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let message = |text: &str, status| SessionEventKind::Message {
+            message_id,
+            actor: EventActor::Assistant,
+            text: text.into(),
+            status,
+            attachments: Vec::new(),
+            delivery: None,
+        };
+        let first = if delta_first {
+            SessionEventKind::MessageDelta {
+                message_id,
+                delta: "I".into(),
+            }
+        } else {
+            message("I", MessageStatus::InProgress)
+        };
+        let first = store
+            .append(SessionEvent::new(session_id, 0, first))
+            .await
+            .unwrap();
+        assert_eq!(first.sequence, 0);
+        assert!(
+            matches!(&first.kind, SessionEventKind::Message {
+            status: MessageStatus::InProgress, text, ..
+        } if text == "I"),
+            "first live frame must replace rather than append to a recovered anchor"
+        );
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ToolStarted {
+                    tool_call_id: "tool".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({}),
+                    input_ref: None,
+                    parent_tool_call_id: None,
+                },
+            ))
+            .await
+            .unwrap();
+        for text in ["I will", "I will inspect"] {
+            store
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    message(text, MessageStatus::InProgress),
+                ))
+                .await
+                .unwrap();
+        }
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                message("I inspected", MessageStatus::Complete),
+            ))
+            .await
+            .unwrap();
+        let history = store.read(session_id).await.unwrap();
+        assert_eq!(history.len(), 4, "only one assistant anchor is durable");
+        assert!(matches!(&history[1].kind, SessionEventKind::Message {
+            message_id: id, status: MessageStatus::InProgress, ..
+        } if *id == message_id));
+        assert!(matches!(
+            &history[2].kind,
+            SessionEventKind::ToolStarted { .. }
+        ));
+        assert!(matches!(&history[3].kind, SessionEventKind::Message {
+            message_id: id, status: MessageStatus::Complete, text, ..
+        } if *id == message_id && text == "I inspected"));
+        let context = store.recovery(session_id).await.unwrap().context_events;
+        assert_eq!(
+            context
+                .iter()
+                .filter(|event| matches!(&event.kind,
+            SessionEventKind::Message { message_id: id, .. } if *id == message_id))
+                .count(),
+            1
+        );
+        assert!(
+            store
+                .live_events_after(session_id, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn reasoning_is_archived_at_its_original_position_with_full_text() {
+    let (scratch, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let first = store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningTextDelta {
+                delta: "think ".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    for delta in ["carefully", " carefully"] {
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ReasoningTextDelta {
+                    delta: delta.into(),
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    let boundary = store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "tool".into(),
+                name: "shell".into(),
+                input: serde_json::json!({}),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let history = store.read(session_id).await.unwrap();
+    assert_eq!(
+        history.len(),
+        4,
+        "only first and finalized reasoning snapshots are durable"
+    );
+    let id = first.id.to_string();
+    assert!(
+        matches!(&history[1].kind, SessionEventKind::ProviderEvent { kind, payload, .. }
+        if kind == "reasoning_snapshot" && payload["reasoning_id"] == id
+            && payload["text"] == "think " && payload["complete"] == false)
+    );
+    assert!(
+        matches!(&history[2].kind, SessionEventKind::ProviderEvent { kind, payload, .. }
+        if kind == "reasoning_snapshot" && payload["reasoning_id"] == id
+            && payload["text"] == "think carefully carefully" && payload["complete"] == true
+            && payload["started_at"] == serde_json::to_value(first.created_at).unwrap())
+    );
+    assert_eq!(history[2].created_at, boundary.created_at);
+    assert!(matches!(
+        &history[3].kind,
+        SessionEventKind::ToolStarted { .. }
+    ));
+    assert!(
+        store
+            .live_events_after(session_id, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!store.recovery(session_id).await.unwrap().context_events.iter().any(|event|
+        matches!(&event.kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "reasoning_snapshot")));
     scratch.discard().await;
 }
