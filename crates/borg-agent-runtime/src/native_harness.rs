@@ -3226,10 +3226,11 @@ async fn call_model_streaming(
                 send(
                     context.events,
                     SessionEventKind::ReasoningDelta {
-                        text: std::mem::take(&mut pending_reasoning),
+                        text: reasoning_accumulated.clone(),
                     },
                 )
                 .await;
+                pending_reasoning.clear();
                 last_reasoning_emit = Instant::now();
             }
             progress = progress_rx.recv(), if progress_open => {
@@ -3257,10 +3258,11 @@ async fn call_model_streaming(
                         send(
                             context.events,
                             SessionEventKind::ReasoningDelta {
-                                text: std::mem::take(&mut pending_reasoning),
+                                text: reasoning_accumulated.clone(),
                             },
                         )
                         .await;
+                        pending_reasoning.clear();
                         last_reasoning_emit = Instant::now();
                     }
                     let delta = String::from_utf8_lossy(&chunk);
@@ -3307,15 +3309,26 @@ async fn call_model_streaming(
                             send(
                                 context.events,
                                 SessionEventKind::ReasoningDelta {
-                                    text: std::mem::take(&mut pending_reasoning),
+                                    text: reasoning_accumulated.clone(),
                                 },
                             )
                             .await;
+                            pending_reasoning.clear();
                             last_reasoning_emit = Instant::now();
                         }
                     }
                 }
                 Some(ProviderProgress::ProviderEvent { kind, payload, .. }) => {
+                    if kind == "item/completed:reasoning" {
+                        if !pending_reasoning.is_empty() {
+                            send(context.events, SessionEventKind::ReasoningDelta {
+                                text: reasoning_accumulated.clone(),
+                            }).await;
+                            pending_reasoning.clear();
+                        }
+                        send(context.events, SessionEventKind::ReasoningCompleted).await;
+                        reasoning_accumulated.clear();
+                    }
                     if kind == "native_model_attempt_failed" {
                         cancel_preparing_tool_calls(context.events, context.coding_provider, &mut preparing).await;
                         text.clear();
@@ -3439,10 +3452,11 @@ async fn call_model_streaming(
                 send(
                     context.events,
                     SessionEventKind::ReasoningDelta {
-                        text: std::mem::take(&mut pending_reasoning),
+                        text: reasoning_accumulated.clone(),
                     },
                 )
                 .await;
+                pending_reasoning.clear();
             }
             if text.len() != emitted_text_len {
                 send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
@@ -6925,7 +6939,7 @@ mod tests {
             // reach the reader before the prose it produced.
             assert!(matches!(
                 events_rx.recv().await,
-                Some(SessionEventKind::ReasoningDelta { text }) if text == "the next step"
+                Some(SessionEventKind::ReasoningDelta { text }) if text == "weighing the next step"
             ));
             assert!(matches!(
                 events_rx.recv().await,
@@ -7010,7 +7024,7 @@ mod tests {
             assert!(matches!(events_rx.recv().await,
                 Some(SessionEventKind::ReasoningTextDelta { delta }) if delta == "the next step"));
             assert!(matches!(events_rx.recv().await,
-                Some(SessionEventKind::ReasoningDelta { text }) if text == "the next step"));
+                Some(SessionEventKind::ReasoningDelta { text }) if text == "weighing the next step"));
         };
         tokio::select! {
             _ = &mut call => panic!("model must remain unfinished during the quiet tail"),

@@ -1470,6 +1470,48 @@ impl ResponseState {
                     });
                 }
             }
+            "response.output_item.added" | "response.output_item.done"
+                if event["item"]["type"] == "reasoning" =>
+            {
+                let done = event["type"] == "response.output_item.done";
+                if done && let Some(summary) = event["item"]["summary"].as_array() {
+                    for (index, part) in summary.iter().enumerate() {
+                        if let Some(text) = part["text"].as_str() {
+                            self.event(
+                                &json!({"type":"response.reasoning_summary_text.done",
+                                    "item_id":event["item"]["id"],
+                                    "summary_index":index,"text":text}),
+                                progress,
+                                model,
+                                effort,
+                            )?;
+                        }
+                    }
+                }
+                if done {
+                    let index = event["output_index"]
+                        .as_u64()
+                        .context("Codex output item has no index")?;
+                    self.output.insert(index, event["item"].clone());
+                }
+                emit(ProviderProgress::ProviderEvent {
+                    kind: if done {
+                        "item/completed:reasoning"
+                    } else {
+                        "item/started:reasoning"
+                    }
+                    .into(),
+                    payload: json!({"item": {"type":"reasoning", "id":event["item"]["id"]}}),
+                    raw_payload: Box::new(None),
+                    stream_channel: Some("reasoning".into()),
+                    content_text: None,
+                    provider_item_id: event["item"]["id"].as_str().map(str::to_owned),
+                    tool_use_id: None,
+                    tool_name: None,
+                    model: Some(model.into()),
+                    effort: Some(effort.into()),
+                });
+            }
             "response.output_item.done" => {
                 let index = event["output_index"]
                     .as_u64()
@@ -2369,6 +2411,45 @@ mod tests {
         assert!(!error.contains("private-") && !error.contains("99 seconds"));
         assert!(events.try_recv().is_err());
         server.await.unwrap();
+    }
+
+    #[test]
+    fn reasoning_items_publish_lifecycle_and_completed_only_summaries() {
+        let mut state = ResponseState::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for (event_type, summary) in [
+            ("response.output_item.added", json!([])),
+            (
+                "response.output_item.done",
+                json!([{"type":"summary_text", "text":"Checking replay"}]),
+            ),
+        ] {
+            state
+                .event(
+                    &json!({"type":event_type,"output_index":0,
+                "item":{"type":"reasoning","id":"reason","summary":summary}}),
+                    Some(&tx),
+                    "model",
+                    "medium",
+                )
+                .unwrap();
+        }
+        let mut events = Vec::new();
+        while let Ok(ProviderProgress::ProviderEvent {
+            kind, content_text, ..
+        }) = rx.try_recv()
+        {
+            events.push((kind, content_text));
+        }
+        assert_eq!(
+            events,
+            vec![
+                ("item/started:reasoning".into(), None),
+                ("reasoning_delta".into(), Some("Checking replay".into())),
+                ("item/completed:reasoning".into(), None),
+            ]
+        );
+        assert_eq!(state.output[&0]["summary"][0]["text"], "Checking replay");
     }
 
     #[test]
