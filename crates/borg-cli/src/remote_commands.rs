@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::IpAddr;
@@ -17,16 +17,16 @@ use borg_provider::provider::{
 use borg_remote::{
     AgentTurnExecutor, ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus,
     HostCommand, HostConfig, HostExecutionProfile, HostExecutorFactory, LaunchSession,
-    LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus, PermissionMode, PlanItem,
-    PlanItemStatus, PromptDelivery, RecoveryParts, ResponseLanguage, SessionConfigAction,
-    SessionEvent, SessionEventKind, SessionGoal, SessionState, SessionStatus, SessionStore,
-    SessionWriterLease, SpawnSubagent, SubagentAction, SubagentSnapshot, SubagentStatus,
-    TodoAction, default_host_config_path, enroll_host, force_terminate_local_session_owner,
-    local_session_owner_is_active, local_session_owner_uses_current_binary, login_provider,
-    mirror_local_session, obsolete_local_session_owner_pid, probe_capabilities,
-    probe_provider_admission_capabilities, provider_credentials_present,
-    run_agent_session_with_priority_commands, run_attached_session, run_host_with_executor_factory,
-    send_local_session_command, session_control_socket_path,
+    LiveEventQueue, LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus,
+    PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, RecoveryParts, ResponseLanguage,
+    SessionConfigAction, SessionEvent, SessionEventKind, SessionGoal, SessionState, SessionStatus,
+    SessionStore, SessionWriterLease, SpawnSubagent, SubagentAction, SubagentSnapshot,
+    SubagentStatus, TodoAction, default_host_config_path, enroll_host,
+    force_terminate_local_session_owner, local_session_owner_is_active,
+    local_session_owner_uses_current_binary, login_provider, mirror_local_session,
+    obsolete_local_session_owner_pid, probe_capabilities, probe_provider_admission_capabilities,
+    provider_credentials_present, run_agent_session_with_priority_commands, run_attached_session,
+    run_host_with_executor_factory, send_local_session_command, session_control_socket_path,
 };
 use chrono::{DateTime, Local, TimeZone, Utc};
 use futures_util::{FutureExt, StreamExt};
@@ -1833,10 +1833,27 @@ impl DeliveredSessionProjection {
     }
 }
 
-// Drain ready events independently of painting, but yield to keys and timers
+/// Most events pulled ahead of rendering. Past it the channel's backpressure
+/// applies again, so a stalled loop still slows a flooding producer.
+const LIVE_EVENT_QUEUE_LIMIT: usize = 4_096;
+
+// Pull every ready event before applying any, so superseded streaming
+// snapshots are merged away instead of each being applied in turn.
+fn pull_ready_session_events(
+    queued: &mut LiveEventQueue,
+    events: &mut mpsc::Receiver<SessionEvent>,
+) {
+    while queued.len() < LIVE_EVENT_QUEUE_LIMIT
+        && let Ok(event) = events.try_recv()
+    {
+        queued.push_back(event);
+    }
+}
+
+// Apply events independently of painting, but yield to keys and timers
 // after a bounded burst. Repairs retain priority over the live channel.
 fn next_ready_session_event(
-    queued: &mut VecDeque<SessionEvent>,
+    queued: &mut LiveEventQueue,
     events: &mut mpsc::Receiver<SessionEvent>,
     started: std::time::Instant,
     drained: usize,
@@ -1844,9 +1861,8 @@ fn next_ready_session_event(
     if drained >= 256 || started.elapsed() >= std::time::Duration::from_millis(2) {
         return None;
     }
-    queued
-        .pop_front()
-        .or_else(|| events.recv().now_or_never().flatten())
+    pull_ready_session_events(queued, events);
+    queued.pop_front()
 }
 
 async fn load_projection_gap(
@@ -3121,7 +3137,7 @@ async fn run_local_agent_session(
     let mut agent_config_poll_task: Option<tokio::task::JoinHandle<AgentConfigPollResult>> = None;
     let mut shutdown_signal_open = true;
     let mut session_event_stream_open = true;
-    let mut queued_session_events = VecDeque::new();
+    let mut queued_session_events = LiveEventQueue::default();
     let mut projection_gap_repair_task: Option<ProjectionGapRepairTask> = None;
     let mut projection_tail_repair_task: Option<ProjectionGapRepairTask> = None;
     let mut projection_tail_tick = tokio::time::interval(std::time::Duration::from_millis(500));
@@ -3314,7 +3330,7 @@ async fn run_local_agent_session(
                     // Do not let a store snapshot overtake previews that
                     // arrived while the query was in flight. Retry when idle.
                     Ok(Ok(events)) if session_events.is_empty() && queued_session_events.is_empty() => {
-                        queued_session_events.extend(events);
+                        queued_session_events.extend_front(events);
                     }
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => tracing::warn!(%error, %session_id, "session tail repair will retry"),
@@ -3329,7 +3345,8 @@ async fn run_local_agent_session(
             }, if projection_gap_repair_task.is_some() => {
                 projection_gap_repair_task = None;
                 match result {
-                    Ok(Ok(events)) => queued_session_events.extend(events),
+                    // Repairs fill a hole ahead of anything already pulled.
+                    Ok(Ok(events)) => queued_session_events.extend_front(events),
                     Ok(Err(error)) => return Err(error),
                     Err(error) => {
                         return Err(anyhow::anyhow!("session projection repair task failed: {error}"));
@@ -3844,8 +3861,7 @@ async fn run_local_agent_session(
                     }
                 }
             }
-            scheduled = interaction_tick.tick(), if terminal.is_some() && interaction_dirty => {
-                tui_timing.observe("input_wait", scheduled.elapsed(), 0);
+            _ = interaction_tick.tick(), if terminal.is_some() && interaction_dirty => {
                 let terminal = terminal.as_mut().expect("terminal");
                 if terminal.has_pending_scroll_frame() {
                     terminal.advance_scroll_frame();
@@ -3853,10 +3869,10 @@ async fn run_local_agent_session(
                 let started = std::time::Instant::now();
                 terminal.draw_for_interaction()?;
                 tui_timing.observe("interaction_draw", started.elapsed(), 0);
+                tui_timing.observe_key_paint();
                 interaction_dirty = false;
             }
-            scheduled = render_tick.tick(), if terminal.is_some() && terminal_dirty => {
-                tui_timing.observe("frame_wait", scheduled.elapsed(), 0);
+            _ = render_tick.tick(), if terminal.is_some() && terminal_dirty => {
                 if tool_started_frame_hold_until
                     .is_some_and(|until| tokio::time::Instant::now() < until)
                 {
@@ -3880,6 +3896,7 @@ async fn run_local_agent_session(
                 let draw_started = std::time::Instant::now();
                 terminal.draw()?;
                 tui_timing.observe("frame_draw", draw_started.elapsed(), 0);
+                tui_timing.observe_key_paint();
                 interaction_dirty = false;
                 let next_interval = responsive_tui_frame_interval(
                     tui_fps,
@@ -4157,11 +4174,11 @@ async fn run_local_agent_session(
                 }
             }
             event = async {
-                if let Some(event) = queued_session_events.pop_front() {
-                    Some(event)
-                } else {
-                    session_events.recv().await
+                if queued_session_events.is_empty() {
+                    queued_session_events.push_back(session_events.recv().await?);
                 }
+                pull_ready_session_events(&mut queued_session_events, &mut session_events);
+                queued_session_events.pop_front()
             }, if projection_gap_repair_task.is_none()
                 && (session_event_stream_open || !queued_session_events.is_empty()) => {
                 let drain_started = std::time::Instant::now();
@@ -10345,14 +10362,22 @@ struct TuiTiming {
 }
 
 impl TuiTiming {
+    /// Typing latency as felt: from the reader seeing the oldest unpainted
+    /// key to the frame that shows it, including any wait behind other work.
+    fn observe_key_paint(&mut self) {
+        if let Some(read_at) = borg_tui::take_unpainted_key_read() {
+            self.observe("key_to_paint", read_at.elapsed(), 0);
+        }
+    }
+
     fn observe(&mut self, phase: &str, elapsed: std::time::Duration, queued: usize) {
         let index = match phase {
             "event_apply" => 0,
             "stream_age" => 1,
-            "frame_wait" => 2,
+            "key_to_paint" => 2,
             "frame_draw" => 3,
             "immediate_draw" => 4,
-            "input_wait" | "input_handle" => 5,
+            "input_handle" => 5,
             "interaction_draw" => 6,
             _ => return,
         };
@@ -10374,7 +10399,7 @@ impl TuiTiming {
                     samples = ?self.samples,
                     max_ms = ?self.maxima_ms,
                     max_queued_events = self.queue_max,
-                    "tui latency (event_apply, stream_age, frame_wait, frame_draw, immediate_draw, input_wait_or_handle, interaction_draw)"
+                    "tui latency (event_apply, stream_age, key_to_paint, frame_draw, immediate_draw, input_handle, interaction_draw)"
                 );
             }
             *self = Self {

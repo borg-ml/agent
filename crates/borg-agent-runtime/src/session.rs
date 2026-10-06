@@ -1129,6 +1129,9 @@ const INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(100);
 /// amortisation and bounds that wait to about a tenth of it. Raising this
 /// trades Escape latency for select throughput one for one.
 const PROVIDER_EVENT_BATCH_LIMIT: usize = 8;
+/// Raw provider events read ahead while coalescing one batch. Bounds the time
+/// spent folding a long run of snapshots before the actor returns to select.
+const PROVIDER_EVENT_SCAN_LIMIT: usize = 1_024;
 #[cfg(not(test))]
 const PROVIDER_DRAIN_LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -7009,8 +7012,14 @@ async fn run_agent_session_store_kernel_inner(
                     begin_live_delivery_burst();
                     let mut provider_batch = Vec::with_capacity(PROVIDER_EVENT_BATCH_LIMIT);
                     push_coalesced_provider_event(&mut provider_batch, first_kind);
+                    // The limit counts entries left after coalescing, which is
+                    // the durable work an Escape waits behind. Snapshots that
+                    // supersede one another collapse for free, so a backlog
+                    // jumps to its newest state instead of replaying it.
                     let mut consumed = 1;
-                    while consumed < PROVIDER_EVENT_BATCH_LIMIT {
+                    while provider_batch.len() < PROVIDER_EVENT_BATCH_LIMIT
+                        && consumed < PROVIDER_EVENT_SCAN_LIMIT
+                    {
                         let Some(kind) = provider_carry
                             .pop_front()
                             .or_else(|| provider_events.try_recv().ok())
@@ -13930,50 +13939,14 @@ async fn next_provider_event(
 }
 
 fn push_coalesced_provider_event(batch: &mut Vec<SessionEventKind>, next: SessionEventKind) {
-    let Some(previous) = batch.last_mut() else {
-        batch.push(next);
-        return;
-    };
-    let replaces_message = matches!(
-        (&*previous, &next),
-        (
-            SessionEventKind::Message {
-                message_id: previous_id,
-                status: MessageStatus::InProgress,
-                ..
-            },
-            SessionEventKind::Message {
-                message_id: next_id,
-                status: MessageStatus::InProgress,
-                ..
-            },
-        ) if previous_id == next_id
-    );
-    if replaces_message
-        || matches!(
-            (&*previous, &next),
-            (
-                SessionEventKind::ContextWindowUpdated { .. },
-                SessionEventKind::ContextWindowUpdated { .. }
-            )
-        )
+    if let Some(previous) = batch.last_mut()
+        && let Some(key) = crate::live_queue::snapshot_key(previous)
+        && crate::live_queue::snapshot_key(&next) == Some(key)
     {
-        *previous = next;
+        crate::live_queue::merge_snapshot(previous, next);
         return;
     }
-    match (previous, next) {
-        (
-            SessionEventKind::ReasoningDelta { text: previous },
-            SessionEventKind::ReasoningDelta { text: next },
-        ) => {
-            if next.starts_with(previous.as_str()) {
-                *previous = next;
-            } else if !previous.starts_with(next.as_str()) {
-                previous.push_str(&next);
-            }
-        }
-        (_, next) => batch.push(next),
-    }
+    batch.push(next);
 }
 
 tokio::task_local! {

@@ -24,6 +24,7 @@ mod host_paths;
 mod imported_memory;
 #[cfg(unix)]
 mod lane_tools;
+mod live_queue;
 mod local_control;
 mod lsp;
 mod model_context;
@@ -97,6 +98,7 @@ pub use extension_api::{
 pub use filesystem::{execute_workspace_filesystem, execute_workspace_filesystem_with_limits};
 pub use host_paths::default_host_config_path;
 pub use imported_memory::{ImportedMemory, copy_imported_memory, imported_memory_directory};
+pub use live_queue::LiveEventQueue;
 pub use local_control::{
     LocalSessionControlServer, force_terminate_local_session_owner, local_session_owner_is_active,
     local_session_owner_uses_binary, local_session_owner_uses_current_binary,

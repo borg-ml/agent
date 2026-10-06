@@ -25,6 +25,18 @@ pub fn take_last_enter_read() -> Option<std::time::Instant> {
         .take()
 }
 
+/// When the reader saw the oldest keyboard input not yet painted, so typing
+/// latency covers time spent queued behind a busy loop, not only handling.
+static UNPAINTED_KEY_READ: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+pub fn take_unpainted_key_read() -> Option<std::time::Instant> {
+    UNPAINTED_KEY_READ
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
 static LAST_ESCAPE_READ: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 pub fn take_last_escape_read() -> Option<std::time::Instant> {
@@ -378,6 +390,14 @@ async fn pump_terminal_events<S>(
                     );
                     return;
                 };
+                if matches!(&event, Ok(Event::Paste(_)))
+                    || matches!(&event, Ok(Event::Key(key)) if key.kind != KeyEventKind::Release)
+                {
+                    UNPAINTED_KEY_READ
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get_or_insert_with(std::time::Instant::now);
+                }
                 if let Ok(Event::Key(key)) = &event
                     && key.code == KeyCode::Esc
                     && key.kind != KeyEventKind::Release

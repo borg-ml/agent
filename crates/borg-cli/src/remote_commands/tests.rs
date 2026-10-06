@@ -3823,7 +3823,8 @@ async fn stream_drain_preserves_burst_order_and_yields_without_losing_events() {
             },
         )
     };
-    let mut repaired = VecDeque::from([make(1), make(2)]);
+    let mut repaired = LiveEventQueue::default();
+    repaired.extend_front(vec![make(1), make(2)]);
     for sequence in 3..=4_098 {
         tx.try_send(make(sequence)).unwrap();
     }
@@ -3858,7 +3859,8 @@ async fn stream_drain_preserves_burst_order_and_yields_without_losing_events() {
         started.elapsed()
     );
 
-    let mut repaired = VecDeque::from([make(1)]);
+    let mut repaired = LiveEventQueue::default();
+    repaired.extend_front(vec![make(1)]);
     assert!(
         next_ready_session_event(
             &mut repaired,
@@ -3869,7 +3871,7 @@ async fn stream_drain_preserves_burst_order_and_yields_without_losing_events() {
         .is_none()
     );
     assert_eq!(
-        repaired.front().unwrap().sequence,
+        repaired.pop_front().unwrap().sequence,
         1,
         "time budget must not consume the next event"
     );
