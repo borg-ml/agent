@@ -59,8 +59,19 @@ pub const SESSIONS_SHARED_ENV: &str = "BORG_SESSIONS_SHARED";
 /// no such ceiling; this is sized so one busy process can overlap reads with
 /// its writer without monopolising a 200-connection server shared by dozens of
 /// agent processes.
-const POSTGRES_MAX_CONNECTIONS: u32 = 8;
-const POSTGRES_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
+/// One owner process hosts the whole agent tree (root plus every child), so the
+/// pool must cover dozens of concurrent agents; 8 starved ~20 children. Override
+/// with BORG_SESSIONS_POOL_SIZE.
+const POSTGRES_MAX_CONNECTIONS: u32 = 64;
+const POSTGRES_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn production_pool_size() -> u32 {
+    std::env::var("BORG_SESSIONS_POOL_SIZE")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|size| *size > 0)
+        .unwrap_or(POSTGRES_MAX_CONNECTIONS)
+}
 
 /// Advisory lock key guarding schema bootstrap. Arbitrary but fixed: every
 /// process must choose the same number for the lock to mean anything.
@@ -104,7 +115,7 @@ impl PostgresSessionStore {
 
     /// Connect to `url` and bring the schema up to the current version.
     pub async fn connect(url: &str) -> Result<Self> {
-        Self::connect_inner(url, POSTGRES_MAX_CONNECTIONS).await
+        Self::connect_inner(url, production_pool_size()).await
     }
 
     async fn connect_inner(url: &str, max_connections: u32) -> Result<Self> {
