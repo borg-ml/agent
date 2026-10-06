@@ -139,19 +139,26 @@ pub async fn refresh_provider_capability_usage(
             } else if usage.is_some() {
                 capability.usage = usage;
             }
-            let exhausted = capability
-                .usage
-                .as_ref()
-                .is_some_and(|usage| usage.availability == ProviderUsageAvailability::Exhausted);
-            let alternate_route = matches!(
-                capability.billing,
-                Some(crate::BillingLane::ApiKey | crate::BillingLane::Endpoint)
-            );
-            capability.can_spawn =
-                capability.installed && capability.authenticated && (!exhausted || alternate_route);
+            apply_spawn_admission(&mut capability);
             capability
         })
         .collect()
+}
+
+// Codex's reported allowance excludes subscription credit-backed capacity.
+// Keep usage visible, but let the selected provider route decide whether an
+// authenticated request can be funded; never select another billing lane here.
+fn apply_spawn_admission(capability: &mut ProviderCapability) {
+    let quota_blocks = capability.provider != CodingProvider::Codex
+        && capability
+            .usage
+            .as_ref()
+            .is_some_and(|usage| usage.availability == ProviderUsageAvailability::Exhausted)
+        && !matches!(
+            capability.billing,
+            Some(crate::BillingLane::ApiKey | crate::BillingLane::Endpoint)
+        );
+    capability.can_spawn = capability.installed && capability.authenticated && !quota_blocks;
 }
 
 async fn probe_provider_usage(provider: CodingProvider) -> Option<ProviderUsage> {
@@ -286,6 +293,50 @@ fn apply_claude_subscription_status(capability: &mut ProviderCapability, authent
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression: an exhausted base allowance must not block credit-backed
+    // Codex subscription attempts or silently switch them to API-key billing.
+    #[test]
+    fn exhausted_codex_allowance_does_not_veto_authenticated_credit_requests() {
+        let mut capability = ProviderCapability {
+            provider: CodingProvider::Codex,
+            installed: true,
+            version: None,
+            authenticated: true,
+            auth_detail: None,
+            auth_methods: vec![ProviderAuthMethod::Subscription],
+            can_spawn: false,
+            usage: Some(ProviderUsage {
+                availability: ProviderUsageAvailability::Exhausted,
+                windows: Vec::new(),
+                detail: Some("base allowance exhausted".into()),
+                plan: None,
+            }),
+            billing: Some(crate::BillingLane::Subscription),
+        };
+        apply_spawn_admission(&mut capability);
+        assert!(capability.can_spawn);
+        assert_eq!(capability.billing, Some(crate::BillingLane::Subscription));
+        assert_eq!(
+            capability.auth_methods,
+            vec![ProviderAuthMethod::Subscription]
+        );
+        assert_eq!(
+            capability.usage.as_ref().unwrap().availability,
+            ProviderUsageAvailability::Exhausted
+        );
+        capability.authenticated = false;
+        apply_spawn_admission(&mut capability);
+        assert!(!capability.can_spawn);
+        capability.authenticated = true;
+        capability.installed = false;
+        apply_spawn_admission(&mut capability);
+        assert!(!capability.can_spawn);
+        capability.installed = true;
+        capability.provider = CodingProvider::Claude;
+        apply_spawn_admission(&mut capability);
+        assert!(!capability.can_spawn);
+    }
 
     #[test]
     fn fresh_claude_login_repairs_a_stale_admission_snapshot() {
