@@ -775,6 +775,7 @@ impl NativeHarness {
         // that still owes one gets a single further response to write it.
         let mut reply_owed = turn.answers_human;
         let mut reply_round_spent = false;
+        let mut subagent_count = turn.prompt_context_base.get(&ContextSlot::Subagents).cloned();
         // Set for that one response: the context it sends that the model has
         // not seen, for the usage anchor if the turn settles without a reply.
         let mut parked_reply_unsent_tokens: Option<u64> = None;
@@ -820,6 +821,17 @@ impl NativeHarness {
                     },
                 )
                 .await?;
+            }
+            let current = turn.agent_tools.subagent_count_prompt().await;
+            let previous = subagent_count.as_deref().filter(|previous| {
+                messages.iter().any(|message| {
+                    matches!(message, ModelMessage::User { content, .. } if content.as_str() == *previous)
+                })
+            });
+            if let Some(content) = ContextSlot::Subagents.next(previous, current) {
+                record_prompt_context(&events, turn.provider, ContextSlot::Subagents, &content).await?;
+                messages.push(ModelMessage::user(content.clone()));
+                subagent_count = Some(content);
             }
             editor.publish(&messages, true).await;
             let request = ModelTurnRequest {

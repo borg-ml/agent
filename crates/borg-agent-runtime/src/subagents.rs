@@ -1697,6 +1697,37 @@ impl AgentToolDispatcher {
         }
     }
 
+    pub(crate) async fn subagent_count_prompt(&self) -> String {
+        let mut direct = 0;
+        let mut descendants = 0;
+        if let Some(subagents) = &self.subagents {
+            let table = subagents.table.lock().await;
+            if let Ok(path) = table.task_name(self.actor_session_id) {
+                let prefix = format!("{path}/");
+                for entry in table.entries.values() {
+                    let agent = &entry.snapshot;
+                    if !entry.dormant
+                        && agent.task_name.starts_with(&prefix)
+                        && matches!(
+                            agent.status,
+                            SubagentStatus::Starting | SubagentStatus::Running
+                        )
+                    {
+                        descendants += 1;
+                        if agent.parent_session_id == self.actor_session_id {
+                            direct += 1;
+                        }
+                    }
+                }
+            }
+        }
+        format!(
+            "Live subagent count: {direct} running direct children; {descendants} running descendants in total. \
+             Refreshed before this model request; includes starting/running agents, excludes idle, \
+             approval-waiting, stopped and failed agents and yourself."
+        )
+    }
+
     pub(crate) async fn harness_prompt_appendix(&self) -> Result<String> {
         let store = self.session_store();
         let mut appendix = crate::harness::prompt_appendix(

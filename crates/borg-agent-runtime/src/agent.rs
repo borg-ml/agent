@@ -1696,21 +1696,33 @@ async fn run_borg_provider_turn(
             turn.provider,
             CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode
         ) {
-        let slot = crate::prompt_context::ContextSlot::Harness;
-        let previous = turn.prompt_context_base.get(&slot).map(String::as_str);
-        slot.next(previous, turn.agent_tools.harness_prompt_appendix().await?)
+        let mut updates = Vec::new();
+        for (slot, current) in [
+            (
+                crate::prompt_context::ContextSlot::Harness,
+                turn.agent_tools.harness_prompt_appendix().await?,
+            ),
+            (
+                crate::prompt_context::ContextSlot::Subagents,
+                turn.agent_tools.subagent_count_prompt().await,
+            ),
+        ] {
+            let previous = turn.prompt_context_base.get(&slot).map(String::as_str);
+            if let Some(content) = slot.next(previous, current) {
+                crate::prompt_context::record_prompt_context(
+                    &events,
+                    turn.provider,
+                    slot,
+                    &content,
+                )
+                .await?;
+                updates.push(content);
+            }
+        }
+        (!updates.is_empty()).then(|| updates.join("\n\n"))
     } else {
         None
     };
-    if let Some(prompt_context) = prompt_context.as_ref() {
-        crate::prompt_context::record_prompt_context(
-            &events,
-            turn.provider,
-            crate::prompt_context::ContextSlot::Harness,
-            prompt_context,
-        )
-        .await?;
-    }
     let mut request = match request_template {
         Some(mut request) => {
             request.prompt = turn.prompt.clone();

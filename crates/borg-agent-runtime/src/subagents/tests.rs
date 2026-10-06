@@ -6,6 +6,71 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::tempdir;
 
+#[tokio::test]
+async fn live_subagent_count_tracks_lifecycle_and_descendant_scope() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        8,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        Arc::new(store),
+    )
+    .unwrap();
+    let (child, grandchild, sibling) = {
+        let mut table = coordinator.table.lock().await;
+        let child = table.reserve("child", &launch()).unwrap().session_id;
+        let grandchild = table
+            .reserve_as(child, "helper", &launch())
+            .unwrap()
+            .session_id;
+        let sibling = table.reserve("sibling", &launch()).unwrap().session_id;
+        table.entries.get_mut(&grandchild).unwrap().snapshot.status = SubagentStatus::Running;
+        table.entries.get_mut(&sibling).unwrap().snapshot.status = SubagentStatus::Ready;
+        (child, grandchild, sibling)
+    };
+    let mut dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        Some(coordinator.clone()),
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        root,
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    assert!(dispatcher.subagent_count_prompt().await.starts_with(
+        "Live subagent count: 1 running direct children; 2 running descendants in total."
+    ));
+    dispatcher.actor_session_id = child;
+    assert!(dispatcher.subagent_count_prompt().await.starts_with(
+        "Live subagent count: 1 running direct children; 1 running descendants in total."
+    ));
+    {
+        let mut table = coordinator.table.lock().await;
+        table.entries.get_mut(&child).unwrap().snapshot.status = SubagentStatus::Ready;
+        table.entries.get_mut(&grandchild).unwrap().snapshot.status =
+            SubagentStatus::WaitingForApproval;
+        table.entries.get_mut(&sibling).unwrap().snapshot.status = SubagentStatus::Failed;
+    }
+    dispatcher.actor_session_id = root;
+    assert!(dispatcher.subagent_count_prompt().await.starts_with(
+        "Live subagent count: 0 running direct children; 0 running descendants in total."
+    ));
+}
+
 // Context correction remains available without exposing a context-budget signal.
 #[tokio::test]
 async fn context_tool_allows_edits_without_exposing_capacity() {
