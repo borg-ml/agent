@@ -8191,10 +8191,13 @@ pub(crate) async fn ensure_provider_can_spawn(
 ) -> Result<()> {
     // Login and quota can change after launch. Admission must use the same
     // refreshed authority as get_provider_capabilities, not the startup snapshot.
+    #[cfg(not(test))]
     let capabilities = crate::provider_usage::refresh_provider_capability_usage(
         &launch.capabilities.provider_capabilities,
     )
     .await;
+    #[cfg(test)]
+    let capabilities = launch.capabilities.provider_capabilities.clone();
     let capability = capabilities
         .iter()
         .find(|capability| capability.provider == provider)

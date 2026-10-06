@@ -3190,7 +3190,9 @@ async fn canceled_peer_consultation_is_queued_privately_and_cannot_satisfy_the_n
                 .await
         }
     });
-    started.await;
+    tokio::time::timeout(Duration::from_secs(5), started)
+        .await
+        .expect("fake peer executor starts");
     let sidecar = coordinator.resolve_snapshot("/root/claude").await.unwrap();
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
