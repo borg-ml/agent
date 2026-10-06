@@ -2258,13 +2258,6 @@ struct CommittingSteerExecutor {
     steer_accepted: Arc<Notify>,
 }
 
-struct FlushingQueueExecutor {
-    turn_started: Arc<Notify>,
-    steers: Arc<Mutex<Vec<String>>>,
-    steer_seen: Arc<Notify>,
-    interrupted: Arc<AtomicBool>,
-}
-
 struct BoundaryRetrySteerExecutor {
     turn_started: Arc<Notify>,
     first_attempt_rejected: Arc<Notify>,
@@ -2718,49 +2711,6 @@ impl AgentTurnExecutor for NativeFoldSteerExecutor {
         ) {}
         Ok(AgentTurnResult {
             provider_session_id: None,
-            final_text: String::new(),
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl AgentTurnExecutor for FlushingQueueExecutor {
-    async fn execute(
-        &self,
-        _turn: AgentTurn,
-        events: mpsc::Sender<SessionEventKind>,
-        controls: Option<mpsc::Receiver<AgentTurnControl>>,
-    ) -> Result<AgentTurnResult> {
-        self.turn_started.notify_one();
-        events
-            .send(SessionEventKind::ReasoningDelta {
-                text: "working".to_string(),
-            })
-            .await?;
-        let mut controls = controls.expect("active turn has controls");
-        while let Some(control) = controls.recv().await {
-            match control {
-                AgentTurnControl::Steer {
-                    text,
-                    admission,
-                    ack,
-                    ..
-                } => {
-                    assert!(admission.accept());
-                    self.steers.lock().unwrap().push(text);
-                    let _ = ack.send(Ok(()));
-                    self.steer_seen.notify_one();
-                }
-                AgentTurnControl::Interrupt => {
-                    self.interrupted.store(true, Ordering::Release);
-                    break;
-                }
-                AgentTurnControl::Approval { .. }
-                | AgentTurnControl::ProviderInteractionResponse { .. } => {}
-            }
-        }
-        Ok(AgentTurnResult {
-            provider_session_id: Some("provider-session".to_string()),
             final_text: String::new(),
         })
     }
@@ -4982,7 +4932,7 @@ async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() 
 
 #[tokio::test]
 async fn interrupted_turn_reaches_fifo_drain_boundary() {
-    assert_interrupted_fifo(CodingProvider::Codex, None, true).await;
+    assert_interrupted_fifo(CodingProvider::Codex, None, true, false).await;
 }
 
 #[tokio::test]
@@ -5001,19 +4951,20 @@ async fn claude_interrupt_preserves_queue_and_only_normalizes_expected_aborts() 
             false,
         ),
     ] {
-        assert_interrupted_fifo(CodingProvider::Claude, Some(error), expected).await;
+        assert_interrupted_fifo(CodingProvider::Claude, Some(error), expected, false).await;
     }
 }
 
 #[tokio::test]
 async fn escape_flush_opencode_redirects_pending_input_without_user_stop() {
-    assert_interrupted_fifo(CodingProvider::OpenCode, None, true).await;
+    assert_interrupted_fifo(CodingProvider::OpenCode, None, true, true).await;
 }
 
 async fn assert_interrupted_fifo(
     provider: CodingProvider,
     abort_error: Option<&'static str>,
     expected_interrupt: bool,
+    flush: bool,
 ) {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
@@ -5087,7 +5038,7 @@ async fn assert_interrupted_fifo(
         .await
         .expect("first turn starts");
     command_tx
-        .send(if provider == CodingProvider::OpenCode {
+        .send(if flush {
             HostCommand::FlushPendingInput { session_id }
         } else {
             HostCommand::Interrupt { session_id }
@@ -5129,7 +5080,7 @@ async fn assert_interrupted_fifo(
         );
     }
 
-    if provider == CodingProvider::OpenCode {
+    if flush {
         assert!(!events.iter().any(|event| matches!(
             event.kind,
             SessionEventKind::UserStopChanged { engaged: true, .. }
@@ -6511,193 +6462,10 @@ async fn accepted_codex_steer_is_settled_before_turn_is_interrupted() {
 }
 
 #[tokio::test]
-async fn escape_flush_keeps_the_turn_running_after_admission_and_steers_queued_input_fifo() {
-    let root = tempdir().unwrap();
-    let journal_path = root.path().join("session.lock");
-    let session_id = Uuid::new_v4();
-    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
-    let store: Arc<dyn SessionStore> = Arc::new(store);
-    store.create_session(session_id).await.unwrap();
-    let admitted_id = Uuid::new_v4();
-    let queued_ids = [Uuid::new_v4(), Uuid::new_v4()];
-    let (command_tx, command_rx) = mpsc::channel(16);
-    let (event_tx, mut event_rx) = mpsc::channel(64);
-    let turn_started = Arc::new(Notify::new());
-    let steer_seen = Arc::new(Notify::new());
-    let steers = Arc::new(Mutex::new(Vec::new()));
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let executor = Arc::new(FlushingQueueExecutor {
-        turn_started: Arc::clone(&turn_started),
-        steers: Arc::clone(&steers),
-        steer_seen: Arc::clone(&steer_seen),
-        interrupted: Arc::clone(&interrupted),
-    });
-    let actor_store = Arc::clone(&store);
-    let actor = tokio::spawn(async move {
-        run_session_actor(
-            &journal_path,
-            session_id,
-            LaunchSession {
-                request_id: Uuid::new_v4(),
-                cwd: root.path().to_path_buf(),
-                provider: CodingProvider::Codex,
-                model: Some("gpt-5.6-luna".to_string()),
-                effort: None,
-                fast: Some(false),
-                ultrafast: None,
-                response_language: crate::ResponseLanguage::Auto,
-                permission_mode: PermissionMode::Manual,
-                name: None,
-                initial_prompt: None,
-                capabilities: Default::default(),
-                subagent_concurrency_limit: None,
-                extension_skill_roots: Vec::new(),
-                team_policy: None,
-            },
-            command_rx,
-            event_tx,
-            executor,
-            actor_store,
-        )
-        .await
-    });
-
-    command_tx
-        .send(HostCommand::Prompt {
-            session_id,
-            message_id: Uuid::new_v4(),
-            text: "keep working".to_string(),
-            attachments: Vec::new(),
-            output_schema: None,
-            delivery: PromptDelivery::Steer,
-        })
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), turn_started.notified())
-        .await
-        .expect("active turn starts");
-    command_tx
-        .send(HostCommand::Prompt {
-            session_id,
-            message_id: admitted_id,
-            text: "already admitted before escape".to_string(),
-            attachments: Vec::new(),
-            output_schema: None,
-            delivery: PromptDelivery::Steer,
-        })
-        .await
-        .unwrap();
-
-    loop {
-        let notified = steer_seen.notified();
-        if !steers.lock().unwrap().is_empty() {
-            break;
-        }
-        tokio::time::timeout(Duration::from_secs(1), notified)
-            .await
-            .expect("provider accepts the first follow-up");
+async fn escape_flush_cancels_and_resumes_pending_input() {
+    for provider in [CodingProvider::Codex, CodingProvider::Claude] {
+        assert_interrupted_fifo(provider, None, true, true).await;
     }
-    loop {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
-            .await
-            .expect("admission status arrives")
-            .expect("session remains open");
-        if matches!(
-            event.kind,
-            SessionEventKind::Message {
-                message_id,
-                status: MessageStatus::Complete,
-                delivery: Some(PromptDelivery::Steer),
-                ..
-            } if message_id == admitted_id
-        ) {
-            break;
-        }
-    }
-
-    command_tx
-        .send(HostCommand::FlushPendingInput { session_id })
-        .await
-        .unwrap();
-    for (message_id, text) in queued_ids.into_iter().zip(["queued one", "queued two"]) {
-        command_tx
-            .send(HostCommand::Prompt {
-                session_id,
-                message_id,
-                text: text.to_string(),
-                attachments: Vec::new(),
-                output_schema: None,
-                delivery: PromptDelivery::Queue,
-            })
-            .await
-            .unwrap();
-    }
-    command_tx
-        .send(HostCommand::FlushPendingInput { session_id })
-        .await
-        .unwrap();
-
-    loop {
-        let notified = steer_seen.notified();
-        if steers.lock().unwrap().len() >= 2 {
-            break;
-        }
-        if tokio::time::timeout(Duration::from_secs(1), notified)
-            .await
-            .is_err()
-        {
-            let events = std::iter::from_fn(|| event_rx.try_recv().ok())
-                .map(|event| event.kind)
-                .collect::<Vec<_>>();
-            panic!(
-                "every queued input reaches the active provider turn: {:?}; events: {events:?}",
-                *steers.lock().unwrap(),
-            );
-        }
-    }
-    assert_eq!(
-        *steers.lock().unwrap(),
-        ["already admitted before escape", "queued one\n\nqueued two"]
-    );
-    assert!(
-        !interrupted.load(Ordering::Acquire),
-        "flushing input must never send provider cancellation"
-    );
-
-    let mut completed = HashSet::new();
-    while completed.len() < queued_ids.len() {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
-            .await
-            .expect("flushed input settles durably")
-            .expect("session remains open");
-        assert!(
-            !matches!(
-                &event.kind,
-                SessionEventKind::StatusChanged {
-                    detail: Some(detail),
-                    ..
-                } if detail.contains("cancelling")
-            ),
-            "Escape flush changed the active turn into cancellation"
-        );
-        if let SessionEventKind::Message {
-            message_id,
-            status: MessageStatus::Complete,
-            delivery: Some(PromptDelivery::Steer),
-            ..
-        } = event.kind
-            && queued_ids.contains(&message_id)
-        {
-            completed.insert(message_id);
-        }
-    }
-
-    command_tx
-        .send(HostCommand::Stop { session_id })
-        .await
-        .unwrap();
-    actor.await.unwrap().unwrap();
-    scratch.discard().await;
 }
 
 #[tokio::test]

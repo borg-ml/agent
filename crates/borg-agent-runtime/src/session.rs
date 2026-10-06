@@ -6286,39 +6286,30 @@ async fn run_agent_session_store_kernel_inner(
                                 .await?;
                             }
                         }
-                        HostCommand::FlushPendingInput { .. }
-                            if !provider_supports_active_turn_control(
-                                launch.provider,
-                                executor.uses_native_harness(launch.provider),
-                            ) =>
-                        {
+                        HostCommand::FlushPendingInput { .. } => {
                             if !pending.iter().any(|queued| queued.actor == EventActor::User) {
                                 continue;
                             }
-                            // OpenCode has no steering channel. End its old turn
-                            // and immediately admit the pending human input,
+                            // Explicit flush ends the old turn immediately and admits pending input,
                             // without latching user-stop or pausing the goal.
-                            running.0.abort();
-                            let _ = (&mut running.0).await;
+                            let cooperative = if control_tx.try_send(AgentTurnControl::Interrupt).is_ok() {
+                                tokio::time::timeout(Duration::from_millis(10), &mut running.0).await.ok()
+                            } else {
+                                None
+                            };
+                            interrupted_result = Some(match cooperative {
+                                Some(result) => result,
+                                None => {
+                                    running.0.abort();
+                                    (&mut running.0).await
+                                }
+                            });
                             let _ = stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT).await;
-                            subscription_context_reusable = false;
                             provider_session_id = None;
                             provider_fork_turn_id = None;
-                            deny_pending_approval(&mut journal, &events, session_id, &mut pending_approval).await?;
-                            cancel_pending_provider_interaction(&mut journal, &events, session_id, &mut pending_provider_interaction).await?;
-                            if prompt.visible {
-                                record_prompt_status(&mut journal, &events, session_id, &prompt,
-                                    MessageStatus::Complete, prompt.delivery).await?;
-                            }
-                            record(&mut journal, &events, session_id, SessionEventKind::TurnCompleted {
-                                message_id: prompt.message_id,
-                                provider_session_id: None,
-                                final_text: String::new(),
-                                error: Some("turn interrupted by pending input".into()),
-                            }).await?;
                             batch_pending_after_interrupt = true;
                             interrupted = true;
-                            break;
+                            watchdog.set_phase(TurnPhase::Cancelling);
                         }
                         HostCommand::RecoverPendingInput { prompts, .. } => {
                             for recovered in prompts {
@@ -6333,19 +6324,6 @@ async fn run_agent_session_store_kernel_inner(
                                     recovered.attachments, recovered.output_schema,
                                 ).await?;
                             }
-                        }
-                        HostCommand::FlushPendingInput { .. } => {
-                            flush_pending_input_into_active_turn(
-                                launch.provider,
-                                executor.uses_native_harness(launch.provider),
-                                &control_tx,
-                                &steer_result_tx,
-                                &mut pending,
-                                &mut pending_steers,
-                                steer_boundary_generation,
-                                context_compaction_in_progress, launch.capabilities.frames_steers_for(launch.provider, launch.model.as_deref()),
-                            )
-                            .await;
                         }
                         command @ HostCommand::ExtensionCommand { .. } => {
                             deferred_commands.push_back(command);
@@ -11029,52 +11007,6 @@ async fn retry_pending_steers(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn flush_pending_input_into_active_turn(
-    provider: CodingProvider,
-    native_harness: bool,
-    control_tx: &mpsc::Sender<AgentTurnControl>,
-    steer_result_tx: &mpsc::Sender<(Uuid, std::result::Result<(), String>)>,
-    pending: &mut VecDeque<QueuedPrompt>,
-    pending_steers: &mut VecDeque<PendingSteer>,
-    boundary_generation: u64,
-    context_compaction_in_progress: bool,
-    reply_prompt: bool,
-) {
-    if !provider_supports_active_turn_control(provider, native_harness) {
-        return;
-    }
-
-    let mut retained = VecDeque::with_capacity(pending.len());
-    while let Some(mut prompt) = pending.pop_front() {
-        if prompt.actor != EventActor::User {
-            retained.push_back(prompt);
-            continue;
-        }
-        prompt.delivery = PromptDelivery::Steer;
-        pending_steers.push_back(PendingSteer {
-            prompt,
-            acknowledgement_id: Uuid::new_v4(),
-            admission: SteerAdmission::pending(),
-            state: PendingSteerState::RetryAtBoundary {
-                error: "explicit pending-input flush".into(),
-            },
-            attempt_boundary: boundary_generation,
-        });
-    }
-    *pending = retained;
-    if !context_compaction_in_progress {
-        retry_pending_steers(
-            control_tx,
-            steer_result_tx,
-            pending_steers,
-            boundary_generation,
-            reply_prompt,
-        )
-        .await;
-    }
-}
-
 async fn record_prompt_status(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
@@ -13470,7 +13402,9 @@ fn format_reset_delay(delay: Duration) -> String {
 }
 
 fn provider_error_is_temporary_usage_limited(error: &str) -> bool {
-    !error.to_ascii_lowercase().contains("usage credits are required")
+    !error
+        .to_ascii_lowercase()
+        .contains("usage credits are required")
         && provider_error_is_usage_limited(error)
         && !error
             .chars()
