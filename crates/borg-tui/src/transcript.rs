@@ -1242,7 +1242,7 @@ impl Transcript {
     fn show_goal(&mut self, goal: Option<&SessionGoal>) -> Option<usize> {
         let time = canonical_local_time(Local::now());
         match goal {
-            Some(goal) => self.upsert_goal(goal.clone(), time),
+            Some(goal) => self.upsert_goal(goal.clone(), time, false),
             None => {
                 self.order.push(TranscriptEntry::Activity {
                     text: "No durable goal is set. Use /goal OBJECTIVE to start one.".to_string(),
@@ -1277,7 +1277,7 @@ impl Transcript {
             goal.updated_at = Utc::now();
             goal.clone()
         };
-        self.upsert_goal(updated_goal, canonical_local_time(Local::now()));
+        self.upsert_goal(updated_goal, canonical_local_time(Local::now()), false);
         true
     }
 
@@ -1294,20 +1294,14 @@ impl Transcript {
         self.upsert_plan(items.to_vec(), time)
     }
 
-    fn upsert_goal(&mut self, goal: SessionGoal, time: String) -> Option<usize> {
+    fn upsert_goal(&mut self, goal: SessionGoal, time: String, refresh: bool) -> Option<usize> {
         let removed = self
             .order
             .iter()
             .rposition(|entry| matches!(entry, TranscriptEntry::Goal { .. }));
-        // A replayed goal -- every retry re-emits one, because the turn restarts
-        // and re-establishes the goal it is working to -- must not move the
-        // card. Taking it out and pushing it back would drop the whole block
-        // to the bottom of the transcript and re-announce it, so a resume would
-        // re-print a goal the reader already has in view. Only the fields the
-        // card actually prints are compared; the elapsed figure is derived
-        // from the goal at render time, so it keeps counting without the entry
-        // needing to be rewritten.
-        if let Some(index) = removed
+        // Retry/accounting updates keep the card in place; completed turns
+        // explicitly refresh it at the tail for the next goal iteration.
+        if !refresh && let Some(index) = removed
             && let Some(TranscriptEntry::Goal { goal: shown, .. }) = self.order.get(index)
             && goal.objective == shown.objective
             && goal.status == shown.status
@@ -2789,6 +2783,9 @@ impl Transcript {
             SessionEventKind::TurnCompleted { error: None, .. } => {
                 self.flush_streaming_tails();
                 self.finish_running_tools(event.created_at, false, "");
+                if let Some(goal) = self.goal.clone().filter(|goal| goal.status.is_active()) {
+                    removed_entry = self.upsert_goal(goal, local_event_time(event), true);
+                }
             }
             SessionEventKind::ApprovalRequested { title, detail, .. } => {
                 self.finish_reasoning(event.created_at);
@@ -2829,7 +2826,7 @@ impl Transcript {
             }
             SessionEventKind::GoalUpdated { goal } => {
                 self.goal = Some(goal.clone());
-                return self.upsert_goal(goal.clone(), local_event_time(event));
+                return self.upsert_goal(goal.clone(), local_event_time(event), false);
             }
             SessionEventKind::GoalCleared { .. } => {
                 self.goal = None;
@@ -6985,6 +6982,37 @@ impl Transcript {
 #[cfg(test)]
 mod parallel_preparation_tests {
     use super::*;
+
+    #[test]
+    fn active_goal_returns_to_the_tail_at_turn_completion_in_live_and_replay() {
+        let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let goal = SessionGoal::new("Keep checking replay".into(), None);
+        let events = [
+            SessionEvent::new(session_id, 1, SessionEventKind::GoalUpdated { goal: goal.clone() }),
+            SessionEvent::new(session_id, 2, SessionEventKind::Message {
+                message_id, actor: EventActor::Assistant, text: "One turn finished".into(),
+                attachments: Vec::new(), status: MessageStatus::Complete, delivery: None,
+            }),
+            SessionEvent::new(session_id, 3, SessionEventKind::GoalUpdated { goal }),
+            SessionEvent::new(session_id, 4, SessionEventKind::TurnCompleted {
+                message_id, provider_session_id: None, final_text: "One turn finished".into(),
+                error: None,
+            }),
+        ];
+        for replay in [false, true] {
+            let mut transcript = Transcript::default();
+            for event in &events[..3] {
+                if replay { transcript.apply_history(event); } else { transcript.apply(event); }
+            }
+            assert!(matches!(&transcript.order[0], TranscriptEntry::Goal { .. }));
+            if replay { transcript.apply_history(&events[3]); } else { transcript.apply(&events[3]); }
+            assert_eq!(transcript.order.len(), 2);
+            assert!(matches!(&transcript.order[0], TranscriptEntry::Message { .. }));
+            assert!(matches!(&transcript.order[1], TranscriptEntry::Goal { goal, .. }
+                if goal.objective == "Keep checking replay"));
+        }
+    }
 
     #[test]
     fn finalized_reasoning_reuses_a_live_lifecycle_row() {
