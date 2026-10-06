@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.14.5)
+## Unreleased (since 0.14.6)
+
+## 0.14.6 (2026-10-06)
 
 ### Live settings
 
