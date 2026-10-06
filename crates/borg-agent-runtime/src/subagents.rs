@@ -125,6 +125,36 @@ impl SubagentStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubagentCounts {
+    pub running: usize,
+    pub starting: usize,
+    pub inactive: usize,
+}
+
+impl SubagentCounts {
+    fn add(&mut self, status: SubagentStatus) {
+        match status {
+            SubagentStatus::Running => self.running += 1,
+            SubagentStatus::Starting => self.starting += 1,
+            SubagentStatus::Ready
+            | SubagentStatus::WaitingForApproval
+            | SubagentStatus::Stopped
+            | SubagentStatus::Failed => self.inactive += 1,
+        }
+    }
+}
+
+impl FromIterator<SubagentStatus> for SubagentCounts {
+    fn from_iter<T: IntoIterator<Item = SubagentStatus>>(statuses: T) -> Self {
+        let mut counts = Self::default();
+        for status in statuses {
+            counts.add(status);
+        }
+        counts
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 #[ts(export)]
@@ -1698,33 +1728,39 @@ impl AgentToolDispatcher {
     }
 
     pub(crate) async fn subagent_count_prompt(&self) -> String {
-        let mut direct = 0;
-        let mut descendants = 0;
+        let mut direct = SubagentCounts::default();
+        let mut descendants = SubagentCounts::default();
         if let Some(subagents) = &self.subagents {
             let table = subagents.table.lock().await;
             if let Ok(path) = table.task_name(self.actor_session_id) {
                 let prefix = format!("{path}/");
                 for entry in table.entries.values() {
                     let agent = &entry.snapshot;
-                    if !entry.dormant
-                        && agent.task_name.starts_with(&prefix)
-                        && matches!(
-                            agent.status,
-                            SubagentStatus::Starting | SubagentStatus::Running
-                        )
-                    {
-                        descendants += 1;
+                    if agent.task_name.starts_with(&prefix) {
+                        let status = if entry.dormant {
+                            SubagentStatus::Stopped
+                        } else {
+                            agent.status
+                        };
+                        descendants.add(status);
                         if agent.parent_session_id == self.actor_session_id {
-                            direct += 1;
+                            direct.add(status);
                         }
                     }
                 }
             }
         }
         format!(
-            "Live subagent count: {direct} running direct children; {descendants} running descendants in total. \
-             Refreshed before this model request; includes starting/running agents, excludes idle, \
-             approval-waiting, stopped and failed agents and yourself."
+            "Live subagent counts — direct children: running={}, starting={}, inactive={}; \
+             all descendants: running={}, starting={}, inactive={}. \
+             Refreshed before this model request; excludes yourself. Inactive includes ready, \
+             approval-waiting, stopped, failed and dormant agents.",
+            direct.running,
+            direct.starting,
+            direct.inactive,
+            descendants.running,
+            descendants.starting,
+            descendants.inactive,
         )
     }
 

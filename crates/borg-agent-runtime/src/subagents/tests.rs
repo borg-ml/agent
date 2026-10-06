@@ -6,6 +6,32 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::tempdir;
 
+#[test]
+fn subagent_counts_partition_all_lifecycle_states() {
+    let counts = [
+        SubagentStatus::Running,
+        SubagentStatus::Starting,
+        SubagentStatus::Ready,
+        SubagentStatus::WaitingForApproval,
+        SubagentStatus::Stopped,
+        SubagentStatus::Failed,
+    ]
+    .into_iter()
+    .collect::<SubagentCounts>();
+    assert_eq!(
+        counts,
+        SubagentCounts {
+            running: 1,
+            starting: 1,
+            inactive: 4
+        }
+    );
+    assert_eq!(
+        std::iter::empty().collect::<SubagentCounts>(),
+        SubagentCounts::default()
+    );
+}
+
 #[tokio::test]
 async fn live_subagent_count_tracks_lifecycle_and_descendant_scope() {
     let directory = tempdir().unwrap();
@@ -52,11 +78,11 @@ async fn live_subagent_count_tracks_lifecycle_and_descendant_scope() {
         PermissionMode::FullAccess,
     );
     assert!(dispatcher.subagent_count_prompt().await.starts_with(
-        "Live subagent count: 1 running direct children; 2 running descendants in total."
+        "Live subagent counts — direct children: running=0, starting=1, inactive=1; all descendants: running=1, starting=1, inactive=1."
     ));
     dispatcher.actor_session_id = child;
     assert!(dispatcher.subagent_count_prompt().await.starts_with(
-        "Live subagent count: 1 running direct children; 1 running descendants in total."
+        "Live subagent counts — direct children: running=1, starting=0, inactive=0; all descendants: running=1, starting=0, inactive=0."
     ));
     {
         let mut table = coordinator.table.lock().await;
@@ -67,7 +93,7 @@ async fn live_subagent_count_tracks_lifecycle_and_descendant_scope() {
     }
     dispatcher.actor_session_id = root;
     assert!(dispatcher.subagent_count_prompt().await.starts_with(
-        "Live subagent count: 0 running direct children; 0 running descendants in total."
+        "Live subagent counts — direct children: running=0, starting=0, inactive=2; all descendants: running=0, starting=0, inactive=3."
     ));
 }
 

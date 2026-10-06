@@ -8071,6 +8071,9 @@ fn active_subagent_count_tracks_only_running_children() {
         .insert(Uuid::new_v4(), SubagentStatus::Running);
     transcript
         .subagents
+        .insert(Uuid::new_v4(), SubagentStatus::Starting);
+    transcript
+        .subagents
         .insert(Uuid::new_v4(), SubagentStatus::WaitingForApproval);
     transcript
         .subagents

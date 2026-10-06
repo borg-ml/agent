@@ -74,7 +74,7 @@ pub(crate) enum ContextSlot {
     Harness,
     /// Provider admission and usage status.
     ProviderStatus,
-    /// Live running child and descendant counts.
+    /// Live child and descendant counts by lifecycle state.
     Subagents,
 }
 

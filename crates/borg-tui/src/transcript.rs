@@ -4793,8 +4793,9 @@ impl Transcript {
     fn active_subagent_count(&self) -> usize {
         self.subagents
             .values()
-            .filter(|status| **status == SubagentStatus::Running)
-            .count()
+            .copied()
+            .collect::<borg_agent_runtime::SubagentCounts>()
+            .running
     }
 
     fn agent_roster_entries(&self) -> Vec<AgentRosterEntry> {

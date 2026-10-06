@@ -143,8 +143,8 @@ pub use session_store::{
 pub use subagents::{
     AgentToolDispatcher, AgentToolServer, DEFAULT_MAX_SUBAGENTS, MAX_MESSAGE_ATTACHMENT_BYTES,
     MAX_MESSAGE_ATTACHMENTS, SpawnSubagent, SubagentActivity, SubagentActivityKind,
-    SubagentCoordinator, SubagentSnapshot, SubagentStatus, SubagentUsage, ToolSurface,
-    agent_tool_specs, agent_tool_specs_for_child, agent_tool_specs_for_surface,
+    SubagentCoordinator, SubagentCounts, SubagentSnapshot, SubagentStatus, SubagentUsage,
+    ToolSurface, agent_tool_specs, agent_tool_specs_for_child, agent_tool_specs_for_surface,
     agent_tool_specs_with_capabilities, agent_tool_specs_with_capabilities_and_consultation,
     agent_tool_specs_with_subagents, agent_tool_specs_with_team_policy, load_message_attachment,
     store_relayed_message_attachment, subagent_tool_specs, validate_message_attachment,
