@@ -3662,19 +3662,16 @@ impl BorgTerminal {
             .map_or_else(ComposerDraft::default, |(text, attachments)| {
                 ComposerDraft { text, attachments }
             });
-        if self.persisted_draft.as_ref() == Some(&current) {
+        if self
+            .persisted_draft
+            .as_ref()
+            .unwrap_or(&ComposerDraft::default())
+            == &current
+        {
             return;
         }
-        match self.composer_draft_store.save(&current) {
-            Ok(()) => {
-                self.persisted_draft = (!current.is_empty()).then_some(current);
-            }
-            Err(error) => {
-                tracing::warn!(%error, "failed to persist composer draft");
-                // Do not retry the same failing write on every keystroke.
-                self.persisted_draft = Some(current);
-            }
-        }
+        self.composer_draft_store.save(current.clone());
+        self.persisted_draft = (!current.is_empty()).then_some(current);
     }
 
     pub fn project_pending_prompt(
