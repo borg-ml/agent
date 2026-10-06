@@ -447,7 +447,7 @@ enum PromptAdmissionState {
     Settled,
 }
 
-struct RuntimeSessionStore {
+pub(crate) struct RuntimeSessionStore {
     store: Arc<dyn SessionStore>,
     context_events: Vec<SessionEvent>,
     context_complete: bool,
@@ -778,7 +778,7 @@ fn start_workspace_projection_repair(
 }
 
 impl RuntimeSessionStore {
-    fn new(
+    pub(crate) fn new(
         store: Arc<dyn SessionStore>,
         context_events: Vec<SessionEvent>,
         context_complete: bool,
@@ -11665,7 +11665,7 @@ async fn apply_live_session_config(
     result
 }
 
-async fn apply_session_config(
+pub(crate) async fn apply_session_config(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
@@ -11812,6 +11812,9 @@ async fn apply_session_config(
         crate::SessionConfigAction::SetResponseLanguage { language } => {
             next.response_language = language;
         }
+    }
+    if atomic_child {
+        next.capabilities.model_fallback.clear();
     }
     if next.provider == CodingProvider::Claude && next.effort.is_none() {
         next.effort = Some(borg_provider::claude_default_effort().to_string());

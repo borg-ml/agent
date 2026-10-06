@@ -2784,14 +2784,20 @@ async fn director_configures_live_child_speed_and_reuses_its_new_lane_after_wake
     })
     .await
     .unwrap();
-    assert!(
-        coordinator
-            .call_tool("configure_agent", json!({"target": target, "fast": false}))
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("paused or stopped")
-    );
+    let dormant = coordinator.call_tool("configure_agent", json!({
+        "target": target, "provider": "codex", "model": "gpt-6-sol",
+        "effort": "high", "fast": true
+    })).await.unwrap();
+    assert_eq!(dormant["agent"]["model"], "gpt-6-sol");
+    assert_eq!(dormant["agent"]["effort"], "high");
+    assert_eq!(dormant["agent"]["status"], "stopped");
+    let saved = store.state(child.session_id).await.unwrap().configuration.unwrap();
+    assert_eq!(saved.model.as_deref(), Some("gpt-6-sol"));
+    assert_eq!(saved.effort.as_deref(), Some("high"));
+    // Restore the original fixture route, still without resuming the actor.
+    coordinator.call_tool("configure_agent", json!({
+        "target": target, "model": "gpt-6-sol", "effort": "xhigh", "fast": true
+    })).await.unwrap();
     assert_eq!(
         coordinator.get(child.session_id).await.unwrap().status,
         SubagentStatus::Stopped
