@@ -5,6 +5,29 @@ Git comparison.
 
 ## Unreleased (since 0.14.6)
 
+### Terminal
+
+- Tool inputs and results that are JSON render as an indented key/value outline
+  with real line breaks instead of escaped source, and plain-text results drop
+  the second line-number gutter. Details headers keep the action's summary, an
+  orphaned result names the command it belongs to, and command-shaped results
+  are shown as output whatever the tool was called.
+- The active goal is shown again between loop turns.
+- Resumed sessions keep transcript row positions and reasoning blocks, preserve
+  prompt admission markers when paging history, and live GPT reasoning stays
+  bound to its archived block with cumulative visible summaries.
+
+### Subagents
+
+- Model requests now include live running-subagent counts, shared with the
+  terminal UI so both report the same lifecycle state.
+
+### Performance
+
+- Claude login status is read once per 60 seconds across all sessions instead of
+  spawning `claude auth status` for every session's 3-second capability refresh,
+  which kept several cores busy on hosts with many sessions.
+
 ## 0.14.6 (2026-10-06)
 
 ### Live settings
