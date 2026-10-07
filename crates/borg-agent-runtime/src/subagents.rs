@@ -4217,7 +4217,7 @@ impl SubagentCoordinator {
             return Ok((
                 TeamInboxMessage {
                     message_id: Uuid::new_v4(),
-                    text: attributed_team_message(actor, actor, message),
+                    text: attributed_team_message(actor, actor, message, None),
                     report_text: message.to_string(),
                     sender_session_id: actor_session_id,
                     delivery: prompt_delivery,
@@ -4294,7 +4294,6 @@ impl SubagentCoordinator {
         } else {
             format!("participant:{}", actor_binding.participant_id)
         };
-        let text = attributed_team_message(actor, &reply_target, message);
         let idempotency_id = Uuid::new_v4();
         let receipt = workspace_store
             .append_message(NewWorkspaceMessage {
@@ -4317,7 +4316,12 @@ impl SubagentCoordinator {
         Ok((
             TeamInboxMessage {
                 message_id: receipt.message_id,
-                text,
+                text: attributed_team_message(
+                    actor,
+                    &reply_target,
+                    message,
+                    Some(receipt.message_id),
+                ),
                 report_text: message.to_string(),
                 sender_session_id: actor_session_id,
                 delivery: prompt_delivery,
@@ -4377,7 +4381,12 @@ impl SubagentCoordinator {
                     ordering,
                     TeamInboxMessage {
                         message_id: message.id,
-                        text: attributed_team_message(&actor, &reply_target, &message.body.text),
+                        text: attributed_team_message(
+                            &actor,
+                            &reply_target,
+                            &message.body.text,
+                            Some(message.id),
+                        ),
                         report_text: message.body.text,
                         sender_session_id: message.author_id,
                         delivery: match delivery.mode {
@@ -6087,7 +6096,7 @@ impl SubagentCoordinator {
             .await?;
         let inbox = TeamInboxMessage {
             message_id: receipt.message_id,
-            text: attributed_team_message(&actor, &actor, &message),
+            text: attributed_team_message(&actor, &actor, &message, Some(receipt.message_id)),
             report_text: message,
             sender_session_id: actor_session_id,
             delivery: PromptDelivery::Queue,
@@ -7564,8 +7573,14 @@ impl SubagentCoordinator {
                     )
                     .await?
                 };
-                self.with_sender_address(actor_session_id, routed_message_json(routed, "queued"))
-                    .await
+                let mut receipt = routed_message_json(routed, "queued");
+                receipt["action_requested"] = json!(args.wake);
+                receipt["next_step"] = json!(if args.wake {
+                    "Action requested, not proven applied. Check get_message_status for a linked reply, then verify it addresses the request."
+                } else {
+                    "Notification only; no response was requested. Use followup_task for a question, approval or work request needing action."
+                });
+                self.with_sender_address(actor_session_id, receipt).await
             }
             "followup_task" => {
                 let args: MessageArgs = serde_json::from_value(arguments)?;
@@ -7578,8 +7593,12 @@ impl SubagentCoordinator {
                         options,
                     )
                     .await?;
-                self.with_sender_address(actor_session_id, routed_message_json(routed, "accepted"))
-                    .await
+                let mut receipt = routed_message_json(routed, "accepted");
+                receipt["action_requested"] = json!(true);
+                receipt["next_step"] = json!(
+                    "Action requested, not proven applied. Check get_message_status for a linked reply, then verify it addresses the request."
+                );
+                self.with_sender_address(actor_session_id, receipt).await
             }
             "broadcast_team" => {
                 let args: BroadcastArgs = serde_json::from_value(arguments)?;
@@ -7668,7 +7687,7 @@ impl SubagentCoordinator {
                 Ok(json!({ "acknowledged": true, "count": ids.len(), "message_ids": ids }))
             }
             "get_message_status" => {
-                let args: AcknowledgeMessageArgs = serde_json::from_value(arguments)?;
+                let args: MessageStatusArgs = serde_json::from_value(arguments)?;
                 let deliveries = self
                     .workspace_store()
                     .await?
@@ -7701,8 +7720,74 @@ impl SubagentCoordinator {
                     team_harness::scrub_value(&mut receipt);
                     receipts.push(receipt);
                 }
+                let mut replies = Vec::new();
+                let mut reply_scans = Vec::new();
+                if let Some(binding) = self.store.workspace_binding(actor_session_id).await? {
+                    let store = self.workspace_store().await?;
+                    let visible: HashSet<_> = store
+                        .list_workspaces_for_participant(binding.participant_id)
+                        .await?
+                        .into_iter()
+                        .map(|workspace| workspace.id)
+                        .collect();
+                    let recipients: HashSet<_> = deliveries
+                        .iter()
+                        .map(|delivery| delivery.recipient_id)
+                        .collect();
+                    let mut scanned = HashSet::new();
+                    for delivery in &deliveries {
+                        if !visible.contains(&delivery.workspace_id)
+                            || !scanned.insert(delivery.workspace_id)
+                        {
+                            continue;
+                        }
+                        let after = args
+                            .reply_after_sequence
+                            .unwrap_or(delivery.sequence)
+                            .max(delivery.sequence);
+                        let events = store
+                            .message_events_after(
+                                delivery.workspace_id,
+                                binding.participant_id,
+                                after,
+                                65,
+                            )
+                            .await?;
+                        let mut more = events.len() > 64;
+                        let mut next = after;
+                        for event in events.into_iter().take(64) {
+                            if replies.len() >= 16 {
+                                more = true;
+                                break;
+                            }
+                            next = event.sequence;
+                            let WorkspaceEventKind::Message { message, .. } = event.kind else {
+                                continue;
+                            };
+                            if message.reply_to_message_id != Some(args.message_id)
+                                || !recipients.contains(&message.author_id)
+                            {
+                                continue;
+                            }
+                            let safe_text = crate::secret_scrub::scrub_secrets(&message.body.text);
+                            let preview = safe_text.chars().take(512).collect::<String>();
+                            replies.push(json!({"message_id": message.id, "workspace_id": event.workspace_id,
+                                "sequence": event.sequence, "author_id": message.author_id, "created_at": event.created_at,
+                                "preview_truncated": preview.len() < safe_text.len(), "preview": preview}));
+                        }
+                        reply_scans.push(
+                            json!({"workspace_id": delivery.workspace_id, "after_sequence": after,
+                            "next_after_sequence": next, "more": more}),
+                        );
+                    }
+                }
+                for reply in &mut replies {
+                    team_harness::scrub_value(reply);
+                }
                 Ok(
                     json!({"message_id": args.message_id, "deliveries": receipts, "observed_at": Utc::now(),
+                    "reply_evidence": {"linked_replies": replies, "scans": reply_scans,
+                        "caveat": "Only canonical linked replies from recorded recipients addressed to the caller are shown. A linked reply is not proof of a useful answer, approval or completion. Unlinked responses are not inferred; empty bounded scans do not prove no response. Follow next_after_sequence when more is true."},
                     "source": "workspace delivery projection plus read-only canonical message presence",
                     "caveat": "Unknown evidence stays null. Pending may already be dispatched locally; canonical presence is not proof of read or action. Attempts count recorded delivery-attempt receipts, not every dispatch. ACK is not business approval or task completion. Reads never repair projections."}),
                 )
@@ -8055,11 +8140,11 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         message_tool(
             "send_message",
-            "Queue a durable message for any discovered Borg instance, across projects and enrolled machines. Use participant:<id> from list_instances, session:<UUID> for a local session, or a team path. Cross-workspace messages use a private channel. Messages notify by default without starting an idle agent. Set wake:true to request a turn; explicit user interruption still takes precedence. A relay_pending result means the host relay forwards it asynchronously; confirm with get_message_status.",
+            "Send a NOTIFICATION, not an action request, unless wake:true is explicitly chosen. For questions, approvals or work needing a response, use followup_task. Queue a durable message for any discovered Borg instance, across projects and enrolled machines. Use participant:<id> from list_instances, session:<UUID> for a local session, or a team path. Cross-workspace messages use a private channel. Messages notify by default without starting an idle agent. Set wake:true to request a turn; explicit user interruption still takes precedence. A relay_pending result means the host relay forwards it asynchronously; confirm with get_message_status.",
         ),
         message_tool(
             "followup_task",
-            "Send a durable follow-up and wake or steer a discovered local or remote Borg instance when possible. Use participant:<id> from list_instances or session:<UUID> for a local session.",
+            "Request ACTION or a RESPONSE: use this for questions, evidence requests, approvals and work needing a reply. Send a durable follow-up and wake or steer a discovered local or remote Borg instance when possible. Receipt means accepted, not answered or completed; verify a linked reply with get_message_status. Use participant:<id> from list_instances or session:<UUID> for a local session.",
         ),
         tool(
             "broadcast_team",
@@ -8086,8 +8171,9 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "get_message_status",
-            "Recorded per-recipient delivery state of a message you sent: pending (no admission/relay receipt yet; local dispatch may already have occurred), relayed, admitted, acknowledged, recalled or failed. Returns timestamped evidence with unknown read/acted-on fields; projection can lag canonical recipient events. Attempts count recorded attempt receipts, not every dispatch. ACK is not business approval or task completion. This read never repairs state.",
-            json!({"type":"object","properties":{"message_id":{"type":"string"}},"required":["message_id"],"additionalProperties":false}),
+            "Recorded per-recipient delivery state of a message you sent: pending (no admission/relay receipt yet; local dispatch may already have occurred), relayed, admitted, acknowledged, recalled or failed. Returns timestamped delivery evidence and bounded canonical linked replies addressed to you (512-character previews). A reply must still be checked against the request; acknowledgement alone is not a response. Unknown read/acted-on fields stay null; projection can lag canonical recipient events. Attempts count recorded attempt receipts, not every dispatch. ACK is not business approval or task completion. This read never repairs state.",
+            json!({"type":"object","properties":{"message_id":{"type":"string"},
+                "reply_after_sequence":{"type":"integer","minimum":0,"description":"Continue a bounded canonical reply scan after its next_after_sequence."}},"required":["message_id"],"additionalProperties":false}),
         ),
         tool(
             "interrupt_agent",
@@ -9912,6 +9998,13 @@ struct ConfigureAgentArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct MessageStatusArgs {
+    message_id: Uuid,
+    reply_after_sequence: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MessageArgs {
     #[serde(default)]
     wake: bool,
@@ -10995,9 +11088,10 @@ fn message_tool(name: &str, description: &str) -> Value {
         }),
     );
     if name == "send_message" {
+        definition["inputSchema"]["required"] = json!(["target", "message", "wake"]);
         definition["inputSchema"]["properties"]["wake"] = json!({
-            "type": "boolean", "default": false,
-            "description": "Request waking an idle recipient; never overrides an explicit user stop."
+            "type": "boolean",
+            "description": "Choose explicitly: false for an FYI notification; true for a question, approval or task requiring action. Prefer followup_task for requests. Never overrides an explicit user stop."
         });
     }
     definition
@@ -11143,10 +11237,23 @@ fn optional_tool_text(value: Option<String>) -> Option<String> {
     })
 }
 
-fn attributed_team_message(actor: &str, reply_target: &str, message: &str) -> String {
+fn attributed_team_message(
+    actor: &str,
+    reply_target: &str,
+    message: &str,
+    message_id: Option<Uuid>,
+) -> String {
+    let correlation = message_id
+        .map(|id| {
+            format!(
+                "Message ID: {id}. When replying, include reply_to_message_id: \"{id}\". \
+         Acknowledgement is not a response or task completion.\n\n"
+            )
+        })
+        .unwrap_or_default();
     if reply_target == actor {
         return format!(
-            "Team message from {actor}:\n\n{message}\n\n\
+            "Team message from {actor}:\n\n{correlation}{message}\n\n\
              ({actor} is another Borg instance, not the human user. In the main thread, address \
              your updates to the user; send replies or acknowledgments to {actor} via \
              send_message with target \"{reply_target}\".)"
@@ -11155,7 +11262,7 @@ fn attributed_team_message(actor: &str, reply_target: &str, message: &str) -> St
     // Every top-level session is /root of its own team, so a bare path from
     // another session reads as the recipient itself.
     format!(
-        "Team message from {actor} of another session ({reply_target}):\n\n{message}\n\n\
+        "Team message from {actor} of another session ({reply_target}):\n\n{correlation}{message}\n\n\
          (This sender is a separate Borg session with its own team tree: not you, your parent, \
          or your children, and not the human user. Team paths are per session, so its {actor} \
          can equal your own. In the main thread, address your updates to the user; send replies \

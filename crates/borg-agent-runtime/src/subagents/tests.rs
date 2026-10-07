@@ -9676,3 +9676,133 @@ async fn saturated_child_message_send_is_bounded_and_preserves_the_message() {
     assert_eq!(status["deliveries"].as_array().unwrap().len(), 1);
     scratch.discard().await;
 }
+
+// Admission and acknowledgement are not answers. Only an explicitly linked
+// response from a recorded recipient, delivered to the caller, is reply evidence.
+#[tokio::test]
+async fn message_status_distinguishes_notifications_acknowledgements_and_linked_replies() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        2,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+    let (child, observer, mut input) = {
+        let mut table = coordinator.table.lock().await;
+        let child = table.reserve("worker", &launch()).unwrap().session_id;
+        let observer = table.reserve("observer", &launch()).unwrap().session_id;
+        let (tx, rx) = mpsc::channel(8);
+        let entry = table.entries.get_mut(&child).unwrap();
+        entry.snapshot.status = SubagentStatus::Running;
+        entry.commands = Some(tx);
+        (child, observer, rx)
+    };
+    bind_test_team(directory.path(), &store, root, &[child, observer]).await;
+    let request = coordinator
+        .call_tool_as(
+            root,
+            "followup_task",
+            json!({"target":"worker", "message":"send specific evidence"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(request["action_requested"], true);
+    let request_id: Uuid = serde_json::from_value(request["message_id"].clone()).unwrap();
+    let HostCommand::TeamPrompt { text, .. } = input.recv().await.unwrap() else {
+        panic!("team prompt")
+    };
+    assert!(text.contains(&format!("Message ID: {request_id}")));
+    coordinator
+        .call_tool_as(
+            child,
+            "acknowledge_team_message",
+            json!({"message_id":request_id}),
+        )
+        .await
+        .unwrap();
+    let acknowledged = coordinator
+        .call_tool_as(root, "get_message_status", json!({"message_id":request_id}))
+        .await
+        .unwrap();
+    assert_eq!(acknowledged["deliveries"][0]["state"], "acknowledged");
+    assert!(
+        acknowledged["reply_evidence"]["linked_replies"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    for (sender, linked, text) in [
+        (child, false, "unrelated status"),
+        (observer, true, "not a requested recipient"),
+        (child, true, "here is the requested evidence"),
+    ] {
+        let mut args = json!({"target":"/root", "message":text, "wake":false});
+        if linked {
+            args["reply_to_message_id"] = json!(request_id);
+        }
+        let receipt = coordinator
+            .call_tool_as(sender, "send_message", args)
+            .await
+            .unwrap();
+        assert_eq!(receipt["action_requested"], false);
+    }
+    let status = coordinator
+        .call_tool_as(root, "get_message_status", json!({"message_id":request_id}))
+        .await
+        .unwrap();
+    let replies = status["reply_evidence"]["linked_replies"]
+        .as_array()
+        .unwrap();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0]["author_id"], child.to_string());
+    assert_eq!(replies[0]["preview"], "here is the requested evidence");
+    assert!(status["deliveries"][0]["evidence"]["acted_on"].is_null());
+    let private = coordinator
+        .call_tool_as(
+            observer,
+            "get_message_status",
+            json!({"message_id":request_id}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        private["reply_evidence"]["linked_replies"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    scratch.discard().await;
+}
+
+#[test]
+fn message_tool_requires_explicit_notification_or_wake_choice() {
+    let tools = subagent_tool_specs(CodingProvider::Codex);
+    let notify = tools
+        .iter()
+        .find(|tool| tool["name"] == "send_message")
+        .unwrap();
+    assert!(
+        notify["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("wake"))
+    );
+    let request = tools
+        .iter()
+        .find(|tool| tool["name"] == "followup_task")
+        .unwrap();
+    assert!(
+        !request["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("wake"))
+    );
+}
