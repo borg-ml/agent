@@ -985,7 +985,13 @@ fn child_history_merge_prefers_completion_over_a_late_partial_snapshot() {
     anchor.sequence = 7;
     anchor.created_at = now - chrono::Duration::seconds(1);
     let anchored = merge_child_history(&[anchor, complete.clone()], vec![stale_partial.clone()]);
-    assert_eq!(anchored.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![7, 8]);
+    assert_eq!(
+        anchored
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![7, 8]
+    );
 
     let merged = merge_child_history(&[complete], vec![stale_partial]);
 

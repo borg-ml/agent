@@ -2546,7 +2546,8 @@ async fn run_local_agent_session(
         // journal here before a terminal can attach.
         (Vec::new(), session_state.latest_sequence.saturating_add(1))
     } else {
-        let history = complete_tui_history(store.as_ref(), session_id, session_state.latest_sequence).await?;
+        let history =
+            complete_tui_history(store.as_ref(), session_id, session_state.latest_sequence).await?;
         (history.events, history.page_before)
     };
     let history_ms = history_started.elapsed().as_millis() as u64;
@@ -9039,8 +9040,13 @@ async fn complete_tui_history(
 ) -> Result<ResumeBootstrapHistory> {
     let mut events = store.read(session_id).await?;
     events.retain(|event| event.sequence <= latest_sequence);
-    let page_before = events.first().map_or(latest_sequence.saturating_add(1), |event| event.sequence);
-    Ok(ResumeBootstrapHistory { events, page_before })
+    let page_before = events
+        .first()
+        .map_or(latest_sequence.saturating_add(1), |event| event.sequence);
+    Ok(ResumeBootstrapHistory {
+        events,
+        page_before,
+    })
 }
 
 fn coalesced_transcript_event(kind: &SessionEventKind) -> bool {

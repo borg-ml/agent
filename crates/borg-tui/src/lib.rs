@@ -4049,7 +4049,7 @@ impl BorgTerminal {
                     || kind == "network_retry"
                     || kind == "network_recovered"
                     || kind == "mcp_server_unavailable"
-                || kind == "reasoning_snapshot"
+                    || kind == "reasoning_snapshot"
                     || Transcript::provider_reasoning_lifecycle(kind, payload).is_some()
             }
             _ => true,
