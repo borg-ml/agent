@@ -7,6 +7,8 @@ Git comparison.
 
 ### Terminal
 
+- Preserve GPT reasoning summaries delivered as atomic summary parts or only in
+  final model responses, without duplicating streamed text.
 - Rename the subagent menu model column from “Model now” to “Model”.
 
 - Model, effort, and speed controls and status metadata stay synchronized with
@@ -17,6 +19,9 @@ Git comparison.
 
 ### Usage
 
+- Usage-limit notices distinguish scheduled retries from provider resets, no
+  longer show expired deadlines as future resumptions, and clear when a retry
+  is explicitly released.
 - Fill missing model-call costs from published prices so subagent totals show
   API-equivalent estimates instead of remaining unavailable. Cache reads,
   writes, and context pricing tiers are included; provider-reported amounts
@@ -26,6 +31,10 @@ Git comparison.
 
 ### Subagents
 
+- Saturated child command queues no longer block message delivery indefinitely;
+  timed-out messages stay queued and callers are warned not to resend them.
+- Already-acknowledged queued team requests no longer reopen completed work;
+  unacknowledged and uncertain deliveries remain preserved.
 - Instance discovery probes an answering control server rather than merely a
   listening socket, and includes session title/activity and attached/detached
   viewer state when available. Reachable detached hosts remain discoverable.
@@ -44,6 +53,21 @@ Git comparison.
 - Scout defaults to Haiku 5.5 at `xhigh`, with GPT-6 Luna at `xhigh` as fallback.
   Model routes, effort, fallback, and API billing opt-in are configurable through
   live `[scout]` settings; changes apply to the next scout call.
+
+### Agent runtime
+
+- Explicit human or director-authorized goal resume releases stale local usage
+  cooldowns and reuses the saved retry rather than adding a duplicate
+  continuation. Provider quota limits remain enforced.
+- Secret scrubbing preserves ordinary task identifiers instead of mistaking
+  their suffixes for provider keys, while retaining credential redaction.
+
+### Language servers
+
+- Nested projects correctly account for inherited `.clangd` compilation-database
+  overrides. Ancestor configuration changes invalidate cached metadata, while
+  opening another document with the same effective configuration avoids an
+  unnecessary server restart.
 
 ## 0.14.7 (2026-10-07)
 
