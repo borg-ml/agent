@@ -3115,6 +3115,25 @@ async fn a_human_message_ends_a_usage_limit_wait_immediately() {
         let store: Arc<dyn SessionStore> = Arc::new(store);
         store.create_session(session_id).await.unwrap();
         if goal_command.is_some() {
+            for kind in [
+                SessionEventKind::SessionStarted,
+                SessionEventKind::SessionConfigured {
+                    cwd: root.path().to_path_buf(),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: false,
+                    ultrafast: false,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    speed_support: Default::default(),
+                },
+            ] {
+                store
+                    .append(SessionEvent::new(session_id, 0, kind))
+                    .await
+                    .unwrap();
+            }
             store
                 .append(SessionEvent::new(
                     session_id,
