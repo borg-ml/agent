@@ -3495,10 +3495,7 @@ all green"
             )
             .0
         };
-        assert_eq!(
-            titled("lsp_workspace_diagnostics"),
-            "Workspace diagnostics"
-        );
+        assert_eq!(titled("lsp_workspace_diagnostics"), "Workspace diagnostics");
         assert_eq!(titled("list_instances"), "List instances");
         assert_eq!(titled("get_goal"), "Read goal");
         assert_eq!(titled("wait_agent"), "Wait for agents");

@@ -3238,13 +3238,29 @@ fn tool_lifecycle_labels_use_progressive_and_past_tense() {
         "Finished waiting for agents"
     );
     for (name, running, finished) in [
-        ("Wait agent", "Waiting for agent…", "Finished waiting for agent"),
-        ("Wait on tool", "Waiting for tool…", "Finished waiting for tool"),
+        (
+            "Wait agent",
+            "Waiting for agent…",
+            "Finished waiting for agent",
+        ),
+        (
+            "Wait on tool",
+            "Waiting for tool…",
+            "Finished waiting for tool",
+        ),
         ("Delegate task", "Delegating task…", "Delegated task"),
         ("Write", "Writing…", "Wrote"),
         ("Generate image", "Generating image…", "Generated image"),
-        ("Follow up with agent", "Following up with agent…", "Followed up with agent"),
-        ("Send message to agent", "Sending message to agent…", "Sent message to agent"),
+        (
+            "Follow up with agent",
+            "Following up with agent…",
+            "Followed up with agent",
+        ),
+        (
+            "Send message to agent",
+            "Sending message to agent…",
+            "Sent message to agent",
+        ),
     ] {
         assert_eq!(tool_lifecycle_label(name, false), running);
         assert_eq!(tool_lifecycle_label(name, true), finished);

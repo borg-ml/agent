@@ -12,6 +12,9 @@ Git comparison.
   the second line-number gutter. Details headers keep the action's summary, an
   orphaned result names the command it belongs to, and command-shaped results
   are shown as output whatever the tool was called.
+- Action labels use consistent wording and running/completed forms, including
+  waiting for agents, delegation, messages, follow-ups, and image generation.
+  Capability wrappers show the same action label as direct tool calls.
 - The active goal is shown again between loop turns.
 - Resumed sessions keep transcript row positions and reasoning blocks, preserve
   prompt admission markers when paging history, and live GPT reasoning stays
@@ -21,6 +24,16 @@ Git comparison.
 
 - Model requests now include live running-subagent counts, shared with the
   terminal UI so both report the same lifecycle state.
+- Incoming agent messages retain their sender name and pink identity when
+  user-message snapshots arrive before or after their receipt, including history
+  replay. Independently authored human messages retain their own identity.
+
+### Agent runtime
+
+- Native tools capture queued steering when they complete.
+- Live subagent-count updates preserve canonical request prefixes through replay
+  and compaction, and unchanged counts are not restored after explicit context
+  edits.
 
 ### Performance
 

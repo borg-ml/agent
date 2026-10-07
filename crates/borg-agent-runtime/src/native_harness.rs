@@ -657,9 +657,17 @@ impl NativeHarness {
         // the head, and stays in history once sent, so a change only extends
         // the cached prefix.
         let harness_prompt_appendix = turn.agent_tools.harness_prompt_appendix().await?;
+        let mut subagent_count = turn
+            .prompt_context_base
+            .get(&ContextSlot::Subagents)
+            .cloned();
         for (slot, current) in [
             (ContextSlot::Instructions, varying_instructions),
             (ContextSlot::Harness, harness_prompt_appendix),
+            (
+                ContextSlot::Subagents,
+                turn.agent_tools.subagent_count_prompt().await,
+            ),
             (
                 ContextSlot::ProviderStatus,
                 turn.volatile_system_prompt_appendix.clone(),
@@ -668,6 +676,9 @@ impl NativeHarness {
             let previous = turn.prompt_context_base.get(&slot).map(String::as_str);
             if let Some(content) = slot.next(previous, current) {
                 record_prompt_context(&events, turn.provider, slot, &content).await?;
+                if slot == ContextSlot::Subagents {
+                    subagent_count = Some(content.clone());
+                }
                 messages.push(ModelMessage::user(content));
             }
         }
@@ -775,7 +786,6 @@ impl NativeHarness {
         // that still owes one gets a single further response to write it.
         let mut reply_owed = turn.answers_human;
         let mut reply_round_spent = false;
-        let mut subagent_count = turn.prompt_context_base.get(&ContextSlot::Subagents).cloned();
         // Set for that one response: the context it sends that the model has
         // not seen, for the usage anchor if the turn settles without a reply.
         let mut parked_reply_unsent_tokens: Option<u64> = None;
@@ -823,15 +833,14 @@ impl NativeHarness {
                 .await?;
             }
             let current = turn.agent_tools.subagent_count_prompt().await;
-            let previous = subagent_count.as_deref().filter(|previous| {
-                messages.iter().any(|message| {
-                    matches!(message, ModelMessage::User { content, .. } if content.as_str() == *previous)
-                })
-            });
-            if let Some(content) = ContextSlot::Subagents.next(previous, current) {
+            // Compare with the last delivered snapshot, not its message shape:
+            // canonicalization merges user context and an explicit context edit
+            // may remove it. Neither should resend an unchanged count.
+            if let Some(content) = ContextSlot::Subagents.next(subagent_count.as_deref(), current) {
                 record_prompt_context(&events, turn.provider, ContextSlot::Subagents, &content).await?;
                 messages.push(ModelMessage::user(content.clone()));
                 subagent_count = Some(content);
+                canonicalize_native_messages(&mut messages);
             }
             editor.publish(&messages, true).await;
             let request = ModelTurnRequest {

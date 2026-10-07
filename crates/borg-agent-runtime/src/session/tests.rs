@@ -20231,7 +20231,14 @@ async fn escape_keeps_a_prompt_the_model_already_acted_on_delivered() {
         if emit_output {
             tokio::time::timeout(Duration::from_secs(10), async {
                 while let Some(event) = event_rx.recv().await {
-                    if matches!(event.kind, SessionEventKind::MessageDelta { .. }) {
+                    if matches!(
+                        &event.kind,
+                        SessionEventKind::MessageDelta { delta, .. } if !delta.is_empty()
+                    ) || matches!(
+                        &event.kind,
+                        SessionEventKind::Message { actor: EventActor::Assistant, text, .. }
+                            if !text.is_empty()
+                    ) {
                         break;
                     }
                 }

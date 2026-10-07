@@ -2266,9 +2266,22 @@ mod tests {
         assert_eq!(text, "thinking hard");
         assert!(live[0].revision >= 3);
 
-        // Only the two durable events occupy sequences; no number of live
-        // frames advances the durable sequence space.
-        assert_eq!(store.read(session_id).await.expect("read").len(), 2);
+        // The first nonempty frame adds one durable reasoning anchor, but
+        // subsequent streaming frames stay in the coalesced live row.
+        let durable = store.read(session_id).await.expect("read");
+        assert_eq!(durable.len(), 3);
+        assert!(matches!(
+            &durable[2].kind,
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "reasoning_snapshot"
+                    && payload["text"] == "think"
+                    && payload["complete"] == false
+        ));
+        assert!(
+            !durable
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::ReasoningDelta { .. }))
+        );
         assert!(
             store
                 .live_events_after(session_id, live[0].revision)
