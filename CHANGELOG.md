@@ -15,6 +15,8 @@ Git comparison.
 - Action labels use consistent wording and running/completed forms, including
   waiting for agents, delegation, messages, follow-ups, and image generation.
   Capability wrappers show the same action label as direct tool calls.
+- Manually expanded action groups and their scroll offsets survive history
+  paging and reconnects.
 - The active goal is shown again between loop turns.
 - Resumed sessions keep transcript row positions and reasoning blocks, preserve
   prompt admission markers when paging history, and live GPT reasoning stays
@@ -30,6 +32,9 @@ Git comparison.
 
 ### Agent runtime
 
+- Claude replay retains visible assistant narration as text even when the native
+  response stores it in thinking blocks, while preserving signed thinking
+  unchanged. Existing stored messages benefit without rewriting session history.
 - Native tools capture queued steering when they complete.
 - Live subagent-count updates preserve canonical request prefixes through replay
   and compaction, and unchanged counts are not restored after explicit context

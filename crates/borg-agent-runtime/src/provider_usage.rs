@@ -37,10 +37,10 @@ static CLAUDE_LOGIN_STATUS_CACHE: OnceLock<Mutex<Option<(Instant, bool)>>> = Onc
 async fn cached_claude_subscription_status() -> Option<bool> {
     let cache = CLAUDE_LOGIN_STATUS_CACHE.get_or_init(|| Mutex::new(None));
     let mut slot = cache.lock().await;
-    if let Some((read_at, authenticated)) = *slot {
-        if read_at.elapsed() < CLAUDE_LOGIN_STATUS_CACHE_TTL {
-            return Some(authenticated);
-        }
+    if let Some((read_at, authenticated)) = *slot
+        && read_at.elapsed() < CLAUDE_LOGIN_STATUS_CACHE_TTL
+    {
+        return Some(authenticated);
     }
     let authenticated = borg_provider::provider::read_claude_subscription_status()
         .await

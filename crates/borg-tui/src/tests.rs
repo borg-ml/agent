@@ -14017,6 +14017,91 @@ fn a_group_with_a_running_command_stays_unfolded() {
 }
 
 #[test]
+fn history_paging_preserves_manually_expanded_action_groups_and_offsets() {
+    let session = Uuid::new_v4();
+    let group = |prefix: &str, sequence: u64| {
+        let mut events = Vec::new();
+        for i in 0..2 {
+            let id = format!("{prefix}-{i}");
+            events.push(SessionEvent::new(
+                session,
+                sequence + i * 2,
+                SessionEventKind::ToolStarted {
+                    tool_call_id: id.clone(),
+                    name: "exec".into(),
+                    input: serde_json::json!({"cmd": id}),
+                    input_ref: None,
+                    parent_tool_call_id: None,
+                },
+            ));
+            events.push(SessionEvent::new(
+                session,
+                sequence + i * 2 + 1,
+                SessionEventKind::ToolCompleted {
+                    tool_call_id: id,
+                    output: "done".into(),
+                    output_ref: None,
+                    is_error: false,
+                    input: None,
+                    input_ref: None,
+                    parent_tool_call_id: None,
+                },
+            ));
+        }
+        events.push(SessionEvent::new(
+            session,
+            sequence + 4,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: format!("{prefix} finished"),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ));
+        events
+    };
+    let selected = group("selected", 10);
+    let mut paged = group("older", 1);
+    paged.extend(selected.clone());
+    for child_is_focused in [false, true] {
+        let mut root = Transcript::default();
+        for event in &selected {
+            root.apply_history(event);
+        }
+        let old_start = root.tools["selected-0"];
+        root.toggle_tool_run_expansion(old_start);
+        root.anchor_tool_run(old_start, 1);
+        let (mut transcript, mut director) = if child_is_focused {
+            (Transcript::default(), Some(Box::new(root)))
+        } else {
+            (root, None)
+        };
+        replace_root_transcript_history(&mut transcript, &mut director, child_is_focused, &paged);
+        let rebuilt = director.as_deref().unwrap_or(&transcript);
+        let new_start = rebuilt.tools["selected-0"];
+        assert_ne!(old_start, new_start, "paging must move the selected group");
+        let rendered = rebuilt
+            .lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("selected-0"),
+            "paging hid the manually expanded actions: {rendered}"
+        );
+        assert!(
+            !rendered.contains("older-0"),
+            "unopened historical groups should still fold: {rendered}"
+        );
+        assert_eq!(rebuilt.tool_run_offset(new_start, 20), 1);
+        assert!(!rebuilt.tool_run_expanded(rebuilt.tools["older-0"]));
+    }
+}
+
+#[test]
 fn a_finished_action_group_folds_to_its_summary_until_clicked() {
     let tool = |detail: &str, name: &str, cwd: Option<&str>| TranscriptEntry::Tool {
         source_name: "exec".to_string(),

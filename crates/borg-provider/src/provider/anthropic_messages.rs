@@ -270,12 +270,15 @@ pub(crate) fn messages_request_body(
                 provider_state,
                 ..
             } => {
-                if let Some(ModelProviderState::AnthropicMessages { content, .. }) = provider_state
+                if let Some(ModelProviderState::AnthropicMessages {
+                    content: native_content,
+                    ..
+                }) = provider_state
                 {
                     // History repair drops calls nothing answers from
                     // `tool_calls`. The native blocks must follow it, or every
                     // retry replays a `tool_use` the API refuses.
-                    let blocks = content
+                    let mut blocks: Vec<Value> = native_content
                         .iter()
                         .filter(|block| {
                             block.get("type").and_then(Value::as_str) != Some("tool_use")
@@ -286,6 +289,23 @@ pub(crate) fn messages_request_body(
                         })
                         .cloned()
                         .collect();
+                    if let Some(text) = content.as_deref().filter(|text| !text.trim().is_empty()) {
+                        let native_text = blocks
+                            .iter()
+                            .filter(|block| block["type"] == "text")
+                            .filter_map(|block| block["text"].as_str())
+                            .collect::<String>();
+                        if text != native_text {
+                            // Public narration may originate in signed thinking.
+                            // Keep those blocks intact, but replay visible text too.
+                            blocks.retain(|block| block["type"] != "text");
+                            let before_tools = blocks
+                                .iter()
+                                .position(|block| block["type"] == "tool_use")
+                                .unwrap_or(blocks.len());
+                            blocks.insert(before_tools, json!({ "type": "text", "text": text }));
+                        }
+                    }
                     push_turn(&mut messages, "assistant", blocks);
                     continue;
                 }
@@ -1321,6 +1341,59 @@ mod tests {
         assert!(body.get("thinking").is_none());
     }
 
+    #[test]
+    fn native_replay_keeps_public_narration_and_signed_thinking() {
+        for suffix in ["", " Ordinary text."] {
+            let narration = "I'll run `just dev` now.\n\n";
+            let visible = format!("{narration}{suffix}");
+            let signed = vec![
+                json!({"type":"thinking", "thinking":"private reasoning", "signature":"private-signature"}),
+                json!({"type":"thinking", "thinking":narration, "signature":"narration-signature"}),
+            ];
+            let mut native = signed.clone();
+            if !suffix.is_empty() {
+                native.push(json!({"type":"text", "text":suffix}));
+            }
+            native.push(
+                json!({"type":"tool_use", "id":"handoff", "name":"followup_task", "input":{}}),
+            );
+            let body = messages_request_body(
+                "claude-test",
+                None,
+                &request(
+                    vec![
+                        ModelMessage::user("check the game"),
+                        ModelMessage::Assistant {
+                            content: Some(visible.clone()),
+                            reasoning_content: Some("private reasoning".into()),
+                            reasoning_details: None,
+                            provider_state: Some(ModelProviderState::AnthropicMessages {
+                                content: native,
+                                account_identity: None,
+                            }),
+                            tool_calls: vec![ModelToolCall::function(
+                                "handoff".into(),
+                                "followup_task".into(),
+                                "{}".into(),
+                            )],
+                        },
+                        ModelMessage::tool("handoff", "sent"),
+                    ],
+                    Vec::new(),
+                ),
+            );
+            let blocks = body["messages"][1]["content"].as_array().unwrap();
+            assert_eq!(&blocks[..2], signed.as_slice());
+            let replayed_text = blocks
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .collect::<String>();
+            assert_eq!(replayed_text, visible);
+            assert_eq!(blocks.last().unwrap()["id"], "handoff");
+        }
+    }
+
     /// A durable history can keep a native `tool_use` whose result was never
     /// recorded. Repair removes the call from `tool_calls`; replaying the
     /// native blocks verbatim would still send it, failing every retry.
@@ -1768,7 +1841,7 @@ mod tests {
     }
 
     #[test]
-    fn native_narration_is_public_text_not_reasoning_and_replay_is_unchanged() {
+    fn native_narration_is_public_text_not_reasoning_and_signed_replay_is_unchanged() {
         for classified in [true, false] {
             let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
             let mut state = AnthropicStreamState::claude_summaries();
@@ -1887,9 +1960,25 @@ mod tests {
                     vec![],
                 ),
             );
+            let blocks = replay["messages"][1]["content"].as_array().unwrap();
+            let signed: Vec<_> = blocks
+                .iter()
+                .filter(|block| block["type"] != "text")
+                .cloned()
+                .collect();
+            assert_eq!(Value::Array(signed), state.raw_response()["content"]);
+            let public_text: String = blocks
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .collect();
             assert_eq!(
-                replay["messages"][1]["content"],
-                state.raw_response()["content"]
+                public_text,
+                if classified {
+                    "Off keeps the old lighting."
+                } else {
+                    ""
+                }
             );
             assert!(
                 replay["messages"][1]["content"][1]

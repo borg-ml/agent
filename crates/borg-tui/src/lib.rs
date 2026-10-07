@@ -12032,6 +12032,29 @@ fn replace_root_transcript_history(
             replacement.apply_history(event);
         }
     }
+    // Paging shifts row indices; anchor each saved group to its first tool.
+    let windows = replacement.tool_run_windows();
+    for (tool_call_id, old_start) in &previous.tools {
+        if !previous.expanded_tool_runs.contains(old_start)
+            && !previous.tool_run_offsets.contains_key(old_start)
+        {
+            continue;
+        }
+        let Some(new_start) = replacement
+            .tools
+            .get(tool_call_id)
+            .and_then(|index| windows[*index])
+            .map(|window| window.start)
+        else {
+            continue;
+        };
+        if previous.expanded_tool_runs.contains(old_start) {
+            replacement.expanded_tool_runs.insert(new_start);
+        }
+        if let Some(offset) = previous.tool_run_offsets.get(old_start) {
+            replacement.tool_run_offsets.insert(new_start, *offset);
+        }
+    }
     replacement.session_usage = reconciled_usage;
     // Older-page hydration rebuilds the root transcript. It may contain the
     // parent's last pre-crash Running mirror even though child hydration has

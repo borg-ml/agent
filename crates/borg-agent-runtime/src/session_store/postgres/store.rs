@@ -892,24 +892,22 @@ impl SessionStore for PostgresSessionStore {
                     if matches!(
                         state.status,
                         Some(SessionStatus::Running | SessionStatus::WaitingForApproval)
-                    ) {
-                        if self
-                            .anchor_assistant_message(&mut transaction, &event)
-                            .await?
-                        {
-                            let SessionEventKind::MessageDelta { message_id, delta } = &event.kind
-                            else {
-                                unreachable!("assistant delta was checked before anchoring");
-                            };
-                            event.kind = SessionEventKind::Message {
-                                message_id: *message_id,
-                                actor: crate::EventActor::Assistant,
-                                text: delta.clone(),
-                                status: MessageStatus::InProgress,
-                                attachments: Vec::new(),
-                                delivery: None,
-                            };
-                        }
+                    ) && self
+                        .anchor_assistant_message(&mut transaction, &event)
+                        .await?
+                    {
+                        let SessionEventKind::MessageDelta { message_id, delta } = &event.kind
+                        else {
+                            unreachable!("assistant delta was checked before anchoring");
+                        };
+                        event.kind = SessionEventKind::Message {
+                            message_id: *message_id,
+                            actor: crate::EventActor::Assistant,
+                            text: delta.clone(),
+                            status: MessageStatus::InProgress,
+                            attachments: Vec::new(),
+                            delivery: None,
+                        };
                     }
                     transaction.commit().await?;
                 }
