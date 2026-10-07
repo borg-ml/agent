@@ -2110,6 +2110,66 @@ return receipt
                 "{result:?}"
             );
         }
+        // Disk growth is a per-job estimate, never a lowered host floor. Mock
+        // only host inspection so this planning contract is independent of RAM,
+        // disk headroom and installed toolchains on the test host.
+        let source = concat!(
+            r#"local borg_exec = function(call_id)
+                if call_id == 2 then
+                    return '{"exit_code":0,"stdout":"root=/tmp/native-contract\\noutput=/tmp/native-contract/target\\nmanifest=1\\nmem_kb=67108864\\ncpus=2\\nmax_jobs=2\\ntool_path=/usr/bin/tool\\nnice=/usr/bin/nice\\nborg=/usr/bin/borg\\nparticipant=00000000-0000-0000-0000-000000000001\\nsession=00000000-0000-0000-0000-000000000002\\n"}'
+                end
+                return '{"exit_code":0,"stdout":"abc"}'
+            end
+            "#,
+            include_str!("../../../extensions/native/workflows/native.blu")
+        );
+        for (arguments, reserve) in [
+            ("cargo check --dry-run", 24),
+            ("cmake configure --dry-run", 6),
+            ("ctest test --dry-run", 6),
+            ("cargo check --reserve-disk-gib 4 --dry-run", 4),
+            ("cmake build --reserve-disk-gib=4 --dry-run", 4),
+            ("ctest test --reserve-disk-gib 1024 --dry-run", 1024),
+        ] {
+            let result = runner
+                .clone()
+                .with_invocation_arguments(json!({ "arguments": arguments }))
+                .run(BluWorkflowRequest {
+                    workflow_id: Uuid::new_v4(),
+                    name: "native:native".to_string(),
+                    source: source.to_string(),
+                })
+                .await
+                .expect("workflow terminal record");
+            assert!(result.success, "{result:?}");
+            let plan: Value = serde_json::from_str(result.values[0].as_str().unwrap()).unwrap();
+            let budget = &plan["spec"]["admission"];
+            assert_eq!(budget["min_free_disk_bytes"], 60_u64 << 30);
+            assert_eq!(budget["reserve_disk_bytes"], (reserve as u64) << 30);
+        }
+        for value in ["0", "-1", "1025", "1.5", "abc", "99999999999999999999"] {
+            let result = runner
+                .clone()
+                .with_invocation_arguments(json!({
+                    "arguments": format!("cargo check --reserve-disk-gib {value} --dry-run")
+                }))
+                .run(BluWorkflowRequest {
+                    workflow_id: Uuid::new_v4(),
+                    name: "native:native".to_string(),
+                    source: source.to_string(),
+                })
+                .await
+                .expect("workflow terminal record");
+            assert!(!result.success, "{result:?}");
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("--reserve-disk-gib must be an integer between 1 and 1024"),
+                "{result:?}"
+            );
+        }
         scratch.discard().await;
     }
 }

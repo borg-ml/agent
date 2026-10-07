@@ -34,3 +34,12 @@ run Unreal via this adapter.
 Each call submits one engine-neutral Borg lane job and returns its ID; await
 it with `borg lane job wait ID --json`. There is no fallback that runs CMake
 or ctest outside the lane.
+
+Disk admission keeps a 60 GiB free-space floor **plus** planned growth
+(default 24 GiB for Cargo, 6 GiB for CMake/ctest) and other active reservations.
+For a cached job with a justified smaller growth estimate, pass
+`--reserve-disk-gib 4` on that invocation (integer 1..1024); this never lowers
+the floor or changes defaults. Do not use cached-growth estimates for cold
+builds. A queued job's reason is in `borg lane job status ID --json`;
+`borg lane job wait ID --timeout 60 --json` returns that state/reason on timeout
+(exit 124) without cancelling the job.

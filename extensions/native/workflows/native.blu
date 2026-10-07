@@ -13,7 +13,7 @@ local GIB = 1024 * 1024 * 1024
 local MIB = 1024 * 1024
 local null = {}
 
-local USAGE = "native: usage: [--project DIR] [--target-dir DIR] [--build-dir DIR] [--dry-run] "
+local USAGE = "native: usage: [--project DIR] [--target-dir DIR] [--build-dir DIR] [--reserve-disk-gib N] [--dry-run] "
     .. "(cargo check|build|test [-p PKG] | cmake configure|build [--target T] | "
     .. "ctest test [--exclude-label L] [--label L] [--regex R] | postgres cargo test [-p PKG] | "
     .. "service show|start [--data-dir DIR] [--port N]) [-- EXTRA...]"
@@ -253,10 +253,11 @@ local VALUED = {
     ["-p"] = "package", ["--package"] = "package", ["--target"] = "target",
     ["--exclude-label"] = "exclude_label", ["--label"] = "label", ["--regex"] = "regex",
     ["--data-dir"] = "data_dir", ["--port"] = "port",
+    ["--reserve-disk-gib"] = "reserve_disk_gib",
 }
 local ALLOWED = {
-    cargo = { package = true }, cmake = { target = true },
-    ctest = { exclude_label = true, label = true, regex = true },
+    cargo = { package = true, reserve_disk_gib = true }, cmake = { target = true, reserve_disk_gib = true },
+    ctest = { exclude_label = true, label = true, regex = true, reserve_disk_gib = true },
     service = { data_dir = true, port = true },
 }
 local OPERATIONS = {
@@ -312,6 +313,13 @@ local function parse(argv)
         if not ALLOWED[options.tool][key] and key ~= "project" and key ~= "target_dir" and key ~= "build_dir" then
             fail("option for " .. key .. " does not apply to " .. options.tool)
         end
+    end
+    if options.reserve_disk_gib then
+        local value = options.reserve_disk_gib:match("^%d+$") and tonumber(options.reserve_disk_gib)
+        if not value or value < 1 or value > 1024 then
+            fail("--reserve-disk-gib must be an integer between 1 and 1024")
+        end
+        options.reserve_disk_gib = value
     end
     return options
 end
@@ -501,7 +509,7 @@ local function lane(options)
             min_available_ram_bytes = 8 * GIB,
             reserve_ram_bytes = memory,
             min_free_disk_bytes = 60 * GIB,
-            reserve_disk_bytes = kind == "cargo" and 24 * GIB or 6 * GIB,
+            reserve_disk_bytes = (options.reserve_disk_gib or (kind == "cargo" and 24 or 6)) * GIB,
             disk_path = root,
         },
         pre_hook = pre_hook,

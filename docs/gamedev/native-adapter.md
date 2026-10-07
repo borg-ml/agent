@@ -13,7 +13,7 @@ exposed as the tool `ext__native__run` (which also takes a fresh `request_id`,
 because identical tool arguments replay) and the command `/ext:native:run`:
 
 ```text
-[--project DIR] [--target-dir DIR] [--build-dir DIR] [--dry-run]
+[--project DIR] [--target-dir DIR] [--build-dir DIR] [--reserve-disk-gib N] [--dry-run]
   cargo check|build|test [-p PKG]
   cmake configure|build [--target T]
   ctest test [--exclude-label L] [--label L] [--regex R]
@@ -42,7 +42,25 @@ CMake uses a private `build` and Release profile; ctest includes `-j`, regex
 and `-L`/`-LE` label selection. All output paths must remain inside the
 current worktree. Jobs request an exclusive worktree output resource, memory
 reserve and 60 GiB host disk floor. Cargo jobs reserve 24 GiB of additional
-disk headroom, while CMake/ctest reserve 6 GiB. Source/argv/env fingerprinting
+disk headroom, while CMake/ctest reserve 6 GiB. Admission needs the floor
+**plus** this job's reserve and other active reservations on the same filesystem:
+a Cargo job can pass the adapter's 60 GiB preflight yet queue with 79 GiB free,
+because its default request needs at least 84 GiB. Inspect
+`borg lane job status ID --json` for `wait_reason`, or use
+`borg lane job wait ID --timeout 60 --json` for a bounded receipt with the current
+state and wait reason (timeout exits 124; it does not cancel the job).
+
+For a cached check with known smaller output growth, explicitly set
+`--reserve-disk-gib 4` on that invocation. It accepts integer GiB from 1 to 1024,
+changes only that job's growth reservation, and cannot lower the 60 GiB floor.
+Defaults remain Cargo 24 GiB and CMake/ctest 6 GiB; do not use a cached-growth
+estimate for a cold/full build. This is an admission estimate, not a disk quota.
+
+```text
+/ext:native:run --reserve-disk-gib 4 cargo check -p borg-core
+```
+
+Source/argv/env fingerprinting
 prevents a different build from joining a pending coalesced job. PostgreSQL
 tests never coalesce between client databases.
 
