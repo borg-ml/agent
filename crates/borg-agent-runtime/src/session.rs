@@ -3638,6 +3638,8 @@ async fn run_agent_session_store_kernel_inner(
                         }
                         let explicit_resume =
                             matches!(action, GoalAction::Set { .. } | GoalAction::Resume);
+                        let resume_pending_retry =
+                            matches!(action, GoalAction::Resume) && retry_not_before.is_some();
                         apply_goal_action(
                             &mut journal,
                             &events,
@@ -3680,6 +3682,11 @@ async fn run_agent_session_store_kernel_inner(
                                 },
                             )
                             .await?;
+                            if resume_pending_retry
+                                && let Some(prompt) = pop_next_pending_prompt(&mut pending, true)
+                            {
+                                break Some(prompt);
+                            }
                             break Some(QueuedPrompt {
                                 message_id: Uuid::new_v4(),
                                 text: continuation_prompt(
