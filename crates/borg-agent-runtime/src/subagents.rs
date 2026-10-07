@@ -5221,7 +5221,7 @@ impl SubagentCoordinator {
                 revived.detail = Some("Waking persistent peer after resume".to_string());
                 revived.updated_at = Utc::now();
                 let mut launch = self.root_launch.clone();
-        launch.capabilities.model_fallback.clear();
+                launch.capabilities.model_fallback.clear();
                 launch.request_id = Uuid::new_v4();
                 launch.initial_prompt = None;
                 launch.provider = snapshot.provider;
@@ -5868,7 +5868,7 @@ impl SubagentCoordinator {
             };
             if let Some((snapshot, revived_from)) = wake {
                 let mut launch = self.root_launch.clone();
-        launch.capabilities.model_fallback.clear();
+                launch.capabilities.model_fallback.clear();
                 launch.request_id = Uuid::new_v4();
                 launch.initial_prompt = None;
                 launch.provider = snapshot.provider;
@@ -7101,12 +7101,14 @@ impl SubagentCoordinator {
         // Reconfigure a dormant child durably without starting it or releasing its stop.
         let dormant = {
             let table = self.table.lock().await;
-            table.entries.get(&session_id)
+            table
+                .entries
+                .get(&session_id)
                 .is_some_and(|entry| entry.dormant || entry.snapshot.status.is_terminal())
         };
         if dormant {
             let mut launch = self.root_launch.clone();
-        launch.capabilities.model_fallback.clear();
+            launch.capabilities.model_fallback.clear();
             launch.cwd = current.cwd.clone();
             launch.provider = current.provider;
             launch.model = current.model.clone();
@@ -7116,18 +7118,38 @@ impl SubagentCoordinator {
             launch.permission_mode = current.permission_mode;
             launch.response_language = current.response_language;
             let mut journal = crate::session::RuntimeSessionStore::new(
-                Arc::clone(&self.store), Vec::new(), false);
+                Arc::clone(&self.store),
+                Vec::new(),
+                false,
+            );
             let (events, _receiver) = mpsc::channel(16);
             crate::session::apply_session_config(
-                &mut journal, &events, session_id, &mut launch, self.executor.as_ref(),
+                &mut journal,
+                &events,
+                session_id,
+                &mut launch,
+                self.executor.as_ref(),
                 crate::SessionConfigAction::SetAgent {
-                    request_id: Uuid::new_v4(), provider, model, effort, fast, ultrafast,
+                    request_id: Uuid::new_v4(),
+                    provider,
+                    model,
+                    effort,
+                    fast,
+                    ultrafast,
                 },
-            ).await?;
-            let config = self.store.state(session_id).await?.configuration
+            )
+            .await?;
+            let config = self
+                .store
+                .state(session_id)
+                .await?
+                .configuration
                 .context("configured session has no configuration")?;
             let mut table = self.table.lock().await;
-            let entry = table.entries.get_mut(&session_id).context("not a managed agent")?;
+            let entry = table
+                .entries
+                .get_mut(&session_id)
+                .context("not a managed agent")?;
             entry.snapshot.provider = config.provider;
             entry.snapshot.model = config.model;
             entry.snapshot.effort = config.effort;
