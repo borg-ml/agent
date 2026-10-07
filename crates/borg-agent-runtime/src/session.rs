@@ -3636,6 +3636,8 @@ async fn run_agent_session_store_kernel_inner(
                             .await?;
                             continue;
                         }
+                        let explicit_resume =
+                            matches!(action, GoalAction::Set { .. } | GoalAction::Resume);
                         apply_goal_action(
                             &mut journal,
                             &events,
@@ -3649,6 +3651,21 @@ async fn run_agent_session_store_kernel_inner(
                             .as_ref()
                             .is_some_and(|goal| goal.status == GoalStatus::Active)
                         {
+                            if explicit_resume && retry_not_before.take().is_some() {
+                                record(
+                                    &mut journal,
+                                    &events,
+                                    session_id,
+                                    SessionEventKind::ProviderEvent {
+                                        provider: launch.provider,
+                                        kind: "usage_limit_retry_released".into(),
+                                        payload: serde_json::json!({}),
+                                    },
+                                )
+                                .await?;
+                                usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
+                                usage_wait_prompts = None;
+                            }
                             // Explicit human resume or new objective.
                             set_user_stop(&mut journal, &events, session_id, &mut user_stop, false)
                                 .await?;

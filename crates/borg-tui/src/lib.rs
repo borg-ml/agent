@@ -3899,12 +3899,15 @@ impl BorgTerminal {
                         .get("retry_at")
                         .cloned()
                         .and_then(|value| serde_json::from_value(value).ok());
-                    if let Some(deadline) = self.usage_retry_at {
-                        self.set_notice(format!(
-                            "Usage limit · resumes {} · /login or /model to switch · Esc to cancel",
-                            deadline.with_timezone(&Local).format("%a %H:%M")
-                        ));
+                    if self.usage_retry_at.is_some() {
+                        self.set_notice("Usage limit · automatic retry scheduled · Esc to cancel");
                     }
+                }
+                SessionEventKind::ProviderEvent { kind, .. }
+                    if kind == "usage_limit_retry_released" =>
+                {
+                    self.usage_retry_at = None;
+                    self.notice = None;
                 }
                 SessionEventKind::ProviderEvent { kind, .. }
                     if kind == "usage_limit_retry_cancelled" =>
@@ -8486,10 +8489,14 @@ impl BorgTerminal {
             .map(|deadline| {
                 let seconds = (deadline - Utc::now()).num_seconds().max(0);
                 if self.usage_retry_at.is_some() {
-                    format!(
-                        "resumes {}",
-                        deadline.with_timezone(&Local).format("%a %H:%M")
-                    )
+                    if seconds > 0 {
+                        format!(
+                            "retries {}",
+                            deadline.with_timezone(&Local).format("%a %H:%M")
+                        )
+                    } else {
+                        "usage limit · retry pending".to_string()
+                    }
                 } else if let Some((attempt, max_attempts)) = self.connection_retry_attempt {
                     // The bound is what makes the countdown honest: a session is
                     // never waiting on an attempt that cannot be the last one
