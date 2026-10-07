@@ -16976,7 +16976,15 @@ fn fullscreen_message_details_preserve_long_json_and_control_text() {
         "
 ",
     );
-    assert!(!rendered.contains("…"), "{rendered}");
+    // The header may clip its summary; the bodies below it must not clip.
+    assert!(
+        lines
+            .iter()
+            .map(Line::to_string)
+            .filter(|row| row.starts_with("  │"))
+            .all(|row| !row.contains('…')),
+        "{rendered}"
+    );
     assert_eq!(
         rendered.matches("界").count(),
         200,

@@ -91,7 +91,13 @@ pub(super) fn tool_body_lines(
     prefix: &str,
 ) -> Vec<Line<'static>> {
     let prefix_width = UnicodeWidthStr::width(prefix);
-    let mut lines = code_block_lines(language, source, width.saturating_sub(prefix_width).max(1));
+    let content_width = width.saturating_sub(prefix_width).max(1);
+    let mut lines = match language {
+        "json" => json_tree_lines(source, content_width)
+            .unwrap_or_else(|| code_block_lines(language, source, content_width)),
+        "text" => plain_lines(source, content_width),
+        _ => code_block_lines(language, source, content_width),
+    };
     let is_diff = matches!(language.split(':').next(), Some("diff" | "patch" | "udiff"));
     let hidden = if is_diff && lines.len() > INLINE_DIFF_PREVIEW_ROWS {
         let hidden = lines.len() - INLINE_DIFF_PREVIEW_ROWS;
@@ -136,7 +142,9 @@ pub(super) fn tool_detail_lines(
         "diff" | "patch" | "udiff" => {
             unified_diff_lines(source, content_width, source_language, true)
         }
-        "command" => plain_lines(source, content_width),
+        "command" | "text" => plain_lines(source, content_width),
+        "json" => json_tree_lines(source, content_width)
+            .unwrap_or_else(|| syntax_lines(language, source, content_width, true)),
         "reasoning" => reasoning_lines(source, content_width),
         "subagent" => plain_lines(source, content_width)
             .into_iter()
@@ -309,6 +317,114 @@ fn bold_reasoning_thoughts(mut source: &str) -> Option<Vec<&str>> {
             }
             thoughts.push(thought);
             return Some(thoughts);
+        }
+    }
+}
+
+/// Tool inputs and results are JSON, which reads poorly as source: strings
+/// carry their newlines as `\\n` escapes and every value sits inside quotes and
+/// braces. Show the data instead, as an indented key/value outline with each
+/// string's real line breaks. `None` when the text is not (yet) complete JSON.
+fn json_tree_lines(source: &str, width: usize) -> Option<Vec<Line<'static>>> {
+    let value = serde_json::from_str::<serde_json::Value>(source.trim()).ok()?;
+    let mut lines = Vec::new();
+    json_entry(None, &value, 0, width.max(8), &mut lines);
+    Some(lines)
+}
+
+fn json_entry(
+    label: Option<&str>,
+    value: &serde_json::Value,
+    indent: usize,
+    width: usize,
+    out: &mut Vec<Line<'static>>,
+) {
+    use serde_json::Value;
+    let pad = " ".repeat(indent);
+    let key_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let label_spans = |label: &str, colon: &str| {
+        vec![
+            Span::styled(label.to_string(), key_style),
+            Span::styled(colon.to_string(), dim),
+        ]
+    };
+    let (text, color) = match value {
+        Value::Object(map) if !map.is_empty() => {
+            let mut child_indent = indent;
+            if let Some(label) = label {
+                let mut spans = vec![Span::raw(pad)];
+                spans.extend(label_spans(label, ":"));
+                out.push(Line::from(spans));
+                child_indent += 2;
+            }
+            for (key, child) in map {
+                json_entry(Some(key), child, child_indent, width, out);
+            }
+            return;
+        }
+        Value::Array(items) if !items.is_empty() => {
+            let mut child_indent = indent;
+            if let Some(label) = label {
+                let mut spans = vec![Span::raw(pad)];
+                spans.extend(label_spans(label, ":"));
+                out.push(Line::from(spans));
+                child_indent += 2;
+            }
+            for item in items {
+                let mut rows = Vec::new();
+                json_entry(None, item, child_indent + 2, width, &mut rows);
+                if let Some(first) = rows.first_mut() {
+                    first.spans[0] = Span::styled(format!("{}- ", " ".repeat(child_indent)), dim);
+                }
+                out.extend(rows);
+            }
+            return;
+        }
+        Value::Object(_) => ("{}".to_string(), Color::DarkGray),
+        Value::Array(_) => ("[]".to_string(), Color::DarkGray),
+        Value::Null => ("null".to_string(), Color::DarkGray),
+        Value::Bool(flag) => (flag.to_string(), Color::Yellow),
+        Value::Number(number) => (number.to_string(), Color::Yellow),
+        Value::String(text) if text.is_empty() => ("\"\"".to_string(), Color::DarkGray),
+        Value::String(text) => (text.replace('\r', "").replace('\t', "    "), Color::White),
+    };
+    let value_style = Style::default().fg(color);
+    let label_width = label.map_or(0, |label| UnicodeWidthStr::width(label) + 2);
+    if !text.contains('\n') && indent + label_width + UnicodeWidthStr::width(text.as_str()) <= width
+    {
+        let mut spans = vec![Span::raw(pad)];
+        if let Some(label) = label {
+            spans.extend(label_spans(label, ": "));
+        }
+        spans.push(Span::styled(text, value_style));
+        out.push(Line::from(spans));
+        return;
+    }
+    // Too long for one row, or several lines: the value gets its own indented
+    // block under the key so every row of it lines up.
+    let text_indent = if let Some(label) = label {
+        let mut spans = vec![Span::raw(pad)];
+        spans.extend(label_spans(label, ":"));
+        out.push(Line::from(spans));
+        indent + 2
+    } else {
+        indent
+    };
+    let available = width.saturating_sub(text_indent).max(1);
+    for line in text.lines() {
+        let rows = if line.is_empty() {
+            vec![String::new()]
+        } else {
+            super::wrap_display(line, available)
+        };
+        for row in rows {
+            out.push(Line::from(vec![
+                Span::raw(" ".repeat(text_indent)),
+                Span::styled(row, value_style),
+            ]));
         }
     }
 }
@@ -1628,6 +1744,28 @@ mod tests {
         assert!(lines[2..].iter().all(|line| {
             !line.to_string().contains("• ") && !line.to_string().trim().is_empty()
         }));
+    }
+
+    #[test]
+    fn json_tool_bodies_show_data_not_escaped_source() {
+        let source = r#"{"cwd":"/tmp","items":[{"id":1},"x"],"ok":true,"stdout":"one\ntwo"}"#;
+        let rows = tool_body_lines("json", source, 60, "  │ ")
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                "  │ cwd: /tmp",
+                "  │ items:",
+                "  │   - id: 1",
+                "  │   - x",
+                "  │ ok: true",
+                "  │ stdout:",
+                "  │   one",
+                "  │   two",
+            ]
+        );
     }
 
     #[test]

@@ -961,7 +961,11 @@ pub fn tool_output_code_view(name: &str, output: &str) -> Option<(String, String
     }
     let readable = readable_result_text(trimmed);
     if let Ok(value) = serde_json::from_str::<Value>(&readable) {
-        if tool_leaf_name(name) == "exec" && value.get("stdout").is_some() {
+        if value.get("stdout").is_some()
+            && (tool_leaf_name(name) == "exec"
+                || value.get("exit_code").is_some()
+                || value.get("running").is_some())
+        {
             let mut text = tool_process_output_text(&readable);
             let status = if value.get("timed_out").and_then(Value::as_bool) == Some(true) {
                 Some("Timed out".to_string())

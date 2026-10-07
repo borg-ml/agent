@@ -2709,6 +2709,14 @@ impl Transcript {
                             };
                         }
                     }
+                    // A result that arrives without the call that produced it
+                    // still names the process it came from.
+                    if code_view.is_none()
+                        && let Some(process) = decoded_session_id(output)
+                            .and_then(|id| self.runtime_processes.get(&id))
+                    {
+                        *code_view = Some(("command".to_string(), process.command.clone()));
+                    }
                     let _ = name;
                 }
                 if let (Some(index), Some(handle)) = (tool_index, output_handle.as_ref()) {
@@ -4502,11 +4510,15 @@ impl Transcript {
             source_name,
             name,
             detail,
+            code_view,
             ..
         }) = self.order.get_mut(tool_index)
             && source_name == "action_preparing"
         {
             *source_name = "action".to_string();
+            // The preparation's `{"label": ...}` only repeats the title; the
+            // real input, if it ever arrives, replaces it on completion.
+            *code_view = None;
             if !detail.is_empty() {
                 *name = format!("Run {detail}");
                 detail.clear();
@@ -4794,7 +4806,7 @@ impl Transcript {
         self.subagents
             .values()
             .copied()
-            .collect::<borg_agent_runtime::SubagentCounts>()
+            .collect::<borg_remote::SubagentCounts>()
             .running
     }
 
@@ -6381,7 +6393,14 @@ impl Transcript {
                     } else {
                         format!("{time}  ")
                     };
-                    let mut summary = if display_detail.is_empty() || focused_tool == Some(index) {
+                    // The detail view's body already spells out a command or a diff; for
+                    // anything else the header is the only place that says what ran.
+                    let body_states_action = code_view
+                        .as_ref()
+                        .is_some_and(|(language, _)| language == "command" || is_diff_language(language));
+                    let mut summary = if display_detail.is_empty()
+                        || (focused_tool == Some(index) && body_states_action)
+                    {
                         format!("{time}{glyph} {display_name}")
                     } else {
                         format!("{time}{glyph} {display_name:<8}  {display_detail}")
@@ -7279,4 +7298,9 @@ fn format_short_age(age: chrono::Duration) -> String {
     } else {
         format!("{}d", seconds / 86_400)
     }
+}
+
+fn decoded_session_id(output: &str) -> Option<Uuid> {
+    let value = serde_json::from_str::<serde_json::Value>(output.trim()).ok()?;
+    Uuid::parse_str(value.get("session_id")?.as_str()?).ok()
 }
