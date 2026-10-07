@@ -7,6 +7,8 @@ Git comparison.
 
 ### Terminal
 
+- Rename the subagent menu model column from “Model now” to “Model”.
+
 - Model, effort, and speed controls and status metadata stay synchronized with
   the viewed subagent, including live roster updates and history hydration.
   Model and effort edits target that child rather than changing the director.

@@ -12492,7 +12492,7 @@ fn team_roster_table_lines(
     let header = roster_table_row(
         "  ",
         ui_text(language, "AGENT"),
-        ui_text(language, "MODEL NOW"),
+        ui_text(language, "MODEL"),
         ui_text(language, "EFFORT"),
         ui_text(language, "MODE"),
         ui_text(language, "STATE"),
@@ -12544,7 +12544,7 @@ fn team_roster_table_columns(
     };
     let mut columns = AgentRosterColumns {
         name: column_width("AGENT", |entry| &entry.name, 34),
-        model: column_width("MODEL NOW", |entry| &entry.model, 20),
+        model: column_width("MODEL", |entry| &entry.model, 20),
         effort: Some(column_width("EFFORT", |entry| &entry.effort, 8)),
         mode: Some(
             entries

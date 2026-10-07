@@ -8196,7 +8196,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
         row.find(value)
             .map(|offset| UnicodeWidthStr::width(&row[..offset]))
     };
-    let model_column = column(&rows[0], "MODEL NOW").expect("model header");
+    let model_column = column(&rows[0], "MODEL").expect("model header");
     assert_eq!(column(&rows[1], "gpt-5.6-sol"), Some(model_column));
     assert_eq!(column(&rows[2], "gpt-5.6-luna"), Some(model_column));
     assert!(rows[0].contains("LIFETIME TOKENS · COST"));
@@ -8224,7 +8224,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
     .map(|line| line.to_string())
     .collect::<Vec<_>>();
     assert!(narrow[0].contains("AGENT"));
-    assert!(narrow[0].contains("MODEL NOW"));
+    assert!(narrow[0].contains("MODEL"));
     assert!(!narrow[0].contains("STATE"));
     assert!(!narrow[0].contains("  MODE "));
     assert!(narrow.iter().all(|row| row.width() <= 28));
@@ -8321,7 +8321,7 @@ fn team_roster_mode_cells_render_requested_speed_with_ultrafast_precedence() {
             UiLanguage::English,
         );
         assert!(!narrow[0].to_string().contains("  MODE "));
-        assert!(narrow[0].to_string().contains("MODEL NOW"));
+        assert!(narrow[0].to_string().contains("MODEL"));
         assert!(narrow.iter().all(|row| row.width() <= 28));
     }
 }
