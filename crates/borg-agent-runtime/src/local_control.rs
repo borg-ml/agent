@@ -304,6 +304,8 @@ struct LocalSessionOwnerMetadata {
     pid: u32,
     executable_identity: String,
     #[serde(default)]
+    package_version: Option<String>,
+    #[serde(default)]
     process_start_time: Option<u64>,
 }
 
@@ -692,6 +694,7 @@ fn write_local_session_owner_metadata(sessions_dir: &Path, session_id: Uuid) -> 
         schema_version: 1,
         pid: std::process::id(),
         executable_identity: current_executable_identity()?,
+        package_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         process_start_time: process_start_time(std::process::id())?,
     };
     fs::write(&temporary, serde_json::to_vec(&metadata)?)
@@ -2178,6 +2181,7 @@ mod tests {
             schema_version: 1,
             pid: u32::MAX,
             executable_identity: current_executable_identity().unwrap(),
+            package_version: None,
             process_start_time: None,
         };
         fs::write(
@@ -2230,6 +2234,7 @@ mod tests {
             executable_identity: process_executable_identity(owner.id())
                 .unwrap()
                 .expect("flock child executable identity"),
+            package_version: None,
             process_start_time: process_start_time(owner.id()).unwrap(),
         };
         fs::write(

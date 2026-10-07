@@ -83,6 +83,48 @@ fn public_goal(goal: Option<&crate::SessionGoal>) -> Value {
     goal
 }
 
+fn assignment_goal_observation(state: &crate::SessionState) -> Value {
+    let unfinished = state
+        .todos
+        .iter()
+        .filter(|item| item.status != crate::PlanItemStatus::Completed)
+        .count();
+    let warning = if unfinished == 0 {
+        None
+    } else if state.goal.is_none() {
+        Some("unfinished_assignments_without_goal")
+    } else if state
+        .goal
+        .as_ref()
+        .is_some_and(|goal| goal.status == crate::GoalStatus::Complete)
+    {
+        Some("unfinished_assignments_with_completed_goal")
+    } else {
+        None
+    };
+    json!({"source": "session_store.state", "plan_revision": state.plan_workspace_revision,
+        "unfinished_assigned_items": unfinished, "warning": warning,
+        "caveat": "Assignment and goal lifecycles are independent. This warning is not proof of stale work or authorization to change or resume a goal."})
+}
+
+fn execution_goal_warning(
+    goal: Option<&crate::SessionGoal>,
+    executing: bool,
+) -> Option<&'static str> {
+    if executing
+        && goal.is_some_and(|goal| {
+            matches!(
+                goal.status,
+                crate::GoalStatus::Blocked | crate::GoalStatus::Paused
+            )
+        })
+    {
+        Some("executing_with_blocked_or_paused_goal")
+    } else {
+        None
+    }
+}
+
 fn canonical_summary(id: Uuid, state: &crate::SessionState) -> Value {
     let mut plan = serde_json::to_value(&state.todos).expect("plan is serializable");
     scrub_value(&mut plan);
@@ -90,6 +132,8 @@ fn canonical_summary(id: Uuid, state: &crate::SessionState) -> Value {
         "observed_at": Utc::now(), "activity_at": state.activity_at,
         "execution_status": state.status, "status_detail": state.status_detail.as_deref().map(crate::secret_scrub::scrub_secrets),
         "goal": public_goal(state.goal.as_ref()),
+        "execution_goal_warning": execution_goal_warning(state.goal.as_ref(), matches!(state.status, Some(crate::SessionStatus::Starting | crate::SessionStatus::Running))),
+        "assignment_goal_observation": assignment_goal_observation(state),
         "remaining_tokens": state.goal.as_ref().and_then(|goal| goal.token_budget.map(|budget| budget.saturating_sub(goal.tokens_used))), "usage": state.usage, "assigned_plan": plan,
         "plan_revision": state.plan_workspace_revision, "user_stopped": state.user_stopped,
         "pending_approval_id": state.pending_approval_id,
@@ -139,6 +183,9 @@ impl SubagentCoordinator {
             return Ok(
                 json!({"session_id": id, "goal": public_goal(state.goal.as_ref()),
                 "revision": state.latest_sequence, "user_stopped": state.user_stopped,
+                "assignment_goal_observation": assignment_goal_observation(&state),
+                "execution_status": state.status,
+                "execution_goal_warning": execution_goal_warning(state.goal.as_ref(), matches!(state.status, Some(crate::SessionStatus::Starting | crate::SessionStatus::Running))),
                 "source": "canonical session store", "observed_at": Utc::now()}),
             );
         }
@@ -234,7 +281,9 @@ impl SubagentCoordinator {
                     let mut summary = canonical_summary(id, &state);
                     if let Some(live) = self.get(id).await {
                         summary["execution_observation"] = json!({"source": "coordinator", "status": live.status,
-                            "updated_at": live.updated_at, "task_name": live.task_name, "cwd": live.cwd});
+                            "updated_at": live.updated_at, "task_name": live.task_name, "cwd": live.cwd,
+                            "execution_goal_warning": execution_goal_warning(state.goal.as_ref(), matches!(live.status, SubagentStatus::Starting | SubagentStatus::Running)),
+                            "caveat": "Coordinator projection, not a liveness probe. task_name is session identity, not the current assignment or goal. Goal and execution lifecycles are independent; a warning does not authorize resume."});
                     } else {
                         summary["execution_observation"] = json!({"source": "coordinator", "status": null, "caveat": "No live observation in this coordinator"});
                     }
@@ -639,4 +688,64 @@ fn bounded_recent_message(mut event: Value) -> Value {
         }
     }
     event
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+
+    #[test]
+    fn executing_with_blocked_or_paused_goal_is_visible_without_resuming() {
+        let mut state = crate::SessionState::default();
+        state.goal = Some(crate::SessionGoal::new("work".into(), None));
+        for status in [
+            crate::SessionStatus::Starting,
+            crate::SessionStatus::Running,
+        ] {
+            state.status = Some(status);
+            for goal_status in [crate::GoalStatus::Blocked, crate::GoalStatus::Paused] {
+                state.goal.as_mut().unwrap().status = goal_status;
+                let summary = canonical_summary(Uuid::nil(), &state);
+                assert_eq!(
+                    summary["execution_goal_warning"],
+                    "executing_with_blocked_or_paused_goal"
+                );
+                assert_eq!(state.goal.as_ref().unwrap().status, goal_status);
+            }
+        }
+        state.status = Some(crate::SessionStatus::Ready);
+        assert!(canonical_summary(Uuid::nil(), &state)["execution_goal_warning"].is_null());
+        state.status = Some(crate::SessionStatus::Running);
+        state.goal.as_mut().unwrap().status = crate::GoalStatus::Active;
+        assert!(canonical_summary(Uuid::nil(), &state)["execution_goal_warning"].is_null());
+    }
+
+    #[test]
+    fn unfinished_assignments_warn_without_an_unfinished_goal() {
+        let mut state = crate::SessionState::default();
+        state.todos.push(crate::PlanItem {
+            id: Uuid::new_v4(),
+            content: "assigned work".into(),
+            status: crate::PlanItemStatus::Pending,
+        });
+        assert_eq!(
+            canonical_summary(Uuid::nil(), &state)["assignment_goal_observation"]["warning"],
+            "unfinished_assignments_without_goal"
+        );
+        state.goal = Some(crate::SessionGoal::new("work".into(), None));
+        assert!(
+            canonical_summary(Uuid::nil(), &state)["assignment_goal_observation"]["warning"]
+                .is_null()
+        );
+        state.goal.as_mut().unwrap().status = crate::GoalStatus::Complete;
+        assert_eq!(
+            canonical_summary(Uuid::nil(), &state)["assignment_goal_observation"]["warning"],
+            "unfinished_assignments_with_completed_goal"
+        );
+        state.todos[0].status = crate::PlanItemStatus::Completed;
+        assert!(
+            canonical_summary(Uuid::nil(), &state)["assignment_goal_observation"]["warning"]
+                .is_null()
+        );
+    }
 }

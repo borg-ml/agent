@@ -19,6 +19,8 @@ struct OwnerMetadata {
     pid: u32,
     executable_identity: String,
     #[serde(default)]
+    package_version: Option<String>,
+    #[serde(default)]
     process_start_time: Option<u64>,
 }
 
@@ -49,6 +51,8 @@ struct OwnerInspection {
     pid: u32,
     running: bool,
     executable_identity: String,
+    package_version: Option<String>,
+    source_revision: Option<String>,
     process_start_time: Option<u64>,
 }
 
@@ -127,6 +131,8 @@ fn inspect_session(sessions_dir: &Path, session_id: Uuid) -> Result<LiveSessionI
                 pid: metadata.pid,
                 running: process_is_alive(&metadata),
                 executable_identity: metadata.executable_identity,
+                package_version: metadata.package_version,
+                source_revision: None,
                 process_start_time: metadata.process_start_time,
             })
         }
@@ -201,10 +207,11 @@ fn print_human_inspection(inspection: &LiveSessionInspection) {
     );
     match &inspection.owner {
         Some(owner) => println!(
-            "  owner: pid={} · {} · executable={}",
+            "  owner: pid={} · {} · executable={} · package={} · source_revision=unknown",
             owner.pid,
             if owner.running { "alive" } else { "not alive" },
-            owner.executable_identity
+            owner.executable_identity,
+            owner.package_version.as_deref().unwrap_or("unknown")
         ),
         None => println!("  owner: none"),
     }
@@ -326,6 +333,36 @@ mod tests {
     use super::*;
     use borg_remote::RuntimeProfilePhase;
     use chrono::Utc;
+
+    #[test]
+    fn owner_version_comes_only_from_owner_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = Uuid::new_v4();
+        let path = directory
+            .path()
+            .join(format!("{session}{OWNER_FILE_SUFFIX}"));
+        let mut metadata = serde_json::json!({
+            "schema_version": 1, "pid": u32::MAX, "executable_identity": "old-image"
+        });
+        fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        let owner = inspect_session(directory.path(), session)
+            .unwrap()
+            .owner
+            .unwrap();
+        assert!(owner.package_version.is_none());
+        assert!(owner.source_revision.is_none());
+        metadata["package_version"] = serde_json::json!("recorded-owner-version");
+        fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        let owner = inspect_session(directory.path(), session)
+            .unwrap()
+            .owner
+            .unwrap();
+        assert_eq!(
+            owner.package_version.as_deref(),
+            Some("recorded-owner-version")
+        );
+        assert!(owner.source_revision.is_none());
+    }
 
     #[test]
     fn hotspot_ranking_uses_measured_time_and_is_bounded() {
