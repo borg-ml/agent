@@ -1027,7 +1027,14 @@ fn parse_claude_account_rate_limits(value: &Value) -> Result<ClaudeAccountRateLi
 /// A bounded failure observation from the selected native subscription route;
 /// this neither launches software nor reads or rewrites credential contents.
 pub fn claude_native_account_verification_failed_recently() -> Result<bool> {
-    super::claude_connector::recent_account_verification_failure(None)
+    #[cfg(feature = "claude")]
+    {
+        super::claude_connector::recent_account_verification_failure(None)
+    }
+    #[cfg(not(feature = "claude"))]
+    {
+        Ok(false)
+    }
 }
 
 pub async fn read_claude_subscription_status() -> Result<bool> {

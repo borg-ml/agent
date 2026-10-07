@@ -34,6 +34,8 @@ Git comparison.
 - Live subagent-count updates preserve canonical request prefixes through replay
   and compaction, and unchanged counts are not restored after explicit context
   edits.
+- Builds without Claude subscription support no longer reference the optional
+  Claude connector when checking recent account-verification failures.
 
 ### Performance
 
