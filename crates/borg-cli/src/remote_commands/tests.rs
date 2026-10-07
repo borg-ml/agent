@@ -3728,11 +3728,11 @@ fn speed_selection_targets_the_focused_child_without_changing_the_director() {
         ),
     ] {
         assert!(matches!(
-            speed_selection_command(root, None, action.clone()),
+            configuration_selection_command(root, None, action.clone()),
             HostCommand::Configure { session_id, .. } if session_id == root
         ));
         assert!(matches!(
-            speed_selection_command(root, Some(child), action),
+            configuration_selection_command(root, Some(child), action),
             HostCommand::Subagent { session_id, action: SubagentAction::Configure {
                 target, fast: actual_fast, ultrafast: actual_ultrafast,
                 provider: None, model: None, effort: None, ..
@@ -3978,4 +3978,25 @@ async fn owner_upgrade_waits_for_child_work_and_background_processes() {
         );
     }
     scratch.discard().await;
+}
+
+#[test]
+fn focused_child_model_and_effort_edits_never_configure_the_director() {
+    let root = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    assert!(matches!(
+        model_selection_command(root, Some(child), CodingProvider::Claude, CodingProvider::Codex, "gpt-6-luna".into()),
+        HostCommand::Subagent { session_id, action: SubagentAction::Configure {
+            target, provider: Some(CodingProvider::Codex), model: Some(model), ..
+        }} if session_id == root && target == child.to_string() && model == "gpt-6-luna"
+    ));
+    assert!(matches!(
+        configuration_selection_command(root, Some(child), SessionConfigAction::SetEffort { effort: "xhigh".into() }),
+        HostCommand::Subagent { session_id, action: SubagentAction::Configure { target, effort: Some(effort), .. }}
+            if session_id == root && target == child.to_string() && effort == "xhigh"
+    ));
+    assert!(matches!(
+        model_selection_command(root, None, CodingProvider::Claude, CodingProvider::Codex, "gpt-6-luna".into()),
+        HostCommand::Configure { session_id, action: SessionConfigAction::SetProvider { provider: CodingProvider::Codex, .. }} if session_id == root
+    ));
 }

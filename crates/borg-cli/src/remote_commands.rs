@@ -4685,7 +4685,7 @@ async fn run_local_agent_session(
                 if let Some(choice) = line.strip_prefix("/model-for ") {
                     if let Some((target, model)) = provider_model_choice(choice) {
                         session_command_tx.send(model_selection_command(
-                            session_id, provider, target, model,
+                            session_id, terminal.as_ref().and_then(BorgTerminal::focused_child), provider, target, model,
                         )).await.ok();
                     } else {
                         println!("  Use /model-for PROVIDER MODEL_ID.");
@@ -4697,7 +4697,7 @@ async fn run_local_agent_session(
                     let target = CodingProvider::for_model(&model).unwrap_or(provider);
                     session_command_tx
                         .send(model_selection_command(
-                            session_id,
+                            session_id, terminal.as_ref().and_then(BorgTerminal::focused_child),
                             provider,
                             target,
                             model,
@@ -5542,7 +5542,7 @@ async fn run_local_agent_session(
                         } else {
                             dispatch_ui_command(
                                 &ui_interaction_tx,
-                                model_selection_command(session_id, active, target, model.clone()),
+                                model_selection_command(session_id, terminal.as_ref().and_then(BorgTerminal::focused_child), active, target, model.clone()),
                             );
                             terminal.as_mut().expect("terminal").open_effort_picker_for(Some(target), Some(&model));
                         }
@@ -5639,7 +5639,7 @@ async fn run_local_agent_session(
                                 } else {
                                     dispatch_ui_command(
                                         &ui_interaction_tx,
-                                        model_selection_command(session_id, active, target, model.clone()),
+                                        model_selection_command(session_id, terminal.focused_child(), active, target, model.clone()),
                                     );
                                     terminal.open_effort_picker_for(Some(target), Some(&model));
                                 }
@@ -5649,10 +5649,11 @@ async fn run_local_agent_session(
                     UiAction::SetEffort(effort) => {
                         dispatch_ui_command(
                             &ui_interaction_tx,
-                            HostCommand::Configure {
+                            configuration_selection_command(
                                 session_id,
-                                action: SessionConfigAction::SetEffort { effort },
-                            },
+                                terminal.as_ref().and_then(BorgTerminal::focused_child),
+                                SessionConfigAction::SetEffort { effort },
+                            ),
                         );
                     }
                     UiAction::SetPermissionMode(permission_mode) => {
@@ -5693,7 +5694,7 @@ async fn run_local_agent_session(
                     UiAction::SetFast(enabled) => {
                         dispatch_ui_command(
                             &ui_interaction_tx,
-                            speed_selection_command(
+                            configuration_selection_command(
                                 session_id,
                                 terminal.as_ref().and_then(BorgTerminal::focused_child),
                                 SessionConfigAction::SetFast { enabled },
@@ -5703,7 +5704,7 @@ async fn run_local_agent_session(
                     UiAction::SetUltrafast(enabled) => {
                         dispatch_ui_command(
                             &ui_interaction_tx,
-                            speed_selection_command(
+                            configuration_selection_command(
                                 session_id,
                                 terminal.as_ref().and_then(BorgTerminal::focused_child),
                                 SessionConfigAction::SetUltrafast { enabled },
@@ -6830,7 +6831,7 @@ async fn run_local_agent_session(
                                     .unwrap_or(provider);
                                 dispatch_ui_command(
                                     &ui_interaction_tx,
-                                    model_selection_command(session_id, active, target, model),
+                                    model_selection_command(session_id, terminal.as_ref().and_then(BorgTerminal::focused_child), active, target, model),
                                 );
                             } else {
                                 terminal.as_mut().expect("terminal").set_notice(
@@ -6850,7 +6851,7 @@ async fn run_local_agent_session(
                             dispatch_ui_command(
                                 &ui_interaction_tx,
                                 model_selection_command(
-                                    session_id,
+                                    session_id, terminal.as_ref().and_then(BorgTerminal::focused_child),
                                     active_provider,
                                     target,
                                     model.clone(),
@@ -6862,12 +6863,13 @@ async fn run_local_agent_session(
                         {
                             dispatch_ui_command(
                                 &ui_interaction_tx,
-                                HostCommand::Configure {
+                                configuration_selection_command(
                                     session_id,
-                                    action: SessionConfigAction::SetEffort {
+                                    terminal.as_ref().and_then(BorgTerminal::focused_child),
+                                    SessionConfigAction::SetEffort {
                                         effort: effort.trim().to_string(),
                                     },
-                                },
+                                ),
                             );
                         } else if let Some(value) = line.strip_prefix("/language ")
                             && attachments.is_empty()
@@ -6916,7 +6918,7 @@ async fn run_local_agent_session(
                             if let Some(action) = parse_speed_action(line) {
                                 dispatch_ui_command(
                                     &ui_interaction_tx,
-                                    speed_selection_command(
+                                    configuration_selection_command(
                                         session_id,
                                         terminal.as_ref().and_then(BorgTerminal::focused_child),
                                         action,
@@ -8174,6 +8176,7 @@ fn provider_model_choice(input: &str) -> Option<(CodingProvider, String)> {
 /// Switch the live session's provider before applying its model when needed.
 fn model_selection_command(
     session_id: Uuid,
+    focused_child: Option<Uuid>,
     active: CodingProvider,
     target: CodingProvider,
     model: String,
@@ -8186,10 +8189,10 @@ fn model_selection_command(
             model: Some(model),
         }
     };
-    HostCommand::Configure { session_id, action }
+    configuration_selection_command(session_id, focused_child, action)
 }
 
-fn speed_selection_command(
+fn configuration_selection_command(
     session_id: Uuid,
     target: Option<Uuid>,
     action: SessionConfigAction,
@@ -8197,19 +8200,24 @@ fn speed_selection_command(
     let Some(target) = target else {
         return HostCommand::Configure { session_id, action };
     };
-    let (fast, ultrafast) = match action {
-        SessionConfigAction::SetFast { enabled } => (Some(enabled), None),
-        SessionConfigAction::SetUltrafast { enabled } => (None, Some(enabled)),
-        _ => unreachable!("speed selection requires a speed action"),
+    let (provider, model, effort, fast, ultrafast) = match action {
+        SessionConfigAction::SetProvider { provider, model } => {
+            (Some(provider), model, None, None, None)
+        }
+        SessionConfigAction::SetModel { model } => (None, Some(model), None, None, None),
+        SessionConfigAction::SetEffort { effort } => (None, None, Some(effort), None, None),
+        SessionConfigAction::SetFast { enabled } => (None, None, None, Some(enabled), None),
+        SessionConfigAction::SetUltrafast { enabled } => (None, None, None, None, Some(enabled)),
+        _ => unreachable!("configuration selection requires a model, effort, or speed action"),
     };
     HostCommand::Subagent {
         session_id,
         action: SubagentAction::Configure {
             request_id: Uuid::new_v4(),
             target: target.to_string(),
-            provider: None,
-            model: None,
-            effort: None,
+            provider,
+            model,
+            effort,
             fast,
             ultrafast,
         },

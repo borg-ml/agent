@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.14.7)
 
+### Terminal
+
+- Model, effort, and speed controls and status metadata stay synchronized with
+  the viewed subagent, including live roster updates and history hydration.
+  Model and effort edits target that child rather than changing the director.
+  Director-scoped access and response-language controls explicitly name their
+  target and show the director's current values.
+
 ### Subagents
 
 - Add `scout`, a first-class tool for bounded exploration in a fresh subagent

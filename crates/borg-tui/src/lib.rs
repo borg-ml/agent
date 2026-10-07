@@ -4035,6 +4035,13 @@ impl BorgTerminal {
             self.focus_child_transcript(agent.session_id);
             self.sidecar_focus_request = None;
         }
+        let previous_config = self.transcript.config.clone();
+        let previous_director_config = self
+            .director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript)
+            .config
+            .clone();
         let focused_child_transcript_changed = self.record_child_event(event);
         let projection_changed = match &event.kind {
             SessionEventKind::SessionStarted
@@ -4218,6 +4225,37 @@ impl BorgTerminal {
                 changed || transcript.order.len() != entries_before,
             )
         };
+        if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind {
+            self.sync_child_configuration(agent.session_id);
+        }
+        if matches!(
+            event.kind,
+            SessionEventKind::ProviderCapabilitiesUpdated { .. }
+        ) {
+            let children = self
+                .director_transcript
+                .as_deref()
+                .unwrap_or(&self.transcript)
+                .subagent_snapshots
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            for child in children {
+                self.sync_child_configuration(child);
+            }
+        }
+        let director_picker_changed = matches!(
+            self.picker.as_ref().map(|picker| &picker.kind),
+            Some(PickerKind::Permission | PickerKind::Language)
+        ) && self
+            .director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript)
+            .config
+            != previous_director_config;
+        if self.transcript.config != previous_config || director_picker_changed {
+            self.refresh_configuration_picker();
+        }
         if self.focused_child.is_none() {
             if let Some(removed) = removed_entry {
                 self.remap_selection_after_entry_removal(removed);
@@ -4457,6 +4495,36 @@ impl BorgTerminal {
         transcript
     }
 
+    fn sync_child_configuration(&mut self, child_id: Uuid) {
+        let director = self
+            .director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript);
+        let Some(agent) = director.subagent_snapshots.get(&child_id).cloned() else {
+            return;
+        };
+        let inherited = director.config.clone();
+        let capabilities = director.provider_capabilities.clone();
+        let child = if self.focused_child == Some(child_id) {
+            &mut self.transcript
+        } else {
+            self.child_transcript_mut(child_id)
+        };
+        child.sync_subagent_config(&agent, inherited.as_ref());
+        child.provider_capabilities = capabilities;
+    }
+
+    fn refresh_configuration_picker(&mut self) {
+        match self.picker.as_ref().map(|picker| &picker.kind) {
+            Some(PickerKind::Effort) => self.open_effort_picker(),
+            Some(PickerKind::Model) => self.open_model_picker(),
+            Some(PickerKind::Fast) => self.open_fast_picker(),
+            Some(PickerKind::Permission) => self.open_permission_picker(),
+            Some(PickerKind::Language) => self.open_language_picker(),
+            _ => {}
+        }
+    }
+
     fn focus_child_transcript(&mut self, child_id: Uuid) {
         if self.focused_child == Some(child_id) {
             self.team_switcher_open = false;
@@ -4479,6 +4547,8 @@ impl BorgTerminal {
         }
         self.transcript.assignment_sender = self.assignment_sender(child_id);
         self.focused_child = Some(child_id);
+        self.sync_child_configuration(child_id);
+        self.refresh_configuration_picker();
         self.interrupt_requested = false;
         self.team_switcher_open = false;
         self.reset_transcript_focus();
@@ -4506,6 +4576,7 @@ impl BorgTerminal {
             child_id,
         );
         self.team_switcher_open = false;
+        self.refresh_configuration_picker();
         self.reset_transcript_focus();
         // The director transcript is the default view. A persistent banner
         // saying that we are viewing it is both redundant and obscures the
@@ -4651,6 +4722,10 @@ impl BorgTerminal {
         } else {
             self.child_transcripts.insert(child_id, transcript);
         }
+        self.sync_child_configuration(child_id);
+        if self.focused_child == Some(child_id) {
+            self.refresh_configuration_picker();
+        }
         self.hydrated_children.insert(child_id);
         self.replaying_history = was_replaying;
     }
@@ -4693,6 +4768,10 @@ impl BorgTerminal {
                 observed_at,
             );
         }
+        for agent in agents {
+            self.sync_child_configuration(agent.session_id);
+        }
+        self.refresh_configuration_picker();
     }
 
     fn active_status(&self) -> SessionStatus {
@@ -5725,6 +5804,7 @@ impl BorgTerminal {
         // A model with no known effort support has nothing to choose between,
         // so leave the picker closed rather than listing levels it will refuse.
         if options.is_empty() {
+            self.picker = None;
             return;
         }
         let mut picker = Picker::new(
@@ -5750,13 +5830,19 @@ impl BorgTerminal {
 
     pub fn open_permission_picker(&mut self) {
         let current = self
-            .transcript
+            .director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript)
             .config
             .as_ref()
             .map(|config| permission_mode_label(config.permission_mode));
         self.picker = Some(Picker::new(
             PickerKind::Permission,
-            "Choose access",
+            if self.focused_child.is_some() {
+                "Director access"
+            } else {
+                "Choose access"
+            },
             ["full access", "auto approvals", "manual approvals"],
             current,
         ));
@@ -5764,7 +5850,9 @@ impl BorgTerminal {
 
     pub fn open_language_picker(&mut self) {
         let current = self
-            .transcript
+            .director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript)
             .config
             .as_ref()
             .map(|config| config.response_language.code());
@@ -5772,7 +5860,11 @@ impl BorgTerminal {
             .map(|language| format!("{} ({})", language.name(), language.code()));
         self.picker = Some(Picker {
             kind: PickerKind::Language,
-            title: "Response and drafting language",
+            title: if self.focused_child.is_some() {
+                "Director response and drafting language"
+            } else {
+                "Response and drafting language"
+            },
             options: options
                 .into_iter()
                 .zip(ResponseLanguage::ALL)

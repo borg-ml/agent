@@ -19901,3 +19901,163 @@ fn message_cards_resolve_team_threads_after_replay() {
         }
     }
 }
+
+#[tokio::test]
+#[ignore = "requires a PTY; run under script"]
+async fn focused_child_configuration_keeps_pickers_and_status_synced() {
+    fn selected(terminal: &BorgTerminal) -> &str {
+        let picker = terminal.picker.as_ref().unwrap();
+        &picker.options[picker.selected].value
+    }
+    let root = Uuid::new_v4();
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        root,
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    let configured = |model: &str, effort: &str| SessionEventKind::SessionConfigured {
+        cwd: directory.path().to_path_buf(),
+        provider: CodingProvider::Codex,
+        model: Some(model.into()),
+        effort: Some(effort.into()),
+        response_language: ResponseLanguage::default(),
+        fast: false,
+        ultrafast: false,
+        permission_mode: PermissionMode::Manual,
+        speed_support: Default::default(),
+    };
+    terminal.apply_session_event(&SessionEvent::new(
+        root,
+        1,
+        configured("gpt-6.1-sol", "high"),
+    ));
+    let now = Utc::now();
+    let mut child = SubagentSnapshot {
+        session_id: Uuid::new_v4(),
+        parent_session_id: root,
+        task_name: "/root/scout".into(),
+        status: SubagentStatus::Ready,
+        provider: CodingProvider::Claude,
+        model: Some("claude-haiku-5-5".into()),
+        effort: Some("xhigh".into()),
+        fast: false,
+        ultrafast: false,
+        cwd: directory.path().to_path_buf(),
+        created_at: now,
+        updated_at: now,
+        detail: None,
+        final_text: None,
+        usage: Default::default(),
+        interrupted_by: None,
+    };
+    terminal.seed_team_roster(&[child.clone()]);
+    terminal.open_effort_picker();
+    terminal.focus_child_transcript(child.session_id);
+    assert_eq!(selected(&terminal), "xhigh");
+    assert_eq!(terminal.session_provider(), Some(CodingProvider::Claude));
+    assert!(
+        !terminal
+            .picker
+            .as_ref()
+            .unwrap()
+            .options
+            .iter()
+            .any(|o| o.value == "ultra")
+    );
+    let stale = SessionEvent::new(child.session_id, 1, configured("gpt-6-luna", "low"));
+    child.effort = Some("max".into());
+    child.updated_at = Utc::now();
+    terminal.apply_session_event(&SessionEvent::new(
+        root,
+        2,
+        SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Updated,
+            agent: child.clone(),
+            event: None,
+        },
+    ));
+    assert_eq!(selected(&terminal), "max");
+    terminal.seed_child_history(child.session_id, &[stale]);
+    assert_eq!(selected(&terminal), "max");
+    assert_eq!(
+        terminal.transcript.config.as_ref().unwrap().model,
+        child.model
+    );
+    terminal.open_model_picker();
+    assert_eq!(selected(&terminal), "claude-haiku-5-5");
+    let metadata = SessionEvent::new(
+        child.session_id,
+        2,
+        SessionEventKind::SessionConfigured {
+            cwd: child.cwd.clone(),
+            provider: child.provider,
+            model: child.model.clone(),
+            effort: child.effort.clone(),
+            fast: child.fast,
+            ultrafast: child.ultrafast,
+            permission_mode: PermissionMode::Manual,
+            response_language: ResponseLanguage::default(),
+            speed_support: borg_remote::SpeedSupport {
+                fast: true,
+                ultrafast: false,
+            },
+        },
+    );
+    child.updated_at = Utc::now();
+    terminal.apply_session_event(&SessionEvent::new(
+        root,
+        3,
+        SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Updated,
+            agent: child.clone(),
+            event: None,
+        },
+    ));
+    terminal.apply_session_event(&SessionEvent::new(
+        root,
+        4,
+        SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Updated,
+            agent: child.clone(),
+            event: Some(Box::new(metadata)),
+        },
+    ));
+    assert!(
+        terminal
+            .transcript
+            .config
+            .as_ref()
+            .unwrap()
+            .speed_support
+            .fast
+    );
+    terminal.open_fast_picker();
+    assert_eq!(selected(&terminal), "Standard");
+    let mut other = child.clone();
+    other.session_id = Uuid::new_v4();
+    other.task_name = "/root/other".into();
+    other.provider = CodingProvider::Codex;
+    other.model = Some("gpt-6-luna".into());
+    other.effort = Some("low".into());
+    terminal.seed_team_roster(&[other.clone()]);
+    terminal.open_effort_picker();
+    terminal.focus_child_transcript(other.session_id);
+    assert_eq!(selected(&terminal), "low");
+    terminal.focus_child_transcript(child.session_id);
+    assert_eq!(selected(&terminal), "max");
+    terminal.open_permission_picker();
+    assert_eq!(terminal.picker.as_ref().unwrap().title, "Director access");
+    terminal.open_language_picker();
+    assert_eq!(
+        terminal.picker.as_ref().unwrap().title,
+        "Director response and drafting language"
+    );
+    terminal.open_effort_picker();
+    terminal.focus_director_transcript();
+    assert_eq!(selected(&terminal), "high");
+    assert_eq!(terminal.session_provider(), Some(CodingProvider::Codex));
+    terminal.shutdown().await;
+}

@@ -258,6 +258,8 @@ struct Transcript {
     plan_participant_id: Option<Uuid>,
     agent_plans: std::collections::BTreeMap<Uuid, borg_remote::AgentPlanProjection>,
     config: Option<SessionDisplayConfig>,
+    config_updated_at: Option<DateTime<Utc>>,
+    config_event_updated_at: Option<DateTime<Utc>>,
     provider_capabilities: Vec<borg_remote::ProviderCapability>,
     active_turn: Option<ActiveTurnDisplayConfig>,
     live_turn_closed: bool,
@@ -403,6 +405,8 @@ impl Default for Transcript {
             plan_participant_id: None,
             agent_plans: Default::default(),
             config: None,
+            config_updated_at: None,
+            config_event_updated_at: None,
             active_turn: None,
             live_turn_closed: false,
             waiting_on_watchers: false,
@@ -572,7 +576,7 @@ fn goal_live_seconds(goal: &SessionGoal, now: DateTime<Utc>) -> u64 {
         })
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct SessionDisplayConfig {
     cwd: PathBuf,
     provider: CodingProvider,
@@ -989,6 +993,52 @@ impl Transcript {
             })
     }
 
+    fn sync_subagent_config(
+        &mut self,
+        agent: &SubagentSnapshot,
+        inherited: Option<&SessionDisplayConfig>,
+    ) {
+        if self
+            .config_updated_at
+            .is_some_and(|updated| updated > agent.updated_at)
+        {
+            return;
+        }
+        let identity_changed = self
+            .config
+            .as_ref()
+            .is_some_and(|config| config.provider != agent.provider || config.model != agent.model);
+        let config = self.config.get_or_insert_with(|| {
+            inherited.cloned().unwrap_or(SessionDisplayConfig {
+                cwd: agent.cwd.clone(),
+                provider: agent.provider,
+                model: agent.model.clone(),
+                effort: agent.effort.clone(),
+                response_language: ResponseLanguage::default(),
+                fast: agent.fast,
+                ultrafast: agent.ultrafast,
+                permission_mode: PermissionMode::Manual,
+                speed_support: Default::default(),
+            })
+        });
+        if config.provider != agent.provider || config.model != agent.model {
+            config.speed_support = Default::default();
+        }
+        config.cwd = agent.cwd.clone();
+        config.provider = agent.provider;
+        config.model = agent.model.clone();
+        config.effort = agent.effort.clone();
+        config.fast = agent.fast;
+        config.ultrafast = agent.ultrafast;
+        self.config_updated_at = Some(agent.updated_at);
+        if identity_changed {
+            self.context_known = false;
+            self.context_remaining_percent = 100;
+            self.context_tokens = None;
+            self.context_window_tokens = None;
+        }
+    }
+
     fn upsert_subagent_snapshot(&mut self, agent: &SubagentSnapshot) {
         self.upsert_subagent_snapshot_with_status(agent, agent.status);
     }
@@ -998,6 +1048,11 @@ impl Transcript {
         agent: &SubagentSnapshot,
         status: SubagentStatus,
     ) {
+        if self.subagent_snapshots.get(&agent.session_id)
+            .is_some_and(|current| current.updated_at > agent.updated_at)
+        {
+            return;
+        }
         self.subagents.insert(agent.session_id, status);
         let mut snapshot = agent.clone();
         snapshot.status = status;
@@ -1935,7 +1990,16 @@ impl Transcript {
                 ultrafast,
                 permission_mode,
                 speed_support,
-            } => {
+            } if self.config_event_updated_at.is_none_or(|updated| event.created_at >= updated)
+                && (self.config_updated_at.is_none_or(|updated| event.created_at >= updated)
+                    || self.config.as_ref().is_some_and(|current| {
+                        current.provider == *provider && current.model == *model
+                            && current.effort == *effort && current.fast == *fast
+                            && current.ultrafast == *ultrafast && current.cwd == *cwd
+                    })) => {
+                self.config_event_updated_at = Some(event.created_at);
+                self.config_updated_at = Some(self.config_updated_at
+                    .map_or(event.created_at, |updated| updated.max(event.created_at)));
                 let context_identity_changed = self.config.as_ref().is_some_and(|old| {
                     old.provider != *provider || old.model.as_ref() != model.as_ref()
                 });
