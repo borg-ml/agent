@@ -11168,24 +11168,39 @@ fn child_lock_path(root: &Path, session_id: Uuid) -> PathBuf {
 }
 
 async fn send_prompt(
-    entry: &SubagentEntry,
+    entry: &mut SubagentEntry,
     session_id: Uuid,
     message: TeamInboxMessage,
 ) -> Result<()> {
-    entry
-        .commands
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("subagent {} is still starting", entry.snapshot.task_name))?
-        .send(HostCommand::TeamPrompt {
+    let message_id = message.message_id;
+    let commands = entry.commands.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("subagent {} is still starting", entry.snapshot.task_name)
+    })?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        commands.send(HostCommand::TeamPrompt {
             session_id,
-            message_id: message.message_id,
-            text: message.text,
-            attachments: message.attachments,
+            message_id,
+            text: message.text.clone(),
+            attachments: message.attachments.clone(),
             output_schema: None,
             delivery: message.delivery,
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("subagent command channel closed"))
+        }),
+    )
+    .await;
+    match result {
+        Ok(Ok(())) => Ok(()),
+        result => {
+            entry.inbox.push(message);
+            if result.is_err() {
+                bail!(
+                    "subagent command channel is full: message {message_id} is already queued; \
+                       do not resend it. Check get_message_status for delivery."
+                );
+            }
+            bail!("subagent command channel closed: message {message_id} remains queued");
+        }
+    }
 }
 
 /// Apply a child event to its snapshot and return the task name the child is

@@ -9521,3 +9521,62 @@ fn scout_child_transcripts_are_not_parent_model_context() {
     assert!(!event.is_context_relevant());
     assert!(event.is_subagent_relevant());
 }
+
+// A full child channel used to park the director indefinitely while holding
+// the roster lock. Timeout must preserve the message and release that lock.
+#[tokio::test]
+async fn saturated_child_message_send_is_bounded_and_preserves_the_message() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        1,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+    let (child, _rx) = {
+        let mut table = coordinator.table.lock().await;
+        let child = table.reserve("worker", &launch()).unwrap().session_id;
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(HostCommand::Stop { session_id: child })
+            .unwrap();
+        let entry = table.entries.get_mut(&child).unwrap();
+        entry.snapshot.status = SubagentStatus::Running;
+        entry.commands = Some(tx);
+        (child, rx)
+    };
+    bind_test_team(directory.path(), &store, root, &[child]).await;
+    let error = tokio::time::timeout(
+        Duration::from_secs(3),
+        coordinator.call_tool_as(
+            root,
+            "send_message",
+            json!({"target":"worker", "message":"keep this once"}),
+        ),
+    )
+    .await
+    .expect("full channel cannot park the director indefinitely")
+    .unwrap_err();
+    assert!(error.to_string().contains("do not resend"));
+    let message_id = tokio::time::timeout(Duration::from_secs(1), async {
+        let table = coordinator.table.lock().await;
+        let inbox = &table.entries.get(&child).unwrap().inbox;
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].report_text, "keep this once");
+        inbox[0].message_id
+    })
+    .await
+    .expect("timed-out send releases the roster lock");
+    let status = coordinator
+        .call_tool_as(root, "get_message_status", json!({"message_id":message_id}))
+        .await
+        .unwrap();
+    assert_eq!(status["deliveries"].as_array().unwrap().len(), 1);
+    scratch.discard().await;
+}
