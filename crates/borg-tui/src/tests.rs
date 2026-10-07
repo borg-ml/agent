@@ -11078,7 +11078,7 @@ fn agent_receipt_replaces_user_projection_in_either_arrival_order() {
             text: "review result".to_string(),
         },
     );
-    for receipt_first in [false, true] {
+    for (receipt_first, replay) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut transcript = Transcript {
             show_subagent_messages: true,
             ..Transcript::default()
@@ -11089,7 +11089,11 @@ fn agent_receipt_replaces_user_projection_in_either_arrival_order() {
             [&prompt, &receipt, &prompt]
         };
         for event in events {
-            transcript.apply(event);
+            if replay {
+                transcript.apply_history(event);
+            } else {
+                transcript.apply(event);
+            }
         }
         assert_eq!(transcript.order.len(), 1);
         assert!(matches!(
@@ -11112,10 +11116,37 @@ fn agent_receipt_replaces_user_projection_in_either_arrival_order() {
                 .iter()
                 .any(|span| span.style.fg == Some(SUBAGENT_PURPLE))
         );
+
+        // Identical text is not provenance: an independently authored human
+        // prompt must retain the user's identity.
+        let mut human_prompt = prompt.clone();
+        if let SessionEventKind::Message { message_id, .. } = &mut human_prompt.kind {
+            *message_id = Uuid::new_v4();
+        }
+        transcript.apply(&human_prompt);
+        assert_eq!(transcript.order.len(), 2);
+        assert!(matches!(
+            &transcript.order[1],
+            TranscriptEntry::Message {
+                actor: EventActor::User,
+                ..
+            }
+        ));
+        let human = transcript.lines(100);
+        let body = human
+            .iter()
+            .rev()
+            .find(|line| line.to_string().contains("review result"))
+            .unwrap();
         assert!(
-            !lines
+            body.spans
                 .iter()
-                .any(|line| line.to_string().contains("▌ User ▐"))
+                .any(|span| span.style.fg == Some(transcript.user_message_color))
+        );
+        assert!(
+            body.spans
+                .iter()
+                .all(|span| span.style.fg != Some(SUBAGENT_PURPLE))
         );
     }
 }
