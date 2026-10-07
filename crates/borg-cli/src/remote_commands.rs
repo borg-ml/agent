@@ -2546,8 +2546,11 @@ async fn run_local_agent_session(
         // journal here before a terminal can attach.
         (Vec::new(), session_state.latest_sequence.saturating_add(1))
     } else {
-        let history =
-            complete_tui_history(store.as_ref(), session_id, session_state.latest_sequence).await?;
+        let history = if can_prompt && !fallback_terminal {
+            recent_tui_history(store.as_ref(), session_id, session_state.latest_sequence).await?
+        } else {
+            complete_tui_history(store.as_ref(), session_id, session_state.latest_sequence).await?
+        };
         (history.events, history.page_before)
     };
     let history_ms = history_started.elapsed().as_millis() as u64;
@@ -2570,8 +2573,7 @@ async fn run_local_agent_session(
                 }),
         );
     }
-    let mut history_start_reached = session_state.latest_sequence == 0
-        || history.first().is_some_and(|event| event.sequence <= 1);
+    let mut history_start_reached = history_page_before_sequence <= 1;
     let (team_history, tail_team_snapshots) = if can_prompt && !fallback_terminal {
         subagent_state_from_history(&history)
     } else {
@@ -5584,7 +5586,7 @@ async fn run_local_agent_session(
                             }
                             if interactive {
                                 let latest_state = store.state(session_id).await?;
-                                let latest = complete_tui_history(
+                                let latest = recent_tui_history(
                                     store.as_ref(),
                                     session_id,
                                     latest_state.latest_sequence,
@@ -7534,7 +7536,7 @@ async fn run_local_agent_session(
                                             remote_open = true;
                                         }
                                         let latest_state = store.state(session_id).await?;
-                                        let latest = complete_tui_history(
+                                        let latest = recent_tui_history(
                                             store.as_ref(),
                                             session_id,
                                             latest_state.latest_sequence,
@@ -9031,6 +9033,28 @@ fn prompt_summary(value: &str, limit: usize) -> String {
     } else {
         compact
     }
+}
+
+async fn recent_tui_history(
+    store: &dyn SessionStore,
+    session_id: Uuid,
+    latest_sequence: u64,
+) -> Result<ResumeBootstrapHistory> {
+    let after = latest_sequence.saturating_sub(RICH_TUI_HISTORY_PAGE_SIZE as u64);
+    let (mut events, mut messages) = tokio::try_join!(
+        store.events_after(session_id, after, RICH_TUI_HISTORY_PAGE_SIZE),
+        store.recent_messages_until(session_id, latest_sequence, 8),
+    )?;
+    events.retain(|event| event.sequence <= latest_sequence);
+    messages.retain(|event| event.sequence <= latest_sequence);
+    // Indexed conversation rows keep the latest reply visible even when a
+    // long tool/subagent tail fills the entire event page. They are sparse:
+    // paging must continue from the contiguous page, not the first message.
+    merge_tui_history_page(&mut events, messages);
+    Ok(ResumeBootstrapHistory {
+        events,
+        page_before: after.saturating_add(1),
+    })
 }
 
 async fn complete_tui_history(

@@ -468,6 +468,14 @@ mod tests {
         ) -> Result<Vec<SessionEvent>> {
             unimplemented!("journal access is not part of this test")
         }
+        async fn recent_messages_until(
+            &self,
+            _session_id: Uuid,
+            _sequence: u64,
+            _limit: usize,
+        ) -> Result<Vec<SessionEvent>> {
+            unimplemented!("journal access is not part of this test")
+        }
         async fn prompt_cache_session_id(&self, _session_id: Uuid) -> Result<Uuid> {
             unimplemented!("journal access is not part of this test")
         }

@@ -198,6 +198,7 @@ impl PostgresSessionStore {
         &self,
         session_id: Uuid,
         after_sequence: u64,
+        until_sequence: u64,
         limit: usize,
         matches: impl Fn(&SessionEvent) -> bool,
     ) -> Result<Vec<SessionEvent>> {
@@ -208,13 +209,14 @@ impl PostgresSessionStore {
             let rows = sqlx::query(
                 "select sequence, event_json, event_body, dict_id from session_events \
                  where session_id = $1 and event_kind = 'message' \
-                   and sequence > $2 and sequence < $3 \
+                   and sequence > $2 and sequence < $3 and sequence <= $5 \
                  order by sequence desc limit $4",
             )
             .bind(session_id)
             .bind(i64::try_from(after_sequence).unwrap_or(i64::MAX))
             .bind(before)
             .bind(PAGE)
+            .bind(i64::try_from(until_sequence).unwrap_or(i64::MAX))
             .fetch_all(self.pool())
             .await?;
             if rows.is_empty() {
@@ -1684,6 +1686,16 @@ impl SessionStore for PostgresSessionStore {
     }
 
     async fn recent_messages(&self, session_id: Uuid, limit: usize) -> Result<Vec<SessionEvent>> {
+        self.recent_messages_until(session_id, u64::MAX, limit)
+            .await
+    }
+
+    async fn recent_messages_until(
+        &self,
+        session_id: Uuid,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1691,7 +1703,7 @@ impl SessionStore for PostgresSessionStore {
         // the bound is stated rather than left to where a fork's rows happen to
         // start -- matching the trait's contract by construction.
         let inherited = self.session_row(session_id).await?.inherited_event_count;
-        self.recent_messages_matching(session_id, inherited, limit, |event| {
+        self.recent_messages_matching(session_id, inherited, sequence, limit, |event| {
             matches!(
                 event.kind,
                 SessionEventKind::Message {
@@ -1712,7 +1724,7 @@ impl SessionStore for PostgresSessionStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        self.recent_messages_matching(session_id, 0, limit, |event| {
+        self.recent_messages_matching(session_id, 0, u64::MAX, limit, |event| {
             event.kind.is_recallable_user_message()
         })
         .await

@@ -1045,7 +1045,7 @@ async fn first_resume_frame_keeps_latest_updates_from_a_long_autonomous_turn() {
         .await
         .unwrap();
 
-    let history = complete_tui_history(&store, session_id, latest.sequence)
+    let history = recent_tui_history(&store, session_id, latest.sequence)
         .await
         .unwrap();
 
@@ -1116,7 +1116,7 @@ async fn first_resume_frame_reaches_a_conversation_end_buried_behind_a_long_even
     }
 
     let latest_sequence = store.state(session_id).await.unwrap().latest_sequence;
-    let history = complete_tui_history(&store, session_id, latest_sequence)
+    let history = recent_tui_history(&store, session_id, latest_sequence)
         .await
         .unwrap();
 
@@ -1143,13 +1143,28 @@ async fn first_resume_frame_reaches_a_conversation_end_buried_behind_a_long_even
             .all(|pair| pair[0].sequence < pair[1].sequence),
         "spliced conversation rows must stay in sequence order"
     );
-    assert_eq!(history.page_before, 1);
-    assert_eq!(history.events.len() as u64, latest_sequence);
+    assert_eq!(
+        history.page_before,
+        latest_sequence - RICH_TUI_HISTORY_PAGE_SIZE as u64 + 1
+    );
+    assert_eq!(history.events.len(), RICH_TUI_HISTORY_PAGE_SIZE + 2);
     assert!(
         history
             .events
             .iter()
-            .any(|event| event.sequence == reply.sequence + 1)
+            .any(|event| event.sequence == reply.sequence)
+    );
+    let mut events = history.events;
+    let mut before = history.page_before;
+    while before > 1 {
+        let older = older_tui_history(&store, session_id, before).await.unwrap();
+        before = older.first().unwrap().sequence;
+        merge_tui_history_page(&mut events, older);
+    }
+    assert_eq!(
+        events.len() as u64,
+        latest_sequence,
+        "lazy paging must retain every saved event"
     );
     scratch.discard().await;
 }
@@ -1254,7 +1269,7 @@ async fn first_resume_frame_reaches_a_forked_conversation_end_in_logical_sequenc
     );
 
     let latest_sequence = store.state(fork_id).await.unwrap().latest_sequence;
-    let history = complete_tui_history(&store, fork_id, latest_sequence)
+    let history = recent_tui_history(&store, fork_id, latest_sequence)
         .await
         .unwrap();
     assert!(
@@ -1271,12 +1286,16 @@ async fn first_resume_frame_reaches_a_forked_conversation_end_in_logical_sequenc
             .windows(2)
             .all(|pair| pair[0].sequence < pair[1].sequence)
     );
-    assert!(history.page_before <= fork.inherited_event_count);
+    assert_eq!(
+        history.page_before,
+        latest_sequence - RICH_TUI_HISTORY_PAGE_SIZE as u64 + 1
+    );
+    assert!(history.events.len() <= RICH_TUI_HISTORY_PAGE_SIZE + 8);
     assert!(
         history
             .events
             .iter()
-            .any(|event| event.sequence == forked_reply.sequence + 1)
+            .any(|event| event.sequence == forked_reply.sequence)
     );
     scratch.discard().await;
 }
@@ -3768,25 +3787,37 @@ async fn resume_bootstrap_stops_at_the_live_cursor() {
         ))
         .await
         .unwrap();
-    let cursor = store
+    store
         .append(SessionEvent::new(
             session_id,
             0,
             message(EventActor::Assistant, "seen"),
         ))
         .await
-        .unwrap()
-        .sequence;
-    store
-        .append(SessionEvent::new(
-            session_id,
-            0,
-            message(EventActor::Assistant, "after"),
-        ))
-        .await
         .unwrap();
+    for _ in 0..=RICH_TUI_HISTORY_PAGE_SIZE {
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ReasoningCompleted,
+            ))
+            .await
+            .unwrap();
+    }
+    let cursor = store.state(session_id).await.unwrap().latest_sequence;
+    for _ in 0..8 {
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                message(EventActor::Assistant, "after"),
+            ))
+            .await
+            .unwrap();
+    }
 
-    let history = complete_tui_history(&store, session_id, cursor)
+    let history = recent_tui_history(&store, session_id, cursor)
         .await
         .unwrap();
 

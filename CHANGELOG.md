@@ -15,6 +15,10 @@ Git comparison.
 - Action labels use consistent wording and running/completed forms, including
   waiting for agents, delegation, messages, follow-ups, and image generation.
   Capability wrappers show the same action label as direct tool calls.
+- Rich-terminal resumes and reconnects no longer scan and replay the complete
+  journal before the first frame. A bounded recent page keeps the latest prompt
+  and reply visible, while older events load on demand without skipping history
+  when new messages arrive.
 - Manually expanded action groups and their scroll offsets survive history
   paging and reconnects.
 - The active goal is shown again between loop turns.

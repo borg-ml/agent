@@ -1590,6 +1590,13 @@ pub trait SessionStore: Send + Sync {
     /// returns fewer rows rather than wrong ones, and the remainder still
     /// pages in normally.
     async fn recent_messages(&self, session_id: Uuid, limit: usize) -> Result<Vec<SessionEvent>>;
+    /// The same indexed conversation slice, capped at a captured durable cursor.
+    async fn recent_messages_until(
+        &self,
+        session_id: Uuid,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>>;
     async fn state(&self, session_id: Uuid) -> Result<SessionState>;
     /// Cache-routing identity only; a fork must still start its own provider continuation.
     async fn prompt_cache_session_id(&self, session_id: Uuid) -> Result<Uuid>;
