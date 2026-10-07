@@ -3845,14 +3845,24 @@ async fn await_tool_with_controls(
     let mut pending_steer: Vec<CapturedSteer> = Vec::new();
     loop {
         tokio::select! {
-            result = &mut call => return Ok(match result {
-                Ok(value) => (serde_json::to_string(&value)?, false, pending_steer),
-                Err(error) => (
-                    json!({ "error": format!("{error:#}") }).to_string(),
-                    true,
-                    pending_steer,
-                ),
-            }),
+            result = &mut call => {
+                // A wait can finish because this same queued steer woke it.
+                // Collect controls before returning the result to the model.
+                while let Some(control) = controls
+                    .as_mut()
+                    .and_then(|controls| controls.try_recv().ok())
+                {
+                    pending_steer.extend(accept_tool_boundary_control(control)?);
+                }
+                return Ok(match result {
+                    Ok(value) => (serde_json::to_string(&value)?, false, pending_steer),
+                    Err(error) => (
+                        json!({ "error": format!("{error:#}") }).to_string(),
+                        true,
+                        pending_steer,
+                    ),
+                });
+            },
             control = next_control(controls) => match control {
                 Some(AgentTurnControl::Interrupt) => {
                     if let Some(cancel) = &call_cancel {
@@ -10379,6 +10389,52 @@ mod tests {
             vec![json!("call")],
             "the abandoned tool call row has to be closed exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn a_wait_result_captures_the_steer_that_woke_it() {
+        let (tx, rx) = mpsc::channel(1);
+        let mut controls = Some(rx);
+        let admission = borg_provider::provider::SteerAdmission::pending();
+        let message_id = Uuid::new_v4();
+        let (ack, mut acked) = tokio::sync::oneshot::channel();
+        let call = async {
+            tx.try_send(AgentTurnControl::Steer {
+                message_id,
+                text: "land the finished work now".into(),
+                attachments: Vec::new(),
+                admission: admission.clone(),
+                preempt: false,
+                human: true,
+                ack,
+            })
+            .unwrap();
+            Ok(json!({ "reason": "input_pending" }))
+        };
+        let (output, is_error, captured) =
+            await_tool_with_controls(call, None, false, &mut controls)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&output).unwrap()["reason"],
+            "input_pending"
+        );
+        assert!(!is_error);
+        assert_eq!(
+            captured.len(),
+            1,
+            "the next model request must include the steer"
+        );
+        assert!(!admission.is_accepted(), "capture is not durable delivery");
+        assert!(matches!(
+            acked.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let (steer, acks) = admit_steers(captured).unwrap();
+        assert_eq!(steer.message_ids, vec![message_id]);
+        assert!(steer.human);
+        confirm_steers(acks);
+        assert!(acked.await.unwrap().is_ok());
     }
 
     type SteerAckReceiver = tokio::sync::oneshot::Receiver<std::result::Result<(), String>>;
