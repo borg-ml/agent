@@ -24,6 +24,12 @@ Git comparison.
 
 ### Subagents
 
+- Instance discovery probes an answering control server rather than merely a
+  listening socket, and includes session title/activity and attached/detached
+  viewer state when available. Reachable detached hosts remain discoverable.
+- Local command delivery has a bounded acknowledgement timeout; uncertain
+  delivery is not misreported as confirmed or retried as a duplicate command.
+
 - Spawning a task always creates a new child, preserving idle workers' names,
   context, answers and follow-up addresses.
 - Shared-work creation returns explicit work and event IDs; revision conflicts

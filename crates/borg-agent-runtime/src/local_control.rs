@@ -17,6 +17,7 @@ use crate::{
 };
 
 const MAX_CONTROL_COMMAND_BYTES: u64 = 1024 * 1024;
+const CONTROL_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const ATTACHED_SESSION_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 const ATTACHED_LIVE_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const ATTACHED_STORE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
@@ -702,34 +703,60 @@ fn write_local_session_owner_metadata(sessions_dir: &Path, session_id: Uuid) -> 
     Ok(())
 }
 
-/// Whether a session's control socket currently has a listener.
-///
-/// A `<session>.control.sock` file outlives the process that created it, so
-/// its mere existence reports long-dead sessions as reachable. Connecting is
-/// the only honest test: a stale path refuses immediately, and this is the
-/// same thing `send_local_session_command` learns when it dispatches, so
-/// discovery and delivery agree instead of contradicting each other.
-///
-/// The owner process being alive is NOT sufficient either — a running owner
-/// that has stopped serving its socket still refuses connections.
+/// A legacy owner can answer the probe without publishing viewer presence.
+pub(crate) struct LocalSessionControlStatus {
+    pub attached_viewers: Option<usize>,
+}
+
 #[cfg(unix)]
-pub async fn session_control_socket_is_reachable(socket_path: &Path) -> bool {
+pub(crate) async fn session_control_status(
+    socket_path: &Path,
+) -> Option<LocalSessionControlStatus> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
-    // Bounded so one unresponsive peer cannot stall a whole listing.
-    matches!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            UnixStream::connect(socket_path),
-        )
-        .await,
-        Ok(Ok(_))
-    )
+    let probe = async {
+        let mut stream = UnixStream::connect(socket_path).await?;
+        stream.write_all(b"{\"probe\":true}").await?;
+        stream.shutdown().await?;
+        let mut response = Vec::new();
+        stream.take(4096).read_to_end(&mut response).await?;
+        let response: serde_json::Value = serde_json::from_slice(&response)?;
+        if response.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Ok::<_, anyhow::Error>(Some(LocalSessionControlStatus {
+                attached_viewers: response
+                    .get("attached_viewers")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|count| usize::try_from(count).ok()),
+            }));
+        }
+        // Older owners reject the probe before decoding a command. This proves
+        // responsiveness, but cannot prove their command receiver is still open.
+        Ok(response
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .filter(|error| error.starts_with("missing field `type`"))
+            .map(|_| LocalSessionControlStatus {
+                attached_viewers: None,
+            }))
+    };
+    tokio::time::timeout(std::time::Duration::from_millis(250), probe)
+        .await
+        .ok()?
+        .ok()?
 }
 
 #[cfg(not(unix))]
-pub async fn session_control_socket_is_reachable(_socket_path: &Path) -> bool {
-    false
+pub(crate) async fn session_control_status(
+    _socket_path: &Path,
+) -> Option<LocalSessionControlStatus> {
+    None
+}
+
+/// Whether the control server answers a bounded probe. Current owners also
+/// check their command receiver; connecting alone can hit an unserviced listener.
+pub async fn session_control_socket_is_reachable(socket_path: &Path) -> bool {
+    session_control_status(socket_path).await.is_some()
 }
 
 /// Send one typed command to the process holding a session's writer lease.
@@ -746,23 +773,29 @@ pub async fn send_local_session_command(
         command.session_id() == Some(session_id),
         "command targets a different session"
     );
-    let mut stream = UnixStream::connect(socket_path)
-        .await
-        .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
-    stream.write_all(&serde_json::to_vec(&command)?).await?;
-    stream.shutdown().await?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await?;
-    let response: serde_json::Value =
-        serde_json::from_slice(&response).context("session owner returned invalid control JSON")?;
-    if let Some(error) = response.get("error").and_then(serde_json::Value::as_str) {
-        bail!("session owner rejected command: {error}");
-    }
-    anyhow::ensure!(
-        response.get("ok").and_then(serde_json::Value::as_bool) == Some(true),
-        "session owner did not acknowledge command"
-    );
-    Ok(())
+    // A timed-out command may already be durable; callers must keep its identity
+    // rather than interpreting a missing acknowledgement as a rejected prompt.
+    tokio::time::timeout(CONTROL_COMMAND_TIMEOUT, async {
+        let mut stream = UnixStream::connect(socket_path)
+            .await
+            .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
+        stream.write_all(&serde_json::to_vec(&command)?).await?;
+        stream.shutdown().await?;
+        let mut response = Vec::new();
+        stream.take(4096).read_to_end(&mut response).await?;
+        let response: serde_json::Value = serde_json::from_slice(&response)
+            .context("session owner returned invalid control JSON")?;
+        if let Some(error) = response.get("error").and_then(serde_json::Value::as_str) {
+            bail!("session owner rejected command: {error}");
+        }
+        anyhow::ensure!(
+            response.get("ok").and_then(serde_json::Value::as_bool) == Some(true),
+            "session owner did not acknowledge command"
+        );
+        Ok(())
+    })
+    .await
+    .context("session owner did not acknowledge command within 30 seconds; command may already have been accepted or durably queued")?
 }
 
 #[cfg(not(unix))]
@@ -988,6 +1021,7 @@ impl LocalSessionControlServer {
                                     priority,
                                     prompt_admissions,
                                     store,
+                                    Arc::clone(&task_attached_viewers),
                                 ));
                             }
                             Err(error) => {
@@ -1158,6 +1192,7 @@ async fn handle_control_connection(
     priority: Option<mpsc::Sender<HostCommand>>,
     prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
     store: Option<Arc<dyn SessionStore>>,
+    attached_viewers: Arc<AtomicUsize>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1171,6 +1206,10 @@ async fn handle_control_connection(
             payload.len() as u64 <= MAX_CONTROL_COMMAND_BYTES,
             "control command exceeds the 1 MiB limit"
         );
+        if payload == b"{\"probe\":true}" {
+            anyhow::ensure!(!commands.is_closed(), "session owner stopped");
+            return Ok(Some(attached_viewers.load(Ordering::Acquire)));
+        }
         let command: HostCommand = serde_json::from_slice(&payload)?;
         if command.session_id() != Some(session_id) {
             bail!("command targets a different session");
@@ -1276,11 +1315,14 @@ async fn handle_control_connection(
             .send(command)
             .await
             .map_err(|_| anyhow::anyhow!("session owner stopped"))?;
-        Result::<()>::Ok(())
+        Result::<Option<usize>>::Ok(None)
     }
     .await;
     let response = match result {
-        Ok(()) => serde_json::json!({ "ok": true }),
+        Ok(Some(attached_viewers)) => {
+            serde_json::json!({ "ok": true, "attached_viewers": attached_viewers })
+        }
+        Ok(None) => serde_json::json!({ "ok": true }),
         Err(error) => serde_json::json!({ "error": error.to_string() }),
     };
     let _ = stream.write_all(response.to_string().as_bytes()).await;
@@ -2027,8 +2069,8 @@ mod tests {
 
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         assert!(
-            session_control_socket_is_reachable(&path).await,
-            "a bound socket with a listener is reachable"
+            !session_control_socket_is_reachable(&path).await,
+            "a listener that never serves commands is not reachable"
         );
 
         // Dropping the listener leaves the path behind: this is exactly the
@@ -2038,6 +2080,31 @@ mod tests {
         assert!(
             !session_control_socket_is_reachable(&path).await,
             "an abandoned socket path must read as unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_delivery_times_out_when_owner_never_acknowledges() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let command_path = socket_path.clone();
+        let delivery = tokio::spawn(async move {
+            send_local_session_command(&command_path, session_id, HostCommand::Stop { session_id })
+                .await
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut payload = Vec::new();
+        stream.read_to_end(&mut payload).await.unwrap();
+        assert!(!payload.is_empty(), "the command reached the peer");
+        tokio::time::pause();
+        tokio::time::advance(CONTROL_COMMAND_TIMEOUT).await;
+        let error = delivery.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some()
         );
     }
 
@@ -2503,7 +2570,8 @@ mod tests {
             .unwrap();
         let (owner_tx, _owner_rx) = mpsc::channel(1);
         let server =
-            LocalSessionControlServer::start(socket_path, session_id, &writer, owner_tx).unwrap();
+            LocalSessionControlServer::start(socket_path.clone(), session_id, &writer, owner_tx)
+                .unwrap();
 
         assert!(!server.has_attached_viewers());
         let mut presence = tokio::net::UnixStream::connect(presence_path)
@@ -2512,6 +2580,13 @@ mod tests {
         let mut acknowledgement = [0_u8; 1];
         presence.read_exact(&mut acknowledgement).await.unwrap();
         assert!(server.has_attached_viewers());
+        assert_eq!(
+            session_control_status(&socket_path)
+                .await
+                .unwrap()
+                .attached_viewers,
+            Some(1)
+        );
 
         drop(presence);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -2521,6 +2596,13 @@ mod tests {
         })
         .await
         .expect("viewer presence should be released when the attachment closes");
+        assert_eq!(
+            session_control_status(&socket_path)
+                .await
+                .unwrap()
+                .attached_viewers,
+            Some(0)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -3321,7 +3403,7 @@ mod tests {
         let writer = SessionWriterLease::try_acquire(&lock_path)
             .unwrap()
             .unwrap();
-        let (owner_tx, _owner_rx) = mpsc::channel(1);
+        let (owner_tx, owner_rx) = mpsc::channel(1);
         let server =
             LocalSessionControlServer::start(socket_path.clone(), session_id, &writer, owner_tx)
                 .unwrap();
@@ -3341,6 +3423,18 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(reachable, "a served socket is reachable");
+        assert_eq!(
+            session_control_status(&socket_path)
+                .await
+                .unwrap()
+                .attached_viewers,
+            Some(0)
+        );
+        drop(owner_rx);
+        assert!(
+            !session_control_socket_is_reachable(&socket_path).await,
+            "a listening server with a closed command receiver cannot deliver"
+        );
         drop(server);
     }
 

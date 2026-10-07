@@ -7394,8 +7394,12 @@ impl SubagentCoordinator {
                         &self.journal_root,
                         instance.participant.id,
                     );
-                    let live =
-                        local && crate::session_control_socket_is_reachable(&socket_path).await;
+                    let control_status = if local {
+                        crate::local_control::session_control_status(&socket_path).await
+                    } else {
+                        None
+                    };
+                    let live = control_status.is_some();
                     let owner_running = local
                         && crate::local_control::local_session_owner_is_active_with_pid(
                             &self.journal_root,
@@ -7441,6 +7445,15 @@ impl SubagentCoordinator {
                     let mut entry = serde_json::to_value(instance)?;
                     entry["local"] = json!(local);
                     entry["live"] = json!(live);
+                    let attached_viewers = control_status
+                        .as_ref()
+                        .and_then(|status| status.attached_viewers);
+                    entry["attached_viewers"] = json!(attached_viewers);
+                    entry["attachment"] = json!(attached_viewers.map(|count| if count == 0 {
+                        "detached"
+                    } else {
+                        "attached"
+                    }));
                     entry["owner_running"] = json!(owner_running);
                     entry["workspace_name"] = json!(workspace_name);
                     instances.push((local, live, owner_running, seen_at, created_at, entry));
@@ -7483,13 +7496,39 @@ impl SubagentCoordinator {
                 let total = instances.len();
                 let limit = args.limit.unwrap_or(DEFAULT_INSTANCE_LIMIT).max(1);
                 instances.truncate(limit);
-                let instances = instances
+                let mut instances = instances
                     .into_iter()
                     .map(|(local, _, _, seen_at, _, mut entry)| {
                         entry["stale"] = json!(is_stale(local, seen_at));
                         entry
                     })
                     .collect::<Vec<_>>();
+                let identities = self
+                    .store
+                    .list_sessions(limit.max(DEFAULT_INSTANCE_LIMIT).min(200))
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|summary| (summary.session_id, summary.state))
+                    .collect::<HashMap<_, _>>();
+                for entry in &mut instances {
+                    entry["title"] = Value::Null;
+                    entry["activity"] = Value::Null;
+                    entry["activity_at"] = Value::Null;
+                    if entry["local"].as_bool() != Some(true) {
+                        continue;
+                    }
+                    let Some(id) = entry["id"].as_str().and_then(|id| Uuid::parse_str(id).ok())
+                    else {
+                        continue;
+                    };
+                    if let Some(state) = identities.get(&id) {
+                        entry["title"] =
+                            json!(state.title.as_ref().or(state.imported_title.as_ref()));
+                        entry["activity"] = json!(state.status);
+                        entry["activity_at"] = json!(state.activity_at);
+                    }
+                }
                 let participant_id = self
                     .store
                     .workspace_binding(actor_session_id)
@@ -8002,7 +8041,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "list_instances",
-            "Discover Borg agent instances across all local workspaces and the authenticated remote instance directory. What the fields mean: live is whether this machine answers that instance's control socket right now, so a message reaches it immediately - only a row on this machine can be live and a peer on another host is never marked live here; owner_running is whether the OS process owning a local row is still alive, reachable or not; status is the owning host's lifecycle state as its last directory sync reported it (running, ready, starting, or stopped) and is the liveness signal for a peer on another host; stale is a directory row the newest sync no longer refreshes; reaped counts the local rows retired during this call because their owner is gone. An instance the owning host reports as stopped, and a local row that was reaped, stay out of the listing until include_exited is set, and both come back if that peer is reported running again. cwd identifies a peer: recorded here when this machine launched it, and reported by its owning host otherwise. Results are ranked live, then running, then local, then newest, so a truncated page keeps the reachable peers rather than the most recently created rows. Prefer live:true for local peers and status for remote ones over paging, and cwd to pick one of several sessions in the same checkout - display_name is only the workspace basename and does not distinguish them. Use participant:<id> with send_message or followup_task. Remote entries require an enrolled host relay and may be offline; discovery does not grant project access.",
+            "Discover Borg agent instances across all local workspaces and the authenticated remote instance directory. What the fields mean: live is whether this machine answers that instance's control socket right now, so a message reaches it immediately - only a row on this machine can be live and a peer on another host is never marked live here; owner_running is whether the OS process owning a local row is still alive, reachable or not; status is the owning host's lifecycle state as its last directory sync reported it (running, ready, starting, or stopped) and is the liveness signal for a peer on another host; stale is a directory row the newest sync no longer refreshes; reaped counts the local rows retired during this call because their owner is gone. An instance the owning host reports as stopped, and a local row that was reaped, stay out of the listing until include_exited is set, and both come back if that peer is reported running again. cwd identifies a peer: recorded here when this machine launched it, and reported by its owning host otherwise. Results are ranked live, then running, then local, then newest, so a truncated page keeps the reachable peers rather than the most recently created rows. Local rows also include title, activity, and activity_at when present in the bounded recent-session metadata page; attached_viewers and attachment distinguish an attached UI from a detached host on newer owners, and are null on legacy owners. Closing a UI may detach rather than stop its host. Prefer live:true for local peers and status for remote ones over paging, and cwd to pick one of several sessions in the same checkout - display_name is only the workspace basename and does not distinguish them. Use participant:<id> with send_message or followup_task. Remote entries require an enrolled host relay and may be offline; discovery does not grant project access.",
             json!({"type":"object","properties":{
                 "query":{"type":"string","description":"Case-insensitive display-name substring or participant id prefix."},
                 "host_id":{"type":"string","description":"Only instances on this host UUID."},

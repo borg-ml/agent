@@ -4123,6 +4123,19 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
         (servers, receivers)
     };
 
+    sender_coordinator
+        .store
+        .append(SessionEvent::new(
+            recipient,
+            0,
+            SessionEventKind::SessionTitled {
+                title: "Recipient exploration".into(),
+                generated: false,
+                usage_tokens: None,
+            },
+        ))
+        .await
+        .unwrap();
     let instances = sender_coordinator
         .call_tool_as(sender, "list_instances", json!({}))
         .await
@@ -4139,6 +4152,19 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
             })
     );
 
+    let peer = instances["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == recipient.to_string())
+        .unwrap();
+    assert_eq!(peer["title"], "Recipient exploration");
+    #[cfg(unix)]
+    {
+        assert_eq!(peer["live"], true);
+        assert_eq!(peer["attached_viewers"], 0);
+        assert_eq!(peer["attachment"], "detached");
+    }
     let result = sender_coordinator
         .call_tool_as(
             sender,
