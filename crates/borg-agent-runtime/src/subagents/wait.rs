@@ -25,6 +25,8 @@ const IDLE_GRACE: Duration = Duration::from_secs(5);
 /// still noticed within this bound.
 const RECHECK: Duration = Duration::from_secs(5);
 const TEXT_LIMIT: usize = 4_000;
+const MESSAGE_TEXT_LIMIT: usize = 1_000;
+const MESSAGE_LIMIT: usize = 8;
 const LINE_LIMIT: usize = 200;
 const AGENT_LIMIT: usize = 40;
 
@@ -32,6 +34,7 @@ const AGENT_LIMIT: usize = 40;
 #[derive(Default)]
 pub(super) struct WaitCursor {
     settled: HashMap<Uuid, u64>,
+    agents: HashMap<Uuid, u64>,
     messages: HashSet<Uuid>,
 }
 
@@ -141,9 +144,8 @@ impl SubagentCoordinator {
         let mut activity = self.subscribe();
         let mut wakes = self.subscribe_root_messages();
         let mut wakes_open = self.is_root_session(actor);
-        let mut woken = Vec::new();
 
-        let unseen = self.unseen(actor, &woken).await;
+        let unseen = self.unseen(actor).await;
         if !unseen.is_empty() {
             return self.report(actor, "child_update", unseen, started).await;
         }
@@ -173,18 +175,20 @@ impl SubagentCoordinator {
                 biased;
                 _ = cancel.cancelled() => {
                     let reason = if input_waiting(&input) && !reported.swap(true, Ordering::AcqRel) { "input_pending" } else { "cancelled" };
-                    let unseen = self.unseen(actor, &woken).await;
+                    let unseen = self.unseen(actor).await;
                     return self.report(actor, reason, unseen, started).await;
                 }
                 () = input_arrives(&mut input, &reported) => {
                     self.take_awaiting_reply(actor);
-                    let unseen = self.unseen(actor, &woken).await;
+                    let unseen = self.unseen(actor).await;
                     return self.report(actor, "input_pending", unseen, started).await;
                 }
                 message = wakes.recv(), if wakes_open => match message {
-                    Ok(message) => {
-                        woken.push(message);
-                        check = true;
+                    Ok(_) => {
+                        reported.store(true, Ordering::Release);
+                        self.take_awaiting_reply(actor);
+                        let unseen = self.unseen(actor).await;
+                        return self.report(actor, "input_pending", unseen, started).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => check = true,
                     Err(broadcast::error::RecvError::Closed) => wakes_open = false,
@@ -202,7 +206,7 @@ impl SubagentCoordinator {
                         // The change can vanish while coalescing: the child
                         // resumed work, or its message was delivered as input.
                         // An empty result reads as a dropped message.
-                        let unseen = self.unseen(actor, &woken).await;
+                        let unseen = self.unseen(actor).await;
                         if !unseen.is_empty() {
                             return self.report(actor, "child_update", unseen, started).await;
                         }
@@ -213,11 +217,11 @@ impl SubagentCoordinator {
                         continue;
                     }
                     let reason = if until < deadline { "no_active_children" } else { "timeout" };
-                    let unseen = self.unseen(actor, &woken).await;
+                    let unseen = self.unseen(actor).await;
                     return self.report(actor, reason, unseen, started).await;
                 }
             }
-            if check && settle_at.is_none() && !self.unseen(actor, &woken).await.is_empty() {
+            if check && settle_at.is_none() && !self.unseen(actor).await.is_empty() {
                 settle_at = Some(tokio::time::Instant::now() + COALESCE);
             }
         }
@@ -252,7 +256,7 @@ impl SubagentCoordinator {
             .collect()
     }
 
-    async fn unseen(&self, actor: Uuid, woken: &[TeamInboxMessage]) -> Unseen {
+    async fn unseen(&self, actor: Uuid) -> Unseen {
         let children = self.children(actor).await;
         let inbox = if self.is_root_session(actor) {
             self.root_inbox.lock().await.clone()
@@ -270,7 +274,9 @@ impl SubagentCoordinator {
             })
             .collect();
         let mut messages: Vec<(Uuid, Uuid, String)> = Vec::new();
-        for message in inbox.iter().chain(woken) {
+        // Wake messages are steers delivered by the session, not a second
+        // source of directives to replay from a wait result.
+        for message in &inbox {
             if message.sender_session_id != actor
                 && !cursor.is_some_and(|cursor| cursor.messages.contains(&message.message_id))
                 && !messages.iter().any(|(id, ..)| *id == message.message_id)
@@ -290,9 +296,13 @@ impl SubagentCoordinator {
         &self,
         actor: Uuid,
         reason: &str,
-        unseen: Unseen,
+        mut unseen: Unseen,
         started: tokio::time::Instant,
     ) -> Result<Value> {
+        let more_messages = unseen.messages.len().saturating_sub(MESSAGE_LIMIT);
+        unseen.messages.truncate(MESSAGE_LIMIT);
+        let more_changes = unseen.changes.len().saturating_sub(AGENT_LIMIT);
+        unseen.changes.truncate(AGENT_LIMIT);
         {
             let mut cursors = self.wait_cursors.lock().await;
             let cursor = cursors.entry(actor).or_default();
@@ -327,10 +337,18 @@ impl SubagentCoordinator {
         let mut children = self.children(actor).await;
         children.sort_by_key(|agent| !working(agent));
         let now = Utc::now();
-        let agents = children
+        let mut cursors = self.wait_cursors.lock().await;
+        let cursor = cursors.entry(actor).or_default();
+        let changed = children
             .iter()
+            .filter(|agent| cursor.agents.get(&agent.session_id) != Some(&fingerprint(agent)))
+            .collect::<Vec<_>>();
+        let more_agents = changed.len().saturating_sub(AGENT_LIMIT);
+        let agents = changed
+            .into_iter()
             .take(AGENT_LIMIT)
             .map(|agent| {
+                cursor.agents.insert(agent.session_id, fingerprint(agent));
                 let mut row = json!({
                     "task_name": agent.task_name,
                     "session_id": agent.session_id,
@@ -343,6 +361,7 @@ impl SubagentCoordinator {
                 row
             })
             .collect::<Vec<_>>();
+        drop(cursors);
         let mut senders = HashMap::new();
         for (_, sender, _) in &unseen.messages {
             if !senders.contains_key(sender) {
@@ -369,19 +388,34 @@ impl SubagentCoordinator {
                 "task_name": agent.task_name,
                 "session_id": agent.session_id,
                 "status": agent.status,
-                "detail": agent.detail,
+                "detail": agent.detail.as_deref().map(|text| bounded(text, MESSAGE_TEXT_LIMIT)),
                 "final_text": agent.final_text.as_deref().map(|text| bounded(text, TEXT_LIMIT)),
+                "final_text_truncated": agent.final_text.as_deref().is_some_and(|text| text.trim().chars().count() > TEXT_LIMIT),
             })).collect::<Vec<_>>(),
             "messages": unseen.messages.iter().map(|(id, sender, text)| json!({
                 "message_id": id,
+                "sender_session_id": sender,
                 "from": senders[sender],
-                "text": bounded(text, TEXT_LIMIT),
+                "text": bounded(text, MESSAGE_TEXT_LIMIT),
+                "text_truncated": text.trim().chars().count() > MESSAGE_TEXT_LIMIT,
             })).collect::<Vec<_>>(),
             "agents": agents,
+            "agents_mode": "delta",
+            "total_children": children.len(),
+            "working_children": children.iter().filter(|agent| working(agent)).count(),
         });
-        if children.len() > AGENT_LIMIT {
-            result["more_agents"] = json!(children.len() - AGENT_LIMIT);
+        if more_agents > 0 {
+            result["more_agents"] = json!(more_agents);
         }
+        if more_changes > 0 {
+            result["more_changes"] = json!(more_changes);
+        }
+        if more_messages > 0 {
+            result["more_messages"] = json!(more_messages);
+        }
+        result["retrieval"] = json!(
+            "list_agents for the full roster; inspect_agent for owned child history. Retain message_id for canonical full-text lookup. Summaries are observations, not new assignments."
+        );
         let note = match reason {
             "input_pending" => Some(
                 "Human or team input is waiting and is delivered right after this result. Answer it before waiting again.",

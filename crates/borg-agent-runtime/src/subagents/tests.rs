@@ -7875,6 +7875,8 @@ async fn wait_agent_blocks_until_a_child_finishes_and_reports_it_once() {
         .unwrap();
     assert_eq!(again["reason"], "timeout");
     assert_eq!(again["changes"], json!([]));
+    assert_eq!(again["agents"], json!([]));
+    assert_eq!(again["total_children"], 1);
     scratch.discard().await;
 }
 
@@ -7974,6 +7976,100 @@ async fn wait_agent_returns_on_a_child_report_and_on_waiting_input() {
         .await
         .unwrap();
     assert_eq!(next["reason"], "input_pending");
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn wait_agent_batches_new_reports_without_acknowledging_omitted_messages() {
+    let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
+    let text = "é".repeat(1_200);
+    for _ in 0..10 {
+        coordinator
+            .send_message_as(worker, "/root", &text)
+            .await
+            .unwrap();
+    }
+    let pending = coordinator.unread_messages_for_session(root).await.unwrap();
+    assert_eq!(pending.len(), 10);
+    assert!(pending.iter().all(|message| message.report_text == text));
+    let first = coordinator
+        .wait_for(root, Duration::from_millis(100), WaitSignals::default())
+        .await
+        .unwrap();
+    let messages = first["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 8);
+    assert_eq!(first["more_messages"], 2);
+    for (message, original) in messages.iter().zip(&pending) {
+        assert_eq!(message["message_id"], json!(original.message_id));
+        assert_eq!(message["sender_session_id"], json!(worker));
+        assert_eq!(message["text_truncated"], true);
+        assert_eq!(message["text"].as_str().unwrap().chars().count(), 1_001);
+    }
+    let remaining = coordinator.unread_messages_for_session(root).await.unwrap();
+    assert_eq!(
+        remaining
+            .iter()
+            .map(|message| message.message_id)
+            .collect::<Vec<_>>(),
+        pending[8..]
+            .iter()
+            .map(|message| message.message_id)
+            .collect::<Vec<_>>()
+    );
+    let second = coordinator
+        .wait_for(root, Duration::from_millis(100), WaitSignals::default())
+        .await
+        .unwrap();
+    let second_messages = second["messages"].as_array().unwrap();
+    assert_eq!(second_messages.len(), 2);
+    for (message, original) in second_messages.iter().zip(&remaining) {
+        assert_eq!(message["message_id"], json!(original.message_id));
+    }
+    assert_eq!(second["agents"], json!([]));
+    assert!(
+        coordinator
+            .unread_messages_for_session(root)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let third = coordinator
+        .wait_for(root, Duration::from_millis(100), WaitSignals::default())
+        .await
+        .unwrap();
+    assert_eq!(third["messages"], json!([]));
+
+    // Wake text belongs to the steer, not a second directive in wait output.
+    coordinator
+        .send_message_as(worker, "/root", "new input")
+        .await
+        .unwrap();
+    let wake = coordinator.take_root_inbox().await.pop().unwrap();
+    let waiting = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .wait_for(root, Duration::from_secs(5), WaitSignals::default())
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    coordinator.broadcast_root_message(wake).await;
+    let input = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(input["reason"], "input_pending");
+    assert_eq!(input["messages"], json!([]));
+    assert_eq!(
+        coordinator
+            .unread_messages_for_session(root)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     scratch.discard().await;
 }
 
