@@ -7420,6 +7420,48 @@ impl SubagentCoordinator {
             arguments.remove("action");
         }
         match name {
+            "scout" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Args {
+                    task_name: String,
+                    message: String,
+                }
+                let args: Args = serde_json::from_value(arguments)?;
+                let settings =
+                    crate::self_service::SelfServiceContext::new(self.root_launch.cwd.clone())
+                        .scout_settings()?;
+                let routes = settings.routes()?;
+                #[cfg(not(test))]
+                let capabilities = crate::provider_usage::refresh_provider_capability_usage(
+                    &self.root_launch.capabilities.provider_capabilities,
+                )
+                .await;
+                #[cfg(test)]
+                let capabilities = self.root_launch.capabilities.provider_capabilities.clone();
+                let route = select_scout_route(&routes, &capabilities)
+                    .context("No configured Scout route is available on an allowed billing lane")?;
+                let request = SpawnSubagent {
+                    task_name: args.task_name,
+                    message: format!(
+                        "You are a scout subagent. Explore the assigned question and report concise findings with file paths, relevant symbols, and evidence. Do not edit project files or implement changes. Do not delegate further.\n\n{}",
+                        required_message(&args.message)?
+                    ),
+                    provider: Some(route.provider),
+                    model: route.model.clone(),
+                    effort: route.effort.clone(),
+                    fast: Some(false),
+                    ultrafast: Some(false),
+                };
+                let mut launch = self.subagent_launch(actor_session_id, &request).await?;
+                launch.capabilities.model_fallback = routes.clone();
+                let snapshot = self
+                    .spawn_with_launch(actor_session_id, &request.task_name, launch)
+                    .await?;
+                let mut result = serde_json::to_value(snapshot)?;
+                result["model_fallback"] = serde_json::to_value(routes)?;
+                Ok(result)
+            }
             "spawn_agent" => {
                 let args: SpawnAgentArgs = serde_json::from_value(arguments)?;
                 self.assign_task_in_directory_as(
@@ -8002,6 +8044,56 @@ fn boxed_agent_store_session(
     })
 }
 
+/// Live user settings for the first-class exploration worker.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ScoutSettings {
+    pub model: String,
+    pub fallback: Vec<String>,
+    pub allow_api_billing: bool,
+}
+
+impl Default for ScoutSettings {
+    fn default() -> Self {
+        Self {
+            model: "claude-haiku-5-5@xhigh".into(),
+            fallback: vec!["gpt-6-luna@xhigh".into()],
+            allow_api_billing: false,
+        }
+    }
+}
+
+impl ScoutSettings {
+    pub(crate) fn routes(&self) -> Result<Vec<crate::ModelRoute>> {
+        std::iter::once(&self.model)
+            .chain(&self.fallback)
+            .map(|spec| {
+                let mut route = crate::ModelRoute::parse(spec)?;
+                validate_subagent_overrides(
+                    route.provider,
+                    route.model.as_deref(),
+                    route.effort.as_deref(),
+                )?;
+                route.allow_api_billing = self.allow_api_billing;
+                Ok(route)
+            })
+            .collect()
+    }
+}
+
+fn select_scout_route<'a>(
+    routes: &'a [crate::ModelRoute],
+    capabilities: &[crate::ProviderCapability],
+) -> Option<&'a crate::ModelRoute> {
+    routes.iter().find(|route| {
+        capabilities.iter().any(|capability| {
+            capability.provider == route.provider
+                && capability.can_spawn
+                && route.permitted(capabilities)
+        })
+    })
+}
+
 /// Provider-neutral schemas exposed to every supported execution lane.
 pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
     let description = subagent_tool_description(provider);
@@ -8015,6 +8107,14 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         .flat_map(|catalog| catalog.selectable_models.iter().map(|(model, _)| *model))
         .collect::<Vec<_>>();
     vec![
+        tool(
+            "scout",
+            "Launch a fresh scout subagent for a bounded exploration question, not implementation. Reports findings with paths and evidence. Uses live [scout] settings: Haiku 5.5@xhigh by default, GPT-6 Luna@xhigh fallback; model, effort, fallback and API billing are configurable. Returns the child identity immediately; use wait_agent, inspect_agent or messaging to collect results. Never use provider-native exploration tools.",
+            json!({"type":"object","properties":{
+                "task_name":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[a-z0-9_]+$"},
+                "message":{"type":"string","minLength":1,"description":"The bounded exploration question and relevant context."}
+            },"required":["task_name","message"],"additionalProperties":false}),
+        ),
         tool(
             "spawn_agent",
             &description,
@@ -10437,7 +10537,7 @@ pub(crate) fn exec_tool_spec() -> Value {
 /// The schemas are the catalog's own, taken by name rather than rewritten here.
 /// A second copy of a description is a second thing to forget to update, and
 /// these are descriptions the runtime already depends on.
-pub(crate) fn promoted_capability_tools() -> [&'static str; 12] {
+pub(crate) fn promoted_capability_tools() -> [&'static str; 13] {
     [
         "get_goal",
         "create_goal",
@@ -10445,6 +10545,7 @@ pub(crate) fn promoted_capability_tools() -> [&'static str; 12] {
         "get_plan",
         "update_plan",
         "list_agents",
+        "scout",
         "send_message",
         "followup_task",
         "query_history",

@@ -21,6 +21,7 @@ const MAX_EXTENSION_HISTORY_VERSIONS: usize = 32;
 /// capability grants. A model writing these is escalating its own privileges,
 /// so the write needs a human decision in every mode short of Full Access.
 pub(crate) const TRUSTED_SETTINGS_SECTIONS: &[&str] = &[
+    "scout",
     "mcp",
     "extensions",
     "approvals",
@@ -48,6 +49,7 @@ pub(crate) fn trusted_settings_sections(tool: &str, arguments: &Value) -> Vec<St
 }
 
 const SETTINGS_SECTIONS: &[&str] = &[
+    "scout",
     "capabilities",
     "prompt",
     "extensions",
@@ -165,10 +167,25 @@ impl SelfServiceContext {
         }
     }
 
+    pub(crate) fn scout_settings(&self) -> Result<crate::subagents::ScoutSettings> {
+        let path = self.settings_path("user")?;
+        if !path.is_file() {
+            return Ok(crate::subagents::ScoutSettings::default());
+        }
+        let root: toml::Value = toml::from_str(&fs::read_to_string(path)?)?;
+        let settings: crate::subagents::ScoutSettings = root
+            .get("scout")
+            .cloned()
+            .map(toml::Value::try_into)
+            .transpose()?
+            .unwrap_or_default();
+        Ok(settings)
+    }
+
     fn get_settings(&self, scope: &str) -> Result<Value> {
         let path = self.settings_path(scope)?;
         let exists = path.is_file();
-        let settings = if exists {
+        let mut settings = if exists {
             let source = fs::read_to_string(&path)
                 .with_context(|| format!("failed to read agent settings {}", path.display()))?;
             let parsed: toml::Value = toml::from_str(&source)
@@ -177,12 +194,19 @@ impl SelfServiceContext {
         } else {
             toml::Value::Table(toml::map::Map::new())
         };
+        settings
+            .as_table_mut()
+            .context("agent settings root must be a table")?
+            .insert(
+                "scout".into(),
+                toml::Value::try_from(self.scout_settings()?)?,
+            );
         Ok(json!({
             "scope": scope,
             "path": path,
             "exists": exists,
             "settings": serde_json::to_value(settings)?,
-            "hot_reload": ["commands.aliases", "keybindings"],
+            "hot_reload": ["commands.aliases", "keybindings", "scout"],
             "next_turn_reload": ["extensions", "mcp"],
             "restart_required": [
                 "capabilities", "team", "approvals", "updates", "providers", "prompt"
@@ -324,12 +348,12 @@ impl SelfServiceContext {
             "scope": scope,
             "path": path,
             "updated_sections": updated_sections,
-            "hot_reloaded": ["commands.aliases", "keybindings"],
+            "hot_reloaded": ["commands.aliases", "keybindings", "scout"],
             "next_turn_reloaded": ["extensions", "mcp"],
             "restart_required": [
                 "capabilities", "team", "approvals", "updates", "prompt"
             ],
-            "note": "Aliases and keybindings reload in the running TUI. Blu and base MCP catalogs swap at the next turn boundary; capability/team/approval/update/prompt changes require a new session."
+            "note": "Aliases and keybindings reload in the running TUI; scout settings apply on the next scout call. Blu and base MCP catalogs swap at the next turn boundary; capability/team/approval/update/prompt changes require a new session."
         }))
     }
 
@@ -2152,6 +2176,10 @@ fn validate_settings_shape(root: &toml::Value) -> Result<()> {
             value.is_table(),
             "settings section `{section}` must be a table"
         );
+    }
+    if let Some(scout) = root.get("scout") {
+        let settings: crate::subagents::ScoutSettings = scout.clone().try_into()?;
+        settings.routes()?;
     }
     if let Some(prompt) = root.get("prompt") {
         check_keys(prompt, &["append"], "prompt")?;

@@ -92,7 +92,7 @@ impl ModelRoute {
     /// Whether the host can run this route on a lane it is allowed to spend.
     /// A host that did not report the provider is given the benefit of the
     /// doubt: the turn itself will say if the lane is unusable.
-    fn permitted(&self, capabilities: &[ProviderCapability]) -> bool {
+    pub(crate) fn permitted(&self, capabilities: &[ProviderCapability]) -> bool {
         let Some(capability) = capabilities
             .iter()
             .find(|capability| capability.provider == self.provider)

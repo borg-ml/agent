@@ -9539,3 +9539,88 @@ async fn parent_goal_control_routes_real_actions_and_denies_unrelated_callers() 
     assert_eq!(store.state(child).await.unwrap().goal.unwrap().id, goal.id);
     scratch.discard().await;
 }
+
+#[test]
+fn scout_settings_select_available_routes_without_unapproved_api_billing() {
+    let settings = ScoutSettings::default();
+    let routes = settings.routes().unwrap();
+    let mut capabilities = test_provider_capabilities();
+    for capability in &mut capabilities {
+        capability.billing = Some(crate::BillingLane::Subscription);
+    }
+    let primary = select_scout_route(&routes, &capabilities).unwrap();
+    assert_eq!(primary.model.as_deref(), Some("claude-haiku-5-5"));
+    assert_eq!(primary.effort.as_deref(), Some("xhigh"));
+    capabilities
+        .iter_mut()
+        .find(|c| c.provider == CodingProvider::Claude)
+        .unwrap()
+        .can_spawn = false;
+    let fallback = select_scout_route(&routes, &capabilities).unwrap();
+    assert_eq!(fallback.model.as_deref(), Some("gpt-6-luna"));
+    assert_eq!(fallback.effort.as_deref(), Some("xhigh"));
+    capabilities
+        .iter_mut()
+        .find(|c| c.provider == CodingProvider::Codex)
+        .unwrap()
+        .billing = Some(crate::BillingLane::ApiKey);
+    assert!(select_scout_route(&routes, &capabilities).is_none());
+    let configured: ScoutSettings = toml::from_str(
+        r#"
+model = "gpt-6-luna@high"
+fallback = []
+allow_api_billing = true
+"#,
+    )
+    .unwrap();
+    let configured_routes = configured.routes().unwrap();
+    assert_eq!(
+        select_scout_route(&configured_routes, &capabilities)
+            .unwrap()
+            .effort
+            .as_deref(),
+        Some("high")
+    );
+    assert!(toml::from_str::<ScoutSettings>("unknown = true").is_err());
+    assert!(
+        ScoutSettings {
+            model: "claude-haiku-5-5@invalid".into(),
+            ..settings
+        }
+        .routes()
+        .is_err()
+    );
+}
+
+#[test]
+fn scout_child_transcripts_are_not_parent_model_context() {
+    let event = SessionEventKind::SubagentActivity {
+        activity: SubagentActivityKind::Updated,
+        agent: {
+            let mut table = SubagentTable {
+                root_session_id: Uuid::new_v4(),
+                max_children: 2,
+                entries: HashMap::new(),
+                task_names: HashMap::new(),
+                parking: None,
+                resume_after_restore: Vec::new(),
+            };
+            table.reserve("scout", &launch()).unwrap()
+        },
+        event: Some(Box::new(SessionEvent::new(
+            Uuid::new_v4(),
+            1,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "scout-search".into(),
+                output: "large private exploration result".into(),
+                output_ref: None,
+                parent_tool_call_id: None,
+                input: None,
+                input_ref: None,
+                is_error: false,
+            },
+        ))),
+    };
+    assert!(!event.is_context_relevant());
+    assert!(event.is_subagent_relevant());
+}

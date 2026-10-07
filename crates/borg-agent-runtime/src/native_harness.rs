@@ -4047,10 +4047,10 @@ fn mutating_builtin_approval(name: &str, input: &Value) -> Option<(&'static str,
                 bounded_text(field("new_text"), MAX_APPROVAL_DETAIL_BYTES / 2),
             ),
         )),
-        "spawn_agent" => Some((
+        "spawn_agent" | "scout" => Some((
             "Spawn subagent",
             format!(
-                "spawn_agent {}{}: {}",
+                "{name} {}{}: {}",
                 field("task_name"),
                 input
                     .get("provider")
@@ -5430,6 +5430,14 @@ mod tests {
             &json!({"task_name": "build", "message": "compile it", "provider": "codex"}),
         )
         .expect("spawn_agent is gated");
+        assert_eq!(
+            mutating_builtin_approval(
+                "scout",
+                &json!({"task_name":"map", "message":"find entry points"})
+            )
+            .map(|(title, _)| title),
+            Some("Spawn subagent")
+        );
         assert_eq!(spawn.0, "Spawn subagent");
         assert!(spawn.1.contains("build") && spawn.1.contains("[codex]"));
 
