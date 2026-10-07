@@ -41,8 +41,8 @@ fn rules() -> &'static [Rule] {
             ),
             // Anthropic keys are checked before the generic `sk-` rule so the
             // more specific label wins.
-            rule("anthropic-key", r"sk-ant-[A-Za-z0-9_-]{20,}"),
-            rule("openai-key", r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
+            rule("anthropic-key", r"\bsk-ant-[A-Za-z0-9_-]{20,}"),
+            rule("openai-key", r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
             rule("github-token", r"gh[pousr]_[A-Za-z0-9]{36,}"),
             rule("aws-access-key-id", r"AKIA[0-9A-Z]{16}"),
             rule("google-api-key", r"AIza[0-9A-Za-z_-]{35}"),
@@ -103,6 +103,28 @@ mod tests {
         let scrubbed = scrub_secrets(text);
         assert!(matches!(scrubbed, Cow::Borrowed(_)));
         assert_eq!(scrubbed, text);
+    }
+
+    // A compiler check cannot guard token boundaries: the old regex matched
+    // the sk- suffix inside ordinary task identifiers and corrupted journals.
+    #[test]
+    fn preserves_long_task_names_but_still_redacts_standalone_keys() {
+        let text = concat!(
+            "1/7 Test #94: ws2-ta",
+            "sk-consumers-contract-test ... Passed"
+        );
+        assert!(matches!(scrub_secrets(text), Cow::Borrowed(_)));
+        assert_eq!(scrub_secrets(text), text);
+        let key = format!("sk-proj-{}", "A".repeat(32));
+        assert_eq!(
+            scrub_secrets(&format!("key={key}")),
+            "key=[redacted:openai-key]"
+        );
+        let key = format!("sk-ant-{}", "B".repeat(32));
+        assert_eq!(
+            scrub_secrets(&format!("key={key}")),
+            "key=[redacted:anthropic-key]"
+        );
     }
 
     #[test]
