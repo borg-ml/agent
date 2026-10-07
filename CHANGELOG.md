@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.14.7)
 
+### Subagents
+
+- Add `scout`, a first-class tool for bounded exploration in a fresh subagent
+  with its own context window. Findings return to the parent without dumping
+  the child's transcript into the parent model's context.
+- Scout defaults to Haiku 5.5 at `xhigh`, with GPT-6 Luna at `xhigh` as fallback.
+  Model routes, effort, fallback, and API billing opt-in are configurable through
+  live `[scout]` settings; changes apply to the next scout call.
+
 ## 0.14.7 (2026-10-07)
 
 ### Terminal
