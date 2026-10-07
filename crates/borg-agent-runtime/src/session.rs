@@ -2847,14 +2847,29 @@ async fn run_agent_session_store_kernel_inner(
         if !usage_limit_retry_waiting {
             usage_wait_prompts = None;
         }
-        // Before admitting, fold any queued team notifications into one prompt.
-        // This runs ahead of `pop_next_pending_prompt`, which still prefers a
-        // human prompt, so batching can never take a turn from a person.
+        // Before admitting, fold queued team notifications into a bounded batch.
         coalesce_pending_team_notifications(
             &mut pending,
             &autonomy_prompt_ids,
             usage_limit_continuation_id,
         );
+        // Human priority is untouched, and each settled batch yields back to
+        // host input before another one is checked or admitted.
+        if !pending
+            .iter()
+            .any(|prompt| prompt.actor == EventActor::User)
+            && settle_acknowledged_team_notifications(
+                &mut journal,
+                &events,
+                session_id,
+                participant_id,
+                work_plan.store.as_ref(),
+                &mut pending,
+            )
+            .await?
+        {
+            continue;
+        }
         let next = if !usage_limit_retry_waiting
             && let Some(prompt) = pop_next_pending_prompt(
                 &mut pending,
@@ -10397,6 +10412,69 @@ fn pop_next_pending_prompt(
         return pending.remove(index);
     }
     allow_internal_turn.then(|| pending.pop_front()).flatten()
+}
+
+/// An explicit inbox acknowledgment can precede this prompt's own turn.
+/// Check only the next bounded batch, including after restart. Unknown input
+/// and another recipient's acknowledgment cannot settle our queued request.
+async fn settle_acknowledged_team_notifications(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    participant_id: Uuid,
+    workspace_store: &dyn WorkspaceStore,
+    pending: &mut VecDeque<QueuedPrompt>,
+) -> Result<bool> {
+    let Some(prompt) = pending.front().filter(|prompt| {
+        prompt.actor == EventActor::System
+            && prompt.visible
+            && prompt.delivery == PromptDelivery::Queue
+    }) else {
+        return Ok(false);
+    };
+    let mut statuses = Vec::new();
+    let mut remaining = Vec::new();
+    for entry in prompt.batch_entries() {
+        let acknowledged = if entry.actor == EventActor::System {
+            match workspace_store.message_deliveries(entry.message_id).await {
+                Ok(deliveries) => deliveries.iter().any(|delivery| {
+                    delivery.recipient_id == participant_id
+                        && delivery.state == crate::DeliveryState::Acknowledged
+                }),
+                Err(error) => {
+                    tracing::warn!(message_id = %entry.message_id, %error,
+                        "retaining queued input: cannot check team acknowledgment");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if acknowledged {
+            statuses.push((entry, MessageStatus::Complete, prompt.delivery));
+        } else {
+            remaining.push(entry);
+        }
+    }
+    if statuses.is_empty() {
+        return Ok(false);
+    }
+    // Persist before removing local input so a reload cannot replay it.
+    record_prompt_statuses(journal, events, session_id, statuses).await?;
+    let prompt = pending
+        .pop_front()
+        .expect("checked pending prompt is still queued");
+    for entry in remaining.into_iter().rev() {
+        pending.push_front(QueuedPrompt {
+            message_id: entry.message_id,
+            text: entry.text,
+            actor: entry.actor,
+            attachments: entry.attachments,
+            batch: Vec::new(),
+            ..prompt.clone()
+        });
+    }
+    Ok(true)
 }
 
 async fn settle_team_notification(

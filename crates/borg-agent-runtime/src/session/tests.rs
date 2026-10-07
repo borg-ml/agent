@@ -18568,6 +18568,161 @@ async fn delivery_state(
         .state
 }
 
+/// An inbox read/ack during goal work must not replay the same side request
+/// from the child's local queue after completion or restart. This needs the
+/// real delivery ledger: another recipient's ack must not discard our input.
+#[tokio::test]
+async fn acknowledged_queued_team_input_cannot_reopen_completed_work() {
+    let (scratch, session_id, session_store, workspace_store, binding, projection) =
+        team_delivery_fixture().await;
+    let old = append_team_message(
+        &workspace_store,
+        &binding,
+        "old assignment",
+        crate::DeliveryMode::NextTurn,
+    )
+    .await;
+    let fresh = append_team_message(
+        &workspace_store,
+        &binding,
+        "new assignment",
+        crate::DeliveryMode::NextTurn,
+    )
+    .await;
+    let mut other = binding.clone();
+    other.participant_id = crate::local_human_participant_id("Human");
+    let other_ack = append_team_message(
+        &workspace_store,
+        &other,
+        "other recipient",
+        crate::DeliveryMode::NextTurn,
+    )
+    .await;
+    for (id, recipient) in [
+        (old, binding.participant_id),
+        (other_ack, other.participant_id),
+    ] {
+        for state in [
+            crate::DeliveryState::Admitted,
+            crate::DeliveryState::Acknowledged,
+        ] {
+            workspace_store
+                .transition_message_delivery(binding.workspace_id, id, recipient, state, None)
+                .await
+                .unwrap();
+        }
+    }
+    workspace_store
+        .transition_message_delivery(
+            binding.workspace_id,
+            fresh,
+            binding.participant_id,
+            crate::DeliveryState::Admitted,
+            None,
+        )
+        .await
+        .unwrap();
+    let note = |id, text: &str, actor| QueuedPrompt {
+        message_id: id,
+        text: text.into(),
+        actor,
+        attachments: vec![PathBuf::from(format!("{id}.png"))],
+        output_schema: None,
+        delivery: PromptDelivery::Queue,
+        visible: true,
+        interrupt_batch: actor == EventActor::User,
+        batch: Vec::new(),
+    };
+    let human = note(Uuid::new_v4(), "human first", EventActor::User);
+    let fresh_note = note(fresh, "new assignment", EventActor::System);
+    let unknown = note(Uuid::new_v4(), "watch notification", EventActor::System);
+    let mut pending = VecDeque::from([
+        human.clone(),
+        note(old, "old assignment", EventActor::System),
+        fresh_note.clone(),
+        note(other_ack, "other recipient", EventActor::System),
+        unknown.clone(),
+    ]);
+    let store: Arc<dyn SessionStore> = session_store.clone();
+    let mut journal =
+        RuntimeSessionStore::new(store, Vec::new(), true).with_workspace_projection(projection);
+    let (events, _receiver) = mpsc::channel(32);
+    for prompt in &pending {
+        record_prompt_status(
+            &mut journal,
+            &events,
+            session_id,
+            prompt,
+            MessageStatus::Queued,
+            PromptDelivery::Queue,
+        )
+        .await
+        .unwrap();
+    }
+    coalesce_pending_team_notifications(&mut pending, &HashSet::new(), None);
+    assert!(pending.iter().any(|p| p.batch.len() == 4));
+    assert!(
+        !settle_acknowledged_team_notifications(
+            &mut journal,
+            &events,
+            session_id,
+            binding.participant_id,
+            workspace_store.as_ref(),
+            &mut pending,
+        )
+        .await
+        .unwrap(),
+        "a human prompt is never inspected as team input"
+    );
+    assert_eq!(pop_next_pending_prompt(&mut pending, true).unwrap(), human);
+    assert!(
+        settle_acknowledged_team_notifications(
+            &mut journal,
+            &events,
+            session_id,
+            binding.participant_id,
+            workspace_store.as_ref(),
+            &mut pending,
+        )
+        .await
+        .unwrap(),
+        "settlement yields before admitting another queued batch"
+    );
+    assert_eq!(pending.len(), 3);
+    assert!(!pending.iter().any(|p| p.message_id == old));
+    assert_eq!(
+        pending.iter().find(|p| p.message_id == fresh).unwrap(),
+        &fresh_note
+    );
+    assert_eq!(
+        pending
+            .iter()
+            .find(|p| p.message_id == unknown.message_id)
+            .unwrap(),
+        &unknown
+    );
+    assert!(pending.iter().any(|p| p.message_id == other_ack));
+    assert_eq!(
+        delivery_state(&workspace_store, &binding, old).await,
+        crate::DeliveryState::Acknowledged
+    );
+    assert_eq!(
+        delivery_state(&workspace_store, &binding, fresh).await,
+        crate::DeliveryState::Admitted
+    );
+    // No provider turn was needed; terminal status is enough to prevent replay.
+    let recovery = session_store.recovery(session_id).await.unwrap();
+    let recovered = recover_prompts_on_resume(&recovery.queue_events);
+    assert!(
+        !recovered
+            .iter()
+            .flat_map(|p| p.batch_entries())
+            .any(|e| e.message_id == old)
+    );
+    assert!(recovered.iter().any(|p| p.message_id == fresh));
+    scratch.discard().await;
+}
+
 /// A busy child is steered mid-turn, so no `TurnCompleted` ever names the
 /// team message. Team prompts are journaled as `System`, so gating admission
 /// on `User` left the delivery pending forever and every later inbox read
