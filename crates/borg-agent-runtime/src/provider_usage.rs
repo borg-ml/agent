@@ -22,6 +22,33 @@ type ProviderUsageCache = HashMap<CodingProvider, (Instant, Option<ProviderUsage
 
 pub static PROVIDER_USAGE_CACHE: OnceLock<Mutex<ProviderUsageCache>> = OnceLock::new();
 
+/// How long one `claude auth status` login read is shared. Every session runs
+/// a capability refresh loop every few seconds; without this, each loop
+/// spawned its own heavy Claude CLI process, which on a host with dozens of
+/// sessions kept several cores busy permanently.
+pub const CLAUDE_LOGIN_STATUS_CACHE_TTL: Duration = Duration::from_secs(60);
+
+static CLAUDE_LOGIN_STATUS_CACHE: OnceLock<Mutex<Option<(Instant, bool)>>> = OnceLock::new();
+
+/// Process-wide, single-flight cached Claude login read. Holding the async
+/// mutex across the probe makes concurrent refreshes wait for one process
+/// instead of each spawning their own. A failed read is not cached, so the
+/// caller keeps its last admitted state and the next refresh retries.
+async fn cached_claude_subscription_status() -> Option<bool> {
+    let cache = CLAUDE_LOGIN_STATUS_CACHE.get_or_init(|| Mutex::new(None));
+    let mut slot = cache.lock().await;
+    if let Some((read_at, authenticated)) = *slot {
+        if read_at.elapsed() < CLAUDE_LOGIN_STATUS_CACHE_TTL {
+            return Some(authenticated);
+        }
+    }
+    let authenticated = borg_provider::provider::read_claude_subscription_status()
+        .await
+        .ok()?;
+    *slot = Some((Instant::now(), authenticated));
+    Some(authenticated)
+}
+
 pub async fn refresh_provider_capability_usage(
     capabilities: &[ProviderCapability],
 ) -> Vec<ProviderCapability> {
@@ -36,9 +63,7 @@ pub async fn refresh_provider_capability_usage(
         {
             // Login can change after this session's startup snapshot. A failed
             // read is not proof of logout; retain the last admitted state.
-            if let Ok(authenticated) =
-                borg_provider::provider::read_claude_subscription_status().await
-            {
+            if let Some(authenticated) = cached_claude_subscription_status().await {
                 apply_claude_subscription_status(capability, authenticated);
             }
         }
