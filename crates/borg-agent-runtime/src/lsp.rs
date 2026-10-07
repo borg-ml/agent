@@ -1280,6 +1280,19 @@ async fn compilation_configuration_stamp(
             ));
         }
     }
+    // clangd inherits .clangd files above a nested CMake/project root too.
+    // Keep those in the stamp so a parent override change cannot leave a
+    // warm client serving diagnostics from a different compilation context.
+    for ancestor in root.ancestors().skip(1) {
+        let path = ancestor.join(".clangd");
+        if let Ok(metadata) = tokio::fs::metadata(&path).await {
+            stamp.push((
+                path,
+                metadata.len(),
+                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+            ));
+        }
+    }
     stamp
 }
 
@@ -1313,6 +1326,10 @@ async fn ready_client<'a>(
             configuration.extend(compilation_configuration_stamp(spec, &directory).await);
         }
     }
+    // Ancestors may be reached from several opened documents. Compare the
+    // configuration set, not duplicate counts or the order of document visits.
+    configuration.sort();
+    configuration.dedup();
     let changed = slot
         .ready_mut()
         .is_some_and(|client| client.compilation_configuration != configuration);
@@ -1441,11 +1458,10 @@ fn uses_compilation_database(spec: &ServerSpec) -> bool {
 // clangd configuration may choose a different database per path. Finding a
 // nearby database is not proof that clangd uses it; avoid a false "present" /
 // coversFile claim until configuration selection can be resolved faithfully.
-async fn clangd_database_override(search_start: &Path, workspace_root: &Path) -> Option<PathBuf> {
+async fn clangd_database_override(search_start: &Path) -> Option<PathBuf> {
+    // A discovered nested project root does not stop clangd's configuration
+    // inheritance. Its parent .clangd may override a nearer compile database.
     for directory in search_start.ancestors() {
-        if !directory.starts_with(workspace_root) {
-            break;
-        }
         let path = directory.join(".clangd");
         if let Ok(contents) = tokio::fs::read_to_string(&path).await
             && contents.lines().any(|line| {
@@ -1474,7 +1490,7 @@ async fn compilation_context_status(
         .and_then(Path::parent)
         .unwrap_or(workspace_root)
         .to_path_buf();
-    if let Some(configuration) = clangd_database_override(&search_start, workspace_root).await {
+    if let Some(configuration) = clangd_database_override(&search_start).await {
         return Some(json!({
             "status": "unverified",
             "diagnosticTrust": "clangd_database_override_not_code_error_proof",
@@ -2849,6 +2865,38 @@ mod tests {
                 .await
                 .is_none(),
             "servers that do not read a compilation database stay unannotated"
+        );
+    }
+
+    // Native compilation cannot guard this metadata contract: clangd may
+    // inherit a parent database override while the nested target builds with
+    // its own flags. Never certify those diagnostics as covered by that target.
+    #[tokio::test]
+    async fn nested_clangd_context_inherits_parent_database_override() {
+        let parent = tempfile::tempdir().expect("parent project");
+        let nested = parent.path().join("nested");
+        tokio::fs::create_dir(&nested).await.unwrap();
+        let source = nested.join("unit.cpp");
+        tokio::fs::write(&source, "int value;\n").await.unwrap();
+        tokio::fs::write(nested.join("compile_flags.txt"), "-std=c++20\n")
+            .await
+            .unwrap();
+        let clangd = spec_for_id("clangd").unwrap();
+        let before = compilation_configuration_stamp(clangd, &nested).await;
+        let inherited = parent.path().join(".clangd");
+        tokio::fs::write(&inherited, "CompileFlags:\n  CompilationDatabase: build\n")
+            .await
+            .unwrap();
+
+        let report = compilation_context_status(&nested, clangd, Some(&source))
+            .await
+            .unwrap();
+        assert_eq!(report["status"], json!("unverified"));
+        assert_eq!(report["coversFile"], json!("unknown"));
+        assert_eq!(report["clangdConfiguration"], json!(inherited));
+        assert_ne!(
+            before,
+            compilation_configuration_stamp(clangd, &nested).await
         );
     }
 
