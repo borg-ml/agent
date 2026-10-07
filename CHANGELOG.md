@@ -24,6 +24,12 @@ Git comparison.
 
 ### Subagents
 
+- Spawning a task always creates a new child, preserving idle workers' names,
+  context, answers and follow-up addresses.
+- Shared-work creation returns explicit work and event IDs; revision conflicts
+  report the expected and current revisions.
+- Keep autonomous-team policy metadata on `spawn_agent` when scout is enabled.
+
 - Add `scout`, a first-class tool for bounded exploration in a fresh subagent
   with its own context window. Findings return to the parent without dumping
   the child's transcript into the parent model's context.

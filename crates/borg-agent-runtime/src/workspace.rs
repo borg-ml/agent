@@ -1110,7 +1110,8 @@ impl WorkSnapshot {
                 edit(*work_id)?;
                 ensure!(
                     item(*work_id)?.revision == *expected_revision,
-                    "work revision conflict"
+                    "work revision conflict: expected {expected_revision}, current {}",
+                    item(*work_id)?.revision
                 );
             }
             WorkspaceEventKind::WorkPlanUpdated {
@@ -1126,7 +1127,7 @@ impl WorkSnapshot {
                 member(*assignee_id)?;
                 ensure!(
                     plan_revision == *expected_revision,
-                    "work revision conflict"
+                    "work revision conflict: expected {expected_revision}, current {plan_revision}"
                 );
                 let mut ids = std::collections::HashSet::new();
                 for update in items {

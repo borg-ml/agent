@@ -1505,23 +1505,24 @@ pub async fn work_plan_is_a_revision_checked_assignment_projection(
         empty_director.revision > other.revision,
         "reassignment advances the now-empty old owner plan"
     );
-    assert!(
-        store
-            .update_work_plan(
-                workspace,
-                actor,
-                actor,
-                "stale".into(),
-                first.revision,
-                vec![]
-            )
-            .await
-            .is_err()
-    );
+    let conflict = store
+        .update_work_plan(
+            workspace,
+            actor,
+            actor,
+            "stale".into(),
+            first.revision,
+            vec![],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
     let current = store
         .work_items(workspace, actor, Some(actor))
         .await
         .unwrap();
+    assert!(conflict.contains(&format!("expected {}", first.revision)));
+    assert!(conflict.contains(&format!("current {}", current.revision)));
     assert_eq!(current.items.len(), 2);
     let cleared = store
         .update_work_plan(

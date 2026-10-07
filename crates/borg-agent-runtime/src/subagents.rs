@@ -3442,14 +3442,19 @@ impl SharedWorkToolContext {
                     parent_id: args.parent_id,
                     blocked_reason: optional_tool_text(args.blocked_reason),
                 };
-                self.append(
-                    key,
-                    WorkspaceEventKind::WorkCreated {
-                        work,
-                        mode: DeliveryMode::Notify,
-                    },
-                )
-                .await
+                let mut result = self
+                    .append(
+                        key,
+                        WorkspaceEventKind::WorkCreated {
+                            work,
+                            mode: DeliveryMode::Notify,
+                        },
+                    )
+                    .await?;
+                result["event_id"] = result["id"].clone();
+                result["work"] = result["kind"]["work"].clone();
+                result["id"] = result["work"]["id"].clone();
+                Ok(result)
             }
             "assign_shared_work" => {
                 let args: AssignSharedWorkArgs = serde_json::from_value(arguments)?;
@@ -3686,10 +3691,6 @@ struct SubagentEntry {
     snapshot: SubagentSnapshot,
     commands: Option<mpsc::Sender<HostCommand>>,
     inbox: Vec<TeamInboxMessage>,
-    /// A delegation has selected this ready worker but its actor has not yet
-    /// projected the next status boundary. This closes the double-assignment
-    /// window without misreporting the durable lifecycle state.
-    assignment_claimed: bool,
     /// Restored children are metadata-only until an explicit child-directed
     /// action wakes them. This prevents resuming an idle root from silently
     /// starting providers in the background.
@@ -3773,7 +3774,6 @@ impl SubagentTable {
                 snapshot: snapshot.clone(),
                 commands: None,
                 inbox: Vec::new(),
-                assignment_claimed: false,
                 dormant: false,
             },
         );
@@ -4655,7 +4655,6 @@ impl SubagentCoordinator {
                         snapshot: snapshot.clone(),
                         commands: None,
                         inbox: Vec::new(),
-                        assignment_claimed: false,
                         dormant: !snapshot.status.is_terminal() && !recovery_failed,
                     },
                 );
@@ -4893,19 +4892,15 @@ impl SubagentCoordinator {
         Ok(snapshot)
     }
 
-    /// Give `request` to a compatible idle worker, or spawn a child for it.
-    /// `fresh` always spawns: an idle worker may be holding context or
-    /// unlanded work its parent means to follow up on, and reusing it renames
-    /// it and drops its last answer.
+    /// Spawn a new child without repurposing another task's session.
     async fn assign_task_in_directory_as(
         &self,
         actor_session_id: Uuid,
         request: SpawnSubagent,
-        fresh: bool,
+        _fresh: bool,
         directory: Option<PathBuf>,
     ) -> Result<Value> {
         let mut launch = self.subagent_launch(actor_session_id, &request).await?;
-        let explicit_directory = directory.is_some();
         if let Some(directory) = directory {
             let base = if actor_session_id == self.root_session_id {
                 self.root_launch.cwd.clone()
@@ -4942,9 +4937,7 @@ impl SubagentCoordinator {
             .as_deref()
             .expect("subagent launch has a canonical task name")
             .to_string();
-        // Members get fresh children; never repurpose another branch's context.
         let member = (actor_session_id != self.root_session_id).then_some(actor_session_id);
-        let may_reuse = !fresh && !explicit_directory && member.is_none();
         if let Some(member) = member {
             let requester = self
                 .get(member)
@@ -4960,171 +4953,6 @@ impl SubagentCoordinator {
                  receives your final answer.\n\n{prompt}"
             ));
         }
-        let claimed = {
-            let mut table = self.table.lock().await;
-            anyhow::ensure!(
-                !table.task_names.contains_key(&assignment_name),
-                "subagent task name already exists: {assignment_name}; use followup_task to give it more work"
-            );
-            // Claim and rename under one lock. The name is what the roster,
-            // `resolve`, and child-report attribution all key on, so a reused
-            // worker that keeps its previous name reports the new task under
-            // the old identity. Holding the lock across both steps also makes
-            // the uniqueness check above authoritative: two concurrent
-            // assignments cannot reserve the same name.
-            let parents = table
-                .entries
-                .values()
-                .map(|entry| entry.snapshot.parent_session_id)
-                .collect::<HashSet<_>>();
-            let claimed = table
-                .entries
-                .values_mut()
-                .filter(|entry| {
-                    may_reuse
-                        && entry.snapshot.parent_session_id == actor_session_id
-                        && !parents.contains(&entry.snapshot.session_id)
-                        && entry.snapshot.status == SubagentStatus::Ready
-                        && !entry.assignment_claimed
-                        && !is_persistent_peer_lane(&entry.snapshot.task_name)
-                        && entry.snapshot.provider == launch.provider
-                        && entry.snapshot.model == launch.model
-                        && entry.snapshot.effort == launch.effort
-                        && entry.snapshot.fast == launch.fast.unwrap_or(false)
-                        && entry.snapshot.ultrafast == launch.ultrafast.unwrap_or(false)
-                })
-                .min_by_key(|entry| entry.snapshot.updated_at)
-                .map(|entry| {
-                    let previous_name =
-                        std::mem::replace(&mut entry.snapshot.task_name, assignment_name.clone());
-                    // The previous task's answer is not this task's result.
-                    let previous_final_text = entry.snapshot.final_text.take();
-                    entry.assignment_claimed = true;
-                    entry.snapshot.updated_at = Utc::now();
-                    entry.snapshot.detail = Some(format!("Assigned new task {assignment_name}"));
-                    (entry.snapshot.clone(), previous_name, previous_final_text)
-                });
-            if let Some((snapshot, previous_name, _)) = &claimed {
-                table.task_names.remove(previous_name);
-                table
-                    .task_names
-                    .insert(assignment_name.clone(), snapshot.session_id);
-            }
-            claimed
-        };
-
-        if let Some((claimed, previous_name, previous_final_text)) = claimed {
-            // A human stop belongs to the task the human stopped, not to the
-            // next one. A stopped worker still reports `Ready`, because the
-            // stop journals that status in the same breath it latches the
-            // gate, so it is claimed here like any idle worker -- and then
-            // the assignment, which arrives as a team message and therefore
-            // as `System`, is held by the user-stop gate and never runs. The
-            // roster shows the new task name on a worker that silently does
-            // nothing.
-            //
-            // Clearing the gate here is not the answer. `Ready` is set the
-            // instant the human interrupts, so a worker stopped seconds ago
-            // is indistinguishable from one retired long ago, and an agent
-            // claim must never overrule a live human stop. Leave the stop
-            // exactly as it is and spawn a fresh worker instead.
-            let reusable = match self.store.state(claimed.session_id).await {
-                Ok(state) => !state.user_stopped,
-                Err(error) => {
-                    // A gate that cannot be read is not a gate that is open.
-                    tracing::warn!(
-                        %error,
-                        session_id = %claimed.session_id,
-                        "could not read the user-stop gate of a reuse candidate; spawning instead"
-                    );
-                    false
-                }
-            };
-            // Membership is repaired here, before the hand-off, and never
-            // after one fails.
-            //
-            // A child restored from the journal is bound into the team
-            // workspace but carries no membership row, so `resolve_recipients`
-            // refuses its assignment as "audience contains a non-member".
-            // Startup repair covers a child this process restored; a worker
-            // that was already on the roster is only met again here, on the
-            // ordinary reuse path, which is where the gap surfaces.
-            //
-            // The order is the safety property. This runs while nothing has
-            // been persisted, so a failure can release the claim and fall
-            // through to a fresh spawn with no risk of the task running twice.
-            // Once the hand-off starts, a failure may follow a durable enqueue
-            // and must not be retried -- which is why the repair is a
-            // precondition and not a recovery.
-            //
-            // Idempotent by construction: `ensure_execution_workspace` inserts
-            // on conflict do nothing and refreshes the display name, so a
-            // worker that already belongs is unchanged apart from taking the
-            // name of the task it was just given.
-            let reusable = reusable
-                && match self
-                    .join_team_workspace(claimed.session_id, &assignment_name)
-                    .await
-                {
-                    Ok(()) => true,
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            session_id = %claimed.session_id,
-                            "could not give a reuse candidate its team membership; spawning instead"
-                        );
-                        false
-                    }
-                };
-            if !reusable {
-                self.release_assignment_claim(
-                    claimed.session_id,
-                    &assignment_name,
-                    previous_name,
-                    previous_final_text,
-                    "Not reused; original task retained".to_string(),
-                )
-                .await;
-                // Falls through to the spawn below, which reports reused=false.
-            } else {
-                let target = format!("session:{}", claimed.session_id);
-                if let Err(error) = self
-                    .route_followup_task_with_options_as(
-                        actor_session_id,
-                        &target,
-                        launch
-                            .initial_prompt
-                            .as_deref()
-                            .expect("subagent launch has an initial prompt"),
-                        TeamMessageOptions::default(),
-                    )
-                    .await
-                {
-                    self.release_assignment_claim(
-                        claimed.session_id,
-                        &assignment_name,
-                        previous_name,
-                        previous_final_text,
-                        format!("Automatic task assignment failed: {error:#}"),
-                    )
-                    .await;
-                    return Err(error);
-                }
-                let renamed = self.get(claimed.session_id).await.unwrap_or(claimed);
-                // Journal the rename now. `restore_from_events` rebuilds the
-                // task-name index from the latest durable snapshot, so a reused
-                // worker that is only renamed in memory comes back under its
-                // previous name if the parent dies before the child's next event.
-                let _ = self.activity_tx.send(SubagentActivity::Started {
-                    agent: renamed.clone(),
-                });
-                let mut value = serde_json::to_value(renamed)?;
-                value["reused"] = Value::Bool(true);
-                value["assignment_task_name"] = Value::String(assignment_name);
-                return Ok(value);
-            }
-        }
-
         let agent = self
             .spawn_with_launch(actor_session_id, &request.task_name, launch)
             .await?;
@@ -5132,40 +4960,6 @@ impl SubagentCoordinator {
         value["reused"] = Value::Bool(false);
         value["assignment_task_name"] = Value::String(assignment_name);
         Ok(value)
-    }
-
-    /// Return a claimed worker to the identity it had before the claim.
-    ///
-    /// A half-applied rename would strand the roster on a task that is not
-    /// running and leak the new name out of the index forever, so the claim
-    /// flag, the task name, the previous answer and the name index are all
-    /// unwound together. Shared by every path that claims a worker and then
-    /// declines to hand it the task.
-    async fn release_assignment_claim(
-        &self,
-        session_id: Uuid,
-        assignment_name: &str,
-        previous_name: String,
-        previous_final_text: Option<String>,
-        detail: String,
-    ) {
-        let mut table = self.table.lock().await;
-        let mut restore_previous_name = false;
-        if let Some(entry) = table.entries.get_mut(&session_id)
-            && entry.assignment_claimed
-            && entry.snapshot.task_name == assignment_name
-        {
-            entry.assignment_claimed = false;
-            entry.snapshot.updated_at = Utc::now();
-            entry.snapshot.task_name = previous_name.clone();
-            entry.snapshot.final_text = previous_final_text;
-            entry.snapshot.detail = Some(detail);
-            restore_previous_name = true;
-        }
-        if restore_previous_name {
-            table.task_names.remove(assignment_name);
-            table.task_names.insert(previous_name, session_id);
-        }
     }
 
     /// Return the durable child for a provider-specific sidecar, creating it
@@ -7944,10 +7738,6 @@ fn persistent_peer_lane(provider: CodingProvider) -> (&'static str, &'static str
     }
 }
 
-fn is_persistent_peer_lane(task_name: &str) -> bool {
-    matches!(task_name, "/root/claude" | "/root/gpt")
-}
-
 fn resolve_persistent_peer_profile(
     parent_provider: CodingProvider,
     profile: Option<&str>,
@@ -8139,10 +7929,10 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
                     "reasoning_effort": { "type": "string" },
                     "fast": { "type": "boolean", "description": "Select fast mode for this child. Omit speed fields to inherit the live parent's tier on the same provider; explicit false selects standard mode. Only supported models/accounts can enable it." },
                     "ultrafast": { "type": "boolean", "description": "Select the Codex/OpenAI premium tier when supported. Mutually exclusive with fast; explicit speed settings override inheritance." },
-                    "cwd": {"type":"string", "description":"Explicit existing worktree/default tool directory for a NEW child. Relative to the author workspace. Never takes over or rewrites existing sessions; specifying cwd disables idle-worker reuse. Exec/runtime/read/search/LSP start here; later explicit shell cd or path overrides remain deliberate. Outside-workspace assignment requires Full Access."},
+                    "cwd": {"type":"string", "description":"Explicit existing worktree/default tool directory for a NEW child. Relative to the author workspace. Never takes over or rewrites existing sessions. Exec/runtime/read/search/LSP start here; later explicit shell cd or path overrides remain deliberate. Outside-workspace assignment requires Full Access."},
                     "fresh": {
                         "type": "boolean",
-                        "description": "Always start a new child session instead of reusing an idle worker with the same profile. Use it when idle workers hold context or pending work you will follow up on, or the task needs a clean context."
+                        "description": "Accepted for compatibility; spawn_agent always starts a new child session. Use followup_task to continue an existing task."
                     }
                 },
                 "required": ["task_name", "message"],
@@ -8311,10 +8101,9 @@ fn subagent_tool_description(provider: CodingProvider) -> String {
             )
         });
     format!(
-        "Delegate a concrete, bounded task. Borg atomically reuses a compatible idle worker \
-         when one is available and otherwise spawns an isolated child session; do not list \
-         agents or issue follow-up calls just to manage worker capacity. Pass fresh:true to \
-         always start a new session, leaving idle workers to their own tasks. Omit provider, model, \
+        "Delegate a concrete, bounded task in a new isolated child session. Existing task names, \
+         conversation context, goals and work are never repurposed. Use followup_task to continue \
+         an existing task. Omit provider, model, \
          and reasoning_effort to inherit the parent. {inheritance} All catalog-backed subagent \
          choices are also available explicitly: {}",
         subagent_model_override_description()
@@ -9113,13 +8902,12 @@ pub fn agent_tool_specs_for_surface(
         if let Some(policy) = team_policy {
             let metadata = serde_json::to_string(policy)
                 .unwrap_or_else(|_| "autonomous team policy enabled".to_string());
-            if let Some(description) = subagent_specs
-                .first_mut()
-                .and_then(|spec| spec.get_mut("description"))
-                .and_then(|value| value.as_str())
-                .map(str::to_owned)
+            if let Some(spawn) = subagent_specs
+                .iter_mut()
+                .find(|spec| spec["name"] == "spawn_agent")
+                && let Some(description) = spawn["description"].as_str()
             {
-                subagent_specs[0]["description"] = Value::String(format!(
+                spawn["description"] = Value::String(format!(
                     "{description} Effective autonomous-team policy: {metadata}"
                 ));
             }
@@ -9221,7 +9009,7 @@ fn shared_work_tool_specs() -> Vec<Value> {
         ),
         tool(
             "create_shared_work",
-            "Create one shared todo. Set assignee to self or a participant UUID; omit only for intentionally unassigned work.",
+            "Create one shared todo. Returns id (the work ID), work, and event_id (the journal event ID). Set assignee to self or a participant UUID; omit only for intentionally unassigned work.",
             json!({
                 "type": "object",
                 "properties": {
@@ -11400,7 +11188,6 @@ async fn update_from_session_event(
             }
         }
         SessionEventKind::StatusChanged { status, detail } => {
-            entry.assignment_claimed = false;
             entry.snapshot.status = match status {
                 SessionStatus::Starting => SubagentStatus::Starting,
                 SessionStatus::Running => SubagentStatus::Running,

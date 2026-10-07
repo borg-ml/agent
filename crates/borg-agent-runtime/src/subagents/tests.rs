@@ -1858,135 +1858,6 @@ fn child_identity_is_stable_and_inherits_execution_context() {
     );
 }
 
-#[tokio::test]
-async fn spawn_tool_reuses_a_compatible_ready_worker_for_a_new_task() {
-    let directory = tempdir().unwrap();
-    let root = Uuid::new_v4();
-    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
-    let store = Arc::new(store);
-    store.create_session(root).await.unwrap();
-    let prompts = Arc::new(StdMutex::new(Vec::new()));
-    let executor = RecordingPeerExecutor {
-        prompts: Arc::clone(&prompts),
-    };
-    let mut root_launch = launch();
-    root_launch.capabilities.multiplayer = false;
-    root_launch.cwd = directory.path().to_path_buf();
-    let coordinator = SubagentCoordinator::new_with_store_and_executor(
-        directory.path(),
-        root,
-        root_launch,
-        1,
-        Arc::new(executor),
-        store,
-    )
-    .unwrap();
-
-    let first = coordinator
-        .call_tool(
-            "spawn_agent",
-            json!({
-                "action": "delegate task",
-                "task_name": "first_task",
-                "message": "Complete the first bounded task."
-            }),
-        )
-        .await
-        .unwrap();
-    let session_id = Uuid::parse_str(first["session_id"].as_str().unwrap()).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if coordinator.get(session_id).await.unwrap().status == SubagentStatus::Ready {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("first assignment should complete");
-
-    // Subscribe before the reuse: the first turn's report has already been
-    // broadcast, so the only assistant report this receiver sees belongs to
-    // the second assignment.
-    let mut activity = coordinator.subscribe();
-    let second = coordinator
-        .call_tool(
-            "spawn_agent",
-            json!({
-                "action": "reuse worker",
-                "task_name": "second_task",
-                "message": "Complete the second bounded task."
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(second["reused"], true);
-    assert_eq!(second["assignment_task_name"], "/root/second_task");
-    assert_eq!(second["session_id"], session_id.to_string());
-    // The worker keeps its session, and therefore its conversation, but it
-    // must take the new task's identity with it. The assignment used to
-    // rewrite only `detail`, leaving the first task's name on the snapshot.
-    assert_eq!(second["task_name"], "/root/second_task");
-    assert_eq!(coordinator.list(None).await.len(), 1);
-    assert_eq!(coordinator.list(Some("/root/second_task")).await.len(), 1);
-    assert!(coordinator.list(Some("/root/first_task")).await.is_empty());
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if prompts.lock().unwrap().len() == 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("reused worker should receive the second assignment");
-    let recorded = prompts.lock().unwrap().clone();
-    assert!(recorded[0].contains("first bounded task"));
-    assert!(recorded[1].contains("second bounded task"));
-
-    // The root projects a child report as `AgentMessageReceived` under the
-    // task name carried on this activity. Capturing it once at spawn made a
-    // reused worker answer the new task under the previous task's name.
-    let reported_name = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match activity.recv().await {
-                Ok(SubagentActivity::SessionEvent {
-                    task_name,
-                    event:
-                        SessionEvent {
-                            kind:
-                                SessionEventKind::Message {
-                                    actor: EventActor::Assistant,
-                                    status: MessageStatus::Complete,
-                                    ..
-                                },
-                            ..
-                        },
-                    ..
-                }) => break task_name,
-                Ok(_) => continue,
-                Err(error) => panic!("subagent activity stream ended: {error}"),
-            }
-        }
-    })
-    .await
-    .expect("reused worker should report its second turn");
-    assert_eq!(reported_name, "/root/second_task");
-    assert_eq!(
-        coordinator.get(session_id).await.unwrap().task_name,
-        "/root/second_task"
-    );
-
-    // The name index moved with the worker: the first task's name is free
-    // again rather than resolving to a worker that stopped running it.
-    assert!(coordinator.stop("/root/first_task").await.is_err());
-    coordinator.stop("/root/second_task").await.unwrap();
-
-    coordinator.stop_all().await;
-    scratch.discard().await;
-}
-
 /// A child spawned without a provider, or with a provider but no model, runs on
 /// the lane its parent is on *now* rather than the lane the parent session was
 /// launched on.
@@ -2390,7 +2261,7 @@ async fn a_member_delegation_spawns_fresh_and_names_the_requester() {
         "the director's own assignments carry no requester note"
     );
 
-    // The director still reuses its own idle workers.
+    // The director also leaves its existing tasks intact.
     let reassigned = coordinator
         .call_tool(
             "spawn_agent",
@@ -2398,7 +2269,7 @@ async fn a_member_delegation_spawns_fresh_and_names_the_requester() {
         )
         .await
         .unwrap();
-    assert_eq!(reassigned["reused"], true);
+    assert_eq!(reassigned["reused"], false);
 
     coordinator.stop_all().await;
     scratch.discard().await;
@@ -2431,7 +2302,7 @@ impl crate::AgentTurnExecutor for FastPeerExecutor {
 }
 
 #[tokio::test]
-async fn subagent_speed_overrides_live_inheritance_and_controls_worker_reuse() {
+async fn subagent_speed_overrides_live_inheritance_without_reusing_workers() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
     let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
@@ -2475,7 +2346,7 @@ async fn subagent_speed_overrides_live_inheritance_and_controls_worker_reuse() {
     for (task_name, speed, reused) in [
         ("inherited_fast", None, false),
         ("standard", Some(false), false),
-        ("explicit_fast", Some(true), true),
+        ("explicit_fast", Some(true), false),
     ] {
         let mut args = json!({ "task_name": task_name, "message": "Complete this bounded task." });
         if let Some(fast) = speed {
@@ -2489,8 +2360,8 @@ async fn subagent_speed_overrides_live_inheritance_and_controls_worker_reuse() {
         if task_name == "inherited_fast" {
             first_fast = Some(id);
         }
-        if reused {
-            assert_eq!(Some(id), first_fast);
+        if task_name == "explicit_fast" {
+            assert_ne!(Some(id), first_fast);
         }
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -4591,6 +4462,7 @@ fn tool_catalog_exposes_one_complete_lifecycle() {
     assert_eq!(
         names,
         [
+            "scout",
             "spawn_agent",
             "get_agent_goal",
             "control_agent_goal",
@@ -4793,7 +4665,10 @@ async fn shared_work_tools_are_idempotent_atomic_and_replayable() {
             .contains("idempotency conflict")
     );
 
-    let work_id: Uuid = serde_json::from_value(created["kind"]["work"]["id"].clone()).unwrap();
+    let work_id: Uuid = serde_json::from_value(created["id"].clone()).unwrap();
+    assert_eq!(created["id"], created["work"]["id"]);
+    assert_eq!(created["work"], created["kind"]["work"]);
+    assert_ne!(created["event_id"], created["id"]);
     let claim_args = json!({
         "work_id": work_id,
         "idempotency_key": "claim:boundary-delivery"
@@ -5122,22 +4997,9 @@ async fn durable_parent_activity_restores_child_topology() {
     scratch.discard().await;
 }
 
-/// A worker restored by a build that predated the startup repair sits on the
-/// roster as Ready, bound into the team workspace, and with no membership row:
-/// `register_child_session` re-homes the binding and membership does not travel
-/// with it. The ordinary assignment path claims exactly that worker first --
-/// the filter takes the oldest Ready match of the same profile -- and handing
-/// it the task was refused by `resolve_recipients` as "audience contains a
-/// non-member". The assignment then returned that error instead of spawning, so
-/// a default-profile task could not be given to anyone while such a worker sat
-/// on the roster. Forcing a different profile avoided the candidate; it did not
-/// fix the default path.
-///
-/// The repair runs before the hand-off rather than after it fails, and that
-/// ordering is the point: a hand-off that fails may already have enqueued the
-/// task durably, so retrying it as a fresh spawn would run the work twice.
+/// Missing membership on an old child must not block or hijack a new task.
 #[tokio::test]
-async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membership() {
+async fn a_new_assignment_does_not_take_over_a_child_with_missing_membership() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
     let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
@@ -5157,8 +5019,6 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
     let mut root_launch = launch();
     root_launch.cwd = directory.path().to_path_buf();
     let session_store: Arc<dyn SessionStore> = store.clone();
-    // Room for two, so declining to reuse could actually spawn. Otherwise a
-    // reused=true assertion would pass because the cap left no alternative.
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
         root,
@@ -5196,7 +5056,7 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
         }
     })
     .await
-    .expect("the first assignment settles before the worker is reused");
+    .expect("the first assignment settles before another task is spawned");
 
     // The state a restart on an older build leaves behind: the binding is
     // re-homed onto the team workspace, and the membership row that move does
@@ -5225,8 +5085,6 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
         "the candidate must start out a member, or this removes nothing and proves nothing"
     );
 
-    // The ordinary path: no provider, model or effort override, so the claim
-    // filter selects this worker instead of spawning a fresh one.
     let assigned = coordinator
         .assign_task_in_directory_as(
             root,
@@ -5243,16 +5101,20 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
             None,
         )
         .await
-        .expect("a default-profile assignment must not fail on a stale reuse candidate");
+        .expect("a new task must not depend on the old child's membership");
     assert_eq!(
         assigned["reused"],
-        serde_json::json!(true),
-        "the candidate is reused, so this exercises the repair and not the spawn"
+        serde_json::json!(false),
+        "a missing membership must not cause another task to take over this session"
     );
 
-    // And it ran. A durable delivery on its own would still pass with the
-    // worker never executing, which is the half of the workflow the repair
-    // exists to restore.
+    assert_ne!(assigned["session_id"], first["session_id"]);
+    assert_eq!(
+        coordinator.get(child_session_id).await.unwrap().task_name,
+        "/root/first_task"
+    );
+
+    // The new child must execute its own assignment.
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if prompts.lock().expect("peer prompt lock").len() == 2 {
@@ -5262,7 +5124,7 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
         }
     })
     .await
-    .expect("the repaired worker must execute the task it was assigned");
+    .expect("the new worker must execute the task it was assigned");
     let recorded = prompts.lock().expect("peer prompt lock").clone();
     assert!(
         recorded[1].contains("describe the material set"),
@@ -5273,11 +5135,9 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
     scratch.discard().await;
 }
 
-/// An orchestrator keeps finished workers idle to follow up with them later
-/// (land this once the gate passes). A reuse renames such a worker and drops
-/// its last answer, so fresh:true must spawn and leave it untouched.
+/// A new task must preserve an idle child's name, answer and message address.
 #[tokio::test]
-async fn a_fresh_assignment_spawns_and_leaves_an_idle_worker_to_its_task() {
+async fn a_default_assignment_spawns_and_preserves_an_idle_workers_identity() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
     let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
@@ -5313,10 +5173,11 @@ async fn a_fresh_assignment_spawns_and_leaves_an_idle_worker_to_its_task() {
     .await
     .expect("the first worker settles idle");
 
+    let answer = coordinator.get(idle).await.unwrap().final_text;
     let second = coordinator
         .call_tool(
             "spawn_agent",
-            json!({ "task_name": "landing", "message": "Land the branches.", "fresh": true }),
+            json!({ "task_name": "landing", "message": "Land the branches.", "fresh": false }),
         )
         .await
         .unwrap();
@@ -5329,6 +5190,16 @@ async fn a_fresh_assignment_spawns_and_leaves_an_idle_worker_to_its_task() {
         kept.task_name
     );
     assert_eq!(kept.status, SubagentStatus::Ready);
+    assert_eq!(kept.final_text, answer);
+    assert_eq!(
+        coordinator
+            .table
+            .lock()
+            .await
+            .resolve("/root/rivers")
+            .unwrap(),
+        idle
+    );
 
     coordinator.stop_all().await;
     scratch.discard().await;
