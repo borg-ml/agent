@@ -457,6 +457,14 @@ fn wait_until_started_and_timeout_leave_the_job_alone() {
     );
     let value: Value = serde_json::from_slice(&timed.stdout).unwrap();
     assert_eq!(value["timed_out"], true);
+    assert_eq!(value["job_id"], queued);
+    assert_eq!(value["state"], "Queued", "{value}");
+    assert!(
+        value["wait_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("busy")),
+        "{value}"
+    );
     let status: Value = lane.json(&["job", "status", &queued]);
     assert_eq!(status["state"], "Queued", "{status}");
     assert!(

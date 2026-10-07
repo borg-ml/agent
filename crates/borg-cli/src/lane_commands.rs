@@ -239,10 +239,18 @@ pub(crate) async fn run(args: LaneArgs) -> Result<()> {
                             Err(_) => {
                                 eprintln!("timed out waiting for job {id}");
                                 if json {
-                                    println!(
-                                        "{}",
-                                        serde_json::json!({"job_id": id, "timed_out": true})
-                                    );
+                                    let mut value = store
+                                        .snapshot()
+                                        .ok()
+                                        .and_then(|records| {
+                                            records
+                                                .into_iter()
+                                                .find(|record| record.ticket.id == id)
+                                        })
+                                        .map(|record| job_json(&record))
+                                        .unwrap_or_else(|| serde_json::json!({"job_id": id}));
+                                    value["timed_out"] = true.into();
+                                    println!("{value}");
                                 }
                                 std::process::exit(124);
                             }
