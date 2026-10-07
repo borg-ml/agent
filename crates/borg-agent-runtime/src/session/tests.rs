@@ -3110,6 +3110,7 @@ async fn a_human_message_ends_a_usage_limit_wait_immediately() {
     for goal_command in [None, Some(false), Some(true)] {
         let root = tempdir().unwrap();
         let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
         let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let store: Arc<dyn SessionStore> = Arc::new(store);
         store.create_session(session_id).await.unwrap();
@@ -3140,7 +3141,7 @@ async fn a_human_message_ends_a_usage_limit_wait_immediately() {
                     &journal_path,
                     session_id,
                     LaunchSession {
-                        request_id: Uuid::new_v4(),
+                        request_id: message_id,
                         cwd,
                         provider: CodingProvider::Codex,
                         model: None,
@@ -3198,6 +3199,20 @@ async fn a_human_message_ends_a_usage_limit_wait_immediately() {
                 if matches!(event.kind, SessionEventKind::ProviderEvent { ref kind, .. }
                 if kind == "usage_limit_retry_released")
                 {
+                    break;
+                }
+            }
+            loop {
+                let event = tokio::time::timeout_at(deadline, event_rx.recv())
+                    .await
+                    .expect("resume starts the saved retry")
+                    .unwrap();
+                if let SessionEventKind::TurnStarted {
+                    message_id: started,
+                    ..
+                } = event.kind
+                {
+                    assert_eq!(started, message_id, "resume must reuse the saved retry");
                     break;
                 }
             }
