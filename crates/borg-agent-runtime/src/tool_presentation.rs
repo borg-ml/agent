@@ -584,7 +584,7 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
 
     if matches!(tool.as_str(), "toolsearch" | "tool_search") {
         return (
-            "Search Tools".to_string(),
+            "Search tools".to_string(),
             high_signal_detail(input).unwrap_or_default(),
         );
     }
@@ -677,9 +677,9 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
             .map(|message| format!(" · {}", compact_text(message, 100)))
             .unwrap_or_default();
         let action = if tool == "send_message" {
-            "Message agent"
+            "Send message to agent"
         } else {
-            "Follow up"
+            "Follow up with agent"
         };
         return (action.to_string(), format!("{target}{message}"));
     }
@@ -752,7 +752,7 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
     if let Some(action) = match tool.as_str() {
         "lsp_diagnostics" => Some("Check diagnostics"),
         "lsp_hover" => Some("Inspect symbol"),
-        "lsp_definition" => Some("Go to definition"),
+        "lsp_definition" => Some("Find definition"),
         "lsp_references" => Some("Find references"),
         "lsp_document_symbols" => Some("List symbols"),
         _ => None,
@@ -767,7 +767,7 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
     if tool.contains("fetch")
         && let Some(url) = string_field(input, "url").filter(|url| !url.trim().is_empty())
     {
-        return ("Fetch web".to_string(), compact_text(url, 120));
+        return ("Fetch web page".to_string(), compact_text(url, 120));
     }
 
     if name.to_ascii_lowercase().contains("web") {
@@ -835,11 +835,15 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
             .and_then(Value::as_str)
             .filter(|target| !target.is_empty())
     {
-        let detail = capability_inner_call(name, input).map_or_else(
-            || concise_tool_input(input),
-            |(target, arguments)| tool_call_summary(target, arguments).1,
-        );
-        return (capability_action_title(target), detail);
+        if let Some((target, arguments)) = capability_inner_call(name, input) {
+            return tool_call_summary(target, arguments);
+        }
+        let label = if tool_leaf_name(target) == "capability" {
+            "Capability".to_string()
+        } else {
+            tool_call_summary(target, &serde_json::json!({})).0
+        };
+        return (label, concise_tool_input(input));
     }
 
     (humanize_tool_name(name), concise_tool_input(input))
@@ -854,27 +858,6 @@ fn capability_inner_call<'a>(name: &str, input: &'a Value) -> Option<(&'a str, &
         .get("arguments")
         .filter(|arguments| !arguments.is_null())?;
     (tool_leaf_name(target) != "capability").then_some((target, arguments))
-}
-
-/// The shortest honest title for a capability. The verb it is named after is
-/// dropped, since the row already spells out the action in words.
-fn capability_action_title(target: &str) -> String {
-    let words = target
-        .split(['_', '-'])
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-    let words = match words.as_slice() {
-        [
-            "get" | "list" | "read" | "send" | "create" | "update" | "set",
-            rest @ ..,
-        ] => rest,
-        _ => words.as_slice(),
-    };
-    if words.is_empty() {
-        "Capability".to_string()
-    } else {
-        title_case(&words.join(" "))
-    }
 }
 
 pub fn web_search_query(input: &Value) -> Option<String> {
@@ -3096,7 +3079,7 @@ mod tests {
         assert_eq!(
             tools,
             (
-                "Search Tools".to_string(),
+                "Search tools".to_string(),
                 "select:mcp__borg_agent__get_goal".to_string()
             )
         );
@@ -3514,10 +3497,13 @@ all green"
         };
         assert_eq!(
             titled("lsp_workspace_diagnostics"),
-            "Lsp workspace diagnostics"
+            "Workspace diagnostics"
         );
-        assert_eq!(titled("list_instances"), "Instances");
-        assert_eq!(titled("get_goal"), "Goal");
+        assert_eq!(titled("list_instances"), "List instances");
+        assert_eq!(titled("get_goal"), "Read goal");
+        assert_eq!(titled("wait_agent"), "Wait for agents");
+        assert_eq!(titled("send_message"), "Send message to agent");
+        assert_eq!(titled("followup_task"), "Follow up with agent");
         // The wrapper's own fields are not the action: the row shows what the
         // wrapped call does, exactly as the direct call would.
         assert_eq!(
@@ -3529,7 +3515,7 @@ all green"
                     "arguments": {"query": "ratatui wrap", "max_results": 5},
                 }),
             ),
-            ("Web search".to_string(), "“ratatui wrap”".to_string())
+            ("Search web".to_string(), "“ratatui wrap”".to_string())
         );
         assert_eq!(
             project_tool_presentation(

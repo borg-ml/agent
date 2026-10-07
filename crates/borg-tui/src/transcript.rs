@@ -2174,7 +2174,7 @@ impl Transcript {
                     return removed_entry;
                 }
                 // Provider input is hidden; AgentMessageReceived owns visible team reports.
-                if *actor == EventActor::System {
+                if *actor == EventActor::System || self.agent_messages.contains(message_id) {
                     removed_entry = self.remove_message(*message_id);
                     return removed_entry;
                 }
@@ -3231,6 +3231,9 @@ impl Transcript {
                 sender_name,
                 text,
             } => {
+                removed_entry = self.remove_message(*message_id);
+                self.queued_messages.remove(message_id);
+                self.queued_message_sequences.remove(message_id);
                 if self.agent_messages.insert(*message_id) {
                     self.agent_message_senders.insert(*sender_id);
                     self.hide_received_subagent_report(*sender_id);

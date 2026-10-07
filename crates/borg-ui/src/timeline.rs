@@ -17,6 +17,13 @@ pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
             "Awaiting tool-call arguments…"
         });
     }
+    if name == "Generate image" {
+        return Cow::Borrowed(if complete {
+            "Generated image"
+        } else {
+            "Generating image…"
+        });
+    }
     if name == "Generate" || name.starts_with("Generate ") {
         let label = name.strip_prefix("Generate ").unwrap_or("");
         let state = if complete {
@@ -38,8 +45,12 @@ pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
             "Updating Git index…"
         });
     }
-    if let Some(rest) = name.strip_prefix("Wait on") {
-        let form = if complete { "Waited on" } else { "Waiting on" };
+    if let Some(rest) = name.strip_prefix("Wait on ") {
+        let form = if complete {
+            "Finished waiting for "
+        } else {
+            "Waiting for "
+        };
         return Cow::Owned(format!("{form}{rest}{}", if complete { "" } else { "…" }));
     }
     let (verb, rest) = name.split_once(' ').unwrap_or((name, ""));
@@ -49,6 +60,21 @@ pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
         "Consult" => Some(("Consulting", "Consulted")),
         "Inspect" => Some(("Inspecting", "Inspected")),
         "Read" => Some(("Reading", "Read")),
+        "Get" => Some(("Retrieving", "Retrieved")),
+        "Set" => Some(("Setting", "Set")),
+        "Save" => Some(("Saving", "Saved")),
+        "Record" => Some(("Recording", "Recorded")),
+        "Publish" => Some(("Publishing", "Published")),
+        "Assign" => Some(("Assigning", "Assigned")),
+        "Claim" => Some(("Claiming", "Claimed")),
+        "Resume" => Some(("Resuming", "Resumed")),
+        "Cancel" => Some(("Cancelling", "Cancelled")),
+        "Acknowledge" => Some(("Acknowledging", "Acknowledged")),
+        "Reload" => Some(("Reloading", "Reloaded")),
+        "Configure" => Some(("Configuring", "Configured")),
+        "Broadcast" => Some(("Broadcasting", "Broadcast")),
+        "Write" => Some(("Writing", "Wrote")),
+        "Delegate" => Some(("Delegating", "Delegated")),
         "Edit" => Some(("Editing", "Edited")),
         "Update" => Some(("Updating", "Updated")),
         "Refine" => Some(("Refining", "Refined")),
@@ -61,6 +87,9 @@ pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
         "View" => Some(("Viewing", "Viewed")),
         "Create" => Some(("Creating", "Created")),
         "Delete" => Some(("Deleting", "Deleted")),
+        "Wait" if !rest.is_empty() && !rest.starts_with("for ") => {
+            Some(("Waiting for", "Finished waiting for"))
+        }
         "Wait" => Some(("Waiting", "Finished waiting")),
         "Send" => Some(("Sending", "Sent")),
         "Follow" => Some(("Following", "Followed")),

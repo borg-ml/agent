@@ -3237,6 +3237,18 @@ fn tool_lifecycle_labels_use_progressive_and_past_tense() {
         tool_lifecycle_label("Wait for agents", true),
         "Finished waiting for agents"
     );
+    for (name, running, finished) in [
+        ("Wait agent", "Waiting for agent…", "Finished waiting for agent"),
+        ("Wait on tool", "Waiting for tool…", "Finished waiting for tool"),
+        ("Delegate task", "Delegating task…", "Delegated task"),
+        ("Write", "Writing…", "Wrote"),
+        ("Generate image", "Generating image…", "Generated image"),
+        ("Follow up with agent", "Following up with agent…", "Followed up with agent"),
+        ("Send message to agent", "Sending message to agent…", "Sent message to agent"),
+    ] {
+        assert_eq!(tool_lifecycle_label(name, false), running);
+        assert_eq!(tool_lifecycle_label(name, true), finished);
+    }
 }
 
 #[test]
@@ -7914,7 +7926,7 @@ fn tool_call_summaries_cover_cli_display_contract() {
             &serde_json::json!({"target": "inspect_ui", "message": "Run focused tests"})
         ),
         (
-            "Follow up".to_string(),
+            "Follow up with agent".to_string(),
             "inspect_ui · Run focused tests".to_string()
         )
     );
@@ -7934,7 +7946,7 @@ fn tool_call_summaries_cover_cli_display_contract() {
             &serde_json::json!({"path": "src/main.rs", "line": 42, "character": 7})
         ),
         (
-            "Go to definition".to_string(),
+            "Find definition".to_string(),
             "src/main.rs:42:7".to_string()
         )
     );
@@ -11038,6 +11050,74 @@ fn resume_mid_turn_accepts_an_assistant_live_snapshot_without_turn_started() {
             ..
         }) if text == "resumed response"
     ));
+}
+
+#[test]
+fn agent_receipt_replaces_user_projection_in_either_arrival_order() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let prompt = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "review result".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+    let receipt = SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::AgentMessageReceived {
+            message_id,
+            sender_id: Uuid::new_v4(),
+            sender_name: "reviewer".to_string(),
+            text: "review result".to_string(),
+        },
+    );
+    for receipt_first in [false, true] {
+        let mut transcript = Transcript {
+            show_subagent_messages: true,
+            ..Transcript::default()
+        };
+        let events = if receipt_first {
+            [&receipt, &prompt, &receipt]
+        } else {
+            [&prompt, &receipt, &prompt]
+        };
+        for event in events {
+            transcript.apply(event);
+        }
+        assert_eq!(transcript.order.len(), 1);
+        assert!(matches!(
+            &transcript.order[0],
+            TranscriptEntry::Action {
+                kind: TranscriptActionKind::Agent,
+                detail,
+                body: Some(body),
+                ..
+            } if detail == "reviewer" && body == "review result"
+        ));
+        let lines = transcript.lines(100);
+        let sender = lines
+            .iter()
+            .find(|line| line.to_string().contains("reviewer"))
+            .unwrap();
+        assert!(
+            sender
+                .spans
+                .iter()
+                .any(|span| span.style.fg == Some(SUBAGENT_PURPLE))
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.to_string().contains("▌ User ▐"))
+        );
+    }
 }
 
 #[test]
