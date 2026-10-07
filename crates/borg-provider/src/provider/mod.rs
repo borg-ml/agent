@@ -1209,6 +1209,7 @@ mod tests {
             [
                 ("claude-opus-5-5", "Opus 5.5"),
                 ("claude-sonnet-5-5", "Sonnet 5.5"),
+                ("claude-haiku-5-5", "Haiku 5.5"),
                 ("claude-fable-5-1", "Fable 5.1"),
             ]
         );
