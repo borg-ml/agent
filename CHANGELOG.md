@@ -13,6 +13,15 @@ Git comparison.
   Director-scoped access and response-language controls explicitly name their
   target and show the director's current values.
 
+### Usage
+
+- Fill missing model-call costs from published prices so subagent totals show
+  API-equivalent estimates instead of remaining unavailable. Cache reads,
+  writes, and context pricing tiers are included; provider-reported amounts
+  are preserved and subscription equivalents remain clearly labelled.
+- Pricing catalog requests identify Borg explicitly, avoiding catalog requests
+  being refused for a missing user-agent.
+
 ### Subagents
 
 - Add `scout`, a first-class tool for bounded exploration in a fresh subagent

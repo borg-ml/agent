@@ -34,9 +34,10 @@ pub struct ModelFacts {
     /// The largest reasoning token budget the model accepts.
     pub budget_tokens_max: Option<u64>,
     /// Price in micro-USD per million tokens. `None` unless the entry states
-    /// all three rates: a partial price would make an estimate quietly wrong
-    /// in whichever direction it was missing.
+    /// input, cached-input and output rates. Cache writes are priced only when
+    /// the catalog also reports their rate.
     pub pricing: Option<Pricing>,
+    pub pricing_tiers: Vec<(u64, Pricing)>,
     pub context_window: Option<u64>,
     pub output_limit: Option<u64>,
 }
@@ -56,6 +57,7 @@ impl ModelFacts {
 pub struct Pricing {
     pub input: u64,
     pub cached_input: u64,
+    pub cache_creation: Option<u64>,
     pub output: u64,
 }
 
@@ -72,12 +74,12 @@ fn catalog() -> &'static RwLock<Option<Facts>> {
 /// Concurrent callers join the same load rather than each issuing a request:
 /// the document is large and every consumer wants all of it.
 pub async fn ensure_loaded() {
-    if catalog()
-        .read()
-        .ok()
-        .and_then(|cache| cache.clone())
-        .is_some()
-    {
+    if loaded() {
+        return;
+    }
+    static LOAD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _loading = LOAD.lock().await;
+    if loaded() {
         return;
     }
     if let Ok(parsed) = fetch().await
@@ -123,6 +125,68 @@ pub fn pricing(provider: &str, model: &str) -> Option<Pricing> {
     facts(provider, model).and_then(|found| found.pricing)
 }
 
+/// Fill missing costs from published rates; subscription amounts are API equivalents.
+pub fn price_usage(
+    provider: &str,
+    model: &str,
+    usage: &mut crate::ProviderCallUsage,
+    hourly_cache_creation_tokens: u64,
+) {
+    if usage.cost_microusd.is_some() {
+        return;
+    }
+    let Some(facts) = facts(provider, model).or_else(|| {
+        model
+            .split_once('/')
+            .and_then(|(_, model)| facts(provider, model))
+    }) else {
+        return;
+    };
+    let prompt_tokens = usage
+        .input_tokens
+        .saturating_add(usage.cached_input_tokens)
+        .saturating_add(usage.cache_creation_input_tokens);
+    if prompt_tokens == 0 && usage.output_tokens == 0 {
+        return;
+    }
+    let price = facts
+        .pricing_tiers
+        .iter()
+        .filter(|(threshold, _)| prompt_tokens > *threshold)
+        .max_by_key(|(threshold, _)| *threshold)
+        .map(|(_, price)| *price)
+        .or(facts.pricing);
+    let Some(price) = price else {
+        return;
+    };
+    let hourly_tokens = hourly_cache_creation_tokens.min(usage.cache_creation_input_tokens);
+    let default_write_tokens = usage
+        .cache_creation_input_tokens
+        .saturating_sub(hourly_tokens);
+    let cache_creation_rate = match (default_write_tokens, price.cache_creation) {
+        (0, _) => 0,
+        (_, Some(rate)) => rate,
+        _ => return,
+    };
+    let weighted = [
+        (usage.input_tokens, price.input),
+        (usage.cached_input_tokens, price.cached_input),
+        (default_write_tokens, cache_creation_rate),
+        // Anthropic publishes one-hour cache writes at 2× the input rate.
+        (hourly_tokens, price.input.saturating_mul(2)),
+        (usage.output_tokens, price.output),
+    ]
+    .into_iter()
+    .fold(0_u128, |sum, (tokens, rate)| {
+        sum.saturating_add(u128::from(tokens) * u128::from(rate))
+    });
+    usage.cost_microusd =
+        Some((weighted.saturating_add(500_000) / 1_000_000).min(u128::from(u64::MAX)) as u64);
+    if usage.cost_basis != crate::CostBasis::SubscriptionEquivalent {
+        usage.cost_basis = crate::CostBasis::EstimatedFromPricing;
+    }
+}
+
 /// The context window, scoped to `provider` with no cross-provider fallback.
 ///
 /// A window is deliberately stricter than a price here. The Go route reports
@@ -154,6 +218,7 @@ pub fn effort_values(provider: &str, model: &str) -> Vec<String> {
 
 async fn fetch() -> Result<Facts, String> {
     let response = reqwest::Client::builder()
+        .user_agent(concat!("BorgAgent/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -192,7 +257,20 @@ pub fn parse(payload: &Value) -> Facts {
                 effort_values: reasoning_effort_values(model),
                 reasoning_toggle: has_reasoning_option(model, "toggle"),
                 budget_tokens_max: reasoning_budget_max(model),
-                pricing: parse_pricing(model),
+                pricing: model.get("cost").and_then(parse_pricing),
+                pricing_tiers: model
+                    .pointer("/cost/tiers")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tier| {
+                        (tier.pointer("/tier/type")?.as_str()? == "context").then_some(())?;
+                        Some((
+                            positive_u64(tier.pointer("/tier/size"))?,
+                            parse_pricing(tier)?,
+                        ))
+                    })
+                    .collect(),
                 context_window: positive_u64(model.pointer("/limit/context")),
                 output_limit: positive_u64(model.pointer("/limit/output")),
             };
@@ -248,8 +326,7 @@ fn reasoning_budget_max(model: &Value) -> Option<u64> {
         .and_then(|option| positive_u64(option.get("max")))
 }
 
-fn parse_pricing(model: &Value) -> Option<Pricing> {
-    let cost = model.get("cost")?;
+fn parse_pricing(cost: &Value) -> Option<Pricing> {
     let rate = |field: &str| {
         cost.get(field)
             .and_then(Value::as_f64)
@@ -261,6 +338,7 @@ fn parse_pricing(model: &Value) -> Option<Pricing> {
     Some(Pricing {
         input: rate("input")?,
         cached_input: rate("cache_read")?,
+        cache_creation: rate("cache_write"),
         output: rate("output")?,
     })
 }
@@ -279,4 +357,56 @@ pub fn set_for_test(facts: Facts) -> MutexGuard<'static, ()> {
         *guard = Some(facts);
     }
     owner
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CostBasis, ProviderCallUsage};
+    use serde_json::json;
+
+    #[test]
+    fn published_rates_price_usage_without_overwriting_reported_costs() {
+        let _catalog = set_for_test(parse(&json!({"vendor":{"models":{
+            "priced":{"cost":{"input":2,"output":10,"cache_read":0.2,"cache_write":2.5,
+                "tiers":[{"input":4,"output":15,"cache_read":0.4,"cache_write":5,
+                    "tier":{"type":"context","size":1000}}]}},
+            "no_write_price":{"cost":{"input":2,"output":10,"cache_read":0.2}}
+        }}})));
+        let mut usage = ProviderCallUsage {
+            input_tokens: 100,
+            cached_input_tokens: 200,
+            cache_creation_input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 450,
+            cost_basis: CostBasis::SubscriptionEquivalent,
+            ..Default::default()
+        };
+        price_usage("vendor", "priced", &mut usage, 0);
+        assert_eq!(usage.cost_microusd, Some(990));
+        assert_eq!(usage.cost_basis, CostBasis::SubscriptionEquivalent);
+        usage.cost_microusd = None;
+        price_usage("vendor", "priced", &mut usage, 100);
+        assert_eq!(usage.cost_microusd, Some(1140));
+        let mut reported = usage.clone();
+        reported.cost_microusd = Some(123);
+        reported.cost_basis = CostBasis::ProviderReported;
+        price_usage("vendor", "priced", &mut reported, 0);
+        assert_eq!(reported.cost_microusd, Some(123));
+        assert_eq!(reported.cost_basis, CostBasis::ProviderReported);
+        usage.cost_microusd = None;
+        usage.cost_basis = CostBasis::Unavailable;
+        usage.input_tokens = 1001;
+        price_usage("vendor", "priced", &mut usage, 0);
+        assert_eq!(usage.cost_microusd, Some(5334));
+        assert_eq!(usage.cost_basis, CostBasis::EstimatedFromPricing);
+        usage.cost_microusd = None;
+        price_usage("vendor", "unknown", &mut usage, 0);
+        assert_eq!(usage.cost_microusd, None);
+        price_usage("vendor", "no_write_price", &mut usage, 0);
+        assert_eq!(usage.cost_microusd, None);
+        usage.cache_creation_input_tokens = 0;
+        price_usage("vendor", "no_write_price", &mut usage, 0);
+        assert!(usage.cost_microusd.is_some());
+    }
 }

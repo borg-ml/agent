@@ -2388,6 +2388,45 @@ impl ProviderModelClient {
         request: ModelTurnRequest,
         progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        let mut result = self
+            .infer_unpriced(provider, model, effort, request, progress)
+            .await?;
+        if result.usage.cost_microusd.is_none() {
+            borg_provider::models_catalog::ensure_loaded().await;
+            let pricing_provider = match provider {
+                crate::CodingProvider::Claude | crate::CodingProvider::Anthropic => "anthropic",
+                crate::CodingProvider::Codex => "openai",
+                _ => provider.catalog_backend(),
+            };
+            let hourly_cache_creation_tokens = result
+                .raw_response
+                .pointer("/usage/cache_creation/ephemeral_1h_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| {
+                    if provider == crate::CodingProvider::Claude {
+                        result.usage.cache_creation_input_tokens
+                    } else {
+                        0
+                    }
+                });
+            borg_provider::models_catalog::price_usage(
+                pricing_provider,
+                model,
+                &mut result.usage,
+                hourly_cache_creation_tokens,
+            );
+        }
+        Ok(result)
+    }
+
+    async fn infer_unpriced(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+        effort: Option<&str>,
+        request: ModelTurnRequest,
+        progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+    ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
         let route = self
             .route(provider, model)
             .map_err(|NotNative| not_native_error(provider, model, effort))?;
