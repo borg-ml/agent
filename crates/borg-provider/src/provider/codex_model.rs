@@ -1425,6 +1425,16 @@ impl ResponseState {
                     });
                 }
             }
+            "response.reasoning_summary_part.done" => {
+                self.event(
+                    &json!({"type":"response.reasoning_summary_text.done",
+                        "item_id":event["item_id"], "summary_index":event["summary_index"],
+                        "text":event["part"]["text"]}),
+                    progress,
+                    model,
+                    effort,
+                )?;
+            }
             "response.reasoning_summary_text.delta" | "response.reasoning_summary_text.done" => {
                 let done = event["type"] == "response.reasoning_summary_text.done";
                 let field = if done { "text" } else { "delta" };
@@ -1518,11 +1528,23 @@ impl ResponseState {
                     .context("Codex output item has no index")?;
                 self.output.insert(index, event["item"].clone());
             }
-            "response.completed" => return Ok(Some(event["response"].clone())),
-            // A reply cut at `max_output_tokens` still carries its output
-            // items; it is surfaced as a `length` finish so the harness can
-            // keep the text and continue, instead of discarding it.
-            "response.incomplete" if response_hit_output_limit(&event["response"]) => {
+            "response.completed" | "response.incomplete"
+                if event["type"] == "response.completed"
+                    || response_hit_output_limit(&event["response"]) =>
+            {
+                if let Some(output) = event["response"]["output"].as_array() {
+                    for (index, item) in output.iter().enumerate() {
+                        if item["type"] == "reasoning" {
+                            self.event(
+                                &json!({"type":"response.output_item.done",
+                                    "output_index":index, "item":item}),
+                                progress,
+                                model,
+                                effort,
+                            )?;
+                        }
+                    }
+                }
                 return Ok(Some(event["response"].clone()));
             }
             "response.failed" | "response.incomplete" | "error" => {
@@ -2488,7 +2510,19 @@ mod tests {
                 )
                 .unwrap();
         }
-        let expected = "Running validation\nReviewing the diff\nChecking replay safely\nCompleted-only summary";
+        for event in [
+            json!({"type":"response.reasoning_summary_part.done",
+                "item_id":"fourth", "summary_index":0,
+                "part":{"type":"summary_text", "text":"Atomic summary"}}),
+            json!({"type":"response.reasoning_summary_text.done",
+                "item_id":"fourth", "summary_index":0, "text":"Atomic summary"}),
+            json!({"type":"response.completed", "response":{"status":"completed", "output":[
+                {"type":"reasoning", "id":"fifth", "summary":[
+                    {"type":"summary_text", "text":"Final-only summary"}]}]}}),
+        ] {
+            state.event(&event, Some(&tx), "model", "low").unwrap();
+        }
+        let expected = "Running validation\nReviewing the diff\nChecking replay safely\nCompleted-only summary\nAtomic summary\nFinal-only summary";
         assert_eq!(state.reasoning, expected);
         let mut streamed = String::new();
         while let Ok(event) = rx.try_recv() {
