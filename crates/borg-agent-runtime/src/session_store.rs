@@ -126,7 +126,7 @@ pub struct SessionHistoryQuery {
     /// Maximum canonical candidates inspected by regex or lineage fallback.
     pub scan_limit: Option<usize>,
     pub expand_payloads: bool,
-    /// Aggregate byte budget for expanded payloads in the response.
+    /// Aggregate content budget for inline previews, snippets, and expanded payloads.
     pub max_payload_bytes: Option<usize>,
 }
 
@@ -137,16 +137,49 @@ pub struct SessionHistoryPayload {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SessionHistoryHit {
-    /// Always rehydrated from the canonical journal, never returned directly
-    /// from FTS or a future semantic index.
+    /// Always rehydrated from the canonical journal, never an index preview.
+    /// On the wire, omitted/oversized content uses `event_preview` instead;
+    /// only a full `event` can deserialize as this canonical DTO.
     pub event: SessionEvent,
     pub snippet: Option<String>,
     pub score: Option<f64>,
     pub payloads: Vec<SessionHistoryPayload>,
+    /// Wire-only display projection. The typed event above remains canonical.
+    #[serde(skip)]
+    pub(crate) event_preview: Option<serde_json::Value>,
+    #[serde(default)]
+    pub content_truncated: bool,
+    #[serde(default)]
+    pub canonical_event_bytes: usize,
+    /// The canonical event or a referenced payload exceeds the tool's cap.
+    #[serde(default)]
+    pub canonical_lookup_required: bool,
 }
 
+impl Serialize for SessionHistoryHit {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut hit = serializer.serialize_struct("SessionHistoryHit", 8)?;
+        if let Some(preview) = &self.event_preview {
+            hit.serialize_field("event_preview", preview)?;
+        } else {
+            hit.serialize_field("event", &self.event)?;
+        }
+        hit.serialize_field("event_projected", &self.event_preview.is_some())?;
+        hit.serialize_field("content_truncated", &self.content_truncated)?;
+        hit.serialize_field("canonical_event_bytes", &self.canonical_event_bytes)?;
+        hit.serialize_field("canonical_lookup_required", &self.canonical_lookup_required)?;
+        hit.serialize_field("snippet", &self.snippet)?;
+        hit.serialize_field("score", &self.score)?;
+        hit.serialize_field("payloads", &self.payloads)?;
+        hit.end()
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionHistoryPage {
     pub hits: Vec<SessionHistoryHit>,
@@ -2297,9 +2330,6 @@ fn history_scan_limit(query: &SessionHistoryQuery) -> usize {
 }
 
 fn history_payload_budget(query: &SessionHistoryQuery) -> usize {
-    if !query.expand_payloads {
-        return 0;
-    }
     query
         .max_payload_bytes
         .unwrap_or(DEFAULT_HISTORY_PAYLOAD_BYTES)

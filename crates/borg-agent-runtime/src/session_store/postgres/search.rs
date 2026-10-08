@@ -20,10 +20,11 @@ use uuid::Uuid;
 use super::PostgresSessionStore;
 use crate::SessionEvent;
 use crate::session_store::{
-    MAX_HISTORY_QUERY_BYTES, SessionHistoryHit, SessionHistoryIndexDocument, SessionHistoryPage,
-    SessionHistoryQuery, SessionHistorySearchMode, event_actor, event_kind,
-    history_event_matches_filters, history_index_document_id, history_limit, history_match_snippet,
-    history_payload_budget, history_payload_refs, history_regex, history_scan_limit,
+    MAX_HISTORY_PAYLOAD_BYTES, MAX_HISTORY_QUERY_BYTES, SessionHistoryHit,
+    SessionHistoryIndexDocument, SessionHistoryPage, SessionHistoryQuery, SessionHistorySearchMode,
+    event_actor, event_kind, history_event_matches_filters, history_index_document_id,
+    history_limit, history_match_snippet, history_payload_budget, history_payload_refs,
+    history_regex, history_scan_limit,
 };
 
 /// Rows projected per transaction. Small enough that a session with a long
@@ -121,6 +122,93 @@ fn bind_history_filters<'q>(
         builder = builder.bind(actors);
     }
     builder
+}
+
+fn bound_history_text(text: &mut String, budget: &mut usize) -> bool {
+    let original = text.len();
+    let mut take = original.min(*budget);
+    while !text.is_char_boundary(take) {
+        take -= 1;
+    }
+    text.truncate(take);
+    *budget -= take;
+    take != original
+}
+
+fn omit_history_replay(event: &mut serde_json::Value) -> bool {
+    let kind = &mut event["kind"];
+    if kind["type"] == "provider_event"
+        && kind["kind"] == "native_model_message"
+        && kind["payload"]["role"] == "assistant"
+    {
+        return kind["payload"]
+            .as_object_mut()
+            .is_some_and(|payload| payload.remove("provider_state").is_some());
+    }
+    if kind["type"] == "subagent_activity" && kind["event"].is_object() {
+        return omit_history_replay(&mut kind["event"]);
+    }
+    false
+}
+
+fn bound_history_content(value: &mut serde_json::Value, budget: &mut usize) -> Result<bool> {
+    let mut truncated = false;
+    match value {
+        serde_json::Value::Object(fields) => {
+            let model_message = fields.get("type").is_some_and(|v| v == "provider_event")
+                && fields
+                    .get("kind")
+                    .is_some_and(|v| v == "native_model_message");
+            for (name, field) in fields {
+                if model_message && name == "payload" {
+                    truncated |= bound_history_content(field, budget)?;
+                    continue;
+                }
+                if matches!(
+                    name.as_str(),
+                    "text"
+                        | "delta"
+                        | "output"
+                        | "input"
+                        | "payload"
+                        | "message"
+                        | "detail"
+                        | "final_text"
+                        | "objective"
+                        | "content"
+                        | "description"
+                        | "reason"
+                        | "command"
+                        | "prompt"
+                        | "reasoning_content"
+                        | "reasoning_details"
+                        | "arguments"
+                        | "data_base64"
+                ) && !field.is_null()
+                {
+                    if let serde_json::Value::String(text) = field {
+                        truncated |= bound_history_text(text, budget);
+                    } else {
+                        let mut text = serde_json::to_string(field)?;
+                        let bytes = text.len();
+                        if bound_history_text(&mut text, budget) {
+                            *field = serde_json::json!({"preview": text, "byte_len": bytes, "truncated": true});
+                            truncated = true;
+                        }
+                    }
+                } else {
+                    truncated |= bound_history_content(field, budget)?;
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                truncated |= bound_history_content(item, budget)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(truncated)
 }
 
 impl PostgresSessionStore {
@@ -731,12 +819,27 @@ impl PostgresSessionStore {
         query: &SessionHistoryQuery,
         payload_budget: &mut usize,
     ) -> Result<SessionHistoryHit> {
+        let mut preview = serde_json::to_value(&event)?;
+        let canonical_event_bytes = serde_json::to_vec(&preview)?.len();
+        let mut references = Vec::new();
+        history_payload_refs(&event.kind, &mut references);
+        let canonical_lookup_required = canonical_event_bytes > MAX_HISTORY_PAYLOAD_BYTES
+            || references
+                .iter()
+                .any(|reference| reference.byte_len > MAX_HISTORY_PAYLOAD_BYTES as u64);
+        let mut content_truncated = false;
+        let opaque_omitted = omit_history_replay(&mut preview);
+        let canonical_permitted =
+            !opaque_omitted || (query.event_id.is_some() && query.expand_payloads);
+        let canonical_fits = canonical_permitted && canonical_event_bytes <= *payload_budget;
+        if canonical_fits {
+            *payload_budget -= canonical_event_bytes;
+        }
         let mut payloads = Vec::new();
-        if query.expand_payloads && *payload_budget > 0 {
-            let mut references = Vec::new();
-            history_payload_refs(&event.kind, &mut references);
+        if query.expand_payloads {
             for reference in references {
                 if *payload_budget == 0 {
+                    content_truncated = true;
                     break;
                 }
                 let take = (*payload_budget)
@@ -768,13 +871,42 @@ impl PostgresSessionStore {
                     reference.id
                 );
                 let bytes: Vec<u8> = row.try_get("payload")?;
-                *payload_budget = payload_budget.saturating_sub(bytes.len());
-                let truncated = bytes.len() as u64 != reference.byte_len;
+                let mut text = String::from_utf8_lossy(&bytes).into_owned();
+                let text_truncated = bound_history_text(&mut text, payload_budget);
+                let truncated = bytes.len() as u64 != reference.byte_len || text_truncated;
+                content_truncated |= truncated;
                 payloads.push(crate::SessionHistoryPayload {
                     reference,
                     truncated,
-                    text: String::from_utf8_lossy(&bytes).into_owned(),
+                    text,
                 });
+            }
+        }
+        let event_preview = if canonical_fits {
+            None
+        } else {
+            let body_truncated = bound_history_content(&mut preview["kind"], payload_budget)?;
+            content_truncated |= opaque_omitted || body_truncated;
+            if !opaque_omitted
+                && !body_truncated
+                && canonical_event_bytes <= MAX_HISTORY_PAYLOAD_BYTES
+            {
+                None
+            } else {
+                Some((preview, opaque_omitted))
+            }
+        };
+        // A canonical FTS snippet can include bytes from the omitted replay
+        // subtree. The safe event preview still contains the useful text.
+        let mut snippet = if event_preview.as_ref().is_some_and(|(_, opaque)| *opaque) {
+            None
+        } else {
+            snippet
+        };
+        if let Some(text) = &mut snippet {
+            content_truncated |= bound_history_text(text, payload_budget);
+            if text.is_empty() {
+                snippet = None;
             }
         }
         Ok(SessionHistoryHit {
@@ -782,6 +914,10 @@ impl PostgresSessionStore {
             snippet,
             score,
             payloads,
+            event_preview: event_preview.map(|(preview, _)| preview),
+            content_truncated,
+            canonical_event_bytes,
+            canonical_lookup_required,
         })
     }
 
@@ -875,6 +1011,209 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn history_wire_projection_bounds_inline_without_losing_canonical_lookup() {
+        let url = test_url().expect("native lane PostgreSQL fixture");
+        let scratch = ScratchDatabase::create(&url).await;
+        let store = PostgresSessionStore::connect(&scratch.url).await.unwrap();
+        let session = Uuid::new_v4();
+        store.create_session(session).await.unwrap();
+        let opaque = "opaqueReplaySecret".repeat(2048);
+        let audit = store.append(SessionEvent::new(session, 0, SessionEventKind::ProviderEvent {
+            provider: crate::CodingProvider::Codex, kind: "native_model_message".into(),
+            payload: serde_json::json!({"role": "assistant", "content": "opaque recall marker useful text",
+                "provider_state": {"protocol": "open_ai_responses", "output": [{"type": "reasoning", "encrypted_content": opaque}]}}),
+        })).await.unwrap();
+        let tool_input = store.append(SessionEvent::new(session, 0, SessionEventKind::ToolStarted {
+            tool_call_id: "tool".into(), name: "example".into(),
+            input: serde_json::json!({"role": "assistant", "provider_state": "ordinary tool data", "text": "tool input"}),
+            input_ref: None, parent_tool_call_id: None,
+        })).await.unwrap();
+        let user = store
+            .append(SessionEvent::new(
+                session,
+                0,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::User,
+                    text: format!("user recall marker {}", "useful user text ".repeat(600)),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let tool = store
+            .append(SessionEvent::new(
+                session,
+                0,
+                SessionEventKind::ToolCompleted {
+                    tool_call_id: "tool".into(),
+                    output: format!("tool recall marker {}", "useful tool text ".repeat(600)),
+                    output_ref: None,
+                    is_error: false,
+                    input: None,
+                    input_ref: None,
+                    parent_tool_call_id: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let page = store
+            .query_history(
+                session,
+                SessionHistoryQuery {
+                    max_payload_bytes: Some(1200),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!page.search_incomplete);
+        assert!(
+            !page.truncated,
+            "content omission must not change hit/window completeness"
+        );
+        let wire = serde_json::to_value(&page).unwrap();
+        assert!(!wire.to_string().contains("opaqueReplaySecret"));
+        for (hit, expected) in
+            wire["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip([&audit, &tool_input, &user, &tool])
+        {
+            let displayed = hit.get("event").unwrap_or(&hit["event_preview"]);
+            assert_eq!(displayed["id"], expected.id.to_string());
+            assert_eq!(displayed["sequence"], expected.sequence);
+            assert_eq!(displayed["session_id"], expected.session_id.to_string());
+            assert_eq!(
+                displayed["created_at"],
+                serde_json::to_value(expected.created_at).unwrap()
+            );
+        }
+        let hits = wire["hits"].as_array().unwrap();
+        assert!(
+            hits[0].get("event").is_none(),
+            "omitted replay cannot masquerade as canonical"
+        );
+        assert_eq!(hits[1]["event"], serde_json::to_value(&tool_input).unwrap());
+        assert_eq!(hits[1]["event_projected"], false);
+        let decoded: SessionHistoryHit = serde_json::from_value(hits[1].clone()).unwrap();
+        assert_eq!(
+            decoded.event, tool_input,
+            "ordinary small event wire compatibility"
+        );
+        let used = hits[0]["event_preview"]["kind"]["payload"]["content"]
+            .as_str()
+            .unwrap()
+            .len()
+            + serde_json::to_vec(&hits[1]["event"]).unwrap().len()
+            + hits[2]["event_preview"]["kind"]["text"]
+                .as_str()
+                .unwrap()
+                .len()
+            + hits[3]["event_preview"]["kind"]["output"]
+                .as_str()
+                .unwrap()
+                .len();
+        assert!(used <= 1200);
+        assert_eq!(
+            hits[1]["event"]["kind"]["input"]["provider_state"],
+            "ordinary tool data"
+        );
+        assert!(
+            hits[2]["event_preview"]["kind"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("user recall marker")
+        );
+        for (id, marker) in [(audit.id, "useful text"), (tool.id, "tool recall marker")] {
+            let page = store
+                .query_history(
+                    session,
+                    SessionHistoryQuery {
+                        text: Some(marker.into()),
+                        event_id: Some(id),
+                        max_payload_bytes: Some(1200),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let wire = serde_json::to_value(page).unwrap();
+            assert!(wire.to_string().contains(marker));
+            assert!(!wire.to_string().contains("opaqueReplaySecret"));
+            assert_eq!(wire["hits"][0]["content_truncated"], true);
+            if id == audit.id {
+                assert!(wire["hits"][0]["snippet"].is_null());
+            }
+        }
+        let exact = store
+            .query_history(
+                session,
+                SessionHistoryQuery {
+                    event_id: Some(audit.id),
+                    expand_payloads: true,
+                    max_payload_bytes: Some(MAX_HISTORY_PAYLOAD_BYTES),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let wire = serde_json::to_value(&exact).unwrap();
+        assert_eq!(
+            wire["hits"][0]["event"],
+            serde_json::to_value(&audit).unwrap()
+        );
+        let decoded: SessionHistoryHit = serde_json::from_value(wire["hits"][0].clone()).unwrap();
+        assert_eq!(decoded.event, audit);
+        let canonical = store
+            .query_history(
+                session,
+                SessionHistoryQuery {
+                    event_id: Some(audit.id),
+                    max_payload_bytes: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            canonical.hits[0].event, audit,
+            "display projection must not mutate the journal or typed event"
+        );
+        let over_cap = store
+            .append(SessionEvent::new(
+                session,
+                0,
+                SessionEventKind::Error {
+                    message: "large inline diagnostic ".repeat(60000),
+                },
+            ))
+            .await
+            .unwrap();
+        let capped = store
+            .query_history(
+                session,
+                SessionHistoryQuery {
+                    event_id: Some(over_cap.id),
+                    expand_payloads: true,
+                    max_payload_bytes: Some(MAX_HISTORY_PAYLOAD_BYTES),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let wire = serde_json::to_value(&capped).unwrap();
+        assert_eq!(wire["hits"][0]["canonical_lookup_required"], true);
+        assert_eq!(wire["hits"][0]["content_truncated"], true);
+        assert!(wire["hits"][0].get("event").is_none());
+        assert_eq!(capped.hits[0].event, over_cap);
+        scratch.discard().await;
     }
 
     #[tokio::test]

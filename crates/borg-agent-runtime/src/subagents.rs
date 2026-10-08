@@ -8752,7 +8752,7 @@ pub fn agent_tool_specs_for_surface(
         ),
         tool(
             "query_history",
-            "Search this session's canonical, lossless event journal. Empty text performs fast exact/typed/sequence retrieval; lexical uses the local FTS5 projection; regex is bounded. Results always resolve to canonical event ids and can expand deferred tool payloads. Use this for programmatic recall instead of relying on the compacted model transcript.\n\nA zero-hit result is NOT proof that something never happened. Check `search_incomplete`: when it is true the scan only covered `scanned_from_sequence`..`scanned_to_sequence` and further matches may lie outside it, so page the rest with `start_sequence` before concluding anything is absent. `truncated` alone only means the hit list hit the requested limit.",
+            "Search this session's canonical lossless journal with lexical/regex/typed filters. Normal small hits retain event; opaque or oversized hits expose event_preview with event_projected/content_truncated, never a fake canonical event. Defaults omit native_model_message assistant.provider_state. max_payload_bytes bounds aggregate inline previews, snippets and expanded deferred text, excluding fixed metadata. Exact event_id plus expand_payloads returns a full canonical event only when it fits; canonical_lookup_required means the event or payload exceeds the 1 MiB tool cap: use programmatic SessionStore history hit.event/load_payload or payload references, not an impossible larger tool budget. Canonical ids and search_incomplete/window semantics remain authoritative for lookup, not for actor liveness.",
             json!({
                 "type": "object",
                 "properties": {
