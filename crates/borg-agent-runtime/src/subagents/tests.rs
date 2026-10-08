@@ -3706,18 +3706,44 @@ async fn sibling_messages_use_the_shared_team_directory() {
         panic!("expected prompt");
     };
     assert_eq!(session_id, recipient.session_id);
-    assert_eq!(delivery, PromptDelivery::Queue);
+    assert_eq!(delivery, PromptDelivery::Steer);
     assert!(text.contains("Team message from /root/sender"));
     assert!(text.contains("share the benchmark"));
+
+    coordinator
+        .send_message_with_options_as(
+            sender.session_id,
+            "recipient",
+            "non-urgent benchmark note",
+            TeamMessageOptions {
+                delivery: Some(PromptDelivery::Queue),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        received.recv().await.unwrap(),
+        HostCommand::TeamPrompt {
+            delivery: PromptDelivery::Queue,
+            ..
+        }
+    ));
 
     let broadcast = coordinator
         .broadcast_message_as(sender.session_id, "team checkpoint")
         .await
         .unwrap();
-    let HostCommand::TeamPrompt { message_id, .. } = received.recv().await.unwrap() else {
+    let HostCommand::TeamPrompt {
+        message_id,
+        delivery,
+        ..
+    } = received.recv().await.unwrap()
+    else {
         panic!("expected broadcast prompt");
     };
     assert_eq!(message_id, broadcast.message_id);
+    assert_eq!(delivery, PromptDelivery::Steer);
     assert_eq!(
         coordinator.take_root_inbox().await[0].message_id,
         broadcast.message_id
@@ -3740,7 +3766,7 @@ async fn sibling_messages_use_the_shared_team_directory() {
             .iter()
             .filter(|delivery| delivery.sequence > 0)
             .count(),
-        2
+        3
     );
     coordinator
         .acknowledge_message_for_session(recipient.session_id, broadcast.message_id)

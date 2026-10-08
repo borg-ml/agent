@@ -1886,30 +1886,6 @@ impl Transcript {
         }
     }
 
-    fn model_request_status(&self, now: DateTime<Utc>) -> Option<String> {
-        let request = self.model_request.as_ref()?;
-        let elapsed = |at: DateTime<Utc>| {
-            let seconds = now.signed_duration_since(at).num_seconds().max(0);
-            if seconds < 60 {
-                format!("{seconds}s")
-            } else {
-                format!("{}m {}s", seconds / 60, seconds % 60)
-            }
-        };
-        let received = request
-            .last_received_at
-            .map(|at| format!("last received {} ago", elapsed(at)))
-            .unwrap_or_else(|| "last received unknown".into());
-        let tokens = request
-            .output_tokens
-            .map(|tokens| format!(" · {tokens} output tokens (reported)"))
-            .unwrap_or_default();
-        Some(format!(
-            "model request {} · {received}{tokens}",
-            elapsed(request.started_at)
-        ))
-    }
-
     fn apply(&mut self, event: &SessionEvent) -> Option<usize> {
         self.apply_event(event, true)
     }
@@ -3371,14 +3347,20 @@ impl Transcript {
                 text,
                 recipient_ids,
                 acknowledged,
+                steered,
             } => {
                 let total = recipient_ids.len();
-                let detail = format!("sent · {acknowledged}/{total} acknowledged");
-                let state = if usize::try_from(*acknowledged).unwrap_or(usize::MAX) >= total {
-                    TranscriptActionState::Complete
+                let detail = if *steered {
+                    format!("steer sent to {total} active subagents")
                 } else {
-                    TranscriptActionState::Waiting
+                    format!("sent · {acknowledged}/{total} acknowledged")
                 };
+                let state =
+                    if *steered || usize::try_from(*acknowledged).unwrap_or(usize::MAX) >= total {
+                        TranscriptActionState::Complete
+                    } else {
+                        TranscriptActionState::Waiting
+                    };
                 if let Some(index) = self.team_broadcast_entries.get(message_id).copied() {
                     if let Some(TranscriptEntry::Action { detail: row_detail, state: row_state, .. }) =
                         self.order.get_mut(index)
@@ -7513,11 +7495,14 @@ mod model_request_tests {
         for _ in 0..18 {
             transcript.apply_history(&summary);
         }
-        let now = started + chrono::Duration::seconds(222);
-        let status = transcript.model_request_status(now).unwrap();
-        assert!(status.contains("model request 3m 42s"));
-        assert!(status.contains("last received unknown"));
-        assert!(!status.contains("tokens"));
+        assert_eq!(
+            transcript.model_request.as_ref().unwrap().last_received_at,
+            None
+        );
+        assert_eq!(
+            transcript.model_request.as_ref().unwrap().output_tokens,
+            None
+        );
         let received_after = Utc::now();
         transcript.apply(&summary);
         transcript.apply(&request);
@@ -7530,16 +7515,14 @@ mod model_request_tests {
         ));
         assert!(transcript.model_request.is_some());
         transcript.apply(&event("native_model_usage", serde_json::json!({"request_id": "request", "complete": false, "usage": {"output_tokens": 7}})));
-        assert!(
-            transcript
-                .model_request_status(Utc::now())
-                .unwrap()
-                .contains("7 output tokens (reported)")
+        assert_eq!(
+            transcript.model_request.as_ref().unwrap().output_tokens,
+            Some(7)
         );
         transcript.apply(&event(
             "native_model_usage",
             serde_json::json!({"request_id": "request", "complete": true}),
         ));
-        assert!(transcript.model_request_status(Utc::now()).is_none());
+        assert!(transcript.model_request.is_none());
     }
 }

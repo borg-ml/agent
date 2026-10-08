@@ -19145,6 +19145,7 @@ fn team_broadcast_timeline_updates_one_durable_row_across_replay_and_insertion()
                 text: "Please report status".into(),
                 recipient_ids: recipient_ids.clone(),
                 acknowledged,
+                steered: false,
             },
         )
     };

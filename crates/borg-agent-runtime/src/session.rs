@@ -10006,10 +10006,7 @@ fn recall_withdrawable_steers(
     recalled
 }
 
-/// A frontend asked to broadcast a message to the whole agent team (the
-/// `/team` command). Reuses the same queue-to-every-non-terminal-child path as
-/// the `broadcast_team` agent tool. Failures and the "no team" case surface as
-/// visible errors rather than panicking.
+/// Legacy team broadcast receipts retained across session recovery.
 #[derive(Clone)]
 struct TeamBroadcastProgress {
     text: String,
@@ -10025,6 +10022,7 @@ fn recover_team_broadcasts(events: &[SessionEvent]) -> HashMap<Uuid, TeamBroadca
             text,
             recipient_ids,
             acknowledged,
+            steered,
         } = &event.kind
         {
             let progress = TeamBroadcastProgress {
@@ -10032,7 +10030,7 @@ fn recover_team_broadcasts(events: &[SessionEvent]) -> HashMap<Uuid, TeamBroadca
                 recipient_ids: recipient_ids.clone(),
                 acknowledged: *acknowledged,
             };
-            if *acknowledged < recipient_ids.len() as u32 {
+            if !*steered && *acknowledged < recipient_ids.len() as u32 {
                 pending.insert(*message_id, progress);
             } else {
                 pending.remove(message_id);
@@ -10082,6 +10080,7 @@ async fn refresh_team_broadcasts(
                     text: progress.text.clone(),
                     recipient_ids: progress.recipient_ids.clone(),
                     acknowledged,
+                    steered: false,
                 },
             )
             .await?;
@@ -10102,56 +10101,64 @@ async fn broadcast_team_message(
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
     subagents: Option<&SubagentCoordinator>,
-    pending: &mut HashMap<Uuid, TeamBroadcastProgress>,
+    _pending: &mut HashMap<Uuid, TeamBroadcastProgress>,
     text: String,
 ) -> Result<()> {
-    let message = match subagents {
-        Some(coordinator) => coordinator
-            .broadcast_message_to_active_as(session_id, &text)
-            .await
-            .map(|receipt| {
-                let recipients = receipt.recipient_ids.clone();
-                (receipt, recipients)
-            }),
-        None => Err(anyhow::anyhow!(
-            "no agent team is active to broadcast to; spawn a subagent first"
-        )),
+    let Some(coordinator) = subagents else {
+        record(
+            journal,
+            events,
+            session_id,
+            SessionEventKind::Error {
+                message: "no agent team is active to steer; spawn a subagent first".into(),
+            },
+        )
+        .await?;
+        return Ok(());
     };
-    match message {
-        Ok((receipt, recipient_ids)) => {
-            let progress = TeamBroadcastProgress {
-                text: text.clone(),
-                recipient_ids,
-                acknowledged: 0,
-            };
-            record(
-                journal,
-                events,
-                session_id,
-                SessionEventKind::TeamBroadcastUpdated {
-                    message_id: receipt.message_id,
-                    text,
-                    recipient_ids: progress.recipient_ids.clone(),
-                    acknowledged: 0,
-                },
+    let message_id = Uuid::new_v4();
+    let mut recipient_ids = Vec::new();
+    for child in coordinator.list(None).await {
+        if !child.status.consumes_concurrency_slot() {
+            continue;
+        }
+        match coordinator
+            .prompt_child(
+                &child.session_id.to_string(),
+                message_id,
+                text.clone(),
+                Vec::new(),
+                PromptDelivery::Steer,
             )
-            .await?;
-            if !progress.recipient_ids.is_empty() {
-                pending.insert(receipt.message_id, progress);
+            .await
+        {
+            Ok(()) => recipient_ids.push(child.session_id),
+            Err(error) => {
+                record(
+                    journal,
+                    events,
+                    session_id,
+                    SessionEventKind::Error {
+                        message: format!("team steer to {} failed: {error:#}", child.task_name),
+                    },
+                )
+                .await?
             }
         }
-        Err(error) => {
-            record(
-                journal,
-                events,
-                session_id,
-                SessionEventKind::Error {
-                    message: format!("team broadcast failed: {error:#}"),
-                },
-            )
-            .await?
-        }
     }
+    record(
+        journal,
+        events,
+        session_id,
+        SessionEventKind::TeamBroadcastUpdated {
+            message_id,
+            text,
+            recipient_ids,
+            acknowledged: 0,
+            steered: true,
+        },
+    )
+    .await?;
     Ok(())
 }
 

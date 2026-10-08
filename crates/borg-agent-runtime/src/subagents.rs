@@ -3866,6 +3866,7 @@ pub(crate) struct TeamInboxMessage {
 
 #[derive(Debug, Clone, Default)]
 pub struct TeamMessageOptions {
+    pub delivery: Option<PromptDelivery>,
     pub mentions: Vec<StructuredMention>,
     pub reply_to_message_id: Option<Uuid>,
     /// Durable references to images captured from the sender before routing.
@@ -6004,7 +6005,7 @@ impl SubagentCoordinator {
             .map_err(|_| anyhow::anyhow!("subagent {task_name} command channel closed"))
     }
 
-    /// Queue a message without waking an idle child.
+    /// Steer an active child without waking an idle child.
     pub async fn send_message(&self, target: &str, message: &str) -> Result<()> {
         let root_session_id = self.table.lock().await.root_session_id;
         self.send_message_as(root_session_id, target, message).await
@@ -6018,9 +6019,14 @@ impl SubagentCoordinator {
         actor_session_id: Uuid,
         message: &str,
     ) -> Result<WorkspaceMessageReceipt> {
-        self.broadcast_message_as_targeted(actor_session_id, message, TeamBroadcastReach::Workspace)
-            .await
-            .map(|(receipt, _)| receipt)
+        self.broadcast_message_as_targeted(
+            actor_session_id,
+            message,
+            TeamBroadcastReach::Workspace,
+            PromptDelivery::Steer,
+        )
+        .await
+        .map(|(receipt, _)| receipt)
     }
 
     /// Append one message addressed to the workers currently doing something.
@@ -6040,6 +6046,7 @@ impl SubagentCoordinator {
             actor_session_id,
             message,
             TeamBroadcastReach::ActiveTeam,
+            PromptDelivery::Steer,
         )
         .await
         .map(|(receipt, _)| receipt)
@@ -6052,6 +6059,7 @@ impl SubagentCoordinator {
         actor_session_id: Uuid,
         message: &str,
         reach: TeamBroadcastReach,
+        delivery: PromptDelivery,
     ) -> Result<(WorkspaceMessageReceipt, Vec<Uuid>)> {
         anyhow::ensure!(
             self.root_launch.capabilities.multiplayer,
@@ -6110,7 +6118,10 @@ impl SubagentCoordinator {
                     },
                     TeamBroadcastReach::Workspace => Audience::Workspace,
                 },
-                mode: DeliveryMode::NextTurn,
+                mode: match delivery {
+                    PromptDelivery::Steer => DeliveryMode::Boundary,
+                    PromptDelivery::Queue => DeliveryMode::NextTurn,
+                },
                 thread_id: None,
                 reply_to_message_id: None,
                 idempotency_key: format!("team-broadcast:{idempotency_id}"),
@@ -6121,7 +6132,7 @@ impl SubagentCoordinator {
             text: attributed_team_message(&actor, &actor, &message, Some(receipt.message_id)),
             report_text: message,
             sender_session_id: actor_session_id,
-            delivery: PromptDelivery::Queue,
+            delivery,
             attachments: Vec::new(),
         };
         let root_session_id = self.table.lock().await.root_session_id;
@@ -6211,15 +6222,19 @@ impl SubagentCoordinator {
                 skipped += 1;
                 continue;
             }
-            let target = format!("participant:{participant_id}");
-            match self
-                .send_message_with_options_as(
-                    actor_session_id,
-                    &target,
-                    &message,
-                    TeamMessageOptions::default(),
-                )
-                .await
+            match crate::send_local_session_command(
+                &socket_path,
+                participant_id,
+                HostCommand::Prompt {
+                    session_id: participant_id,
+                    message_id: Uuid::new_v4(),
+                    text: message.clone(),
+                    attachments: Vec::new(),
+                    output_schema: None,
+                    delivery: PromptDelivery::Steer,
+                },
+            )
+            .await
             {
                 Ok(()) => delivered.push(participant_id),
                 Err(error) => {
@@ -6325,6 +6340,11 @@ impl SubagentCoordinator {
         options: TeamMessageOptions,
     ) -> Result<RoutedTeamMessage> {
         let message = required_message(message)?;
+        let delivery = options.delivery.unwrap_or(PromptDelivery::Steer);
+        let mode = match delivery {
+            PromptDelivery::Steer => DeliveryMode::Boundary,
+            PromptDelivery::Queue => DeliveryMode::NextTurn,
+        };
         let (actor, local_id, root_session_id) = {
             let table = self.table.lock().await;
             let actor = table.task_name(actor_session_id)?;
@@ -6341,7 +6361,7 @@ impl SubagentCoordinator {
                             participant_id,
                             &message,
                             options,
-                            DeliveryMode::NextTurn,
+                            mode,
                         )
                         .await;
                 }
@@ -6361,8 +6381,8 @@ impl SubagentCoordinator {
                 id,
                 &actor,
                 &message,
-                PromptDelivery::Queue,
-                DeliveryMode::NextTurn,
+                delivery,
+                mode,
                 options,
             )
             .await?;
@@ -7578,6 +7598,10 @@ impl SubagentCoordinator {
             "send_message" => {
                 let args: MessageArgs = serde_json::from_value(arguments)?;
                 let options = self.message_options_with_attachments(&args).await?;
+                ensure!(
+                    !(args.wake && args.delivery == Some(PromptDelivery::Queue)),
+                    "delivery:queue requires wake:false; use steer to request immediate action"
+                );
                 let routed = if args.wake {
                     self.route_followup_task_with_options_as(
                         actor_session_id,
@@ -7624,8 +7648,13 @@ impl SubagentCoordinator {
             }
             "broadcast_team" => {
                 let args: BroadcastArgs = serde_json::from_value(arguments)?;
-                let receipt = self
-                    .broadcast_message_to_active_as(actor_session_id, &args.message)
+                let (receipt, _) = self
+                    .broadcast_message_as_targeted(
+                        actor_session_id,
+                        &args.message,
+                        TeamBroadcastReach::ActiveTeam,
+                        args.delivery.unwrap_or(PromptDelivery::Steer),
+                    )
                     .await?;
                 let relay_pending = self
                     .store
@@ -8177,7 +8206,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         message_tool(
             "send_message",
-            "Send a NOTIFICATION, not an action request, unless wake:true is explicitly chosen. For questions, approvals or work needing a response, use followup_task. Queue a durable message for any discovered Borg instance, across projects and enrolled machines. Use participant:<id> from list_instances, session:<UUID> for a local session, or a team path. Cross-workspace messages use a private channel. Messages notify by default without starting an idle agent. Set wake:true to request a turn; explicit user interruption still takes precedence. A relay_pending result means the host relay forwards it asynchronously; confirm with get_message_status.",
+            "Send a NOTIFICATION, not an action request, unless wake:true is explicitly chosen. For questions, approvals or work needing a response, use followup_task. Steer the active turn by default; use delivery:queue for non-urgent notifications. Send a durable message for any discovered Borg instance, across projects and enrolled machines. Use participant:<id> from list_instances, session:<UUID> for a local session, or a team path. Cross-workspace messages use a private channel. Messages notify by default without starting an idle agent. Set wake:true to request a turn; explicit user interruption still takes precedence. A relay_pending result means the host relay forwards it asynchronously; confirm with get_message_status.",
         ),
         message_tool(
             "followup_task",
@@ -8185,8 +8214,8 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "broadcast_team",
-            "Broadcast one durable message to the team that is working right now: the root plus every subagent that is starting, running or waiting for approval. Idle and dormant workers are not addressed, so a note meant for the active agents does not land in every historical inbox.",
-            json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}),
+            "Broadcast one durable message to the team that is working right now: the root plus every subagent that is starting, running or waiting for approval. Steers by default; delivery:queue opts into non-urgent delivery. Idle and dormant workers are not addressed, so a note meant for the active agents does not land in every historical inbox.",
+            json!({"type":"object","properties":{"message":{"type":"string"},"delivery":{"type":"string","enum":["steer","queue"],"description":"Steer by default; queue non-urgent input."}},"required":["message"],"additionalProperties":false}),
         ),
         tool(
             "list_unread_team_messages",
@@ -10051,6 +10080,8 @@ struct MessageStatusArgs {
 #[serde(deny_unknown_fields)]
 struct MessageArgs {
     #[serde(default)]
+    delivery: Option<PromptDelivery>,
+    #[serde(default)]
     wake: bool,
     target: String,
     message: String,
@@ -10067,6 +10098,7 @@ struct MessageArgs {
 impl MessageArgs {
     fn options(&self) -> TeamMessageOptions {
         TeamMessageOptions {
+            delivery: self.delivery,
             mentions: self.mentions.clone(),
             reply_to_message_id: self.reply_to_message_id,
             attachments: Vec::new(),
@@ -10079,6 +10111,8 @@ impl MessageArgs {
 #[serde(deny_unknown_fields)]
 struct BroadcastArgs {
     message: String,
+    #[serde(default)]
+    delivery: Option<PromptDelivery>,
 }
 
 #[derive(Deserialize)]
@@ -11111,6 +11145,7 @@ fn message_tool(name: &str, description: &str) -> Value {
         json!({
             "type": "object",
             "properties": {
+                "delivery": { "type": "string", "enum": ["steer", "queue"], "description": "Steer the active turn by default; choose queue for non-urgent input. Does not wake an idle agent." },
                 "target": { "type": "string" },
                 "message": { "type": "string" },
                 "mentions": { "type": "array" },
@@ -11125,6 +11160,12 @@ fn message_tool(name: &str, description: &str) -> Value {
             "additionalProperties": false
         }),
     );
+    if name != "send_message" {
+        definition["inputSchema"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("delivery");
+    }
     if name == "send_message" {
         definition["inputSchema"]["required"] = json!(["target", "message", "wake"]);
         definition["inputSchema"]["properties"]["wake"] = json!({

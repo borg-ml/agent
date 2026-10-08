@@ -20730,14 +20730,20 @@ fn team_broadcast_recovery_tracks_only_unfinished_receipts() {
                 text: "check in".into(),
                 recipient_ids: recipient_ids.clone(),
                 acknowledged,
+                steered: false,
             },
         )
     };
+    let mut steer = event(5, Uuid::new_v4(), 0);
+    if let SessionEventKind::TeamBroadcastUpdated { steered, .. } = &mut steer.kind {
+        *steered = true;
+    }
     let pending = recover_team_broadcasts(&[
         event(1, sent, 0),
         event(2, complete, 0),
         event(3, sent, 1),
         event(4, complete, 2),
+        steer,
     ]);
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[&sent].acknowledged, 1);

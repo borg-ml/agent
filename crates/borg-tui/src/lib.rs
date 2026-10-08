@@ -644,7 +644,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/dictate", "start or stop local dictation"),
     ("/queue", "send after the current turn finishes"),
     ("/steer", "send now and redirect the current turn"),
-    ("/team", "message every agent in the team"),
+    ("/team", "steer active subagents"),
     (
         "/broadcast",
         "message every Borg instance running on this machine",
@@ -891,8 +891,7 @@ pub enum UiAction {
         text: String,
         attachments: Vec<PathBuf>,
     },
-    /// `/team <message>`: queue one message to every non-terminal agent in the
-    /// team (subagents plus root). Always addressed at the director session.
+    /// `/team <message>`: steer active subagents. Addressed at the director session.
     Broadcast {
         text: String,
     },
@@ -9730,14 +9729,9 @@ impl BorgTerminal {
             let status_highlight = self.status_hovered && status_is_interruptible;
             let status_duration = if session_is_active && reconnect_label.is_none() {
                 let now = Utc::now();
-                let turn = activity_clock
+                activity_clock
                     .status_duration(now)
-                    .map(|duration| format!("turn {duration}"));
-                match (turn, self.transcript.model_request_status(now)) {
-                    (Some(turn), Some(request)) => Some(format!("{turn} · {request}")),
-                    (turn, None) => turn,
-                    (None, request) => request,
-                }
+                    .map(|duration| format!("turn {duration}"))
             } else {
                 None
             };

@@ -1470,8 +1470,7 @@ pub enum HostCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<Uuid>,
     },
-    /// A human `/team` broadcast: queue one message to every non-terminal
-    /// child plus root. Host-local like `TeamPrompt`; never accepted from a
+    /// A human `/team` broadcast: steer every active child. Host-local like `TeamPrompt`; never accepted from a
     /// remote participant.
     Broadcast {
         session_id: Uuid,
@@ -2759,6 +2758,8 @@ pub enum SessionEventKind {
         text: String,
         recipient_ids: Vec<Uuid>,
         acknowledged: u32,
+        #[serde(default)]
+        steered: bool,
     },
     AgentMessageReceived {
         message_id: Uuid,
