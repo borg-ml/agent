@@ -423,10 +423,16 @@ fn spawn_revert_fork(
 ) -> RevertForkTask {
     let fork_id = Uuid::new_v4();
     tokio::spawn(async move {
+        store.fork_before(session_id, fork_id, sequence).await?;
+        // Reverting opens an editable draft, not permission to resume inherited work.
         store
-            .fork_before(session_id, fork_id, sequence)
-            .await
-            .map(|_| fork_id)
+            .append(SessionEvent::new(
+                fork_id,
+                0,
+                SessionEventKind::UserStopChanged { engaged: true },
+            ))
+            .await?;
+        Ok(fork_id)
     })
 }
 

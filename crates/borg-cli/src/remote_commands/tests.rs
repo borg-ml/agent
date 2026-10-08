@@ -4000,3 +4000,21 @@ fn focused_child_model_and_effort_edits_never_configure_the_director() {
         HostCommand::Configure { session_id, action: SessionConfigAction::SetProvider { provider: CodingProvider::Codex, .. }} if session_id == root
     ));
 }
+
+#[tokio::test]
+async fn revert_fork_waits_for_human_input_after_reload() {
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
+    let parent = Uuid::new_v4();
+    store.create_session(parent).await.unwrap();
+    let fork = spawn_revert_fork(Arc::new(store), parent, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    let reopened = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+        .await
+        .unwrap();
+    assert!(reopened.state(fork).await.unwrap().user_stopped);
+    assert!(!reopened.state(parent).await.unwrap().user_stopped);
+    reopened.pool().close().await;
+    scratch.discard().await;
+}

@@ -1549,10 +1549,21 @@ impl ResponseState {
                 let retryable = matches!(
                     code,
                     Some("server_error" | "internal_error" | "service_unavailable")
-                ) && event
-                    .pointer("/response/incomplete_details/reason")
-                    .and_then(Value::as_str)
-                    != Some("content_filter");
+                ) || code.is_none_or(|code| {
+                    !KNOWN_ERROR_CODES.contains(&code)
+                        && !matches!(
+                            code,
+                            "usage_limit_reached"
+                                | "rate_limit_exceeded"
+                                | "insufficient_quota"
+                                | "content_filter"
+                        )
+                });
+                let retryable = retryable
+                    && event
+                        .pointer("/response/incomplete_details/reason")
+                        .and_then(Value::as_str)
+                        .is_none();
                 publish_model_audit(
                     progress,
                     "native_model_terminal_failure",
@@ -1563,7 +1574,13 @@ impl ResponseState {
                     }),
                 );
                 return Err(TerminalResponseFailure {
-                    message: subscription_failure_message(error, None, None),
+                    message: {
+                        let mut message = subscription_failure_message(error, None, None);
+                        if retryable {
+                            message.push_str(" Provider terminal failure is retryable.");
+                        }
+                        message
+                    },
                     retryable,
                 }
                 .into());
@@ -2707,12 +2724,14 @@ mod tests {
         for (code, top_level) in [
             ("server_error", false),
             ("server_error", true),
+            ("new_backend_error", false),
+            ("new_backend_error", true),
             ("invalid_value", false),
             ("invalid_value", true),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
-            let retry = code == "server_error";
+            let retry = matches!(code, "server_error" | "new_backend_error");
             let server = tokio::spawn(async move {
                 let mut previous = None;
                 for attempt in 0..if retry { 2 } else { 1 } {

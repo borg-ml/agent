@@ -1151,6 +1151,9 @@ async fn accepted_steers_settle_in_fifo_order_when_acknowledgements_arrive_out_o
 
 #[test]
 fn structured_claude_result_terminations_classify_without_prose() {
+    assert!(is_safe_automatic_retry_error(
+        "Codex subscription response did not complete. Provider error: code=other, param=unknown. Provider terminal failure is retryable."
+    ));
     for status in [500, 502, 503, 504, 529] {
         assert!(provider_error_is_transient_api_failure(&format!(
             "openrouter request failed with HTTP {status}: Provider returned error"
@@ -23336,10 +23339,18 @@ fn native_goal_rounds_do_not_charge_the_final_goal_twice() {
     assert_eq!(goal_token_usage(&round(250), &mut ledger), Some(0));
     assert_eq!(goal_token_usage(&round(200), &mut ledger), Some(0));
     let mut aggregate = SessionEventKind::UsageUpdated {
-        provider_duration_ms: 0, turn_id: Some(turn), provider_context_reused: None,
-        input_tokens: 20, cached_input_tokens: 200, cache_creation_input_tokens: 30,
-        output_tokens: 50, total_tokens: 300, cost_microusd: None,
-        cost_basis: String::new(), cost_usd: None, context_tokens: None,
+        provider_duration_ms: 0,
+        turn_id: Some(turn),
+        provider_context_reused: None,
+        input_tokens: 20,
+        cached_input_tokens: 200,
+        cache_creation_input_tokens: 30,
+        output_tokens: 50,
+        total_tokens: 300,
+        cost_microusd: None,
+        cost_basis: String::new(),
+        cost_usd: None,
+        context_tokens: None,
         context_window_tokens: None,
     };
     assert_eq!(goal_token_usage(&aggregate, &mut ledger), Some(50));

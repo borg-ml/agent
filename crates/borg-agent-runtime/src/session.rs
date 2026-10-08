@@ -13642,6 +13642,9 @@ fn is_safe_automatic_retry_error(error: &str) -> bool {
 /// 429 is a usage limit and handled separately.
 fn provider_error_is_transient_api_failure(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
+    if error.contains("provider terminal failure is retryable.") {
+        return true;
+    }
     if [
         "request failed with http ",
         "codex subscription response did not complete. http ",
@@ -13885,10 +13888,7 @@ fn goal_status_name(status: GoalStatus) -> &'static str {
     }
 }
 
-fn goal_token_usage(
-    kind: &SessionEventKind,
-    native_turns: &mut HashMap<Uuid, u64>,
-) -> Option<u64> {
+fn goal_token_usage(kind: &SessionEventKind, native_turns: &mut HashMap<Uuid, u64>) -> Option<u64> {
     match kind {
         SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "native_goal_usage" => {
             let turn = payload.get("turn_id")?.as_str()?.parse::<Uuid>().ok()?;
@@ -13908,7 +13908,8 @@ fn goal_token_usage(
             ..
         } => {
             let total = (*total_tokens).max(
-                input_tokens.saturating_add(*cached_input_tokens)
+                input_tokens
+                    .saturating_add(*cached_input_tokens)
                     .saturating_add(*cache_creation_input_tokens)
                     .saturating_add(*output_tokens),
             );

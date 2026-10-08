@@ -9729,9 +9729,7 @@ impl BorgTerminal {
             let status_highlight = self.status_hovered && status_is_interruptible;
             let status_duration = if session_is_active && reconnect_label.is_none() {
                 let now = Utc::now();
-                activity_clock
-                    .status_duration(now)
-                    .map(|duration| format!("turn {duration}"))
+                activity_clock.status_duration(now)
             } else {
                 None
             };

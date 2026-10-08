@@ -240,7 +240,6 @@ impl Extend<TranscriptEntry> for TranscriptEntries {
 
 struct ModelRequestDisplay {
     id: String,
-    started_at: DateTime<Utc>,
     last_received_at: Option<DateTime<Utc>>,
     output_tokens: Option<u64>,
 }
@@ -1824,7 +1823,6 @@ impl Transcript {
                 {
                     self.model_request = Some(ModelRequestDisplay {
                         id: id.to_string(),
-                        started_at: event.created_at,
                         last_received_at: None,
                         output_tokens: None,
                     });
@@ -7470,7 +7468,7 @@ mod model_request_tests {
     use super::*;
 
     #[test]
-    fn model_request_clock_survives_summaries_and_replay_does_not_claim_receipt() {
+    fn model_request_survives_summaries_and_replay_does_not_claim_receipt() {
         let mut transcript = Transcript::default();
         let started = Utc::now() - chrono::Duration::seconds(222);
         let event = |kind: &str, payload: serde_json::Value| {
@@ -7507,7 +7505,7 @@ mod model_request_tests {
         transcript.apply(&summary);
         transcript.apply(&request);
         let progress = transcript.model_request.as_ref().unwrap();
-        assert_eq!(progress.started_at, started);
+        assert_eq!(progress.id, "request");
         assert!(progress.last_received_at.unwrap() >= received_after);
         transcript.apply(&event(
             "native_model_usage",
