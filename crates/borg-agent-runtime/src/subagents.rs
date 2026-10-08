@@ -10051,12 +10051,6 @@ struct BroadcastArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AcknowledgeMessageArgs {
-    message_id: Uuid,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AcknowledgeMessagesArgs {
     message_id: Option<Uuid>,
     #[serde(default)]

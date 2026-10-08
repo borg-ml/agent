@@ -7,6 +7,8 @@ Git comparison.
 
 ### Terminal
 
+- Show per-model-call elapsed time and last received provider activity without
+  treating replayed history as fresh progress.
 - Preserve GPT reasoning summaries delivered as atomic summary parts or only in
   final model responses, without duplicating streamed text.
 - Rename the subagent menu model column from “Model now” to “Model”.
@@ -31,6 +33,17 @@ Git comparison.
 
 ### Subagents
 
+- Messaging tools require an explicit wake choice, expose canonical message IDs
+  for replies, and report bounded linked-reply evidence separately from delivery
+  acknowledgements. Use `followup_task` for actionable requests.
+- Coordination waits return new deltas instead of repeating the full roster.
+  Nested-agent watches seed current owned-child state and receive lifecycle
+  updates, including parked children and resumptions.
+- Ordered `team_batch` handoffs support director-authorized goal actions with
+  replay-safe receipts and explicit-stop protection. Queued commands remain
+  distinct from verified application; goal identity and accounting are preserved.
+- Canonical goal/execution warnings and recorded owner versions make stale
+  assignments and loaded-binary uncertainty visible without guessing a Git SHA.
 - Saturated child command queues no longer block message delivery indefinitely;
   timed-out messages stay queued and callers are warned not to resend them.
 - Already-acknowledged queued team requests no longer reopen completed work;
@@ -62,8 +75,20 @@ Git comparison.
 - Secret scrubbing preserves ordinary task identifiers instead of mistaking
   their suffixes for provider keys, while retaining credential redaction.
 
+### Native workflows
+
+- Bounded lane waits return admission state and wait reasons instead of only a
+  timeout. Native checks can explicitly reserve less disk growth while retaining
+  the free-space floor and conservative default reservation.
+- Common nested Rust test, Rayon and OpenMP thread pools default to the bounded
+  job count only when unset; explicit environment and CLI choices are preserved.
+- Document cooperative Git landing locks, preservation of foreign staged work,
+  and compact evidence handoffs using existing shared-work/artifact APIs.
+
 ### Language servers
 
+- Compilation-context metadata distinguishes database presence/file coverage
+  from unobserved clangd effective flags, including conditional configuration.
 - Nested projects correctly account for inherited `.clangd` compilation-database
   overrides. Ancestor configuration changes invalidate cached metadata, while
   opening another document with the same effective configuration avoids an
