@@ -37,6 +37,16 @@
 - Before each commit, inspect the status and diff, preserve unrelated user or
   other-agent changes, and use a clear commit message. Do not bundle unrelated
   work merely to create a commit.
+- Serialize cooperative landing across the whole status/diff/commit/push
+  transaction with `flock` on `borg-landing.lock` in the absolute Git common
+  directory (`git rev-parse --path-format=absolute --git-common-dir`). This is
+  advisory: it does not fence nonparticipating Git commands or editors. Never
+  delete another worker's lock. Without `flock`, the coordinator serializes.
+- For fully owned, disjoint paths, reject overlap with preexisting staged
+  paths, then use `git commit --only -- <owned paths>`; never bundle user or
+  other-worker staged changes. For shared files, deliver a reviewed,
+  hash-addressed patch to the parent for integration under the same lock and
+  a clean-index preflight. Do not reset foreign staged work to make it clean.
 - Keep the working tree recoverable: do not leave a long-running task with a
   large, uncommitted change set when a coherent checkpoint can be committed.
 - Agents must not attribute work to themselves. Never add `Co-Authored-By`

@@ -98,6 +98,69 @@ only handles clean merged Borg-created trees with confirmed-dead owners.
    review or an exclusive resource lease. A timeout is not auto-ack or
    auto-rebase.
 
+## Cooperative Git landing
+
+Git's `index.lock` protects individual index updates, not the whole
+inspection → staging → commit → push transaction. Shared-work claims and the
+freeze handshake record ownership; they do not fence Git commands or editors.
+All participating workers should hold one stable common-directory lock through
+the whole landing transaction:
+
+```sh
+common=$(git rev-parse --path-format=absolute --git-common-dir) || exit 1
+exec 9>"$common/borg-landing.lock"
+flock 9 || exit 1
+# Inspect status, staged paths and the owned diff while holding descriptor 9.
+# Refuse overlap with any preexisting staged path; never reset foreign work.
+# For fully owned, disjoint paths only:
+git commit --only -m 'Describe the coherent change' -- path/to/owned-file
+git push origin main
+```
+
+This is a **cooperative** lock, not a kernel-global guarantee that other Git
+commands or editors cannot modify the checkout. Never unlink foreign lock
+files or bypass a held lock. On platforms without `flock`, have the coordinator
+serialize landings instead. Whole-path commits require whole-path ownership;
+they are not a way to select owned hunks from a shared dirty file.
+
+For shared files, publish a hash-addressed patch with the existing
+`publish_workspace_artifact`, link its shared work ID and provenance, and obtain
+review using `request_work_review` / `record_work_review`. The parent integrates
+that reviewed patch under the same lock after a **clean-index preflight** and
+checks the staged patch is exactly the reviewed change before committing. A
+nonempty user/other-worker index blocks that integration; coordinate with its
+owner rather than stashing, resetting or bundling their work. These are existing
+Git/work APIs, not a new landing engine or permission grant.
+
+## Compact delivery manifest
+
+Keep a small manifest beside retained patch/check evidence; publish its URI and
+content hash with `publish_workspace_artifact` (and `record_workspace_provenance`
+when linking a source artifact). Use actual work IDs, revisions and checks, not
+invented passed verdicts. For example, fill in this outline:
+
+```text
+work_id / assignment / owner: existing UUIDs and agreed owned paths
+source: repository + source SHA + dirty paths/patch hash + job fingerprint
+artifact: retained patch/manifest URI + content hash + provenance source ID
+checks: actual commands/selectors + lane job IDs + results + evidence paths
+review: recorded review ID/verdict, or pending (not a fabricated approval)
+deferred: human verification required + exact unverified claim/action
+handoff: dependencies/work IDs + resource owner/release + next stage/owner
+```
+
+Separate measured results from source-only findings and deferred human checks.
+A notification ACK, successful patch delivery or compiler check is not proof of
+runtime behavior, human acceptance or a passed review. Keep deferred checks
+visible through the next handoff rather than relabeling them complete.
+
+Native jobs bound common nested fanout with `RUST_TEST_THREADS`,
+`RAYON_NUM_THREADS` and `OMP_NUM_THREADS`, defaulting each **only when unset** to
+the adapter's bounded job count. Explicit environment values (including empty)
+and tool/test CLI overrides remain intact. This does not constrain every custom
+thread pool or implement a parent/descendant fairness quota; host RAM/disk
+admission and cgroup limits remain the separate enforced boundary.
+
 ## Measured read-only demo (2026-09-23, this host)
 
 Commands used a debug `borg` binary built from this branch. **No deletion or
