@@ -1261,7 +1261,10 @@ fn subscription_failure_message(
     }
     // Fixed tokens identify a rejected field without copying backend message
     // text, which may contain user content or account-specific details.
-    let code = known_or_other(error["code"].as_str(), &KNOWN_ERROR_CODES);
+    let code = known_or_other(
+        error["code"].as_str().or_else(|| error["type"].as_str()),
+        &KNOWN_ERROR_CODES,
+    );
     let param = known_or_other(error["param"].as_str(), &KNOWN_ERROR_PARAMS);
     if code != "unknown" || param != "unknown" {
         message.push_str(&format!(" Provider error: code={code}, param={param}."));
@@ -1545,7 +1548,8 @@ impl ResponseState {
                     .filter(|error| error.is_object())
                     .or_else(|| event.get("error").filter(|error| error.is_object()))
                     .or_else(|| (event["type"] == "error").then_some(event));
-                let code = error.and_then(|error| error["code"].as_str());
+                let code = error
+                    .and_then(|error| error["code"].as_str().or_else(|| error["type"].as_str()));
                 let retryable = matches!(
                     code,
                     Some("server_error" | "internal_error" | "service_unavailable")
@@ -1733,7 +1737,7 @@ const KNOWN_INCOMPLETE_REASONS: [&str; 2] = ["max_output_tokens", "content_filte
 /// counted as `other`, which still shows that an unsupported item arrived
 /// without repeating whatever the backend called it.
 const KNOWN_ITEM_TYPES: [&str; 3] = ["message", "function_call", "reasoning"];
-const KNOWN_ERROR_CODES: [&str; 12] = [
+const KNOWN_ERROR_CODES: [&str; 16] = [
     "server_error",
     "internal_error",
     "service_unavailable",
@@ -1746,6 +1750,10 @@ const KNOWN_ERROR_CODES: [&str; 12] = [
     "model_not_found",
     "context_length_exceeded",
     "unsupported_value",
+    "usage_limit_reached",
+    "rate_limit_exceeded",
+    "insufficient_quota",
+    "content_filter",
 ];
 const KNOWN_ERROR_PARAMS: [&str; 15] = [
     "reasoning.effort",
@@ -2579,12 +2587,25 @@ mod tests {
                 if kind == "native_model_terminal_failure"
                     && payload == json!({
                         "event_type":"response.failed",
-                        "code":"other",
+                        "code":"rate_limit_exceeded",
                         "retryable":false,
                     })
                     && raw_payload.is_none()
         ));
         assert!(events.try_recv().is_err());
+        for kind in ["invalid_value", "rate_limit_exceeded", "server_error"] {
+            let error = state
+                .event(
+                    &json!({"type":"response.failed","response":{"error":{"type":kind}}}),
+                    None,
+                    "test-model",
+                    "low",
+                )
+                .unwrap_err();
+            let failure = error.downcast_ref::<TerminalResponseFailure>().unwrap();
+            assert_eq!(failure.retryable, kind == "server_error");
+            assert!(failure.message.contains(&format!("code={kind}")));
+        }
         let context_error = subscription_failure_message(
             Some(&json!({"code":"context_length_exceeded"})),
             None,
