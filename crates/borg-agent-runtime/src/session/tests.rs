@@ -23096,3 +23096,153 @@ fn history_only_context_edits_keep_the_prior_system_prompt() {
         Some("custom")
     );
 }
+
+#[tokio::test]
+async fn queued_agent_goal_cannot_clear_a_human_stop() {
+    for running in [false, true] {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let (scratch, store, mut journal) = runtime_store(session_id).await;
+        let mut goal = SessionGoal::new("held assignment".into(), Some(100));
+        goal.status = GoalStatus::Paused;
+        goal.tokens_used = 42;
+        for kind in [
+            SessionEventKind::SessionStarted,
+            SessionEventKind::SessionConfigured {
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+                ultrafast: false,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                speed_support: Default::default(),
+            },
+            SessionEventKind::GoalUpdated { goal: goal.clone() },
+        ] {
+            journal
+                .append(SessionEvent::new(session_id, 0, kind))
+                .await
+                .unwrap();
+        }
+        if running {
+            journal
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    SessionEventKind::Message {
+                        message_id: Uuid::new_v4(),
+                        actor: EventActor::User,
+                        text: "the pre-stop prompt".into(),
+                        attachments: Vec::new(),
+                        status: MessageStatus::Queued,
+                        delivery: Some(PromptDelivery::Queue),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        drop(journal);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let mut actor = tokio::spawn({
+            let journal_path = root.path().join("session.lock");
+            let cwd = root.path().to_path_buf();
+            let store = Arc::clone(&store);
+            async move {
+                run_session_actor(
+                    &journal_path,
+                    session_id,
+                    LaunchSession {
+                        request_id: Uuid::new_v4(),
+                        cwd,
+                        provider: CodingProvider::Codex,
+                        model: None,
+                        effort: None,
+                        fast: Some(false),
+                        ultrafast: None,
+                        response_language: crate::ResponseLanguage::Auto,
+                        permission_mode: PermissionMode::Manual,
+                        name: None,
+                        initial_prompt: None,
+                        capabilities: Default::default(),
+                        subagent_concurrency_limit: None,
+                        extension_skill_roots: Vec::new(),
+                        team_policy: None,
+                    },
+                    command_rx,
+                    event_tx,
+                    Arc::new(HungProviderExecutor),
+                    store,
+                )
+                .await
+            }
+        });
+        let expected = if running {
+            SessionStatus::Running
+        } else {
+            SessionStatus::Ready
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = match event_rx.recv().await {
+                    Some(event) => event,
+                    None => panic!("actor setup exited: {:?}", (&mut actor).await),
+                };
+                if let SessionEventKind::Error { message } = &event.kind {
+                    panic!("actor setup failed before race: {message}");
+                }
+                if matches!(event.kind, SessionEventKind::StatusChanged { status, .. } if status == expected) { break; }
+            }
+        }).await.expect("actor reaches the requested idle/running state");
+        // A coordinator could have admitted the goal before this stop was
+        // recorded. FIFO delivery must still honor the actor's current latch.
+        command_tx
+            .send(HostCommand::Interrupt { session_id })
+            .await
+            .unwrap();
+        command_tx
+            .send(HostCommand::AgentGoal {
+                session_id,
+                action: GoalAction::Set {
+                    objective: "must not replace held assignment".into(),
+                    token_budget: None,
+                },
+            })
+            .await
+            .unwrap();
+        command_tx
+            .send(HostCommand::AgentGoal {
+                session_id,
+                action: GoalAction::Resume,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut rejected = 0;
+            while rejected < 2 {
+                let event = event_rx.recv().await.expect("actor remains attached");
+                if matches!(event.kind, SessionEventKind::Error { ref message } if message.contains("Agent goal change rejected: explicit human stop")) { rejected += 1; }
+            }
+        }).await.expect("both queued agent actions are rejected at application");
+        let state = store.state(session_id).await.unwrap();
+        assert!(state.user_stopped);
+        let held = state.goal.unwrap();
+        assert_eq!(held.id, goal.id);
+        assert_eq!(held.objective, goal.objective);
+        assert_eq!(held.token_budget, goal.token_budget);
+        assert_eq!(held.tokens_used, goal.tokens_used);
+        assert_ne!(held.status, GoalStatus::Active);
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), actor)
+            .await
+            .expect("actor shuts down")
+            .unwrap()
+            .unwrap();
+        scratch.discard().await;
+    }
+}

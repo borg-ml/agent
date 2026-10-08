@@ -9900,3 +9900,150 @@ fn message_tool_requires_explicit_notification_or_wake_choice() {
             .contains(&json!("wake"))
     );
 }
+
+#[tokio::test]
+async fn team_batch_goal_handoff_is_ordered_authorized_and_not_replayed() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        3,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+    let (child, grandchild, mut rx) = {
+        let mut table = coordinator.table.lock().await;
+        let child = table.reserve("worker", &launch()).unwrap().session_id;
+        let grandchild = table
+            .reserve_as(child, "nested", &launch())
+            .unwrap()
+            .session_id;
+        let (tx, rx) = mpsc::channel(8);
+        let entry = table.entries.get_mut(&child).unwrap();
+        entry.snapshot.status = SubagentStatus::Running;
+        entry.commands = Some(tx);
+        (child, grandchild, rx)
+    };
+    bind_test_team(directory.path(), &store, root, &[child]).await;
+    store
+        .register_child_session(child, grandchild)
+        .await
+        .unwrap();
+    let mut goal = crate::SessionGoal::new("original".into(), None);
+    goal.status = crate::GoalStatus::Blocked;
+    goal.tokens_used = 42;
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::GoalUpdated { goal: goal.clone() },
+        ))
+        .await
+        .unwrap();
+    let denied = coordinator.call_tool_as(child, "team_batch", json!({"idempotency_key": "unauthorized", "operations": [
+        {"session_id": grandchild, "operation": "control_agent_goal", "goal_action": {"type": "resume"}}]
+    })).await.unwrap_err();
+    assert!(denied.to_string().contains("only the director"));
+    assert!(coordinator.call_tool_as(root, "team_batch", json!({"idempotency_key": "invalid", "operations": [
+        {"session_id": child, "operation": "followup_task", "message": "must not be sent"},
+        {"session_id": child, "operation": "control_agent_goal", "goal_action": {"type": "set", "objective": " "}}]
+    })).await.is_err());
+    assert!(
+        rx.try_recv().is_err(),
+        "invalid batch must fail before sending earlier operations"
+    );
+    let request = json!({"idempotency_key": "goal-handoff", "operations": [
+        {"session_id": child, "operation": "control_agent_goal", "goal_action": {"type": "resume"}},
+        {"session_id": child, "operation": "followup_task", "message": "continue assigned work"}]
+    });
+    let receipt = coordinator
+        .call_tool_as(root, "team_batch", request.clone())
+        .await
+        .unwrap();
+    let queued = &receipt["receipt"]["results"][0];
+    assert_eq!(queued["accepted"], true);
+    assert!(queued["applied"].is_null());
+    assert!(matches!(
+        rx.recv().await.unwrap(),
+        HostCommand::AgentGoal {
+            action: crate::GoalAction::Resume,
+            ..
+        }
+    ));
+    assert!(matches!(
+        rx.recv().await.unwrap(),
+        HostCommand::TeamPrompt { .. }
+    ));
+    let recorded = store.state(child).await.unwrap().goal.unwrap();
+    assert_eq!(
+        recorded, goal,
+        "enqueueing must not mutate canonical goal identity/accounting or claim application"
+    );
+    goal.status = crate::GoalStatus::Complete;
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::GoalUpdated { goal },
+        ))
+        .await
+        .unwrap();
+    let replay = coordinator
+        .call_tool_as(root, "team_batch", request)
+        .await
+        .unwrap();
+    assert_eq!(replay["operation_id"], receipt["operation_id"]);
+    assert!(
+        rx.try_recv().is_err(),
+        "submitted goal and wake must not replay after state changes"
+    );
+    let failed_handoff = json!({"idempotency_key": "rejected-handoff", "operations": [
+        {"session_id": child, "operation": "control_agent_goal", "goal_action": {"type": "resume"}},
+        {"session_id": child, "operation": "followup_task", "message": "must remain unsent"}]
+    });
+    for _ in 0..2 {
+        let failed = coordinator
+            .call_tool_as(root, "team_batch", failed_handoff.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            failed["receipt"]["results"][0]["state"],
+            "failed_or_uncertain"
+        );
+        assert_eq!(failed["receipt"]["results"][1]["state"], "pending");
+        assert!(
+            rx.try_recv().is_err(),
+            "rejected resume must not admit a later wake, including on replay"
+        );
+    }
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::UserStopChanged { engaged: true },
+        ))
+        .await
+        .unwrap();
+    let stopped = coordinator.call_tool_as(root, "team_batch", json!({"idempotency_key": "human-stopped", "operations": [
+        {"session_id": child, "operation": "control_agent_goal", "goal_action": {"type": "set", "objective": "new work"}}]
+    })).await.unwrap();
+    assert_eq!(
+        stopped["receipt"]["results"][0]["state"],
+        "failed_or_uncertain"
+    );
+    assert!(
+        stopped["receipt"]["results"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("explicit human stop")
+    );
+    assert!(rx.try_recv().is_err());
+    assert!(store.state(child).await.unwrap().user_stopped);
+    scratch.discard().await;
+}

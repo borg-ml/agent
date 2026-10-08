@@ -156,6 +156,65 @@ pub(super) fn scrub_value(value: &mut Value) {
     }
 }
 
+fn validate_goal_action(
+    action: &crate::GoalAction,
+    state: Option<&crate::SessionState>,
+) -> Result<()> {
+    if let crate::GoalAction::Set {
+        objective,
+        token_budget,
+    } = action
+    {
+        ensure!(
+            !objective.trim().is_empty() && objective.chars().count() <= 4096,
+            "goal objective must contain 1..4096 characters"
+        );
+        ensure!(
+            token_budget.is_none_or(|budget| budget > 0),
+            "token budget must be positive"
+        );
+    }
+    if let Some(state) = state {
+        match action {
+            crate::GoalAction::Pause => {
+                ensure!(state.goal.is_some(), "child has no goal");
+            }
+            crate::GoalAction::Resume => {
+                let goal = state.goal.as_ref().context("child has no goal")?;
+                ensure!(
+                    !state.user_stopped,
+                    "explicit human stop requires human resume authorization"
+                );
+                ensure!(
+                    state.pending_approval_id.is_none()
+                        && state.pending_provider_interaction_id.is_none(),
+                    "child has a pending approval or decision"
+                );
+                ensure!(
+                    !matches!(
+                        goal.status,
+                        crate::GoalStatus::Complete | crate::GoalStatus::BudgetLimited
+                    ),
+                    "completed or budget-limited goals cannot be resumed"
+                );
+            }
+            crate::GoalAction::Set { .. } => {
+                ensure!(
+                    !state.user_stopped,
+                    "explicit human stop requires human resume authorization"
+                );
+                ensure!(
+                    state.pending_approval_id.is_none()
+                        && state.pending_provider_interaction_id.is_none(),
+                    "child has a pending approval or decision"
+                );
+            }
+            crate::GoalAction::Clear => (),
+        }
+    }
+    Ok(())
+}
+
 impl SubagentCoordinator {
     async fn authorize_inspection(&self, actor: Uuid, target: Uuid) -> Result<()> {
         ensure!(
@@ -194,57 +253,8 @@ impl SubagentCoordinator {
             "only the director may control child goals"
         );
         let action = args.goal_action.context("goal_action is required")?;
-        if let crate::GoalAction::Set {
-            objective,
-            token_budget,
-        } = &action
-        {
-            ensure!(
-                !objective.trim().is_empty() && objective.chars().count() <= 4096,
-                "goal objective must contain 1..4096 characters"
-            );
-            ensure!(
-                token_budget.is_none_or(|budget| budget > 0),
-                "token budget must be positive"
-            );
-        }
         let state = self.store.state(id).await?;
-        match &action {
-            crate::GoalAction::Pause => {
-                ensure!(state.goal.is_some(), "child has no goal");
-            }
-            crate::GoalAction::Resume => {
-                let goal = state.goal.as_ref().context("child has no goal")?;
-                ensure!(
-                    !state.user_stopped,
-                    "explicit human stop requires human resume authorization"
-                );
-                ensure!(
-                    state.pending_approval_id.is_none()
-                        && state.pending_provider_interaction_id.is_none(),
-                    "child has a pending approval or decision"
-                );
-                ensure!(
-                    !matches!(
-                        goal.status,
-                        crate::GoalStatus::Complete | crate::GoalStatus::BudgetLimited
-                    ),
-                    "completed or budget-limited goals cannot be resumed"
-                );
-            }
-            crate::GoalAction::Set { .. } => {
-                ensure!(
-                    !state.user_stopped,
-                    "explicit human stop requires human resume authorization"
-                );
-                ensure!(
-                    state.pending_approval_id.is_none()
-                        && state.pending_provider_interaction_id.is_none(),
-                    "child has a pending approval or decision"
-                );
-            }
-            crate::GoalAction::Clear => (),
-        }
+        validate_goal_action(&action, Some(&state))?;
         self.send_command(&id.to_string(), |session_id| HostCommand::AgentGoal {
             session_id,
             action,
@@ -394,6 +404,8 @@ struct BatchItem {
     #[serde(default)]
     message: String,
     configuration: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    goal_action: Option<crate::GoalAction>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -499,6 +511,10 @@ impl SubagentCoordinator {
         );
         // Validate every target before writing intent or producing any side effect.
         for item in &args.operations {
+            ensure!(
+                item.operation == "control_agent_goal" || item.goal_action.is_none(),
+                "goal_action is only accepted for control_agent_goal"
+            );
             match item.operation.as_str() {
                 "send_message" | "followup_task" => {
                     ensure!(
@@ -532,6 +548,21 @@ impl SubagentCoordinator {
                     );
                     fields.insert("target".into(), json!(item.session_id));
                     let _: ConfigureAgentArgs = serde_json::from_value(configuration)?;
+                }
+                "control_agent_goal" => {
+                    ensure!(
+                        actor == self.root_session_id,
+                        "only the director may control child goals"
+                    );
+                    ensure!(
+                        item.message.is_empty() && item.configuration.is_none(),
+                        "control_agent_goal accepts only session_id and goal_action"
+                    );
+                    let action = item
+                        .goal_action
+                        .as_ref()
+                        .context("goal_action is required")?;
+                    validate_goal_action(action, None)?;
                 }
                 "interrupt_agent" => ensure!(
                     item.message.is_empty() && item.configuration.is_none(),
@@ -575,6 +606,22 @@ impl SubagentCoordinator {
                 .context("batch disappeared")?;
             let mut state = entry.value.context("batch disappeared")?;
             if state["cancelled"] == true {
+                break;
+            }
+            if args
+                .operations
+                .iter()
+                .enumerate()
+                .take(index)
+                .any(|(prior, operation)| {
+                    operation.operation == "control_agent_goal"
+                        && state["results"][prior]["state"] != "submitted"
+                })
+            {
+                state["gate"] = json!(
+                    "earlier goal command has no confirmed submission; later operations remain unsent"
+                );
+                self.save_batch(actor, id, entry.revision, state).await?;
                 break;
             }
             // Fence concurrent retries durably BEFORE the effect. A dropped
@@ -623,7 +670,14 @@ impl SubagentCoordinator {
             state["results"][index]["started_at"] = json!(Utc::now());
             self.save_batch(actor, id, entry.revision, state).await?;
             let target = item.session_id.to_string();
-            let result: Result<Value> = if matches!(
+            let result: Result<Value> = if item.operation == "control_agent_goal" {
+                self.agent_goal(
+                    actor,
+                    json!({"target": target, "goal_action": item.goal_action}),
+                    true,
+                )
+                .await
+            } else if matches!(
                 item.operation.as_str(),
                 "configure_agent" | "interrupt_agent"
             ) {
@@ -693,6 +747,15 @@ fn bounded_recent_message(mut event: Value) -> Value {
 #[cfg(test)]
 mod observation_tests {
     use super::*;
+
+    #[test]
+    fn batch_goal_extension_preserves_legacy_request_serialization() {
+        let legacy = json!({"session_id": Uuid::nil(), "operation": "interrupt_agent", "message": "", "configuration": null});
+        let item: BatchItem = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(item).unwrap(), legacy);
+        let invalid = json!({"session_id": Uuid::nil(), "operation": "control_agent_goal", "goal_action": {"type": "unknown"}});
+        assert!(serde_json::from_value::<BatchItem>(invalid).is_err());
+    }
 
     #[test]
     fn executing_with_blocked_or_paused_goal_is_visible_without_resuming() {
