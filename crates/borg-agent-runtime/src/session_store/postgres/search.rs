@@ -1488,13 +1488,8 @@ mod tests {
         assert_eq!(page.hits[0].event.id, oversized.id);
         assert_eq!(page.hits[0].event.sequence, oversized.sequence);
         assert!(page.hits[0].score.is_none());
-        assert!(
-            page.hits[0]
-                .snippet
-                .as_deref()
-                .unwrap()
-                .contains("payloadneedle")
-        );
+        // Expanded payload text consumes the full shared 64-byte budget.
+        assert!(page.hits[0].snippet.is_none());
         assert_eq!(page.hits[0].payloads.len(), 1);
         assert_eq!(page.hits[0].payloads[0].reference.id, reference.id);
         assert_eq!(page.hits[0].payloads[0].text, output[..64]);

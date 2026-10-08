@@ -3533,7 +3533,7 @@ async fn child_messages_are_team_scoped_and_can_report_to_root() {
     ));
     let notifications = coordinator.take_root_inbox().await;
     assert_eq!(notifications.len(), 1);
-    assert_eq!(notifications[0].delivery, PromptDelivery::Queue);
+    assert_eq!(notifications[0].delivery, PromptDelivery::Steer);
 
     coordinator
         .followup_task_as(worker.session_id, "/root", "please review")
@@ -4213,7 +4213,7 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
         HostCommand::TeamPrompt {
             session_id,
             message_id: delivered_id,
-            delivery: PromptDelivery::Queue,
+            delivery: PromptDelivery::Steer,
             ..
         } if session_id == recipient && delivered_id == message_id
     ));
@@ -9046,13 +9046,26 @@ async fn team_harness_tool_context_keeps_literal_shell_cd_separate_from_assigned
             .unwrap();
         assert_eq!(started["running"], true);
         assert_eq!(started["cwd"], nested.to_string_lossy().as_ref());
-        let finished = dispatcher
+        let mut finished = dispatcher
             .call(
                 "exec",
                 json!({"session_id":started["session_id"], "chars":"done\n", "yield_time_ms":1000}),
             )
             .await
             .unwrap();
+        for _ in 0..10 {
+            assert_eq!(finished["cwd"], nested.to_string_lossy().as_ref());
+            if finished["running"] == false {
+                break;
+            }
+            finished = dispatcher
+                .call(
+                    "exec",
+                    json!({"session_id":started["session_id"], "yield_time_ms":250}),
+                )
+                .await
+                .unwrap();
+        }
         assert_eq!(finished["cwd"], nested.to_string_lossy().as_ref());
         assert_eq!(finished["running"], false);
     }
