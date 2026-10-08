@@ -114,8 +114,6 @@ struct ModelCapabilities {
     #[serde(default = "default_true")]
     supports_reasoning_summary_parameter: bool,
     #[serde(default)]
-    default_reasoning_summary: Option<String>,
-    #[serde(default)]
     support_verbosity: bool,
     #[serde(default)]
     default_verbosity: Option<String>,
@@ -923,7 +921,7 @@ impl CodexModelProvider {
         }
         let mut body = json!({"model": self.model, "instructions": instructions,
             "input": input, "tools": tools, "tool_choice": "auto", "parallel_tool_calls": true,
-            "reasoning": {"effort": baseline, "summary": "auto"},
+            "reasoning": {"effort": baseline, "summary": "detailed"},
             "store": false, "stream": true, "include": ["reasoning.encrypted_content"]});
         if let Some(capabilities) = capabilities {
             if capabilities.use_responses_lite {
@@ -931,13 +929,7 @@ impl CodexModelProvider {
                 body.as_object_mut().unwrap().remove("tools");
                 body["reasoning"]["context"] = json!("all_turns");
             }
-            let summary = capabilities
-                .default_reasoning_summary
-                .as_deref()
-                .filter(|summary| *summary != "none")
-                .unwrap_or("auto");
             if capabilities.supports_reasoning_summary_parameter {
-                body["reasoning"]["summary"] = json!(summary);
                 if subscription_only {
                     body["stream_options"] =
                         json!({"reasoning_summary_delivery":"sequential_cutoff"});
@@ -2087,7 +2079,7 @@ mod tests {
         );
         assert_eq!(
             first["reasoning"],
-            json!({"effort":"low", "context":"all_turns", "summary":"auto"})
+            json!({"effort":"low", "context":"all_turns", "summary":"detailed"})
         );
         assert_eq!(
             first["stream_options"]["reasoning_summary_delivery"],
@@ -2150,7 +2142,6 @@ mod tests {
         capabilities.use_responses_lite = false;
         capabilities.supports_reasoning_effort_updates = false;
         capabilities.supports_reasoning_summary_parameter = false;
-        capabilities.default_reasoning_summary = Some("detailed".into());
         let classic = provider
             .request_body_with_capabilities(&request, Some(&capabilities), true)
             .unwrap();
@@ -2959,6 +2950,7 @@ mod tests {
         let body = provider.request_body(&request).unwrap();
         assert_eq!(body["model"], "gpt-6.1-sol");
         assert_eq!(body["reasoning"]["effort"], "max");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
     }
 
     #[test]
