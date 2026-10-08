@@ -7,6 +7,8 @@ Git comparison.
 
 ### Terminal
 
+- Hide the transcript scrollbar track so only the draggable thumb is visible.
+
 - Show per-model-call elapsed time and last received provider activity without
   treating replayed history as fresh progress.
 - Preserve GPT reasoning summaries delivered as atomic summary parts or only in

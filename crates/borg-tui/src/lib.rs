@@ -9528,7 +9528,7 @@ impl BorgTerminal {
                                     },
                                 )
                             } else {
-                                (" ▕", Color::Rgb(67, 72, 81))
+                                ("  ", Color::Reset)
                             };
                             Line::from(Span::styled(glyph, Style::default().fg(color)))
                         })
