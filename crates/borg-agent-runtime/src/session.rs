@@ -10119,7 +10119,10 @@ async fn broadcast_team_message(
     let message_id = Uuid::new_v4();
     let mut recipient_ids = Vec::new();
     for child in coordinator.list(None).await {
-        if !child.status.consumes_concurrency_slot() {
+        if !matches!(
+            child.status,
+            SubagentStatus::Starting | SubagentStatus::Running | SubagentStatus::WaitingForApproval
+        ) {
             continue;
         }
         match coordinator
