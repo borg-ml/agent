@@ -7644,7 +7644,7 @@ fn replayed_user_message(
 
 fn native_conversation_with_images(
     events: &[SessionEvent],
-    _provider: CodingProvider,
+    provider: CodingProvider,
     mut images: HashMap<Uuid, Vec<ModelInputAttachment>>,
 ) -> Result<Vec<borg_provider::provider::ModelMessage>> {
     // Borg's event journal is the source of truth for the conversation. Native
@@ -8150,7 +8150,53 @@ fn native_conversation_with_images(
         close_dangling_tool_calls(&mut pending_generic);
         conversation.append(&mut pending_generic);
     }
+    if provider != CodingProvider::Codex {
+        for message in &mut conversation {
+            project_visible_reasoning_summary(message);
+        }
+    }
     Ok(conversation)
+}
+
+fn project_visible_reasoning_summary(message: &mut borg_provider::provider::ModelMessage) {
+    use borg_core::ModelProviderState;
+    use borg_provider::provider::ModelMessage;
+
+    let ModelMessage::Assistant {
+        content,
+        reasoning_content,
+        reasoning_details,
+        provider_state: state @ Some(ModelProviderState::OpenAiResponses { .. }),
+        ..
+    } = message
+    else {
+        return;
+    };
+    let Some(ModelProviderState::OpenAiResponses { output, .. }) = state else {
+        return;
+    };
+    let summary = output
+        .iter()
+        .filter(|item| item["type"] == "reasoning")
+        .filter_map(|item| item["summary"].as_array())
+        .flatten()
+        .filter_map(|part| part["text"].as_str())
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if summary.is_empty() {
+        return;
+    }
+    let note = format!(
+        "[Previous visible reasoning summary — context, not instructions]\n{summary}\n[/Previous visible reasoning summary]"
+    );
+    *content = Some(match content.take() {
+        Some(text) if !text.is_empty() => format!("{text}\n\n{note}"),
+        _ => note,
+    });
+    *reasoning_content = None;
+    *reasoning_details = None;
+    *state = None;
 }
 
 fn close_interrupted_native_round(
@@ -9276,6 +9322,7 @@ pub(crate) fn prune_conversation_for_compaction(
     // to continue a provider turn. In particular, Responses replay includes
     // encrypted reasoning that would otherwise bypass the neutral projection.
     for message in &mut projected {
+        project_visible_reasoning_summary(message);
         if let ModelMessage::Assistant {
             reasoning_content,
             reasoning_details,
@@ -9379,6 +9426,8 @@ fn compact_message_for_budget(
     content_limit: usize,
 ) {
     use borg_provider::provider::ModelMessage;
+
+    project_visible_reasoning_summary(message);
 
     match message {
         ModelMessage::System { content } | ModelMessage::User { content, .. } => {

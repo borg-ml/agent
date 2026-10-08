@@ -12840,6 +12840,71 @@ fn provider_neutral_replay_carries_subscription_tools_across_provider_switches()
 }
 
 #[test]
+fn visible_gpt_summary_survives_durable_replay_provider_switch_and_compaction() {
+    use borg_core::ModelProviderState;
+    use borg_provider::provider::ModelMessage;
+
+    let original = ModelMessage::Assistant {
+        content: Some("Checking the implementation".into()),
+        reasoning_content: Some("not a portable summary".into()),
+        reasoning_details: None,
+        provider_state: Some(ModelProviderState::OpenAiResponses {
+            output: vec![
+                json!({"type":"reasoning", "encrypted_content":"opaque replay",
+                "summary":[{"type":"summary_text", "text":"Compare persistence and replay before editing."}]}),
+            ],
+            account_identity: None,
+            request_model: None,
+            request_effort: None,
+            effective_effort: None,
+        }),
+        tool_calls: Vec::new(),
+    };
+    let event = SessionEvent::new(
+        Uuid::new_v4(),
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "native_model_message".into(),
+            payload: serde_json::to_value(&original).unwrap(),
+        },
+    );
+    let restored: SessionEvent =
+        serde_json::from_slice(&serde_json::to_vec(&event).unwrap()).unwrap();
+    let events = [restored];
+    assert_eq!(
+        native_conversation(&events, CodingProvider::Codex).unwrap(),
+        vec![original.clone()]
+    );
+    for provider in [CodingProvider::Claude, CodingProvider::OpenRouter] {
+        let replay = native_conversation(&events, provider).unwrap();
+        let ModelMessage::Assistant {
+            content: Some(text),
+            provider_state,
+            reasoning_content,
+            ..
+        } = &replay[0]
+        else {
+            panic!("expected assistant context");
+        };
+        assert!(text.contains("Compare persistence and replay before editing."));
+        assert!(text.contains("Checking the implementation"));
+        assert!(!text.contains("opaque replay") && !text.contains("not a portable summary"));
+        assert!(provider_state.is_none() && reasoning_content.is_none());
+        assert_eq!(prune_conversation_for_compaction(&replay), replay);
+    }
+    let compacted = prune_conversation_for_compaction(&[original.clone()]);
+    assert_eq!(
+        compacted,
+        native_conversation(&events, CodingProvider::Claude).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&events[0]).unwrap(),
+        serde_json::to_value(&event).unwrap()
+    );
+}
+
+#[test]
 fn compaction_drops_provider_reasoning_without_mutating_durable_evidence() {
     use borg_provider::provider::{ModelMessage, ModelToolCall};
 
