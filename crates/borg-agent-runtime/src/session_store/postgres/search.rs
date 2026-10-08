@@ -1104,7 +1104,8 @@ mod tests {
         assert_eq!(hits[1]["event_projected"], false);
         let decoded: SessionHistoryHit = serde_json::from_value(hits[1].clone()).unwrap();
         assert_eq!(
-            decoded.event, tool_input,
+            serde_json::to_value(&decoded.event).unwrap(),
+            serde_json::to_value(&tool_input).unwrap(),
             "ordinary small event wire compatibility"
         );
         let used = hits[0]["event_preview"]["kind"]["payload"]["content"]
@@ -1170,7 +1171,10 @@ mod tests {
             serde_json::to_value(&audit).unwrap()
         );
         let decoded: SessionHistoryHit = serde_json::from_value(wire["hits"][0].clone()).unwrap();
-        assert_eq!(decoded.event, audit);
+        assert_eq!(
+            serde_json::to_value(&decoded.event).unwrap(),
+            serde_json::to_value(&audit).unwrap()
+        );
         let canonical = store
             .query_history(
                 session,
@@ -1183,7 +1187,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            canonical.hits[0].event, audit,
+            serde_json::to_value(&canonical.hits[0].event).unwrap(),
+            serde_json::to_value(&audit).unwrap(),
             "display projection must not mutate the journal or typed event"
         );
         let over_cap = store
@@ -1212,7 +1217,10 @@ mod tests {
         assert_eq!(wire["hits"][0]["canonical_lookup_required"], true);
         assert_eq!(wire["hits"][0]["content_truncated"], true);
         assert!(wire["hits"][0].get("event").is_none());
-        assert_eq!(capped.hits[0].event, over_cap);
+        assert_eq!(
+            serde_json::to_value(&capped.hits[0].event).unwrap(),
+            serde_json::to_value(&over_cap).unwrap()
+        );
         scratch.discard().await;
     }
 
