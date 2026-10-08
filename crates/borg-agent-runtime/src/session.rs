@@ -2313,6 +2313,7 @@ async fn run_agent_session_store_kernel_inner(
     let mut title_result_rx: Option<oneshot::Receiver<Option<(String, u64)>>> = None;
     let mut title_task: Option<AbortTask> = None;
     let mut goal = state.goal;
+    let mut native_goal_usage = HashMap::<Uuid, u64>::new();
     let binding = store
         .workspace_binding(session_id)
         .await?
@@ -5347,7 +5348,7 @@ async fn run_agent_session_store_kernel_inner(
                         }
                         track_approval(&kind, &mut pending_approval);
                         track_provider_interaction(&kind, &mut pending_provider_interaction);
-                        let usage = goal_token_usage(&kind);
+                        let usage = goal_token_usage(&kind, &mut native_goal_usage);
                         if context_usage_observation(&kind) {
                             provider_context_usage_valid = true;
                         }
@@ -7172,7 +7173,7 @@ async fn run_agent_session_store_kernel_inner(
                     }
                     track_approval(&kind, &mut pending_approval);
                     track_provider_interaction(&kind, &mut pending_provider_interaction);
-                    let usage = goal_token_usage(&kind);
+                    let usage = goal_token_usage(&kind, &mut native_goal_usage);
                     if context_usage_observation(&kind) {
                         provider_context_usage_valid = true;
                     }
@@ -13825,23 +13826,40 @@ fn goal_status_name(status: GoalStatus) -> &'static str {
     }
 }
 
-fn goal_token_usage(kind: &SessionEventKind) -> Option<u64> {
+fn goal_token_usage(
+    kind: &SessionEventKind,
+    native_turns: &mut HashMap<Uuid, u64>,
+) -> Option<u64> {
     match kind {
+        SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "native_goal_usage" => {
+            let turn = payload.get("turn_id")?.as_str()?.parse::<Uuid>().ok()?;
+            let total = payload.get("total_tokens")?.as_u64()?;
+            let previous = native_turns.entry(turn).or_default();
+            let delta = total.saturating_sub(*previous);
+            *previous = (*previous).max(total);
+            Some(delta)
+        }
         SessionEventKind::UsageUpdated {
+            turn_id,
             input_tokens,
             output_tokens,
             cached_input_tokens,
             cache_creation_input_tokens,
             total_tokens,
             ..
-        } => Some(
-            (*total_tokens).max(
-                input_tokens
-                    .saturating_add(*cached_input_tokens)
+        } => {
+            let total = (*total_tokens).max(
+                input_tokens.saturating_add(*cached_input_tokens)
                     .saturating_add(*cache_creation_input_tokens)
                     .saturating_add(*output_tokens),
-            ),
-        ),
+            );
+            // Final native aggregate remains unchanged for billing/UI. Only
+            // the goal receives any usage not already charged by model round.
+            let counted = turn_id
+                .and_then(|turn| native_turns.remove(&turn))
+                .unwrap_or(0);
+            Some(total.saturating_sub(counted))
+        }
         _ => None,
     }
 }

@@ -9141,7 +9141,7 @@ async fn goal_state_is_recoverable_from_the_session_journal() {
         session_id,
         &mut goal,
         &mut active_since,
-        goal_token_usage(&usage).unwrap(),
+        goal_token_usage(&usage, &mut HashMap::new()).unwrap(),
     )
     .await
     .unwrap();
@@ -23245,4 +23245,37 @@ async fn queued_agent_goal_cannot_clear_a_human_stop() {
             .unwrap();
         scratch.discard().await;
     }
+}
+
+// A later goal must not inherit the previous model rounds when one native
+// tool loop changes goals before emitting its final billing aggregate.
+#[test]
+fn native_goal_rounds_do_not_charge_the_final_goal_twice() {
+    let turn = Uuid::new_v4();
+    let mut ledger = HashMap::new();
+    let round = |total| SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Codex,
+        kind: "native_goal_usage".into(),
+        payload: serde_json::json!({"turn_id": turn, "total_tokens": total}),
+    };
+    assert!(!provider_event_is_progress(&round(100)));
+    let first_goal = goal_token_usage(&round(100), &mut ledger).unwrap();
+    let second_goal = goal_token_usage(&round(250), &mut ledger).unwrap();
+    assert_eq!((first_goal, second_goal), (100, 150));
+    assert_eq!(goal_token_usage(&round(250), &mut ledger), Some(0));
+    assert_eq!(goal_token_usage(&round(200), &mut ledger), Some(0));
+    let mut aggregate = SessionEventKind::UsageUpdated {
+        provider_duration_ms: 0, turn_id: Some(turn), provider_context_reused: None,
+        input_tokens: 20, cached_input_tokens: 200, cache_creation_input_tokens: 30,
+        output_tokens: 50, total_tokens: 300, cost_microusd: None,
+        cost_basis: String::new(), cost_usd: None, context_tokens: None,
+        context_window_tokens: None,
+    };
+    assert_eq!(goal_token_usage(&aggregate, &mut ledger), Some(50));
+    assert!(ledger.is_empty());
+    // Non-native routes retain their original aggregate-token accounting.
+    if let SessionEventKind::UsageUpdated { turn_id, .. } = &mut aggregate {
+        *turn_id = None;
+    }
+    assert_eq!(goal_token_usage(&aggregate, &mut ledger), Some(300));
 }

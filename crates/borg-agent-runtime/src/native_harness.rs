@@ -998,6 +998,23 @@ impl NativeHarness {
                 .or(route_window_tokens);
             route_window_tokens = result.usage.context_window_tokens;
             absorb_usage(&mut usage, &result.usage);
+            // Goals can change inside the tool loop. Account model rounds now,
+            // while keeping the aggregate UsageUpdated event for billing/UI.
+            send(
+                &events,
+                SessionEventKind::ProviderEvent {
+                    provider: turn.provider,
+                    kind: "native_goal_usage".into(),
+                    payload: json!({
+                        "turn_id": turn.message_id,
+                        "total_tokens": usage.total_tokens.max(
+                            usage.input_tokens.saturating_add(usage.cached_input_tokens)
+                                .saturating_add(usage.cache_creation_input_tokens)
+                                .saturating_add(usage.output_tokens)),
+                    }),
+                },
+            )
+            .await;
             if let (Some(warmer), Some(request)) = (warmer.as_ref(), warm_request) {
                 warmer.start(CacheWarmRequest {
                     provider: turn.provider,
