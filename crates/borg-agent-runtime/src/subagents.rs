@@ -1272,6 +1272,15 @@ impl AgentToolDispatcher {
                     .await?,
             )?;
             drop_command_echo(&mut result);
+            // Poll results report the tracked shell directory just like starts,
+            // not the launcher's root before the command's leading cd.
+            let remembered = self
+                .shell_directory
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let (Some(directory), Some(result)) = (remembered.as_ref(), result.as_object_mut()) {
+                result.insert("cwd".to_string(), json!(directory));
+            }
             return Ok(result);
         }
         let args = command.expect("a shell call is a command or a process write");

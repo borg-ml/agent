@@ -9007,6 +9007,23 @@ async fn team_harness_tool_context_keeps_literal_shell_cd_separate_from_assigned
         .call("exec", json!({"cmd":"cd nested; pwd"}))
         .await
         .unwrap();
+    // Polling must preserve the public tracked-directory contract too. The
+    // process launcher starts in the assigned root, before the shell's cd.
+    #[cfg(unix)]
+    {
+        let started = dispatcher
+            .call("exec", json!({"cmd":"read -r line; pwd", "yield_time_ms":1}))
+            .await
+            .unwrap();
+        assert_eq!(started["running"], true);
+        assert_eq!(started["cwd"], nested.to_string_lossy().as_ref());
+        let finished = dispatcher
+            .call("exec", json!({"session_id":started["session_id"], "chars":"done\n", "yield_time_ms":1000}))
+            .await
+            .unwrap();
+        assert_eq!(finished["cwd"], nested.to_string_lossy().as_ref());
+        assert_eq!(finished["running"], false);
+    }
     let context = dispatcher
         .call("get_tool_context", json!({}))
         .await
