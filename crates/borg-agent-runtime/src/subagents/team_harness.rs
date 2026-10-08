@@ -759,8 +759,10 @@ mod observation_tests {
 
     #[test]
     fn executing_with_blocked_or_paused_goal_is_visible_without_resuming() {
-        let mut state = crate::SessionState::default();
-        state.goal = Some(crate::SessionGoal::new("work".into(), None));
+        let mut state = crate::SessionState {
+            goal: Some(crate::SessionGoal::new("work".into(), None)),
+            ..Default::default()
+        };
         for status in [
             crate::SessionStatus::Starting,
             crate::SessionStatus::Running,

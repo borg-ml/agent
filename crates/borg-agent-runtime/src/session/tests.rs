@@ -12896,7 +12896,7 @@ fn visible_gpt_summary_survives_durable_replay_provider_switch_and_compaction() 
         assert!(provider_state.is_none() && reasoning_content.is_none());
         assert_eq!(prune_conversation_for_compaction(&replay), replay);
     }
-    let compacted = prune_conversation_for_compaction(&[original.clone()]);
+    let compacted = prune_conversation_for_compaction(std::slice::from_ref(&original));
     assert_eq!(
         compacted,
         native_conversation(&events, CodingProvider::Claude).unwrap()

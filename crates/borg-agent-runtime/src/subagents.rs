@@ -7556,7 +7556,7 @@ impl SubagentCoordinator {
                     .collect::<Vec<_>>();
                 let identities = self
                     .store
-                    .list_sessions(limit.max(DEFAULT_INSTANCE_LIMIT).min(200))
+                    .list_sessions(limit.clamp(DEFAULT_INSTANCE_LIMIT, 200))
                     .await
                     .unwrap_or_default()
                     .into_iter()
