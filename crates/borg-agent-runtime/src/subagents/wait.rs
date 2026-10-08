@@ -414,7 +414,7 @@ impl SubagentCoordinator {
             result["more_messages"] = json!(more_messages);
         }
         result["retrieval"] = json!(
-            "list_agents for the full roster; inspect_agent for owned child history. Retain message_id for canonical full-text lookup. Summaries are observations, not new assignments."
+            "list_agents for the full roster; inspect_agent for owned child history. get_message_status with message_id and include_message:true for canonical paged report text, including after acknowledgement. Summaries are observations, not new assignments."
         );
         let note = match reason {
             "input_pending" => Some(

@@ -1,3 +1,4 @@
+mod message_body;
 mod team_harness;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
@@ -7700,6 +7701,19 @@ impl SubagentCoordinator {
             }
             "get_message_status" => {
                 let args: MessageStatusArgs = serde_json::from_value(arguments)?;
+                let message = if args.include_message {
+                    Some(
+                        self.message_body_page(
+                            actor_session_id,
+                            args.message_id,
+                            args.text_offset_chars.unwrap_or(0),
+                            args.text_limit_chars.unwrap_or(4_000),
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
                 let deliveries = self
                     .workspace_store()
                     .await?
@@ -7796,13 +7810,15 @@ impl SubagentCoordinator {
                 for reply in &mut replies {
                     team_harness::scrub_value(reply);
                 }
-                Ok(
-                    json!({"message_id": args.message_id, "deliveries": receipts, "observed_at": Utc::now(),
+                let mut result = json!({"message_id": args.message_id, "deliveries": receipts, "observed_at": Utc::now(),
                     "reply_evidence": {"linked_replies": replies, "scans": reply_scans,
                         "caveat": "Only canonical linked replies from recorded recipients addressed to the caller are shown. A linked reply is not proof of a useful answer, approval or completion. Unlinked responses are not inferred; empty bounded scans do not prove no response. Follow next_after_sequence when more is true."},
                     "source": "workspace delivery projection plus read-only canonical message presence",
-                    "caveat": "Unknown evidence stays null. Pending may already be dispatched locally; canonical presence is not proof of read or action. Attempts count recorded delivery-attempt receipts, not every dispatch. ACK is not business approval or task completion. Reads never repair projections."}),
-                )
+                    "caveat": "Unknown evidence stays null. Pending may already be dispatched locally; canonical presence is not proof of read or action. Attempts count recorded delivery-attempt receipts, not every dispatch. ACK is not business approval or task completion. Reads never repair projections."});
+                if let Some(message) = message {
+                    result["message"] = message;
+                }
+                Ok(result)
             }
             "interrupt_agent" => {
                 let args: TargetArgs = serde_json::from_value(arguments)?;
@@ -8183,9 +8199,12 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "get_message_status",
-            "Recorded per-recipient delivery state of a message you sent: pending (no admission/relay receipt yet; local dispatch may already have occurred), relayed, admitted, acknowledged, recalled or failed. Returns timestamped delivery evidence and bounded canonical linked replies addressed to you (512-character previews). A reply must still be checked against the request; acknowledgement alone is not a response. Unknown read/acted-on fields stay null; projection can lag canonical recipient events. Attempts count recorded attempt receipts, not every dispatch. ACK is not business approval or task completion. This read never repairs state.",
+            "Recorded per-recipient delivery state of a message you sent or received: pending (no admission/relay receipt yet; local dispatch may already have occurred), relayed, admitted, acknowledged, recalled or failed. Returns timestamped delivery evidence and bounded canonical linked replies addressed to you (512-character previews). A reply must still be checked against the request; acknowledgement alone is not a response. Unknown read/acted-on fields stay null; projection can lag canonical recipient events. Attempts count recorded attempt receipts, not every dispatch. ACK is not business approval or task completion. include_message:true retrieves a read-only canonical body page after acknowledgement, authorized only for its sender or addressed recipient. Follow message.next_text_offset_chars to reconstruct full text (except secret redaction); attachments are metadata only. This read never repairs state.",
             json!({"type":"object","properties":{"message_id":{"type":"string"},
-                "reply_after_sequence":{"type":"integer","minimum":0,"description":"Continue a bounded canonical reply scan after its next_after_sequence."}},"required":["message_id"],"additionalProperties":false}),
+                "reply_after_sequence":{"type":"integer","minimum":0,"description":"Continue a bounded canonical reply scan after its next_after_sequence."},
+                "include_message":{"type":"boolean","default":false,"description":"Include an authorized canonical body page, even after acknowledgement."},
+                "text_offset_chars":{"type":"integer","minimum":0,"default":0,"description":"Unicode-character offset in the fully secret-scrubbed text; use next_text_offset_chars."},
+                "text_limit_chars":{"type":"integer","minimum":0,"default":4000,"description":"Body page characters, clamped to 1..4000."}},"required":["message_id"],"additionalProperties":false}),
         ),
         tool(
             "interrupt_agent",
@@ -10013,6 +10032,10 @@ struct ConfigureAgentArgs {
 struct MessageStatusArgs {
     message_id: Uuid,
     reply_after_sequence: Option<u64>,
+    #[serde(default)]
+    include_message: bool,
+    text_offset_chars: Option<usize>,
+    text_limit_chars: Option<usize>,
 }
 
 #[derive(Deserialize)]

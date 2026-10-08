@@ -10047,3 +10047,153 @@ async fn team_batch_goal_handoff_is_ordered_authorized_and_not_replayed() {
     assert!(store.state(child).await.unwrap().user_stopped);
     scratch.discard().await;
 }
+
+// A bounded wait must not make a workspace-only report unretrievable after
+// acknowledgement, or let another workspace member read a private body.
+#[tokio::test]
+async fn acknowledged_team_message_body_is_paged_private_and_read_only() {
+    let (directory, scratch, coordinator, root, worker) = waiting_team().await;
+    let observer = coordinator
+        .table
+        .lock()
+        .await
+        .reserve("observer", &launch())
+        .unwrap()
+        .session_id;
+    coordinator
+        .store
+        .register_child_session(root, observer)
+        .await
+        .unwrap();
+    let workspace = coordinator.workspace_store().await.unwrap();
+    let human = crate::local_human_participant_id("Human");
+    workspace
+        .ensure_execution_workspace(root, "test team", human, "Human", observer, "Observer")
+        .await
+        .unwrap();
+    let text = format!(
+        "{}\nkey: sk-proj-{}\n done \n",
+        "é🔭\n".repeat(1500),
+        "A".repeat(32)
+    );
+    // The send path trims input before persisting its canonical message.
+    let expected = crate::secret_scrub::scrub_secrets(text.trim()).into_owned();
+    assert_ne!(expected, text);
+    let source = directory.path().join("report.png");
+    std::fs::write(&source, sample_png()).unwrap();
+    let attachments = capture_message_attachments(directory.path(), &[source])
+        .await
+        .unwrap();
+    coordinator
+        .send_message_with_options_as(
+            worker,
+            "/root",
+            &text,
+            TeamMessageOptions {
+                attachments: attachments.clone(),
+                ..TeamMessageOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let wait = coordinator
+        .wait_for(root, Duration::from_millis(100), WaitSignals::default())
+        .await
+        .unwrap();
+    let id: Uuid = serde_json::from_value(wait["messages"][0]["message_id"].clone()).unwrap();
+    assert_eq!(wait["messages"][0]["text_truncated"], true);
+    assert!(
+        coordinator
+            .unread_messages_for_session(root)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !coordinator.store.contains_message(root, id).await.unwrap(),
+        "the report exists only in the workspace store"
+    );
+    let before = serde_json::to_value(workspace.message_deliveries(id).await.unwrap()).unwrap();
+    assert_eq!(before[0]["state"], "acknowledged");
+    let default = coordinator
+        .call_tool_as(root, "get_message_status", json!({"message_id":id}))
+        .await
+        .unwrap();
+    assert!(default.get("message").is_none());
+    let mut reconstructed = String::new();
+    let mut offset = 0;
+    loop {
+        let status = coordinator
+            .call_tool_as(
+                root,
+                "get_message_status",
+                json!({"message_id":id,"include_message":true,"text_offset_chars":offset}),
+            )
+            .await
+            .unwrap();
+        let page = &status["message"];
+        assert_eq!(page["message_id"], json!(id));
+        assert!(page["event_id"].is_string() && page["sequence"].is_u64());
+        assert_eq!(page["author_id"], json!(worker));
+        assert_eq!(page["text_offset_chars"], offset);
+        assert_eq!(page["text_redacted"], true);
+        assert_eq!(
+            page["attachments"],
+            serde_json::to_value(&attachments).unwrap()
+        );
+        let chunk = page["text"].as_str().unwrap();
+        assert!(chunk.chars().count() <= 4000);
+        reconstructed.push_str(chunk);
+        if !page["has_more"].as_bool().unwrap() {
+            break;
+        }
+        let next = page["next_text_offset_chars"].as_u64().unwrap();
+        assert!(next > offset);
+        offset = next;
+    }
+    assert_eq!(reconstructed, expected);
+    let sender = coordinator
+        .call_tool_as(
+            worker,
+            "get_message_status",
+            json!({"message_id":id,"include_message":true,"text_limit_chars":8000}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sender["message"]["text"].as_str().unwrap().chars().count(),
+        4000
+    );
+    let one = coordinator
+        .call_tool_as(
+            root,
+            "get_message_status",
+            json!({"message_id":id,"include_message":true,"text_limit_chars":0}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(one["message"]["text"], "é");
+    assert!(coordinator.call_tool_as(root, "get_message_status", json!({"message_id":id,"include_message":true,"text_offset_chars":expected.chars().count()+1})).await.is_err());
+    assert!(
+        coordinator
+            .call_tool_as(
+                observer,
+                "get_message_status",
+                json!({"message_id":id,"include_message":true})
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        serde_json::to_value(workspace.message_deliveries(id).await.unwrap()).unwrap(),
+        before
+    );
+    assert!(
+        coordinator
+            .unread_messages_for_session(root)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    scratch.discard().await;
+}
