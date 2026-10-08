@@ -201,3 +201,29 @@ The default Unreal build reserves 12 GiB and caps compiler parallelism to fit
 that estimate (including 2 GiB of overhead); the editor reserves 8 GiB. These
 estimates are distinct from hard cgroup limits and should be calibrated from
 measured peaks. Keep the existing launch floors and containment.
+
+## Known legacy MCP endpoints
+
+Unreal 5.8's first-party MCP endpoint uses `initialize`, not `server/discover`.
+For an explicitly configured stdio-to-HTTP bridge, select legacy startup per
+server in Borg's `agent.toml` (merge the env key with any existing env entries):
+
+```toml
+[mcp.servers.unreal]
+command = "bunx"
+args = ["-y", "mcp-remote", "http://127.0.0.1:PORT/mcp", "--transport", "http-only", "--protocol", "legacy"]
+env = { BORG_MCP_PROTOCOL = "legacy" }
+```
+
+Replace `PORT` with the owned editor lane's front port; this does not grant
+permission to bypass lane ownership or connect directly to backend ports.
+Use a bridge version supporting `--protocol legacy`. Both layers must use
+legacy mode: bridge `auto` can issue its own discovery probe. Borg's per-server
+`BORG_MCP_PROTOCOL = "legacy"` starts directly with the existing initialize /
+initialized handshake and emits no modern metadata. Omitted or `"auto"` keeps
+Borg's modern discovery, version negotiation, and legacy fallback unchanged.
+Other values fail startup rather than silently selecting a protocol. This
+setting applies to the native harness; it does not change provider selection.
+Load the patched Borg runtime and reload the MCP configuration before capture;
+a source patch alone does not change an already running process. This prevents
+unknown-method automation pollution, not genuine capture errors.

@@ -233,6 +233,16 @@ struct ListedTool {
 
 impl NativeMcpClient {
     async fn start(server: &ExternalMcpServer) -> Result<Self> {
+        // Known legacy endpoints can log unknown discovery methods as errors.
+        // Read only this server's explicit config, never a process-global override.
+        match server.env.get("BORG_MCP_PROTOCOL").map(String::as_str) {
+            Some("legacy") => return Self::start_legacy(server).await,
+            None | Some("auto") => {}
+            Some(value) => bail!(
+                "MCP server `{}` has invalid BORG_MCP_PROTOCOL `{value}`; expected auto or legacy",
+                server.name
+            ),
+        }
         let mut probe = Self::spawn(server).await?;
         match probe.probe_modern().await {
             ModernProbe::Ready(version) => {
@@ -1134,6 +1144,72 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"isError":true,"content":[{"typ
         assert!(
             error.contains("[redacted:anthropic-key]"),
             "the secret is redacted in place: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicitly_legacy_server_initializes_without_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join("requests");
+        let script = r#"
+while IFS= read -r request; do
+  printf '%s\n' "$request" >> "$TRANSCRIPT"
+  case "$request" in
+    *server/discover*) exit 9 ;;
+    *notifications/initialized*) ;;
+    *initialize*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}' ;;
+    *tools/list*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}' ;;
+    *tools/call*) printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}' ;;
+    *) exit 10 ;;
+  esac
+done
+"#;
+        let runtime = NativeMcpRuntime::start(
+            uuid::Uuid::new_v4(),
+            vec![ExternalMcpServer {
+                name: "legacy-server".to_string(),
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), script.to_string()],
+                env: BTreeMap::from([
+                    ("BORG_MCP_PROTOCOL".to_string(), "legacy".to_string()),
+                    ("TRANSCRIPT".to_string(), transcript.display().to_string()),
+                ]),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(runtime.startup_failures.is_empty());
+        let result = runtime
+            .call("mcp__legacy_server__echo", json!({}), None)
+            .await
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], "ok");
+        let requests = std::fs::read_to_string(transcript)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call"
+            ]
+        );
+        assert_eq!(
+            requests[0]["params"]["protocolVersion"],
+            LEGACY_PROTOCOL_VERSION
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request["params"].get("_meta").is_none())
         );
     }
 
