@@ -238,6 +238,13 @@ impl Extend<TranscriptEntry> for TranscriptEntries {
     }
 }
 
+struct ModelRequestDisplay {
+    id: String,
+    started_at: DateTime<Utc>,
+    last_received_at: Option<DateTime<Utc>>,
+    output_tokens: Option<u64>,
+}
+
 struct Transcript {
     order: TranscriptEntries,
     messages: HashMap<Uuid, usize>,
@@ -262,6 +269,7 @@ struct Transcript {
     config_event_updated_at: Option<DateTime<Utc>>,
     provider_capabilities: Vec<borg_remote::ProviderCapability>,
     active_turn: Option<ActiveTurnDisplayConfig>,
+    model_request: Option<ModelRequestDisplay>,
     live_turn_closed: bool,
     waiting_on_watchers: bool,
     subagents: HashMap<Uuid, SubagentStatus>,
@@ -408,6 +416,7 @@ impl Default for Transcript {
             config_updated_at: None,
             config_event_updated_at: None,
             active_turn: None,
+            model_request: None,
             live_turn_closed: false,
             waiting_on_watchers: false,
             subagents: HashMap::new(),
@@ -1800,6 +1809,107 @@ impl Transcript {
         }
     }
 
+    fn observe_model_request(&mut self, event: &SessionEvent, live: bool) {
+        match &event.kind {
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "native_model_request" =>
+            {
+                if let Some(id) = payload
+                    .get("request_id")
+                    .and_then(serde_json::Value::as_str)
+                    && self
+                        .model_request
+                        .as_ref()
+                        .is_none_or(|request| request.id != id)
+                {
+                    self.model_request = Some(ModelRequestDisplay {
+                        id: id.to_string(),
+                        started_at: event.created_at,
+                        last_received_at: None,
+                        output_tokens: None,
+                    });
+                }
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "native_model_usage" =>
+            {
+                if let Some(request) = self.model_request.as_mut()
+                    && payload
+                        .get("request_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(request.id.as_str())
+                {
+                    if live {
+                        request.last_received_at = Some(Utc::now());
+                    }
+                    if let Some(tokens) = payload
+                        .pointer("/usage/output_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        request.output_tokens = Some(tokens);
+                    }
+                    if payload.get("complete").and_then(serde_json::Value::as_bool) == Some(true) {
+                        self.model_request = None;
+                    }
+                }
+            }
+            SessionEventKind::ToolStarted { .. }
+            | SessionEventKind::TurnCompleted { .. }
+            | SessionEventKind::TurnStarted { .. }
+            | SessionEventKind::ContextCleared
+            | SessionEventKind::StatusChanged {
+                status:
+                    SessionStatus::Ready
+                    | SessionStatus::Stopped
+                    | SessionStatus::Failed
+                    | SessionStatus::Completed,
+                ..
+            } => {
+                self.model_request = None;
+            }
+            _ => {
+                let progress = matches!(
+                    &event.kind,
+                    SessionEventKind::MessageDelta { .. }
+                        | SessionEventKind::ReasoningDelta { .. }
+                        | SessionEventKind::ReasoningTextDelta { .. }
+                        | SessionEventKind::ReasoningCompleted
+                ) || matches!(&event.kind, SessionEventKind::ProviderEvent { kind, payload, .. }
+                        if kind == "reasoning_snapshot" || Self::provider_reasoning_lifecycle(kind, payload).is_some() || is_live_tool_call_event(kind));
+                if live
+                    && progress
+                    && let Some(request) = self.model_request.as_mut()
+                {
+                    request.last_received_at = Some(Utc::now());
+                }
+            }
+        }
+    }
+
+    fn model_request_status(&self, now: DateTime<Utc>) -> Option<String> {
+        let request = self.model_request.as_ref()?;
+        let elapsed = |at: DateTime<Utc>| {
+            let seconds = now.signed_duration_since(at).num_seconds().max(0);
+            if seconds < 60 {
+                format!("{seconds}s")
+            } else {
+                format!("{}m {}s", seconds / 60, seconds % 60)
+            }
+        };
+        let received = request
+            .last_received_at
+            .map(|at| format!("last received {} ago", elapsed(at)))
+            .unwrap_or_else(|| "last received unknown".into());
+        let tokens = request
+            .output_tokens
+            .map(|tokens| format!(" · {tokens} output tokens (reported)"))
+            .unwrap_or_default();
+        Some(format!(
+            "model request {} · {received}{tokens}",
+            elapsed(request.started_at)
+        ))
+    }
+
     fn apply(&mut self, event: &SessionEvent) -> Option<usize> {
         self.apply_event(event, true)
     }
@@ -1816,6 +1926,7 @@ impl Transcript {
         // Scope recorded insertions to this event so a transcript nobody
         // drains (an unfocused child) cannot accumulate stale indices.
         self.pending_entry_insertions.clear();
+        self.observe_model_request(event, reorder_late_user_messages);
         match &event.kind {
             SessionEventKind::ProviderEvent { kind, .. } if kind == "goal_yielded" => {
                 self.waiting_on_watchers = true;
@@ -7370,4 +7481,65 @@ fn format_short_age(age: chrono::Duration) -> String {
 fn decoded_session_id(output: &str) -> Option<Uuid> {
     let value = serde_json::from_str::<serde_json::Value>(output.trim()).ok()?;
     Uuid::parse_str(value.get("session_id")?.as_str()?).ok()
+}
+
+#[cfg(test)]
+mod model_request_tests {
+    use super::*;
+
+    #[test]
+    fn model_request_clock_survives_summaries_and_replay_does_not_claim_receipt() {
+        let mut transcript = Transcript::default();
+        let started = Utc::now() - chrono::Duration::seconds(222);
+        let event = |kind: &str, payload: serde_json::Value| {
+            let mut event = SessionEvent::new(
+                Uuid::nil(),
+                0,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: kind.into(),
+                    payload,
+                },
+            );
+            event.created_at = started;
+            event
+        };
+        let request = event(
+            "native_model_request",
+            serde_json::json!({"request_id": "request"}),
+        );
+        transcript.apply_history(&request);
+        let summary = event("reasoning_snapshot", serde_json::json!({"text": "summary"}));
+        for _ in 0..18 {
+            transcript.apply_history(&summary);
+        }
+        let now = started + chrono::Duration::seconds(222);
+        let status = transcript.model_request_status(now).unwrap();
+        assert!(status.contains("model request 3m 42s"));
+        assert!(status.contains("last received unknown"));
+        assert!(!status.contains("tokens"));
+        let received_after = Utc::now();
+        transcript.apply(&summary);
+        transcript.apply(&request);
+        let progress = transcript.model_request.as_ref().unwrap();
+        assert_eq!(progress.started_at, started);
+        assert!(progress.last_received_at.unwrap() >= received_after);
+        transcript.apply(&event(
+            "native_model_usage",
+            serde_json::json!({"request_id": "other", "complete": true}),
+        ));
+        assert!(transcript.model_request.is_some());
+        transcript.apply(&event("native_model_usage", serde_json::json!({"request_id": "request", "complete": false, "usage": {"output_tokens": 7}})));
+        assert!(
+            transcript
+                .model_request_status(Utc::now())
+                .unwrap()
+                .contains("7 output tokens (reported)")
+        );
+        transcript.apply(&event(
+            "native_model_usage",
+            serde_json::json!({"request_id": "request", "complete": true}),
+        ));
+        assert!(transcript.model_request_status(Utc::now()).is_none());
+    }
 }

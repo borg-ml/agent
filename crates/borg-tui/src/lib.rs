@@ -4059,6 +4059,8 @@ impl BorgTerminal {
                     || kind == "network_retry"
                     || kind == "network_recovered"
                     || kind == "mcp_server_unavailable"
+                    || kind == "native_model_request"
+                    || kind == "native_model_usage"
                     || kind == "reasoning_snapshot"
                     || Transcript::provider_reasoning_lifecycle(kind, payload).is_some()
             }
@@ -9727,7 +9729,15 @@ impl BorgTerminal {
             }
             let status_highlight = self.status_hovered && status_is_interruptible;
             let status_duration = if session_is_active && reconnect_label.is_none() {
-                activity_clock.status_duration(Utc::now())
+                let now = Utc::now();
+                let turn = activity_clock
+                    .status_duration(now)
+                    .map(|duration| format!("turn {duration}"));
+                match (turn, self.transcript.model_request_status(now)) {
+                    (Some(turn), Some(request)) => Some(format!("{turn} · {request}")),
+                    (turn, None) => turn,
+                    (None, request) => request,
+                }
             } else {
                 None
             };
@@ -13739,7 +13749,9 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
                 || kind == "action/generation_status"
                 || kind == "action/preparing_cancelled"
                 || kind == "mcp_server_unavailable"
-                || kind == "reasoning_snapshot"
+                || kind == "native_model_request"
+                    || kind == "native_model_usage"
+                    || kind == "reasoning_snapshot"
                 // `reasoning/started` opens the Thinking row. Without this the
                 // row only materialises on `reasoning_completed`, i.e. in the
                 // same frame as the tool call it precedes.
