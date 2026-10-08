@@ -7754,6 +7754,100 @@ async fn child_event(coordinator: &SubagentCoordinator, child: Uuid, kind: Sessi
         });
 }
 
+// A nested parent's watch must seed current state, including after a child
+// resumes, without granting permission to watch siblings or its own parent.
+#[tokio::test]
+async fn nested_agent_watch_seeds_current_owned_child_state() {
+    let (directory, scratch, coordinator, root, parent) = waiting_team().await;
+    let child = coordinator
+        .table
+        .lock()
+        .await
+        .reserve_as(parent, "child", &launch())
+        .unwrap()
+        .session_id;
+    let sibling = coordinator
+        .table
+        .lock()
+        .await
+        .reserve("sibling", &launch())
+        .unwrap()
+        .session_id;
+    let (tx, mut rx) = mpsc::channel(8);
+    let watches =
+        crate::watch::Watches::new(crate::native_process::ProcessManager::default(), tx, parent);
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        Some(coordinator.clone()),
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        parent,
+        true,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    )
+    .with_watches(watches.clone());
+    for forbidden in [root, parent, sibling] {
+        assert!(
+            dispatcher
+                .call(
+                    "watch",
+                    json!({"agents": [forbidden], "label": "forbidden"})
+                )
+                .await
+                .is_err()
+        );
+    }
+    for status in [
+        SubagentStatus::Ready,
+        SubagentStatus::Running,
+        SubagentStatus::WaitingForApproval,
+        SubagentStatus::Stopped,
+        SubagentStatus::Failed,
+    ] {
+        coordinator
+            .table
+            .lock()
+            .await
+            .entries
+            .get_mut(&child)
+            .unwrap()
+            .snapshot
+            .status = status;
+        let result = dispatcher.call("watch", json!({"agents": [child], "label": "nested", "notify_on": if matches!(status, SubagentStatus::Stopped | SubagentStatus::Failed) { "exit" } else { "attention" }})).await.unwrap();
+        assert_eq!(result["running"], json!(status == SubagentStatus::Running));
+        if status == SubagentStatus::Running {
+            assert!(
+                rx.try_recv().is_err(),
+                "resuming must replace the previous parked observation"
+            );
+            watches
+                .observe_agent(
+                    child,
+                    crate::session::subject_life(SubagentStatus::Ready),
+                    "child",
+                )
+                .await;
+        }
+        rx.try_recv()
+            .expect("current child state settles the watch");
+        assert!(
+            rx.try_recv().is_err(),
+            "one lifecycle notification per watch"
+        );
+    }
+    scratch.discard().await;
+}
+
 // Aborting the parent runtime drops the nested capability future. Its durable
 // Started event still needs a terminal pair or live/replayed UI spins forever.
 #[tokio::test]

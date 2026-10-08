@@ -15549,6 +15549,24 @@ async fn parent_journal_preserves_full_child_transcript_events() {
             },
         ),
     };
+    // A non-root actor observing the shared child must not consume the
+    // root's projection receipt before the root records the same completion.
+    let observer = Uuid::new_v4();
+    persisted.create_session(observer).await.unwrap();
+    let mut observer_journal = RuntimeSessionStore::new(persisted.clone(), Vec::new(), true);
+    let (observer_events, mut observer_rx) = mpsc::channel(4);
+    record_subagent_activity(
+        &mut observer_journal,
+        &observer_events,
+        observer,
+        &coordinator,
+        &test_watches(observer),
+        child_message(8, "I am complete", MessageStatus::Complete),
+    )
+    .await
+    .unwrap();
+    assert!(observer_rx.try_recv().is_ok());
+    assert!(!coordinator.root_message_is_projected(message_id).await);
     record_subagent_activity(
         &mut journal,
         &events,
@@ -20086,7 +20104,7 @@ async fn assert_immediate_interrupt(control_backlog: usize) {
 async fn forwarded_child_activity_keeps_the_coordinator_order() {
     let (activity_tx, activity_rx) = broadcast::channel(8);
     let (forwarded_tx, mut forwarded_rx) = mpsc::channel(8);
-    let forwarder = tokio::spawn(forward_child_activity(activity_rx, forwarded_tx));
+    let forwarder = tokio::spawn(forward_child_activity(activity_rx, forwarded_tx, None));
     let children: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
     for child in &children {
         activity_tx
@@ -20106,6 +20124,83 @@ async fn forwarded_child_activity_keeps_the_coordinator_order() {
     // waiting on a source that can never speak again.
     drop(activity_tx);
     forwarder.await.unwrap();
+}
+
+// A nested actor receives its own child's lifecycle, never sibling or
+// grandchild activity from the shared coordinator's broadcast.
+#[tokio::test]
+async fn forwarded_nested_child_activity_preserves_lifecycle_and_parent_boundary() {
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let (activity_tx, activity_rx) = broadcast::channel(32);
+    let (forwarded_tx, mut forwarded_rx) = mpsc::channel(16);
+    let forwarder = tokio::spawn(forward_child_activity(
+        activity_rx,
+        forwarded_tx,
+        Some(parent),
+    ));
+    let mut agent = watched_child(child);
+    agent.parent_session_id = parent;
+    for status in [
+        SubagentStatus::Running,
+        SubagentStatus::Ready,
+        SubagentStatus::Running,
+        SubagentStatus::WaitingForApproval,
+        SubagentStatus::Stopped,
+        SubagentStatus::Failed,
+    ] {
+        let mut unrelated = agent.clone();
+        unrelated.parent_session_id = child;
+        activity_tx
+            .send(SubagentActivity::Started { agent: unrelated })
+            .unwrap();
+        agent.status = status;
+        activity_tx
+            .send(SubagentActivity::SessionEvent {
+                parent_session_id: parent,
+                task_name: agent.task_name.clone(),
+                event: SessionEvent::new(
+                    child,
+                    1,
+                    SessionEventKind::StatusChanged {
+                        status: SessionStatus::Ready,
+                        detail: None,
+                    },
+                ),
+            })
+            .unwrap();
+        activity_tx
+            .send(SubagentActivity::Completed {
+                agent: agent.clone(),
+            })
+            .unwrap();
+    }
+    drop(activity_tx);
+    let mut lives = Vec::new();
+    while let Some(activity) = forwarded_rx.recv().await {
+        match activity {
+            SubagentActivity::SessionEvent {
+                parent_session_id, ..
+            } => assert_eq!(parent_session_id, parent),
+            SubagentActivity::Completed { agent } => {
+                assert_eq!(agent.parent_session_id, parent);
+                lives.push(subject_life(agent.status));
+            }
+            _ => panic!("out-of-role activity must not cross into the actor"),
+        }
+    }
+    forwarder.await.unwrap();
+    assert_eq!(
+        lives,
+        vec![
+            SubjectLife::Live,
+            SubjectLife::Parked,
+            SubjectLife::Live,
+            SubjectLife::Parked,
+            SubjectLife::Exited,
+            SubjectLife::Exited
+        ]
+    );
 }
 
 fn watched_child(session_id: Uuid) -> crate::SubagentSnapshot {

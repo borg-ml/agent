@@ -2522,11 +2522,12 @@ async fn run_agent_session_store_kernel_inner(
     // Child activity reaches the actor on one channel of its own, so no loop has
     // to know where it came from. See `forward_child_activity`.
     let (child_activity_tx, mut child_activity_rx) = mpsc::channel(CHILD_ACTIVITY_BUFFER);
-    let mut child_activity_open = owns_team;
-    let _child_activity_forwarder = owns_team.then(|| {
+    let mut child_activity_open = subagents_enabled;
+    let _child_activity_forwarder = subagents_enabled.then(|| {
         AbortTask(tokio::spawn(forward_child_activity(
             subagent_activity_rx,
             child_activity_tx,
+            (!owns_team).then_some(session_id),
         )))
     });
     let mut root_message_rx = subagents
@@ -12625,7 +12626,7 @@ async fn apply_model_goal_request(
 /// `WaitingForApproval` one blocked on the parent: both are alive and waiting on
 /// the parent, which is what `notify_on=attention` reports. `Starting` and
 /// `Running` are working, and `Stopped` and `Failed` are gone.
-fn subject_life(status: SubagentStatus) -> SubjectLife {
+pub(crate) fn subject_life(status: SubagentStatus) -> SubjectLife {
     match status {
         SubagentStatus::Starting | SubagentStatus::Running => SubjectLife::Live,
         SubagentStatus::Ready | SubagentStatus::WaitingForApproval => SubjectLife::Parked,
@@ -12713,10 +12714,23 @@ async fn collect_agent_message_receipts(
 async fn forward_child_activity(
     mut activity: broadcast::Receiver<SubagentActivity>,
     forwarded: mpsc::Sender<SubagentActivity>,
+    parent: Option<Uuid>,
 ) {
     loop {
         match activity.recv().await {
             Ok(activity) => {
+                let owner = match &activity {
+                    SubagentActivity::Started { agent }
+                    | SubagentActivity::Completed { agent }
+                    | SubagentActivity::Stopped { agent }
+                    | SubagentActivity::Failed { agent } => agent.parent_session_id,
+                    SubagentActivity::SessionEvent {
+                        parent_session_id, ..
+                    } => *parent_session_id,
+                };
+                if parent.is_some_and(|parent| parent != owner) {
+                    continue;
+                }
                 if forwarded.send(activity).await.is_err() {
                     return;
                 }
@@ -12764,7 +12778,7 @@ async fn record_subagent_activity(
                     ..
                 },
             ..
-        } => Some(*message_id),
+        } if subagents.is_root_session(session_id) => Some(*message_id),
         _ => None,
     };
     if let Some(message_id) = projected_message_id
@@ -12806,7 +12820,9 @@ async fn record_subagent_activity(
             },
         )
         .await?;
-        subagents.mark_root_message_projected(*message_id).await;
+        if subagents.is_root_session(session_id) {
+            subagents.mark_root_message_projected(*message_id).await;
+        }
     }
     let (kind, agent, event) = match activity {
         SubagentActivity::Started { agent } => (SubagentActivityKind::Started, agent, None),

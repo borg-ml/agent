@@ -2353,23 +2353,35 @@ impl AgentToolDispatcher {
                     "watch requires Full Access or an explicit approval"
                 );
                 let args: crate::watch::WatchArgs = serde_json::from_value(arguments)?;
-                if !args.agents.is_empty() {
-                    let team = self.subagents.as_ref().context(
-                        "agent watches require your own children; use followup_task and wait_agent for peers",
-                    )?;
-                    for subject in &args.agents {
-                        ensure!(
-                            team.get(*subject).await.is_some_and(
-                                |agent| agent.parent_session_id == self.actor_session_id
-                            ),
-                            "watch cannot observe {subject}: it is not your child; use followup_task and wait_agent for peers"
-                        );
-                    }
-                }
                 let watches = self
                     .watches
                     .as_ref()
                     .context("watchers are unavailable for this session")?;
+                if !args.agents.is_empty() {
+                    let team = self.subagents.as_ref().context(
+                        "agent watches require your own children; use followup_task and wait_agent for peers",
+                    )?;
+                    let mut subjects = Vec::with_capacity(args.agents.len());
+                    for subject in &args.agents {
+                        let agent = team.get(*subject).await;
+                        ensure!(
+                            agent.as_ref().is_some_and(
+                                |agent| agent.parent_session_id == self.actor_session_id
+                            ),
+                            "watch cannot observe {subject}: it is not your child; use followup_task and wait_agent for peers"
+                        );
+                        subjects.push(agent.expect("authorized child"));
+                    }
+                    for agent in subjects {
+                        watches
+                            .observe_agent(
+                                agent.session_id,
+                                crate::session::subject_life(agent.status),
+                                &agent.task_name,
+                            )
+                            .await;
+                    }
+                }
                 let timeout = self
                     .resource_limits
                     .as_ref()
