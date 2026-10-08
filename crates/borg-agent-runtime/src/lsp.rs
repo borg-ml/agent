@@ -1514,7 +1514,12 @@ async fn compilation_context_status(
     let mut status = json!({
         "status": "present",
         "kind": database.kind,
-        "path": database.path
+        "path": database.path,
+        "provenance": "filesystem_database_discovery",
+        "effectiveFlagsVerified": false,
+        "effectiveFlagsCaveat": "Database presence and file-entry coverage do not establish \
+            clangd's selected effective command. Conditional, inherited or user CompileFlags \
+            may modify it; the effective command has not been observed."
     });
     let Ok(metadata) = tokio::fs::metadata(&database.path).await else {
         return Some(status);
@@ -2842,6 +2847,26 @@ mod tests {
             .expect("clangd reports compilation context");
         assert_eq!(covered["status"], json!("present"));
         assert_eq!(covered["coversFile"], json!(true));
+        // A matching database entry remains valid evidence of coverage, not
+        // proof of the effective command after clangd configuration applies.
+        assert_eq!(
+            covered["provenance"],
+            json!("filesystem_database_discovery")
+        );
+        assert_eq!(covered["effectiveFlagsVerified"], json!(false));
+        tokio::fs::write(
+            root.path().join(".clangd"),
+            "If:\n  PathMatch: .*\nCompileFlags:\n  Add: [-DCONFIGURED]\n",
+        )
+        .await
+        .expect("write conditional flag configuration");
+        let configured = compilation_context_status(root.path(), clangd, Some(&source))
+            .await
+            .expect("database coverage with unobserved effective flags");
+        assert_eq!(configured["status"], json!("present"));
+        assert_eq!(configured["coversFile"], json!(true));
+        assert_eq!(configured["effectiveFlagsVerified"], json!(false));
+        assert!(configured["effectiveFlagsCaveat"].is_string());
 
         tokio::fs::write(
             root.path().join(".clangd"),
