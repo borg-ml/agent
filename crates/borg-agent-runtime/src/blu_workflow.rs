@@ -2146,7 +2146,55 @@ return receipt
             let budget = &plan["spec"]["admission"];
             assert_eq!(budget["min_free_disk_bytes"], 60_u64 << 30);
             assert_eq!(budget["reserve_disk_bytes"], (reserve as u64) << 30);
+            for name in ["RUST_TEST_THREADS", "RAYON_NUM_THREADS", "OMP_NUM_THREADS"] {
+                assert!(plan["env"].as_array().unwrap().contains(&json!([
+                    name,
+                    if arguments.starts_with("cmake configure") {
+                        "1"
+                    } else {
+                        "2"
+                    }
+                ])));
+            }
         }
+        // Explicit values (including empty) and harness CLI overrides survive
+        // planning; the defaults must not silently change user concurrency.
+        let explicit = source.replace(
+            "manifest=1",
+            r"manifest=1\\nRUST_TEST_THREADS=7\\nRAYON_NUM_THREADS=3\\nOMP_NUM_THREADS=\\n",
+        );
+        let result = runner
+            .clone()
+            .with_invocation_arguments(json!({
+                "arguments": "cargo test --dry-run -- -- --test-threads=5"
+            }))
+            .run(BluWorkflowRequest {
+                workflow_id: Uuid::new_v4(),
+                name: "native:native".to_string(),
+                source: explicit,
+            })
+            .await
+            .expect("workflow terminal record");
+        assert!(result.success, "{result:?}");
+        let plan: Value = serde_json::from_str(result.values[0].as_str().unwrap()).unwrap();
+        for (name, value) in [
+            ("RUST_TEST_THREADS", "7"),
+            ("RAYON_NUM_THREADS", "3"),
+            ("OMP_NUM_THREADS", ""),
+        ] {
+            assert!(
+                plan["env"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!([name, value]))
+            );
+        }
+        assert!(
+            plan["argv"]
+                .as_array()
+                .unwrap()
+                .ends_with(&[json!("--"), json!("--test-threads=5")])
+        );
         for value in ["0", "-1", "1025", "1.5", "abc", "99999999999999999999"] {
             let result = runner
                 .clone()

@@ -377,6 +377,9 @@ local function lane(options)
         "awk '/^MemAvailable:/ {print \"mem_kb=\" $2}' /proc/meminfo",
         "kv cpus \"$(nproc)\"",
         "kv max_jobs \"${BORG_NATIVE_MAX_JOBS-6}\"",
+        "[ \"${RUST_TEST_THREADS+set}\" = set ] && kv RUST_TEST_THREADS \"$RUST_TEST_THREADS\"",
+        "[ \"${RAYON_NUM_THREADS+set}\" = set ] && kv RAYON_NUM_THREADS \"$RAYON_NUM_THREADS\"",
+        "[ \"${OMP_NUM_THREADS+set}\" = set ] && kv OMP_NUM_THREADS \"$OMP_NUM_THREADS\"",
         "kv tool_path \"$(command -v -- " .. q(kind) .. ")\"",
         "kv nice \"$(command -v nice || echo /usr/bin/nice)\"",
         "kv borg \"$(command -v -- \"${BORG_NATIVE_BORG:-borg}\")\"",
@@ -429,6 +432,9 @@ local function lane(options)
                 command[#command + 1] = pair[2]
             end
         end
+    end
+    for _, name in ipairs({ "RUST_TEST_THREADS", "RAYON_NUM_THREADS", "OMP_NUM_THREADS" }) do
+        env[name] = f[name] or tostring(job_count)
     end
     for _, word in ipairs(options.extra) do
         command[#command + 1] = word
