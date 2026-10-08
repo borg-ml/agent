@@ -2168,9 +2168,21 @@ async fn a_member_delegation_spawns_fresh_and_names_the_requester() {
     let settle = |session_id: Uuid| {
         let coordinator = &coordinator;
         async move {
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while coordinator.get(session_id).await.unwrap().status != SubagentStatus::Ready {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+            let mut activity = coordinator.subscribe();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let worker = coordinator.get(session_id).await.unwrap();
+                    if worker.status == SubagentStatus::Ready {
+                        break;
+                    }
+                    assert!(
+                        !matches!(
+                            worker.status,
+                            SubagentStatus::Failed | SubagentStatus::Stopped
+                        ),
+                        "assignment failed to settle: {worker:?}"
+                    );
+                    activity.recv().await.expect("worker activity stream");
                 }
             })
             .await
