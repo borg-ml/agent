@@ -2397,6 +2397,7 @@ pub(crate) mod tests {
     const FAKE_HTTP: &str = r#"
 import http.server, os, sys, time
 port, record, flag = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+while os.path.exists(os.path.join(os.path.dirname(record), 'hold-start')): time.sleep(0.01)
 with open(record, 'a') as f: f.write(str(port) + '\n')
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args): pass
@@ -3984,6 +3985,8 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
         let launches = root.path().join("launches");
         let launched = || fs::read_to_string(&launches).unwrap().lines().count();
         let first_launches = launched();
+        let hold_start = root.path().join("hold-start");
+        fs::write(&hold_start, "").unwrap();
         manager
             .send(
                 "fake",
@@ -3997,7 +4000,7 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
             .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut unavailable = false;
-        while launched() == first_launches {
+        while !unavailable {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "no replacement launched"
@@ -4006,6 +4009,14 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
                 .await
                 .is_ok_and(|reply| reply.contains("503 Service Unavailable"));
             assert_eq!(lease(), Some(held), "service lease released mid-restart");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        fs::remove_file(hold_start).unwrap();
+        while launched() == first_launches {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no replacement launched"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(
