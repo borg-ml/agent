@@ -10419,6 +10419,7 @@ mod tests {
                 grace_wrapup: None,
             },
         );
+        let (ack, mut received) = tokio::sync::oneshot::channel();
         let steer = async {
             while let Some(event) = events_rx.recv().await {
                 if matches!(event, SessionEventKind::ProviderEvent { ref kind, .. } if kind == "action/preparing")
@@ -10426,7 +10427,6 @@ mod tests {
                     break;
                 }
             }
-            let (ack, received) = tokio::sync::oneshot::channel();
             controls_tx
                 .send(AgentTurnControl::Steer {
                     message_id: Uuid::new_v4(),
@@ -10439,9 +10439,8 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            received
         };
-        let (outcome, mut received) =
+        let (outcome, ()) =
             tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(call, steer) })
                 .await
                 .expect("human steering must not wait for response completion");
