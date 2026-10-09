@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.15.0)
+## Unreleased (since 0.15.1)
+
+## 0.15.1 (2026-10-09)
 
 ### Steering
 
