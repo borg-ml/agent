@@ -18178,7 +18178,16 @@ fn subagent_actions_render_names_without_changing_routing_targets() {
         let index = transcript.tools["action"];
         let render = |transcript: &Transcript| {
             transcript
-                .render(120, None, None, Some(index))
+                .render_with_tool_run_viewport_mode(
+                    120,
+                    DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT,
+                    None,
+                    None,
+                    None,
+                    false,
+                    Some(index),
+                    Utc::now(),
+                )
                 .0
                 .iter()
                 .map(|line| line.to_string())
@@ -18188,7 +18197,7 @@ fn subagent_actions_render_names_without_changing_routing_targets() {
         assert!(!render(&transcript).contains(&child_id.to_string()));
         transcript.upsert_subagent_snapshot(&agent);
         let named = render(&transcript);
-        assert!(named.contains("inspect_ui"));
+        assert!(named.contains("inspect_ui"), "{tool}: {named}");
         assert!(!named.contains(&child_id.to_string()));
         assert!(!named.contains("session:"));
         assert!(

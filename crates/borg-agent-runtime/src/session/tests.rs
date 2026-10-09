@@ -15485,7 +15485,20 @@ async fn team_steer_admits_a_distinct_prompt_for_each_active_child() {
         permission_mode: PermissionMode::FullAccess,
         name: None,
         initial_prompt: None,
-        capabilities: Default::default(),
+        capabilities: crate::SessionCapabilities {
+            provider_capabilities: vec![crate::ProviderCapability {
+                provider: CodingProvider::Codex,
+                installed: true,
+                version: Some("test".to_string()),
+                authenticated: true,
+                auth_detail: Some("mock executor".to_string()),
+                auth_methods: vec![crate::ProviderAuthMethod::Subscription],
+                can_spawn: true,
+                usage: None,
+                billing: None,
+            }],
+            ..Default::default()
+        },
         subagent_concurrency_limit: None,
         extension_skill_roots: Vec::new(),
         team_policy: None,
