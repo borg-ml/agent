@@ -17421,29 +17421,42 @@ fn diff_backgrounds_cover_edit_and_inline_viewport_edges_without_changing_copy()
                     let mut buffer = Buffer::empty(viewport);
                     render_transcript_lines(lines.clone(), content, viewport, &mut buffer);
                     let mut changed = Vec::new();
+                    let mut expected_edges = Vec::new();
                     for (row, line) in lines.iter().enumerate() {
                         let backgrounds = line
                             .spans
                             .iter()
                             .filter_map(|span| span.style.bg.filter(|color| is_diff_bg(*color)))
                             .collect::<Vec<_>>();
-                        if let (Some(left), Some(right)) = (backgrounds.first(), backgrounds.last())
-                        {
+                        if !backgrounds.is_empty() {
+                            let left = line
+                                .spans
+                                .first()
+                                .and_then(|span| span.style.bg)
+                                .or(line.style.bg)
+                                .unwrap();
+                            let right = line
+                                .spans
+                                .last()
+                                .and_then(|span| span.style.bg)
+                                .or(line.style.bg)
+                                .unwrap();
+                            expected_edges.push((left, right));
                             changed.push(line.clone());
                             assert_eq!(
                                 buffer[(0, row as u16)].bg,
-                                *left,
+                                left,
                                 "native={native_edit}, width={width}, row={row}"
                             );
                             assert_eq!(
                                 buffer[(viewport.right() - 1, row as u16)].bg,
-                                *right,
+                                right,
                                 "native={native_edit}, width={width}, row={row}"
                             );
-                            if left == right {
+                            if left == right && is_diff_bg(left) {
                                 assert!(
                                     (0..viewport.width)
-                                        .all(|column| buffer[(column, row as u16)].bg == *left)
+                                        .all(|column| buffer[(column, row as u16)].bg == left)
                                 );
                             }
                         } else {
@@ -17497,11 +17510,13 @@ fn diff_backgrounds_cover_edit_and_inline_viewport_edges_without_changing_copy()
                             .collect::<Vec<_>>(),
                         raw_entry_copy
                     );
-                    for (row, line) in unselected.iter().enumerate() {
-                        assert_eq!(selected_buffer[(0, row as u16)].bg, line.style.bg.unwrap());
-                        assert!(is_diff_bg(
-                            selected_buffer[(viewport.right() - 1, row as u16)].bg
-                        ));
+                    for (row, _) in unselected.iter().enumerate() {
+                        let (left, right) = expected_edges[row];
+                        assert_eq!(selected_buffer[(0, row as u16)].bg, left);
+                        assert_eq!(
+                            selected_buffer[(viewport.right() - 1, row as u16)].bg,
+                            right
+                        );
                     }
                     assert!(
                         selected_buffer
