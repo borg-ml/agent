@@ -406,10 +406,24 @@ pub fn tool_action_is_instant(display_name: &str, language: Option<&str>) -> boo
 
 pub fn is_subagent_tool(display_name: &str) -> bool {
     matches!(
-        display_name.to_ascii_lowercase().as_str(),
-        "spawn agent"
+        tool_leaf_name(display_name).as_str(),
+        "spawn_agent"
+            | "scout"
+            | "list_agents"
+            | "send_message"
+            | "followup_task"
+            | "inspect_agent"
+            | "configure_agent"
+            | "get_agent_goal"
+            | "control_agent_goal"
+            | "interrupt_agent"
+            | "stop_agent"
+            | "wait_agent"
+            | "spawn agent"
             | "delegate task"
             | "list agents"
+            | "follow up with agent"
+            | "send message to agent"
             | "follow up"
             | "message agent"
             | "interrupt agent"

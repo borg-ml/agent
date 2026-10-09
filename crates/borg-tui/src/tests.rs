@@ -18121,6 +18121,85 @@ fn reasoning_snapshot_repairs_a_dropped_live_preview() {
 }
 
 #[test]
+fn subagent_actions_render_names_without_changing_routing_targets() {
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let now = Utc::now();
+    let agent = SubagentSnapshot {
+        session_id: child_id,
+        parent_session_id: parent_id,
+        task_name: "/root/inspect_ui".to_string(),
+        status: SubagentStatus::Running,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        fast: false,
+        ultrafast: false,
+        cwd: PathBuf::from("/workspace"),
+        created_at: now,
+        updated_at: now,
+        detail: None,
+        final_text: None,
+        usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
+    };
+    for tool in [
+        "send_message",
+        "mcp__borg_agent__inspect_agent",
+        "list_agents",
+    ] {
+        let mut transcript = Transcript::default();
+        let target = format!("session:{child_id}");
+        transcript.apply(&SessionEvent::new(parent_id, 1, SessionEventKind::ToolStarted {
+            tool_call_id: "action".into(),
+            name: tool.into(),
+            input: serde_json::json!({"target": target, "session_id": child_id, "message": "inspect"}),
+            input_ref: None,
+            parent_tool_call_id: None,
+        }));
+        transcript.apply(&SessionEvent::new(
+            parent_id,
+            2,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "action".into(),
+                output: if tool == "list_agents" {
+                    serde_json::json!({"agents": [{"id": child_id, "status": "running"}]})
+                        .to_string()
+                } else {
+                    serde_json::json!({"recipient_id": child_id}).to_string()
+                },
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        ));
+        let index = transcript.tools["action"];
+        let render = |transcript: &Transcript| {
+            transcript
+                .render(120, None, None, Some(index))
+                .0
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(!render(&transcript).contains(&child_id.to_string()));
+        transcript.upsert_subagent_snapshot(&agent);
+        let named = render(&transcript);
+        assert!(named.contains("inspect_ui"));
+        assert!(!named.contains(&child_id.to_string()));
+        assert!(!named.contains("session:"));
+        assert!(
+            matches!(&transcript.order[index], TranscriptEntry::Tool { code_view: Some((_, input)), .. }
+            if input.contains(&target)),
+            "routing metadata must stay untouched"
+        );
+    }
+}
+
+#[test]
 fn completed_action_identity_survives_late_start_and_update_events() {
     let mut transcript = Transcript::default();
     let session_id = Uuid::new_v4();

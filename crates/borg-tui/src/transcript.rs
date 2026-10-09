@@ -273,6 +273,7 @@ struct Transcript {
     waiting_on_watchers: bool,
     subagents: HashMap<Uuid, SubagentStatus>,
     subagent_snapshots: HashMap<Uuid, SubagentSnapshot>,
+    agent_names: HashMap<Uuid, String>,
     /// Watches the agent armed (last `WatchesChanged` snapshot).
     pub(crate) watches: Vec<WatchSummary>,
     /// Watch events already materialised as transcript rows.
@@ -420,6 +421,7 @@ impl Default for Transcript {
             waiting_on_watchers: false,
             subagents: HashMap::new(),
             subagent_snapshots: HashMap::new(),
+            agent_names: HashMap::new(),
             watches: Vec::new(),
             watch_messages: HashSet::new(),
             subagent_entries: HashMap::new(),
@@ -651,6 +653,7 @@ fn display_message_effort(effort: Option<String>, fast: bool, ultrafast: bool) -
     }
 }
 
+#[derive(Clone)]
 enum TranscriptEntry {
     Message {
         actor: EventActor,
@@ -1060,6 +1063,11 @@ impl Transcript {
             .is_some_and(|current| current.updated_at > agent.updated_at)
         {
             return;
+        }
+        let name = display_agent_name(&agent.task_name);
+        if self.agent_names.get(&agent.session_id) != Some(&name) {
+            self.agent_names.insert(agent.session_id, name);
+            self.render_resumes.get_mut().clear();
         }
         self.subagents.insert(agent.session_id, status);
         let mut snapshot = agent.clone();
@@ -3403,7 +3411,8 @@ impl Transcript {
                             kind: TranscriptActionKind::Agent,
                             label: if from_peer { "Peer" } else { "Agent" }.to_string(),
                             detail: if sender_name.trim().is_empty() {
-                                sender_id.to_string()
+                                self.agent_names.get(sender_id).cloned()
+                                    .unwrap_or_else(|| "agent".to_string())
                             } else {
                                 sender_name.clone()
                             },
@@ -5659,6 +5668,24 @@ impl Transcript {
         render
     }
 
+    fn subagent_display_text(&self, text: &str) -> String {
+        static IDS: OnceLock<Regex> = OnceLock::new();
+        let ids = IDS.get_or_init(|| {
+            Regex::new(
+                r"(?i)(?:session:|participant:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            )
+            .unwrap()
+        });
+        ids.replace_all(text, |capture: &regex::Captures<'_>| {
+            let target = capture[0].rsplit(':').next().unwrap();
+            Uuid::parse_str(target)
+                .ok()
+                .and_then(|id| self.agent_names.get(&id).cloned())
+                .unwrap_or_else(|| "agent".to_string())
+        })
+        .into_owned()
+    }
+
     /// Draws entries from `start` onward into `render`, which must hold exactly
     /// the rows drawn before `start` (a checkpoint that is not inside a run).
     #[allow(clippy::too_many_arguments)]
@@ -5731,6 +5758,30 @@ impl Transcript {
             if focused_tool.is_some_and(|focused| focused != index) {
                 continue;
             }
+            let mut display_entry = Cow::Borrowed(entry);
+            if let TranscriptEntry::Tool { source_name, name, .. } = entry
+                && (is_subagent_tool(source_name) || is_subagent_tool(name))
+                && let TranscriptEntry::Tool {
+                    detail,
+                    code_view,
+                    output_view,
+                    ..
+                } = display_entry.to_mut()
+            {
+                *detail = self.subagent_display_text(detail);
+                for (_, body) in code_view.iter_mut().chain(output_view.iter_mut()) {
+                    *body = self.subagent_display_text(body);
+                }
+            }
+            if let TranscriptEntry::Action { kind: TranscriptActionKind::Agent, .. } = entry
+                && let TranscriptEntry::Action { detail, body, .. } = display_entry.to_mut()
+            {
+                *detail = self.subagent_display_text(detail);
+                if let Some(body) = body {
+                    *body = self.subagent_display_text(body);
+                }
+            }
+            let entry = display_entry.as_ref();
             let tool_window = focused_tool
                 .is_none()
                 .then_some(tool_run_windows[index])
@@ -6464,6 +6515,7 @@ impl Transcript {
                     outcome,
                     ..
                 } => {
+                    let agent_action = is_subagent_tool(source_name) || is_subagent_tool(name);
                     // Tool and action rows (Watch, Peer) form one uniform run.
                     let next_is_tool = focused_tool.is_none()
                         && matches!(
@@ -6662,7 +6714,7 @@ impl Transcript {
                                 width,
                                 body_prefix,
                             ));
-                        } else if *complete {
+                        } else if *complete && !agent_action {
                             let key = (index, width, false, tool_window.is_some());
                             let mut cache = self.tool_body_cache.borrow_mut();
                             #[cfg(test)]
@@ -6724,7 +6776,7 @@ impl Transcript {
                                 width,
                                 body_prefix,
                             ));
-                        } else if *complete {
+                        } else if *complete && !agent_action {
                             let key = (index, width, true, tool_window.is_some());
                             let mut cache = self.tool_body_cache.borrow_mut();
                             #[cfg(test)]

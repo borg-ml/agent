@@ -5,6 +5,24 @@ Git comparison.
 
 ## Unreleased (since 0.15.1)
 
+### Subagents
+
+- Fix `/team` steering failing after the first recipient by giving each worker
+  its own durable prompt ID.
+- Show subagent names instead of session IDs in action summaries, expanded
+  action bodies, message labels, and focused-agent notices. Names refresh when
+  the roster arrives; routing continues to use the original internal IDs.
+
+### Terminal
+
+- Keep completed actions attached to their original rows when late tool start
+  or update events arrive, rather than switching the action being inspected.
+
+### CI
+
+- Make the cold-restart service regression deterministic by holding replacement
+  startup until the test observes the front's unavailable response.
+
 ## 0.15.1 (2026-10-09)
 
 ### Steering

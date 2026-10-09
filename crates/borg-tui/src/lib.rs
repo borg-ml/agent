@@ -4231,6 +4231,9 @@ impl BorgTerminal {
         };
         if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind {
             self.sync_child_configuration(agent.session_id);
+            if let Some(focused) = self.focused_child.filter(|id| *id != agent.session_id) {
+                self.sync_child_configuration(focused);
+            }
         }
         if matches!(
             event.kind,
@@ -4507,6 +4510,7 @@ impl BorgTerminal {
         let Some(agent) = director.subagent_snapshots.get(&child_id).cloned() else {
             return;
         };
+        let names = director.agent_names.clone();
         let inherited = director.config.clone();
         let capabilities = director.provider_capabilities.clone();
         let child = if self.focused_child == Some(child_id) {
@@ -4514,6 +4518,12 @@ impl BorgTerminal {
         } else {
             self.child_transcript_mut(child_id)
         };
+        for (id, name) in names {
+            if child.agent_names.get(&id) != Some(&name) {
+                child.agent_names.insert(id, name);
+                child.render_resumes.get_mut().clear();
+            }
+        }
         child.sync_subagent_config(&agent, inherited.as_ref());
         child.provider_capabilities = capabilities;
     }
@@ -4561,7 +4571,7 @@ impl BorgTerminal {
             .as_deref()
             .and_then(|transcript| transcript.subagent_snapshots.get(&child_id))
             .map(|agent| display_agent_name(&agent.task_name))
-            .unwrap_or_else(|| child_id.to_string());
+            .unwrap_or_else(|| "agent".to_string());
         self.notice = Some(format!(
             "Viewing {name} · messages and interrupts target this agent"
         ));
