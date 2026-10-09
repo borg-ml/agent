@@ -674,6 +674,16 @@ impl Watches {
             .collect()
     }
 
+    pub async fn list_for(&self, watch_ids: &[Uuid]) -> Vec<WatchInfo> {
+        self.entries
+            .lock()
+            .await
+            .values()
+            .filter(|entry| watch_ids.contains(&entry.info.watch_id))
+            .map(|entry| entry.info.clone())
+            .collect()
+    }
+
     pub async fn stop(&self, watch_id: Uuid) -> Result<WatchInfo> {
         let mut entries = self.entries.lock().await;
         let entry = entries
@@ -1833,5 +1843,44 @@ mod tests {
             "a wait that already ended cannot be reported as silent"
         );
         assert!(rx.try_recv().is_err(), "one watch, one event");
+    }
+    #[tokio::test]
+    async fn completed_watch_query_excludes_unrequested_runtime_results() {
+        let (tx, _rx) = mpsc::channel(8);
+        let watches = Watches::new(ProcessManager::default(), tx, Uuid::new_v4());
+        let requested = Uuid::new_v4();
+        let unrelated = Uuid::new_v4();
+        for id in [requested, unrelated] {
+            watches.entries.lock().await.insert(
+                id,
+                WatchEntry {
+                    info: WatchInfo {
+                        watch_id: id,
+                        label: "finished runtime".into(),
+                        command: "runtime_exec (python)".into(),
+                        running: false,
+                        started_at: chrono::Utc::now(),
+                        last_event_at: None,
+                        event_count: 1,
+                        result: Some(serde_json::json!({"output": id.to_string()})),
+                    },
+                    cancel: CancellationToken::new(),
+                    stopped: CancellationToken::new(),
+                    agent: None,
+                    runtime: true,
+                    attached: false,
+                    pending_report: false,
+                },
+            );
+        }
+        let selected = watches.list_for(&[requested]).await;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].watch_id, requested);
+        assert_eq!(
+            selected[0].result,
+            Some(serde_json::json!({"output": requested.to_string()}))
+        );
+        assert!(watches.list_for(&[Uuid::new_v4()]).await.is_empty());
+        assert_eq!(watches.list().await.len(), 2);
     }
 }

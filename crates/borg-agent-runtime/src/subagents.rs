@@ -2465,7 +2465,7 @@ impl AgentToolDispatcher {
                         None => json!({
                             "status": "not_waiting",
                             "detail": "None of those watchers is still running, so there is nothing to wait for. Re-check their output and continue with the remaining work.",
-                            "watchers": watches.list().await,
+                            "watchers": watches.list_for(&args.watch_ids).await,
                         }),
                     },
                 )
