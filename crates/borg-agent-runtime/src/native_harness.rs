@@ -774,9 +774,8 @@ impl NativeHarness {
         let mut length_continuations = 0_usize;
         let mut context_length_recoveries = 0_usize;
         let mut truncated_text = String::new();
-        // A steer that lands while the model is still streaming is parked here
-        // rather than ending the request, so a tool call in mid-generation
-        // still reaches execution. It is folded at the next safe boundary.
+        // Background steers wait for a safe boundary; human steers preempt
+        // generation without cancelling tools that have already started.
         let mut queued_steer: Vec<CapturedSteer> = Vec::new();
         // A person who wrote to this turn is owed a visible reply. A turn that
         // parks on watchers ends without asking the model again, so a model
@@ -3488,23 +3487,18 @@ async fn call_model_streaming(
                 }
                 Some(control) => {
                     let preempt =
-                        matches!(&control, AgentTurnControl::Steer { preempt: true, .. });
+                        matches!(&control, AgentTurnControl::Steer { preempt: true, .. } | AgentTurnControl::Steer { human: true, .. });
                     let Some(captured) = CapturedSteer::from_control(control) else {
                         continue;
                     };
                     if !preempt {
-                        // The human asked for this to be folded into the
-                        // current task, which is what an ordinary steer sends.
-                        // Ending the request here would discard a tool call the
-                        // model is still writing: the call never runs, no result
-                        // is journaled, and the row opened for it never closes.
-                        // Queue it and let the round finish -- the tool boundary
-                        // is the safe point, and the caller folds it there.
+                        // Background input waits for the current response; it
+                        // must not repeatedly cancel useful foreground work.
                         context.queued_steer.push(captured);
                         continue;
                     }
-                    // An explicit preempt may end the stream, but it still owes
-                    // a terminal event for anything it was part way through.
+                    // Preemption owes a terminal event for any tool preview
+                    // abandoned before execution.
                     cancel_preparing_tool_calls(
                         context.events,
                         context.coding_provider,
@@ -10279,8 +10273,7 @@ mod tests {
         }
     }
 
-    /// The release contract: an ordinary human steer queues, it does not
-    /// cancel. A steer that lands while the model is still writing a tool call
+    /// Background steering queues rather than cancelling generation. A steer that lands while the model is still writing a tool call
     /// used to end the request, so the call never ran, no result was journaled,
     /// and the row the UI had opened for it stayed live forever.
     #[tokio::test]
@@ -10328,8 +10321,7 @@ mod tests {
                     text: "check the log first".into(),
                     attachments: Vec::new(),
                     admission: borg_provider::provider::SteerAdmission::pending(),
-                    // What a human steer actually sends: fold this in, do not
-                    // replace what is running.
+                    // Background input waits for the generation boundary.
                     preempt: false,
                     human: false,
                     ack,
@@ -10390,6 +10382,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn human_steering_preempts_a_held_model_response() {
+        let (_resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let client = SteerDuringToolGenerationClient {
+            resume: std::sync::Mutex::new(Some(resume_rx)),
+        };
+        let (events_tx, mut events_rx) = mpsc::channel(32);
+        let (controls_tx, controls_rx) = mpsc::channel(1);
+        let mut controls = Some(controls_rx);
+        let mut queued_steer = Vec::new();
+        let call = call_model_streaming(
+            &client,
+            crate::CodingProvider::Codex,
+            "test-model",
+            None,
+            ModelTurnRequest {
+                fast: false,
+                ultrafast: false,
+                request_id: None,
+                session_id: None,
+                prompt_cache_key: None,
+                turn_routing: Default::default(),
+                messages: vec![ModelMessage::user("build it")],
+                tools: Vec::new(),
+                output_schema: None,
+            },
+            ModelStreamContext {
+                coding_provider: crate::CodingProvider::Codex,
+                assistant_message_id: Uuid::new_v4(),
+                events: &events_tx,
+                controls: &mut controls,
+                queued_steer: &mut queued_steer,
+                grace_wrapup: None,
+            },
+        );
+        let steer = async {
+            while let Some(event) = events_rx.recv().await {
+                if matches!(event, SessionEventKind::ProviderEvent { ref kind, .. } if kind == "action/preparing")
+                {
+                    break;
+                }
+            }
+            let (ack, received) = tokio::sync::oneshot::channel();
+            controls_tx
+                .send(AgentTurnControl::Steer {
+                    message_id: Uuid::new_v4(),
+                    text: "change direction".into(),
+                    attachments: Vec::new(),
+                    admission: borg_provider::provider::SteerAdmission::pending(),
+                    preempt: false,
+                    human: true,
+                    ack,
+                })
+                .await
+                .unwrap();
+            received
+        };
+        let (outcome, mut received) =
+            tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(call, steer) })
+                .await
+                .expect("human steering must not wait for response completion");
+        assert!(matches!(outcome.unwrap(), NativeModelOutcome::Steered(_)));
+        assert!(queued_steer.is_empty());
+        // No fold occurred here: receipt alone is not durable consumption.
+        assert!(received.try_recv().is_err());
+        assert!(std::iter::from_fn(|| events_rx.try_recv().ok()).any(|event| {
+            matches!(event, SessionEventKind::ProviderEvent { kind, .. } if kind == "action/preparing_cancelled")
+        }));
     }
 
     /// Escape still cancels. It just owes the row it abandoned a terminal
@@ -10621,7 +10683,7 @@ mod tests {
     /// The release contract, end to end through the real harness: a steer that
     /// lands while the model is writing a tool call must not cancel it. The
     /// tool runs exactly once, its result is journaled, and only then is the
-    /// human's message folded in.
+    /// background message folded in.
     #[tokio::test]
     async fn a_steer_during_generation_still_runs_the_tool_once_before_folding() {
         for abort in [false, true] {
