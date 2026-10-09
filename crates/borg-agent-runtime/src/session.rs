@@ -10177,7 +10177,7 @@ async fn broadcast_team_message(
         match coordinator
             .prompt_child(
                 &child.session_id.to_string(),
-                message_id,
+                Uuid::new_v4(),
                 text.clone(),
                 Vec::new(),
                 PromptDelivery::Steer,

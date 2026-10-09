@@ -15469,6 +15469,103 @@ async fn cancelling_a_turn_resolves_its_pending_provider_interaction() {
 }
 
 #[tokio::test]
+async fn team_steer_admits_a_distinct_prompt_for_each_active_child() {
+    let root = tempdir().unwrap();
+    let parent_id = Uuid::new_v4();
+    let (scratch, store, mut journal) = runtime_store(parent_id).await;
+    let launch = LaunchSession {
+        request_id: Uuid::new_v4(),
+        cwd: root.path().to_path_buf(),
+        provider: CodingProvider::Codex,
+        model: Some("gpt-test".to_string()),
+        effort: Some("low".to_string()),
+        fast: Some(false),
+        ultrafast: None,
+        response_language: crate::ResponseLanguage::Auto,
+        permission_mode: PermissionMode::FullAccess,
+        name: None,
+        initial_prompt: None,
+        capabilities: Default::default(),
+        subagent_concurrency_limit: None,
+        extension_skill_roots: Vec::new(),
+        team_policy: None,
+    };
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        root.path(),
+        parent_id,
+        launch,
+        2,
+        Arc::new(HungProviderExecutor),
+        store.clone(),
+    )
+    .unwrap();
+    let mut children = Vec::new();
+    for name in ["first", "second"] {
+        children.push(
+            coordinator
+                .spawn(crate::SpawnSubagent {
+                    task_name: name.to_string(),
+                    message: "hold this task".to_string(),
+                    provider: None,
+                    model: None,
+                    effort: None,
+                    fast: None,
+                    ultrafast: None,
+                })
+                .await
+                .unwrap()
+                .session_id,
+        );
+    }
+    let (events, mut received) = mpsc::channel(8);
+    broadcast_team_message(
+        &mut journal,
+        &events,
+        parent_id,
+        Some(&coordinator),
+        &mut HashMap::new(),
+        "implementation only".to_string(),
+    )
+    .await
+    .unwrap();
+    let SessionEventKind::TeamBroadcastUpdated {
+        recipient_ids,
+        steered,
+        ..
+    } = received.recv().await.unwrap().kind
+    else {
+        panic!("expected a successful team broadcast, not a delivery error");
+    };
+    assert!(steered);
+    assert_eq!(recipient_ids.len(), 2);
+    let mut prompt_ids = HashSet::new();
+    for child in children {
+        assert!(recipient_ids.contains(&child));
+        let prompts = store.read(child).await.unwrap();
+        let ids: Vec<_> = prompts
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::User,
+                    text,
+                    delivery: Some(PromptDelivery::Steer),
+                    ..
+                } if text == "implementation only" => Some(*message_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 1, "each child has one durable team prompt");
+        assert!(
+            prompt_ids.insert(ids[0]),
+            "prompt IDs must not cross sessions"
+        );
+    }
+    coordinator.stop_all().await;
+    scratch.discard().await;
+}
+
+#[tokio::test]
 async fn parent_journal_preserves_full_child_transcript_events() {
     let root = tempdir().unwrap();
     let parent_id = Uuid::new_v4();
