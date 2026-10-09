@@ -4183,6 +4183,11 @@ impl Transcript {
         input: &serde_json::Value,
         input_ref: Option<&SessionPayloadRef>,
     ) {
+        if self.tools.get(tool_call_id).is_some_and(|index| {
+            matches!(self.order.get(*index), Some(TranscriptEntry::Tool { complete: true, .. }))
+        }) {
+            return;
+        }
         self.finish_reasoning(event.created_at);
         if let Some(handle) = tool_process_followup_handle(name, Some(input)) {
             self.provider_followups

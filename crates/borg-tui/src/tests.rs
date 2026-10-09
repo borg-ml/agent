@@ -18120,6 +18120,53 @@ fn reasoning_snapshot_repairs_a_dropped_live_preview() {
     assert_eq!(reasoning_text(&transcript), "abcdefghi");
 }
 
+#[test]
+fn completed_action_identity_survives_late_start_and_update_events() {
+    let mut transcript = Transcript::default();
+    let session_id = Uuid::new_v4();
+    let start = SessionEventKind::ToolStarted {
+        tool_call_id: "selected".into(),
+        name: "exec".into(),
+        input: serde_json::json!({"cmd": "original command"}),
+        input_ref: None,
+        parent_tool_call_id: None,
+    };
+    transcript.apply(&SessionEvent::new(session_id, 1, start.clone()));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "selected".into(),
+            output: "original result".into(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    let selected = transcript.tools["selected"];
+    transcript.toggle_tool(selected);
+    for (sequence, event) in [
+        (3, start),
+        (
+            4,
+            SessionEventKind::ToolUpdated {
+                tool_call_id: "selected".into(),
+                name: "exec".into(),
+                input: serde_json::json!({"cmd": "late update"}),
+            },
+        ),
+    ] {
+        transcript.apply(&SessionEvent::new(session_id, sequence, event));
+        assert_eq!(transcript.tools["selected"], selected);
+        assert_eq!(transcript.order.len(), 1);
+        assert!(matches!(&transcript.order[selected],
+            TranscriptEntry::Tool { complete: true, expanded: true, output_view: Some((_, output)), .. }
+                if output == "original result"));
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires a PTY; exercises action clicks across live updates and history replacement"]
 async fn action_inspector_keeps_identity_across_history_reprojection() {
