@@ -9,7 +9,7 @@ use syntect::highlighting::{Color as SyntectColor, Theme, ThemeSet};
 use syntect::parsing::{SyntaxDefinition, SyntaxReference, SyntaxSet};
 use unicode_width::UnicodeWidthStr;
 
-const SPLIT_DIFF_MIN_WIDTH: usize = 160;
+const SPLIT_DIFF_MIN_WIDTH: usize = 120;
 const CODE_GUTTER_WIDTH: usize = 5;
 const DIFF_NUMBER_WIDTH: usize = 4;
 const INLINE_DIFF_PREVIEW_ROWS: usize = 18;
@@ -606,7 +606,7 @@ fn syntax_for_language<'a>(syntaxes: &'a SyntaxSet, language: &str) -> Option<&'
 
 fn diff_lines(source: &str, width: usize, source_language: Option<&str>) -> Vec<Line<'static>> {
     if width >= SPLIT_DIFF_MIN_WIDTH
-        && diff_has_balanced_changes(source)
+        && diff_has_both_changes(source)
         && diff_fits_split_panes(source, width)
         && source.lines().any(|line| hunk_starts(line).is_some())
         && !source.lines().any(is_apply_patch_control_line)
@@ -628,7 +628,7 @@ fn diff_fits_split_panes(source: &str, width: usize) -> bool {
         .all(|text| UnicodeWidthStr::width(text) <= content)
 }
 
-fn diff_has_balanced_changes(source: &str) -> bool {
+fn diff_has_both_changes(source: &str) -> bool {
     let (mut additions, mut deletions) = (0usize, 0usize);
     for line in source.lines() {
         if line.starts_with("+++") || line.starts_with("---") {
@@ -640,9 +640,7 @@ fn diff_has_balanced_changes(source: &str) -> bool {
             deletions += 1;
         }
     }
-    let larger = additions.max(deletions);
-    let smaller = additions.min(deletions);
-    additions > 0 && deletions > 0 && smaller.saturating_mul(2) >= larger
+    additions > 0 && deletions > 0
 }
 
 fn unified_diff_lines(
@@ -1071,11 +1069,7 @@ fn split_diff_row(
         syntax.after.as_mut(),
         syntax.syntaxes,
     ));
-    Line::from(spans).style(Style::default().bg(if before_number.is_some() {
-        DIFF_REMOVED_BG
-    } else {
-        DIFF_ADDED_BG
-    }))
+    Line::from(spans).style(Style::default().bg(Color::Reset))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1093,7 +1087,7 @@ fn split_diff_pane(
     let content_width = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
     let Some(_) = number else {
         return vec![Span::styled(
-            pad_cells(&prefix, width),
+            pad_cells(&format!("{} │   ", diff_number(None, number_width)), width),
             Style::default().fg(Color::DarkGray).bg(Color::Reset),
         )];
     };
@@ -1351,8 +1345,8 @@ mod tests {
     #[test]
     fn diff_layout_tracks_the_available_terminal_width() {
         let diff = "@@ -1 +1 @@\n-old\n+new";
-        let narrow = diff_lines(diff, 120, None);
-        let wide = diff_lines(diff, 180, None);
+        let narrow = diff_lines(diff, 119, None);
+        let wide = diff_lines(diff, 120, None);
         assert_eq!(narrow[0].to_string().matches('│').count(), 1);
         assert_eq!(wide[0].to_string().matches('│').count(), 3);
     }
@@ -1429,14 +1423,14 @@ mod tests {
     }
 
     #[test]
-    fn mixed_but_unbalanced_diff_uses_unified_layout() {
+    fn mixed_but_unbalanced_diff_uses_split_layout() {
         let diff = "@@ -1 +1,3 @@\n-old\n+new one\n+new two\n+new three";
         assert_eq!(
-            diff_lines(diff, 180, None)[0]
+            diff_lines(diff, 120, None)[0]
                 .to_string()
                 .matches('│')
                 .count(),
-            1
+            3
         );
     }
 
@@ -1890,6 +1884,22 @@ mod tests {
             }),
             "split diff should retain syntax and change colors: {changed:?}"
         );
+    }
+
+    #[test]
+    fn split_diff_unpaired_rows_leave_missing_pane_neutral() {
+        for (diff, missing_pane) in [("@@ -1,0 +1 @@\n+added", 0), ("@@ -1 +1,0 @@\n-removed", 1)] {
+            let lines = split_diff_lines(diff, 180, None);
+            let row = &lines[0];
+            assert_eq!(row.style.bg, Some(Color::Reset));
+            let blank = if missing_pane == 0 {
+                &row.spans[0]
+            } else {
+                row.spans.last().unwrap()
+            };
+            assert_eq!(blank.style.bg, Some(Color::Reset));
+            assert!(!blank.content.contains(['−', '+']));
+        }
     }
 
     #[test]
