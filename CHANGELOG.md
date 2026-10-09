@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.15.0)
 
+### Steering
+
+- Human messages immediately interrupt native model generation and continue in
+  the same harness, without restarting an external agent. Already-running tools
+  are preserved, background messages remain queued, and abandoned tool previews
+  are closed.
+
 ### Terminal
 
 - Keep empty side-by-side diff panes neutral, without phantom change markers or
