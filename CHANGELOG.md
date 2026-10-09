@@ -18,6 +18,12 @@ Git comparison.
 - Keep completed actions attached to their original rows when late tool start
   or update events arrive, rather than switching the action being inspected.
 
+### Diagnostics
+
+- Preserve the original document error and any collected diagnostics when a
+  language server disconnects during a workspace scan. Cleanup failures now
+  produce an explicitly partial report instead of discarding the evidence.
+
 ### CI
 
 - Make the cold-restart service regression deterministic by holding replacement

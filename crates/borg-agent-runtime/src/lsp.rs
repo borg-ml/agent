@@ -989,6 +989,7 @@ impl LspClient {
         let mut items = Vec::new();
         let mut failed = 0usize;
         let mut exhausted = false;
+        let mut interrupted = None;
         for path in scan.paths {
             if Instant::now() >= deadline {
                 exhausted = true;
@@ -997,15 +998,18 @@ impl LspClient {
             let uri = Url::from_file_path(&path)
                 .map_err(|_| anyhow::anyhow!("cannot convert {} to a file URI", path.display()))?
                 .to_string();
-            self.close_document(&path, &uri)
-                .await
-                .with_context(|| format!("failed to reset {}", path.display()))?;
+            if let Err(error) = self.close_document(&path, &uri).await {
+                let error = format!("failed to reset {}: {error:#}", path.display());
+                failed += 1;
+                items.push(json!({ "uri": uri, "kind": "full", "items": [], "error": error }));
+                interrupted = Some(error);
+                break;
+            }
             let report = self
                 .document_diagnostics(&path, &uri, spec.language_id, Some(deadline))
                 .await;
-            self.close_document(&path, &uri)
-                .await
-                .with_context(|| format!("failed to close {}", path.display()))?;
+            let close_error = self.close_document(&path, &uri).await.err();
+            let diagnostic_failed = report.is_err();
             // One unreadable or slow document used to abort the whole pass
             // and discard every diagnostic already collected.
             match report {
@@ -1020,6 +1024,15 @@ impl LspClient {
                     }));
                 }
             }
+            if let Some(error) = close_error {
+                let error = format!("failed to close {}: {error:#}", path.display());
+                if let Some(document) = items.last_mut() {
+                    document["closeError"] = json!(error);
+                }
+                failed += usize::from(!diagnostic_failed);
+                interrupted = Some(error);
+                break;
+            }
             // The last discovered file may itself exhaust the deadline. In
             // that case there is no next loop iteration to mark this partial.
             if Instant::now() >= deadline {
@@ -1033,6 +1046,9 @@ impl LspClient {
             result["failedDocuments"] = json!(failed);
         }
         let mut partial_reasons = Vec::new();
+        if let Some(error) = interrupted {
+            partial_reasons.push(error);
+        }
         if scan.truncated {
             partial_reasons.push(format!(
                 "workspace scan limited to {MAX_WORKSPACE_DIAGNOSTIC_FILES} files"
@@ -3056,6 +3072,64 @@ mod tests {
             client.opened_versions.is_empty(),
             "close the timed-out document"
         );
+    }
+
+    /// A dead server's didClose error must not replace the original document
+    /// failure or turn a workspace sweep into an empty, unauditable report.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dead_workspace_server_preserves_document_and_cleanup_failures() {
+        let root = tempfile::tempdir().expect("workspace");
+        for name in ["first.cpp", "second.cpp"] {
+            tokio::fs::write(root.path().join(name), "int value;\n")
+                .await
+                .expect("source");
+        }
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("owned server");
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        child.wait().await.expect("closed server pipes");
+        let mut client = LspClient {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
+            supports_pull_diagnostics: false,
+            compilation_configuration: Vec::new(),
+            opened_versions: HashMap::new(),
+            last_versions: HashMap::new(),
+            published_diagnostics: HashMap::new(),
+        };
+        let report = client
+            .document_workspace_diagnostics(
+                root.path(),
+                spec_for_id("clangd").expect("spec"),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .expect("server loss returns a partial report");
+        assert_eq!(report["partial"], json!(true));
+        assert_eq!(report["documentsScanned"], json!(1));
+        assert_eq!(report["documentsDiscovered"], json!(2));
+        assert_eq!(report["failedDocuments"], json!(1));
+        assert!(
+            report["items"][0]["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("first.cpp"))
+        );
+        assert!(report["items"][0]["error"].is_string());
+        assert!(
+            report["items"][0]["closeError"]
+                .as_str()
+                .is_some_and(|error| error.contains("failed to close"))
+        );
+        assert!(client.opened_versions.is_empty());
     }
 
     /// The per-document fallback multiplied its own timeout by the file
