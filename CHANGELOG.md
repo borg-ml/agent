@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.15.0)
 
+### Terminal
+
+- Keep empty side-by-side diff panes neutral, without phantom change markers or
+  background highlights.
+- Show side-by-side diffs from 120 columns and for uneven replacements, while
+  keeping one-sided changes and lines too wide for the panes in unified view.
+
 ## 0.15.0 (2026-10-08)
 
 ### Terminal
