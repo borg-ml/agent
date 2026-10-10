@@ -49,6 +49,7 @@ pub struct ProviderCallUsage {
     /// not a subscription allowance debit or a provider's blended UI counter.
     #[serde(default)]
     pub total_tokens: u64,
+    /// Input context occupied by this request, before its generated output.
     #[serde(default)]
     pub context_tokens: Option<u64>,
     #[serde(default)]

@@ -262,6 +262,7 @@ impl Extend<TranscriptEntry> for TranscriptEntries {
 struct ModelRequestDisplay {
     id: String,
     started_at: DateTime<Utc>,
+    summary_requested: bool,
     last_received_at: Option<DateTime<Utc>>,
     output_tokens: Option<u64>,
 }
@@ -1909,6 +1910,10 @@ impl Transcript {
                     self.model_request = Some(ModelRequestDisplay {
                         id: id.to_string(),
                         started_at: event.created_at,
+                        summary_requested: payload
+                            .pointer("/reasoning/summary")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|summary| summary != "none"),
                         last_received_at: None,
                         output_tokens: None,
                     });
@@ -3267,6 +3272,14 @@ impl Transcript {
                 if Self::provider_reasoning_lifecycle(kind, payload) == Some(true) =>
             {
                 self.start_reasoning(event.created_at, local_event_time(event));
+                if let (Some(id), Some(index)) = (
+                    payload
+                        .pointer("/item/id")
+                        .and_then(serde_json::Value::as_str),
+                    self.active_reasoning,
+                ) {
+                    self.tools.insert(format!("reasoning:{id}"), index);
+                }
             }
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if Self::provider_reasoning_lifecycle(kind, payload) == Some(false) =>
@@ -4229,6 +4242,7 @@ impl Transcript {
             self.active_reasoning = None;
         }
         if let Some(request) = &self.model_request
+            && !request.summary_requested
             && let Some(index) = self.order.len().checked_sub(1)
             && let Some(TranscriptEntry::Tool {
                 code_view: Some((language, source)),
@@ -6643,22 +6657,31 @@ impl Transcript {
                 } => {
                     let time = display_local_time(time, &today_prefix);
                     let expandable = *complete && compaction_has_expandable_detail(summary);
-                    let action_hint = "";
+                    let title = if *complete || focused_tool == Some(index) {
+                        "Compacted context".to_string()
+                    } else {
+                        compact_text(summary, 180)
+                    };
+                    let detail = if *complete && focused_tool != Some(index) {
+                        let detail = summary
+                            .strip_prefix("Compacted context")
+                            .unwrap_or(summary)
+                            .trim_start_matches(':')
+                            .trim_start();
+                        format!(" {}", compact_text(detail, 162))
+                    } else {
+                        String::new()
+                    };
                     lines.push(Line::from(vec![
+                        Span::styled("▌ ", Style::default().fg(Color::Gray)),
                         Span::styled(
-                            if focused_tool == Some(index) {
-                                "▌ Compacted context".to_string()
-                            } else {
-                                format!("▌ {}", compact_text(summary, 180))
-                            },
+                            title,
                             Style::default()
                                 .fg(BORG_ORANGE)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(
-                            format!("  {time}{action_hint}"),
-                            Style::default().fg(Color::DarkGray),
-                        ),
+                        Span::styled(detail, Style::default().fg(Color::Gray)),
+                        Span::styled(format!("  {time}"), Style::default().fg(Color::DarkGray)),
                     ]));
                     if (*expanded || focused_tool == Some(index)) && expandable {
                         let detail = summary
@@ -7517,7 +7540,7 @@ mod parallel_preparation_tests {
             SessionEventKind::ProviderEvent {
                 provider: CodingProvider::Codex,
                 kind: "item/started:reasoning".into(),
-                payload: serde_json::json!({}),
+                payload: serde_json::json!({"item":{"type":"reasoning","id":"provider-reason"}}),
             },
         ));
         let first = SessionEvent::new(
@@ -7539,7 +7562,7 @@ mod parallel_preparation_tests {
             SessionEventKind::ProviderEvent {
                 provider: CodingProvider::Codex,
                 kind: "reasoning_snapshot".into(),
-                payload: serde_json::json!({"reasoning_id":first.id,"started_at":first.created_at,
+                payload: serde_json::json!({"reasoning_id":"provider-reason","started_at":first.created_at,
                 "text":"Checking replay safely","complete":true}),
             },
         ));

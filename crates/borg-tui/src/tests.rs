@@ -12725,7 +12725,29 @@ fn compaction_completion_updates_the_live_card_and_can_expand() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("Compacted context:"));
+    assert!(rendered.contains("Compacted context"));
+    assert!(!rendered.contains("Compacted context:"));
+    let lines = transcript.lines(100);
+    let header = lines
+        .iter()
+        .find(|line| line.to_string().contains("Compacted context"))
+        .unwrap();
+    assert_eq!(
+        header
+            .spans
+            .iter()
+            .filter(|span| span.style.fg == Some(BORG_ORANGE))
+            .map(|span| span.content.as_ref())
+            .collect::<String>(),
+        "Compacted context"
+    );
+    assert!(
+        header
+            .spans
+            .iter()
+            .filter(|span| span.style.fg != Some(BORG_ORANGE))
+            .all(|span| matches!(span.style.fg, Some(Color::Gray | Color::DarkGray)))
+    );
     assert!(rendered.contains("Retained the durable conversation"));
     assert!(!rendered.contains("right-click for actions"));
     let compaction = transcript
@@ -15123,6 +15145,53 @@ fn hidden_reasoning_chunks_share_one_row_within_a_request() {
     apply(&mut transcript, 108, SessionEventKind::ReasoningCompleted);
     apply(&mut transcript, 109, chunk());
     assert_eq!(transcript.order.len(), 5);
+    apply(&mut transcript, 110, SessionEventKind::ReasoningCompleted);
+    apply(
+        &mut transcript,
+        111,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "native_model_request".into(),
+            payload: serde_json::json!({"request_id":"request-4", "reasoning":{"summary":"detailed"}}),
+        },
+    );
+    for (id, start) in [("first-summary", 112), ("second-summary", 114)] {
+        apply(
+            &mut transcript,
+            start,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "item/started:reasoning".into(),
+                payload: serde_json::json!({"item":{"type":"reasoning","id":id}}),
+            },
+        );
+        apply(
+            &mut transcript,
+            start + 1,
+            SessionEventKind::ReasoningCompleted,
+        );
+    }
+    assert_eq!(transcript.order.len(), 7);
+    for (id, text) in [
+        ("first-summary", "First final summary"),
+        ("second-summary", "Second final summary"),
+    ] {
+        apply(
+            &mut transcript,
+            116,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "reasoning_snapshot".into(),
+                payload: serde_json::json!({"reasoning_id":id,"text":text,"complete":true}),
+            },
+        );
+    }
+    assert_eq!(transcript.order.len(), 7);
+    for (index, expected) in [(5, "First final summary"), (6, "Second final summary")] {
+        assert!(matches!(&transcript.order[index], TranscriptEntry::Tool {
+            code_view: Some((_, text)), complete: true, ..
+        } if text == expected));
+    }
 }
 
 #[test]

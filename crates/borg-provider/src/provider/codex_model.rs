@@ -114,6 +114,8 @@ struct ModelCapabilities {
     #[serde(default = "default_true")]
     supports_reasoning_summary_parameter: bool,
     #[serde(default)]
+    default_reasoning_summary: Option<String>,
+    #[serde(default)]
     support_verbosity: bool,
     #[serde(default)]
     default_verbosity: Option<String>,
@@ -643,6 +645,10 @@ impl CodexModelProvider {
                 "reasoning": body["reasoning"], "text": body.get("text"),
                 "stream_options": body.get("stream_options"),
                 "responses_lite": capabilities.as_ref().is_some_and(|c| c.use_responses_lite),
+                "raw_context_window_tokens": capabilities.as_ref().and_then(|c| c.context_window.or(c.max_context_window)).or(context_window),
+                "max_context_window_tokens": capabilities.as_ref().and_then(|c| c.max_context_window),
+                "effective_context_window_tokens": context_window,
+                "effective_context_window_percent": capabilities.as_ref().map(|c| c.effective_context_window_percent),
                 "prompt_cache_key": request.prompt_cache_key,
                 "instructions_sha256": hex::encode(Sha256::digest(request.messages.iter().filter_map(|message| match message {
                     ModelMessage::System { content } => Some(content.as_str()), _ => None,
@@ -922,16 +928,23 @@ impl CodexModelProvider {
         }
         let mut body = json!({"model": self.model, "instructions": instructions,
             "input": input, "tools": tools, "tool_choice": "auto", "parallel_tool_calls": true,
-            "reasoning": {"effort": baseline, "summary": "detailed"},
+            "reasoning": {"effort": baseline, "summary": "auto"},
             "store": false, "stream": true, "include": ["reasoning.encrypted_content"]});
         if let Some(capabilities) = capabilities {
             if capabilities.use_responses_lite {
                 body["instructions"] = json!("");
                 body.as_object_mut().unwrap().remove("tools");
                 body["reasoning"]["context"] = json!("all_turns");
+                body["parallel_tool_calls"] = json!(false);
             }
-            if !capabilities.supports_reasoning_summary_parameter {
+            let summary = capabilities
+                .default_reasoning_summary
+                .as_deref()
+                .unwrap_or("auto");
+            if !capabilities.supports_reasoning_summary_parameter || summary == "none" {
                 body["reasoning"].as_object_mut().unwrap().remove("summary");
+            } else {
+                body["reasoning"]["summary"] = json!(summary);
             }
             if capabilities.support_verbosity
                 && let Some(verbosity) = &capabilities.default_verbosity
@@ -993,7 +1006,10 @@ impl CodexModelProvider {
             http = http.header("session-id", affinity);
         }
         if let Some(id) = &request.session_id {
-            http = http.header("session_id", id);
+            http = http.header("thread-id", id);
+        }
+        if !access.is_api_key() && body["reasoning"]["context"] == "all_turns" {
+            http = http.header("x-openai-internal-codex-responses-lite", "true");
         }
         // Sticky routing for the rest of the turn: without it every request
         // looks like a new turn to the backend and is routed afresh.
@@ -1479,6 +1495,11 @@ impl ResponseState {
                     && event["output_index"]
                         .as_u64()
                         .is_some_and(|index| self.output.contains_key(&index));
+                let snapshot_id = event["item"]["id"].as_str().filter(|_| completed_before);
+                let summary_changed = completed_before
+                    && event["output_index"].as_u64().is_some_and(|index| {
+                        self.output[&index]["summary"] != event["item"]["summary"]
+                    });
                 if done && let Some(summary) = event["item"]["summary"].as_array() {
                     for (index, part) in summary.iter().enumerate() {
                         if let Some(text) = part["text"].as_str() {
@@ -1486,7 +1507,11 @@ impl ResponseState {
                                 &json!({"type":"response.reasoning_summary_text.done",
                                     "item_id":event["item"]["id"],
                                     "summary_index":index,"text":text}),
-                                progress,
+                                if snapshot_id.is_some() {
+                                    None
+                                } else {
+                                    progress
+                                },
                                 model,
                                 effort,
                             )?;
@@ -1500,6 +1525,24 @@ impl ResponseState {
                     self.output.insert(index, event["item"].clone());
                 }
                 if completed_before {
+                    if summary_changed && let Some(id) = snapshot_id {
+                        let text = event["item"]["summary"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|part| part["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !text.is_empty() {
+                            publish_model_audit(
+                                progress,
+                                "reasoning_snapshot",
+                                json!({
+                                    "reasoning_id": id, "text": text, "complete": true
+                                }),
+                            );
+                        }
+                    }
                     return Ok(None);
                 }
                 emit(ProviderProgress::ProviderEvent {
@@ -2107,7 +2150,7 @@ mod tests {
         );
         assert_eq!(
             first["reasoning"],
-            json!({"effort":"low", "context":"all_turns", "summary":"detailed"})
+            json!({"effort":"low", "context":"all_turns"})
         );
         assert!(
             first.get("stream_options").is_none(),
@@ -2173,6 +2216,7 @@ mod tests {
         let classic = provider
             .request_body_with_capabilities(&request, Some(&capabilities), true)
             .unwrap();
+        assert_eq!(classic["parallel_tool_calls"], true);
         assert_eq!(classic["instructions"], "stable instructions");
         assert_eq!(classic["reasoning"], json!({"effort":"high"}));
         assert!(
@@ -2489,9 +2533,18 @@ mod tests {
             .unwrap();
         let mut events = Vec::new();
         while let Ok(ProviderProgress::ProviderEvent {
-            kind, content_text, ..
+            kind,
+            content_text,
+            payload,
+            ..
         }) = rx.try_recv()
         {
+            if kind == "reasoning_snapshot" {
+                assert_eq!(
+                    payload,
+                    json!({"reasoning_id":"reason", "text":"Checking replay safely", "complete":true})
+                );
+            }
             events.push((kind, content_text));
         }
         assert_eq!(
@@ -2500,13 +2553,14 @@ mod tests {
                 ("item/started:reasoning".into(), None),
                 ("reasoning_delta".into(), Some("Checking replay".into())),
                 ("item/completed:reasoning".into(), None),
-                ("reasoning_delta".into(), Some(" safely".into())),
+                ("reasoning_snapshot".into(), None),
             ]
         );
         assert_eq!(
             state.output[&0]["summary"][0]["text"],
             "Checking replay safely"
         );
+        assert_eq!(state.reasoning, "Checking replay safely");
     }
 
     #[test]
@@ -3009,7 +3063,7 @@ mod tests {
         let body = provider.request_body(&request).unwrap();
         assert_eq!(body["model"], "gpt-6.1-sol");
         assert_eq!(body["reasoning"]["effort"], "max");
-        assert_eq!(body["reasoning"]["summary"], "detailed");
+        assert_eq!(body["reasoning"]["summary"], "auto");
     }
 
     #[test]
@@ -3130,9 +3184,10 @@ mod tests {
                         // the turn still succeeds, it just may not be routed
                         // to the cache its prefix lives in. `session-id`
                         // carries the prompt cache key, per upstream; the
-                        // session's own identity rides `session_id`.
+                        // session's own identity rides `thread-id`.
                         assert!(headers.contains("session-id: cache"));
-                        assert!(headers.contains("session_id: session"));
+                        assert!(headers.contains("thread-id: session"));
+                        assert!(headers.contains("x-openai-internal-codex-responses-lite: true"));
                         assert!(headers.contains("x-codex-routing-hint: model=gpt-6-astra;tier=priority"));
                         let len: usize = headers.lines().find_map(|line| line.strip_prefix("content-length: ")).unwrap().parse().unwrap();
                         break (end + 4, len);
@@ -3148,7 +3203,9 @@ mod tests {
                 assert_eq!(body["store"], false);
                 assert_eq!(body["service_tier"], "priority");
                 assert_eq!(body["prompt_cache_key"], "cache");
-                assert_eq!(body["tools"][0]["name"], "inspect");
+                assert!(body.get("tools").is_none());
+                assert_eq!(body["input"][0]["type"], "additional_tools");
+                assert_eq!(body["input"][0]["tools"][0]["name"], "inspect");
                 socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
                 // Metadata and reasoning cannot cause speculative generation.
                 for event in [
@@ -3180,9 +3237,16 @@ mod tests {
                 tools: vec![super::super::ModelToolDefinition::new("inspect", "Inspect", json!({"type":"object"})).unwrap()], output_schema: None };
             let mut access = SubscriptionAccess { token: "test-token".into(), account_id: "test-account".into(), auth_file: None };
             let account = access.identity();
+            let capabilities = serde_json::from_value(json!({
+                "slug":"gpt-6-astra", "supported_reasoning_levels":[],
+                "use_responses_lite":true, "default_reasoning_summary":"none"
+            })).unwrap();
+            let body = provider.request_body_with_capabilities(&request, Some(&capabilities), true).unwrap();
+            assert_eq!(body["parallel_tool_calls"], false);
+            assert!(body["reasoning"].get("summary").is_none());
             let response = provider.send(&reqwest::Client::new(), &endpoint,
                 &mut access, &account,
-                &request, &provider.request_body(&request).unwrap()).await.unwrap();
+                &request, &body).await.unwrap();
             let (tx, mut rx) = mpsc::unbounded_channel();
             let read = tokio::spawn(async move { provider.read_stream(response, Some(&tx), Some("test-request")).await });
             assert!(matches!(rx.recv().await.unwrap(), ProviderProgress::ProviderEvent { kind, .. } if kind == "reasoning_delta"));

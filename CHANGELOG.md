@@ -7,6 +7,7 @@ Git comparison.
 
 ### Terminal
 
+- Accent only “Compacted context” in orange; render its details grey without a colon.
 - Restore transcript images when menus and tooltips close, move, or resize.
   Team, Todos, and other overlays share the same image-safe repaint handling.
 - Keep consecutive hidden reasoning chunks in one row, preserving elapsed time
@@ -14,6 +15,12 @@ Git comparison.
 
 ### Reasoning
 
+- Budget encrypted reasoning in compacted history and count generated model
+  output when checking context pressure, so retained tails stay within budget.
+- Match Codex Responses Lite headers and tool-call mode, honor model-default
+  reasoning summaries, and record raw, usable, and maximum context limits.
+- Update finalized reasoning summaries in their original rows rather than
+  reopening a second reasoning phase for terminal summary fragments.
 - Avoid duplicate completion events when Codex's final response replays finished
   reasoning items, while retaining newly delivered summary text.
 

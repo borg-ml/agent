@@ -1179,7 +1179,7 @@ impl NativeHarness {
                     continue;
                 }
                 let budget =
-                    native_context_budget(&result.usage, &messages, result.usage.output_tokens);
+                    native_context_budget(&result.usage, &messages, 0);
                 if budget.context_source == "provider"
                     && budget.window_source == "provider"
                     && budget
@@ -4547,9 +4547,12 @@ fn native_context_budget(
     trailing_context_tokens: u64,
 ) -> NativeContextBudget {
     let (context_tokens, context_source) = match usage.context_tokens {
-        Some(reported) if reported > 0 => {
-            (reported.saturating_add(trailing_context_tokens), "provider")
-        }
+        Some(reported) if reported > 0 => (
+            reported
+                .saturating_add(usage.output_tokens)
+                .saturating_add(trailing_context_tokens),
+            "provider",
+        ),
         _ => (estimated_messages_tokens(messages), "estimated"),
     };
     let (context_window_tokens, window_source) = match usage.context_window_tokens {
@@ -4829,10 +4832,32 @@ pub(crate) fn estimated_message_tokens(message: &ModelMessage) -> u64 {
 }
 
 fn estimated_text_tokens(message: &ModelMessage) -> u64 {
-    // Provider state repeats text/tool calls and carries opaque signatures or
-    // encrypted reasoning. Those bytes are not additional model-visible text;
-    // hidden reasoning size is unknown here, so measured checkpoints remain
-    // authoritative and provider context-length recovery guards this fallback.
+    // Count encrypted Responses reasoning like Codex does: decoded bytes minus
+    // envelope overhead, then four bytes per token. Other replay fields repeat
+    // visible content or carry transport metadata and must not be counted twice.
+    let encrypted_reasoning_tokens = match message {
+        ModelMessage::Assistant {
+            provider_state: Some(borg_core::ModelProviderState::OpenAiResponses { output, .. }),
+            ..
+        } => output
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item["type"].as_str(),
+                    Some("reasoning" | "compaction" | "context_compaction")
+                )
+            })
+            .filter_map(|item| item["encrypted_content"].as_str())
+            .map(|content| {
+                (content.len() as u64)
+                    .saturating_mul(3)
+                    .saturating_div(4)
+                    .saturating_sub(650)
+                    .div_ceil(4)
+            })
+            .fold(0_u64, u64::saturating_add),
+        _ => 0,
+    };
     let text;
     let message = if let ModelMessage::Assistant {
         content,
@@ -4856,9 +4881,11 @@ fn estimated_text_tokens(message: &ModelMessage) -> u64 {
     } else {
         message
     };
-    serde_json::to_string(message).map_or(u64::MAX, |serialized| {
-        u64::try_from(serialized.chars().count().div_ceil(4)).unwrap_or(u64::MAX)
-    })
+    serde_json::to_string(message)
+        .map_or(u64::MAX, |serialized| {
+            u64::try_from(serialized.chars().count().div_ceil(4)).unwrap_or(u64::MAX)
+        })
+        .saturating_add(encrypted_reasoning_tokens)
 }
 
 /// Move a tool result's `borg_attachments` images out of the text and into
@@ -7983,7 +8010,83 @@ mod tests {
     }
 
     #[test]
-    fn opaque_provider_state_does_not_inflate_context_estimates() {
+    fn retained_tail_budgets_encrypted_reasoning_and_preserves_tool_pairs() {
+        let with_reasoning = |mut message: ModelMessage, length| {
+            let ModelMessage::Assistant { provider_state, .. } = &mut message else {
+                unreachable!()
+            };
+            *provider_state = Some(
+                serde_json::from_value(json!({
+                    "protocol": "open_ai_responses",
+                    "output": [{"type": "reasoning", "encrypted_content": "A".repeat(length)}]
+                }))
+                .unwrap(),
+            );
+            message
+        };
+        let live = with_reasoning(
+            ModelMessage::assistant(
+                None,
+                None,
+                None,
+                vec![ModelToolCall::function(
+                    "recent".into(),
+                    "read_file".into(),
+                    "{}".into(),
+                )],
+            ),
+            8_000,
+        );
+        let recent = vec![
+            ModelMessage::user("Continue with the recent evidence"),
+            live,
+            ModelMessage::tool("recent", "recent evidence"),
+        ];
+        let mut messages = vec![
+            ModelMessage::System {
+                content: "system".into(),
+            },
+            with_reasoning(
+                ModelMessage::assistant(Some("older answer".into()), None, None, vec![]),
+                1_600_000,
+            ),
+        ];
+        messages.extend(recent.clone());
+        let retained = retain_recent_native_messages(&messages, 1_600);
+        assert_eq!(retained, recent);
+        assert!(estimated_messages_tokens(&retained) <= 1_600);
+        let mut rebuilt = vec![messages[0].clone()];
+        rebuilt.extend(retained);
+        validate_native_messages(&rebuilt).unwrap();
+    }
+
+    #[test]
+    fn post_response_budget_counts_generated_output_and_unsent_tool_results() {
+        let usage = ProviderCallUsage {
+            context_tokens: Some(20_000),
+            context_window_tokens: Some(30_000),
+            output_tokens: 10_000,
+            ..ProviderCallUsage::default()
+        };
+        let budget = native_context_budget(&usage, &[], 500);
+        assert_eq!(budget.context_tokens, 30_500);
+        assert_eq!(budget.context_source, "provider");
+        assert!(
+            budget.needs_auto_compaction(&EffectiveCompactionBudget::defaults_for_window(30_000))
+        );
+        let saturated = native_context_budget(
+            &ProviderCallUsage {
+                context_tokens: Some(u64::MAX - 10),
+                ..usage
+            },
+            &[],
+            500,
+        );
+        assert_eq!(saturated.context_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn context_estimates_count_encrypted_reasoning_without_replay_metadata() {
         let plain = ModelMessage::assistant(
             Some("answer".repeat(100)),
             Some("reasoning".repeat(100)),
@@ -8004,6 +8107,11 @@ mod tests {
                 {"type": "text", "text": "answer".repeat(100)}
             ]}),
         ] {
+            let encrypted_tokens = if state["protocol"] == "open_ai_responses" {
+                (1_600_000_u64 * 3 / 4 - 650).div_ceil(4)
+            } else {
+                0
+            };
             let mut replay = plain.clone();
             let ModelMessage::Assistant {
                 provider_state,
@@ -8020,7 +8128,7 @@ mod tests {
             ]));
             assert_eq!(
                 estimated_message_tokens(&replay),
-                estimated_message_tokens(&plain)
+                estimated_message_tokens(&plain) + encrypted_tokens
             );
         }
     }
