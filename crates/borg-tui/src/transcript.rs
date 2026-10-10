@@ -150,6 +150,8 @@ fn extend_tool_lifecycle_spans(
 #[derive(Default)]
 struct TranscriptEntries {
     entries: Vec<TranscriptEntry>,
+    identities: Vec<(Uuid, usize)>,
+    event_identity: Option<(Uuid, usize)>,
     changed_from: Cell<usize>,
 }
 
@@ -178,33 +180,51 @@ impl TranscriptEntries {
         self.entries.iter_mut()
     }
 
+    fn next_identity(&mut self) -> (Uuid, usize) {
+        if let Some((event_id, ordinal)) = self.event_identity.as_mut() {
+            let identity = (*event_id, *ordinal);
+            *ordinal += 1;
+            identity
+        } else {
+            (Uuid::new_v4(), 0)
+        }
+    }
+
     fn push(&mut self, entry: TranscriptEntry) {
         self.mark_changed(self.entries.len());
+        let identity = self.next_identity();
         self.entries.push(entry);
+        self.identities.push(identity);
     }
 
     fn pop(&mut self) -> Option<TranscriptEntry> {
         self.mark_changed(self.entries.len().saturating_sub(1));
+        self.identities.pop();
         self.entries.pop()
     }
 
     fn insert(&mut self, index: usize, entry: TranscriptEntry) {
         self.mark_changed(index);
+        let identity = self.next_identity();
         self.entries.insert(index, entry);
+        self.identities.insert(index, identity);
     }
 
     fn remove(&mut self, index: usize) -> TranscriptEntry {
         self.mark_changed(index);
+        self.identities.remove(index);
         self.entries.remove(index)
     }
 
     fn clear(&mut self) {
         self.mark_changed(0);
         self.entries.clear();
+        self.identities.clear();
     }
 
     fn reserve(&mut self, additional: usize) {
         self.entries.reserve(additional);
+        self.identities.reserve(additional);
     }
 }
 
@@ -233,8 +253,9 @@ impl std::ops::IndexMut<usize> for TranscriptEntries {
 
 impl Extend<TranscriptEntry> for TranscriptEntries {
     fn extend<T: IntoIterator<Item = TranscriptEntry>>(&mut self, entries: T) {
-        self.mark_changed(self.entries.len());
-        self.entries.extend(entries);
+        for entry in entries {
+            self.push(entry);
+        }
     }
 }
 
@@ -1430,6 +1451,7 @@ impl Transcript {
             .order
             .iter()
             .rposition(|entry| matches!(entry, TranscriptEntry::Plan { .. }));
+        let identity = removed.map(|index| self.order.identities[index]);
         if let Some(index) = removed {
             if let Some(TranscriptEntry::Plan {
                 items: superseded,
@@ -1449,6 +1471,9 @@ impl Transcript {
             time,
             expanded,
         });
+        if let Some(identity) = identity {
+            *self.order.identities.last_mut().expect("plan identity") = identity;
+        }
         removed
     }
 
@@ -1925,11 +1950,17 @@ impl Transcript {
     }
 
     fn apply(&mut self, event: &SessionEvent) -> Option<usize> {
-        self.apply_event(event, true)
+        self.order.event_identity = Some((event.id, 0));
+        let removed = self.apply_event(event, true);
+        self.order.event_identity = None;
+        removed
     }
 
     fn apply_history(&mut self, event: &SessionEvent) -> Option<usize> {
-        self.apply_event(event, false)
+        self.order.event_identity = Some((event.id, 0));
+        let removed = self.apply_event(event, false);
+        self.order.event_identity = None;
+        removed
     }
 
     fn apply_event(

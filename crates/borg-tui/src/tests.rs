@@ -18401,6 +18401,12 @@ async fn action_inspector_keeps_identity_across_history_reprojection() {
             },
         ),
     );
+    for event in &mut history {
+        if matches!(&event.kind, SessionEventKind::ToolStarted { tool_call_id, .. } if tool_call_id == "selected-tool")
+        {
+            event.id = Uuid::new_v4();
+        }
+    }
     terminal.replace_history(&history);
     assert_eq!(
         terminal.focused_tool,
@@ -18450,51 +18456,130 @@ async fn action_inspector_keeps_identity_across_history_reprojection() {
         terminal.focused_tool,
         Some(terminal.transcript.tools["other-tool"])
     );
+    for child_view in [false, true] {
+        for kind in [
+            SessionEventKind::ReasoningDelta {
+                text: "identical".into(),
+            },
+            SessionEventKind::Error {
+                message: "identical".into(),
+            },
+        ] {
+            terminal.focus_director_transcript();
+            let first = SessionEvent::new(session_id, 10, kind.clone());
+            let mut selected = SessionEvent::new(session_id, 12, kind.clone());
+            selected.created_at = first.created_at;
+            let mut entries = vec![
+                first,
+                SessionEvent::new(session_id, 11, SessionEventKind::ReasoningCompleted),
+                selected.clone(),
+            ];
+            if child_view {
+                terminal.seed_child_history(child_id, &entries);
+                terminal.focus_child_transcript(child_id);
+            } else {
+                terminal.replace_history(&entries);
+            }
+            let target = terminal.transcript.order.len() - 1;
+            let identity = terminal.transcript.order.identities[target];
+            assert_eq!(identity.0, selected.id);
+            terminal.open_tool_inspector(target);
+            entries.insert(0, history[0].clone());
+            if child_view {
+                terminal.seed_child_history(child_id, &entries);
+            } else {
+                terminal.replace_history(&entries);
+            }
+            assert_eq!(
+                terminal.transcript.order.identities[terminal.focused_tool.unwrap()],
+                identity
+            );
+            entries.retain(|event| event.id != selected.id);
+            let mut replacement = SessionEvent::new(session_id, 13, kind);
+            replacement.created_at = selected.created_at;
+            entries.push(replacement);
+            if child_view {
+                terminal.seed_child_history(child_id, &entries);
+            } else {
+                terminal.replace_history(&entries);
+            }
+            assert!(
+                !terminal.is_inspecting_action(),
+                "identical replacement is not the selected action"
+            );
+        }
+    }
     terminal.shutdown().await;
 }
 
 #[tokio::test]
 #[ignore = "requires a PTY; verifies inspector identity across plan updates"]
 async fn action_inspector_stays_on_its_tool_when_plan_or_goal_moves() {
-    for update in [
-        SessionEventKind::PlanUpdated { items: Vec::new() },
-        SessionEventKind::GoalUpdated {
-            goal: SessionGoal::new("keep working".into(), None),
-        },
-    ] {
-        let session_id = Uuid::new_v4();
-        let directory = tempfile::tempdir().unwrap();
-        let mut terminal = BorgTerminal::enter(
-            directory.path(),
-            session_id,
-            directory.path().to_path_buf(),
-            &KeybindingConfig::default(),
-        )
-        .unwrap();
-        terminal.apply_session_event(&SessionEvent::new(session_id, 1, update.clone()));
-        terminal.apply_session_event(&SessionEvent::new(
-            session_id,
-            2,
-            SessionEventKind::ToolStarted {
-                tool_call_id: "selected-tool".into(),
-                name: "exec".into(),
-                input: serde_json::json!({"cmd": "cargo check"}),
-                input_ref: None,
-                parent_tool_call_id: None,
+    for child_view in [false, true] {
+        for update in [
+            SessionEventKind::PlanUpdated { items: Vec::new() },
+            SessionEventKind::GoalUpdated {
+                goal: SessionGoal::new("keep working".into(), None),
             },
-        ));
-        let tool = terminal.transcript.tools["selected-tool"];
-        terminal.open_tool_inspector(tool);
-        terminal.apply_session_event(&SessionEvent::new(session_id, 3, update.clone()));
-        assert_eq!(
-            terminal.focused_tool,
-            Some(terminal.transcript.tools["selected-tool"])
-        );
-        assert!(matches!(
-            terminal.transcript.order[terminal.focused_tool.unwrap()],
-            TranscriptEntry::Tool { .. }
-        ));
-        terminal.shutdown().await;
+        ] {
+            let session_id = Uuid::new_v4();
+            let directory = tempfile::tempdir().unwrap();
+            let mut terminal = BorgTerminal::enter(
+                directory.path(),
+                session_id,
+                directory.path().to_path_buf(),
+                &KeybindingConfig::default(),
+            )
+            .unwrap();
+            let mut history = vec![SessionEvent::new(session_id, 1, update.clone())];
+            for (sequence, id) in [(2, "selected-tool"), (3, "other-tool")] {
+                history.push(SessionEvent::new(
+                    session_id,
+                    sequence,
+                    SessionEventKind::ToolStarted {
+                        tool_call_id: id.into(),
+                        name: "exec".into(),
+                        input: serde_json::json!({"cmd": id}),
+                        input_ref: None,
+                        parent_tool_call_id: None,
+                    },
+                ));
+            }
+            let child_id = Uuid::new_v4();
+            if child_view {
+                terminal.seed_child_history(child_id, &history);
+                terminal.focus_child_transcript(child_id);
+            } else {
+                for event in &history {
+                    terminal.apply_session_event(event);
+                }
+            }
+            terminal.open_tool_inspector(terminal.transcript.tools["selected-tool"]);
+            if matches!(update, SessionEventKind::GoalUpdated { .. }) {
+                for action in [GoalAction::Pause, GoalAction::Resume] {
+                    assert!(terminal.optimistically_apply_goal_action(&action));
+                    assert_eq!(
+                        terminal.focused_tool,
+                        Some(terminal.transcript.tools["selected-tool"])
+                    );
+                }
+            }
+            history.push(SessionEvent::new(session_id, 4, update));
+            if child_view {
+                terminal.seed_child_history(child_id, &history);
+            } else {
+                terminal.apply_session_event(history.last().unwrap());
+            }
+            assert_eq!(
+                terminal.focused_tool,
+                Some(terminal.transcript.tools["selected-tool"])
+            );
+            assert!(matches!(
+                terminal.transcript.order[terminal.focused_tool.unwrap()],
+                TranscriptEntry::Tool { .. }
+            ));
+            terminal.shutdown().await;
+        }
     }
 }
 

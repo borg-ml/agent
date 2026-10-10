@@ -257,13 +257,14 @@ struct TranscriptViewportAnchor {
     collapsed_tool_header: Option<usize>,
 }
 
+#[derive(Clone)]
 enum ActionInspectorAnchor {
     Tool(String),
     CommandEdit(String),
     Agent(Uuid),
     Broadcast(Uuid),
-    Reasoning(DateTime<Utc>),
-    Compaction(u64),
+    Plan(Uuid),
+    Entry((Uuid, usize)),
 }
 
 #[derive(Clone, Copy)]
@@ -1636,6 +1637,7 @@ pub struct BorgTerminal {
     suppress_bootstrap_subagent_activity: bool,
     focused_child: Option<Uuid>,
     focused_tool: Option<usize>,
+    focused_tool_anchor: Option<ActionInspectorAnchor>,
     tool_return_scroll_from_bottom: usize,
     tool_return_follow_tail: bool,
     sidecar_focus_request: Option<String>,
@@ -3062,6 +3064,7 @@ impl BorgTerminal {
             suppress_bootstrap_subagent_activity: true,
             focused_child: None,
             focused_tool: None,
+            focused_tool_anchor: None,
             tool_return_scroll_from_bottom: 0,
             tool_return_follow_tail: true,
             sidecar_focus_request: None,
@@ -3271,6 +3274,7 @@ impl BorgTerminal {
         self.suppress_bootstrap_subagent_activity = true;
         self.focused_child = None;
         self.focused_tool = None;
+        self.focused_tool_anchor = None;
         self.tool_return_scroll_from_bottom = 0;
         self.tool_return_follow_tail = true;
         self.sidecar_focus_request = None;
@@ -4273,10 +4277,7 @@ impl BorgTerminal {
                 self.remap_selection_after_entry_insertion(inserted);
             }
         }
-        if self.focused_child.is_none()
-            && (inspector_anchor.is_some()
-                || matches!(event.kind, SessionEventKind::ContextCleared))
-        {
+        if inspector_anchor.is_some() || matches!(event.kind, SessionEventKind::ContextCleared) {
             self.restore_action_inspector(inspector_anchor);
         }
         if transcript_changed {
@@ -4912,6 +4913,7 @@ impl BorgTerminal {
 
     fn reset_transcript_focus(&mut self) {
         self.focused_tool = None;
+        self.focused_tool_anchor = None;
         self.scroll_from_bottom = 0;
         self.transcript.follow_tail = true;
         self.invalidate_transcript_render_cache();
@@ -4930,62 +4932,84 @@ impl BorgTerminal {
 
     fn action_inspector_anchor(&self) -> Option<ActionInspectorAnchor> {
         let index = self.focused_tool?;
-        let transcript = &self.transcript;
-        if let Some((id, _)) = transcript.tools.iter().find(|(_, row)| **row == index) {
+        if let Some(anchor) = &self.focused_tool_anchor {
+            return Some(anchor.clone());
+        }
+        let identity = self.transcript.order.identities.get(index).copied()?;
+        let entry = self.transcript.order.get(index)?;
+        if is_reasoning_entry(entry) {
+            return Some(ActionInspectorAnchor::Entry(identity));
+        }
+        if let Some((id, _)) = self.transcript.tools.iter().find(|(_, row)| **row == index) {
             return Some(ActionInspectorAnchor::Tool(id.clone()));
         }
-        if let Some((id, _)) = transcript
+        if let Some((id, _)) = self
+            .transcript
             .command_edit_rows
             .iter()
             .find(|(_, row)| **row == index)
         {
             return Some(ActionInspectorAnchor::CommandEdit(id.clone()));
         }
-        if let Some((id, _)) = transcript
+        if let Some((id, _)) = self
+            .transcript
             .subagent_entries
             .iter()
             .find(|(_, row)| **row == index)
         {
             return Some(ActionInspectorAnchor::Agent(*id));
         }
-        if let Some((id, _)) = transcript
+        if let Some((id, _)) = self
+            .transcript
             .team_broadcast_entries
             .iter()
             .find(|(_, row)| **row == index)
         {
             return Some(ActionInspectorAnchor::Broadcast(*id));
         }
-        match transcript.order.get(index)? {
-            TranscriptEntry::Tool {
-                source_name,
-                started_at,
-                ..
-            } if source_name == "reasoning" => Some(ActionInspectorAnchor::Reasoning(*started_at)),
-            TranscriptEntry::Compaction { sequence, .. } => {
-                Some(ActionInspectorAnchor::Compaction(*sequence))
-            }
-            _ => None,
+        if matches!(entry, TranscriptEntry::Plan { .. })
+            && let Some(participant_id) = self.transcript.plan_participant_id
+        {
+            return Some(ActionInspectorAnchor::Plan(participant_id));
         }
+        Some(ActionInspectorAnchor::Entry(identity))
     }
 
     fn restore_action_inspector(&mut self, anchor: Option<ActionInspectorAnchor>) {
-        if self.focused_tool.is_none() {
+        if anchor.is_none() && self.focused_tool.is_none() {
             return;
         }
+        self.focused_tool_anchor = anchor.clone();
         let index = match anchor {
             Some(ActionInspectorAnchor::Tool(id)) => self.transcript.tools.get(&id).copied(),
-            Some(ActionInspectorAnchor::CommandEdit(id)) => self.transcript.command_edit_rows.get(&id).copied(),
-            Some(ActionInspectorAnchor::Agent(id)) => self.transcript.subagent_entries.get(&id).copied(),
-            Some(ActionInspectorAnchor::Broadcast(id)) => self.transcript.team_broadcast_entries.get(&id).copied(),
-            Some(ActionInspectorAnchor::Reasoning(start)) => self.transcript.order.iter().position(|entry| {
-                matches!(entry, TranscriptEntry::Tool { source_name, started_at, .. }
-                    if source_name == "reasoning" && *started_at == start)
-            }),
-            Some(ActionInspectorAnchor::Compaction(seq)) => self.transcript.order.iter().position(|entry| {
-                matches!(entry, TranscriptEntry::Compaction { sequence, .. } if *sequence == seq)
-            }),
+            Some(ActionInspectorAnchor::CommandEdit(id)) => {
+                self.transcript.command_edit_rows.get(&id).copied()
+            }
+            Some(ActionInspectorAnchor::Agent(id)) => {
+                self.transcript.subagent_entries.get(&id).copied()
+            }
+            Some(ActionInspectorAnchor::Broadcast(id)) => {
+                self.transcript.team_broadcast_entries.get(&id).copied()
+            }
+            Some(ActionInspectorAnchor::Plan(participant_id)) => {
+                (self.transcript.plan_participant_id == Some(participant_id))
+                    .then(|| {
+                        self.transcript
+                            .order
+                            .iter()
+                            .position(|entry| matches!(entry, TranscriptEntry::Plan { .. }))
+                    })
+                    .flatten()
+            }
+            Some(ActionInspectorAnchor::Entry(identity)) => self
+                .transcript
+                .order
+                .identities
+                .iter()
+                .position(|candidate| *candidate == identity),
             None => None,
-        };
+        }
+        .filter(|index| self.transcript.inspector_heading(*index).is_some());
         if let Some(index) = index {
             if self.focused_tool != Some(index) {
                 self.focused_tool = Some(index);
@@ -5014,7 +5038,9 @@ impl BorgTerminal {
         }
         self.tool_return_scroll_from_bottom = self.scroll_from_bottom;
         self.tool_return_follow_tail = self.transcript.follow_tail;
+        self.focused_tool_anchor = None;
         self.focused_tool = Some(index);
+        self.focused_tool_anchor = self.action_inspector_anchor();
         self.transcript.follow_tail = !complete;
         self.scroll_from_bottom = if complete { usize::MAX } else { 0 };
         self.cancel_scroll_motion();
@@ -5028,6 +5054,7 @@ impl BorgTerminal {
     }
 
     fn close_tool_inspector(&mut self) {
+        self.focused_tool_anchor = None;
         self.pending_message_thread = None;
         if self.focused_tool.take().is_none() {
             return;
@@ -5368,8 +5395,10 @@ impl BorgTerminal {
     }
 
     pub fn optimistically_apply_goal_action(&mut self, action: &GoalAction) -> bool {
+        let inspector_anchor = self.action_inspector_anchor();
         let changed = self.transcript.optimistically_apply_goal_action(action);
         if changed {
+            self.restore_action_inspector(inspector_anchor);
             if matches!(action, GoalAction::Resume)
                 && self.focused_child.is_none()
                 && !matches!(
@@ -8298,6 +8327,7 @@ impl BorgTerminal {
     }
 
     fn draw_internal(&mut self, input_fast_path: bool) -> Result<()> {
+        self.restore_action_inspector(self.action_inspector_anchor());
         if self.transcript.tool_click_behavior != self.tool_click_behavior {
             self.transcript.tool_click_behavior = self.tool_click_behavior;
             self.invalidate_transcript_render_cache();
