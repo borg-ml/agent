@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.15.4)
 
+### Discovery
+
+- List instances with attached UIs first, ahead of detached or legacy owners,
+  so open sessions remain visible when discovery results are truncated.
+
 ## 0.15.4 (2026-10-10)
 
 ### Terminal
