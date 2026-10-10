@@ -43,7 +43,7 @@ fn worker() {
             &budget,
         )
         .unwrap();
-    println!("RAM_RESULT {}", lease.is_some());
+    println!("\nRAM_RESULT {}", lease.is_some());
     std::io::stdout().flush().unwrap();
     if let Some(lease) = lease {
         let mut line = String::new();
@@ -58,7 +58,7 @@ fn independent_journals_share_host_reservations() {
     let peak = borg_lanes::workspace::hygiene::ram_available().unwrap() * 3 / 4;
     let spawn = |name: &str| {
         Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "worker", "--nocapture"])
+            .args(["--exact", "worker", "--nocapture", "--test-threads=1"])
             .env("BORG_HOST_ADMISSION_DIR", root.path().join("host"))
             .env("RAM_TEST_JOURNAL", root.path().join(name))
             .env("RAM_TEST_PEAK", peak.to_string())

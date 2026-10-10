@@ -34,6 +34,11 @@ Git comparison.
 - List instances with attached UIs first, ahead of detached or legacy owners,
   so open sessions remain visible when discovery results are truncated.
 
+### Reliability
+
+- Avoid cross-process host-admission test stalls during single-threaded release
+  validation by keeping worker protocol output separate from test-runner chrome.
+
 ## 0.15.4 (2026-10-10)
 
 ### Terminal
