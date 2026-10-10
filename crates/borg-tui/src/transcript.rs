@@ -841,7 +841,12 @@ fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: 
             )
         });
         return format!(
-            "{} ({total})",
+            "{}  {} {} ({total})",
+            match &entries[0] {
+                TranscriptEntry::Tool { time, .. } => display_local_time(time, today_prefix),
+                _ => unreachable!(),
+            },
+            if running { "◇" } else { "◦" },
             if running { "Reasoning" } else { "Reasoned" }
         );
     }
@@ -884,9 +889,23 @@ fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: 
 const TOOL_WINDOW_HEADER_INDENT: &str = "▾ ";
 
 /// A group header in grey.
-fn tool_window_header(prefix: &'static str, text: String) -> Line<'static> {
+fn tool_window_header(prefix: &'static str, text: String, reasoning: bool) -> Line<'static> {
     let grey = Style::default().fg(Color::DarkGray);
-    Line::from(vec![Span::styled(prefix, grey), Span::styled(text, grey)])
+    let mut spans = vec![Span::styled(prefix, grey)];
+    if reasoning && let Some(start) = text.find("Reason") {
+        let end = start + text[start..].find(' ').unwrap_or(text.len() - start);
+        spans.push(Span::styled(text[..start].to_string(), grey));
+        spans.push(Span::styled(
+            text[start..end].to_string(),
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        ));
+        spans.push(Span::styled(text[end..].to_string(), grey));
+    } else {
+        spans.push(Span::styled(text, grey));
+    }
+    Line::from(spans)
 }
 
 /// A command result that means it went wrong.
@@ -7047,6 +7066,7 @@ impl Transcript {
                                 ),
                                 action_hint
                             ),
+                            reasoning_group,
                         );
                         if !folded {
                             lines.push(Line::from(Span::styled(
@@ -7072,6 +7092,39 @@ impl Transcript {
                                     content_start + visible_tool_end - offset,
                                 ));
                             }
+                        }
+                        if reasoning_group {
+                            let reasoning_index = (window.start..window.end)
+                                .find(|index| {
+                                    matches!(
+                                        self.order[*index],
+                                        TranscriptEntry::Tool {
+                                            complete: false,
+                                            ..
+                                        }
+                                    )
+                                })
+                                .unwrap_or(window.end - 1);
+                            if let TranscriptEntry::Tool {
+                                started_at,
+                                completed_at,
+                                ..
+                            } = &self.order[reasoning_index]
+                                && let Some(elapsed) =
+                                    format_tool_elapsed_at(*started_at, *completed_at, render_time)
+                            {
+                                let header = &mut lines[header_row];
+                                let padding =
+                                    width.saturating_sub(header.width() + elapsed.width());
+                                header.spans.push(Span::styled(
+                                    format!("{}{}", " ".repeat(padding.max(2)), elapsed),
+                                    Style::default().fg(Color::DarkGray),
+                                ));
+                            }
+                            tool_rows.insert(
+                                first_tool_row,
+                                (reasoning_index, header_row, header_row + 1),
+                            );
                         }
                         let run_entry_rows = entry_rows.split_off(first_entry_row);
                         for (entry_index, start, end) in run_entry_rows {
