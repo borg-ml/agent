@@ -262,6 +262,9 @@ fn git_status(root: &Path) -> Option<BTreeMap<String, String>> {
         }
         let status = std::str::from_utf8(&record[..2]).ok()?;
         let path = std::str::from_utf8(&record[3..]).ok()?.to_string();
+        if status == "??" && (path.starts_with("artifacts/") || path.starts_with("tmp/")) {
+            continue;
+        }
         if status.contains('R') || status.contains('C') {
             // Porcelain -z follows a rename's destination with its source.
             let _ = records.next();
@@ -418,6 +421,54 @@ fn truncate_patch(mut patch: String, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_excludes_only_untracked_top_level_scratch_outputs() {
+        let root = tempfile::tempdir().expect("workspace");
+        git_output(root.path(), &["init", "--quiet"]).expect("repository");
+        for directory in ["artifacts", "tmp", "src", "tests/artifacts"] {
+            fs::create_dir_all(root.path().join(directory)).expect("directory");
+        }
+        for path in [
+            "artifacts/fixture.txt",
+            "tmp/fixture.txt",
+            "artifacts/job.json",
+        ] {
+            fs::write(root.path().join(path), "before\n").expect("baseline file");
+        }
+        git_output(
+            root.path(),
+            &["add", "--", "artifacts/fixture.txt", "tmp/fixture.txt"],
+        )
+        .expect("tracked fixtures");
+        let baseline = CommandChangeBaseline::capture(root.path()).expect("baseline");
+        for path in [
+            "artifacts/fixture.txt",
+            "tmp/fixture.txt",
+            "artifacts/job.json",
+            "tmp/job.json",
+            "src/new.rs",
+            "tests.rs",
+            "tests/artifacts/new.rs",
+        ] {
+            fs::write(root.path().join(path), "after\n").expect("changed file");
+        }
+        let changes = baseline.finish();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.path.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "artifacts/fixture.txt",
+                "tmp/fixture.txt",
+                "src/new.rs",
+                "tests.rs",
+                "tests/artifacts/new.rs",
+            ])
+        );
+        assert!(changes.iter().all(|change| change.diff.contains("+after")));
+    }
 
     /// Git sees real temporary files on both sides; `/dev/null` is only a
     /// displayed diff label, so add/delete capture also works on Windows.
