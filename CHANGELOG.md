@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.15.2)
 
+### Terminal
+
+- Group consecutive reasoning blocks into a collapsed, expandable mini-group,
+  labelled “Reasoning (N)” while active and “Reasoned (N)” when complete.
+
 ## 0.15.2 (2026-10-09)
 
 ### Subagents
