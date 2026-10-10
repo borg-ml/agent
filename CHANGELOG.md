@@ -5,6 +5,25 @@ Git comparison.
 
 ## Unreleased (since 0.15.3)
 
+### Terminal
+
+- Jump to the first ten agents in Team with number keys 1–9 and 0.
+- Keep action details pinned to the selected action during optimistic goal
+  changes, child updates, and history replay. Close the inspector if that
+  action disappears rather than showing an unrelated replacement.
+
+### Subagents
+
+- Let directors resume their own recorded interruptions directly by default.
+  Set `[capabilities] subagent_resume_guard = true` to require the stricter
+  follow-up handshake. Actual human stops, approvals, and budgets stay protected.
+- Honor authorized resume while an interrupted turn is still winding down.
+
+### Edits
+
+- Exclude untracked top-level `artifacts/` and `tmp/` harness scratch from command
+  edit diffs, while retaining tracked fixtures and new source files.
+
 ## 0.15.3 (2026-10-10)
 
 ### Steering
