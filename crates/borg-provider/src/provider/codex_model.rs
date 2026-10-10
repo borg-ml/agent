@@ -641,6 +641,7 @@ impl CodexModelProvider {
                 "protocol": "openai_responses",
                 "model": self.model, "effort": self.effort, "fast": request.fast, "ultrafast": request.ultrafast,
                 "reasoning": body["reasoning"], "text": body.get("text"),
+                "stream_options": body.get("stream_options"),
                 "responses_lite": capabilities.as_ref().is_some_and(|c| c.use_responses_lite),
                 "prompt_cache_key": request.prompt_cache_key,
                 "instructions_sha256": hex::encode(Sha256::digest(request.messages.iter().filter_map(|message| match message {
@@ -929,12 +930,7 @@ impl CodexModelProvider {
                 body.as_object_mut().unwrap().remove("tools");
                 body["reasoning"]["context"] = json!("all_turns");
             }
-            if capabilities.supports_reasoning_summary_parameter {
-                if subscription_only {
-                    body["stream_options"] =
-                        json!({"reasoning_summary_delivery":"sequential_cutoff"});
-                }
-            } else {
+            if !capabilities.supports_reasoning_summary_parameter {
                 body["reasoning"].as_object_mut().unwrap().remove("summary");
             }
             if capabilities.support_verbosity
@@ -2106,9 +2102,9 @@ mod tests {
             first["reasoning"],
             json!({"effort":"low", "context":"all_turns", "summary":"detailed"})
         );
-        assert_eq!(
-            first["stream_options"]["reasoning_summary_delivery"],
-            "sequential_cutoff"
+        assert!(
+            first.get("stream_options").is_none(),
+            "default summary delivery must not opt into experimental concurrent cutoff"
         );
         assert_eq!(first["text"]["verbosity"], "low");
         assert_eq!(first["text"]["format"]["type"], "json_schema");
