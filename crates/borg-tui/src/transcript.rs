@@ -342,6 +342,7 @@ struct Transcript {
     cache_diagnostics: CacheDiagnostics,
     tool_run_offsets: HashMap<usize, usize>,
     expanded_tool_runs: HashSet<usize>,
+    action_run_expansions: HashMap<usize, bool>,
     active_reasoning: Option<usize>,
     reasoning_has_preview: bool,
     last_edit: Option<usize>,
@@ -487,6 +488,7 @@ impl Default for Transcript {
             cache_diagnostics: CacheDiagnostics::default(),
             tool_run_offsets: HashMap::new(),
             expanded_tool_runs: HashSet::new(),
+            action_run_expansions: HashMap::new(),
             active_reasoning: None,
             reasoning_has_preview: false,
             last_edit: None,
@@ -508,7 +510,7 @@ struct ToolRunWindow {
 }
 
 /// Output lengths of a `TranscriptRender`, in tuple order.
-type RenderLengths = [usize; 8];
+type RenderLengths = [usize; 9];
 
 fn render_lengths(render: &TranscriptRender) -> RenderLengths {
     [
@@ -520,6 +522,7 @@ fn render_lengths(render: &TranscriptRender) -> RenderLengths {
         render.5.len(),
         render.6.len(),
         render.7.len(),
+        render.8.len(),
     ]
 }
 
@@ -532,6 +535,7 @@ fn truncate_render(render: &mut TranscriptRender, lengths: RenderLengths) {
     render.5.truncate(lengths[5]);
     render.6.truncate(lengths[6]);
     render.7.truncate(lengths[7]);
+    render.8.truncate(lengths[8]);
 }
 
 /// What a render pass recorded about the entries it drew.
@@ -577,6 +581,7 @@ struct RenderResume {
     director_prompt_row: Option<usize>,
     tool_run_offsets: HashMap<usize, usize>,
     expanded_tool_runs: HashSet<usize>,
+    action_run_expansions: HashMap<usize, bool>,
     open_tool_run: Option<usize>,
     windows: Vec<Option<ToolRunWindow>>,
     trace: RenderTrace,
@@ -828,6 +833,39 @@ fn compaction_has_expandable_detail(summary: &str) -> bool {
 
 fn is_reasoning_entry(entry: &TranscriptEntry) -> bool {
     matches!(entry, TranscriptEntry::Tool { code_view: Some((language, _)), .. } if language == "reasoning")
+}
+
+fn same_action_type(left: &TranscriptEntry, right: &TranscriptEntry) -> bool {
+    if is_reasoning_entry(left) || is_reasoning_entry(right) {
+        return is_reasoning_entry(left) && is_reasoning_entry(right);
+    }
+    match (left, right) {
+        (
+            TranscriptEntry::Tool {
+                source_name: left_source,
+                name: left_name,
+                ..
+            },
+            TranscriptEntry::Tool {
+                source_name: right_source,
+                name: right_name,
+                ..
+            },
+        ) => left_source == right_source && left_name == right_name,
+        (
+            TranscriptEntry::Action {
+                kind: left_kind,
+                label: left_label,
+                ..
+            },
+            TranscriptEntry::Action {
+                kind: right_kind,
+                label: right_label,
+                ..
+            },
+        ) => left_kind == right_kind && left_label == right_label,
+        _ => false,
+    }
 }
 
 /// A group's header: when it started, how many actions, and where commands ran.
@@ -1371,6 +1409,7 @@ impl Transcript {
         self.queued_message_sequences.clear();
         self.tool_run_offsets.clear();
         self.expanded_tool_runs.clear();
+        self.action_run_expansions.clear();
         self.active_reasoning = None;
         self.reasoning_has_preview = false;
         self.last_edit = None;
@@ -1877,6 +1916,25 @@ impl Transcript {
 
     fn tool_run_expanded(&self, start: usize) -> bool {
         self.expanded_tool_runs.contains(&start)
+    }
+
+    fn action_run_expanded(&self, start: usize) -> bool {
+        self.action_run_expansions
+            .get(&start)
+            .copied()
+            .unwrap_or_else(|| {
+                if self.order.get(start).is_some_and(is_reasoning_entry) {
+                    self.auto_expand_thinking
+                } else {
+                    true
+                }
+            })
+    }
+
+    fn toggle_action_run_expansion(&mut self, start: usize) -> bool {
+        let expanded = !self.action_run_expanded(start);
+        self.action_run_expansions.insert(start, expanded);
+        expanded
     }
 
     fn tool_run_start_containing(&self, index: usize) -> Option<usize> {
@@ -3768,6 +3826,13 @@ impl Transcript {
             .drain()
             .filter_map(|start| (start != index).then_some(start - usize::from(start > index)))
             .collect();
+        self.action_run_expansions = self
+            .action_run_expansions
+            .drain()
+            .filter_map(|(start, expanded)| {
+                (start != index).then_some((start - usize::from(start > index), expanded))
+            })
+            .collect();
         self.active_reasoning = self.active_reasoning.and_then(|reasoning| {
             if reasoning == index {
                 None
@@ -3911,6 +3976,11 @@ impl Transcript {
             .expanded_tool_runs
             .drain()
             .map(|start| start + usize::from(start >= index))
+            .collect();
+        self.action_run_expansions = self
+            .action_run_expansions
+            .drain()
+            .map(|(start, expanded)| (start + usize::from(start >= index), expanded))
             .collect();
         self.active_reasoning = self
             .active_reasoning
@@ -5657,6 +5727,7 @@ impl Transcript {
             director_prompt_row,
             tool_run_offsets: self.tool_run_offsets.clone(),
             expanded_tool_runs: self.expanded_tool_runs.clone(),
+            action_run_expansions: self.action_run_expansions.clone(),
             open_tool_run: self.open_tool_run(&windows),
             windows,
             trace,
@@ -5681,6 +5752,12 @@ impl Transcript {
             matches!(
                 entry,
                 TranscriptEntry::Tool { complete, backgrounded, .. } if !*complete || *backgrounded
+            ) || matches!(
+                entry,
+                TranscriptEntry::Action {
+                    state: TranscriptActionState::Running | TranscriptActionState::Waiting,
+                    ..
+                }
             )
         }) {
             return true;
@@ -5763,6 +5840,14 @@ impl Transcript {
             .chain(
                 self.expanded_tool_runs
                     .symmetric_difference(&resume.expanded_tool_runs),
+            )
+            .chain(
+                self.action_run_expansions
+                    .keys()
+                    .chain(resume.action_run_expansions.keys())
+                    .filter(|run| {
+                        self.action_run_expansions.get(run) != resume.action_run_expansions.get(run)
+                    }),
             )
             .min()
         {
@@ -5907,8 +5992,10 @@ impl Transcript {
             link_rows,
             selection_rows,
             running_tool_elapsed,
+            action_run_rows,
         ) = &mut *render;
         let mut tool_run_starts = HashMap::new();
+        let action_windows = self.action_run_windows(tool_run_windows);
         let running_tool = self.has_running_tool();
         if let Some(index) = focused_tool
             && let Some((name, complete)) = self.inspector_heading(index)
@@ -5942,6 +6029,7 @@ impl Transcript {
                 link_rows.len(),
                 selection_rows.len(),
                 running_tool_elapsed.len(),
+                action_run_rows.len(),
             ]);
             if focused_tool.is_some_and(|focused| focused != index) {
                 continue;
@@ -5994,8 +6082,84 @@ impl Transcript {
                 )));
                 tool_run_starts.insert(
                     window.start,
-                    (row, tool_rows.len(), entry_rows.len(), selection_rows.len()),
+                    (
+                        row,
+                        tool_rows.len(),
+                        entry_rows.len(),
+                        selection_rows.len(),
+                        action_run_rows.len(),
+                    ),
                 );
+            }
+            let action_window = focused_tool
+                .is_none()
+                .then_some(action_windows[index])
+                .flatten();
+            if let Some(window) = action_window.filter(|window| index == window.start) {
+                let reasoning = is_reasoning_entry(entry);
+                let summary = if reasoning {
+                    tool_window_summary(
+                        &self.order[window.start..window.end],
+                        window.total,
+                        &today_prefix,
+                    )
+                } else {
+                    let (time, label) = match entry {
+                        TranscriptEntry::Tool { time, name, .. } => (time, name),
+                        TranscriptEntry::Action { time, label, .. } => (time, label),
+                        _ => unreachable!(),
+                    };
+                    format!(
+                        "{} · {label} ({})",
+                        display_local_time(time, &today_prefix),
+                        window.total
+                    )
+                };
+                let row = lines.len();
+                lines.push(tool_window_header(
+                    if self.action_run_expanded(window.start) {
+                        "  ▾ "
+                    } else {
+                        "  ▸ "
+                    },
+                    summary,
+                    reasoning,
+                ));
+                let timer_entry = reasoning.then(|| {
+                    (window.start..window.end)
+                        .find(|index| {
+                            matches!(
+                                self.order[*index],
+                                TranscriptEntry::Tool {
+                                    complete: false,
+                                    ..
+                                }
+                            )
+                        })
+                        .unwrap_or(window.end - 1)
+                });
+                if let Some(timer) = timer_entry
+                    && let TranscriptEntry::Tool {
+                        started_at,
+                        completed_at,
+                        ..
+                    } = &self.order[timer]
+                {
+                    if completed_at.is_none() {
+                        trace.clock_rows.push(timer);
+                    }
+                    if let Some(elapsed) =
+                        format_tool_elapsed_at(*started_at, *completed_at, render_time)
+                    {
+                        let header = &mut lines[row];
+                        let padding = width.saturating_sub(header.width() + elapsed.width());
+                        header.spans.push(Span::styled(
+                            format!("{}{}", " ".repeat(padding.max(2)), elapsed),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                }
+                action_run_rows.push((window.start, row, row + 1, timer_entry));
             }
             let visible_message =
                 matches!(entry, TranscriptEntry::Message { .. }) && !message_row_hidden(entry);
@@ -6034,7 +6198,15 @@ impl Transcript {
                 }
                 lines.len()
             };
+            let outer_width = width;
+            let width = if action_window.is_some() {
+                width.saturating_sub(2)
+            } else {
+                width
+            };
             match entry {
+                _ if action_window
+                    .is_some_and(|window| !self.action_run_expanded(window.start)) => {}
                 TranscriptEntry::Message {
                     actor,
                     text,
@@ -6903,7 +7075,9 @@ impl Transcript {
                             apply_line_background(line, width, MESSAGE_HOVER_BG);
                         }
                     }
-                    let body_expanded = *expanded || focused_tool == Some(index);
+                    let body_expanded = *expanded
+                        || focused_tool == Some(index)
+                        || (is_reasoning && action_window.is_some());
                     if show_tool_body
                         && body_expanded
                         && expandable
@@ -7036,211 +7210,232 @@ impl Transcript {
                     {
                         lines.push(Line::default());
                     }
-                    if let Some(window) = tool_window
-                        && index + 1 == window.end
-                    {
-                        let (header_row, first_tool_row, first_entry_row, first_selection_row) =
-                            tool_run_starts
-                                .get(&window.start)
-                                .copied()
-                                .expect("tool run header was recorded");
-                        let content_start = header_row + 1;
-                        let content_end = lines.len();
-                        let total_lines = content_end.saturating_sub(content_start);
-                        // A group with work still in flight stays unfolded. Only
-                        // the latest group is ever "open", so a long command
-                        // still running would otherwise be folded away as soon
-                        // as the next action started, taking its live row with it.
-                        // That also keeps a group open once its live work finishes:
-                        // it stays expanded until a new message ends the group,
-                        // rather than collapsing the moment the last running
-                        // action stops.
-                        let reasoning_group = self.order[window.start..window.end]
-                            .iter()
-                            .all(is_reasoning_entry);
-                        let foldable = total_lines > 0
-                            && ((reasoning_group && !self.auto_expand_thinking)
-                                || (!self.window_has_unfinished_work(&window)
-                                    && open_window_start != Some(window.start)));
-                        let folded = foldable && !self.tool_run_expanded(window.start);
-                        let expandable = foldable || total_lines > tool_run_viewport_height;
-                        let expanded = expandable && self.tool_run_expanded(window.start);
-                        let viewport_height = if expanded {
-                            total_lines
-                        } else if folded {
-                            0
-                        } else {
-                            tool_run_viewport_height
-                        };
-                        let max_offset = total_lines.saturating_sub(viewport_height);
-                        let offset = self
-                            .tool_run_offsets
-                            .get(&window.start)
-                            .copied()
-                            .unwrap_or(max_offset)
-                            .min(max_offset);
-                        let visible_end = offset.saturating_add(viewport_height).min(total_lines);
-                        let viewport_start = content_start + offset;
-                        let sticky_tool_header = tool_rows[first_tool_row..]
-                            .iter()
-                            .find(|(_, start, end)| {
-                                *start < viewport_start && *end > viewport_start
-                            })
-                            .map(|(entry, start, _)| (*entry, lines[*start].clone()));
-                        let mut visible_lines =
-                            lines[content_start + offset..content_start + visible_end].to_vec();
-                        if let Some((_, header)) = sticky_tool_header.as_ref()
-                            && let Some(first) = visible_lines.first_mut()
-                        {
-                            *first = header.clone();
-                        }
+                }
+            }
+            if action_window.is_some() {
+                for line in &mut lines[entry_start..] {
+                    line.spans.insert(0, Span::raw("  "));
+                }
+            }
+            let width = outer_width;
+            if let Some(window) = tool_window
+                && index + 1 == window.end
+            {
+                let (
+                    header_row,
+                    first_tool_row,
+                    first_entry_row,
+                    first_selection_row,
+                    first_action_run_row,
+                ) = tool_run_starts
+                    .get(&window.start)
+                    .copied()
+                    .expect("tool run header was recorded");
+                let content_start = header_row + 1;
+                let content_end = lines.len();
+                let total_lines = content_end.saturating_sub(content_start);
+                // A group with work still in flight stays unfolded. Only
+                // the latest group is ever "open", so a long command
+                // still running would otherwise be folded away as soon
+                // as the next action started, taking its live row with it.
+                // That also keeps a group open once its live work finishes:
+                // it stays expanded until a new message ends the group,
+                // rather than collapsing the moment the last running
+                // action stops.
+                let reasoning_group = self.order[window.start..window.end]
+                    .iter()
+                    .all(is_reasoning_entry);
+                let foldable = total_lines > 0
+                    && ((reasoning_group && !self.auto_expand_thinking)
+                        || (!self.window_has_unfinished_work(&window)
+                            && open_window_start != Some(window.start)));
+                let folded = foldable && !self.tool_run_expanded(window.start);
+                let expandable = foldable || total_lines > tool_run_viewport_height;
+                let expanded = expandable && self.tool_run_expanded(window.start);
+                let viewport_height = if expanded {
+                    total_lines
+                } else if folded {
+                    0
+                } else {
+                    tool_run_viewport_height
+                };
+                let max_offset = total_lines.saturating_sub(viewport_height);
+                let offset = self
+                    .tool_run_offsets
+                    .get(&window.start)
+                    .copied()
+                    .unwrap_or(max_offset)
+                    .min(max_offset);
+                let visible_end = offset.saturating_add(viewport_height).min(total_lines);
+                let viewport_start = content_start + offset;
+                let sticky_tool_header = tool_rows[first_tool_row..]
+                    .iter()
+                    .find(|(_, start, end)| *start < viewport_start && *end > viewport_start)
+                    .map(|(entry, start, _)| (*entry, lines[*start].clone()));
+                let mut visible_lines =
+                    lines[content_start + offset..content_start + visible_end].to_vec();
+                if let Some((_, header)) = sticky_tool_header.as_ref()
+                    && let Some(first) = visible_lines.first_mut()
+                {
+                    *first = header.clone();
+                }
 
-                        lines.truncate(content_start);
-                        lines.extend(visible_lines);
-                        let action_hint = if !folded && expandable && offset > 0 {
-                            " · ↑ scroll"
+                lines.truncate(content_start);
+                lines.extend(visible_lines);
+                let action_hint = if !folded && expandable && offset > 0 {
+                    " · ↑ scroll"
+                } else {
+                    ""
+                };
+                lines[header_row] = tool_window_header(
+                    if folded {
+                        "▸ "
+                    } else {
+                        TOOL_WINDOW_HEADER_INDENT
+                    },
+                    format!(
+                        "{}{}",
+                        tool_window_summary(
+                            &self.order[window.start..window.end],
+                            window.total,
+                            &today_prefix,
+                        ),
+                        action_hint
+                    ),
+                    reasoning_group,
+                );
+                if !folded {
+                    lines.push(Line::from(Span::styled(
+                        if visible_end < total_lines {
+                            "  ↓ more"
                         } else {
                             ""
-                        };
-                        lines[header_row] = tool_window_header(
-                            if folded {
-                                "▸ "
-                            } else {
-                                TOOL_WINDOW_HEADER_INDENT
-                            },
-                            format!(
-                                "{}{}",
-                                tool_window_summary(
-                                    &self.order[window.start..window.end],
-                                    window.total,
-                                    &today_prefix,
-                                ),
-                                action_hint
-                            ),
-                            reasoning_group,
-                        );
-                        if !folded {
-                            lines.push(Line::from(Span::styled(
-                                if visible_end < total_lines {
-                                    "  ↓ more"
-                                } else {
-                                    ""
-                                },
-                                Style::default().fg(Color::DarkGray),
-                            )));
-                        }
+                        },
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
 
-                        let run_tool_rows = tool_rows.split_off(first_tool_row);
-                        for (tool_index, start, end) in run_tool_rows {
-                            let start = start.saturating_sub(content_start);
-                            let end = end.saturating_sub(content_start);
-                            let visible_start = start.max(offset);
-                            let visible_tool_end = end.min(visible_end);
-                            if visible_start < visible_tool_end {
-                                tool_rows.push((
-                                    tool_index,
-                                    content_start + visible_start - offset,
-                                    content_start + visible_tool_end - offset,
-                                ));
-                            }
-                        }
-                        if reasoning_group {
-                            let reasoning_index = (window.start..window.end)
-                                .find(|index| {
-                                    matches!(
-                                        self.order[*index],
-                                        TranscriptEntry::Tool {
-                                            complete: false,
-                                            ..
-                                        }
-                                    )
-                                })
-                                .unwrap_or(window.end - 1);
-                            if let TranscriptEntry::Tool {
-                                started_at,
-                                completed_at,
-                                ..
-                            } = &self.order[reasoning_index]
-                                && let Some(elapsed) =
-                                    format_tool_elapsed_at(*started_at, *completed_at, render_time)
-                            {
-                                let header = &mut lines[header_row];
-                                let padding =
-                                    width.saturating_sub(header.width() + elapsed.width());
-                                header.spans.push(Span::styled(
-                                    format!("{}{}", " ".repeat(padding.max(2)), elapsed),
-                                    Style::default().fg(Color::DarkGray),
-                                ));
-                            }
-                            tool_rows.insert(
-                                first_tool_row,
-                                (reasoning_index, header_row, header_row + 1),
-                            );
-                        }
-                        let run_entry_rows = entry_rows.split_off(first_entry_row);
-                        for (entry_index, start, end) in run_entry_rows {
-                            let start = start.saturating_sub(content_start);
-                            let end = end.saturating_sub(content_start);
-                            let visible_start = start.max(offset);
-                            let visible_entry_end = end.min(visible_end);
-                            if visible_start < visible_entry_end {
-                                entry_rows.push((
-                                    entry_index,
-                                    content_start + visible_start - offset,
-                                    content_start + visible_entry_end - offset,
-                                ));
-                            }
-                        }
-                        let run_selection_rows = selection_rows.split_off(first_selection_row);
-                        for range in run_selection_rows {
-                            let start = range.start.saturating_sub(content_start);
-                            let end = range.end.saturating_sub(content_start);
-                            let visible_start = start.max(offset);
-                            let visible_selection_end = end.min(visible_end);
-                            if visible_start < visible_selection_end {
-                                let screen_start = content_start + visible_start - offset;
-                                let screen_end = content_start + visible_selection_end - offset;
-                                let body_start = range
-                                    .body_start
-                                    .saturating_add(visible_start.saturating_sub(start));
-                                let has_sticky_header = sticky_tool_header
-                                    .as_ref()
-                                    .is_some_and(|(entry, _)| *entry == range.entry)
-                                    && visible_start == offset;
-                                if has_sticky_header {
-                                    selection_rows.push(SelectionRowRange::nested_entry(
-                                        range.entry,
-                                        screen_start,
-                                        screen_start + 1,
-                                        0,
-                                    ));
-                                    if screen_start + 1 < screen_end {
-                                        selection_rows.push(SelectionRowRange::nested_entry(
-                                            range.entry,
-                                            screen_start + 1,
-                                            screen_end,
-                                            body_start.saturating_add(1),
-                                        ));
-                                    }
-                                } else {
-                                    selection_rows.push(SelectionRowRange::nested_entry(
-                                        range.entry,
-                                        screen_start,
-                                        screen_end,
-                                        body_start,
-                                    ));
-                                }
-                            }
-                        }
-                        tool_run_rows.push((
-                            window.start,
-                            header_row,
-                            lines.len(),
-                            max_offset,
-                            expandable,
+                let run_action_rows = action_run_rows.split_off(first_action_run_row);
+                for (run, row, _, timer) in run_action_rows {
+                    let relative = row.saturating_sub(content_start);
+                    if relative >= offset
+                        && relative < visible_end
+                        && sticky_tool_header
+                            .as_ref()
+                            .is_none_or(|_| relative != offset)
+                    {
+                        let row = content_start + relative - offset;
+                        action_run_rows.push((run, row, row + 1, timer));
+                    }
+                }
+                let run_tool_rows = tool_rows.split_off(first_tool_row);
+                for (tool_index, start, end) in run_tool_rows {
+                    let start = start.saturating_sub(content_start);
+                    let end = end.saturating_sub(content_start);
+                    let visible_start = start.max(offset);
+                    let visible_tool_end = end.min(visible_end);
+                    if visible_start < visible_tool_end {
+                        tool_rows.push((
+                            tool_index,
+                            content_start + visible_start - offset,
+                            content_start + visible_tool_end - offset,
                         ));
                     }
                 }
+                if reasoning_group {
+                    let reasoning_index = (window.start..window.end)
+                        .find(|index| {
+                            matches!(
+                                self.order[*index],
+                                TranscriptEntry::Tool {
+                                    complete: false,
+                                    ..
+                                }
+                            )
+                        })
+                        .unwrap_or(window.end - 1);
+                    if let TranscriptEntry::Tool {
+                        started_at,
+                        completed_at,
+                        ..
+                    } = &self.order[reasoning_index]
+                        && let Some(elapsed) =
+                            format_tool_elapsed_at(*started_at, *completed_at, render_time)
+                    {
+                        let header = &mut lines[header_row];
+                        let padding = width.saturating_sub(header.width() + elapsed.width());
+                        header.spans.push(Span::styled(
+                            format!("{}{}", " ".repeat(padding.max(2)), elapsed),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    tool_rows.insert(
+                        first_tool_row,
+                        (reasoning_index, header_row, header_row + 1),
+                    );
+                }
+                let run_entry_rows = entry_rows.split_off(first_entry_row);
+                for (entry_index, start, end) in run_entry_rows {
+                    let start = start.saturating_sub(content_start);
+                    let end = end.saturating_sub(content_start);
+                    let visible_start = start.max(offset);
+                    let visible_entry_end = end.min(visible_end);
+                    if visible_start < visible_entry_end {
+                        entry_rows.push((
+                            entry_index,
+                            content_start + visible_start - offset,
+                            content_start + visible_entry_end - offset,
+                        ));
+                    }
+                }
+                let run_selection_rows = selection_rows.split_off(first_selection_row);
+                for range in run_selection_rows {
+                    let start = range.start.saturating_sub(content_start);
+                    let end = range.end.saturating_sub(content_start);
+                    let visible_start = start.max(offset);
+                    let visible_selection_end = end.min(visible_end);
+                    if visible_start < visible_selection_end {
+                        let screen_start = content_start + visible_start - offset;
+                        let screen_end = content_start + visible_selection_end - offset;
+                        let body_start = range
+                            .body_start
+                            .saturating_add(visible_start.saturating_sub(start));
+                        let has_sticky_header = sticky_tool_header
+                            .as_ref()
+                            .is_some_and(|(entry, _)| *entry == range.entry)
+                            && visible_start == offset;
+                        if has_sticky_header {
+                            selection_rows.push(SelectionRowRange::nested_entry(
+                                range.entry,
+                                screen_start,
+                                screen_start + 1,
+                                0,
+                            ));
+                            if screen_start + 1 < screen_end {
+                                selection_rows.push(SelectionRowRange::nested_entry(
+                                    range.entry,
+                                    screen_start + 1,
+                                    screen_end,
+                                    body_start.saturating_add(1),
+                                ));
+                            }
+                        } else {
+                            selection_rows.push(SelectionRowRange::nested_entry(
+                                range.entry,
+                                screen_start,
+                                screen_end,
+                                body_start,
+                            ));
+                        }
+                    }
+                }
+                tool_run_rows.push((
+                    window.start,
+                    header_row,
+                    lines.len(),
+                    max_offset,
+                    expandable,
+                ));
             }
         }
         trace.checkpoints.push(render_lengths(render));
@@ -7369,7 +7564,10 @@ impl Transcript {
             }
             let start = index;
             while index < self.order.len() {
-                if matches!(self.order[index], TranscriptEntry::Tool { .. }) {
+                if matches!(
+                    self.order[index],
+                    TranscriptEntry::Tool { .. } | TranscriptEntry::Action { .. }
+                ) {
                     index += 1;
                     continue;
                 }
@@ -7395,6 +7593,40 @@ impl Transcript {
             };
             for slot in &mut windows[start..index] {
                 *slot = Some(window);
+            }
+        }
+        windows
+    }
+
+    fn action_run_windows(&self, outer: &[Option<ToolRunWindow>]) -> Vec<Option<ToolRunWindow>> {
+        let mut windows = vec![None; self.order.len()];
+        let mut index = 0;
+        while index < self.order.len() {
+            let Some(parent) = outer[index] else {
+                index += 1;
+                continue;
+            };
+            if index == parent.start
+                && self.order[parent.start..parent.end]
+                    .iter()
+                    .all(is_reasoning_entry)
+            {
+                index = parent.end;
+                continue;
+            }
+            let start = index;
+            index += 1;
+            while index < parent.end && same_action_type(&self.order[start], &self.order[index]) {
+                index += 1;
+            }
+            let total = index - start;
+            if total > 1 || is_reasoning_entry(&self.order[start]) {
+                let window = ToolRunWindow {
+                    start,
+                    end: index,
+                    total,
+                };
+                windows[start..index].fill(Some(window));
             }
         }
         windows

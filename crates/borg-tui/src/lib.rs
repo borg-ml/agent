@@ -176,6 +176,7 @@ const DICTATION_ACCELERATOR_OPTIONS: &[(&str, &str)] = &[
 const SELECTION_AUTOSCROLL_LINES_PER_FRAME: usize = 2;
 type RowRange = (usize, usize, usize);
 type ToolRunRowRange = (usize, usize, usize, usize, bool);
+type ActionRunRowRange = (usize, usize, usize, Option<usize>);
 /// The visible slice of one selectable transcript entry.
 ///
 /// `body_start` is the entry-relative row shown at `start`. Nested action
@@ -237,6 +238,7 @@ type TranscriptRender = (
     Vec<LinkRowRange>,
     Vec<SelectionRowRange>,
     Vec<(usize, Option<String>)>,
+    Vec<ActionRunRowRange>,
 );
 type CachedTranscriptRender = (
     usize,
@@ -582,6 +584,7 @@ fn composer_navigation(key: &KeyEvent) -> Option<(ComposerNavigation, bool)> {
 enum PendingTranscriptClick {
     Link(String),
     ToolRunHeader(usize),
+    ActionRunHeader(usize),
     Tool {
         index: usize,
         run: Option<(usize, usize)>,
@@ -1728,6 +1731,7 @@ pub struct BorgTerminal {
     tool_hit_areas: Vec<(Rect, usize)>,
     tool_run_hit_areas: Vec<(Rect, usize, usize)>,
     tool_run_header_hit_areas: Vec<(Rect, usize)>,
+    action_run_header_hit_areas: Vec<(Rect, usize)>,
     entry_hit_areas: Vec<(Rect, usize)>,
     message_hit_areas: Vec<(Rect, usize)>,
     link_hit_areas: Vec<(Rect, String)>,
@@ -1745,6 +1749,7 @@ pub struct BorgTerminal {
     hovered_tool: Option<usize>,
     hovered_tool_run: Option<(usize, usize)>,
     hovered_tool_run_header: Option<usize>,
+    hovered_action_run_header: Option<usize>,
     hovered_entry: Option<usize>,
     hovered_message: Option<usize>,
     hovered_link: Option<String>,
@@ -1852,6 +1857,7 @@ pub struct BorgTerminal {
 struct HoverState {
     hovered_tool: Option<usize>,
     hovered_tool_run_header: Option<usize>,
+    hovered_action_run_header: Option<usize>,
     hovered_entry: Option<usize>,
     hovered_message: Option<usize>,
     hovered_picker_option: Option<usize>,
@@ -1886,6 +1892,7 @@ impl BorgTerminal {
         HoverState {
             hovered_tool: self.hovered_tool,
             hovered_tool_run_header: self.hovered_tool_run_header,
+            hovered_action_run_header: self.hovered_action_run_header,
             hovered_entry: self.hovered_entry,
             hovered_message: self.hovered_message,
             hovered_picker_option: self.hovered_picker_option,
@@ -3148,6 +3155,7 @@ impl BorgTerminal {
             tool_hit_areas: Vec::new(),
             tool_run_hit_areas: Vec::new(),
             tool_run_header_hit_areas: Vec::new(),
+            action_run_header_hit_areas: Vec::new(),
             entry_hit_areas: Vec::new(),
             message_hit_areas: Vec::new(),
             link_hit_areas: Vec::new(),
@@ -3160,6 +3168,7 @@ impl BorgTerminal {
             hovered_tool: None,
             hovered_tool_run: None,
             hovered_tool_run_header: None,
+            hovered_action_run_header: None,
             hovered_entry: None,
             hovered_message: None,
             hovered_link: None,
@@ -3325,6 +3334,7 @@ impl BorgTerminal {
         self.tool_hit_areas.clear();
         self.tool_run_hit_areas.clear();
         self.tool_run_header_hit_areas.clear();
+        self.action_run_header_hit_areas.clear();
         self.entry_hit_areas.clear();
         self.message_hit_areas.clear();
         self.link_hit_areas.clear();
@@ -3332,6 +3342,7 @@ impl BorgTerminal {
         self.hovered_tool = None;
         self.hovered_tool_run = None;
         self.hovered_tool_run_header = None;
+        self.hovered_action_run_header = None;
         self.hovered_entry = None;
         self.hovered_message = None;
         self.hovered_link = None;
@@ -4177,6 +4188,7 @@ impl BorgTerminal {
                 self.hovered_tool = None;
                 self.hovered_tool_run = None;
                 self.hovered_tool_run_header = None;
+                self.hovered_action_run_header = None;
                 self.hovered_entry = None;
                 self.hovered_message = None;
                 self.pending_tool_copy = None;
@@ -4930,6 +4942,7 @@ impl BorgTerminal {
         self.hovered_tool = None;
         self.hovered_tool_run = None;
         self.hovered_tool_run_header = None;
+        self.hovered_action_run_header = None;
     }
 
     fn action_inspector_anchor(&self) -> Option<ActionInspectorAnchor> {
@@ -5051,6 +5064,7 @@ impl BorgTerminal {
         self.hovered_tool = None;
         self.hovered_tool_run = None;
         self.hovered_tool_run_header = None;
+        self.hovered_action_run_header = None;
         self.invalidate_transcript_render_cache();
         self.transcript.tool_payloads(index)
     }
@@ -5074,6 +5088,7 @@ impl BorgTerminal {
         self.hovered_tool = None;
         self.hovered_tool_run = None;
         self.hovered_tool_run_header = None;
+        self.hovered_action_run_header = None;
         self.hovered_entry = None;
         self.hovered_message = None;
         self.hovered_link = None;
@@ -6593,6 +6608,10 @@ impl BorgTerminal {
                     .tool_run_header_hit_areas
                     .iter()
                     .find_map(|(area, start)| area.contains(pointer).then_some(*start));
+                self.hovered_action_run_header = self
+                    .action_run_header_hit_areas
+                    .iter()
+                    .find_map(|(area, start)| area.contains(pointer).then_some(*start));
                 self.hovered_entry = self
                     .entry_hit_areas
                     .iter()
@@ -7481,6 +7500,8 @@ impl BorgTerminal {
             PendingTranscriptClick::Link(url)
         } else if let Some(start) = self.hovered_tool_run_header {
             PendingTranscriptClick::ToolRunHeader(start)
+        } else if let Some(start) = self.hovered_action_run_header {
+            PendingTranscriptClick::ActionRunHeader(start)
         } else if let Some(index) = self.hovered_tool {
             PendingTranscriptClick::Tool {
                 index,
@@ -7534,6 +7555,14 @@ impl BorgTerminal {
                 }
                 self.nested_scroll_motion = None;
                 self.transcript.toggle_tool_run_expansion(start);
+                self.invalidate_transcript_render_cache();
+            }
+            PendingTranscriptClick::ActionRunHeader(start) => {
+                if self.transcript.action_run_expanded(start) {
+                    self.capture_transcript_anchor_for_collapse();
+                }
+                self.nested_scroll_motion = None;
+                self.transcript.toggle_action_run_expansion(start);
                 self.invalidate_transcript_render_cache();
             }
             PendingTranscriptClick::Tool { index, run } => {
@@ -8671,6 +8700,15 @@ impl BorgTerminal {
                         .map(|start| self.transcript.tool_run_header_hint(start))
                 })
                 .or_else(|| {
+                    self.hovered_action_run_header.map(|start| {
+                        if self.transcript.action_run_expanded(start) {
+                            "click collapse group"
+                        } else {
+                            "click expand group"
+                        }
+                    })
+                })
+                .or_else(|| {
                     self.hovered_entry
                         .and_then(|index| self.transcript.entry_click_hint(index))
                 })
@@ -8964,6 +9002,7 @@ impl BorgTerminal {
             link_rows,
             selection_rows,
             cached_tool_elapsed,
+            action_run_rows,
         ) = transcript_render.as_ref();
         let transcript_height = transcript.len();
         self.scroll_from_bottom = resolve_pending_scroll_anchor(
@@ -8992,6 +9031,7 @@ impl BorgTerminal {
         let mut next_tool_hit_areas = Vec::new();
         let mut next_tool_run_hit_areas = Vec::new();
         let mut next_tool_run_header_hit_areas = Vec::new();
+        let mut next_action_run_header_hit_areas = Vec::new();
         let mut next_message_hit_areas = Vec::new();
         let mut next_link_hit_areas = Vec::new();
         let mut next_entry_hit_areas = Vec::new();
@@ -9315,6 +9355,33 @@ impl BorgTerminal {
                         ));
                     }
                 }
+                for (index, start, end, timer_entry) in action_run_rows
+                    .iter()
+                    .filter(|(_, start, end, _)| *end > scroll_start && *start < visible_end)
+                {
+                    if let Some(entry) = timer_entry {
+                        refresh_tool_elapsed_line(
+                            &mut visible_transcript[start.saturating_sub(scroll_start)],
+                            *entry,
+                            cached_tool_elapsed,
+                            &current_tool_elapsed,
+                        );
+                    }
+                    if self.hovered_action_run_header == Some(*index) {
+                        apply_viewport_background(
+                            &mut visible_transcript,
+                            *start,
+                            *end,
+                            scroll_start,
+                            content_area.width as usize,
+                            MESSAGE_HOVER_BG,
+                        );
+                    }
+                    next_action_run_header_hit_areas.push((
+                        viewport_hit_area(content_area, scroll_start, *start, *end),
+                        *index,
+                    ));
+                }
                 for (index, start, end) in
                     visible_row_ranges(message_rows, scroll_start, visible_height)
                 {
@@ -9494,6 +9561,8 @@ impl BorgTerminal {
                         ));
                     }
                 }
+                let has_sticky_header =
+                    sticky_tool_run_header.is_some() || sticky_tool_header.is_some();
                 if !show_history_loader
                     && let Some((index, mut header, expandable)) = sticky_tool_run_header
                 {
@@ -9526,6 +9595,9 @@ impl BorgTerminal {
                     frame.render_widget(Paragraph::new(header), sticky_area);
                     next_tool_hit_areas.push((sticky_area, index));
                 }
+                if has_sticky_header {
+                    next_action_run_header_hit_areas.retain(|(area, _)| area.y > content_area.y);
+                }
                 if show_history_loader {
                     let loader_area = Rect {
                         height: 1,
@@ -9539,6 +9611,7 @@ impl BorgTerminal {
                     next_tool_hit_areas.retain(|(area, _)| !is_behind_loader(area));
                     next_tool_run_hit_areas.retain(|(area, _, _)| !is_behind_loader(area));
                     next_tool_run_header_hit_areas.retain(|(area, _)| !is_behind_loader(area));
+                    next_action_run_header_hit_areas.retain(|(area, _)| !is_behind_loader(area));
                     next_message_hit_areas.retain(|(area, _)| !is_behind_loader(area));
                     next_entry_hit_areas.retain(|(area, _)| !is_behind_loader(area));
                     next_link_hit_areas.retain(|(area, _)| !is_behind_loader(area));
@@ -10807,6 +10880,7 @@ impl BorgTerminal {
             next_tool_hit_areas.clear();
             next_tool_run_hit_areas.clear();
             next_tool_run_header_hit_areas.clear();
+            next_action_run_header_hit_areas.clear();
             next_message_hit_areas.clear();
             next_link_hit_areas.clear();
             next_entry_hit_areas.clear();
@@ -10842,6 +10916,7 @@ impl BorgTerminal {
         self.tool_hit_areas = next_tool_hit_areas;
         self.tool_run_hit_areas = next_tool_run_hit_areas;
         self.tool_run_header_hit_areas = next_tool_run_header_hit_areas;
+        self.action_run_header_hit_areas = next_action_run_header_hit_areas;
         self.message_hit_areas = next_message_hit_areas;
         self.link_hit_areas = next_link_hit_areas;
         self.entry_hit_areas = next_entry_hit_areas;
@@ -12239,6 +12314,21 @@ fn replace_root_transcript_history(
         }
         if let Some(offset) = previous.tool_run_offsets.get(old_start) {
             replacement.tool_run_offsets.insert(new_start, *offset);
+        }
+    }
+    let action_windows = replacement.action_run_windows(&windows);
+    for (old_start, expanded) in &previous.action_run_expansions {
+        if let Some(identity) = previous.order.identities.get(*old_start)
+            && let Some(index) = replacement
+                .order
+                .identities
+                .iter()
+                .position(|id| id == identity)
+            && let Some(window) = action_windows[index]
+        {
+            replacement
+                .action_run_expansions
+                .insert(window.start, *expanded);
         }
     }
     replacement.session_usage = reconciled_usage;
@@ -15060,14 +15150,12 @@ fn selection_content_columns(line: &Line<'static>) -> usize {
     content_end
 }
 
-// The open group header now shares the two-space indent with action rows.
-// Its two grey spans (indent + summary) distinguish chrome from selectable work.
+// Accordion headers are visual chrome, not selectable entry text.
 fn is_open_action_group_header(line: &Line<'_>) -> bool {
-    line.spans.len() == 2
-        && line.spans[0].content == TOOL_WINDOW_HEADER_INDENT
-        && line.spans[0].style.fg == Some(Color::DarkGray)
-        && line.spans[1].style.fg == Some(Color::DarkGray)
-        && line.spans[1].content.contains(" action")
+    line.spans.first().is_some_and(|span| {
+        span.style.fg == Some(Color::DarkGray)
+            && matches!(span.content.as_ref(), "▾ " | "▸ " | "  ▾ " | "  ▸ ")
+    })
 }
 
 fn selection_line_ranges(line: &Line<'static>) -> Vec<(usize, usize)> {

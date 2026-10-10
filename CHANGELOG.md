@@ -7,6 +7,9 @@ Git comparison.
 
 ### Terminal
 
+- Keep consecutive calls of the same tool or action type in nested collapsible
+  groups inside Actions, with independent group toggles and scroll state.
+  Standalone reasoning groups remain top-level.
 - Accent only “Compacted context” in orange; render its details grey without a colon.
 - Restore transcript images when menus and tooltips close, move, or resize.
   Team, Todos, and other overlays share the same image-safe repaint handling.
@@ -17,8 +20,9 @@ Git comparison.
 
 - Budget encrypted reasoning in compacted history and count generated model
   output when checking context pressure, so retained tails stay within budget.
-- Match Codex Responses Lite headers and tool-call mode, honor model-default
-  reasoning summaries, and record raw, usable, and maximum context limits.
+- Match Codex Responses Lite headers and tool-call mode, use standard thread
+  attribution without changing cache affinity, honor model-default reasoning
+  summaries, and record raw, usable, and maximum context limits.
 - Update finalized reasoning summaries in their original rows rather than
   reopening a second reasoning phase for terminal summary fragments.
 - Avoid duplicate completion events when Codex's final response replays finished

@@ -1829,6 +1829,7 @@ fn hover_redraw_gate_ignores_motion_inside_one_target() {
     let idle = HoverState {
         hovered_tool: None,
         hovered_tool_run_header: None,
+        hovered_action_run_header: None,
         hovered_entry: None,
         hovered_message: None,
         hovered_picker_option: None,
@@ -13940,7 +13941,8 @@ fn long_tool_runs_show_eight_lines_and_scroll_independently() {
     assert!(rendered.contains("20 actions · ↑ scroll"));
     assert!(!rendered.contains("scroll for older/newer"));
 
-    transcript.scroll_tool_run(0, 12, -3);
+    let max_offset = transcript.render(100, None, None, None).2[0].3;
+    transcript.scroll_tool_run(0, max_offset, -3);
     let rendered = transcript
         .lines(100)
         .into_iter()
@@ -14113,6 +14115,7 @@ fn history_paging_preserves_manually_expanded_action_groups_and_offsets() {
         }
         let old_start = root.tools["selected-0"];
         root.toggle_tool_run_expansion(old_start);
+        assert!(!root.toggle_action_run_expansion(old_start));
         root.anchor_tool_run(old_start, 1);
         let (mut transcript, mut director) = if child_is_focused {
             (Transcript::default(), Some(Box::new(root)))
@@ -14120,8 +14123,11 @@ fn history_paging_preserves_manually_expanded_action_groups_and_offsets() {
             (root, None)
         };
         replace_root_transcript_history(&mut transcript, &mut director, child_is_focused, &paged);
-        let rebuilt = director.as_deref().unwrap_or(&transcript);
+        let rebuilt = director.as_deref_mut().unwrap_or(&mut transcript);
         let new_start = rebuilt.tools["selected-0"];
+        assert_eq!(rebuilt.action_run_expansions.get(&new_start), Some(&false));
+        assert!(rebuilt.tool_run_expanded(new_start));
+        assert!(rebuilt.toggle_action_run_expansion(new_start));
         assert_ne!(old_start, new_start, "paging must move the selected group");
         let rendered = rebuilt
             .lines(100)
@@ -14424,12 +14430,11 @@ fn sticky_tool_run_header_row_covers_only_overflowing_boxes() {
 #[test]
 fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     let mut transcript = Transcript::default();
-    let tool = |index| TranscriptEntry::Tool {
-        source_name: if index % 2 == 0 { "reasoning" } else { "Run" }.to_string(),
-        name: if index % 2 == 0 { "Reasoned" } else { "Run" }.to_string(),
+    let tool = |index, reasoning| TranscriptEntry::Tool {
+        source_name: if reasoning { "reasoning" } else { "Run" }.to_string(),
+        name: if reasoning { "Reasoned" } else { "Run" }.to_string(),
         detail: format!("call-{index}"),
-        code_view: (index % 2 == 0)
-            .then(|| ("reasoning".to_string(), format!("Reasoning block {index}"))),
+        code_view: reasoning.then(|| ("reasoning".to_string(), format!("Reasoning block {index}"))),
         output_view: None,
         payload_refs: Vec::new(),
         time: "19:38".to_string(),
@@ -14443,34 +14448,176 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
         outcome: None,
         cwd: None,
     };
-    for index in 0..4 {
-        transcript.order.push(tool(index));
+    for index in 0..7 {
+        transcript.order.push(tool(index, index < 5));
     }
     transcript.order.push(TranscriptEntry::Activity {
         text: "agent · /root/v391_scaling_audit · started".to_string(),
         time: "19:38".to_string(),
     });
-    for index in 4..10 {
-        transcript.order.push(tool(index));
+    for (index, name) in [(8, "Read"), (9, "Edit")] {
+        let mut entry = tool(index, false);
+        if let TranscriptEntry::Tool {
+            source_name,
+            name: label,
+            ..
+        } = &mut entry
+        {
+            *source_name = "capability".into();
+            *label = name.into();
+        }
+        transcript.order.push(entry);
     }
-
+    for index in 10..12 {
+        transcript.order.push(TranscriptEntry::Action {
+            kind: TranscriptActionKind::Watch,
+            label: "Watch".into(),
+            detail: format!("watch-{index}"),
+            body: None,
+            time: "19:38".into(),
+            state: TranscriptActionState::Complete,
+            expanded: false,
+        });
+    }
+    transcript.order.push(tool(12, true));
+    transcript.order.push(tool(13, false));
+    let identities = transcript.order.identities.clone();
     let windows = transcript.tool_run_windows();
     assert!(windows.iter().all(Option::is_some));
-    assert_eq!(windows[0].unwrap().total, 11);
-    assert_eq!(windows[10].unwrap().start, 0);
+    assert_eq!(windows[0].unwrap().total, 14);
+    assert_eq!(windows[13].unwrap().start, 0);
+    let children = transcript.action_run_windows(&windows);
+    assert_eq!(children[0].unwrap().end, 5);
+    assert_eq!(children[5].unwrap().end, 7);
+    assert!(children[8].is_none() && children[9].is_none());
+    assert_eq!(children[10].unwrap().end, 12);
 
-    let rendered = transcript
-        .lines(100)
-        .into_iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let now = Utc::now();
+    let render = |transcript: &Transcript| {
+        let cached = Arc::unwrap_or_clone(transcript.render_for_cache_at(100, 100, now));
+        assert_eq!(
+            cached,
+            transcript
+                .render_with_tool_run_viewport_mode(100, 100, None, None, None, true, None, now,)
+        );
+        cached
+    };
+    let text = |render: &TranscriptRender| {
+        render
+            .0
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let collapsed_child = render(&transcript);
+    let rendered = text(&collapsed_child);
     assert_eq!(rendered.matches(" actions").count(), 1);
-    assert!(rendered.contains("▾ 19:38 · 11 actions"), "{rendered}");
+    assert!(rendered.contains("▾ 19:38 · 14 actions"), "{rendered}");
+    assert!(rendered.contains("  ▸ 19:38  ◦ Reasoned (5)"), "{rendered}");
+    assert!(rendered.contains("  ▾ 19:38 · Run (2)"), "{rendered}");
+    assert!(rendered.contains("  ▾ 19:38 · Watch (2)"), "{rendered}");
     assert!(
         rendered.contains("\n  19:38  agent · /root/v391_scaling_audit · started"),
         "{rendered}"
     );
+    assert_eq!(
+        collapsed_child
+            .8
+            .iter()
+            .map(|row| row.0)
+            .collect::<Vec<_>>(),
+        [0, 5, 10, 12]
+    );
+    assert!(collapsed_child.1.iter().all(|(index, ..)| *index >= 5));
+    assert!(collapsed_child.6.iter().all(|range| range.entry >= 5));
+
+    assert!(transcript.toggle_action_run_expansion(0));
+    assert!(!transcript.tool_run_expanded(0));
+    let expanded_child = render(&transcript);
+    assert!(text(&expanded_child).contains("Reasoning block 0"));
+    assert_eq!(
+        expanded_child.1.iter().map(|row| row.0).collect::<Vec<_>>(),
+        [0, 1, 2, 3, 4, 5, 6, 8, 9, 13]
+    );
+    assert_eq!(
+        expanded_child
+            .6
+            .iter()
+            .map(|range| range.entry)
+            .collect::<Vec<_>>(),
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13]
+    );
+    assert_eq!(transcript.order.identities, identities);
+    assert!(transcript.toggle_tool_run_expansion(0));
+    assert!(transcript.action_run_expanded(0));
+    assert!(!transcript.toggle_action_run_expansion(5));
+    assert!(!transcript.toggle_action_run_expansion(10));
+    let hidden_repeated_calls = render(&transcript);
+    assert!(
+        hidden_repeated_calls
+            .1
+            .iter()
+            .all(|(index, ..)| ![5, 6].contains(index))
+    );
+    assert!(
+        hidden_repeated_calls
+            .6
+            .iter()
+            .all(|range| ![5, 6, 10, 11].contains(&range.entry))
+    );
+    assert!(!transcript.toggle_action_run_expansion(0));
+    assert!(transcript.tool_run_expanded(0));
+
+    // Finish the outer group, then hide it without losing child expansion.
+    transcript.order.push(TranscriptEntry::Activity {
+        text: "done".into(),
+        time: "19:38".into(),
+    });
+    assert!(transcript.toggle_action_run_expansion(0));
+    assert!(!transcript.toggle_tool_run_expansion(0));
+    let folded_parent = render(&transcript);
+    assert!(folded_parent.8.is_empty());
+    assert!(folded_parent.1.is_empty());
+    assert!(folded_parent.6.iter().all(|range| range.entry >= 14));
+    if let TranscriptEntry::Action { state, .. } = transcript.order.get_mut(10).unwrap() {
+        *state = TranscriptActionState::Running;
+    }
+    assert!(text(&render(&transcript)).contains("▾ 19:38 · 14 actions"));
+    if let TranscriptEntry::Action { state, .. } = transcript.order.get_mut(10).unwrap() {
+        *state = TranscriptActionState::Complete;
+    }
+    assert!(transcript.action_run_expanded(0));
+    assert!(transcript.toggle_tool_run_expansion(0));
+    assert!(text(&render(&transcript)).contains("Reasoning block 0"));
+
+    // Clipping away a child header must remove its hit metadata, while retained
+    // tool and selection slices still refer to the original transcript indices.
+    assert!(!transcript.toggle_tool_run_expansion(0));
+    transcript.order.pop();
+    let clipped = transcript.render_with_tool_run_viewport(100, 2, None, None, None);
+    assert!(
+        clipped
+            .8
+            .iter()
+            .all(|(index, start, end, _)| *index != 0 && start < end && *end <= clipped.0.len())
+    );
+    assert!(clipped.1.iter().all(|(index, ..)| *index >= 12));
+    assert!(clipped.6.iter().all(|range| range.entry >= 12));
+    assert_eq!(transcript.order.identities, identities);
+
+    // Inserting an earlier entry remaps both expansion namespaces independently.
+    transcript.order.insert(
+        0,
+        TranscriptEntry::Activity {
+            text: "earlier".into(),
+            time: "19:37".into(),
+        },
+    );
+    transcript.reindex_after_insertion(0);
+    assert!(transcript.action_run_expanded(1));
+    assert_eq!(transcript.action_run_expansions.get(&6), Some(&false));
+    assert_eq!(&transcript.order.identities[1..], &identities);
 }
 
 #[test]
