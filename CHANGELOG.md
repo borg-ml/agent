@@ -8,7 +8,8 @@ Git comparison.
 ### Terminal
 
 - Keep consecutive calls of the same tool or action type in nested collapsible
-  groups inside Actions, with independent group toggles and scroll state.
+  groups inside Actions, with independent toggles and preserved scrolling and
+  selection behavior.
   Standalone reasoning groups remain top-level.
 - Accent only “Compacted context” in orange; render its details grey without a colon.
 - Restore transcript images when menus and tooltips close, move, or resize.
