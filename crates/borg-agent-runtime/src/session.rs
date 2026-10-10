@@ -6212,6 +6212,7 @@ async fn run_agent_session_store_kernel_inner(
                                         &prompt,
                                         admission.clone(),
                                         acknowledgement_id, launch.capabilities.frames_steers_for(launch.provider, launch.model.as_deref()),
+                                        prompt.actor == EventActor::User,
                                     )
                                     .await;
                                 pending_steers.push_back(PendingSteer {
@@ -11060,6 +11061,7 @@ pub(crate) fn frame_mid_turn_human_message(text: &str) -> String {
          on later progress updates.\n\nHuman message:\n{text}"
     )
 }
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_steer(
     control_tx: &mpsc::Sender<AgentTurnControl>,
     steer_result_tx: &mpsc::Sender<(Uuid, std::result::Result<(), String>)>,
@@ -11067,6 +11069,7 @@ async fn dispatch_steer(
     admission: SteerAdmission,
     acknowledgement_id: Uuid,
     reply_prompt: bool,
+    human: bool,
 ) -> bool {
     let (ack, result) = oneshot::channel();
     let text = if reply_prompt && prompt.actor == EventActor::User {
@@ -11081,14 +11084,10 @@ async fn dispatch_steer(
             text,
             attachments: prompt.attachments.clone(),
             admission,
-            // Fold every steer in at the next tool boundary, as Claude Code's
-            // own TUI does for a message typed mid-turn: the CLI then wraps it
-            // in its "The user sent a new message while you were working"
-            // framing. A priority-`now` steer instead cancels the running
-            // command and lands as a bare user block, which the model is
-            // measurably less likely to answer.
+            // Native generation uses human priority. The Claude CLI keeps boundary
+            // folding rather than cancelling the command with priority `now`.
             preempt: false,
-            human: prompt.actor == EventActor::User,
+            human,
             ack,
         })
         .is_err()
@@ -11149,6 +11148,9 @@ async fn retry_pending_steers(
         return;
     };
     let mut prompt = pending_steers[first].prompt.clone();
+    let human = indices
+        .iter()
+        .any(|&index| pending_steers[index].prompt.actor == EventActor::User);
     if !indices
         .iter()
         .all(|&index| pending_steers[index].prompt.actor == EventActor::User)
@@ -11178,6 +11180,7 @@ async fn retry_pending_steers(
         admission,
         acknowledgement_id,
         reply_prompt,
+        human,
     )
     .await
     {

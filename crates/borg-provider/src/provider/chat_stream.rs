@@ -647,6 +647,10 @@ impl SteerAdmission {
     pub fn is_accepted(&self) -> bool {
         self.0.load(Ordering::Acquire) == STEER_ACCEPTED
     }
+
+    pub fn is_recalled(&self) -> bool {
+        self.0.load(Ordering::Acquire) == STEER_RECALLED
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

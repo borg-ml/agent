@@ -18393,7 +18393,7 @@ fn collapsed_recovery_journal_still_places_prompts_before_their_replies() {
 }
 
 #[tokio::test]
-async fn human_mid_turn_steers_are_framed_with_a_reply_instruction() {
+async fn human_mid_turn_steers_keep_human_priority_and_frame_only_human_batches() {
     fn steer(text: &str, actor: EventActor) -> PendingSteer {
         PendingSteer {
             prompt: QueuedPrompt {
@@ -18415,19 +18415,23 @@ async fn human_mid_turn_steers_are_framed_with_a_reply_instruction() {
             attempt_boundary: 0,
         }
     }
-    async fn dispatched(pending: &mut VecDeque<PendingSteer>, reply_prompt: bool) -> String {
+    async fn dispatched(
+        pending: &mut VecDeque<PendingSteer>,
+        reply_prompt: bool,
+    ) -> (String, bool) {
         let (control_tx, mut controls) = mpsc::channel(4);
         let (result_tx, _results) = mpsc::channel(4);
         retry_pending_steers(&control_tx, &result_tx, pending, 1, reply_prompt).await;
-        let AgentTurnControl::Steer { text, .. } = controls.recv().await.unwrap() else {
+        let AgentTurnControl::Steer { text, human, .. } = controls.recv().await.unwrap() else {
             panic!("expected steer")
         };
-        text
+        (text, human)
     }
 
     let human = "you dont have my saved world from before?";
     let mut pending = VecDeque::from([steer(human, EventActor::User)]);
-    let framed = dispatched(&mut pending, true).await;
+    let (framed, human_priority) = dispatched(&mut pending, true).await;
+    assert!(human_priority);
     assert_eq!(framed, super::frame_mid_turn_human_message(human));
     assert!(framed.ends_with(human), "the human's words stay verbatim");
     assert!(framed.contains("next visible response"));
@@ -18435,16 +18439,16 @@ async fn human_mid_turn_steers_are_framed_with_a_reply_instruction() {
     let mut pending = VecDeque::from([steer(human, EventActor::User)]);
     assert_eq!(
         dispatched(&mut pending, false).await,
-        human,
-        "the option delivers the bare text"
+        (human.to_string(), true),
+        "bare human input retains human priority"
     );
 
     let team = "Team message from worker: build finished";
     let mut pending = VecDeque::from([steer(team, EventActor::System)]);
     assert_eq!(
         dispatched(&mut pending, true).await,
-        team,
-        "team input is never framed as the human's words"
+        (team.to_string(), false),
+        "team input has neither human framing nor human priority"
     );
 
     let mut pending = VecDeque::from([
@@ -18453,8 +18457,8 @@ async fn human_mid_turn_steers_are_framed_with_a_reply_instruction() {
     ]);
     assert_eq!(
         dispatched(&mut pending, true).await,
-        format!("{human}\n\n{team}"),
-        "a mixed batch is not framed as the human's words"
+        (format!("{human}\n\n{team}"), true),
+        "a mixed batch retains human priority without framing team input as human"
     );
 }
 
