@@ -261,6 +261,7 @@ impl Extend<TranscriptEntry> for TranscriptEntries {
 
 struct ModelRequestDisplay {
     id: String,
+    started_at: DateTime<Utc>,
     last_received_at: Option<DateTime<Utc>>,
     output_tokens: Option<u64>,
 }
@@ -1907,6 +1908,7 @@ impl Transcript {
                 {
                     self.model_request = Some(ModelRequestDisplay {
                         id: id.to_string(),
+                        started_at: event.created_at,
                         last_received_at: None,
                         output_tokens: None,
                     });
@@ -4225,6 +4227,32 @@ impl Transcript {
                 return;
             }
             self.active_reasoning = None;
+        }
+        if let Some(request) = &self.model_request
+            && let Some(index) = self.order.len().checked_sub(1)
+            && let Some(TranscriptEntry::Tool {
+                code_view: Some((language, source)),
+                name,
+                started_at: previous_start,
+                completed_at,
+                complete,
+                expanded,
+                error: false,
+                user_interrupted: false,
+                ..
+            }) = self.order.get_mut(index)
+            && language == "reasoning"
+            && source.is_empty()
+            && *complete
+            && *previous_start >= request.started_at
+        {
+            *name = "Reasoning".to_string();
+            *completed_at = None;
+            *complete = false;
+            *expanded = self.auto_expand_thinking;
+            self.active_reasoning = Some(index);
+            self.reasoning_has_preview = false;
+            return;
         }
         let index = self.order.len();
         self.order.push(TranscriptEntry::Tool {

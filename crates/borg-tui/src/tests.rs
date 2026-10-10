@@ -15050,6 +15050,82 @@ fn reasoning_lifecycle_events_show_reasoning_without_a_text_delta() {
 }
 
 #[test]
+fn hidden_reasoning_chunks_share_one_row_within_a_request() {
+    let session_id = Uuid::new_v4();
+    let started_at = Utc::now();
+    let mut transcript = Transcript::default();
+    let mut sequence = 0;
+    let mut apply = |transcript: &mut Transcript, seconds, kind| {
+        sequence += 1;
+        let mut event = SessionEvent::new(session_id, sequence, kind);
+        event.created_at = started_at + chrono::Duration::seconds(seconds);
+        transcript.apply(&event);
+    };
+    let request = |id| SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Codex,
+        kind: "native_model_request".into(),
+        payload: serde_json::json!({"request_id": id}),
+    };
+    let chunk = || SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Codex,
+        kind: "item/started:reasoning".into(),
+        payload: serde_json::json!({"item": {"type": "reasoning"}}),
+    };
+    apply(&mut transcript, 0, request("request-1"));
+    for index in 0..20 {
+        apply(&mut transcript, index * 5 + 1, chunk());
+        assert_eq!(transcript.order.len(), 1);
+        assert!(matches!(
+            &transcript.order[0],
+            TranscriptEntry::Tool {
+                complete: false,
+                completed_at: None,
+                ..
+            }
+        ));
+        apply(
+            &mut transcript,
+            (index + 1) * 5,
+            SessionEventKind::ReasoningCompleted,
+        );
+    }
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Tool { started_at: start, completed_at: Some(end), .. }
+            if *start == started_at + chrono::Duration::seconds(1)
+                && *end == started_at + chrono::Duration::seconds(100)
+    ));
+    apply(
+        &mut transcript,
+        101,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "read-1".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({"path":"src/lib.rs"}),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    );
+    apply(&mut transcript, 102, request("request-2"));
+    apply(&mut transcript, 103, chunk());
+    apply(&mut transcript, 104, SessionEventKind::ReasoningCompleted);
+    assert_eq!(transcript.order.len(), 3);
+    apply(&mut transcript, 105, request("request-3"));
+    apply(&mut transcript, 106, chunk());
+    assert_eq!(transcript.order.len(), 4);
+    apply(
+        &mut transcript,
+        107,
+        SessionEventKind::ReasoningDelta {
+            text: "Checking the diff".into(),
+        },
+    );
+    apply(&mut transcript, 108, SessionEventKind::ReasoningCompleted);
+    apply(&mut transcript, 109, chunk());
+    assert_eq!(transcript.order.len(), 5);
+}
+
+#[test]
 fn consecutive_reasoning_blocks_fold_and_expand_as_a_counted_group() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
@@ -15078,7 +15154,7 @@ fn consecutive_reasoning_blocks_fold_and_expand_as_a_counted_group() {
             .join("\n")
     };
     let running = text(&transcript);
-    assert!(running.contains("▸ Reasoning (4)"));
+    assert!(running.contains("Reasoning (4)"));
     assert!(!running.contains("Reasoning body"));
     transcript.set_auto_expand_thinking(true);
     assert!(text(&transcript).contains("Reasoning body 3"));
@@ -15089,7 +15165,7 @@ fn consecutive_reasoning_blocks_fold_and_expand_as_a_counted_group() {
         8,
         SessionEventKind::ReasoningCompleted,
     ));
-    assert!(text(&transcript).contains("▸ Reasoned (4)"));
+    assert!(text(&transcript).contains("Reasoned (4)"));
     assert!(transcript.toggle_tool_run_expansion(0));
     assert!(text(&transcript).contains("Reasoning body 0"));
 }

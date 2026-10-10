@@ -1475,6 +1475,10 @@ impl ResponseState {
                 if event["item"]["type"] == "reasoning" =>
             {
                 let done = event["type"] == "response.output_item.done";
+                let completed_before = done
+                    && event["output_index"]
+                        .as_u64()
+                        .is_some_and(|index| self.output.contains_key(&index));
                 if done && let Some(summary) = event["item"]["summary"].as_array() {
                     for (index, part) in summary.iter().enumerate() {
                         if let Some(text) = part["text"].as_str() {
@@ -1494,6 +1498,9 @@ impl ResponseState {
                         .as_u64()
                         .context("Codex output item has no index")?;
                     self.output.insert(index, event["item"].clone());
+                }
+                if completed_before {
+                    return Ok(None);
                 }
                 emit(ProviderProgress::ProviderEvent {
                     kind: if done {
@@ -2468,6 +2475,18 @@ mod tests {
                 )
                 .unwrap();
         }
+        state
+            .event(
+                &json!({"type":"response.completed", "response":{"output":[
+                    {"type":"reasoning", "id":"reason", "summary":[
+                        {"type":"summary_text", "text":"Checking replay safely"}
+                    ]}
+                ]}}),
+                Some(&tx),
+                "model",
+                "medium",
+            )
+            .unwrap();
         let mut events = Vec::new();
         while let Ok(ProviderProgress::ProviderEvent {
             kind, content_text, ..
@@ -2481,9 +2500,13 @@ mod tests {
                 ("item/started:reasoning".into(), None),
                 ("reasoning_delta".into(), Some("Checking replay".into())),
                 ("item/completed:reasoning".into(), None),
+                ("reasoning_delta".into(), Some(" safely".into())),
             ]
         );
-        assert_eq!(state.output[&0]["summary"][0]["text"], "Checking replay");
+        assert_eq!(
+            state.output[&0]["summary"][0]["text"],
+            "Checking replay safely"
+        );
     }
 
     #[test]
