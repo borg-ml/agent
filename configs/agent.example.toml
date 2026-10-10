@@ -23,6 +23,9 @@ enabled = true
 [capabilities]
 multiplayer = true
 subagents = true
+# Opt in to requiring a follow-up before resuming a subagent goal you interrupted.
+# Human stops and approval/budget gates stay enforced regardless.
+subagent_resume_guard = false
 autonomous_team = true
 shared_work = true
 presence = true

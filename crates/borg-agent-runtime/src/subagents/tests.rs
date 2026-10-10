@@ -9613,7 +9613,7 @@ async fn parent_goal_control_routes_real_actions_and_denies_unrelated_callers() 
     let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
     let store = Arc::new(store);
     store.create_session(root).await.unwrap();
-    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+    let mut coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
         root,
         launch(),
@@ -9696,6 +9696,149 @@ async fn parent_goal_control_routes_real_actions_and_denies_unrelated_callers() 
             )
             .await
             .is_err()
+    );
+    assert!(rx.try_recv().is_err());
+    coordinator
+        .call_tool_as(root, "interrupt_agent", json!({"target":"worker"}))
+        .await
+        .unwrap();
+    assert!(matches!(
+        rx.recv().await,
+        Some(HostCommand::Interrupt { .. })
+    ));
+    assert!(
+        coordinator.table.lock().await.entries[&child]
+            .snapshot
+            .interrupted_by
+            .is_none(),
+        "an agent interruption cannot claim an existing human stop"
+    );
+    assert!(
+        coordinator
+            .call_tool_as(
+                root,
+                "control_agent_goal",
+                json!({"target":"worker","goal_action":{"type":"resume"}})
+            )
+            .await
+            .is_err()
+    );
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::UserStopChanged { engaged: false },
+        ))
+        .await
+        .unwrap();
+    coordinator
+        .call_tool_as(root, "interrupt_agent", json!({"target":"worker"}))
+        .await
+        .unwrap();
+    assert!(matches!(
+        rx.recv().await,
+        Some(HostCommand::Interrupt { .. })
+    ));
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::UserStopChanged { engaged: true },
+        ))
+        .await
+        .unwrap();
+    let resume = json!({"target":"worker","goal_action":{"type":"resume"}});
+    coordinator.root_launch.capabilities.subagent_resume_guard = true;
+    assert!(
+        coordinator
+            .call_tool_as(root, "control_agent_goal", resume.clone())
+            .await
+            .is_err()
+    );
+    assert!(rx.try_recv().is_err());
+    coordinator.root_launch.capabilities.subagent_resume_guard = false;
+    let mut limited = goal.clone();
+    limited.status = crate::GoalStatus::BudgetLimited;
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::GoalUpdated { goal: limited },
+        ))
+        .await
+        .unwrap();
+    assert!(
+        coordinator
+            .call_tool_as(root, "control_agent_goal", resume.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "a rejected goal resume must not lift the interrupt"
+    );
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::GoalUpdated { goal: goal.clone() },
+        ))
+        .await
+        .unwrap();
+    coordinator
+        .call_tool_as(root, "control_agent_goal", resume.clone())
+        .await
+        .unwrap();
+    assert!(
+        matches!(rx.recv().await, Some(HostCommand::ResumeFromInterrupt { session_id }) if session_id == child)
+    );
+    assert!(
+        matches!(rx.recv().await, Some(HostCommand::AgentGoal { session_id, action: crate::GoalAction::Resume }) if session_id == child)
+    );
+    assert!(
+        coordinator.table.lock().await.entries[&child]
+            .snapshot
+            .interrupted_by
+            .is_none()
+    );
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::UserStopChanged { engaged: false },
+        ))
+        .await
+        .unwrap();
+    coordinator
+        .call_tool_as(root, "interrupt_agent", json!({"target":"worker"}))
+        .await
+        .unwrap();
+    assert!(matches!(
+        rx.recv().await,
+        Some(HostCommand::Interrupt { .. })
+    ));
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::UserStopChanged { engaged: true },
+        ))
+        .await
+        .unwrap();
+    coordinator.interrupt("worker").await.unwrap();
+    assert!(matches!(
+        rx.recv().await,
+        Some(HostCommand::Interrupt { .. })
+    ));
+    assert!(
+        coordinator
+            .call_tool_as(root, "control_agent_goal", resume)
+            .await
+            .is_err()
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "a later human stop remains authoritative"
     );
     assert_eq!(store.state(child).await.unwrap().goal.unwrap().id, goal.id);
     scratch.discard().await;

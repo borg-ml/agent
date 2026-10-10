@@ -159,6 +159,7 @@ pub(super) fn scrub_value(value: &mut Value) {
 fn validate_goal_action(
     action: &crate::GoalAction,
     state: Option<&crate::SessionState>,
+    resume_own_interrupt: bool,
 ) -> Result<()> {
     if let crate::GoalAction::Set {
         objective,
@@ -182,7 +183,7 @@ fn validate_goal_action(
             crate::GoalAction::Resume => {
                 let goal = state.goal.as_ref().context("child has no goal")?;
                 ensure!(
-                    !state.user_stopped,
+                    !state.user_stopped || resume_own_interrupt,
                     "explicit human stop requires human resume authorization"
                 );
                 ensure!(
@@ -254,12 +255,51 @@ impl SubagentCoordinator {
         );
         let action = args.goal_action.context("goal_action is required")?;
         let state = self.store.state(id).await?;
-        validate_goal_action(&action, Some(&state))?;
-        self.send_command(&id.to_string(), |session_id| HostCommand::AgentGoal {
-            session_id,
-            action,
-        })
-        .await?;
+        let resume_own_interrupt = matches!(action, crate::GoalAction::Resume)
+            && !self.root_launch.capabilities.subagent_resume_guard
+            && self
+                .table
+                .lock()
+                .await
+                .entries
+                .get(&id)
+                .is_some_and(|entry| entry.snapshot.interrupted_by == Some(actor));
+        validate_goal_action(&action, Some(&state), resume_own_interrupt)?;
+        if resume_own_interrupt {
+            self.ensure_child_actor(id).await?;
+            let mut table = self.table.lock().await;
+            let entry = table
+                .entries
+                .get_mut(&id)
+                .context("child no longer exists")?;
+            // Recheck under the same lock used by human interruption before lifting this caller's stop.
+            ensure!(
+                entry.snapshot.interrupted_by == Some(actor),
+                "interruption changed; explicit human stop requires human resume authorization"
+            );
+            let commands = entry
+                .commands
+                .as_ref()
+                .context("subagent is still starting")?;
+            commands
+                .send(HostCommand::ResumeFromInterrupt { session_id: id })
+                .await
+                .map_err(|_| anyhow::anyhow!("subagent command channel closed"))?;
+            commands
+                .send(HostCommand::AgentGoal {
+                    session_id: id,
+                    action,
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("subagent command channel closed"))?;
+            entry.snapshot.interrupted_by = None;
+        } else {
+            self.send_command(&id.to_string(), |session_id| HostCommand::AgentGoal {
+                session_id,
+                action,
+            })
+            .await?;
+        }
         Ok(json!({"session_id": id, "accepted": true, "applied": null,
             "before_revision": state.latest_sequence,
             "caveat": "Queued to the owning child actor, not proof of application. Read get_agent_goal to verify. Pause/clear do not interrupt a running turn; interrupt_agent is separate. Use only for explicit human-authorized goal management."}))
@@ -562,7 +602,7 @@ impl SubagentCoordinator {
                         .goal_action
                         .as_ref()
                         .context("goal_action is required")?;
-                    validate_goal_action(action, None)?;
+                    validate_goal_action(action, None, false)?;
                 }
                 "interrupt_agent" => ensure!(
                     item.message.is_empty() && item.configuration.is_none(),

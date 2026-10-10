@@ -2198,6 +2198,7 @@ fn validate_settings_shape(root: &toml::Value) -> Result<()> {
             &[
                 "multiplayer",
                 "subagents",
+                "subagent_resume_guard",
                 "autonomous_team",
                 "shared_work",
                 "presence",
@@ -2812,6 +2813,8 @@ sibling_flag = "theirs"
             auto_start = true
             port = 8000
             jinja = true
+            [capabilities]
+            subagent_resume_guard = true
             [team]
             preset = "xhigh_director_low_workers"
             worker_concurrency = 2

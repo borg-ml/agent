@@ -6493,6 +6493,11 @@ async fn run_agent_session_store_kernel_inner(
                                 .await
                                 .ok();
                         }
+                        HostCommand::ResumeFromInterrupt { session_id: command_session_id }
+                            if command_session_id == session_id => {
+                            set_user_stop(&mut journal, &events, session_id, &mut user_stop, false).await?;
+                            stale_user_prompts.clear();
+                        }
                         command @ (HostCommand::Goal { .. } | HostCommand::AgentGoal { .. }) => {
                             let (action, from_agent) = match command {
                                 HostCommand::Goal { action, .. } => (action, false),

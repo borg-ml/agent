@@ -355,6 +355,8 @@ pub(crate) struct TeamConfig {
 pub(crate) struct CapabilityConfig {
     pub(crate) multiplayer: bool,
     pub(crate) subagents: bool,
+    /// Require own-interruption follow-up before subagent goal resume.
+    pub(crate) subagent_resume_guard: bool,
     pub(crate) autonomous_team: bool,
     pub(crate) shared_work: bool,
     pub(crate) presence: bool,
@@ -383,6 +385,7 @@ impl Default for CapabilityConfig {
         Self {
             multiplayer: true,
             subagents: true,
+            subagent_resume_guard: false,
             autonomous_team: true,
             shared_work: true,
             presence: true,
@@ -404,6 +407,7 @@ impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
         Self {
             multiplayer: value.multiplayer,
             subagents: value.subagents,
+            subagent_resume_guard: value.subagent_resume_guard,
             autonomous_team: value.autonomous_team,
             shared_work: value.shared_work,
             presence: value.presence,
@@ -1907,6 +1911,7 @@ reasoning_format = "deepseek"
         config.validate().unwrap();
         assert_eq!(config.expand_command("/quick"), "/fast on");
         assert!(config.capabilities.auto_resume_usage_limits);
+        assert!(!config.capabilities.subagent_resume_guard);
     }
 
     #[test]
@@ -2006,6 +2011,26 @@ reasoning_format = "deepseek"
         assert!(config.capabilities.subagents);
         assert!(config.capabilities.autonomous_team);
         assert!(!config.capabilities.telemetry);
+        assert!(!config.capabilities.subagent_resume_guard);
+        assert!(!borg_remote::SessionCapabilities::default().subagent_resume_guard);
+        assert!(
+            !borg_remote::SessionCapabilities::from(&config.capabilities).subagent_resume_guard
+        );
+        let opted_in: AgentConfig =
+            toml::from_str("[capabilities]\nsubagent_resume_guard = true\n").unwrap();
+        assert!(opted_in.capabilities.subagent_resume_guard);
+        let capabilities = borg_remote::SessionCapabilities::from(&opted_in.capabilities);
+        assert!(capabilities.subagent_resume_guard);
+        let mut legacy = serde_json::to_value(capabilities).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("subagent_resume_guard");
+        assert!(
+            !serde_json::from_value::<borg_remote::SessionCapabilities>(legacy)
+                .unwrap()
+                .subagent_resume_guard
+        );
         assert!(!config.extensions.allow_project_mcp);
         assert_eq!(config.extensions.default_access, ExtensionAccess::Trusted);
         assert_eq!(config.extensions.project_access, ExtensionAccess::Sandboxed);

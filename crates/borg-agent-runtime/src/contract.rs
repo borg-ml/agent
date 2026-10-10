@@ -1044,6 +1044,10 @@ pub struct ModelRoute {
 pub struct SessionCapabilities {
     pub multiplayer: bool,
     pub subagents: bool,
+    /// Require a director's follow-up before resuming a goal it interrupted.
+    /// Human stops, approval gates, and budget limits remain enforced.
+    #[serde(default)]
+    pub subagent_resume_guard: bool,
     pub autonomous_team: bool,
     pub shared_work: bool,
     pub presence: bool,
@@ -1122,6 +1126,7 @@ impl Default for SessionCapabilities {
         Self {
             multiplayer: true,
             subagents: true,
+            subagent_resume_guard: false,
             autonomous_team: true,
             shared_work: true,
             presence: true,

@@ -20553,6 +20553,7 @@ async fn a_human_steer_ends_a_blocking_wait_agent() {
 /// Runs each turn until it is interrupted.
 struct InterruptibleExecutor {
     turn_started: Arc<Notify>,
+    release_interrupt: Arc<Notify>,
 }
 
 #[async_trait::async_trait]
@@ -20569,6 +20570,7 @@ impl AgentTurnExecutor for InterruptibleExecutor {
             controls.recv().await,
             Some(AgentTurnControl::Interrupt) | None
         ) {}
+        self.release_interrupt.notified().await;
         Ok(AgentTurnResult {
             provider_session_id: None,
             final_text: String::new(),
@@ -20585,10 +20587,12 @@ async fn resume_from_interrupt_lets_the_parents_follow_up_start_a_turn() {
     let store: Arc<dyn SessionStore> = Arc::new(store);
     store.create_session(session_id).await.unwrap();
     let (command_tx, command_rx) = mpsc::channel(8);
-    let (event_tx, _event_rx) = mpsc::channel(256);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
     let turn_started = Arc::new(Notify::new());
+    let release_interrupt = Arc::new(Notify::new());
     let executor = Arc::new(InterruptibleExecutor {
         turn_started: Arc::clone(&turn_started),
+        release_interrupt: Arc::clone(&release_interrupt),
     });
     let actor = tokio::spawn({
         let cwd = root.path().to_path_buf();
@@ -20653,9 +20657,25 @@ async fn resume_from_interrupt_lets_the_parents_follow_up_start_a_turn() {
         .await
         .unwrap();
     command_tx.send(team_prompt("resume")).await.unwrap();
+    // The authorized resume must be processed even while the old turn is still cancelling.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = event_rx.recv().await {
+            if matches!(
+                event.kind,
+                SessionEventKind::UserStopChanged { engaged: false }
+            ) {
+                return;
+            }
+        }
+        panic!("session event channel closed before resume");
+    })
+    .await
+    .expect("resume releases the stop before cancellation completes");
+    release_interrupt.notify_one();
     tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
         .await
         .expect("the interrupting parent's follow-up starts a turn");
+    release_interrupt.notify_one();
     command_tx
         .send(HostCommand::Stop { session_id })
         .await
