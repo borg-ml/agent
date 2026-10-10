@@ -4,3 +4,5 @@
 *.env.local
 .env
 __pycache__/
+/artifacts/
+/tmp/

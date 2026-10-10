@@ -6355,7 +6355,7 @@ impl Transcript {
                     let mut summary = if detail.is_empty() {
                         format!("{time}  {glyph} {label}")
                     } else {
-                        format!("{time}  {glyph} {label:<8}  {detail}")
+                        format!("{time}  {glyph} {label:<9}  {detail}")
                     };
                     // A single-line row still says what the message is about.
                     if !self.wrap_action_rows
@@ -6804,7 +6804,7 @@ impl Transcript {
                     {
                         format!("{time}{glyph} {display_name}")
                     } else {
-                        format!("{time}{glyph} {display_name:<8}  {display_detail}")
+                        format!("{time}{glyph} {display_name:<9}  {display_detail}")
                     };
                     if let Some(lifecycle) = lifecycle {
                         summary.push_str(&format!(" · {lifecycle}"));
