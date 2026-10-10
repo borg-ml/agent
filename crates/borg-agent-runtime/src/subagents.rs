@@ -7532,14 +7532,19 @@ impl SubagentCoordinator {
                 // newer dead rows, so a truncated page could contain no
                 // reachable peer at all while claiming to be "newest first".
                 instances.sort_by(|left, right| {
-                    let rank = |(local, live, running, _, _, _): &(
+                    let rank = |(local, live, running, _, _, entry): &(
                         bool,
                         bool,
                         bool,
                         Option<DateTime<Utc>>,
                         DateTime<Utc>,
                         serde_json::Value,
-                    )| { (*live, *running, *local) };
+                    )| {
+                        let attached = entry["attached_viewers"]
+                            .as_u64()
+                            .is_some_and(|count| count > 0);
+                        (attached, *live, *running, *local)
+                    };
                     rank(right)
                         .cmp(&rank(left))
                         .then_with(|| right.4.cmp(&left.4))
@@ -8203,7 +8208,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "list_instances",
-            "Discover Borg agent instances across all local workspaces and the authenticated remote instance directory. What the fields mean: live is whether this machine answers that instance's control socket right now, so a message reaches it immediately - only a row on this machine can be live and a peer on another host is never marked live here; owner_running is whether the OS process owning a local row is still alive, reachable or not; status is the owning host's lifecycle state as its last directory sync reported it (running, ready, starting, or stopped) and is the liveness signal for a peer on another host; stale is a directory row the newest sync no longer refreshes; reaped counts the local rows retired during this call because their owner is gone. An instance the owning host reports as stopped, and a local row that was reaped, stay out of the listing until include_exited is set, and both come back if that peer is reported running again. cwd identifies a peer: recorded here when this machine launched it, and reported by its owning host otherwise. Results are ranked live, then running, then local, then newest, so a truncated page keeps the reachable peers rather than the most recently created rows. Local rows also include title, activity, and activity_at when present in the bounded recent-session metadata page; attached_viewers and attachment distinguish an attached UI from a detached host on newer owners, and are null on legacy owners. Closing a UI may detach rather than stop its host. Prefer live:true for local peers and status for remote ones over paging, and cwd to pick one of several sessions in the same checkout - display_name is only the workspace basename and does not distinguish them. Use participant:<id> with send_message or followup_task. Remote entries require an enrolled host relay and may be offline; discovery does not grant project access.",
+            "Discover Borg agent instances across all local workspaces and the authenticated remote instance directory. What the fields mean: live is whether this machine answers that instance's control socket right now, so a message reaches it immediately - only a row on this machine can be live and a peer on another host is never marked live here; owner_running is whether the OS process owning a local row is still alive, reachable or not; status is the owning host's lifecycle state as its last directory sync reported it (running, ready, starting, or stopped) and is the liveness signal for a peer on another host; stale is a directory row the newest sync no longer refreshes; reaped counts the local rows retired during this call because their owner is gone. An instance the owning host reports as stopped, and a local row that was reaped, stay out of the listing until include_exited is set, and both come back if that peer is reported running again. cwd identifies a peer: recorded here when this machine launched it, and reported by its owning host otherwise. Results are ranked attached UI first, then live, then running, then local, then newest, so a truncated page keeps the reachable peers rather than the most recently created rows. Local rows also include title, activity, and activity_at when present in the bounded recent-session metadata page; attached_viewers and attachment distinguish an attached UI from a detached host on newer owners, and are null on legacy owners. Closing a UI may detach rather than stop its host. Prefer live:true for local peers and status for remote ones over paging, and cwd to pick one of several sessions in the same checkout - display_name is only the workspace basename and does not distinguish them. Use participant:<id> with send_message or followup_task. Remote entries require an enrolled host relay and may be offline; discovery does not grant project access.",
             json!({"type":"object","properties":{
                 "query":{"type":"string","description":"Case-insensitive display-name substring or participant id prefix."},
                 "host_id":{"type":"string","description":"Only instances on this host UUID."},

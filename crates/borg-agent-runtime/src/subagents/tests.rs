@@ -4203,6 +4203,24 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
         assert_eq!(peer["attached_viewers"], 0);
         assert_eq!(peer["attachment"], "detached");
     }
+    #[cfg(unix)]
+    {
+        use tokio::io::AsyncReadExt;
+        let mut presence = tokio::net::UnixStream::connect(
+            crate::session_control_presence_socket_path(directory.path(), sender),
+        )
+        .await
+        .unwrap();
+        let mut acknowledgement = [0_u8; 1];
+        presence.read_exact(&mut acknowledgement).await.unwrap();
+        let page = sender_coordinator
+            .call_tool_as(sender, "list_instances", json!({"limit": 1}))
+            .await
+            .unwrap();
+        assert_eq!(page["instances"][0]["id"], sender.to_string());
+        assert_eq!(page["instances"][0]["attachment"], "attached");
+        assert_eq!(page["truncated"], true);
+    }
     let result = sender_coordinator
         .call_tool_as(
             sender,
