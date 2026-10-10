@@ -473,6 +473,8 @@ impl Watches {
                         store,
                         cancel.clone(),
                         environment,
+                        // Monitoring reports progress, not edits made by other work while it waits.
+                        false,
                     )
                     .await?
             }
@@ -1528,7 +1530,19 @@ mod tests {
     #[tokio::test]
     async fn watch_summaries_track_events_and_signal_changes() {
         let root = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.path().join("source.rs"), "before\n").unwrap();
         let session_id = Uuid::new_v4();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn crate::SessionStore> = Arc::new(store);
+        store.create_session(session_id).await.unwrap();
         let (tx, mut rx) = mpsc::channel(8);
         let processes = ProcessManager::default();
         let watches = Watches::new(processes.clone(), tx, session_id);
@@ -1542,7 +1556,7 @@ mod tests {
                     label: "Watch".into(),
                     ..Default::default()
                 },
-                None,
+                Some(store.clone()),
                 60_000,
                 &BTreeMap::new(),
             )
@@ -1559,6 +1573,7 @@ mod tests {
         assert_eq!(armed[0].event_count, 0);
         assert!(armed[0].last_event_at.is_none());
 
+        std::fs::write(root.path().join("source.rs"), "concurrent edit\n").unwrap();
         processes
             .write_stdin(
                 session_id,
@@ -1582,11 +1597,28 @@ mod tests {
         assert!(after_event[0].last_event_at.is_some());
         assert!(after_event[0].started_at <= after_event[0].last_event_at.unwrap());
 
+        let events = store.read(session_id).await.unwrap();
+        let changes = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                crate::SessionEventKind::RuntimeProcessCompleted { changes, .. } => Some(changes),
+                _ => None,
+            })
+            .expect("watch completion is durable");
+        assert!(
+            changes.is_empty(),
+            "monitoring must not claim concurrent edits"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("source.rs")).unwrap(),
+            "concurrent edit\n"
+        );
         watches.stop(info.watch_id).await.unwrap();
         let stopped = watches.summaries().await;
         assert!(!stopped[0].running);
         assert_eq!(stopped[0].watch_id, info.watch_id);
         watches.cancel.cancel();
+        scratch.discard().await;
     }
 
     #[tokio::test]

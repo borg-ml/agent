@@ -252,6 +252,7 @@ impl ProcessManager {
             journal,
             CancellationToken::new(),
             environment,
+            true,
         )
         .await
     }
@@ -280,6 +281,7 @@ impl ProcessManager {
             journal,
             cancel,
             &BTreeMap::new(),
+            true,
         )
         .await
     }
@@ -297,6 +299,7 @@ impl ProcessManager {
         journal: Option<std::sync::Arc<dyn crate::SessionStore>>,
         cancel: CancellationToken,
         environment: &BTreeMap<String, String>,
+        capture_changes: bool,
     ) -> Result<ProcessSnapshot> {
         let cancel = cancel.child_token();
         ensure!(!cancel.is_cancelled(), "process execution was cancelled");
@@ -323,11 +326,14 @@ impl ProcessManager {
         }
 
         let baseline_cwd = cwd.clone();
-        let change_baseline =
+        let change_baseline = if capture_changes {
             tokio::task::spawn_blocking(move || CommandChangeBaseline::capture(&baseline_cwd))
                 .await
                 .ok()
-                .flatten();
+                .flatten()
+        } else {
+            None
+        };
 
         let process_id = Uuid::new_v4();
         let (attachment_spool, attachment_channel_error) = match create_attachment_spool(process_id)

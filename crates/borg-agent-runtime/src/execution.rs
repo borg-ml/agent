@@ -194,6 +194,7 @@ impl ExecutionProvider for LocalExecutionProvider {
                 request.journal,
                 request.cancellation.unwrap_or_default(),
                 &request.environment,
+                true,
             )
             .await
     }
