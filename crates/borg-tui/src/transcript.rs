@@ -803,11 +803,27 @@ fn compaction_has_expandable_detail(summary: &str) -> bool {
     )
 }
 
-/// Keep the collapsed Thinking row current without laying out an unbounded
-/// reasoning line on every streamed fragment. The full text stays in code_view.
-/// A group's header: when it started, how many actions, and where its
-/// commands ran, e.g. `17:41 · 7 actions · ~/abundance-wt/ore-cues`.
+fn is_reasoning_entry(entry: &TranscriptEntry) -> bool {
+    matches!(entry, TranscriptEntry::Tool { code_view: Some((language, _)), .. } if language == "reasoning")
+}
+
+/// A group's header: when it started, how many actions, and where commands ran.
 fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: &str) -> String {
+    if entries.iter().all(is_reasoning_entry) {
+        let running = entries.iter().any(|entry| {
+            matches!(
+                entry,
+                TranscriptEntry::Tool {
+                    complete: false,
+                    ..
+                }
+            )
+        });
+        return format!(
+            "{} ({total})",
+            if running { "Reasoning" } else { "Reasoned" }
+        );
+    }
     let mut time = None;
     let mut cwd = None;
     for entry in entries {
@@ -6847,9 +6863,13 @@ impl Transcript {
                         // it stays expanded until a new message ends the group,
                         // rather than collapsing the moment the last running
                         // action stops.
+                        let reasoning_group = self.order[window.start..window.end]
+                            .iter()
+                            .all(is_reasoning_entry);
                         let foldable = total_lines > 0
-                            && !self.window_has_unfinished_work(&window)
-                            && open_window_start != Some(window.start);
+                            && (reasoning_group
+                                || (!self.window_has_unfinished_work(&window)
+                                    && open_window_start != Some(window.start)));
                         let folded = foldable && !self.tool_run_expanded(window.start);
                         let expandable = foldable || total_lines > tool_run_viewport_height;
                         let expanded = expandable && self.tool_run_expanded(window.start);
@@ -7118,16 +7138,24 @@ impl Transcript {
                 continue;
             }
             let start = index;
+            let reasoning = is_reasoning_entry(&self.order[start]);
             while index < self.order.len() {
                 if matches!(self.order[index], TranscriptEntry::Tool { .. }) {
+                    if is_reasoning_entry(&self.order[index]) != reasoning {
+                        break;
+                    }
                     index += 1;
                     continue;
                 }
-                if action_run_bridge(&self.order[index])
+                if !reasoning
+                    && action_run_bridge(&self.order[index])
                     && self.order[index + 1..]
                         .iter()
                         .find(|entry| !action_run_bridge(entry))
-                        .is_some_and(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
+                        .is_some_and(|entry| {
+                            matches!(entry, TranscriptEntry::Tool { .. })
+                                && !is_reasoning_entry(entry)
+                        })
                 {
                     index += 1;
                     continue;
@@ -7135,7 +7163,7 @@ impl Transcript {
                 break;
             }
             let total = index - start;
-            if total <= TOOL_RUN_BOX_THRESHOLD {
+            if total <= if reasoning { 1 } else { TOOL_RUN_BOX_THRESHOLD } {
                 continue;
             }
             let window = ToolRunWindow {

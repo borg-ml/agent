@@ -15030,6 +15030,47 @@ fn reasoning_lifecycle_events_show_reasoning_without_a_text_delta() {
 }
 
 #[test]
+fn consecutive_reasoning_blocks_fold_and_expand_as_a_counted_group() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    for index in 0..4 {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            index * 2 + 1,
+            SessionEventKind::ReasoningDelta {
+                text: format!("Reasoning body {index}"),
+            },
+        ));
+        if index < 3 {
+            transcript.apply(&SessionEvent::new(
+                session_id,
+                index * 2 + 2,
+                SessionEventKind::ReasoningCompleted,
+            ));
+        }
+    }
+    let text = |transcript: &Transcript| {
+        transcript
+            .lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let running = text(&transcript);
+    assert!(running.contains("▸ Reasoning (4)"));
+    assert!(!running.contains("Reasoning body"));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        8,
+        SessionEventKind::ReasoningCompleted,
+    ));
+    assert!(text(&transcript).contains("▸ Reasoned (4)"));
+    assert!(transcript.toggle_tool_run_expansion(0));
+    assert!(text(&transcript).contains("Reasoning body 0"));
+}
+
+#[test]
 fn cumulative_reasoning_snapshots_replace_the_live_prefix() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
