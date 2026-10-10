@@ -5,10 +5,30 @@ Git comparison.
 
 ## Unreleased (since 0.15.2)
 
+### Steering
+
+- Preserve already-visible response text and pending-message order when human
+  input interrupts generation. Mixed human/background batches retain instant
+  human priority; recalled messages no longer interrupt generation.
+- Keep completed model responses and usage when steering races with stream
+  closure, and skip tool calls that have not started rather than losing them.
+
+### Reasoning
+
+- Request detailed GPT summaries using Codex's normal delivery mode, instead of
+  forcing its experimental concurrent-summary cutoff.
+
 ### Terminal
 
 - Group consecutive reasoning blocks into a collapsed, expandable mini-group,
   labelled “Reasoning (N)” while active and “Reasoned (N)” when complete.
+- Keep interleaved reasoning and actions in one coherent action group, and
+  respect auto-expand thinking for live reasoning groups.
+
+### Monitors
+
+- Stop command monitors attributing unrelated concurrent workspace edits to
+  themselves. Ordinary shell actions continue to record their observed edits.
 
 ## 0.15.2 (2026-10-09)
 
