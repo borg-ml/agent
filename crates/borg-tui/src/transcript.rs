@@ -6867,7 +6867,7 @@ impl Transcript {
                             .iter()
                             .all(is_reasoning_entry);
                         let foldable = total_lines > 0
-                            && (reasoning_group
+                            && ((reasoning_group && !self.auto_expand_thinking)
                                 || (!self.window_has_unfinished_work(&window)
                                     && open_window_start != Some(window.start)));
                         let folded = foldable && !self.tool_run_expanded(window.start);
@@ -7138,24 +7138,16 @@ impl Transcript {
                 continue;
             }
             let start = index;
-            let reasoning = is_reasoning_entry(&self.order[start]);
             while index < self.order.len() {
                 if matches!(self.order[index], TranscriptEntry::Tool { .. }) {
-                    if is_reasoning_entry(&self.order[index]) != reasoning {
-                        break;
-                    }
                     index += 1;
                     continue;
                 }
-                if !reasoning
-                    && action_run_bridge(&self.order[index])
+                if action_run_bridge(&self.order[index])
                     && self.order[index + 1..]
                         .iter()
                         .find(|entry| !action_run_bridge(entry))
-                        .is_some_and(|entry| {
-                            matches!(entry, TranscriptEntry::Tool { .. })
-                                && !is_reasoning_entry(entry)
-                        })
+                        .is_some_and(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
                 {
                     index += 1;
                     continue;
@@ -7163,7 +7155,7 @@ impl Transcript {
                 break;
             }
             let total = index - start;
-            if total <= if reasoning { 1 } else { TOOL_RUN_BOX_THRESHOLD } {
+            if total <= TOOL_RUN_BOX_THRESHOLD {
                 continue;
             }
             let window = ToolRunWindow {

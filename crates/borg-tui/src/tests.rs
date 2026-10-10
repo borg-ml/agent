@@ -14381,13 +14381,14 @@ fn sticky_tool_run_header_row_covers_only_overflowing_boxes() {
 }
 
 #[test]
-fn agent_lifecycle_rows_keep_one_continuous_actions_accordion() {
+fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     let mut transcript = Transcript::default();
     let tool = |index| TranscriptEntry::Tool {
-        source_name: "Run".to_string(),
-        name: "Run".to_string(),
+        source_name: if index % 2 == 0 { "reasoning" } else { "Run" }.to_string(),
+        name: if index % 2 == 0 { "Reasoned" } else { "Run" }.to_string(),
         detail: format!("call-{index}"),
-        code_view: None,
+        code_view: (index % 2 == 0)
+            .then(|| ("reasoning".to_string(), format!("Reasoning block {index}"))),
         output_view: None,
         payload_refs: Vec::new(),
         time: "19:38".to_string(),
@@ -15060,6 +15061,10 @@ fn consecutive_reasoning_blocks_fold_and_expand_as_a_counted_group() {
     let running = text(&transcript);
     assert!(running.contains("▸ Reasoning (4)"));
     assert!(!running.contains("Reasoning body"));
+    transcript.set_auto_expand_thinking(true);
+    assert!(text(&transcript).contains("Reasoning body 3"));
+    transcript.set_auto_expand_thinking(false);
+    assert_eq!(text(&transcript), running);
     transcript.apply(&SessionEvent::new(
         session_id,
         8,
