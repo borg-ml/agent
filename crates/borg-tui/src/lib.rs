@@ -10922,6 +10922,45 @@ impl BorgTerminal {
             self.ctrl_c_count = 0;
         }
         if self.picker.is_none()
+            && !self.keybindings_open
+            && (self.agents_status_hovered
+                || self.team_switcher_open
+                || self.hovered_team_roster.is_some())
+            && key.modifiers == KeyModifiers::NONE
+            && let KeyCode::Char(number @ '0'..='9') = key.code
+        {
+            let index = if number == '0' {
+                9
+            } else {
+                number as usize - '1' as usize
+            };
+            let transcript = self
+                .director_transcript
+                .as_deref()
+                .unwrap_or(&self.transcript);
+            let (entries, inactive_header) = visible_team_roster(
+                &transcript.agent_roster_entries(),
+                self.inactive_team_expanded,
+            );
+            if let Some((_, entry)) = entries
+                .iter()
+                .enumerate()
+                .filter(|(row, _)| Some(*row) != inactive_header)
+                .nth(index)
+            {
+                self.leave_status_focus();
+                self.team_switcher_open = false;
+                self.agents_status_hovered = false;
+                self.hovered_team_roster = None;
+                if let Some(child_id) = entry.child_id {
+                    self.focus_child_transcript(child_id);
+                } else {
+                    self.focus_director_transcript();
+                }
+            }
+            return Ok(UiAction::None);
+        }
+        if self.picker.is_none()
             && let Some(action) = self.handle_status_focus_key(&key)?
         {
             return Ok(action);
@@ -12531,8 +12570,17 @@ fn team_roster_table_lines(
                 .style(team_roster_row_style(false, hovered_row == Some(index)));
         }
         let focused = entry.child_id == focused_child;
+        let shortcut_index =
+            index - usize::from(inactive_header_index.is_some_and(|header| header < index));
+        let marker = if shortcut_index < 10 {
+            format!("{} ", (shortcut_index + 1) % 10)
+        } else if focused {
+            "› ".to_string()
+        } else {
+            "  ".to_string()
+        };
         let row = roster_table_row(
-            if focused { "› " } else { "  " },
+            &marker,
             &entry.name,
             &entry.model,
             ui_text(language, &entry.effort),

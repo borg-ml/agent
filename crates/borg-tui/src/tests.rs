@@ -8305,7 +8305,7 @@ fn team_roster_mode_cells_render_requested_speed_with_ultrafast_precedence() {
         };
         assert_eq!(mode_cell(&rows[1]), "ultrafast");
         assert_eq!(mode_cell(&rows[2]), expected);
-        assert!(rows[2].starts_with("› "));
+        assert!(rows[2].starts_with("2 "));
         assert!(rows[2].contains("running"));
         assert!(rows[2].contains("800.0k · cost unavailable"));
         assert_eq!(lines[2].style, team_roster_row_style(true, true));
@@ -8580,6 +8580,10 @@ fn agent_roster_lists_running_children_then_all_inactive_states() {
         snapshot("idle", SubagentStatus::Ready, 8),
         snapshot("oldest", SubagentStatus::Failed, 6),
         snapshot("older", SubagentStatus::Stopped, 5),
+        snapshot("tail_a", SubagentStatus::Ready, 4),
+        snapshot("tail_b", SubagentStatus::Ready, 3),
+        snapshot("tail_c", SubagentStatus::Ready, 2),
+        snapshot("tail_d", SubagentStatus::Ready, 1),
     ];
     let mut transcript = Transcript::default();
     for agent in agents {
@@ -8590,7 +8594,7 @@ fn agent_roster_lists_running_children_then_all_inactive_states() {
 
     let rows = transcript.agent_roster_entries();
 
-    assert_eq!(rows.len(), 7);
+    assert_eq!(rows.len(), 11);
     assert_eq!(rows[1].name, "z_live");
     assert_eq!(rows[2].name, "a_starting");
     assert_eq!(rows[3].name, "b_waiting");
@@ -8601,14 +8605,29 @@ fn agent_roster_lists_running_children_then_all_inactive_states() {
     let (collapsed, header) = visible_team_roster(&rows, false);
     assert_eq!(header, Some(2));
     assert_eq!(collapsed.len(), 3);
-    assert_eq!(collapsed[2].name, "▸ Inactive · 5");
+    assert_eq!(collapsed[2].name, "▸ Inactive · 9");
     let (expanded, header) = visible_team_roster(&rows, true);
     assert_eq!(header, Some(2));
-    assert_eq!(expanded.len(), 8);
-    assert_eq!(expanded[2].name, "▾ Inactive · 5");
+    assert_eq!(expanded.len(), 12);
+    assert_eq!(expanded[2].name, "▾ Inactive · 9");
     for (visible, original) in expanded[3..].iter().zip(&rows[2..]) {
         assert_eq!(visible.child_id, original.child_id);
     }
+    let rendered = team_roster_table_lines(
+        &expanded,
+        &transcript,
+        90,
+        None,
+        None,
+        header,
+        UiLanguage::English,
+    );
+    assert!(rendered[1].to_string().starts_with("1 director"));
+    assert!(rendered[2].to_string().starts_with("2 z_live"));
+    assert!(rendered[3].to_string().starts_with("  ▾ Inactive · 9"));
+    assert!(rendered[4].to_string().starts_with("3 a_starting"));
+    assert!(rendered[11].to_string().starts_with("0 tail_c"));
+    assert!(rendered[12].to_string().starts_with("  tail_d"));
     assert_eq!(visible_team_roster(&rows[..2], false).1, None);
 }
 
@@ -20256,5 +20275,45 @@ async fn focused_child_configuration_keeps_pickers_and_status_synced() {
     terminal.focus_director_transcript();
     assert_eq!(selected(&terminal), "high");
     assert_eq!(terminal.session_provider(), Some(CodingProvider::Codex));
+    terminal.picker = None;
+    for index in 0..8 {
+        let mut agent = child.clone();
+        agent.session_id = Uuid::new_v4();
+        agent.task_name = format!("/root/team_{index:02}");
+        terminal.seed_team_roster(&[agent]);
+    }
+    terminal.inactive_team_expanded = true;
+    terminal.composer.insert("unsent draft");
+    let roster = terminal.transcript.agent_roster_entries();
+    assert_eq!(roster.len(), 11);
+    for (index, number) in "1234567890".chars().enumerate() {
+        terminal.team_switcher_open = true;
+        terminal.set_status_focus(Some(StatusFocus::Agents), None);
+        terminal
+            .handle_key(KeyEvent::new(KeyCode::Char(number), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(terminal.focused_child(), roster[index].child_id);
+        assert_eq!(terminal.composer.text, "unsent draft");
+        assert!(!terminal.team_switcher_open);
+        assert_eq!(terminal.status_focus, None);
+    }
+    terminal.focus_director_transcript();
+    terminal.inactive_team_expanded = false;
+    terminal.team_switcher_open = true;
+    terminal
+        .handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(terminal.focused_child(), None);
+    assert_eq!(terminal.composer.text, "unsent draft");
+    assert!(terminal.team_switcher_open);
+    terminal.open_model_picker();
+    terminal
+        .handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(terminal.focused_child(), None);
+    assert_eq!(
+        terminal.picker.as_ref().unwrap().query.as_deref(),
+        Some("2")
+    );
     terminal.shutdown().await;
 }
