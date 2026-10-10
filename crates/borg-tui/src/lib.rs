@@ -1740,6 +1740,7 @@ pub struct BorgTerminal {
     image_scroll_settles_at: Option<Instant>,
     /// Encoded previews keyed by source path and tile size in cells.
     image_protocols: HashMap<(PathBuf, u16, u16), SlicedProtocol>,
+    overlay_regions: Vec<Rect>,
     picker_hit_areas: Vec<(Rect, usize)>,
     hovered_tool: Option<usize>,
     hovered_tool_run: Option<(usize, usize)>,
@@ -3154,6 +3155,7 @@ impl BorgTerminal {
             image_picker,
             image_scroll_settles_at: None,
             image_protocols: HashMap::new(),
+            overlay_regions: Vec::new(),
             picker_hit_areas: Vec::new(),
             hovered_tool: None,
             hovered_tool_run: None,
@@ -6682,14 +6684,6 @@ impl BorgTerminal {
                 } else {
                     None
                 };
-                // A popup over a terminal-protocol image can leave stale cells in
-                // the image placement after the popup closes. Repaint that frame.
-                if previous_hover.todo_status_hovered
-                    && !self.todo_status_hovered
-                    && !self.image_protocols.is_empty()
-                {
-                    self.terminal.clear()?;
-                }
                 self.event_redraw_needed |= hover_state_changed(previous_hover, self.hover_state());
                 if !background_hover_suppressed
                     && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
@@ -9033,8 +9027,9 @@ impl BorgTerminal {
         let stdout = io::stdout();
         let mut output = stdout.lock();
         let mut frame_cursor = None;
+        let mut restore_images = false;
         let draw_result = self.terminal.try_draw(|frame| -> io::Result<()> {
-            let mut hint_occlusions = Vec::new();
+            let mut overlays = OverlayLayer::default();
             let area = centered_content_area_with_margin(frame.area(), self.horizontal_margin);
             let chunks = terminal_vertical_chunks(
                 area,
@@ -9536,7 +9531,7 @@ impl BorgTerminal {
                         height: 1,
                         ..content_area
                     };
-                    frame.render_widget(Clear, loader_area);
+                    overlays.clear(frame, loader_area);
                     frame.render_widget(Paragraph::new(history_loading_line()), loader_area);
                     let is_behind_loader = |area: &Rect| {
                         area.y < loader_area.bottom() && area.bottom() > loader_area.y
@@ -10004,8 +9999,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
-                hint_occlusions.push(tooltip);
-                frame.render_widget(Clear, tooltip);
+                overlays.clear(frame, tooltip);
                 let row_capacity = tooltip.height.saturating_sub(3) as usize;
                 self.team_roster_scroll = self
                     .team_roster_scroll
@@ -10129,8 +10123,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
-                hint_occlusions.push(tooltip);
-                frame.render_widget(Clear, tooltip);
+                overlays.clear(frame, tooltip);
                 frame.render_widget(
                     Paragraph::new(goal.objective.as_str())
                         .wrap(ratatui::widgets::Wrap { trim: true })
@@ -10205,8 +10198,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
-                hint_occlusions.push(tooltip);
-                frame.render_widget(Clear, tooltip);
+                overlays.clear(frame, tooltip);
                 frame.render_widget(
                     Paragraph::new(text)
                         .wrap(ratatui::widgets::Wrap { trim: true })
@@ -10241,8 +10233,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
-                hint_occlusions.push(tooltip);
-                frame.render_widget(Clear, tooltip);
+                overlays.clear(frame, tooltip);
                 let lines = shell_rows
                     .iter()
                     .enumerate()
@@ -10295,8 +10286,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
-                hint_occlusions.push(tooltip);
-                frame.render_widget(Clear, tooltip);
+                overlays.clear(frame, tooltip);
                 let lines = watch_rows
                     .iter()
                     .enumerate()
@@ -10363,8 +10353,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
-                hint_occlusions.push(tooltip);
-                frame.render_widget(Clear, tooltip);
+                overlays.clear(frame, tooltip);
                 frame.render_widget(
                     Paragraph::new(
                         tooltip_lines
@@ -10405,8 +10394,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
-                hint_occlusions.push(tooltip);
-                frame.render_widget(Clear, tooltip);
+                overlays.clear(frame, tooltip);
                 frame.render_widget(
                     Paragraph::new(
                         tooltip_lines
@@ -10551,8 +10539,7 @@ impl BorgTerminal {
                     width: tooltip_width,
                     height: tooltip_height,
                 };
-                hint_occlusions.push(tooltip);
-                frame.render_widget(Clear, tooltip);
+                overlays.clear(frame, tooltip);
                 frame.render_widget(
                     Paragraph::new(tooltip_lines)
                         .style(Style::default().fg(Color::White).bg(COMMAND_PANEL_BG))
@@ -10594,8 +10581,7 @@ impl BorgTerminal {
                 );
                 let content_height = popup.height.saturating_sub(2) as usize;
                 let scroll = picker.scroll_offset(content_height, lines.len());
-                hint_occlusions.push(popup);
-                frame.render_widget(Clear, popup);
+                overlays.clear(frame, popup);
                 frame.render_widget(
                     Paragraph::new(lines)
                         .style(Style::default().bg(COMMAND_PANEL_BG))
@@ -10636,8 +10622,7 @@ impl BorgTerminal {
                     52,
                     (picker.options.len() as u16).saturating_add(3).max(6),
                 );
-                hint_occlusions.push(popup);
-                frame.render_widget(Clear, popup);
+                overlays.clear(frame, popup);
                 frame.render_widget(
                     Block::default()
                         .style(Style::default().bg(Color::Rgb(20, 20, 22)))
@@ -10728,7 +10713,7 @@ impl BorgTerminal {
                     width: footer_left_region_width(footer_area.width, metadata_width),
                     ..footer_area
                 };
-                frame.render_widget(Clear, copy_area);
+                overlays.clear(frame, copy_area);
                 frame.render_widget(
                     Paragraph::new(copy_notice_line(notice.to_string()))
                         .style(Style::default().bg(Color::Reset)),
@@ -10762,7 +10747,14 @@ impl BorgTerminal {
                     *identity = format!("{:?}:{identity}", self.focused_child);
                 }
                 self.key_hints
-                    .render(frame, hint_candidates, &hint_occlusions);
+                    .render(frame, hint_candidates, &overlays.regions);
+            }
+            restore_images =
+                overlays.finish(&mut self.overlay_regions, !self.image_protocols.is_empty());
+            if restore_images {
+                return Err(io::Error::other(
+                    "overlay image restoration requires a fresh frame",
+                ));
             }
             // Generate the frame before hiding the caret or starting the
             // terminal's synchronized-update timeout. Present cells and the
@@ -10774,7 +10766,21 @@ impl BorgTerminal {
             )?;
             Ok(())
         });
-        let draw_result = draw_result.map(|_| ());
+        let draw_result = if restore_images {
+            execute!(
+                output,
+                crossterm::terminal::BeginSynchronizedUpdate,
+                crossterm::cursor::Hide
+            )?;
+            self.terminal.clear()?;
+            // The aborted callback has prepared the complete current buffer.
+            // Clear invalidates the back buffer; present without rendering twice.
+            self.terminal
+                .try_draw(|_| Ok::<(), io::Error>(()))
+                .map(|_| ())
+        } else {
+            draw_result.map(|_| ())
+        };
         let cursor_result = draw_result.and_then(|()| {
             if let Some(cursor) = frame_cursor {
                 self.terminal.set_cursor_position(cursor)?;
@@ -17755,6 +17761,26 @@ fn truncate_status_spans(spans: Vec<Span<'static>>, budget: usize) -> Vec<Span<'
         break;
     }
     trimmed
+}
+
+#[derive(Default)]
+struct OverlayLayer {
+    regions: Vec<Rect>,
+}
+
+impl OverlayLayer {
+    fn finish(self, previous: &mut Vec<Rect>, has_images: bool) -> bool {
+        let restore = has_images && self.regions != *previous;
+        *previous = self.regions;
+        restore
+    }
+
+    fn clear(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        if !area.is_empty() {
+            self.regions.push(area);
+            frame.render_widget(Clear, area);
+        }
+    }
 }
 
 fn overlay_suppresses_background_hover(

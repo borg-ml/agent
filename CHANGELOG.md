@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.15.4)
 
+### Terminal
+
+- Restore transcript images when menus and tooltips close, move, or resize.
+  Team, Todos, and other overlays share the same image-safe repaint handling.
+
 ### Discovery
 
 - List instances with attached UIs first, ahead of detached or legacy owners,

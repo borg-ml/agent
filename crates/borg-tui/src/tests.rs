@@ -20402,3 +20402,52 @@ async fn focused_child_configuration_keeps_pickers_and_status_synced() {
     );
     terminal.shutdown().await;
 }
+
+#[test]
+fn overlay_transitions_restore_cells_skipped_by_terminal_images() {
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::CellDiffOption;
+
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(20, 6)).unwrap();
+    let mut previous = Vec::new();
+    for area in [Rect::new(2, 1, 8, 3), Rect::new(5, 2, 10, 3)] {
+        terminal
+            .draw(|frame| {
+                let mut overlays = OverlayLayer::default();
+                overlays.clear(frame, area);
+                frame.render_widget(Paragraph::new("Team / Todos"), area);
+                assert!(overlays.finish(&mut previous, true));
+            })
+            .unwrap();
+        {
+            let mut frame = terminal.get_frame();
+            for cell in &mut frame.buffer_mut().content {
+                cell.set_diff_option(CellDiffOption::Skip);
+            }
+            assert!(OverlayLayer::default().finish(&mut previous, true));
+        }
+        terminal.clear().unwrap();
+        terminal.draw(|_| {}).unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| cell.symbol() == " ")
+        );
+        assert!(!OverlayLayer::default().finish(&mut previous, true));
+    }
+    let menu = OverlayLayer {
+        regions: vec![Rect::new(2, 1, 8, 3)],
+    };
+    assert!(!menu.finish(&mut previous, false));
+    let menu = OverlayLayer {
+        regions: previous.clone(),
+    };
+    assert!(!menu.finish(&mut previous, true));
+    let moved = OverlayLayer {
+        regions: vec![Rect::new(3, 1, 8, 3)],
+    };
+    assert!(moved.finish(&mut previous, true));
+}
