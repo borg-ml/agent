@@ -844,7 +844,10 @@ fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: 
     if let Some(time) = time {
         parts.push(display_local_time(time, today_prefix).to_string());
     }
-    parts.push(format!("{total} action{}", if total == 1 { "" } else { "s" }));
+    parts.push(format!(
+        "{total} action{}",
+        if total == 1 { "" } else { "s" }
+    ));
     if let Some(cwd) = cwd {
         let home = std::env::var("HOME").unwrap_or_default();
         parts.push(match cwd.strip_prefix(&home) {
@@ -969,8 +972,13 @@ fn tool_has_expandable_body(
 
 /// Queued prompts and a reply whose first block is still held have no row.
 fn message_row_hidden(entry: &TranscriptEntry) -> bool {
-    matches!(entry, TranscriptEntry::Message { status: MessageStatus::Queued, .. })
-        || matches!(entry, TranscriptEntry::Message {
+    matches!(
+        entry,
+        TranscriptEntry::Message {
+            status: MessageStatus::Queued,
+            ..
+        }
+    ) || matches!(entry, TranscriptEntry::Message {
             actor: EventActor::Assistant,
             status: MessageStatus::InProgress,
             text,
@@ -1075,7 +1083,9 @@ impl Transcript {
         agent: &SubagentSnapshot,
         status: SubagentStatus,
     ) {
-        if self.subagent_snapshots.get(&agent.session_id)
+        if self
+            .subagent_snapshots
+            .get(&agent.session_id)
             .is_some_and(|current| current.updated_at > agent.updated_at)
         {
             return;
@@ -1176,7 +1186,12 @@ impl Transcript {
             return false;
         }
         // An empty workspace plan is still authoritative, but not a card on a new chat.
-        if items.is_empty() && !self.order.iter().any(|entry| matches!(entry, TranscriptEntry::Plan { .. })) {
+        if items.is_empty()
+            && !self
+                .order
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::Plan { .. }))
+        {
             return true;
         }
         // A workspace snapshot updates the existing card without shifting tool/message indices.
@@ -1388,7 +1403,8 @@ impl Transcript {
             .rposition(|entry| matches!(entry, TranscriptEntry::Goal { .. }));
         // Retry/accounting updates keep the card in place; completed turns
         // explicitly refresh it at the tail for the next goal iteration.
-        if !refresh && let Some(index) = removed
+        if !refresh
+            && let Some(index) = removed
             && let Some(TranscriptEntry::Goal { goal: shown, .. }) = self.order.get(index)
             && goal.objective == shown.objective
             && goal.status == shown.status
@@ -2099,16 +2115,26 @@ impl Transcript {
                 ultrafast,
                 permission_mode,
                 speed_support,
-            } if self.config_event_updated_at.is_none_or(|updated| event.created_at >= updated)
-                && (self.config_updated_at.is_none_or(|updated| event.created_at >= updated)
+            } if self
+                .config_event_updated_at
+                .is_none_or(|updated| event.created_at >= updated)
+                && (self
+                    .config_updated_at
+                    .is_none_or(|updated| event.created_at >= updated)
                     || self.config.as_ref().is_some_and(|current| {
-                        current.provider == *provider && current.model == *model
-                            && current.effort == *effort && current.fast == *fast
-                            && current.ultrafast == *ultrafast && current.cwd == *cwd
-                    })) => {
+                        current.provider == *provider
+                            && current.model == *model
+                            && current.effort == *effort
+                            && current.fast == *fast
+                            && current.ultrafast == *ultrafast
+                            && current.cwd == *cwd
+                    })) =>
+            {
                 self.config_event_updated_at = Some(event.created_at);
-                self.config_updated_at = Some(self.config_updated_at
-                    .map_or(event.created_at, |updated| updated.max(event.created_at)));
+                self.config_updated_at = Some(
+                    self.config_updated_at
+                        .map_or(event.created_at, |updated| updated.max(event.created_at)),
+                );
                 let context_identity_changed = self.config.as_ref().is_some_and(|old| {
                     old.provider != *provider || old.model.as_ref() != model.as_ref()
                 });
@@ -2527,21 +2553,32 @@ impl Transcript {
             SessionEventKind::ReasoningDelta { text } => {
                 self.append_reasoning(text, event.created_at, local_event_time(event));
                 if let Some(index) = self.active_reasoning {
-                    self.tools.entry(format!("reasoning:{}", event.id)).or_insert(index);
+                    self.tools
+                        .entry(format!("reasoning:{}", event.id))
+                        .or_insert(index);
                 }
             }
             SessionEventKind::ReasoningTextDelta { delta } => {
                 let key = format!("reasoning:{}", event.id);
                 if !self.tools.contains_key(&key) {
-                    self.append_reasoning_text_delta(delta, event.created_at, local_event_time(event));
+                    self.append_reasoning_text_delta(
+                        delta,
+                        event.created_at,
+                        local_event_time(event),
+                    );
                     if let Some(index) = self.active_reasoning
-                        && !self.tools.iter().any(|(key, stored)| key.starts_with("reasoning:") && *stored == index)
+                        && !self
+                            .tools
+                            .iter()
+                            .any(|(key, stored)| key.starts_with("reasoning:") && *stored == index)
                     {
                         self.tools.insert(key, index);
                     }
                 }
             }
-            SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "reasoning_snapshot" => {
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "reasoning_snapshot" =>
+            {
                 self.apply_reasoning_snapshot(payload, event);
             }
             SessionEventKind::ReasoningCompleted => {
@@ -2925,9 +2962,18 @@ impl Transcript {
                     *backgrounded = false;
                 }
                 if let (Some(process_id), Some(index)) = (native_followup_process, tool_index) {
-                    if self.runtime_processes.get(&process_id).is_some_and(|process| process.running) {
-                        self.poll_processes.entry(process_id).or_default().push(tool_call_id.clone());
-                    } else if let Some(TranscriptEntry::Tool { backgrounded, .. }) = self.order.get_mut(index) {
+                    if self
+                        .runtime_processes
+                        .get(&process_id)
+                        .is_some_and(|process| process.running)
+                    {
+                        self.poll_processes
+                            .entry(process_id)
+                            .or_default()
+                            .push(tool_call_id.clone());
+                    } else if let Some(TranscriptEntry::Tool { backgrounded, .. }) =
+                        self.order.get_mut(index)
+                    {
                         // A late poll event must not revive an exited process.
                         *backgrounded = false;
                     }
@@ -3021,7 +3067,12 @@ impl Transcript {
                     return None;
                 }
                 self.todos = items.clone();
-                if items.is_empty() && !self.order.iter().any(|entry| matches!(entry, TranscriptEntry::Plan { .. })) {
+                if items.is_empty()
+                    && !self
+                        .order
+                        .iter()
+                        .any(|entry| matches!(entry, TranscriptEntry::Plan { .. }))
+                {
                     return None;
                 }
                 return self.upsert_plan(items.clone(), local_event_time(event));
@@ -3137,7 +3188,8 @@ impl Transcript {
                 if let Some(polls) = self.poll_processes.remove(process_id) {
                     for tool_call_id in polls {
                         if let Some(index) = self.tools.get(&tool_call_id).copied()
-                            && let Some(TranscriptEntry::Tool { backgrounded, .. }) = self.order.get_mut(index)
+                            && let Some(TranscriptEntry::Tool { backgrounded, .. }) =
+                                self.order.get_mut(index)
                         {
                             *backgrounded = false;
                         }
@@ -3299,7 +3351,8 @@ impl Transcript {
                             payload
                                 .get("effective_context_window_tokens")
                                 .and_then(serde_json::Value::as_u64),
-                        ) {
+                        )
+                    {
                         format!(
                             "{progress_summary} · local estimate {} / {} window",
                             format_context_tokens(tokens),
@@ -3384,8 +3437,11 @@ impl Transcript {
                         TranscriptActionState::Waiting
                     };
                 if let Some(index) = self.team_broadcast_entries.get(message_id).copied() {
-                    if let Some(TranscriptEntry::Action { detail: row_detail, state: row_state, .. }) =
-                        self.order.get_mut(index)
+                    if let Some(TranscriptEntry::Action {
+                        detail: row_detail,
+                        state: row_state,
+                        ..
+                    }) = self.order.get_mut(index)
                     {
                         *row_detail = detail;
                         *row_state = state;
@@ -3427,7 +3483,9 @@ impl Transcript {
                             kind: TranscriptActionKind::Agent,
                             label: if from_peer { "Peer" } else { "Agent" }.to_string(),
                             detail: if sender_name.trim().is_empty() {
-                                self.agent_names.get(sender_id).cloned()
+                                self.agent_names
+                                    .get(sender_id)
+                                    .cloned()
                                     .unwrap_or_else(|| "agent".to_string())
                             } else {
                                 sender_name.clone()
@@ -3981,28 +4039,42 @@ impl Transcript {
 
     fn apply_reasoning_snapshot(&mut self, payload: &serde_json::Value, event: &SessionEvent) {
         let (Some(id), Some(text)) = (
-            payload.get("reasoning_id").and_then(serde_json::Value::as_str),
+            payload
+                .get("reasoning_id")
+                .and_then(serde_json::Value::as_str),
             payload.get("text").and_then(serde_json::Value::as_str),
-        ) else { return; };
+        ) else {
+            return;
+        };
         let key = format!("reasoning:{id}");
         let index = if let Some(index) = self.tools.get(&key).copied() {
             index
         } else {
-            let started_at = payload.get("started_at")
+            let started_at = payload
+                .get("started_at")
                 .and_then(serde_json::Value::as_str)
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                 .map(|value| value.with_timezone(&Utc))
                 .unwrap_or(event.created_at);
             self.start_reasoning(started_at, local_event_time(event));
-            let Some(index) = self.active_reasoning else { return; };
+            let Some(index) = self.active_reasoning else {
+                return;
+            };
             self.tools.insert(key, index);
             index
         };
         let finalized = payload.get("complete").and_then(serde_json::Value::as_bool) == Some(true);
         if let Some(TranscriptEntry::Tool {
-            code_view: Some((language, source)), detail, name, complete,
-            completed_at, expanded, ..
-        }) = self.order.get_mut(index) && language == "reasoning" {
+            code_view: Some((language, source)),
+            detail,
+            name,
+            complete,
+            completed_at,
+            expanded,
+            ..
+        }) = self.order.get_mut(index)
+            && language == "reasoning"
+        {
             if finalized {
                 source.clear();
                 source.push_str(text);
@@ -4120,7 +4192,8 @@ impl Transcript {
             user_interrupted: false,
             backgrounded: false,
             expanded: self.auto_expand_thinking,
-            outcome: None, cwd: None,
+            outcome: None,
+            cwd: None,
         });
         self.active_reasoning = Some(index);
         self.reasoning_has_preview = false;
@@ -4209,7 +4282,10 @@ impl Transcript {
         input_ref: Option<&SessionPayloadRef>,
     ) {
         if self.tools.get(tool_call_id).is_some_and(|index| {
-            matches!(self.order.get(*index), Some(TranscriptEntry::Tool { complete: true, .. }))
+            matches!(
+                self.order.get(*index),
+                Some(TranscriptEntry::Tool { complete: true, .. })
+            )
         }) {
             return;
         }
@@ -4425,7 +4501,11 @@ impl Transcript {
     fn is_redundant_process_poll(&self, name: &str, input: &serde_json::Value) -> bool {
         // Sending input to or stopping a process are actions in their own
         // right, and a terminal call is the command itself.
-        if input.get("chars").and_then(serde_json::Value::as_str).is_some_and(|c| !c.is_empty()) {
+        if input
+            .get("chars")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|c| !c.is_empty())
+        {
             return false;
         }
         if input.get("terminate").and_then(serde_json::Value::as_bool) == Some(true) {
@@ -5530,11 +5610,14 @@ impl Transcript {
                 window.end >= self.order.len()
                     || (self.active_turn.is_some()
                         && !self.order[window.end..].iter().any(|entry| {
-                            matches!(entry, TranscriptEntry::Message {
-                                actor: EventActor::Assistant | EventActor::User,
-                                complete: true,
-                                ..
-                            })
+                            matches!(
+                                entry,
+                                TranscriptEntry::Message {
+                                    actor: EventActor::Assistant | EventActor::User,
+                                    complete: true,
+                                    ..
+                                }
+                            )
                         }))
             })
             .map(|window| window.start)
@@ -5550,10 +5633,7 @@ impl Transcript {
     ) -> usize {
         let rendered_entries = resume.trace.checkpoints.len() - 1;
         // A tool row reads the kind of the entry after it.
-        let mut start = resume
-            .changed_from
-            .saturating_sub(1)
-            .min(rendered_entries);
+        let mut start = resume.changed_from.saturating_sub(1).min(rendered_entries);
         // Whether a run is boxed depends on entries after it: its length and
         // any bridging agent rows.
         if let Some(index) = windows
@@ -5775,7 +5855,9 @@ impl Transcript {
                 continue;
             }
             let mut display_entry = Cow::Borrowed(entry);
-            if let TranscriptEntry::Tool { source_name, name, .. } = entry
+            if let TranscriptEntry::Tool {
+                source_name, name, ..
+            } = entry
                 && (is_subagent_tool(source_name) || is_subagent_tool(name))
                 && let TranscriptEntry::Tool {
                     detail,
@@ -5789,7 +5871,10 @@ impl Transcript {
                     *body = self.subagent_display_text(body);
                 }
             }
-            if let TranscriptEntry::Action { kind: TranscriptActionKind::Agent, .. } = entry
+            if let TranscriptEntry::Action {
+                kind: TranscriptActionKind::Agent,
+                ..
+            } = entry
                 && let TranscriptEntry::Action { detail, body, .. } = display_entry.to_mut()
             {
                 *detail = self.subagent_display_text(detail);
@@ -5805,7 +5890,14 @@ impl Transcript {
             if let Some(window) = tool_window.filter(|window| index == window.start) {
                 let row = lines.len();
                 lines.push(Line::from(Span::styled(
-                    format!("    {}", tool_window_summary(&self.order[window.start..window.end], window.total, &today_prefix)),
+                    format!(
+                        "    {}",
+                        tool_window_summary(
+                            &self.order[window.start..window.end],
+                            window.total,
+                            &today_prefix
+                        )
+                    ),
                     Style::default().fg(Color::DarkGray),
                 )));
                 tool_run_starts.insert(
@@ -6626,9 +6718,9 @@ impl Transcript {
                     };
                     // The detail view's body already spells out a command or a diff; for
                     // anything else the header is the only place that says what ran.
-                    let body_states_action = code_view
-                        .as_ref()
-                        .is_some_and(|(language, _)| language == "command" || is_diff_language(language));
+                    let body_states_action = code_view.as_ref().is_some_and(|(language, _)| {
+                        language == "command" || is_diff_language(language)
+                    });
                     let mut summary = if display_detail.is_empty()
                         || (focused_tool == Some(index) && body_states_action)
                     {
@@ -6652,16 +6744,15 @@ impl Transcript {
                     if !*complete {
                         running_tool_elapsed.push((index, elapsed.clone()));
                     }
-                    for (line_index, line) in
-                        tool_summary_lines(
-                            &summary,
-                            right.as_deref(),
-                            prefix,
-                            width,
-                            self.wrap_action_rows,
-                        )
-                            .into_iter()
-                            .enumerate()
+                    for (line_index, line) in tool_summary_lines(
+                        &summary,
+                        right.as_deref(),
+                        prefix,
+                        width,
+                        self.wrap_action_rows,
+                    )
+                    .into_iter()
+                    .enumerate()
                     {
                         if line_index == 0
                             && let Some(name_start) = line.find(display_name.as_ref())
@@ -6911,7 +7002,11 @@ impl Transcript {
                             ""
                         };
                         lines[header_row] = tool_window_header(
-                            if folded { "▸ " } else { TOOL_WINDOW_HEADER_INDENT },
+                            if folded {
+                                "▸ "
+                            } else {
+                                TOOL_WINDOW_HEADER_INDENT
+                            },
                             format!(
                                 "{}{}",
                                 tool_window_summary(
@@ -7244,28 +7339,59 @@ mod parallel_preparation_tests {
         let message_id = Uuid::new_v4();
         let goal = SessionGoal::new("Keep checking replay".into(), None);
         let events = [
-            SessionEvent::new(session_id, 1, SessionEventKind::GoalUpdated { goal: goal.clone() }),
-            SessionEvent::new(session_id, 2, SessionEventKind::Message {
-                message_id, actor: EventActor::Assistant, text: "One turn finished".into(),
-                attachments: Vec::new(), status: MessageStatus::Complete, delivery: None,
-            }),
+            SessionEvent::new(
+                session_id,
+                1,
+                SessionEventKind::GoalUpdated { goal: goal.clone() },
+            ),
+            SessionEvent::new(
+                session_id,
+                2,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::Assistant,
+                    text: "One turn finished".into(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ),
             SessionEvent::new(session_id, 3, SessionEventKind::GoalUpdated { goal }),
-            SessionEvent::new(session_id, 4, SessionEventKind::TurnCompleted {
-                message_id, provider_session_id: None, final_text: "One turn finished".into(),
-                error: None,
-            }),
+            SessionEvent::new(
+                session_id,
+                4,
+                SessionEventKind::TurnCompleted {
+                    message_id,
+                    provider_session_id: None,
+                    final_text: "One turn finished".into(),
+                    error: None,
+                },
+            ),
         ];
         for replay in [false, true] {
             let mut transcript = Transcript::default();
             for event in &events[..3] {
-                if replay { transcript.apply_history(event); } else { transcript.apply(event); }
+                if replay {
+                    transcript.apply_history(event);
+                } else {
+                    transcript.apply(event);
+                }
             }
             assert!(matches!(&transcript.order[0], TranscriptEntry::Goal { .. }));
-            if replay { transcript.apply_history(&events[3]); } else { transcript.apply(&events[3]); }
+            if replay {
+                transcript.apply_history(&events[3]);
+            } else {
+                transcript.apply(&events[3]);
+            }
             assert_eq!(transcript.order.len(), 2);
-            assert!(matches!(&transcript.order[0], TranscriptEntry::Message { .. }));
-            assert!(matches!(&transcript.order[1], TranscriptEntry::Goal { goal, .. }
-                if goal.objective == "Keep checking replay"));
+            assert!(matches!(
+                &transcript.order[0],
+                TranscriptEntry::Message { .. }
+            ));
+            assert!(
+                matches!(&transcript.order[1], TranscriptEntry::Goal { goal, .. }
+                if goal.objective == "Keep checking replay")
+            );
         }
     }
 
@@ -7273,22 +7399,38 @@ mod parallel_preparation_tests {
     fn finalized_reasoning_reuses_a_live_lifecycle_row() {
         let session_id = Uuid::new_v4();
         let mut transcript = Transcript::default();
-        transcript.apply(&SessionEvent::new(session_id, 0, SessionEventKind::ProviderEvent {
-            provider: CodingProvider::Codex,
-            kind: "item/started:reasoning".into(),
-            payload: serde_json::json!({}),
-        }));
-        let first = SessionEvent::new(session_id, 0, SessionEventKind::ReasoningTextDelta {
-            delta: "Checking replay".into(),
-        });
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "item/started:reasoning".into(),
+                payload: serde_json::json!({}),
+            },
+        ));
+        let first = SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningTextDelta {
+                delta: "Checking replay".into(),
+            },
+        );
         transcript.apply(&first);
-        transcript.apply(&SessionEvent::new(session_id, 1, SessionEventKind::ReasoningCompleted));
-        transcript.apply(&SessionEvent::new(session_id, 2, SessionEventKind::ProviderEvent {
-            provider: CodingProvider::Codex,
-            kind: "reasoning_snapshot".into(),
-            payload: serde_json::json!({"reasoning_id":first.id,"started_at":first.created_at,
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::ReasoningCompleted,
+        ));
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "reasoning_snapshot".into(),
+                payload: serde_json::json!({"reasoning_id":first.id,"started_at":first.created_at,
                 "text":"Checking replay safely","complete":true}),
-        }));
+            },
+        ));
         assert_eq!(transcript.order.len(), 1);
         assert!(matches!(&transcript.order[0], TranscriptEntry::Tool {
             code_view: Some((_, text)), complete: true, ..
@@ -7300,27 +7442,41 @@ mod parallel_preparation_tests {
         let session_id = Uuid::new_v4();
         let reasoning_id = Uuid::new_v4();
         let started_at = Utc::now();
-        let snapshot = |sequence, text, complete| SessionEvent::new(session_id, sequence,
-            SessionEventKind::ProviderEvent {
-                provider: CodingProvider::Codex,
-                kind: "reasoning_snapshot".into(),
-                payload: serde_json::json!({"reasoning_id":reasoning_id,
+        let snapshot = |sequence, text, complete| {
+            SessionEvent::new(
+                session_id,
+                sequence,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: "reasoning_snapshot".into(),
+                    payload: serde_json::json!({"reasoning_id":reasoning_id,
                     "started_at":started_at,"text":text,"complete":complete}),
-            });
+                },
+            )
+        };
         let mut transcript = Transcript::default();
         transcript.apply_history(&snapshot(1, "Checking", false));
-        transcript.apply_history(&SessionEvent::new(session_id, 2,
+        transcript.apply_history(&SessionEvent::new(
+            session_id,
+            2,
             SessionEventKind::Message {
-                message_id: Uuid::new_v4(), actor: EventActor::Assistant,
-                text: "I found the issue.".into(), attachments: Vec::new(),
-                status: MessageStatus::Complete, delivery: None,
-            }));
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: "I found the issue.".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ));
         transcript.apply_history(&snapshot(3, "Checking the persisted order.", true));
         assert_eq!(transcript.order.len(), 2);
         assert!(matches!(&transcript.order[0], TranscriptEntry::Tool {
             code_view: Some((language, text)), complete: true, ..
         } if language == "reasoning" && text == "Checking the persisted order."));
-        assert!(matches!(&transcript.order[1], TranscriptEntry::Message { .. }));
+        assert!(matches!(
+            &transcript.order[1],
+            TranscriptEntry::Message { .. }
+        ));
     }
 
     #[test]
@@ -7421,7 +7577,10 @@ mod parallel_preparation_tests {
             reasoning_preview(&format!("{finished} Next I")),
             "They project straight down with pitch -90, set before RegisterComponent."
         );
-        assert_eq!(reasoning_preview("**Tracing ore cues**\n\nLooking at"), "Tracing ore cues");
+        assert_eq!(
+            reasoning_preview("**Tracing ore cues**\n\nLooking at"),
+            "Tracing ore cues"
+        );
     }
 
     #[test]
