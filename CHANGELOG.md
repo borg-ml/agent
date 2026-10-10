@@ -9,6 +9,13 @@ Git comparison.
 
 - Restore transcript images when menus and tooltips close, move, or resize.
   Team, Todos, and other overlays share the same image-safe repaint handling.
+- Keep consecutive hidden reasoning chunks in one row, preserving elapsed time
+  and separate tool and model-request boundaries.
+
+### Reasoning
+
+- Avoid duplicate completion events when Codex's final response replays finished
+  reasoning items, while retaining newly delivered summary text.
 
 ### Discovery
 
