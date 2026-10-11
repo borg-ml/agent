@@ -12259,9 +12259,9 @@ fn terminal_title_identifies_the_project_without_prompt_or_activity() {
 }
 
 #[test]
-fn borging_roll_selects_exactly_one_percent_of_uniform_run_ids() {
+fn borging_roll_selects_exactly_one_in_a_thousand_uniform_run_ids() {
     assert_eq!(
-        (0..100)
+        (0..1000)
             .filter(|value| borging_for_run(Uuid::from_u128(*value)))
             .count(),
         1

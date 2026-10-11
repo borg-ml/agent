@@ -18138,7 +18138,7 @@ fn terminal_title(cwd: &Path, home: Option<&Path>) -> String {
 }
 
 fn borging_for_run(seed: Uuid) -> bool {
-    seed.as_u128().is_multiple_of(100)
+    seed.as_u128().is_multiple_of(1000)
 }
 
 fn format_elapsed_duration(total_seconds: u64) -> Option<String> {
