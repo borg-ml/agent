@@ -1994,9 +1994,38 @@ impl Transcript {
                 if self.order.get(start).is_some_and(is_reasoning_entry) {
                     self.auto_expand_thinking
                 } else {
-                    true
+                    self.action_run_open_by_default(start)
                 }
             })
+    }
+
+    /// A repeated run folds once a different action follows it, unless one of
+    /// its actions is still live.
+    fn action_run_open_by_default(&self, start: usize) -> bool {
+        let Some(first) = self.order.get(start) else {
+            return false;
+        };
+        let mut end = start;
+        let mut live = false;
+        while let Some(entry) = self.order.get(end)
+            && same_action_type(first, entry)
+        {
+            live |= matches!(
+                entry,
+                TranscriptEntry::Tool { complete: false, .. }
+                    | TranscriptEntry::Action {
+                        state: TranscriptActionState::Running | TranscriptActionState::Waiting,
+                        ..
+                    }
+            );
+            end += 1;
+        }
+        let next_is_action = match self.order.get(end) {
+            Some(entry @ TranscriptEntry::Tool { .. }) => !is_reasoning_entry(entry),
+            Some(TranscriptEntry::Action { .. }) => true,
+            _ => false,
+        };
+        live || !next_is_action
     }
 
     fn toggle_action_run_expansion(&mut self, start: usize) -> bool {

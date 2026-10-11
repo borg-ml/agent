@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.15.7)
 
+### Terminal
+
+- Fold repeated action groups by default once a different action follows them,
+  keeping the newest group and any still-running action open.
+
 ## 0.15.7 (2026-10-11)
 
 ### Terminal
