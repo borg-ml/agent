@@ -137,10 +137,27 @@ async function emit(response, value) {
 
 function safeError(error) {
   // Upstream error objects can carry credentials or the submitted prompt.
-  // Only the service's declared message and status cross this boundary.
+  // Only declared service messages, status and allowlisted transport codes cross this boundary.
   const status = Number.isInteger(error.status) ? error.status : null;
   const declared = error.error?.error?.message ?? error.error?.message;
   let message = typeof declared === 'string' ? declared : status ? `Claude model request failed (HTTP ${status})` : 'Claude connector request failed';
+  if (!status && typeof declared !== 'string') {
+    const codes = new Set([
+      'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN',
+      'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+      'UND_ERR_SOCKET', 'CERT_HAS_EXPIRED', 'ERR_TLS_CERT_ALTNAME_INVALID',
+      'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+    ]);
+    const name = error.constructor?.name;
+    if (name === 'APIConnectionTimeoutError') message = 'Claude connection timed out';
+    else if (name === 'APIConnectionError') message = 'Claude connection failed';
+    for (let cause = error, depth = 0; cause && depth < 4; cause = cause.cause, depth++) {
+      if (codes.has(cause.code)) {
+        message += ` (${cause.code})`;
+        break;
+      }
+    }
+  }
   if (error.borgMessage) message = error.borgMessage;
   return { status, message: message.replace(/sk-ant-[A-Za-z0-9_-]+/g, '[redacted]').slice(0, 2000) };
 }
