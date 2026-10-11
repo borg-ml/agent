@@ -3954,6 +3954,9 @@ async fn await_tool_with_controls(
     cancel_on_steer: bool,
     controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
 ) -> Result<(String, bool, Vec<CapturedSteer>)> {
+    let mut cancel_on_drop = call_cancel
+        .as_ref()
+        .map(|cancel| cancel.clone().drop_guard());
     tokio::pin!(call);
     let mut pending_steer: Vec<CapturedSteer> = Vec::new();
     loop {
@@ -3968,7 +3971,13 @@ async fn await_tool_with_controls(
                     pending_steer.extend(accept_tool_boundary_control(control)?);
                 }
                 return Ok(match result {
-                    Ok(value) => (serde_json::to_string(&value)?, false, pending_steer),
+                    Ok(value) => {
+                        let output = serde_json::to_string(&value)?;
+                        if let Some(guard) = cancel_on_drop.take() {
+                            guard.disarm();
+                        }
+                        (output, false, pending_steer)
+                    }
                     Err(error) => (
                         json!({ "error": format!("{error:#}") }).to_string(),
                         true,
@@ -6287,6 +6296,61 @@ mod tests {
             }
             assert!(client.dropped.is_cancelled());
         }
+    }
+
+    #[tokio::test]
+    async fn aborted_tool_wait_cancels_but_successful_background_yield_does_not() {
+        let cancel = CancellationToken::new();
+        let call_cancel = cancel.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            await_tool_with_controls(
+                async {
+                    started.send(()).unwrap();
+                    std::future::pending::<Result<Value>>().await
+                },
+                Some(call_cancel),
+                false,
+                &mut None,
+            )
+            .await
+        });
+        ready.await.unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert!(
+            cancel.is_cancelled(),
+            "aborting the waiter must signal its running tool"
+        );
+
+        let cancel = CancellationToken::new();
+        let (output, is_error, _) = await_tool_with_controls(
+            async { Ok(json!({"running":true,"session_id":"owned-command"})) },
+            Some(cancel.clone()),
+            false,
+            &mut None,
+        )
+        .await
+        .unwrap();
+        assert!(!is_error && serde_json::from_str::<Value>(&output).unwrap()["running"] == true);
+        assert!(
+            !cancel.is_cancelled(),
+            "normal yield must leave the background command running"
+        );
+
+        let cancel = CancellationToken::new();
+        let (_, is_error, _) = await_tool_with_controls(
+            async { bail!("tool failed") },
+            Some(cancel.clone()),
+            false,
+            &mut None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            is_error && cancel.is_cancelled(),
+            "failed tools must not disarm cleanup"
+        );
     }
 
     #[tokio::test]

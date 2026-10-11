@@ -9708,7 +9708,11 @@ async fn interrupt_overtakes_a_full_command_queue_and_deferred_input() {
     urgent_tx
         .try_send(HostCommand::Interrupt { session_id })
         .unwrap();
-    let mut inbox = HostCommandInbox::new(normal_rx, Some(urgent_rx));
+    let mut inbox = HostCommandInbox::new(
+        normal_rx,
+        Some((urgent_rx, SessionInterrupt::default())),
+        session_id,
+    );
     let mut deferred = VecDeque::from([HostCommand::FlushPendingInput { session_id }]);
     assert!(matches!(
         next_host_command(&mut deferred, &mut inbox).await,
@@ -10152,7 +10156,7 @@ async fn setup_recall_returns_all_pending_prompts_in_submission_order() {
             })
             .await
             .unwrap();
-        let mut commands = HostCommandInbox::new(command_rx, None);
+        let mut commands = HostCommandInbox::new(command_rx, None, session_id);
         let mut deferred = VecDeque::new();
         assert!(
             !recall_queued_prompt_before_provider_admission(
@@ -10248,7 +10252,7 @@ async fn recovered_pending_batch_is_admitted_before_flush_at_turn_boundary() {
         .send(HostCommand::FlushPendingInput { session_id })
         .await
         .unwrap();
-    let mut commands = HostCommandInbox::new(command_rx, None);
+    let mut commands = HostCommandInbox::new(command_rx, None, session_id);
     let mut pending = VecDeque::new();
     let mut deferred = VecDeque::new();
     let mut team_ids = HashSet::new();
@@ -10317,7 +10321,7 @@ async fn turn_boundary_waits_for_a_late_sibling_of_pending_input() {
             .await
             .unwrap();
     });
-    let mut command_rx = HostCommandInbox::new(command_rx, None);
+    let mut command_rx = HostCommandInbox::new(command_rx, None, session_id);
     let mut deferred = VecDeque::new();
     let mut stale = HashSet::new();
     collect_input_at_turn_boundary(
@@ -10375,7 +10379,7 @@ async fn turn_boundary_collects_all_emitted_prompts_before_escape() {
         .unwrap();
 
     let mut pending = VecDeque::new();
-    let mut command_rx = HostCommandInbox::new(command_rx, None);
+    let mut command_rx = HostCommandInbox::new(command_rx, None, session_id);
     let mut deferred = VecDeque::new();
     let mut team_message_ids = HashSet::new();
     let mut stale_user_prompts = HashSet::new();
@@ -23549,4 +23553,36 @@ fn native_goal_rounds_do_not_charge_the_final_goal_twice() {
         *turn_id = None;
     }
     assert_eq!(goal_token_usage(&aggregate, &mut ledger), Some(300));
+}
+
+#[tokio::test]
+async fn immediate_interrupt_aborts_generation_and_fences_a_replacement_turn() {
+    let interrupt = SessionInterrupt::default();
+    let mut acknowledged = interrupt.subscribe();
+    let turn = tokio::spawn(std::future::pending::<()>());
+    interrupt.install(turn.abort_handle());
+    interrupt.request();
+    tokio::time::timeout(Duration::from_millis(250), acknowledged.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), turn)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled()
+    );
+
+    let replacement = tokio::spawn(std::future::pending::<()>());
+    interrupt.install(replacement.abort_handle());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), replacement)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled()
+    );
+    interrupt.settle();
+    assert!(!interrupt.requested());
 }

@@ -32,6 +32,63 @@ impl<T> Drop for AbortTask<T> {
     }
 }
 
+/// Stops generation independently of the actor's journal and observer I/O.
+#[derive(Clone)]
+pub struct SessionInterrupt {
+    state: Arc<std::sync::Mutex<SessionInterruptState>>,
+    acknowledged: tokio::sync::watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct SessionInterruptState {
+    revision: u64,
+    settled: u64,
+    turn: Option<tokio::task::AbortHandle>,
+}
+
+impl Default for SessionInterrupt {
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            acknowledged: tokio::sync::watch::channel(0).0,
+        }
+    }
+}
+
+impl SessionInterrupt {
+    pub fn request(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.revision += 1;
+        if let Some(turn) = &state.turn {
+            turn.abort();
+        }
+        self.acknowledged.send_replace(state.revision);
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.acknowledged.subscribe()
+    }
+
+    fn install(&self, turn: tokio::task::AbortHandle) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.revision != state.settled {
+            turn.abort();
+        }
+        state.turn = Some(turn);
+    }
+
+    fn requested(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.revision != state.settled
+    }
+
+    fn settle(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.settled = state.revision;
+        state.turn = None;
+    }
+}
+
 fn short_session_title(text: &str) -> Option<String> {
     let title = text
         .lines()
@@ -1647,17 +1704,42 @@ impl SessionConsultationTools {
 struct HostCommandInbox {
     commands: mpsc::Receiver<HostCommand>,
     priority: Option<mpsc::Receiver<HostCommand>>,
+    interrupt: Option<SessionInterrupt>,
+    session_id: Uuid,
+    interrupt_delivered: bool,
 }
 
 impl HostCommandInbox {
     fn new(
         commands: mpsc::Receiver<HostCommand>,
-        priority: Option<mpsc::Receiver<HostCommand>>,
+        priority: Option<(mpsc::Receiver<HostCommand>, SessionInterrupt)>,
+        session_id: Uuid,
     ) -> Self {
-        Self { commands, priority }
+        let (priority, interrupt) = match priority {
+            Some((priority, interrupt)) => (Some(priority), Some(interrupt)),
+            None => (None, None),
+        };
+        Self {
+            commands,
+            priority,
+            interrupt,
+            session_id,
+            interrupt_delivered: false,
+        }
     }
 
     fn try_recv_priority(&mut self) -> Option<HostCommand> {
+        if !self.interrupt_delivered
+            && self
+                .interrupt
+                .as_ref()
+                .is_some_and(SessionInterrupt::requested)
+        {
+            self.interrupt_delivered = true;
+            return Some(HostCommand::Interrupt {
+                session_id: self.session_id,
+            });
+        }
         let priority = self.priority.as_mut()?;
         match priority.try_recv() {
             Ok(command) => Some(command),
@@ -1775,6 +1857,7 @@ pub async fn run_agent_session_with_priority_commands(
     launch: LaunchSession,
     commands: mpsc::Receiver<HostCommand>,
     priority_commands: mpsc::Receiver<HostCommand>,
+    interrupt: SessionInterrupt,
     events: mpsc::Sender<SessionEvent>,
     executor: Arc<dyn AgentTurnExecutor>,
     store: Arc<dyn SessionStore>,
@@ -1805,7 +1888,7 @@ pub async fn run_agent_session_with_priority_commands(
         crate::LspPathPolicy::unrestricted(),
         None,
         initial_peers,
-        Some(priority_commands),
+        Some((priority_commands, interrupt)),
     ))
     .await
 }
@@ -1962,7 +2045,7 @@ async fn run_agent_session_store_kernel(
     lsp_policy: crate::LspPathPolicy,
     shared_team: Option<SubagentCoordinator>,
     initial_peers: Vec<crate::SpawnSubagent>,
-    priority_commands: Option<mpsc::Receiver<HostCommand>>,
+    priority_commands: Option<(mpsc::Receiver<HostCommand>, SessionInterrupt)>,
 ) -> Result<()> {
     // Every session entry point funnels here, so this is the one place the
     // live-delivery budget needs installing for the actor task.
@@ -1995,9 +2078,10 @@ async fn run_agent_session_store_kernel_inner(
     lsp_policy: crate::LspPathPolicy,
     shared_team: Option<SubagentCoordinator>,
     initial_peers: Vec<crate::SpawnSubagent>,
-    priority_commands: Option<mpsc::Receiver<HostCommand>>,
+    priority_commands: Option<(mpsc::Receiver<HostCommand>, SessionInterrupt)>,
 ) -> Result<()> {
-    let mut commands = HostCommandInbox::new(commands, priority_commands);
+    let mut commands = HostCommandInbox::new(commands, priority_commands, session_id);
+    let interrupt = commands.interrupt.clone();
     validate_launch_session(&mut launch)?;
     let effective_capabilities = launch.capabilities.apply_dependency_intersection();
     let runtime_mcp_context = launch
@@ -3442,6 +3526,10 @@ async fn run_agent_session_store_kernel_inner(
                         snapshot_stale_user_prompts(&mut stale_user_prompts, &pending);
                         set_user_stop(&mut journal, &events, session_id, &mut user_stop, true)
                             .await?;
+                        if let Some(interrupt) = &commands.interrupt {
+                            interrupt.settle();
+                            commands.interrupt_delivered = false;
+                        }
                         record(
                             &mut journal,
                             &events,
@@ -4246,6 +4334,10 @@ async fn run_agent_session_store_kernel_inner(
                     Some(HostCommand::Interrupt {
                         session_id: command_session_id,
                     }) if command_session_id == session_id => {
+                        if let Some(interrupt) = &interrupt {
+                            interrupt.settle();
+                            commands.interrupt_delivered = false;
+                        }
                         // Idle with no retry pending. Before explicit yields this
                         // window barely existed, because an active goal re-prompted
                         // itself immediately. A held yield parks the session
@@ -5194,15 +5286,25 @@ async fn run_agent_session_store_kernel_inner(
             continue;
         }
         let turn_executor = Arc::clone(&executor);
+        let turn_interrupt = interrupt.clone();
         let (tool_approval_tx, mut tool_approval_rx) = mpsc::channel(8);
         dispatcher.configure_tool_approvals(SessionToolApprovals {
             requests: tool_approval_tx,
         });
         let mut running = AbortTask(tokio::spawn(async move {
+            if turn_interrupt
+                .as_ref()
+                .is_some_and(SessionInterrupt::requested)
+            {
+                std::future::pending::<()>().await;
+            }
             turn_executor
                 .execute(turn, provider_events_tx, Some(control_rx))
                 .await
         }));
+        if let Some(interrupt) = &commands.interrupt {
+            interrupt.install(running.0.abort_handle());
+        }
         let mut pending_approval: Option<PendingApproval> = None;
         let mut pending_provider_interaction: Option<String> = None;
         let mut pending_steers = VecDeque::<PendingSteer>::new();
@@ -5282,8 +5384,15 @@ async fn run_agent_session_store_kernel_inner(
                     watchdog.note_output();
                 }
                 result = async {
+                    if !interrupted && interrupt.as_ref().is_some_and(SessionInterrupt::requested) {
+                        std::future::pending::<()>().await;
+                    }
                     match interrupted_result.take() {
                         Some(result) => result,
+                        None if interrupted => Ok(crate::AgentTurnResult {
+                            provider_session_id: None,
+                            final_text: String::new(),
+                        }),
                         None => (&mut running.0).await,
                     }
                 } => {
@@ -5304,10 +5413,16 @@ async fn run_agent_session_store_kernel_inner(
                     } else {
                         result
                     };
-                    while let Some(kind) = provider_carry
-                        .pop_front()
-                        .or_else(|| provider_events.try_recv().ok())
-                    {
+                    let mut completion_events = Vec::new();
+                    for kind in provider_carry.drain(..) {
+                        push_coalesced_provider_event(&mut completion_events, kind);
+                    }
+                    for _ in 0..provider_events.len() {
+                        if let Ok(kind) = provider_events.try_recv() {
+                            push_coalesced_provider_event(&mut completion_events, kind);
+                        }
+                    }
+                    for kind in completion_events {
                         if network_recovery_pending && provider_event_is_progress(&kind) {
                             network_recovery_pending = false;
                             record(&mut journal, &events, session_id, SessionEventKind::ProviderEvent {
@@ -5948,8 +6063,7 @@ async fn run_agent_session_store_kernel_inner(
                     let _trace = SessionBranchTrace::begin(trace_loop, session_id, "command", provider_events.len() + provider_carry.len());
                     let Some(command) = command else {
                         running.0.abort();
-                        let _ = (&mut running.0).await;
-                        executor.stop_session(session_id).await?;
+                        let _ = stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT).await;
                         deny_pending_approval(
                             &mut journal,
                             &events,
@@ -6371,13 +6485,10 @@ async fn run_agent_session_store_kernel_inner(
                             } else {
                                 None
                             };
-                            interrupted_result = Some(match cooperative {
-                                Some(result) => result,
-                                None => {
-                                    running.0.abort();
-                                    (&mut running.0).await
-                                }
-                            });
+                            interrupted_result = cooperative;
+                            if interrupted_result.is_none() {
+                                running.0.abort();
+                            }
                             let _ = stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT).await;
                             provider_session_id = None;
                             provider_fork_turn_id = None;
@@ -6607,8 +6718,17 @@ async fn run_agent_session_store_kernel_inner(
                             )
                             .await?;
                         }
-                        HostCommand::Interrupt { .. } if interrupted => {}
+                        HostCommand::Interrupt { .. } if interrupted => {
+                            if let Some(interrupt) = &interrupt {
+                                interrupt.settle();
+                                commands.interrupt_delivered = false;
+                            }
+                        }
                         HostCommand::Interrupt { .. } => {
+                            if let Some(interrupt) = &interrupt {
+                                interrupt.settle();
+                                commands.interrupt_delivered = false;
+                            }
                             tracing::info!(%session_id, "session interrupt received (active turn)");
                             snapshot_stale_user_prompts(&mut stale_user_prompts, &pending);
                             stale_user_prompts.extend(
@@ -6622,13 +6742,10 @@ async fn run_agent_session_store_kernel_inner(
                             } else {
                                 None
                             };
-                            interrupted_result = Some(match cooperative {
-                                Some(result) => result,
-                                None => {
-                                    running.0.abort();
-                                    (&mut running.0).await
-                                }
-                            });
+                            interrupted_result = cooperative;
+                            if interrupted_result.is_none() {
+                                running.0.abort();
+                            }
                             interrupted = true;
                             batch_pending_after_interrupt = true;
                             provider_session_id = None;
@@ -6732,7 +6849,6 @@ async fn run_agent_session_store_kernel_inner(
                             ).await?;
                             work_plan_refresh.settle(&mut journal, &events, &work_plan).await?;
                             running.0.abort();
-                            let _ = (&mut running.0).await;
                             let _ = stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT).await;
                             deny_pending_approval(
                                 &mut journal,
@@ -6883,7 +6999,6 @@ async fn run_agent_session_store_kernel_inner(
                     };
                     subscription_context_reusable = false;
                     running.0.abort();
-                    let _ = (&mut running.0).await;
                     // Cleanup failure is part of the user-visible story: it is
                     // why processes may still be alive after the turn ends.
                     let error = match stop_session_bounded(&executor, session_id, TURN_WATCHDOG_STOP_TIMEOUT).await {

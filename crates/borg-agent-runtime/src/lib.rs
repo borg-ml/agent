@@ -123,7 +123,7 @@ pub use runtime_protocol::{
 };
 pub use session::run_agent_session_with_store_and_writer_and_lsp_policy;
 pub use session::{
-    SessionConsultationTools, SessionGoalTools, SessionTodoTools,
+    SessionConsultationTools, SessionGoalTools, SessionInterrupt, SessionTodoTools,
     run_agent_session_with_priority_commands, run_agent_session_with_store_and_writer,
     run_agent_session_with_store_writer_and_peers,
 };

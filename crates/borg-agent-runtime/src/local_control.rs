@@ -12,8 +12,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 use uuid::Uuid;
 
 use crate::{
-    EventActor, HostCommand, MessageStatus, SessionEvent, SessionEventKind, SessionStatus,
-    SessionStore, SessionWriterLease,
+    EventActor, HostCommand, MessageStatus, SessionEvent, SessionEventKind, SessionInterrupt,
+    SessionStatus, SessionStore, SessionWriterLease,
 };
 
 const MAX_CONTROL_COMMAND_BYTES: u64 = 1024 * 1024;
@@ -864,6 +864,7 @@ impl LocalSessionControlServer {
         writer: &SessionWriterLease,
         commands: mpsc::Sender<HostCommand>,
         _priority: mpsc::Sender<HostCommand>,
+        _interrupt: SessionInterrupt,
         prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
         store: Arc<dyn SessionStore>,
     ) -> Result<Self> {
@@ -911,6 +912,7 @@ impl LocalSessionControlServer {
             prompt_admissions,
             None,
             None,
+            None,
         )
     }
 
@@ -921,6 +923,7 @@ impl LocalSessionControlServer {
         _writer: &SessionWriterLease,
         commands: mpsc::Sender<HostCommand>,
         priority: mpsc::Sender<HostCommand>,
+        interrupt: SessionInterrupt,
         prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
         store: Arc<dyn SessionStore>,
     ) -> Result<Self> {
@@ -931,6 +934,7 @@ impl LocalSessionControlServer {
             prompt_admissions,
             Some(store),
             Some(priority),
+            Some(interrupt),
         )
     }
 
@@ -949,6 +953,7 @@ impl LocalSessionControlServer {
             prompt_admissions,
             Some(store),
             None,
+            None,
         )
     }
 
@@ -959,6 +964,7 @@ impl LocalSessionControlServer {
         prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
         store: Option<Arc<dyn SessionStore>>,
         priority: Option<mpsc::Sender<HostCommand>>,
+        interrupt: Option<SessionInterrupt>,
     ) -> Result<Self> {
         use std::os::unix::fs::PermissionsExt;
         use tokio::net::UnixListener;
@@ -1015,6 +1021,7 @@ impl LocalSessionControlServer {
                             Ok((stream, _)) => {
                                 let commands = commands.clone();
                                 let priority = priority.clone();
+                                let interrupt = interrupt.clone();
                                 let prompt_admissions = prompt_admissions.clone();
                                 let store = store.clone();
                                 tokio::spawn(handle_control_connection(
@@ -1022,6 +1029,7 @@ impl LocalSessionControlServer {
                                     session_id,
                                     commands,
                                     priority,
+                                    interrupt,
                                     prompt_admissions,
                                     store,
                                     Arc::clone(&task_attached_viewers),
@@ -1193,6 +1201,7 @@ async fn handle_control_connection(
     session_id: Uuid,
     commands: mpsc::Sender<HostCommand>,
     priority: Option<mpsc::Sender<HostCommand>>,
+    interrupt: Option<SessionInterrupt>,
     prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
     store: Option<Arc<dyn SessionStore>>,
     attached_viewers: Arc<AtomicUsize>,
@@ -1221,6 +1230,17 @@ async fn handle_control_connection(
             !matches!(command, HostCommand::RecoverPendingInput { .. }),
             "recovered input is internal to the session owner"
         );
+        if matches!(command, HostCommand::Interrupt { .. })
+            && let Some(interrupt) = &interrupt
+        {
+            interrupt.request();
+            // The signal also synthesizes the ordered Interrupt in the inbox;
+            // a full priority lane cannot delay cancellation or acknowledgement.
+            match priority.as_ref().unwrap_or(&commands).try_send(command) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => return Ok(None),
+                Err(mpsc::error::TrySendError::Closed(_)) => bail!("session owner stopped"),
+            }
+        }
         if let HostCommand::Prompt {
             message_id,
             text,
@@ -2429,12 +2449,18 @@ mod tests {
             .await
             .unwrap();
         let (urgent_tx, mut urgent_rx) = mpsc::channel(1);
+        urgent_tx
+            .try_send(HostCommand::FlushPendingInput { session_id })
+            .unwrap();
+        let interrupt = SessionInterrupt::default();
+        let mut acknowledgement = interrupt.subscribe();
         let _server = LocalSessionControlServer::start_with_priority_commands(
             socket_path.clone(),
             session_id,
             &writer,
             normal_tx,
             urgent_tx,
+            interrupt,
             None,
             store,
         )
@@ -2450,9 +2476,13 @@ mod tests {
         .await
         .expect("interrupt blocked on full command queue")
         .unwrap();
+        tokio::time::timeout(Duration::from_millis(250), acknowledgement.changed())
+            .await
+            .expect("stop acknowledgement waited for the actor")
+            .unwrap();
         assert!(matches!(
             urgent_rx.recv().await,
-            Some(HostCommand::Interrupt { .. })
+            Some(HostCommand::FlushPendingInput { .. })
         ));
         assert!(matches!(
             normal_rx.recv().await,

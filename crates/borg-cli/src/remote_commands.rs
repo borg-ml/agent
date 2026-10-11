@@ -19,9 +19,9 @@ use borg_remote::{
     HostCommand, HostConfig, HostExecutionProfile, HostExecutorFactory, LaunchSession,
     LiveEventQueue, LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus,
     PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, RecoveryParts, ResponseLanguage,
-    SessionConfigAction, SessionEvent, SessionEventKind, SessionGoal, SessionState, SessionStatus,
-    SessionStore, SessionWriterLease, SpawnSubagent, SubagentAction, SubagentSnapshot,
-    SubagentStatus, TodoAction, default_host_config_path, enroll_host,
+    SessionConfigAction, SessionEvent, SessionEventKind, SessionGoal, SessionInterrupt,
+    SessionState, SessionStatus, SessionStore, SessionWriterLease, SpawnSubagent, SubagentAction,
+    SubagentSnapshot, SubagentStatus, TodoAction, default_host_config_path, enroll_host,
     force_terminate_local_session_owner, local_session_owner_is_active,
     local_session_owner_uses_current_binary, login_provider, mirror_local_session,
     obsolete_local_session_owner_pid, probe_capabilities, probe_provider_admission_capabilities,
@@ -2728,6 +2728,8 @@ async fn run_local_agent_session(
 
     let (session_command_tx, session_commands) = mpsc::channel(64);
     let (interrupt_tx, interrupt_commands) = mpsc::channel(1);
+    let interrupt = SessionInterrupt::default();
+    let mut interrupt_acknowledged = interrupt.subscribe();
     // The owned actor is the single ordered live source. A generous bounded
     // queue absorbs bursty child/tool traffic while preserving backpressure;
     // do not merge the same actor stream back through the store here, because a
@@ -2746,6 +2748,7 @@ async fn run_local_agent_session(
             writer.as_ref().expect("session owner holds writer lease"),
             session_command_tx.clone(),
             interrupt_tx.clone(),
+            interrupt.clone(),
             Some(Arc::clone(&local_prompt_admissions)),
             Arc::clone(&store),
         )?)
@@ -2765,6 +2768,7 @@ async fn run_local_agent_session(
         ))
     } else {
         let writer = writer.expect("session owner holds writer lease");
+        let actor_interrupt = interrupt.clone();
         let actor_store = Arc::clone(&durable_store);
         let actor_session_root = sessions_dir.clone();
         tokio::spawn(async move {
@@ -2774,6 +2778,7 @@ async fn run_local_agent_session(
                 launch,
                 session_commands,
                 interrupt_commands,
+                actor_interrupt,
                 session_event_tx,
                 executor,
                 actor_store,
@@ -3553,6 +3558,13 @@ async fn run_local_agent_session(
                     None => editor_preferences_errors_open = false,
                 }
             }
+            Ok(()) = interrupt_acknowledged.changed() => {
+                if let Some(terminal) = terminal.as_mut() {
+                    terminal.acknowledge_interrupt();
+                    terminal.draw_for_activity()?;
+                    terminal_dirty = true;
+                }
+            }
             completion = ui_interaction_completions.recv(), if ui_interaction_completions_open => {
                 let Some(completion) = completion else {
                     ui_interaction_completions_open = false;
@@ -4191,6 +4203,7 @@ async fn run_local_agent_session(
                 && (session_event_stream_open || !queued_session_events.is_empty()) => {
                 let drain_started = std::time::Instant::now();
                 let mut drained = 0;
+                let mut immediate_frame_deferred = false;
                 let mut incoming_event = event;
                 loop {
                     let Some(event) = incoming_event.take() else {
@@ -4474,7 +4487,10 @@ async fn run_local_agent_session(
                             }
                             live_transcript_events = None;
                         }
-                        if terminal_dirty && session_event_needs_immediate_frame(&event.kind) {
+                        immediate_frame_deferred |= terminal_dirty
+                            && queued_events > 0
+                            && session_event_needs_immediate_frame(&event.kind);
+                        if terminal_dirty && queued_events == 0 && session_event_needs_immediate_frame(&event.kind) {
                             if render_frame_interval <= ACTIVITY_FRAME_INTERVAL {
                                 let draw_started = std::time::Instant::now();
                                 terminal.draw()?;
@@ -4622,6 +4638,9 @@ async fn run_local_agent_session(
                         break;
                     };
                     incoming_event = Some(next);
+                }
+                if immediate_frame_deferred && queued_session_events.is_empty() && session_events.is_empty() {
+                    render_tick.reset_immediately();
                 }
             }
             line = recv_terminal_line(&mut input), if input_open => {
@@ -6201,6 +6220,8 @@ async fn run_local_agent_session(
                             if session_access.is_attached() {
                                 let socket = control_socket_path.clone();
                                 let fallback = session_command_tx.clone();
+                                let interrupt = interrupt.clone();
+                                let supports_fast_interrupt = !stale_local_owner;
                                 tokio::spawn(async move {
                                     let started = std::time::Instant::now();
                                     if let Err(error) = send_local_session_command(
@@ -6208,11 +6229,14 @@ async fn run_local_agent_session(
                                     ).await {
                                         tracing::warn!(%error, "direct viewer interrupt failed; retrying through attached actor");
                                         let _ = fallback.send(HostCommand::Interrupt { session_id }).await;
+                                    } else if supports_fast_interrupt {
+                                        interrupt.request();
                                     }
                                     tracing::info!(%session_id, elapsed_ms = started.elapsed().as_millis(), "tui interrupt forwarded");
                                 });
                                 true
                             } else {
+                                interrupt.request();
                                 dispatch_host_command_without_blocking(
                                     &interrupt_tx,
                                     HostCommand::Interrupt { session_id },
