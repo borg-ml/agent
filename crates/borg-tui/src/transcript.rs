@@ -1999,8 +1999,8 @@ impl Transcript {
             })
     }
 
-    /// A repeated run folds once a different action follows it, unless one of
-    /// its actions is still live.
+    /// A repeated run folds once a different action follows it, or once it
+    /// reaches five actions, unless one of its actions is still live.
     fn action_run_open_by_default(&self, start: usize) -> bool {
         let Some(first) = self.order.get(start) else {
             return false;
@@ -2025,6 +2025,9 @@ impl Transcript {
             Some(TranscriptEntry::Action { .. }) => true,
             _ => false,
         };
+        if end - start >= 5 {
+            return live;
+        }
         live || !next_is_action
     }
 

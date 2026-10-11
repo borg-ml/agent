@@ -13929,6 +13929,7 @@ fn long_tool_runs_show_eight_lines_and_scroll_independently() {
         });
     }
 
+    assert!(transcript.toggle_action_run_expansion(0));
     let rendered = transcript
         .lines(100)
         .into_iter()
@@ -14328,6 +14329,7 @@ fn expanded_tool_run_shows_every_action_and_collapses_again() {
             .join("\n")
     };
 
+    assert!(transcript.toggle_action_run_expansion(0));
     assert!(transcript.toggle_tool_run_expansion(0));
     let expanded = render(&transcript);
     assert!(expanded.contains("call-0"), "{expanded}");
@@ -15056,6 +15058,7 @@ fn line_scrolling_preserves_expanded_actions() {
         });
     }
 
+    assert!(transcript.toggle_action_run_expansion(0));
     let render = transcript.render(100, None, None, None);
     let max_offset = render.2[0].3;
     assert!(max_offset > DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT);
@@ -15109,6 +15112,7 @@ fn scrolled_action_viewport_pins_the_current_tool_header() {
         });
     }
 
+    assert!(transcript.toggle_action_run_expansion(0));
     let rendered = transcript.render_with_tool_run_viewport(100, 8, Some(8), None, None);
     let pinned = &rendered.0[1];
 
@@ -15145,6 +15149,7 @@ fn expanding_an_action_preserves_the_current_line_anchor() {
         });
     }
 
+    assert!(transcript.toggle_action_run_expansion(0));
     let max_offset = transcript.render(100, None, None, None).2[0].3;
     transcript.anchor_tool_run(0, max_offset);
     transcript.toggle_tool(8);
@@ -16941,6 +16946,7 @@ fn selection_anchors_follow_content_when_the_actions_window_shifts() {
         transcript.order.push(tool(index));
     }
 
+    assert!(transcript.toggle_action_run_expansion(0));
     let before = transcript.render(100, None, None, None);
     let target_row = before
         .0
@@ -17000,6 +17006,7 @@ fn mixed_actions_window_selection_ranges_match_the_visible_rows() {
         transcript.order.push(tool(index));
     }
 
+    assert!(transcript.toggle_action_run_expansion(5));
     let render = transcript.render_with_tool_run_viewport(100, 8, None, None, None);
     let activity_row = render
         .0
@@ -17069,6 +17076,7 @@ fn drag_selection_stays_live_when_wheel_scroll_hides_its_action_anchor() {
         });
     }
 
+    assert!(transcript.toggle_action_run_expansion(0));
     let before = transcript.render_with_tool_run_viewport(100, 8, None, None, None);
     let anchor_row = before
         .0
@@ -17156,6 +17164,7 @@ fn released_selection_follows_expanded_tool_text_during_nested_scroll() {
         });
     }
 
+    assert!(transcript.toggle_action_run_expansion(0));
     let before = transcript.render_with_tool_run_viewport(100, 8, None, None, None);
     let selected_row = before
         .0
