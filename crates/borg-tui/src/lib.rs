@@ -67,7 +67,7 @@ use pulldown_cmark::{
     Parser, Tag, TagEnd,
 };
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, ClearType, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -10872,9 +10872,9 @@ impl BorgTerminal {
                 crossterm::terminal::BeginSynchronizedUpdate,
                 crossterm::cursor::Hide
             )?;
-            self.terminal.clear()?;
+            clear_terminal_viewport(&mut self.terminal)?;
             // The aborted callback has prepared the complete current buffer.
-            // Clear invalidates the back buffer; present without rendering twice.
+            // The clear invalidates the back buffer; present without rendering twice.
             self.terminal
                 .try_draw(|_| Ok::<(), io::Error>(()))
                 .map(|_| ())
@@ -11975,6 +11975,21 @@ fn completion_alert_policy_from_picker(value: &str) -> CompletionAlertPolicy {
     }
 }
 
+// Ratatui's clear queries the cursor, competing with the input pump for stdin.
+// The next draw positions the cursor itself, so only clear and invalidate here.
+fn clear_terminal_viewport<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    let origin = terminal.get_frame().area().as_position();
+    terminal.backend_mut().set_cursor_position(origin)?;
+    terminal
+        .backend_mut()
+        .clear_region(ClearType::AfterCursor)?;
+    let prepared = std::mem::take(terminal.current_buffer_mut());
+    terminal.swap_buffers();
+    terminal.swap_buffers();
+    *terminal.current_buffer_mut() = prepared;
+    Ok(())
+}
+
 impl BorgTerminal {
     pub fn restore_terminal(&mut self) {
         if self.terminal_restored {
@@ -11987,7 +12002,7 @@ impl BorgTerminal {
         // before restoring the terminal so the last rendered agent summary
         // and composer do not remain above the copyable resume handoff.
         if self.mode == ScreenMode::Inline {
-            let _ = self.terminal.clear();
+            let _ = clear_terminal_viewport(&mut self.terminal);
         }
         let _ = execute!(self.terminal.backend_mut(), SetTitle("Borg Agent"));
         let _ = execute!(self.terminal.backend_mut(), DisableMouseCapture);

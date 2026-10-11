@@ -889,7 +889,7 @@ fn tool_window_summary(
             )
         });
         return format!(
-            "{}{} {}{}",
+            "{}{}{}{}",
             if show_time {
                 match &entries[0] {
                     TranscriptEntry::Tool { time, .. } => {
@@ -900,7 +900,7 @@ fn tool_window_summary(
             } else {
                 String::new()
             },
-            if running { "◇" } else { "◦" },
+            if running { "◇ " } else { "" },
             if running { "Reasoning" } else { "Reasoned" },
             if total > 1 {
                 format!(" ({total})")

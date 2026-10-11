@@ -14526,10 +14526,10 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     let header = collapsed_child.0[0].to_string();
     assert!(header.ends_with(&done_at), "{header}");
     assert_eq!(collapsed_child.0[0].width(), 100);
-    assert!(rendered.contains("  ▸ ◦ Reasoned (5)"), "{rendered}");
-    assert!(rendered.contains("  ▸ ◦ Reasoned\n"), "{rendered}");
+    assert!(rendered.contains("  ▸ Reasoned (5)"), "{rendered}");
+    assert!(rendered.contains("  ▸ Reasoned\n"), "{rendered}");
     assert!(!rendered.contains("Reasoned (1)"), "{rendered}");
-    assert!(!rendered.contains("19:38  ◦ Reasoned"), "{rendered}");
+    assert!(!rendered.contains("◦ Reasoned"), "{rendered}");
     assert!(rendered.contains("  ▾ Run (2)"), "{rendered}");
     assert!(rendered.contains("  ▾ Watch (2)"), "{rendered}");
     assert!(
@@ -15231,7 +15231,7 @@ fn reasoning_lifecycle_events_show_reasoning_without_a_text_delta() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("◦ Reasoned"));
+    assert!(rendered.contains("Reasoned"));
     assert!(!rendered.contains("◇ Thinking"));
 }
 
@@ -20733,9 +20733,12 @@ fn overlay_transitions_restore_cells_skipped_by_terminal_images() {
             for cell in &mut frame.buffer_mut().content {
                 cell.set_diff_option(CellDiffOption::Skip);
             }
+            frame.buffer_mut()[(1, 0)]
+                .set_symbol("R")
+                .set_diff_option(CellDiffOption::None);
             assert!(OverlayLayer::default().finish(&mut previous, true));
         }
-        terminal.clear().unwrap();
+        clear_terminal_viewport(&mut terminal).unwrap();
         terminal.draw(|_| {}).unwrap();
         assert!(
             terminal
@@ -20743,7 +20746,8 @@ fn overlay_transitions_restore_cells_skipped_by_terminal_images() {
                 .buffer()
                 .content
                 .iter()
-                .all(|cell| cell.symbol() == " ")
+                .enumerate()
+                .all(|(index, cell)| cell.symbol() == if index == 1 { "R" } else { " " })
         );
         assert!(!OverlayLayer::default().finish(&mut previous, true));
     }
