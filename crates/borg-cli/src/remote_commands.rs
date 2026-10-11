@@ -1919,8 +1919,17 @@ impl LocalSessionAccess {
     }
 }
 
-fn stale_local_owner_can_handoff(status: Option<SessionStatus>, subagents_working: bool) -> bool {
-    !subagents_working && matches!(status, Some(SessionStatus::Ready | SessionStatus::Stopped))
+fn root_background_work_is_active(state: &SessionState) -> bool {
+    !state.active_processes.is_empty() || state.watches.iter().any(|watch| watch.running)
+}
+
+fn stale_local_owner_can_handoff(state: &SessionState, subagents_working: bool) -> bool {
+    !subagents_working
+        && !root_background_work_is_active(state)
+        && matches!(
+            state.status,
+            Some(SessionStatus::Ready | SessionStatus::Stopped)
+        )
 }
 
 async fn local_subagents_are_idle(store: &dyn SessionStore, session_id: Uuid) -> Result<bool> {
@@ -1947,7 +1956,7 @@ fn session_host_is_idle(
     viewers_attached: bool,
 ) -> bool {
     state.status == Some(SessionStatus::Ready)
-        && state.active_processes.is_empty()
+        && !root_background_work_is_active(state)
         && !prompt_submission_pending
         && !subagents_working
         && !viewers_attached
@@ -2871,6 +2880,7 @@ async fn run_local_agent_session(
         terminal.set_running_sweeps(editor_preferences.presentation.running_sweeps);
         terminal.set_composer_cursor_style(editor_preferences.presentation.composer_cursor_style);
         terminal.set_wrap_action_rows(editor_preferences.presentation.wrap_action_rows);
+        terminal.set_show_action_done_at(editor_preferences.presentation.show_action_done_at);
         terminal.set_ui_language(editor_preferences.presentation.ui_language);
         terminal.set_layout_preferences(&editor_preferences.layout);
         terminal.set_completion_alerts(
@@ -3138,7 +3148,7 @@ async fn run_local_agent_session(
     let mut projection_tail_tick = tokio::time::interval(std::time::Duration::from_millis(500));
     projection_tail_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut stale_owner_handoff_task: Option<StaleOwnerHandoffTask> = if stale_local_owner
-        && stale_local_owner_can_handoff(session_state.status, !working_subagents.is_empty())
+        && stale_local_owner_can_handoff(&session_state, !working_subagents.is_empty())
     {
         let lock_path = lock_path.clone();
         let socket_path = control_socket_path.clone();
@@ -3147,7 +3157,7 @@ async fn run_local_agent_session(
             // Prompt admission precedes the durable Starting event. Recheck
             // after a scheduling window without delaying the first frame.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if stale_local_owner_can_handoff(store.state(session_id).await?.status, false)
+            if stale_local_owner_can_handoff(&store.state(session_id).await?, false)
                 && local_subagents_are_idle(store.as_ref(), session_id).await?
             {
                 let _writer =
@@ -4078,6 +4088,9 @@ async fn run_local_agent_session(
                                 terminal.set_wrap_action_rows(
                                     editor_preferences.presentation.wrap_action_rows,
                                 );
+                                terminal.set_show_action_done_at(
+                                    editor_preferences.presentation.show_action_done_at,
+                                );
                                 terminal.set_ui_language(
                                     editor_preferences.presentation.ui_language,
                                 );
@@ -4499,9 +4512,11 @@ async fn run_local_agent_session(
                             terminal_dirty = true;
                         }
                         stale_owner_handoff_task = Some(tokio::spawn(async move {
+                            let state = store.state(session_id).await?;
                             if local_session_owner_uses_current_binary(&sessions_dir, session_id)?
+                                || root_background_work_is_active(&state)
                                 || (!schema_rejected
-                                    && !stale_local_owner_can_handoff(store.state(session_id).await?.status, false))
+                                    && !stale_local_owner_can_handoff(&state, false))
                                 || !local_subagents_are_idle(store.as_ref(), session_id).await?
                             {
                                 return Ok(false);
@@ -5249,7 +5264,7 @@ async fn run_local_agent_session(
                             session_access,
                             status,
                             attached_prompt_pending,
-                            !working_subagents.is_empty(),
+                            !working_subagents.is_empty() || root_background_work_is_active(delivered_projection.state()),
                             control_server.as_ref(),
                         );
                         let terminal_draft = terminal
@@ -5258,7 +5273,7 @@ async fn run_local_agent_session(
                         shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
                         if !session_access.is_attached()
                             && (should_detach_on_terminal_loss(
-                                status, attached_prompt_pending, !working_subagents.is_empty(),
+                                status, attached_prompt_pending, !working_subagents.is_empty() || root_background_work_is_active(delivered_projection.state()),
                             ) || handoff_to_viewer)
                         {
                             if detached_prompt.is_none() {
@@ -5900,6 +5915,19 @@ async fn run_local_agent_session(
                         terminal.set_wrap_action_rows(enabled);
                         terminal.set_notice(format!(
                             "Wrap action rows: {}",
+                            if enabled { "on" } else { "off" }
+                        ));
+                    }
+                    UiAction::SetShowActionDoneAt(enabled) => {
+                        editor_preferences.presentation.show_action_done_at = enabled;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_show_action_done_at(enabled);
+                        terminal.set_notice(format!(
+                            "Action group completion times: {}",
                             if enabled { "on" } else { "off" }
                         ));
                     }
@@ -6633,6 +6661,11 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .open_wrap_action_rows_picker();
+                        } else if line == "/done-at" && attachments.is_empty() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .open_show_action_done_at_picker();
                         } else if line == "/cursor" && attachments.is_empty() {
                             terminal.as_mut().expect("terminal").open_composer_cursor_style_picker();
                         } else if let Some(value) = line.strip_prefix("/cursor ")
@@ -7202,6 +7235,26 @@ async fn run_local_agent_session(
                             } else {
                                 terminal.as_mut().expect("terminal").set_notice(
                                     "Choose /wrap-actions on or /wrap-actions off",
+                                );
+                            }
+                        } else if let Some(value) = line.strip_prefix("/done-at ")
+                            && attachments.is_empty()
+                        {
+                            if let Some(enabled) = parse_on_off(value) {
+                                editor_preferences.presentation.show_action_done_at = enabled;
+                                dispatch_editor_preferences_save(
+                                    &editor_preferences_tx,
+                                    &editor_preferences,
+                                );
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.set_show_action_done_at(enabled);
+                                terminal.set_notice(format!(
+                                    "Action group completion times: {}",
+                                    if enabled { "on" } else { "off" }
+                                ));
+                            } else {
+                                terminal.as_mut().expect("terminal").set_notice(
+                                    "Choose /done-at on or /done-at off",
                                 );
                             }
                         } else if let Some(value) = line.strip_prefix("/animations ")
@@ -7887,7 +7940,7 @@ async fn run_local_agent_session(
                     session_access,
                     status,
                     attached_prompt_pending,
-                    !working_subagents.is_empty(),
+                    !working_subagents.is_empty() || root_background_work_is_active(delivered_projection.state()),
                     control_server.as_ref(),
                 );
                 let terminal_draft = terminal
@@ -7898,7 +7951,7 @@ async fn run_local_agent_session(
                     signal,
                     status,
                     attached_prompt_pending,
-                    !working_subagents.is_empty(),
+                    !working_subagents.is_empty() || root_background_work_is_active(delivered_projection.state()),
                 ) {
                     // A terminal emulator can disappear independently of Borg (for
                     // example, a GPU/renderer crash). Keep the durable actor and

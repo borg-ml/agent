@@ -2181,33 +2181,57 @@ async fn owner_shutdown_hands_active_turn_to_an_attached_viewer() {
 #[test]
 fn obsolete_owner_handoff_waits_for_a_safe_turn_boundary() {
     assert!(stale_local_owner_can_handoff(
-        Some(SessionStatus::Ready),
+        &SessionState {
+            status: Some(SessionStatus::Ready),
+            ..Default::default()
+        },
         false
     ));
     assert!(stale_local_owner_can_handoff(
-        Some(SessionStatus::Stopped),
+        &SessionState {
+            status: Some(SessionStatus::Stopped),
+            ..Default::default()
+        },
         false
     ));
     assert!(!stale_local_owner_can_handoff(
-        Some(SessionStatus::Starting),
+        &SessionState {
+            status: Some(SessionStatus::Starting),
+            ..Default::default()
+        },
         false
     ));
     assert!(!stale_local_owner_can_handoff(
-        Some(SessionStatus::Running),
+        &SessionState {
+            status: Some(SessionStatus::Running),
+            ..Default::default()
+        },
         false
     ));
     assert!(!stale_local_owner_can_handoff(
-        Some(SessionStatus::WaitingForApproval),
+        &SessionState {
+            status: Some(SessionStatus::WaitingForApproval),
+            ..Default::default()
+        },
         false
     ));
-    assert!(!stale_local_owner_can_handoff(None, false));
+    assert!(!stale_local_owner_can_handoff(
+        &SessionState::default(),
+        false
+    ));
 
     assert!(!stale_local_owner_can_handoff(
-        Some(SessionStatus::Ready),
+        &SessionState {
+            status: Some(SessionStatus::Ready),
+            ..Default::default()
+        },
         true
     ));
     assert!(!stale_local_owner_can_handoff(
-        Some(SessionStatus::Stopped),
+        &SessionState {
+            status: Some(SessionStatus::Stopped),
+            ..Default::default()
+        },
         true
     ));
 
@@ -3832,7 +3856,7 @@ async fn resume_bootstrap_stops_at_the_live_cursor() {
 // Closing every viewer must not let an idle root shut down a busy team. The
 // predicate test covers the five-minute decision without a wall-clock wait.
 #[test]
-fn detached_host_remains_alive_for_children_prompts_processes_and_viewers() {
+fn detached_host_remains_alive_for_children_prompts_processes_watches_and_viewers() {
     let mut state = SessionState {
         status: Some(SessionStatus::Ready),
         ..Default::default()
@@ -3843,7 +3867,21 @@ fn detached_host_remains_alive_for_children_prompts_processes_and_viewers() {
     assert!(!session_host_is_idle(&state, false, false, true));
     state.active_processes.insert(Uuid::new_v4());
     assert!(!session_host_is_idle(&state, false, false, false));
+    assert!(!stale_local_owner_can_handoff(&state, false));
     state.active_processes.clear();
+    state.watches.push(borg_remote::WatchSummary {
+        watch_id: Uuid::new_v4(),
+        label: "background work".into(),
+        command: "long-running command".into(),
+        running: true,
+        started_at: Utc::now(),
+        last_event_at: None,
+        event_count: 0,
+    });
+    assert!(!session_host_is_idle(&state, false, false, false));
+    assert!(!stale_local_owner_can_handoff(&state, false));
+    state.watches[0].running = false;
+    assert!(session_host_is_idle(&state, false, false, false));
     for status in [
         SessionStatus::Starting,
         SessionStatus::Running,
