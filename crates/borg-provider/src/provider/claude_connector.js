@@ -56,7 +56,7 @@ async function verifyIdentity() {
     const account = profile?.account?.uuid;
     const organization = profile?.organization?.uuid;
     if (!account || !organization) {
-      throw Error('Cannot verify the selected Claude subscription account; sign in again or retry.');
+      throw Error('Cannot verify the selected Claude subscription account; account lookup failed. Check connectivity and retry.');
     }
     identity = hash(`claude-subscription\0${account}\0${organization}`);
     accountUuid = account;
