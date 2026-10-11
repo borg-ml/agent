@@ -5,6 +5,20 @@ Git comparison.
 
 ## Unreleased (since 0.15.5)
 
+### Terminal
+
+- Show timestamps only on outer action groups, not their nested tool or reasoning
+  rows, and omit singleton reasoning counts.
+- Offer right-aligned action-group completion times in Settings or `/done-at on`,
+  off by default.
+
+### Reliability
+
+- Keep session hosts alive and prevent stale-owner handoff while root processes
+  or command watches are running, preserving background work after viewers close.
+- Store clangd preambles in private disk-backed client directories instead of RAM
+  to reduce language-server memory use.
+
 ## 0.15.5 (2026-10-10)
 
 ### Terminal
