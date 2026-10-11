@@ -166,6 +166,8 @@ struct LspClient {
     // Retain generations after close so late publications cannot match a reopen.
     last_versions: HashMap<PathBuf, i32>,
     published_diagnostics: HashMap<String, Value>,
+    // Dropped after the child; only this client owns the directory.
+    _private_preamble_storage: Option<tempfile::TempDir>,
 }
 
 /// One language server per (server, canonical workspace root, access scope).
@@ -793,9 +795,30 @@ impl LspService {
     }
 }
 
+fn configure_private_preamble_storage(
+    spec: &ServerSpec,
+    command: &mut Command,
+) -> Result<Option<tempfile::TempDir>> {
+    if spec.id != "clangd" {
+        return Ok(None);
+    }
+    let parent = crate::host_paths::host_home().join("lsp-preambles");
+    std::fs::create_dir_all(&parent).context("create clangd preamble storage root")?;
+    let directory = tempfile::Builder::new()
+        .prefix("clangd-")
+        .tempdir_in(parent)
+        .context("create private clangd preamble storage")?;
+    for name in ["TMPDIR", "TMP", "TEMP"] {
+        command.env(name, directory.path());
+    }
+    Ok(Some(directory))
+}
+
 impl LspClient {
     async fn start(spec: &ServerSpec, root: &Path) -> Result<Self> {
-        let mut child = Command::new(spec.command)
+        let mut command = Command::new(spec.command);
+        let private_preamble_storage = configure_private_preamble_storage(spec, &mut command)?;
+        let mut child = command
             .args(spec.args)
             .current_dir(root)
             .stdin(Stdio::piped())
@@ -827,6 +850,7 @@ impl LspClient {
             opened_versions: HashMap::new(),
             last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
+            _private_preamble_storage: private_preamble_storage,
         };
         let root_uri = Url::from_directory_path(root)
             .map_err(|_| anyhow::anyhow!("cannot convert workspace root to URI"))?
@@ -2103,7 +2127,7 @@ fn server_specs() -> &'static [ServerSpec] {
         ServerSpec {
             id: "clangd",
             command: "clangd",
-            args: &["--pch-storage=memory"],
+            args: &["--pch-storage=disk"],
             language_id: "cpp",
             extensions: &["c", "h", "cc", "cpp", "cxx", "hpp"],
         },
@@ -2485,6 +2509,7 @@ mod tests {
                 opened_versions: HashMap::new(),
                 last_versions: HashMap::new(),
                 published_diagnostics: HashMap::new(),
+                _private_preamble_storage: None,
             }))));
         service.leased.lock().await.insert(key.clone());
         service.clients.lock().await.insert(
@@ -2549,7 +2574,30 @@ mod tests {
     fn clangd_keeps_preambles_out_of_shared_temporary_storage() {
         let spec = spec_for_id("clangd").expect("clangd spec");
 
-        assert!(spec.args.contains(&"--pch-storage=memory"));
+        assert!(spec.args.contains(&"--pch-storage=disk"));
+        let mut command = Command::new(spec.command);
+        let storage = configure_private_preamble_storage(spec, &mut command)
+            .expect("private storage")
+            .expect("clangd storage");
+        let path = storage.path().to_path_buf();
+        assert_eq!(
+            path.parent(),
+            Some(
+                crate::host_paths::host_home()
+                    .join("lsp-preambles")
+                    .as_path()
+            )
+        );
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            assert!(
+                command
+                    .as_std()
+                    .get_envs()
+                    .any(|(key, value)| { key == name && value == Some(path.as_os_str()) })
+            );
+        }
+        drop(storage);
+        assert!(!path.exists());
     }
 
     #[tokio::test]
@@ -2971,6 +3019,7 @@ mod tests {
             opened_versions: HashMap::new(),
             last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
+            _private_preamble_storage: None,
         };
         let publication = |version: Value, diagnostics: Value| {
             json!({
@@ -3045,6 +3094,7 @@ mod tests {
             opened_versions: HashMap::new(),
             last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
+            _private_preamble_storage: None,
         };
         let clangd = spec_for_id("clangd").expect("spec");
         let result = timeout(
@@ -3105,6 +3155,7 @@ mod tests {
             opened_versions: HashMap::new(),
             last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
+            _private_preamble_storage: None,
         };
         let report = client
             .document_workspace_diagnostics(
