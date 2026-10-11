@@ -9350,7 +9350,7 @@ mod tests {
                         if kind == "context_compaction_failed")));
                 assert_eq!(last_usage_context, Some(181_000));
             } else {
-                let reduced_context = events.iter().find_map(|event| match event {
+                let reduced_context = events.iter().rev().find_map(|event| match event {
                     SessionEventKind::ContextWindowUpdated { context_tokens, .. } => {
                         Some(*context_tokens)
                     }
