@@ -14430,6 +14430,8 @@ fn sticky_tool_run_header_row_covers_only_overflowing_boxes() {
 #[test]
 fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     let mut transcript = Transcript::default();
+    assert!(!transcript.show_action_done_at);
+    let completed_at = Utc::now();
     let tool = |index, reasoning| TranscriptEntry::Tool {
         source_name: if reasoning { "reasoning" } else { "Run" }.to_string(),
         name: if reasoning { "Reasoned" } else { "Run" }.to_string(),
@@ -14439,7 +14441,7 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
         payload_refs: Vec::new(),
         time: "19:38".to_string(),
         started_at: Utc::now(),
-        completed_at: Some(Utc::now()),
+        completed_at: Some(completed_at),
         complete: true,
         error: false,
         user_interrupted: false,
@@ -14510,13 +14512,26 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    assert!(!text(&render(&transcript)).contains("done at"));
+    transcript.show_action_done_at = true;
     let collapsed_child = render(&transcript);
     let rendered = text(&collapsed_child);
     assert_eq!(rendered.matches(" actions").count(), 1);
     assert!(rendered.contains("▾ 19:38 · 14 actions"), "{rendered}");
-    assert!(rendered.contains("  ▸ 19:38  ◦ Reasoned (5)"), "{rendered}");
-    assert!(rendered.contains("  ▾ 19:38 · Run (2)"), "{rendered}");
-    assert!(rendered.contains("  ▾ 19:38 · Watch (2)"), "{rendered}");
+    let done_at = format!(
+        "done at {}",
+        completed_at.with_timezone(&Local).format("%H:%M")
+    );
+    assert_eq!(rendered.matches(&done_at).count(), 1, "{rendered}");
+    let header = collapsed_child.0[0].to_string();
+    assert!(header.ends_with(&done_at), "{header}");
+    assert_eq!(collapsed_child.0[0].width(), 100);
+    assert!(rendered.contains("  ▸ ◦ Reasoned (5)"), "{rendered}");
+    assert!(rendered.contains("  ▸ ◦ Reasoned\n"), "{rendered}");
+    assert!(!rendered.contains("Reasoned (1)"), "{rendered}");
+    assert!(!rendered.contains("19:38  ◦ Reasoned"), "{rendered}");
+    assert!(rendered.contains("  ▾ Run (2)"), "{rendered}");
+    assert!(rendered.contains("  ▾ Watch (2)"), "{rendered}");
     assert!(
         rendered.contains("\n  19:38  agent · /root/v391_scaling_audit · started"),
         "{rendered}"
@@ -14583,7 +14598,9 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     if let TranscriptEntry::Action { state, .. } = transcript.order.get_mut(10).unwrap() {
         *state = TranscriptActionState::Running;
     }
-    assert!(text(&render(&transcript)).contains("▾ 19:38 · 14 actions"));
+    let running = text(&render(&transcript));
+    assert!(running.contains("▾ 19:38 · 14 actions"));
+    assert!(!running.contains("done at"), "{running}");
     if let TranscriptEntry::Action { state, .. } = transcript.order.get_mut(10).unwrap() {
         *state = TranscriptActionState::Complete;
     }

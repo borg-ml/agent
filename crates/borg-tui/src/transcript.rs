@@ -319,6 +319,7 @@ struct Transcript {
     auto_expand_thinking: bool,
     action_descriptors: bool,
     pub(crate) wrap_action_rows: bool,
+    pub(crate) show_action_done_at: bool,
     pub(crate) response_streaming: borg_ui::preferences::ResponseStreaming,
     /// Paragraph streaming: the unfinished end of each in-progress reply,
     /// shown once it completes a block or the reply ends.
@@ -467,6 +468,7 @@ impl Default for Transcript {
             auto_expand_thinking: false,
             action_descriptors: true,
             wrap_action_rows: false,
+            show_action_done_at: false,
             // A bare transcript shows text as it arrives; the terminal applies
             // the user's streaming preference to every transcript it shows.
             response_streaming: borg_ui::preferences::ResponseStreaming::Token,
@@ -869,7 +871,12 @@ fn same_action_type(left: &TranscriptEntry, right: &TranscriptEntry) -> bool {
 }
 
 /// A group's header: when it started, how many actions, and where commands ran.
-fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: &str) -> String {
+fn tool_window_summary(
+    entries: &[TranscriptEntry],
+    total: usize,
+    today_prefix: &str,
+    show_time: bool,
+) -> String {
     if entries.iter().all(is_reasoning_entry) {
         let running = entries.iter().any(|entry| {
             matches!(
@@ -881,13 +888,24 @@ fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: 
             )
         });
         return format!(
-            "{}  {} {} ({total})",
-            match &entries[0] {
-                TranscriptEntry::Tool { time, .. } => display_local_time(time, today_prefix),
-                _ => unreachable!(),
+            "{}{} {}{}",
+            if show_time {
+                match &entries[0] {
+                    TranscriptEntry::Tool { time, .. } => {
+                        format!("{}  ", display_local_time(time, today_prefix))
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                String::new()
             },
             if running { "◇" } else { "◦" },
-            if running { "Reasoning" } else { "Reasoned" }
+            if running { "Reasoning" } else { "Reasoned" },
+            if total > 1 {
+                format!(" ({total})")
+            } else {
+                String::new()
+            }
         );
     }
     let mut time = None;
@@ -3563,11 +3581,13 @@ impl Transcript {
                     if let Some(TranscriptEntry::Action {
                         detail: row_detail,
                         state: row_state,
+                        time: row_time,
                         ..
                     }) = self.order.get_mut(index)
                     {
                         *row_detail = detail;
                         *row_state = state;
+                        *row_time = local_event_time(event);
                     }
                 } else {
                     let index = self.order.len();
@@ -6075,7 +6095,8 @@ impl Transcript {
                         tool_window_summary(
                             &self.order[window.start..window.end],
                             window.total,
-                            &today_prefix
+                            &today_prefix,
+                            true,
                         )
                     ),
                     Style::default().fg(Color::DarkGray),
@@ -6102,18 +6123,15 @@ impl Transcript {
                         &self.order[window.start..window.end],
                         window.total,
                         &today_prefix,
+                        false,
                     )
                 } else {
-                    let (time, label) = match entry {
-                        TranscriptEntry::Tool { time, name, .. } => (time, name),
-                        TranscriptEntry::Action { time, label, .. } => (time, label),
+                    let label = match entry {
+                        TranscriptEntry::Tool { name, .. } => name,
+                        TranscriptEntry::Action { label, .. } => label,
                         _ => unreachable!(),
                     };
-                    format!(
-                        "{} · {label} ({})",
-                        display_local_time(time, &today_prefix),
-                        window.total
-                    )
+                    format!("{label} ({})", window.total)
                 };
                 let row = lines.len();
                 lines.push(tool_window_header(
@@ -6534,14 +6552,18 @@ impl Transcript {
                     state,
                     expanded,
                 } => {
-                    let time = display_local_time(time, &today_prefix);
+                    let time = if tool_window.is_some() {
+                        String::new()
+                    } else {
+                        format!("{}  ", display_local_time(time, &today_prefix))
+                    };
                     let prefix = "  ";
                     let glyph = transcript_action_glyph(*state);
                     let color = transcript_action_color(*kind, *state);
                     let mut summary = if detail.is_empty() {
-                        format!("{time}  {glyph} {label}")
+                        format!("{time}{glyph} {label}")
                     } else {
-                        format!("{time}  {glyph} {label:<9}  {detail}")
+                        format!("{time}{glyph} {label:<9}  {detail}")
                     };
                     // A single-line row still says what the message is about.
                     if !self.wrap_action_rows
@@ -7299,6 +7321,7 @@ impl Transcript {
                             &self.order[window.start..window.end],
                             window.total,
                             &today_prefix,
+                            true,
                         ),
                         action_hint
                     ),
@@ -7342,6 +7365,21 @@ impl Transcript {
                         ));
                     }
                 }
+                let mut header_right = (self.show_action_done_at
+                    && !self.window_has_unfinished_work(&window))
+                .then(|| {
+                    self.order[window.start..window.end]
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            TranscriptEntry::Tool { completed_at, .. } => completed_at
+                                .map(|time| canonical_local_time(time.with_timezone(&Local))),
+                            TranscriptEntry::Action { time, .. } => Some(time.clone()),
+                            _ => None,
+                        })
+                        .max()
+                })
+                .flatten()
+                .map(|time| format!("done at {}", display_local_time(&time, &today_prefix)));
                 if reasoning_group {
                     let reasoning_index = (window.start..window.end)
                         .find(|index| {
@@ -7362,17 +7400,27 @@ impl Transcript {
                         && let Some(elapsed) =
                             format_tool_elapsed_at(*started_at, *completed_at, render_time)
                     {
-                        let header = &mut lines[header_row];
-                        let padding = width.saturating_sub(header.width() + elapsed.width());
-                        header.spans.push(Span::styled(
-                            format!("{}{}", " ".repeat(padding.max(2)), elapsed),
-                            Style::default().fg(Color::DarkGray),
-                        ));
+                        header_right = Some(match &header_right {
+                            Some(done_at) => format!("{elapsed} · {done_at}"),
+                            None => elapsed,
+                        });
                     }
                     tool_rows.insert(
                         first_tool_row,
                         (reasoning_index, header_row, header_row + 1),
                     );
+                }
+                if let Some(right) = header_right {
+                    let header = &mut lines[header_row];
+                    header.spans = truncate_status_spans(
+                        std::mem::take(&mut header.spans),
+                        width.saturating_sub(right.width() + 2),
+                    );
+                    let padding = width.saturating_sub(header.width() + right.width());
+                    header.spans.push(Span::styled(
+                        format!("{}{}", " ".repeat(padding), right),
+                        Style::default().fg(Color::DarkGray),
+                    ));
                 }
                 let run_entry_rows = entry_rows.split_off(first_entry_row);
                 for (entry_index, start, end) in run_entry_rows {

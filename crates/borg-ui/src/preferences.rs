@@ -202,6 +202,7 @@ pub struct PresentationPreferences {
     pub composer_cursor_style: ComposerCursorStyle,
     /// Let tool and action rows wrap onto more lines; off keeps each row on one line.
     pub wrap_action_rows: bool,
+    pub show_action_done_at: bool,
     pub dictation_icon: Option<DictationIconStyle>,
     /// Selected managed dictation model id (e.g. "parakeet-v2"); `None` uses
     /// the built-in default.
@@ -227,6 +228,7 @@ impl Default for PresentationPreferences {
             running_sweeps: true,
             composer_cursor_style: ComposerCursorStyle::Underline,
             wrap_action_rows: false,
+            show_action_done_at: false,
             dictation_icon: None,
             dictation_model: None,
             dictation_accelerator: None,
@@ -623,6 +625,7 @@ keep = true
                 running_sweeps: false,
                 composer_cursor_style: ComposerCursorStyle::Bar,
                 wrap_action_rows: true,
+                show_action_done_at: true,
                 dictation_icon: Some(DictationIconStyle::NerdFont),
                 dictation_model: Some("lightweight".to_string()),
                 dictation_accelerator: Some("auto".to_string()),

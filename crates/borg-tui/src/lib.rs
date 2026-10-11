@@ -951,6 +951,7 @@ pub enum UiAction {
     SetResponseStreaming(ResponseStreaming),
     SetActionDescriptors(bool),
     SetWrapActionRows(bool),
+    SetShowActionDoneAt(bool),
     SetRunningSweeps(bool),
     SetComposerCursorStyle(ComposerCursorStyle),
     SetCompletionNotifications(CompletionAlertPolicy),
@@ -2013,6 +2014,7 @@ enum PickerKind {
     ResponseStreaming,
     ActionDescriptors,
     WrapActionRows,
+    ShowActionDoneAt,
     RunningSweeps,
     ComposerCursorStyle,
     CompletionNotifications,
@@ -5684,6 +5686,7 @@ impl BorgTerminal {
             "Running sweep animations".to_string(),
             "Composer cursor".to_string(),
             "Wrap action rows".to_string(),
+            "Action group completion times".to_string(),
             "Completion notifications".to_string(),
             "Completion sound".to_string(),
             "Auto-copy selections".to_string(),
@@ -5714,6 +5717,7 @@ impl BorgTerminal {
             "/animations",
             "cursor-style",
             "/wrap-actions",
+            "/done-at",
             "/notifications",
             "/sound",
             "auto-copy",
@@ -6130,6 +6134,26 @@ impl BorgTerminal {
     pub fn set_wrap_action_rows(&mut self, enabled: bool) {
         if self.transcript.wrap_action_rows != enabled {
             self.transcript.wrap_action_rows = enabled;
+            self.invalidate_transcript_render_cache();
+        }
+    }
+
+    pub fn open_show_action_done_at_picker(&mut self) {
+        self.picker = Some(Picker::new(
+            PickerKind::ShowActionDoneAt,
+            "Show action group completion times",
+            ["Off", "On"],
+            Some(if self.transcript.show_action_done_at {
+                "On"
+            } else {
+                "Off"
+            }),
+        ));
+    }
+
+    pub fn set_show_action_done_at(&mut self, enabled: bool) {
+        if self.transcript.show_action_done_at != enabled {
+            self.transcript.show_action_done_at = enabled;
             self.invalidate_transcript_render_cache();
         }
     }
@@ -8237,6 +8261,9 @@ impl BorgTerminal {
             }
             PickerKind::WrapActionRows => {
                 UiAction::SetWrapActionRows(picker.selected_value() == "On")
+            }
+            PickerKind::ShowActionDoneAt => {
+                UiAction::SetShowActionDoneAt(picker.selected_value() == "On")
             }
             PickerKind::RunningSweeps => {
                 UiAction::SetRunningSweeps(picker.selected_value() == "On")
@@ -11992,6 +12019,7 @@ fn fresh_transcript_like(previous: &Transcript) -> Transcript {
         diff_expansion: previous.diff_expansion,
         auto_expand_tools: previous.auto_expand_tools,
         auto_expand_thinking: previous.auto_expand_thinking,
+        show_action_done_at: previous.show_action_done_at,
         tool_click_behavior: previous.tool_click_behavior,
         response_streaming: previous.response_streaming,
         show_subagent_messages: previous.show_subagent_messages,
