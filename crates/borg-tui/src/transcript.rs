@@ -5781,11 +5781,11 @@ impl Transcript {
         for resume in resumes.iter_mut() {
             resume.changed_from = resume.changed_from.min(changed_from);
         }
-        let resume = resumes
+        let mut resume = resumes
             .iter()
             .position(|resume| resume.inputs == inputs)
             .map(|position| resumes.remove(position));
-        let start = resume.as_ref().map_or(0, |resume| {
+        let start = resume.as_mut().map_or(0, |resume| {
             self.render_resume_start(
                 resume,
                 &windows,
@@ -5897,7 +5897,7 @@ impl Transcript {
 
     fn render_resume_start(
         &self,
-        resume: &RenderResume,
+        resume: &mut RenderResume,
         windows: &[Option<ToolRunWindow>],
         running_tool: bool,
         director_prompt_row: Option<usize>,
@@ -5956,19 +5956,23 @@ impl Transcript {
         {
             start = start.min(*run);
         }
-        // Running tools can tick anywhere in history, not only in the changed tail.
-        if let Some(row) = resume
-            .trace
-            .clock_rows
-            .iter()
-            .copied()
-            .take_while(|row| *row < start)
-            .find(|row| {
-                render_clock_key(&self.order[*row], resume.render_time)
-                    != render_clock_key(&self.order[*row], render_time)
-            })
-        {
-            start = row;
+        // Ticking a timer must not relayout the unrelated history after it.
+        let mut clock_rows = resume.trace.clock_rows.clone();
+        clock_rows.sort_unstable();
+        clock_rows.dedup();
+        for row in clock_rows {
+            if row >= start {
+                break;
+            }
+            if !self.refresh_render_clock(
+                &mut resume.render,
+                row,
+                resume.inputs.width,
+                resume.render_time,
+                render_time,
+            ) {
+                start = row;
+            }
         }
         // A tool run rewrites its rows once its last entry is drawn, so it is
         // redrawn from its header.
@@ -5982,6 +5986,65 @@ impl Transcript {
             start = run_start;
         }
         start
+    }
+
+    /// Updates only timer headers; changed widths or wrapped labels need layout.
+    fn refresh_render_clock(
+        &self,
+        render: &mut Arc<TranscriptRender>,
+        index: usize,
+        width: usize,
+        cached_time: DateTime<Utc>,
+        render_time: DateTime<Utc>,
+    ) -> bool {
+        let cached = render_clock_key(&self.order[index], cached_time);
+        let current = render_clock_key(&self.order[index], render_time);
+        if cached == current {
+            return true;
+        }
+        let (Some(cached), Some(current)) = (cached, current) else {
+            return false;
+        };
+        if cached.width() != current.width()
+            || (matches!(self.order[index], TranscriptEntry::Tool { .. })
+                && width <= current.width().max(8) + 6)
+        {
+            return false;
+        }
+        let mut rows = render
+            .1
+            .iter()
+            .chain(&render.4)
+            .filter_map(|(entry, start, _)| (*entry == index).then_some(*start))
+            .chain(
+                render
+                    .8
+                    .iter()
+                    .filter_map(|(_, start, _, timer)| (*timer == Some(index)).then_some(*start)),
+            )
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows.dedup();
+        if rows.iter().any(|row| {
+            !render.0[*row]
+                .spans
+                .iter()
+                .any(|span| span.content.ends_with(&cached))
+        }) {
+            return false;
+        }
+        let cached = [(index, Some(cached))];
+        let current = [(index, Some(current))];
+        let render = Arc::make_mut(render);
+        for row in rows {
+            refresh_tool_elapsed_line(&mut render.0[row], index, &cached, &current);
+        }
+        for (entry, elapsed) in &mut render.7 {
+            if *entry == index {
+                *elapsed = current[0].1.clone();
+            }
+        }
+        true
     }
 
     #[cfg(test)]

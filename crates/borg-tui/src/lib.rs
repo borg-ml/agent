@@ -1674,6 +1674,7 @@ pub struct BorgTerminal {
     git_pull_hovered: bool,
     status: SessionStatus,
     interrupt_requested: bool,
+    interrupt_acknowledged: bool,
     interrupt_requested_at: Option<Instant>,
     connection_retry_at: Option<DateTime<Utc>>,
     /// Which attempt of the bounded resend chain the countdown belongs to, as
@@ -3105,6 +3106,7 @@ impl BorgTerminal {
             git_pull_hovered: false,
             status: SessionStatus::Starting,
             interrupt_requested: false,
+            interrupt_acknowledged: false,
             interrupt_requested_at: None,
             connection_retry_at: None,
             connection_retry_attempt: None,
@@ -3311,6 +3313,7 @@ impl BorgTerminal {
         self.git_pull_hovered = false;
         self.status = SessionStatus::Starting;
         self.interrupt_requested = false;
+        self.interrupt_acknowledged = false;
         self.session_state_sequence = 0;
         self.pending_approval = false;
         self.pending_provider_interaction = false;
@@ -3424,6 +3427,20 @@ impl BorgTerminal {
         self.keymap = KeyMap::from_config(keybindings)?;
         self.event_redraw_needed = true;
         Ok(())
+    }
+
+    pub fn acknowledge_interrupt(&mut self) {
+        self.apply_session_event(&SessionEvent::new(
+            self.session_id,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                detail: Some("Interrupted".into()),
+            },
+        ));
+        self.interrupt_acknowledged = true;
+        self.interrupt_requested = false;
+        self.set_notice("Stopped · saving state and cleaning up");
     }
 
     pub fn handle_external_interrupt(&mut self) {
@@ -3810,6 +3827,7 @@ impl BorgTerminal {
         self.withheld_queued_prompt = None;
         self.status = SessionStatus::Starting;
         self.interrupt_requested = false;
+        self.interrupt_acknowledged = false;
         self.activity_clock.restart(event.created_at);
         self.transcript.follow_tail = true;
         self.invalidate_transcript_render_cache();
@@ -4109,13 +4127,20 @@ impl BorgTerminal {
             if is_active && !was_active {
                 self.borging_this_run = borging_for_run(Uuid::new_v4());
             }
-            self.status = status;
+            if !self.interrupt_acknowledged || !is_active {
+                self.status = status;
+                self.activity_clock.observe(status, event.created_at);
+            }
             if !status_control_is_actionable(status) {
                 self.interrupt_requested = false;
             }
-            self.activity_clock.observe(status, event.created_at);
         }
-        if matches!(event.kind, SessionEventKind::TurnStarted { .. }) {
+        if matches!(event.kind, SessionEventKind::TurnCompleted { .. }) {
+            self.interrupt_acknowledged = false;
+        }
+        if matches!(event.kind, SessionEventKind::TurnStarted { .. })
+            && !self.interrupt_acknowledged
+        {
             self.interrupt_requested = false;
             self.activity_clock.restart(event.created_at);
         }

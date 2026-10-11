@@ -3215,6 +3215,19 @@ fn instant_tools_keep_a_diamond_without_animation() {
 fn tool_lifecycle_labels_use_progressive_and_past_tense() {
     assert_eq!(tool_lifecycle_label("Run", false), "Running…");
     assert_eq!(tool_lifecycle_label("Run", true), "Ran");
+    for (name, running, completed) in [
+        ("Build project", "Building project…", "Built project"),
+        ("Rebuild projects", "Rebuilding projects…", "Rebuilt projects"),
+        ("Compile module", "Compiling module…", "Compiled module"),
+        ("Compile modules", "Compiling modules…", "Compiled modules"),
+        ("Verify files", "Verifying files…", "Verified files"),
+        ("Audit reasoning", "Auditing reasoning…", "Audited reasoning"),
+        ("Apply patches", "Applying patches…", "Applied patches"),
+        ("Clear caches", "Clearing caches…", "Cleared caches"),
+    ] {
+        assert_eq!(tool_lifecycle_label(name, false), running);
+        assert_eq!(tool_lifecycle_label(name, true), completed);
+    }
     assert_eq!(
         tool_lifecycle_label("Inspect repository", false),
         "Inspecting repository…"
@@ -5129,6 +5142,98 @@ fn incremental_transcript_render_matches_a_full_render_through_a_live_session() 
         resumed * 2 > checks,
         "only {resumed} of {checks} renders kept an unchanged prefix"
     );
+}
+
+// An old live timer used to redraw every entry after it once per second.
+// Layout counters guard the history-size cost; full-render equality also guards
+// stale labels, metadata, and the width-changing/narrow-terminal fallback.
+#[test]
+fn incremental_transcript_clock_tick_preserves_unrelated_history() {
+    let session_id = Uuid::new_v4();
+    let started = Utc::now();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::GoalUpdated {
+            goal: SessionGoal {
+                updated_at: started,
+                ..SessionGoal::new("Keep the UI responsive".to_string(), None)
+            },
+        },
+    ));
+    let mut tool = SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "old-running-tool".to_string(),
+            name: "command_execution".to_string(),
+            input: serde_json::json!({"command": "cargo check"}),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    );
+    tool.created_at = started;
+    transcript.apply(&tool);
+    for index in 0..256 {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            index + 3,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: if index % 2 == 0 {
+                    EventActor::User
+                } else {
+                    EventActor::Assistant
+                },
+                text: format!("Unrelated completed history {index} with **formatting**."),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ));
+    }
+    for width in [100, 98, 12] {
+        let first = transcript.render_for_cache_at(
+            width,
+            DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT,
+            started + chrono::Duration::seconds(119),
+        );
+        for seconds in [120, 121, 600] {
+            let now = started + chrono::Duration::seconds(seconds);
+            let tick = transcript.render_for_cache_at(width, DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT, now);
+            let redrawn_from = transcript
+                .render_resumes
+                .borrow()
+                .last()
+                .unwrap()
+                .redrawn_from;
+            if seconds < 600 && width > 14 {
+                assert_eq!(
+                    redrawn_from,
+                    transcript.order.len(),
+                    "equal-width clock tick must not relayout unrelated history"
+                );
+            } else {
+                assert!(
+                    redrawn_from < transcript.order.len(),
+                    "changed geometry must fall back to layout"
+                );
+            }
+            assert_ne!(first.7, tick.7, "the running tool timer must advance");
+            let full = transcript.render_with_tool_run_viewport_mode(
+                width,
+                DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT,
+                None,
+                None,
+                None,
+                true,
+                None,
+                now,
+            );
+            assert_eq!(*tick, full, "clock tick at {seconds}s, width {width}");
+        }
+    }
 }
 
 #[test]

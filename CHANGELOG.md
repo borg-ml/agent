@@ -12,6 +12,26 @@ Git comparison.
 - Fold repeated action groups by default once a different action follows them
   or they reach five actions. The newest group under four actions stays open,
   and a group with a still-running action stays open.
+- Avoid redundant immediate redraws during event bursts, and update elapsed-time
+  labels without re-rendering the unrelated transcript tail.
+- Use progressive and past-tense labels for more actions, including builds,
+  compilation, verification, audits, and patch application.
+
+### Reliability
+
+- Acknowledge stop requests and abort generation independently of slow journal
+  writes and full command queues. Save interruption state and clean up tools
+  separately, without waiting indefinitely for an aborted turn.
+- Cancel a running tool when its turn is aborted, while preserving commands
+  intentionally left running after a successful background yield.
+
+### Reasoning
+
+- Preserve reasoning-only encrypted GPT Responses and signed or redacted Claude
+  output through continuation and replay repair, rather than dropping assistant
+  messages with no visible text or tool calls.
+- Keep opaque GPT reasoning during replay without resurrecting native tool calls
+  that request repair removed.
 
 ## 0.15.7 (2026-10-11)
 
