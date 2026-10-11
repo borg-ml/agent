@@ -101,4 +101,4 @@ compilers cannot detect a wrong wire header or a zero-cost encrypted history.
 Verified suites: runtime 1,125 passed (12 ignored); provider 187 passed plus 6
 integration tests (5 ignored); TUI 523 passed (21 ignored). The final workspace
 LSP pass scanned 206 documents with no diagnostics. The TUI suite also checks
-that only “Compacted context” is orange and its displayed separator has no colon.
+that only the compaction marker and “Compacted context” title are orange and its displayed separator has no colon.

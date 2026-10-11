@@ -6951,14 +6951,14 @@ impl Transcript {
                         String::new()
                     };
                     lines.push(Line::from(vec![
-                        Span::styled("▌ ", Style::default().fg(Color::Gray)),
+                        Span::styled("▌ ", Style::default().fg(BORG_ORANGE)),
                         Span::styled(
                             title,
                             Style::default()
                                 .fg(BORG_ORANGE)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(detail, Style::default().fg(Color::Gray)),
+                        Span::styled(detail, Style::default().fg(Color::DarkGray)),
                         Span::styled(format!("  {time}"), Style::default().fg(Color::DarkGray)),
                     ]));
                     if (*expanded || focused_tool == Some(index)) && expandable {

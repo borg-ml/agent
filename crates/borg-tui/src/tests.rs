@@ -12739,7 +12739,7 @@ fn compaction_completion_updates_the_live_card_and_can_expand() {
             .filter(|span| span.style.fg == Some(BORG_ORANGE))
             .map(|span| span.content.as_ref())
             .collect::<String>(),
-        "Compacted context"
+        "▌ Compacted context"
     );
     assert!(
         header

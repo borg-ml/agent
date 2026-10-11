@@ -7,6 +7,8 @@ Git comparison.
 
 ### Terminal
 
+- Color the compaction marker and “Compacted context” title orange, and render
+  the compaction summary in a darker grey.
 - Fold repeated action groups by default once a different action follows them
   or they reach five actions. The newest group under four actions stays open,
   and a group with a still-running action stays open.
