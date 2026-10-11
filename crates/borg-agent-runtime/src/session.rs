@@ -5358,16 +5358,16 @@ async fn run_agent_session_store_kernel_inner(
                         track_provider_interaction(&kind, &mut pending_provider_interaction);
                         let usage = goal_token_usage(&kind, &mut native_goal_usage);
                         if let SessionEventKind::UsageUpdated { context_tokens, .. } = &kind {
-                        native_context_usage = *context_tokens;
-                    } else if matches!(&kind, SessionEventKind::ProviderEvent { kind, payload, .. }
-                        if kind == NATIVE_CONTEXT_EDIT_EVENT || (kind == "context_compaction" || kind == "context_microcompaction")
-                            && payload.get("status").and_then(Value::as_str) == Some("completed")) {
-                        native_context_usage = None;
-                    }
-                    if context_usage_observation(&kind) {
-                        provider_context_usage_valid = true;
-                    }
-                    record_provider_event(
+                            native_context_usage = *context_tokens;
+                        } else if matches!(&kind, SessionEventKind::ProviderEvent { kind, payload, .. }
+                            if kind == NATIVE_CONTEXT_EDIT_EVENT || (kind == "context_compaction" || kind == "context_microcompaction")
+                                && payload.get("status").and_then(Value::as_str) == Some("completed")) {
+                            native_context_usage = None;
+                        }
+                        if context_usage_observation(&kind) {
+                            provider_context_usage_valid = true;
+                        }
+                        record_provider_event(
                             kind,
                             &mut pending_steers,
                             &mut steers_awaiting_consumption,
@@ -7197,13 +7197,13 @@ async fn run_agent_session_store_kernel_inner(
                     track_provider_interaction(&kind, &mut pending_provider_interaction);
                     let usage = goal_token_usage(&kind, &mut native_goal_usage);
                     if let SessionEventKind::UsageUpdated { context_tokens, .. } = &kind {
-                            native_context_usage = *context_tokens;
-                        } else if matches!(&kind, SessionEventKind::ProviderEvent { kind, payload, .. }
-                            if kind == NATIVE_CONTEXT_EDIT_EVENT || (kind == "context_compaction" || kind == "context_microcompaction")
-                                && payload.get("status").and_then(Value::as_str) == Some("completed")) {
-                            native_context_usage = None;
-                        }
-                        if context_usage_observation(&kind) {
+                        native_context_usage = *context_tokens;
+                    } else if matches!(&kind, SessionEventKind::ProviderEvent { kind, payload, .. }
+                        if kind == NATIVE_CONTEXT_EDIT_EVENT || (kind == "context_compaction" || kind == "context_microcompaction")
+                            && payload.get("status").and_then(Value::as_str) == Some("completed")) {
+                        native_context_usage = None;
+                    }
+                    if context_usage_observation(&kind) {
                         provider_context_usage_valid = true;
                     }
                     record_provider_event(
