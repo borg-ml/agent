@@ -11936,7 +11936,7 @@ fn recovered_idle_session_stops_orphaned_tool_spinner() {
 
 #[tokio::test]
 #[ignore = "requires a PTY; exercises Esc and Up with a queued prompt and a typed draft"]
-async fn escape_flushes_pending_queue_without_interrupting_and_keeps_the_composer_draft() {
+async fn escape_flushes_pending_queue_without_latching_a_stop_and_keeps_the_composer_draft() {
     let session_id = Uuid::new_v4();
     let directory = tempfile::tempdir().unwrap();
     let mut terminal = BorgTerminal::enter(
@@ -11955,7 +11955,8 @@ async fn escape_flushes_pending_queue_without_interrupting_and_keeps_the_compose
     });
     terminal.composer.insert("unsent draft");
 
-    // Esc flushes queued input into the active turn; it does not stop the agent.
+    // Esc ends the turn at once and starts the queued input; it does not
+    // latch a stop the way a plain interrupt does.
     assert!(matches!(
         terminal
             .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -11964,7 +11965,7 @@ async fn escape_flushes_pending_queue_without_interrupting_and_keeps_the_compose
     ));
     assert!(!terminal.interrupt_requested);
     assert!(
-        !terminal.transcript.order.iter().any(|entry| matches!(entry,
+        terminal.transcript.order.iter().any(|entry| matches!(entry,
             TranscriptEntry::Activity { text, .. } if text == USER_INTERRUPT_ACTIVITY
         ))
     );

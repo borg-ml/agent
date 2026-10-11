@@ -1300,7 +1300,9 @@ async fn handle_control_connection(
                 });
             }
             if !recovered.is_empty() {
-                commands
+                priority
+                    .as_ref()
+                    .unwrap_or(&commands)
                     .send(HostCommand::RecoverPendingInput {
                         session_id,
                         prompts: recovered,
@@ -1309,7 +1311,10 @@ async fn handle_control_connection(
                     .map_err(|_| anyhow::anyhow!("session owner stopped"))?;
             }
         }
-        let sender = if matches!(command, HostCommand::Interrupt { .. }) {
+        let sender = if matches!(
+            command,
+            HostCommand::Interrupt { .. } | HostCommand::FlushPendingInput { .. }
+        ) {
             priority.as_ref().unwrap_or(&commands)
         } else {
             &commands

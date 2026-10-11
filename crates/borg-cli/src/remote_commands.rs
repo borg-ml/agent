@@ -5460,10 +5460,10 @@ async fn run_local_agent_session(
                             HostCommand::BroadcastInstances { session_id, text },
                         );
                     }
-                    UiAction::FlushPendingInput { target } => {
-                        let command = target.map_or_else(
-                            || HostCommand::FlushPendingInput { session_id },
-                            |target| HostCommand::Subagent {
+                    UiAction::FlushPendingInput { target: Some(target) } => {
+                        dispatch_ui_command(
+                            &ui_interaction_tx,
+                            HostCommand::Subagent {
                                 session_id,
                                 action: SubagentAction::FlushPendingInput {
                                     request_id: Uuid::new_v4(),
@@ -5471,7 +5471,33 @@ async fn run_local_agent_session(
                                 },
                             },
                         );
-                        dispatch_ui_command(&ui_interaction_tx, command);
+                    }
+                    // Flushing interrupts the turn, so it takes the interrupt's
+                    // lane rather than queueing behind prompt admission.
+                    UiAction::FlushPendingInput { target: None } => {
+                        let command = HostCommand::FlushPendingInput { session_id };
+                        let dispatched = if session_access.is_attached() {
+                            let socket = control_socket_path.clone();
+                            let fallback = session_command_tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) =
+                                    send_local_session_command(&socket, session_id, command.clone())
+                                        .await
+                                {
+                                    tracing::warn!(%error, "direct pending-input flush failed; retrying through attached actor");
+                                    let _ = fallback.send(command).await;
+                                }
+                            });
+                            true
+                        } else {
+                            dispatch_host_command_without_blocking(&interrupt_tx, command)
+                        };
+                        if !dispatched {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .set_notice("Could not reach the session actor".to_string());
+                        }
                     }
                     UiAction::Rewind {
                         sequence,

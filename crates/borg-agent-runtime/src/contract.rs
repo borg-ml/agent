@@ -1489,8 +1489,8 @@ pub enum HostCommand {
         session_id: Uuid,
         text: String,
     },
-    /// Promote every queued human prompt into the active provider turn.
-    /// Unlike `Interrupt`, this never cancels the turn.
+    /// End the active turn at once and start the queued human prompts. Unlike
+    /// `Interrupt`, this neither latches a user stop nor pauses the goal.
     FlushPendingInput {
         session_id: Uuid,
     },

@@ -5318,16 +5318,20 @@ impl BorgTerminal {
         }
         self.interrupt_requested_at = Some(Instant::now());
         if status == SessionStatus::Running {
-            self.transcript.order.push(TranscriptEntry::Activity {
-                text: USER_INTERRUPT_ACTIVITY.to_string(),
-                time: canonical_local_time(Local::now()),
-            });
-            self.transcript.follow_tail = true;
-            self.scroll_from_bottom = 0;
-            self.invalidate_transcript_render_cache();
-            self.event_redraw_needed = true;
+            self.show_user_interrupt();
         }
         true
+    }
+
+    fn show_user_interrupt(&mut self) {
+        self.transcript.order.push(TranscriptEntry::Activity {
+            text: USER_INTERRUPT_ACTIVITY.to_string(),
+            time: canonical_local_time(Local::now()),
+        });
+        self.transcript.follow_tail = true;
+        self.scroll_from_bottom = 0;
+        self.invalidate_transcript_render_cache();
+        self.event_redraw_needed = true;
     }
 
     fn has_pending_input_for_escape(&self) -> bool {
@@ -5348,6 +5352,7 @@ impl BorgTerminal {
             self.child_active_turn_followups.remove(&child);
         } else {
             self.active_turn_followup = false;
+            self.show_user_interrupt();
         }
         self.notice = Some("Sending pending input".to_string());
         UiAction::FlushPendingInput { target }

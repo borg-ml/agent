@@ -7099,7 +7099,9 @@ async fn run_agent_session_store_kernel_inner(
                         if let Ok(command) = commands.try_recv() {
                             let cancellation = matches!(
                                 command,
-                                HostCommand::Interrupt { .. } | HostCommand::Stop { .. }
+                                HostCommand::Interrupt { .. }
+                                    | HostCommand::Stop { .. }
+                                    | HostCommand::FlushPendingInput { .. }
                             );
                             deferred_commands.push_front(command);
                             if cancellation {
