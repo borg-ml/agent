@@ -1882,7 +1882,7 @@ impl NativeHarness {
             crate::session::IN_PLACE_COMPACTION_PROMPT,
         ));
         canonicalize_native_messages(&mut messages);
-        repair_native_messages(&mut messages);
+        repair_native_messages(&mut messages, provider);
         if validate_native_messages(&messages).is_err() {
             return Ok(None);
         }
@@ -2192,7 +2192,7 @@ impl NativeHarness {
         context: ModelStreamContext<'_>,
     ) -> Result<NativeModelOutcome> {
         let mut request = request;
-        repair_native_messages(&mut request.messages);
+        repair_native_messages(&mut request.messages, provider);
         validate_native_messages(&request.messages)?;
         call_model_streaming(
             self.model_client.as_ref(),
@@ -4642,7 +4642,7 @@ fn retain_recent_native_messages(
 /// on every attempt while a fresh session on the same lane works. The request
 /// view is repaired here and the transcript keeps every byte: the call nothing
 /// answers is dropped from the request rather than sent.
-fn repair_native_messages(messages: &mut Vec<ModelMessage>) {
+fn repair_native_messages(messages: &mut Vec<ModelMessage>, provider: crate::CodingProvider) {
     let called: HashSet<String> = messages
         .iter()
         .filter_map(|message| match message {
@@ -4664,6 +4664,7 @@ fn repair_native_messages(messages: &mut Vec<ModelMessage>) {
             }
             ModelMessage::Assistant {
                 content,
+                provider_state,
                 tool_calls,
                 ..
             } => {
@@ -4671,7 +4672,38 @@ fn repair_native_messages(messages: &mut Vec<ModelMessage>) {
                 let has_content = content
                     .as_deref()
                     .is_some_and(|content| !content.trim().is_empty());
-                if !tool_calls.is_empty() || has_content {
+                // A reasoning-only length stop still has native continuation
+                // state, but only its originating protocol can replay it.
+                let has_replay = match provider_state {
+                    Some(borg_core::ModelProviderState::OpenAiResponses { output, .. })
+                        if provider == crate::CodingProvider::Codex =>
+                    {
+                        output.iter().any(|item| {
+                            item["type"] == "reasoning"
+                                && item["encrypted_content"]
+                                    .as_str()
+                                    .is_some_and(|value| !value.is_empty())
+                        })
+                    }
+                    Some(borg_core::ModelProviderState::AnthropicMessages { content, .. })
+                        if matches!(
+                            provider,
+                            crate::CodingProvider::Claude | crate::CodingProvider::Anthropic
+                        ) =>
+                    {
+                        content.iter().any(|block| match block["type"].as_str() {
+                            Some("thinking") => block["signature"]
+                                .as_str()
+                                .is_some_and(|value| !value.is_empty()),
+                            Some("redacted_thinking") => block["data"]
+                                .as_str()
+                                .is_some_and(|value| !value.is_empty()),
+                            _ => false,
+                        })
+                    }
+                    _ => false,
+                };
+                if !tool_calls.is_empty() || has_content || has_replay {
                     repaired.push(message);
                 }
             }
@@ -8281,7 +8313,7 @@ mod tests {
             result("answered"),
             result("never_called"),
         ];
-        repair_native_messages(&mut messages);
+        repair_native_messages(&mut messages, crate::CodingProvider::OpenRouter);
         let shape: Vec<String> = messages
             .iter()
             .map(|message| match message {
@@ -8312,6 +8344,89 @@ mod tests {
         );
         validate_native_messages(&messages)
             .expect("the repaired request is one a provider accepts");
+    }
+
+    /// A reasoning-only length stop must reach the next request after durable
+    /// serialization; empty assistants and foreign protocol state must not.
+    #[test]
+    fn reasoning_only_native_continuation_survives_roundtrip_and_request_repair() {
+        use crate::CodingProvider;
+        use borg_core::ModelProviderState;
+
+        let responses = |output| ModelProviderState::OpenAiResponses {
+            output,
+            account_identity: Some("test-account".into()),
+            request_model: Some("test-model".into()),
+            request_effort: Some("high".into()),
+            effective_effort: Some("high".into()),
+        };
+        let anthropic = |content| ModelProviderState::AnthropicMessages {
+            content,
+            account_identity: Some("test-account".into()),
+        };
+        let encrypted = responses(vec![json!({
+            "type":"reasoning", "encrypted_content":"opaque-test-state", "summary":[]
+        })]);
+        let signed = anthropic(vec![json!({
+            "type":"thinking", "thinking":"retained", "signature":"opaque-test-signature"
+        })]);
+        let redacted = anthropic(vec![json!({
+            "type":"redacted_thinking", "data":"opaque-test-redacted"
+        })]);
+        for (provider, state, keep) in [
+            (CodingProvider::Codex, Some(encrypted.clone()), true),
+            (CodingProvider::Claude, Some(signed.clone()), true),
+            (CodingProvider::Anthropic, Some(redacted.clone()), true),
+            (CodingProvider::OpenRouter, Some(encrypted), false),
+            (CodingProvider::Codex, Some(signed), false),
+            (CodingProvider::Claude, Some(responses(vec![])), false),
+            (
+                CodingProvider::Codex,
+                Some(responses(vec![json!({
+                    "type":"reasoning", "summary":[{"type":"summary_text", "text":"stale"}]
+                })])),
+                false,
+            ),
+            (
+                CodingProvider::Claude,
+                Some(anthropic(vec![json!({
+                    "type":"thinking", "thinking":"unsigned"
+                })])),
+                false,
+            ),
+            (
+                CodingProvider::Anthropic,
+                Some(anthropic(vec![json!({
+                    "type":"redacted_thinking", "data":""
+                })])),
+                false,
+            ),
+            (CodingProvider::OpenRouter, None, false),
+        ] {
+            let assistant = ModelMessage::Assistant {
+                content: None,
+                reasoning_content: Some("display-only summary".into()),
+                reasoning_details: None,
+                provider_state: state,
+                tool_calls: vec![],
+            };
+            let source = vec![
+                ModelMessage::user("work"),
+                assistant,
+                ModelMessage::user(LENGTH_CONTINUATION_PROMPT),
+            ];
+            let mut restored: Vec<ModelMessage> =
+                serde_json::from_slice(&serde_json::to_vec(&source).unwrap()).unwrap();
+            repair_native_messages(&mut restored, provider);
+            let mut expected = source;
+            if !keep {
+                expected.remove(1);
+            }
+            canonicalize_native_messages(&mut restored);
+            canonicalize_native_messages(&mut expected);
+            assert_eq!(restored, expected, "{provider:?}");
+            validate_native_messages(&restored).unwrap();
+        }
     }
 
     /// The live failure: a compaction window whose oldest message is an

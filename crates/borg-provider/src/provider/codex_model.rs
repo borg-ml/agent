@@ -837,6 +837,7 @@ impl CodexModelProvider {
                             effective_effort,
                             ..
                         }),
+                    tool_calls,
                     ..
                 } => {
                     if effort_updates
@@ -855,6 +856,14 @@ impl CodexModelProvider {
                         output
                             .iter()
                             .filter(|item| item["type"] != "configuration_update")
+                            // Request repair removes unanswered portable calls;
+                            // native replay must not put them back on the wire.
+                            .filter(|item| {
+                                item["type"] != "function_call"
+                                    || item["call_id"].as_str().is_some_and(|id| {
+                                        tool_calls.iter().any(|call| call.id == id)
+                                    })
+                            })
                             .cloned(),
                     );
                 }
@@ -2285,6 +2294,68 @@ mod tests {
                 assert_eq!(input[2]["name"], "exec");
                 assert!(!body.to_string().contains("opaque-account-state"));
             }
+        }
+    }
+
+    /// Durable opaque state must survive repair without resurrecting a native
+    /// function call whose portable counterpart was removed as unanswered.
+    #[test]
+    fn repaired_native_replay_keeps_reasoning_without_resurrecting_removed_calls() {
+        let provider = CodexModelProvider {
+            model: "test-model".into(),
+            effort: "high".into(),
+        };
+        let reasoning =
+            json!({"type":"reasoning", "encrypted_content":"opaque-test-state", "summary":[]});
+        let (message, _) = ResponseState::default().finish(json!({
+            "status":"completed", "output":[reasoning.clone(),
+                {"type":"function_call", "id":"item-kept", "call_id":"kept", "name":"inspect", "arguments":"{}"},
+                {"type":"function_call", "id":"item-removed", "call_id":"removed", "name":"inspect", "arguments":"{}"}]
+        })).unwrap();
+        let mut restored: ModelMessage =
+            serde_json::from_slice(&serde_json::to_vec(&message).unwrap()).unwrap();
+        let ModelMessage::Assistant {
+            tool_calls,
+            provider_state,
+            ..
+        } = &mut restored
+        else {
+            unreachable!()
+        };
+        tool_calls.retain(|call| call.id == "kept");
+        let Some(ModelProviderState::OpenAiResponses {
+            account_identity, ..
+        }) = provider_state
+        else {
+            unreachable!()
+        };
+        *account_identity = Some("test-account".into());
+        let messages = vec![
+            ModelMessage::user("inspect"),
+            restored,
+            ModelMessage::tool("kept", "ok"),
+        ];
+        for subscription_only in [false, true] {
+            let mut request = ModelTurnRequest {
+                fast: false,
+                ultrafast: false,
+                request_id: None,
+                session_id: None,
+                prompt_cache_key: None,
+                turn_routing: Default::default(),
+                messages: messages.clone(),
+                tools: vec![],
+                output_schema: None,
+            };
+            let body = provider
+                .request_body_for_account(&mut request, "test-account", None, subscription_only)
+                .unwrap();
+            let input = body["input"].as_array().unwrap();
+            assert_eq!(input.len(), 4);
+            assert_eq!(input[1], reasoning);
+            assert_eq!(input[2]["call_id"], "kept");
+            assert_eq!(input[3]["type"], "function_call_output");
+            assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         }
     }
 
