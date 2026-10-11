@@ -5,6 +5,20 @@ Git comparison.
 
 ## Unreleased (since 0.15.6)
 
+### Terminal
+
+- Keep single reasoning blocks as solo rows rather than expandable groups.
+- Match expandable action-group labels to solo action styling, including the
+  purple emphasis for agent waits.
+- Show the same context budget in the footer that automatic compaction checks,
+  including after resume and tool-result trimming.
+
+### Reliability
+
+- Preserve context checkpoint accounting across JSON persistence and resume,
+  preventing unchanged history from falling back to an inflated estimate and
+  compacting prematurely. Keep display estimates separate from measured usage.
+
 ## 0.15.6 (2026-10-11)
 
 ### Terminal
