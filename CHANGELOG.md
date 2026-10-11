@@ -8,7 +8,8 @@ Git comparison.
 ### Terminal
 
 - Fold repeated action groups by default once a different action follows them
-  or they reach five actions, keeping any still-running action open.
+  or they reach five actions. The newest group under four actions stays open,
+  and a group with a still-running action stays open.
 
 ## 0.15.7 (2026-10-11)
 
