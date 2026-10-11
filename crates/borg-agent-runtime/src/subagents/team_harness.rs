@@ -249,10 +249,6 @@ impl SubagentCoordinator {
                 "source": "canonical session store", "observed_at": Utc::now()}),
             );
         }
-        ensure!(
-            actor == self.root_session_id,
-            "only the director may control child goals"
-        );
         let action = args.goal_action.context("goal_action is required")?;
         let state = self.store.state(id).await?;
         let resume_own_interrupt = matches!(action, crate::GoalAction::Resume)
@@ -590,10 +586,6 @@ impl SubagentCoordinator {
                     let _: ConfigureAgentArgs = serde_json::from_value(configuration)?;
                 }
                 "control_agent_goal" => {
-                    ensure!(
-                        actor == self.root_session_id,
-                        "only the director may control child goals"
-                    );
                     ensure!(
                         item.message.is_empty() && item.configuration.is_none(),
                         "control_agent_goal accepts only session_id and goal_action"

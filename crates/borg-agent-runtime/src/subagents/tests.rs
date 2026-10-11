@@ -10137,6 +10137,77 @@ fn message_tool_requires_explicit_notification_or_wake_choice() {
 }
 
 #[tokio::test]
+async fn a_parent_controls_its_childs_goal_but_cannot_lift_a_human_stop() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        3,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+    let (child, grandchild, mut rx) = {
+        let mut table = coordinator.table.lock().await;
+        let child = table.reserve("worker", &launch()).unwrap().session_id;
+        let grandchild = table
+            .reserve_as(child, "nested", &launch())
+            .unwrap()
+            .session_id;
+        let (tx, rx) = mpsc::channel(8);
+        let entry = table.entries.get_mut(&grandchild).unwrap();
+        entry.snapshot.status = SubagentStatus::Running;
+        entry.commands = Some(tx);
+        (child, grandchild, rx)
+    };
+    bind_test_team(directory.path(), &store, root, &[child]).await;
+    store
+        .register_child_session(child, grandchild)
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            grandchild,
+            0,
+            SessionEventKind::GoalUpdated {
+                goal: crate::SessionGoal::new("original".into(), None),
+            },
+        ))
+        .await
+        .unwrap();
+    let set = json!({"target": grandchild, "goal_action": {"type": "set", "objective": "revised"}});
+    let accepted = coordinator
+        .call_tool_as(child, "control_agent_goal", set)
+        .await
+        .unwrap();
+    assert_eq!(accepted["accepted"], true);
+    assert!(matches!(
+        rx.recv().await,
+        Some(HostCommand::AgentGoal { session_id, .. }) if session_id == grandchild
+    ));
+    store
+        .append(SessionEvent::new(
+            grandchild,
+            0,
+            SessionEventKind::UserStopChanged { engaged: true },
+        ))
+        .await
+        .unwrap();
+    let resume = json!({"target": grandchild, "goal_action": {"type": "resume"}});
+    let refused = coordinator
+        .call_tool_as(child, "control_agent_goal", resume)
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("human resume authorization"));
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn team_batch_goal_handoff_is_ordered_authorized_and_not_replayed() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
@@ -10181,10 +10252,10 @@ async fn team_batch_goal_handoff_is_ordered_authorized_and_not_replayed() {
         ))
         .await
         .unwrap();
-    let denied = coordinator.call_tool_as(child, "team_batch", json!({"idempotency_key": "unauthorized", "operations": [
-        {"session_id": grandchild, "operation": "control_agent_goal", "goal_action": {"type": "resume"}}]
+    let denied = coordinator.call_tool_as(grandchild, "team_batch", json!({"idempotency_key": "unauthorized", "operations": [
+        {"session_id": child, "operation": "control_agent_goal", "goal_action": {"type": "resume"}}]
     })).await.unwrap_err();
-    assert!(denied.to_string().contains("only the director"));
+    assert!(denied.to_string().contains("not an owned descendant"));
     assert!(coordinator.call_tool_as(root, "team_batch", json!({"idempotency_key": "invalid", "operations": [
         {"session_id": child, "operation": "followup_task", "message": "must not be sent"},
         {"session_id": child, "operation": "control_agent_goal", "goal_action": {"type": "set", "objective": " "}}]
