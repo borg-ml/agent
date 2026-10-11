@@ -1956,6 +1956,14 @@ impl NativeHarness {
             prefix,
             force,
         } = context;
+        send(
+            events,
+            SessionEventKind::ContextWindowUpdated {
+                context_tokens: budget.context_tokens,
+                context_window_tokens: budget.context_window_tokens,
+            },
+        )
+        .await;
         let compaction_budget =
             self.compaction_budget(turn.provider, model, budget.context_window_tokens);
         if !force && !budget.needs_auto_compaction(&compaction_budget) {
@@ -1979,6 +1987,14 @@ impl NativeHarness {
         let sent = (!force && fits).then(|| messages.clone());
         if let Some(trim) = microcompact_native_messages(messages, earlier_tool_calls) {
             budget.context_tokens = budget.context_tokens.saturating_sub(trim.saved_tokens);
+            send(
+                events,
+                SessionEventKind::ContextWindowUpdated {
+                    context_tokens: budget.context_tokens,
+                    context_window_tokens: budget.context_window_tokens,
+                },
+            )
+            .await;
             let enough = !force && !budget.needs_auto_compaction(&compaction_budget);
             send(
                 events,
@@ -4359,7 +4375,9 @@ pub(crate) fn conversation_digest(messages: &[ModelMessage]) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut messages = messages.to_vec();
     canonicalize_native_messages(&mut messages);
-    Ok(Sha256::digest(serde_json::to_vec(&messages)?)
+    let mut value = serde_json::to_value(&messages)?;
+    value.sort_all_objects();
+    Ok(Sha256::digest(serde_json::to_vec(&value)?)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
@@ -4367,7 +4385,9 @@ pub(crate) fn conversation_digest(messages: &[ModelMessage]) -> Result<String> {
 
 pub(crate) fn prefix_digest(prefix: &crate::NativeRequestPrefix) -> Result<String> {
     use sha2::{Digest, Sha256};
-    Ok(Sha256::digest(serde_json::to_vec(prefix)?)
+    let mut value = serde_json::to_value(prefix)?;
+    value.sort_all_objects();
+    Ok(Sha256::digest(serde_json::to_vec(&value)?)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())

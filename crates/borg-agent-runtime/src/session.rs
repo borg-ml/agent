@@ -2273,6 +2273,7 @@ async fn run_agent_session_store_kernel_inner(
     let state = journal.state(session_id).await?;
     validate_session_state(session_id, &state)?;
     let mut provider_context_usage_valid = fresh;
+    let mut native_context_usage = fresh.then_some(state.usage.context_tokens).flatten();
     let mut resumed_native_context_tokens =
         restored_native_context_tokens(journal.context_events(), launch.provider);
     let resumed_context_generation = state.context_generation;
@@ -3568,6 +3569,7 @@ async fn run_agent_session_store_kernel_inner(
                             Ok(provider_switched) => {
                                 if retry_selection {
                                     provider_context_usage_valid = false;
+                                    native_context_usage = None;
                                     resumed_native_context_tokens = None;
                                     // A change probe that went unanswered is
                                     // asked again before the next turn.
@@ -4080,6 +4082,8 @@ async fn run_agent_session_store_kernel_inner(
                                     },
                                 )
                                 .await?;
+                                native_context_usage = None;
+                                provider_context_usage_valid = false;
                                 if executor.uses_native_harness(launch.provider)
                                     && let Some(context_window_tokens) =
                                         journal.state(session_id).await?.usage.context_window_tokens
@@ -4471,12 +4475,14 @@ async fn run_agent_session_store_kernel_inner(
         {
             subscription_context_reusable = false;
             provider_context_usage_valid = false;
+            native_context_usage = None;
             resumed_native_context_tokens = None;
             retained_context = None;
         }
 
         if executor.uses_native_harness(launch.provider) {
-            let state = journal.state(session_id).await?;
+            let mut state = journal.state(session_id).await?;
+            state.usage.context_tokens = native_context_usage;
             if provider_context_usage_valid && native_auto_compaction_needed(&state) {
                 let context_tokens = state.usage.context_tokens.unwrap_or_default();
                 let context_window_tokens = state.usage.context_window_tokens.unwrap_or_default();
@@ -4613,6 +4619,8 @@ async fn run_agent_session_store_kernel_inner(
                             },
                         )
                         .await?;
+                        native_context_usage = None;
+                        provider_context_usage_valid = false;
                         record(
                             &mut journal,
                             &events,
@@ -5091,7 +5099,7 @@ async fn run_agent_session_store_kernel_inner(
             message_id: prompt.message_id,
             context_generation: journal.state(session_id).await?.context_generation,
             prior_native_context_tokens: if native_provider && provider_context_usage_valid {
-                journal.state(session_id).await?.usage.context_tokens
+                native_context_usage
             } else if native_provider
                 && journal.state(session_id).await?.context_generation == resumed_context_generation
             {
@@ -5349,10 +5357,17 @@ async fn run_agent_session_store_kernel_inner(
                         track_approval(&kind, &mut pending_approval);
                         track_provider_interaction(&kind, &mut pending_provider_interaction);
                         let usage = goal_token_usage(&kind, &mut native_goal_usage);
-                        if context_usage_observation(&kind) {
-                            provider_context_usage_valid = true;
-                        }
-                        record_provider_event(
+                        if let SessionEventKind::UsageUpdated { context_tokens, .. } = &kind {
+                        native_context_usage = *context_tokens;
+                    } else if matches!(&kind, SessionEventKind::ProviderEvent { kind, payload, .. }
+                        if kind == NATIVE_CONTEXT_EDIT_EVENT || (kind == "context_compaction" || kind == "context_microcompaction")
+                            && payload.get("status").and_then(Value::as_str) == Some("completed")) {
+                        native_context_usage = None;
+                    }
+                    if context_usage_observation(&kind) {
+                        provider_context_usage_valid = true;
+                    }
+                    record_provider_event(
                             kind,
                             &mut pending_steers,
                             &mut steers_awaiting_consumption,
@@ -6411,6 +6426,7 @@ async fn run_agent_session_store_kernel_inner(
                                 Ok(provider_switched) => {
                                     if context_selection_changed {
                                         provider_context_usage_valid = false;
+                                        native_context_usage = None;
                                         resumed_native_context_tokens = None;
                                         speed_support_confirmed = false;
                                     }
@@ -7180,7 +7196,14 @@ async fn run_agent_session_store_kernel_inner(
                     track_approval(&kind, &mut pending_approval);
                     track_provider_interaction(&kind, &mut pending_provider_interaction);
                     let usage = goal_token_usage(&kind, &mut native_goal_usage);
-                    if context_usage_observation(&kind) {
+                    if let SessionEventKind::UsageUpdated { context_tokens, .. } = &kind {
+                            native_context_usage = *context_tokens;
+                        } else if matches!(&kind, SessionEventKind::ProviderEvent { kind, payload, .. }
+                            if kind == NATIVE_CONTEXT_EDIT_EVENT || (kind == "context_compaction" || kind == "context_microcompaction")
+                                && payload.get("status").and_then(Value::as_str) == Some("completed")) {
+                            native_context_usage = None;
+                        }
+                        if context_usage_observation(&kind) {
                         provider_context_usage_valid = true;
                     }
                     record_provider_event(
@@ -7261,6 +7284,7 @@ async fn run_agent_session_store_kernel_inner(
         at_turn_boundary = true;
         if active_provider != launch.provider || active_model != launch.model {
             provider_context_usage_valid = false;
+            native_context_usage = None;
             resumed_native_context_tokens = None;
         }
         if std::mem::take(&mut provider_switch_pending) {
@@ -8527,12 +8551,11 @@ fn native_usage_event(
 fn context_usage_observation(event: &SessionEventKind) -> bool {
     matches!(
         event,
-        SessionEventKind::ContextWindowUpdated { .. }
-            | SessionEventKind::UsageUpdated {
-                context_tokens: Some(_),
-                context_window_tokens: Some(_),
-                ..
-            }
+        SessionEventKind::UsageUpdated {
+            context_tokens: Some(_),
+            context_window_tokens: Some(_),
+            ..
+        }
     )
 }
 

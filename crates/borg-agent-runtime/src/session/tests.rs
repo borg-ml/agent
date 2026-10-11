@@ -21073,14 +21073,21 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
     let store: Arc<dyn SessionStore> = Arc::new(store);
     store.create_session(session_id).await.unwrap();
     let prefix = crate::NativeRequestPrefix {
-        provider: CodingProvider::OpenRouter,
+        provider: CodingProvider::Codex,
         model: "test".into(),
         system_prompt: "system".into(),
-        tools: Vec::new(),
+        tools: vec![borg_provider::provider::ModelToolDefinition {
+            name: "read_file".into(),
+            description: "read".into(),
+            input_schema: serde_json::from_str(
+                r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#,
+            )
+            .unwrap(),
+        }],
         prompt_cache_key: "cache".into(),
     };
     use borg_provider::provider::ModelMessage;
-    let body = ModelMessage::assistant(
+    let mut body = ModelMessage::assistant(
         None,
         None,
         None,
@@ -21090,6 +21097,20 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
             "{}".into(),
         )],
     );
+    if let ModelMessage::Assistant { provider_state, .. } = &mut body {
+        *provider_state = Some(borg_core::ModelProviderState::OpenAiResponses {
+            output: vec![
+                serde_json::from_str(
+                    r#"{"type":"reasoning","encrypted_content":"opaque","summary":[]}"#,
+                )
+                .unwrap(),
+            ],
+            account_identity: None,
+            request_model: None,
+            request_effort: None,
+            effective_effort: None,
+        });
+    }
     let suffix = ModelMessage::Tool {
         tool_call_id: "call".into(),
         content: "trailing result".repeat(100),
@@ -21100,7 +21121,7 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
     let (tx, mut rx) = mpsc::channel(2);
     crate::native_harness::record_context_checkpoint(
         &tx,
-        CodingProvider::OpenRouter,
+        CodingProvider::Codex,
         &prefix,
         &[
             ModelMessage::System {
@@ -21116,7 +21137,7 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
         SessionEventKind::SessionStarted,
         SessionEventKind::SessionConfigured {
             cwd: root.path().to_path_buf(),
-            provider: CodingProvider::OpenRouter,
+            provider: CodingProvider::Codex,
             model: Some("test".into()),
             effort: Some("max".into()),
             fast: false,
@@ -21127,25 +21148,25 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
         },
         SessionEventKind::TurnStarted {
             message_id: previous_id,
-            provider: CodingProvider::OpenRouter,
+            provider: CodingProvider::Codex,
             model: Some("test".into()),
             effort: None,
             fast: false,
             ultrafast: false,
         },
         SessionEventKind::ProviderEvent {
-            provider: CodingProvider::OpenRouter,
+            provider: CodingProvider::Codex,
             kind: "native_request_prefix".into(),
             payload: serde_json::to_value(prefix).unwrap(),
         },
         SessionEventKind::ProviderEvent {
-            provider: CodingProvider::OpenRouter,
+            provider: CodingProvider::Codex,
             kind: "native_model_message".into(),
             payload: serde_json::to_value(body).unwrap(),
         },
         rx.recv().await.unwrap(),
         SessionEventKind::ProviderEvent {
-            provider: CodingProvider::OpenRouter,
+            provider: CodingProvider::Codex,
             kind: "native_model_message".into(),
             payload: serde_json::to_value(suffix).unwrap(),
         },
@@ -21167,7 +21188,7 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
     }
     let expected = restored_native_context_tokens(
         &store.recovery(session_id).await.unwrap().context_events,
-        CodingProvider::OpenRouter,
+        CodingProvider::Codex,
     )
     .unwrap();
     assert_eq!(expected, 189_910 + suffix_tokens);
@@ -21177,16 +21198,36 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
     }
     #[async_trait::async_trait]
     impl AgentTurnExecutor for Capture {
+        fn uses_native_harness(&self, _provider: CodingProvider) -> bool {
+            true
+        }
+
         async fn execute(
             &self,
             turn: AgentTurn,
-            _events: mpsc::Sender<SessionEventKind>,
+            events: mpsc::Sender<SessionEventKind>,
             _controls: Option<mpsc::Receiver<AgentTurnControl>>,
         ) -> Result<AgentTurnResult> {
             self.seen
                 .lock()
                 .unwrap()
                 .push(turn.prior_native_context_tokens);
+            let usage = borg_provider::ProviderCallUsage {
+                context_tokens: Some(190_000),
+                context_window_tokens: Some(272_000),
+                ..Default::default()
+            };
+            events
+                .send(native_usage_event(&usage, Some(turn.message_id)))
+                .await
+                .unwrap();
+            events
+                .send(SessionEventKind::ContextWindowUpdated {
+                    context_tokens: 287_909,
+                    context_window_tokens: 272_000,
+                })
+                .await
+                .unwrap();
             self.called.notify_one();
             Ok(AgentTurnResult {
                 provider_session_id: None,
@@ -21211,7 +21252,7 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
             LaunchSession {
                 request_id: Uuid::new_v4(),
                 cwd: root.path().to_path_buf(),
-                provider: CodingProvider::OpenRouter,
+                provider: CodingProvider::Codex,
                 model: Some("test".to_string()),
                 effort: Some("max".to_string()),
                 fast: Some(false),
@@ -21248,12 +21289,26 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
         .await
         .expect("resumed turn starts without compaction");
     command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "continue again".into(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
+        .await
+        .unwrap();
+    command_tx
         .send(HostCommand::Stop { session_id })
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
 
-    assert_eq!(*seen.lock().unwrap(), vec![Some(expected)]);
+    assert_eq!(*seen.lock().unwrap(), vec![Some(expected), Some(190_000)]);
     scratch.discard().await;
 }
 
