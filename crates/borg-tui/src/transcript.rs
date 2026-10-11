@@ -947,23 +947,34 @@ fn tool_window_summary(
 /// column as the collapsed `▸ ` header.
 const TOOL_WINDOW_HEADER_INDENT: &str = "▾ ";
 
-/// A group header in grey.
+/// Group labels use the same emphasis as solo tools; metadata stays muted.
 fn tool_window_header(prefix: &'static str, text: String, reasoning: bool) -> Line<'static> {
     let grey = Style::default().fg(Color::DarkGray);
     let mut spans = vec![Span::styled(prefix, grey)];
-    if reasoning && let Some(start) = text.find("Reason") {
-        let end = start + text[start..].find(' ').unwrap_or(text.len() - start);
-        spans.push(Span::styled(text[..start].to_string(), grey));
-        spans.push(Span::styled(
-            text[start..end].to_string(),
+    let start = if reasoning {
+        text.find("Reason").unwrap_or(0)
+    } else {
+        text.find(" · ").map_or(0, |index| index + " · ".len())
+    };
+    let end = if reasoning {
+        start + text[start..].find(' ').unwrap_or(text.len() - start)
+    } else {
+        start + text[start..].find(['(', '·']).unwrap_or(text.len() - start)
+    };
+    spans.push(Span::styled(text[..start].to_string(), grey));
+    spans.push(Span::styled(
+        text[start..end].to_string(),
+        if reasoning {
             Style::default()
                 .fg(Color::Gray)
-                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
-        ));
-        spans.push(Span::styled(text[end..].to_string(), grey));
-    } else {
-        spans.push(Span::styled(text, grey));
-    }
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC)
+        } else {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        },
+    ));
+    spans.push(Span::styled(text[end..].to_string(), grey));
     Line::from(spans)
 }
 
