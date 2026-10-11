@@ -2003,22 +2003,46 @@ impl AgentToolDispatcher {
         workflow_approved: bool,
         workflow_cancel: Option<CancellationToken>,
     ) -> Result<Value> {
-        self.dispatch(name, arguments, workflow_approved, workflow_cancel)
+        let sent = arguments.clone();
+        let mut error = match self
+            .dispatch(name, arguments, workflow_approved, workflow_cancel.clone())
             .await
-            .map_err(|error| {
-                let specs = self.mcp_specs(true);
-                let known = specs
-                    .iter()
-                    .any(|spec| spec.get("name").and_then(Value::as_str) == Some(name));
-                if known && !error.chain().any(|cause| cause.is::<serde_json::Error>()) {
-                    return error;
+        {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let specs = self.mcp_specs(true);
+        let spec = specs
+            .iter()
+            .find(|spec| spec.get("name").and_then(Value::as_str) == Some(name));
+        let malformed = error.chain().any(|cause| cause.is::<serde_json::Error>());
+        // A direct call to a capability the model has no declared tool for
+        // arrives with its numbers and booleans stringified, as through the
+        // `capability` passthrough. Arguments that failed to deserialize ran
+        // nothing, so retry once with the declared types put back.
+        if let (Some(spec), true) = (spec, malformed) {
+            let restored = restore_declared_types(
+                sent.clone(),
+                spec.get("inputSchema").or_else(|| spec.get("input_schema")),
+            );
+            if restored != sent {
+                match self
+                    .dispatch(name, restored, workflow_approved, workflow_cancel)
+                    .await
+                {
+                    Ok(value) => return Ok(value),
+                    Err(retry) => error = retry,
                 }
-                anyhow::anyhow!(crate::capability_catalog::corrective_error(
-                    &specs,
-                    name,
-                    &format!("{error:#}"),
-                ))
-            })
+            }
+        }
+        if spec.is_some() && !error.chain().any(|cause| cause.is::<serde_json::Error>()) {
+            return Err(error);
+        }
+        Err(anyhow::anyhow!(crate::capability_catalog::corrective_error(
+            &specs,
+            name,
+            &format!("{error:#}"),
+        )))
     }
 
     /// What a `capability` call resolves to. See [`classify_capability_call`].
