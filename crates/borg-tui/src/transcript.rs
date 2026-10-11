@@ -571,6 +571,7 @@ struct RenderInputs {
     colors: [Color; 4],
     image_cell: Option<(u16, u16)>,
     tool_click_behavior: ToolClickBehavior,
+    show_action_done_at: bool,
 }
 
 /// A cache-mode render plus what the next render must compare to redraw only
@@ -5689,6 +5690,7 @@ impl Transcript {
             ],
             image_cell: self.image_cell,
             tool_click_behavior: self.tool_click_behavior,
+            show_action_done_at: self.show_action_done_at,
         };
         let windows = self.tool_run_windows();
         let running_tool = self.has_running_tool();
