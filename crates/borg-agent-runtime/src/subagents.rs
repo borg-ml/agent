@@ -5760,6 +5760,35 @@ impl SubagentCoordinator {
         launch: LaunchSession,
         announce: bool,
     ) -> Result<()> {
+        // Detached so a cancelled caller (a steered `runtime_exec`) cannot
+        // abandon the start halfway and leave the child `Starting` forever.
+        let this = self.clone();
+        let session_id = snapshot.session_id;
+        tokio::spawn(async move {
+            let result = this.start_reserved_now(snapshot, launch, announce).await;
+            if let Err(error) = &result {
+                let mut table = this.table.lock().await;
+                if let Some(entry) = table.entries.get_mut(&session_id)
+                    && entry.commands.is_none()
+                    && entry.snapshot.status == SubagentStatus::Starting
+                {
+                    entry.snapshot.status = SubagentStatus::Failed;
+                    entry.snapshot.detail = Some(format!("Could not start: {error:#}"));
+                    entry.snapshot.updated_at = Utc::now();
+                }
+            }
+            result
+        })
+        .await
+        .context("subagent start task failed")?
+    }
+
+    async fn start_reserved_now(
+        &self,
+        snapshot: SubagentSnapshot,
+        launch: LaunchSession,
+        announce: bool,
+    ) -> Result<()> {
         let (command_tx, command_rx) = mpsc::channel(64);
         let (event_tx, mut event_rx) = mpsc::channel(256);
         let actor_path = child_lock_path(&self.journal_root, snapshot.session_id);
@@ -10798,6 +10827,17 @@ fn restore_declared_types(mut arguments: Value, schema: Option<&Value>) -> Value
             _ => continue,
         };
         let types = declared_type_names(declared);
+        // An untyped (`any`, `oneOf`) argument that should be structured came
+        // back as its JSON text.
+        if types.is_empty() {
+            if let Some(parsed) = serde_json::from_str::<Value>(&text)
+                .ok()
+                .filter(|value| value.is_object() || value.is_array())
+            {
+                entries.insert(key.clone(), parsed);
+            }
+            continue;
+        }
         let repaired = types.iter().find_map(|declared_type| match *declared_type {
             "boolean" => match text.as_str() {
                 "true" => Some(json!(true)),
