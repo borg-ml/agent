@@ -11964,11 +11964,9 @@ async fn escape_flushes_pending_queue_without_latching_a_stop_and_keeps_the_comp
         UiAction::FlushPendingInput { target: None }
     ));
     assert!(!terminal.interrupt_requested);
-    assert!(
-        terminal.transcript.order.iter().any(|entry| matches!(entry,
-            TranscriptEntry::Activity { text, .. } if text == USER_INTERRUPT_ACTIVITY
-        ))
-    );
+    assert!(terminal.transcript.order.iter().any(|entry| matches!(entry,
+        TranscriptEntry::Activity { text, .. } if text == USER_INTERRUPT_ACTIVITY
+    )));
     assert_eq!(terminal.composer.text, "unsent draft");
     assert_eq!(terminal.queued_prompts.len(), 1);
 

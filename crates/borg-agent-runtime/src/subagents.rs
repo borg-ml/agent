@@ -2038,11 +2038,9 @@ impl AgentToolDispatcher {
         if spec.is_some() && !error.chain().any(|cause| cause.is::<serde_json::Error>()) {
             return Err(error);
         }
-        Err(anyhow::anyhow!(crate::capability_catalog::corrective_error(
-            &specs,
-            name,
-            &format!("{error:#}"),
-        )))
+        Err(anyhow::anyhow!(
+            crate::capability_catalog::corrective_error(&specs, name, &format!("{error:#}"),)
+        ))
     }
 
     /// What a `capability` call resolves to. See [`classify_capability_call`].
