@@ -9,6 +9,8 @@ Git comparison.
 
 - Color the compaction marker and “Compacted context” title orange, and render
   the compaction summary in a darker grey.
+- Separate the compaction preview from its title with a wider gap, strip Markdown
+  markers from the preview, and render Markdown in expanded summaries.
 - Fold repeated action groups by default once a different action follows them
   or they reach five actions. The newest group under four actions stays open,
   and a group with a still-running action stays open.

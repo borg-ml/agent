@@ -2012,11 +2012,13 @@ impl Transcript {
         {
             live |= matches!(
                 entry,
-                TranscriptEntry::Tool { complete: false, .. }
-                    | TranscriptEntry::Action {
-                        state: TranscriptActionState::Running | TranscriptActionState::Waiting,
-                        ..
-                    }
+                TranscriptEntry::Tool {
+                    complete: false,
+                    ..
+                } | TranscriptEntry::Action {
+                    state: TranscriptActionState::Running | TranscriptActionState::Waiting,
+                    ..
+                }
             );
             end += 1;
         }
@@ -7009,7 +7011,7 @@ impl Transcript {
                             .unwrap_or(summary)
                             .trim_start_matches(':')
                             .trim_start();
-                        format!(" {}", compact_text(detail, 162))
+                        format!("   {}", compact_text(&markdown_plain_text(detail), 162))
                     } else {
                         String::new()
                     };
@@ -7028,11 +7030,12 @@ impl Transcript {
                         let detail = summary
                             .strip_prefix("Compacted context: ")
                             .unwrap_or(summary);
-                        for line in wrap_display(detail, width.saturating_sub(6)) {
-                            lines.push(Line::from(vec![
-                                Span::raw("  │ "),
-                                Span::styled(line, Style::default().fg(Color::Gray)),
-                            ]));
+                        for line in
+                            markdown_lines(detail, width.saturating_sub(6), Some(Color::Gray))
+                        {
+                            let mut spans = vec![Span::raw("  │ ")];
+                            spans.extend(line.spans);
+                            lines.push(Line::from(spans));
                         }
                     }
                     if hovered_entry == Some(index) {

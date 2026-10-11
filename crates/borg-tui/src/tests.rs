@@ -3217,11 +3217,19 @@ fn tool_lifecycle_labels_use_progressive_and_past_tense() {
     assert_eq!(tool_lifecycle_label("Run", true), "Ran");
     for (name, running, completed) in [
         ("Build project", "Building project…", "Built project"),
-        ("Rebuild projects", "Rebuilding projects…", "Rebuilt projects"),
+        (
+            "Rebuild projects",
+            "Rebuilding projects…",
+            "Rebuilt projects",
+        ),
         ("Compile module", "Compiling module…", "Compiled module"),
         ("Compile modules", "Compiling modules…", "Compiled modules"),
         ("Verify files", "Verifying files…", "Verified files"),
-        ("Audit reasoning", "Auditing reasoning…", "Audited reasoning"),
+        (
+            "Audit reasoning",
+            "Auditing reasoning…",
+            "Audited reasoning",
+        ),
         ("Apply patches", "Applying patches…", "Applied patches"),
         ("Clear caches", "Clearing caches…", "Cleared caches"),
     ] {
@@ -20969,4 +20977,30 @@ fn overlay_transitions_restore_cells_skipped_by_terminal_images() {
         regions: vec![Rect::new(3, 1, 8, 3)],
     };
     assert!(moved.finish(&mut previous, true));
+}
+
+#[test]
+fn compaction_preview_separates_title_and_renders_markdown_without_changing_summary() {
+    let summary = "Compacted context: **Goal** - **Active**\n\nKeep `state` and [details](https://example.com).";
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Compaction {
+        summary: summary.into(),
+        time: now_hms(),
+        expanded: true,
+        complete: true,
+        sequence: 1,
+    });
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Compacted context   Goal - Active"));
+    assert!(rendered.contains("Keep state and details."));
+    assert!(!rendered.contains("**Goal**"));
+    assert!(!rendered.contains("`state`"));
+    assert!(
+        matches!(&transcript.order[0], TranscriptEntry::Compaction { summary: stored, .. } if stored == summary)
+    );
 }
