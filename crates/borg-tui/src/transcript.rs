@@ -947,8 +947,57 @@ fn tool_window_summary(
 /// column as the collapsed `▸ ` header.
 const TOOL_WINDOW_HEADER_INDENT: &str = "▾ ";
 
+fn action_label_style(entry: &TranscriptEntry) -> Style {
+    match entry {
+        TranscriptEntry::Tool {
+            name,
+            error,
+            outcome,
+            user_interrupted,
+            backgrounded,
+            ..
+        } => {
+            if is_reasoning_entry(entry) {
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::BOLD | Modifier::ITALIC)
+            } else if *error
+                || outcome.as_deref().is_some_and(outcome_is_failure)
+                || *user_interrupted
+            {
+                Style::default()
+                    .fg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD)
+            } else if *backgrounded {
+                Style::default()
+                    .fg(USER_LABEL_BLUE)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_subagent_tool(name) {
+                Style::default()
+                    .fg(SUBAGENT_PURPLE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            }
+        }
+        TranscriptEntry::Action { kind, state, .. } => {
+            Style::default().fg(transcript_action_color(*kind, *state))
+        }
+        _ => Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    }
+}
+
 /// Group labels use the same emphasis as solo tools; metadata stays muted.
-fn tool_window_header(prefix: &'static str, text: String, reasoning: bool) -> Line<'static> {
+fn tool_window_header(
+    prefix: &'static str,
+    text: String,
+    reasoning: bool,
+    label_style: Style,
+) -> Line<'static> {
     let grey = Style::default().fg(Color::DarkGray);
     let mut spans = vec![Span::styled(prefix, grey)];
     let start = if reasoning {
@@ -962,18 +1011,7 @@ fn tool_window_header(prefix: &'static str, text: String, reasoning: bool) -> Li
         start + text[start..].find(['(', '·']).unwrap_or(text.len() - start)
     };
     spans.push(Span::styled(text[..start].to_string(), grey));
-    spans.push(Span::styled(
-        text[start..end].to_string(),
-        if reasoning {
-            Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::BOLD | Modifier::ITALIC)
-        } else {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        },
-    ));
+    spans.push(Span::styled(text[start..end].to_string(), label_style));
     spans.push(Span::styled(text[end..].to_string(), grey));
     Line::from(spans)
 }
@@ -6155,6 +6193,7 @@ impl Transcript {
                     },
                     summary,
                     reasoning,
+                    action_label_style(entry),
                 ));
                 let timer_entry = reasoning.then(|| {
                     (window.start..window.end)
@@ -6977,27 +7016,7 @@ impl Transcript {
                     } else {
                         gutter_style
                     };
-                    let name_style = if is_reasoning {
-                        Style::default()
-                            .fg(Color::Gray)
-                            .add_modifier(Modifier::BOLD | Modifier::ITALIC)
-                    } else if failed || *user_interrupted {
-                        Style::default()
-                            .fg(Color::LightRed)
-                            .add_modifier(Modifier::BOLD)
-                    } else if *backgrounded {
-                        Style::default()
-                            .fg(USER_LABEL_BLUE)
-                            .add_modifier(Modifier::BOLD)
-                    } else if is_subagent_tool(name) {
-                        Style::default()
-                            .fg(SUBAGENT_PURPLE)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD)
-                    };
+                    let name_style = action_label_style(entry);
                     let is_edit = is_edit_tool(source_name, name);
                     let lifecycle = if *user_interrupted {
                         Some("user interrupted")
@@ -7339,6 +7358,13 @@ impl Transcript {
                         action_hint
                     ),
                     reasoning_group,
+                    if reasoning_group {
+                        action_label_style(&self.order[window.start])
+                    } else {
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    },
                 );
                 if !folded {
                     lines.push(Line::from(Span::styled(
@@ -7681,7 +7707,7 @@ impl Transcript {
                 index += 1;
             }
             let total = index - start;
-            if total > 1 || is_reasoning_entry(&self.order[start]) {
+            if total > 1 {
                 let window = ToolRunWindow {
                     start,
                     end: index,

@@ -14428,6 +14428,99 @@ fn sticky_tool_run_header_row_covers_only_overflowing_boxes() {
 }
 
 #[test]
+fn singleton_reasoning_stays_solo_beside_a_styled_expandable_wait_group() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ReasoningDelta {
+            text: "Checking the workers".into(),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ReasoningCompleted,
+    ));
+    let solo = transcript.lines(100);
+    assert_eq!(
+        solo.iter()
+            .filter(|line| line.to_string().contains("Reasoned"))
+            .count(),
+        1
+    );
+    assert!(solo.iter().all(|line| !is_open_action_group_header(line)));
+    for index in 0..2 {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            3 + index * 2,
+            SessionEventKind::ToolStarted {
+                tool_call_id: format!("wait-{index}"),
+                name: "wait_agent".into(),
+                input: serde_json::json!({}),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        ));
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            4 + index * 2,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: format!("wait-{index}"),
+                output: "done".into(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        ));
+    }
+    let rendered = transcript.render(100, None, None, None);
+    assert_eq!(rendered.8.iter().map(|row| row.0).collect::<Vec<_>>(), [1]);
+    assert_eq!(
+        rendered
+            .0
+            .iter()
+            .filter(|line| line.to_string().contains("Reasoned"))
+            .count(),
+        1
+    );
+    let header = rendered
+        .0
+        .iter()
+        .find(|line| line.to_string().contains("Wait for agents (2)"))
+        .unwrap();
+    let label = header
+        .spans
+        .iter()
+        .find(|span| span.content.contains("Wait for agents"))
+        .unwrap();
+    assert_eq!(label.style.fg, Some(SUBAGENT_PURPLE));
+    assert!(label.style.add_modifier.contains(Modifier::BOLD));
+    assert!(!transcript.toggle_action_run_expansion(1));
+    let folded = transcript.lines(100);
+    assert!(
+        folded
+            .iter()
+            .any(|line| line.to_string().contains("▸ Wait for agents (2)"))
+    );
+    assert!(
+        !folded
+            .iter()
+            .any(|line| line.to_string().contains("Finished waiting for agents"))
+    );
+    assert!(transcript.toggle_action_run_expansion(1));
+    assert!(
+        transcript
+            .lines(100)
+            .iter()
+            .any(|line| line.to_string().contains("Finished waiting for agents"))
+    );
+}
+
+#[test]
 fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     let mut transcript = Transcript::default();
     assert!(!transcript.show_action_done_at);
@@ -14527,9 +14620,9 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     assert!(header.ends_with(&done_at), "{header}");
     assert_eq!(collapsed_child.0[0].width(), 100);
     assert!(rendered.contains("  ▸ Reasoned (5)"), "{rendered}");
-    assert!(rendered.contains("  ▸ Reasoned\n"), "{rendered}");
+    assert!(!rendered.contains("  ▸ Reasoned\n"), "{rendered}");
     assert!(!rendered.contains("Reasoned (1)"), "{rendered}");
-    assert!(!rendered.contains("◦ Reasoned"), "{rendered}");
+    assert!(rendered.contains("◦ Reasoned"), "{rendered}");
     assert!(rendered.contains("  ▾ Run (2)"), "{rendered}");
     assert!(rendered.contains("  ▾ Watch (2)"), "{rendered}");
     assert!(
@@ -14542,7 +14635,7 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
             .iter()
             .map(|row| row.0)
             .collect::<Vec<_>>(),
-        [0, 5, 10, 12]
+        [0, 5, 10]
     );
     assert!(collapsed_child.1.iter().all(|(index, ..)| *index >= 5));
     assert!(collapsed_child.6.iter().all(|range| range.entry >= 5));
@@ -14553,7 +14646,7 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     assert!(text(&expanded_child).contains("Reasoning block 0"));
     assert_eq!(
         expanded_child.1.iter().map(|row| row.0).collect::<Vec<_>>(),
-        [0, 1, 2, 3, 4, 5, 6, 8, 9, 13]
+        [0, 1, 2, 3, 4, 5, 6, 8, 9, 12, 13]
     );
     assert_eq!(
         expanded_child
@@ -14561,7 +14654,7 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
             .iter()
             .map(|range| range.entry)
             .collect::<Vec<_>>(),
-        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13]
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     );
     assert_eq!(transcript.order.identities, identities);
     assert!(transcript.toggle_tool_run_expansion(0));
