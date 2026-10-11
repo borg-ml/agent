@@ -4,6 +4,9 @@ pub mod chat_stream;
 mod claude_connector;
 #[cfg(feature = "claude")]
 mod claude_model;
+// Staged pure wire codec; production routing waits for auth/transport verification.
+#[cfg(all(test, feature = "claude"))]
+mod claude_subscription_wire;
 #[cfg(feature = "codex")]
 mod codex_model;
 mod model_turn;
