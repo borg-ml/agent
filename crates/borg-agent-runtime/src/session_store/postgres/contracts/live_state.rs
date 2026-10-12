@@ -5,7 +5,8 @@
 //! event would make the durable sequence a function of network chatter rather
 //! than of what happened. So these snapshots coalesce into one row per live
 //! key and carry no sequence. Durable display anchors preserve first position;
-//! reasoning is finalized before the boundaries that clear its live state.
+//! reasoning and interrupted assistant text are archived before their live
+//! state is cleared; partial assistant output does not become model context.
 //!
 //! The contracts below pin that bargain: intermediate frames must not grow the
 //! journal, and every boundary -- a tool
@@ -695,6 +696,83 @@ async fn first_visible_assistant_message_keeps_its_position_after_read() {
                 .count(),
             1
         );
+        assert!(
+            store
+                .live_events_after(session_id, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn interrupted_assistant_text_survives_terminal_cleanup_without_entering_model_context() {
+    let (scratch, store) = store().await;
+    for status in [
+        SessionStatus::Ready,
+        SessionStatus::Stopped,
+        SessionStatus::Failed,
+        SessionStatus::Completed,
+    ] {
+        let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Running,
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+        for text in ["I", "I will inspect", "I will inspect the saved logs."] {
+            store
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    SessionEventKind::Message {
+                        message_id,
+                        actor: EventActor::Assistant,
+                        text: text.into(),
+                        status: MessageStatus::InProgress,
+                        attachments: Vec::new(),
+                        delivery: None,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        let terminal = store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status,
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let history = store.read(session_id).await.unwrap();
+        let archived = history.iter().find(|event| matches!(&event.kind,
+            SessionEventKind::Message {
+                message_id: id, actor: EventActor::Assistant, status: MessageStatus::Failed, text, ..
+            } if *id == message_id && text == "I will inspect the saved logs."
+        )).expect("the latest visible text must be archived, not just its first fragment");
+        assert!(archived.sequence < terminal.sequence);
+        assert!(!archived.kind.is_context_relevant());
+        let context = store.recovery(session_id).await.unwrap().context_events;
+        assert!(!context.iter().any(|event| matches!(&event.kind,
+            SessionEventKind::Message { message_id: id, actor: EventActor::Assistant, .. }
+                if *id == message_id
+        )));
+        let recent = store.recent_messages(session_id, 10).await.unwrap();
+        assert!(recent.iter().any(|event| event.id == archived.id));
         assert!(
             store
                 .live_events_after(session_id, 0)

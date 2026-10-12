@@ -39,15 +39,15 @@ Port 5433 rather than 5432 is deliberate: a developer machine frequently
 already runs a system PostgreSQL on 5432, and adopting someone else's cluster is
 not Borg's decision to make.
 
-Borg sets `synchronous_commit = off` on a fresh managed cluster and on an
-existing managed cluster still using PostgreSQL's default, without restarting
-it. An explicit operator setting is left alone. This prevents every agent's
-journal events from waiting on a disk flush. PostgreSQL still keeps `fsync = on`
-and WAL recovery: commits remain atomic, and clean shutdowns flush them. On a
-machine crash or power loss, the most recent unflushed commits (typically under
-one second) may be lost. A server selected with `BORG_SESSIONS_URL` is never
-reconfigured; its operator owns the commit policy. `borg doctor` reports the
-active policy separately from store readiness.
+Borg uses synchronous commits for the managed journal: an acknowledged message
+must survive a PostgreSQL crash. Existing managed clusters with the asynchronous
+policy installed by older Borg versions are migrated to `synchronous_commit = on`
+without restarting agents. Streaming snapshots still coalesce; they do not add
+one durable history event per token. Performance improvements must preserve
+acknowledged messages, using batching rather than globally losable commits.
+A server selected with `BORG_SESSIONS_URL` is never reconfigured; its operator
+owns the commit policy. `borg doctor` reports the active policy separately from
+store readiness.
 
 Borg does **not** install PostgreSQL. It locates the `initdb` and `pg_ctl` that
 an installation already provides -- including the version-suffixed directories

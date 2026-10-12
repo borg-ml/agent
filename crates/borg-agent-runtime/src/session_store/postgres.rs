@@ -453,8 +453,7 @@ impl PostgresSessionStore {
         } else {
             "not_checked".to_string()
         };
-        // Report the actual commit policy. Async commit is the managed default,
-        // so it must not be mistaken for an unavailable or corrupt store.
+        // Report the effective policy, including an operator's explicit override.
         let commit_durability: String = sqlx::query_scalar("show synchronous_commit")
             .fetch_one(&self.pool)
             .await?;

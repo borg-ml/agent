@@ -314,6 +314,38 @@ impl PostgresSessionStore {
             }
         }
 
+        if event.sequence == 0 && event.kind.clears_live_turn_state() {
+            let messages: Vec<serde_json::Value> = sqlx::query_scalar(
+                "select event_json from session_live_state \
+                 where session_id = $1 and live_key like 'message:%' order by revision",
+            )
+            .bind(event.session_id)
+            .fetch_all(&mut **transaction)
+            .await?;
+            for message in messages {
+                let mut message: SessionEvent = serde_json::from_value(message)?;
+                if let SessionEventKind::Message {
+                    actor: crate::EventActor::Assistant,
+                    status,
+                    ..
+                } = &mut message.kind
+                {
+                    // Archive the latest streamed snapshot without treating an
+                    // interrupted model response as complete conversation input.
+                    *status = MessageStatus::Failed;
+                    message.id = Uuid::new_v4();
+                    message.sequence = 0;
+                    Box::pin(self.append_durable_in_transaction(transaction, message)).await?;
+                }
+            }
+            row = sqlx::query(
+                "select inherited_event_count, next_sequence, state_json from sessions where id = $1",
+            )
+            .bind(event.session_id)
+            .fetch_one(&mut **transaction)
+            .await?;
+        }
+
         let inherited_event_count = u64::try_from(row.try_get::<i64, _>("inherited_event_count")?)
             .context("negative inherited event count")?;
         let next_sequence = u64::try_from(row.try_get::<i64, _>("next_sequence")?)
@@ -1709,6 +1741,10 @@ impl SessionStore for PostgresSessionStore {
                 SessionEventKind::Message {
                     actor: crate::EventActor::User | crate::EventActor::Assistant,
                     status: crate::MessageStatus::Complete | crate::MessageStatus::InProgress,
+                    ..
+                } | SessionEventKind::Message {
+                    actor: crate::EventActor::Assistant,
+                    status: crate::MessageStatus::Failed,
                     ..
                 }
             )
