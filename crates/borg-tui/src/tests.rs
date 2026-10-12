@@ -20991,7 +20991,7 @@ fn compaction_preview_separates_title_and_renders_markdown_without_changing_summ
     let mut transcript = Transcript::default();
     transcript.order.push(TranscriptEntry::Compaction {
         summary: summary.into(),
-        time: now_hms(),
+        time: canonical_local_time(Local::now()),
         expanded: true,
         complete: true,
         sequence: 1,
