@@ -169,6 +169,10 @@ fn bound_history_content(value: &mut serde_json::Value, budget: &mut usize) -> R
                     "text"
                         | "delta"
                         | "output"
+                        | "stdout"
+                        | "stderr"
+                        | "chunk"
+                        | "error"
                         | "input"
                         | "payload"
                         | "message"
@@ -1011,6 +1015,47 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn process_history_payloads_share_the_inline_budget() {
+        let output = "process output 🦀".repeat(2048);
+        let mut completed = serde_json::json!({
+            "type": "runtime_process_completed", "process_id": "process", "pid": 42,
+            "status": "exited", "exit_code": 0, "timed_out": false,
+            "stdout": output, "stderr": output, "error": output,
+            "stdout_omitted_bytes": 0, "stderr_omitted_bytes": 0,
+        });
+        let canonical = completed.clone();
+        let mut streamed = serde_json::json!({
+            "type": "runtime_process_output", "process_id": "process",
+            "stream": "stdout", "chunk": output,
+        });
+        let mut budget = 12_000;
+        assert!(bound_history_content(&mut completed, &mut budget).unwrap());
+        assert!(bound_history_content(&mut streamed, &mut budget).unwrap());
+        let used: usize = ["stdout", "stderr", "error"]
+            .iter()
+            .map(|field| completed[field].as_str().unwrap().len())
+            .sum::<usize>()
+            + streamed["chunk"].as_str().unwrap().len();
+        assert!(used <= 12_000);
+        assert_eq!(budget, 12_000 - used);
+        assert_eq!(completed["process_id"], canonical["process_id"]);
+        assert_eq!(completed["pid"], canonical["pid"]);
+        assert_eq!(completed["exit_code"], canonical["exit_code"]);
+        assert_eq!(
+            completed["stdout_omitted_bytes"],
+            canonical["stdout_omitted_bytes"]
+        );
+        for field in ["stdout", "stderr", "error"] {
+            assert!(
+                canonical[field]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(completed[field].as_str().unwrap())
+            );
+        }
     }
 
     #[tokio::test]
