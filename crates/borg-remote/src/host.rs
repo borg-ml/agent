@@ -1653,10 +1653,7 @@ async fn probe_provider(
         | CodingProvider::Vercel
         | CodingProvider::OpenAiCompatible => true,
         CodingProvider::OpenCode if native_go => true,
-        CodingProvider::Claude
-        | CodingProvider::OpenCode
-        | CodingProvider::Grok
-        | CodingProvider::Muse => match mode {
+        CodingProvider::OpenCode | CodingProvider::Grok | CodingProvider::Muse => match mode {
             ProviderProbeMode::Admission => {
                 executable_in_path(Path::new(provider.executable())).is_some()
             }

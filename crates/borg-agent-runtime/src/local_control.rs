@@ -1027,8 +1027,7 @@ impl LocalSessionControlServer {
                                 tokio::spawn(handle_control_connection(
                                     stream,
                                     session_id,
-                                    commands,
-                                    priority,
+                                    (commands, priority),
                                     interrupt,
                                     prompt_admissions,
                                     store,
@@ -1199,8 +1198,7 @@ fn encode_live_frame(frame: &LocalLiveFrame) -> Result<Vec<u8>> {
 async fn handle_control_connection(
     mut stream: tokio::net::UnixStream,
     session_id: Uuid,
-    commands: mpsc::Sender<HostCommand>,
-    priority: Option<mpsc::Sender<HostCommand>>,
+    (commands, priority): (mpsc::Sender<HostCommand>, Option<mpsc::Sender<HostCommand>>),
     interrupt: Option<SessionInterrupt>,
     prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
     store: Option<Arc<dyn SessionStore>>,
