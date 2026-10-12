@@ -5389,10 +5389,10 @@ async fn run_agent_session_store_kernel_inner(
                     }
                     match interrupted_result.take() {
                         Some(result) => result,
-                        None if interrupted => Ok(crate::AgentTurnResult {
+                        None if interrupted => Ok(Ok(crate::AgentTurnResult {
                             provider_session_id: None,
                             final_text: String::new(),
-                        }),
+                        })),
                         None => (&mut running.0).await,
                     }
                 } => {
