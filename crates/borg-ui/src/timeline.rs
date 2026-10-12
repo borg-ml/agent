@@ -10,6 +10,9 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
+    if name == "Reasoning" {
+        return Cow::Borrowed(if complete { "Reasoned" } else { "Reasoning" });
+    }
     if name == "Wait for provider" {
         return Cow::Borrowed(if complete {
             "Tool preparation ended"

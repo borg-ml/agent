@@ -3213,6 +3213,8 @@ fn instant_tools_keep_a_diamond_without_animation() {
 
 #[test]
 fn tool_lifecycle_labels_use_progressive_and_past_tense() {
+    assert_eq!(tool_lifecycle_label("Reasoning", false), "Reasoning");
+    assert_eq!(tool_lifecycle_label("Reasoning", true), "Reasoned");
     assert_eq!(tool_lifecycle_label("Run", false), "Running…");
     assert_eq!(tool_lifecycle_label("Run", true), "Ran");
     for (name, running, completed) in [
@@ -14756,6 +14758,7 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
 
     assert!(transcript.toggle_action_run_expansion(0));
     assert!(!transcript.tool_run_expanded(0));
+    transcript.toggle_tool(0);
     let expanded_child = render(&transcript);
     assert!(text(&expanded_child).contains("Reasoning block 0"));
     assert_eq!(
@@ -15598,7 +15601,7 @@ fn consecutive_reasoning_blocks_fold_and_expand_as_a_counted_group() {
     };
     let running = text(&transcript);
     assert!(running.contains("Reasoning (4)"));
-    assert!(!running.contains("Reasoning body"));
+    assert!(running.contains("4 actions"));
     transcript.set_auto_expand_thinking(true);
     assert!(text(&transcript).contains("Reasoning body 3"));
     transcript.set_auto_expand_thinking(false);
@@ -15609,7 +15612,10 @@ fn consecutive_reasoning_blocks_fold_and_expand_as_a_counted_group() {
         SessionEventKind::ReasoningCompleted,
     ));
     assert!(text(&transcript).contains("Reasoned (4)"));
-    assert!(transcript.toggle_tool_run_expansion(0));
+    assert!(!transcript.toggle_action_run_expansion(0));
+    assert!(!text(&transcript).contains("Reasoning body 0"));
+    assert!(transcript.toggle_action_run_expansion(0));
+    transcript.toggle_tool(0);
     assert!(text(&transcript).contains("Reasoning body 0"));
 }
 

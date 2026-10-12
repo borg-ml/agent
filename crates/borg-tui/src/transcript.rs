@@ -547,6 +547,8 @@ struct RenderTrace {
     checkpoints: Vec<RenderLengths>,
     /// Entries whose rows show the render clock.
     clock_rows: Vec<usize>,
+    /// Group headers span all their timed entries, not an individual clock.
+    clock_groups: Vec<ToolRunWindow>,
     /// Live assistant messages, whose rows depend on whether a tool runs.
     running_tool_rows: Vec<usize>,
 }
@@ -555,6 +557,7 @@ impl RenderTrace {
     fn truncate(&mut self, start: usize) {
         self.checkpoints.truncate(start);
         self.clock_rows.retain(|row| *row < start);
+        self.clock_groups.retain(|window| window.start < start);
         self.running_tool_rows.retain(|row| *row < start);
     }
 }
@@ -604,6 +607,20 @@ fn render_clock_key(entry: &TranscriptEntry, now: DateTime<Utc>) -> Option<Strin
         TranscriptEntry::Goal { goal, .. } => format_elapsed_duration(goal_live_seconds(goal, now)),
         _ => None,
     }
+}
+
+fn format_tool_group_elapsed_at(entries: &[TranscriptEntry], now: DateTime<Utc>) -> Option<String> {
+    let times = entries.iter().filter_map(|entry| match entry {
+        TranscriptEntry::Tool {
+            started_at,
+            completed_at,
+            ..
+        } => Some((*started_at, completed_at.unwrap_or(now))),
+        _ => None,
+    });
+    let started_at = times.clone().map(|(start, _)| start).min()?;
+    let ended_at = times.map(|(_, end)| end).max()?;
+    format_tool_elapsed_at(started_at, Some(ended_at), now)
 }
 
 fn goal_live_seconds(goal: &SessionGoal, now: DateTime<Utc>) -> u64 {
@@ -839,9 +856,6 @@ fn is_reasoning_entry(entry: &TranscriptEntry) -> bool {
 }
 
 fn same_action_type(left: &TranscriptEntry, right: &TranscriptEntry) -> bool {
-    if is_reasoning_entry(left) || is_reasoning_entry(right) {
-        return is_reasoning_entry(left) && is_reasoning_entry(right);
-    }
     match (left, right) {
         (
             TranscriptEntry::Tool {
@@ -854,7 +868,10 @@ fn same_action_type(left: &TranscriptEntry, right: &TranscriptEntry) -> bool {
                 name: right_name,
                 ..
             },
-        ) => left_source == right_source && left_name == right_name,
+        ) => {
+            left_source == right_source
+                && tool_lifecycle_label(left_name, true) == tool_lifecycle_label(right_name, true)
+        }
         (
             TranscriptEntry::Action {
                 kind: left_kind,
@@ -872,43 +889,7 @@ fn same_action_type(left: &TranscriptEntry, right: &TranscriptEntry) -> bool {
 }
 
 /// A group's header: when it started, how many actions, and where commands ran.
-fn tool_window_summary(
-    entries: &[TranscriptEntry],
-    total: usize,
-    today_prefix: &str,
-    show_time: bool,
-) -> String {
-    if entries.iter().all(is_reasoning_entry) {
-        let running = entries.iter().any(|entry| {
-            matches!(
-                entry,
-                TranscriptEntry::Tool {
-                    complete: false,
-                    ..
-                }
-            )
-        });
-        return format!(
-            "{}{}{}{}",
-            if show_time {
-                match &entries[0] {
-                    TranscriptEntry::Tool { time, .. } => {
-                        format!("{}  ", display_local_time(time, today_prefix))
-                    }
-                    _ => unreachable!(),
-                }
-            } else {
-                String::new()
-            },
-            if running { "◇ " } else { "" },
-            if running { "Reasoning" } else { "Reasoned" },
-            if total > 1 {
-                format!(" ({total})")
-            } else {
-                String::new()
-            }
-        );
-    }
+fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: &str) -> String {
     let mut time = None;
     let mut cwd = None;
     for entry in entries {
@@ -995,21 +976,17 @@ fn action_label_style(entry: &TranscriptEntry) -> Style {
 fn tool_window_header(
     prefix: &'static str,
     text: String,
-    reasoning: bool,
+    show_time: bool,
     label_style: Style,
 ) -> Line<'static> {
     let grey = Style::default().fg(Color::DarkGray);
     let mut spans = vec![Span::styled(prefix, grey)];
-    let start = if reasoning {
-        text.find("Reason").unwrap_or(0)
-    } else {
+    let start = if show_time {
         text.find(" · ").map_or(0, |index| index + " · ".len())
-    };
-    let end = if reasoning {
-        start + text[start..].find(' ').unwrap_or(text.len() - start)
     } else {
-        start + text[start..].find(['(', '·']).unwrap_or(text.len() - start)
+        0
     };
+    let end = start + text[start..].find(['(', '·']).unwrap_or(text.len() - start);
     spans.push(Span::styled(text[..start].to_string(), grey));
     spans.push(Span::styled(text[start..end].to_string(), label_style));
     spans.push(Span::styled(text[end..].to_string(), grey));
@@ -1990,13 +1967,7 @@ impl Transcript {
         self.action_run_expansions
             .get(&start)
             .copied()
-            .unwrap_or_else(|| {
-                if self.order.get(start).is_some_and(is_reasoning_entry) {
-                    self.auto_expand_thinking
-                } else {
-                    self.action_run_open_by_default(start)
-                }
-            })
+            .unwrap_or_else(|| self.action_run_open_by_default(start))
     }
 
     /// A repeated run folds once a different action follows it, or once it
@@ -2022,11 +1993,10 @@ impl Transcript {
             );
             end += 1;
         }
-        let next_is_action = match self.order.get(end) {
-            Some(entry @ TranscriptEntry::Tool { .. }) => !is_reasoning_entry(entry),
-            Some(TranscriptEntry::Action { .. }) => true,
-            _ => false,
-        };
+        let next_is_action = matches!(
+            self.order.get(end),
+            Some(TranscriptEntry::Tool { .. } | TranscriptEntry::Action { .. })
+        );
         if end - start >= 5 {
             return live;
         }
@@ -5646,6 +5616,20 @@ impl Transcript {
         indices.extend(self.active_reasoning);
         indices.sort_unstable();
         indices.dedup();
+        // A group header and its individual rows have different clocks. The
+        // single-entry viewport refresh cannot update both; use the renderer.
+        let windows = self.tool_run_windows();
+        if indices.iter().any(|index| {
+            matches!(
+                self.order.get(*index),
+                Some(TranscriptEntry::Tool {
+                    complete: false,
+                    ..
+                })
+            ) && windows.get(*index).is_some_and(Option::is_some)
+        }) {
+            return Vec::new();
+        }
         indices
             .into_iter()
             .filter_map(|index| match self.order.get(index) {
@@ -5958,6 +5942,24 @@ impl Transcript {
         {
             start = start.min(*run);
         }
+        let action_windows = self.action_run_windows(windows);
+        let mut clock_groups = resume.trace.clock_groups.clone();
+        clock_groups.sort_unstable_by_key(|window| (window.start, window.end));
+        clock_groups.dedup();
+        for window in clock_groups {
+            if window.start < start
+                && !self.refresh_render_group_clock(
+                    &mut resume.render,
+                    window,
+                    windows,
+                    &action_windows,
+                    resume.render_time,
+                    render_time,
+                )
+            {
+                start = window.start;
+            }
+        }
         // Ticking a timer must not relayout the unrelated history after it.
         let mut clock_rows = resume.trace.clock_rows.clone();
         clock_rows.sort_unstable();
@@ -5990,6 +5992,56 @@ impl Transcript {
         start
     }
 
+    fn refresh_render_group_clock(
+        &self,
+        render: &mut Arc<TranscriptRender>,
+        window: ToolRunWindow,
+        outer: &[Option<ToolRunWindow>],
+        consecutive: &[Option<ToolRunWindow>],
+        cached_time: DateTime<Utc>,
+        render_time: DateTime<Utc>,
+    ) -> bool {
+        let Some(entries) = self.order.get(window.start..window.end) else {
+            return false;
+        };
+        let cached = format_tool_group_elapsed_at(entries, cached_time);
+        let current = format_tool_group_elapsed_at(entries, render_time);
+        if cached == current {
+            return true;
+        }
+        let (Some(cached), Some(current)) = (cached, current) else {
+            return false;
+        };
+        if cached.width() != current.width() {
+            return false;
+        }
+        let rows = render
+            .2
+            .iter()
+            .filter_map(|(index, row, ..)| {
+                (*index == window.start && outer[*index] == Some(window)).then_some(*row)
+            })
+            .chain(render.8.iter().filter_map(|(index, row, ..)| {
+                (*index == window.start && consecutive[*index] == Some(window)).then_some(*row)
+            }))
+            .collect::<Vec<_>>();
+        if rows.iter().any(|row| {
+            !render.0[*row]
+                .spans
+                .iter()
+                .any(|span| span.content.ends_with(&cached))
+        }) {
+            return false;
+        }
+        let cached = [(window.start, Some(cached))];
+        let current = [(window.start, Some(current))];
+        let render = Arc::make_mut(render);
+        for row in rows {
+            refresh_tool_elapsed_line(&mut render.0[row], window.start, &cached, &current);
+        }
+        true
+    }
+
     /// Updates only timer headers; changed widths or wrapped labels need layout.
     fn refresh_render_clock(
         &self,
@@ -6018,12 +6070,6 @@ impl Transcript {
             .iter()
             .chain(&render.4)
             .filter_map(|(entry, start, _)| (*entry == index).then_some(*start))
-            .chain(
-                render
-                    .8
-                    .iter()
-                    .filter_map(|(_, start, _, timer)| (*timer == Some(index)).then_some(*start)),
-            )
             .collect::<Vec<_>>();
         rows.sort_unstable();
         rows.dedup();
@@ -6244,7 +6290,6 @@ impl Transcript {
                             &self.order[window.start..window.end],
                             window.total,
                             &today_prefix,
-                            true,
                         )
                     ),
                     Style::default().fg(Color::DarkGray),
@@ -6265,22 +6310,28 @@ impl Transcript {
                 .then_some(action_windows[index])
                 .flatten();
             if let Some(window) = action_window.filter(|window| index == window.start) {
-                let reasoning = is_reasoning_entry(entry);
-                let summary = if reasoning {
-                    tool_window_summary(
-                        &self.order[window.start..window.end],
-                        window.total,
-                        &today_prefix,
-                        false,
-                    )
-                } else {
-                    let label = match entry {
-                        TranscriptEntry::Tool { name, .. } => name,
-                        TranscriptEntry::Action { label, .. } => label,
-                        _ => unreachable!(),
-                    };
-                    format!("{label} ({})", window.total)
+                let summary_entry = self.order[window.start..window.end]
+                    .iter()
+                    .find(|entry| {
+                        matches!(
+                            entry,
+                            TranscriptEntry::Tool {
+                                complete: false,
+                                ..
+                            } | TranscriptEntry::Action {
+                                state: TranscriptActionState::Running
+                                    | TranscriptActionState::Waiting,
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap_or(entry);
+                let label = match summary_entry {
+                    TranscriptEntry::Tool { name, .. } => name,
+                    TranscriptEntry::Action { label, .. } => label,
+                    _ => unreachable!(),
                 };
+                let summary = format!("{label} ({})", window.total);
                 let row = lines.len();
                 lines.push(tool_window_header(
                     if self.action_run_expanded(window.start) {
@@ -6289,22 +6340,24 @@ impl Transcript {
                         "  ▸ "
                     },
                     summary,
-                    reasoning,
-                    action_label_style(entry),
+                    false,
+                    action_label_style(summary_entry),
                 ));
-                let timer_entry = reasoning.then(|| {
-                    (window.start..window.end)
-                        .find(|index| {
-                            matches!(
-                                self.order[*index],
-                                TranscriptEntry::Tool {
-                                    complete: false,
-                                    ..
-                                }
-                            )
+                let timer_entry = (window.start..window.end)
+                    .find(|index| {
+                        matches!(
+                            self.order[*index],
+                            TranscriptEntry::Tool {
+                                completed_at: None,
+                                ..
+                            }
+                        )
+                    })
+                    .or_else(|| {
+                        (window.start..window.end).rev().find(|index| {
+                            matches!(self.order[*index], TranscriptEntry::Tool { .. })
                         })
-                        .unwrap_or(window.end - 1)
-                });
+                    });
                 if let Some(timer) = timer_entry
                     && let TranscriptEntry::Tool {
                         started_at,
@@ -6314,10 +6367,16 @@ impl Transcript {
                 {
                     if completed_at.is_none() {
                         trace.clock_rows.push(timer);
+                        trace.clock_groups.push(window);
+                        running_tool_elapsed.push((
+                            timer,
+                            format_tool_elapsed_at(*started_at, *completed_at, render_time),
+                        ));
                     }
-                    if let Some(elapsed) =
-                        format_tool_elapsed_at(*started_at, *completed_at, render_time)
-                    {
+                    if let Some(elapsed) = format_tool_group_elapsed_at(
+                        &self.order[window.start..window.end],
+                        render_time,
+                    ) {
                         let header = &mut lines[row];
                         let padding = width.saturating_sub(header.width() + elapsed.width());
                         header.spans.push(Span::styled(
@@ -7227,9 +7286,7 @@ impl Transcript {
                             apply_line_background(line, width, MESSAGE_HOVER_BG);
                         }
                     }
-                    let body_expanded = *expanded
-                        || focused_tool == Some(index)
-                        || (is_reasoning && action_window.is_some());
+                    let body_expanded = *expanded || focused_tool == Some(index);
                     if show_tool_body
                         && body_expanded
                         && expandable
@@ -7394,13 +7451,9 @@ impl Transcript {
                 // it stays expanded until a new message ends the group,
                 // rather than collapsing the moment the last running
                 // action stops.
-                let reasoning_group = self.order[window.start..window.end]
-                    .iter()
-                    .all(is_reasoning_entry);
                 let foldable = total_lines > 0
-                    && ((reasoning_group && !self.auto_expand_thinking)
-                        || (!self.window_has_unfinished_work(&window)
-                            && open_window_start != Some(window.start)));
+                    && !self.window_has_unfinished_work(&window)
+                    && open_window_start != Some(window.start);
                 let folded = foldable && !self.tool_run_expanded(window.start);
                 let expandable = foldable || total_lines > tool_run_viewport_height;
                 let expanded = expandable && self.tool_run_expanded(window.start);
@@ -7451,18 +7504,13 @@ impl Transcript {
                             &self.order[window.start..window.end],
                             window.total,
                             &today_prefix,
-                            true,
                         ),
                         action_hint
                     ),
-                    reasoning_group,
-                    if reasoning_group {
-                        action_label_style(&self.order[window.start])
-                    } else {
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD)
-                    },
+                    true,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
                 );
                 if !folded {
                     lines.push(Line::from(Span::styled(
@@ -7517,35 +7565,27 @@ impl Transcript {
                 })
                 .flatten()
                 .map(|time| format!("done at {}", display_local_time(&time, &today_prefix)));
-                if reasoning_group {
-                    let reasoning_index = (window.start..window.end)
-                        .find(|index| {
-                            matches!(
-                                self.order[*index],
-                                TranscriptEntry::Tool {
-                                    complete: false,
-                                    ..
-                                }
-                            )
-                        })
-                        .unwrap_or(window.end - 1);
-                    if let TranscriptEntry::Tool {
-                        started_at,
-                        completed_at,
-                        ..
-                    } = &self.order[reasoning_index]
-                        && let Some(elapsed) =
-                            format_tool_elapsed_at(*started_at, *completed_at, render_time)
-                    {
-                        header_right = Some(match &header_right {
-                            Some(done_at) => format!("{elapsed} · {done_at}"),
-                            None => elapsed,
-                        });
-                    }
-                    tool_rows.insert(
-                        first_tool_row,
-                        (reasoning_index, header_row, header_row + 1),
-                    );
+                if let Some(timer) = (window.start..window.end).find(|index| {
+                    matches!(
+                        self.order[*index],
+                        TranscriptEntry::Tool {
+                            completed_at: None,
+                            ..
+                        }
+                    )
+                }) {
+                    trace.clock_rows.push(timer);
+                    trace.clock_groups.push(window);
+                    running_tool_elapsed
+                        .push((timer, render_clock_key(&self.order[timer], render_time)));
+                }
+                if let Some(elapsed) =
+                    format_tool_group_elapsed_at(&self.order[window.start..window.end], render_time)
+                {
+                    header_right = Some(match &header_right {
+                        Some(done_at) => format!("{elapsed} · {done_at}"),
+                        None => elapsed,
+                    });
                 }
                 if let Some(right) = header_right {
                     let header = &mut lines[header_row];
@@ -7791,14 +7831,6 @@ impl Transcript {
                 index += 1;
                 continue;
             };
-            if index == parent.start
-                && self.order[parent.start..parent.end]
-                    .iter()
-                    .all(is_reasoning_entry)
-            {
-                index = parent.end;
-                continue;
-            }
             let start = index;
             index += 1;
             while index < parent.end && same_action_type(&self.order[start], &self.order[index]) {
@@ -8029,6 +8061,142 @@ mod parallel_preparation_tests {
             &transcript.order[1],
             TranscriptEntry::Message { .. }
         ));
+    }
+
+    #[test]
+    fn action_group_duration_spans_all_actions_and_live_ticks() {
+        let base = Utc::now();
+        let at = |millis| base + chrono::Duration::milliseconds(millis);
+        for kind in ["reasoning", "exec", "mixed"] {
+            for nested in [false, true] {
+                for expanded in [false, true] {
+                    let mut transcript = Transcript::default();
+                    for (start, end) in [(100, Some(2_100)), (5_100, Some(12_100)), (10_100, None)]
+                    {
+                        transcript.start_reasoning(at(start), "19:38".into());
+                        if let Some(end) = end {
+                            transcript.finish_reasoning(at(end));
+                        }
+                    }
+                    for index in 0..3 {
+                        if kind == "exec" || (kind == "mixed" && index < 2) {
+                            let TranscriptEntry::Tool {
+                                source_name,
+                                name,
+                                code_view,
+                                ..
+                            } = &mut transcript.order[index]
+                            else {
+                                unreachable!()
+                            };
+                            *source_name = "exec".into();
+                            *name = "Run".into();
+                            *code_view = None;
+                        }
+                    }
+                    if kind == "exec" {
+                        transcript.active_reasoning = None;
+                        transcript.tools.insert("live".into(), 2);
+                    }
+                    if nested {
+                        transcript.order.push(TranscriptEntry::Action {
+                            kind: TranscriptActionKind::Watch,
+                            label: "Watch".into(),
+                            detail: "finished".into(),
+                            body: None,
+                            time: "19:38".into(),
+                            state: TranscriptActionState::Complete,
+                            expanded: false,
+                        });
+                    }
+                    transcript.action_run_expansions.insert(0, expanded);
+                    transcript.order.push(TranscriptEntry::Info {
+                        title: "History".into(),
+                        text: "Unrelated completed output".into(),
+                        time: "19:38".into(),
+                    });
+                    let mut cache = None;
+                    for (millis, expected) in [
+                        (13_100, "13s"),
+                        (14_100, "14s"),
+                        (59_100, "59s"),
+                        (60_100, "1m 00s"),
+                    ] {
+                        let now = at(millis);
+                        let labels = transcript.running_tool_elapsed_labels_at(now);
+                        let render = cached_transcript_render(
+                            &transcript,
+                            &mut cache,
+                            100,
+                            30,
+                            None,
+                            &labels,
+                            Local::now().date_naive(),
+                            now,
+                        );
+                        assert!(render.0[0].to_string().ends_with(expected));
+                        if millis == 14_100 {
+                            assert_eq!(
+                                transcript
+                                    .render_resumes
+                                    .borrow()
+                                    .last()
+                                    .unwrap()
+                                    .redrawn_from,
+                                transcript.order.len(),
+                                "same-width group ticks must reuse unrelated history",
+                            );
+                        }
+                        let subgroup = render.8[0].1;
+                        assert!(
+                            render.0[subgroup]
+                                .to_string()
+                                .ends_with(if kind == "mixed" { "12s" } else { expected })
+                        );
+                        assert!(!committed_viewport_is_reusable(
+                            cache.as_ref().unwrap(),
+                            100,
+                            30,
+                            &labels,
+                        ));
+                        assert_eq!(
+                            *render,
+                            transcript.render_with_tool_run_viewport_mode(
+                                100, 30, None, None, None, true, None, now,
+                            ),
+                        );
+                    }
+                    // Completion delivery can arrive after the clock advanced;
+                    // the latest completion timestamp, not the last row, wins.
+                    transcript.active_reasoning = None;
+                    let TranscriptEntry::Tool {
+                        name,
+                        complete,
+                        completed_at,
+                        ..
+                    } = &mut transcript.order[2]
+                    else {
+                        unreachable!()
+                    };
+                    *name = if kind == "exec" { "Run" } else { "Reasoned" }.into();
+                    *complete = true;
+                    *completed_at = Some(at(11_100));
+                    transcript.show_action_done_at = true;
+                    let done_at = format!(
+                        "done at {}",
+                        at(12_100).with_timezone(&Local).format("%H:%M")
+                    );
+                    for millis in [61_100, 120_100] {
+                        let render = transcript.render_for_cache_at(100, 30, at(millis));
+                        assert!(
+                            render.0[0]
+                                .to_string()
+                                .ends_with(&format!("12s · {done_at}"))
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
