@@ -843,7 +843,7 @@ impl NativeHarness {
             }
             editor.publish(&messages, true).await;
             let request = ModelTurnRequest {
-                request_id: Some(format!("{}:{model_round}", turn.message_id)),
+                request_id: Some(format!("{}:{assistant_message_id}:{model_round}", turn.message_id)),
                 messages: messages.clone(),
                 ..request_template.clone()
             };
@@ -8753,6 +8753,7 @@ mod tests {
             volatile,
             system_prompt_appendix,
             None,
+            None,
         )
         .await
     }
@@ -8769,6 +8770,7 @@ mod tests {
         volatile: &str,
         system_prompt_appendix: &str,
         system_prompt_override: Option<String>,
+        message_id: Option<Uuid>,
     ) -> (Vec<SessionEventKind>, bool) {
         let harness = NativeHarness {
             model_client,
@@ -8778,7 +8780,7 @@ mod tests {
         let turn = AgentTurn {
             session_id,
             prompt_cache_session_id: None,
-            message_id: Uuid::new_v4(),
+            message_id: message_id.unwrap_or_else(Uuid::new_v4),
             context_generation: 0,
             prior_native_context_tokens: None,
             provider,
@@ -8859,6 +8861,60 @@ mod tests {
         })
         .await
         .expect("the harness turn finished inside the timeout")
+    }
+
+    #[tokio::test]
+    async fn reconnecting_the_same_prompt_does_not_reuse_model_request_ids() {
+        #[derive(Default)]
+        struct Recording(Mutex<Vec<ModelTurnRequest>>);
+        #[async_trait]
+        impl NativeModelClient for Recording {
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                request: ModelTurnRequest,
+                _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                self.0.lock().unwrap().push(request);
+                Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(Some("done".into()), None, None, Vec::new()),
+                    finish_reason: "stop".into(),
+                    usage: ProviderCallUsage::default(),
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+        let client = Arc::new(Recording::default());
+        let root = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        for prompt in ["original request", "retry after committed tools"] {
+            let (_, completed) = run_turn_events_with_system_override(
+                client.clone(),
+                crate::CodingProvider::Codex,
+                root.path().into(),
+                session_id,
+                Vec::new(),
+                HashMap::new(),
+                prompt,
+                "",
+                "",
+                None,
+                Some(message_id),
+            )
+            .await;
+            assert!(completed);
+        }
+        let requests = client.0.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(requests[0].messages, requests[1].messages);
+        assert!(requests.iter().all(|request| request.request_id.is_some()));
+        assert_ne!(requests[0].request_id, requests[1].request_id);
+        assert_eq!(requests[0].session_id, requests[1].session_id);
+        assert_eq!(requests[0].prompt_cache_key, requests[1].prompt_cache_key);
     }
 
     /// Run one turn on top of `journal`, replaying it exactly as the session
@@ -9082,6 +9138,7 @@ mod tests {
             "",
             "",
             override_text,
+            None,
         )
         .await;
         assert!(completed);

@@ -1103,7 +1103,11 @@ impl CodexModelProvider {
         let mut total = 0usize;
         let mut state = ResponseState::default();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("Codex model stream disconnected")?;
+            let chunk = chunk.map_err(|error| {
+                let error = anyhow::Error::new(error.without_url());
+                let message = format!("Codex model stream disconnected: {error:#}");
+                error.context(message)
+            })?;
             total = total.saturating_add(chunk.len());
             ensure!(
                 total <= MAX_STREAM_BYTES,
@@ -2881,6 +2885,44 @@ mod tests {
             assert_eq!(result.ok().as_deref(), expected);
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn disconnected_stream_retains_transport_cause_without_request_url() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/private-request-detail",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1000\r\nConnection: close\r\n\r\ndata: ").await.unwrap();
+        });
+        let response = reqwest::Client::new().get(endpoint).send().await.unwrap();
+        let provider = CodexModelProvider {
+            model: "test-model".into(),
+            effort: "xhigh".into(),
+        };
+        let error = provider
+            .read_stream(response, None, None)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.starts_with("Codex model stream disconnected: "));
+        assert!(!message.contains("private-request-detail"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some())
+        );
+        assert_eq!(
+            crate::provider::classify_provider_error(&error),
+            crate::provider::ProviderErrorKind::ConnectionLost
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
