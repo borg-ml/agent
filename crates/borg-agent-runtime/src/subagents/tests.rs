@@ -2868,6 +2868,7 @@ async fn ensuring_a_sidecar_reuses_one_idle_provider_session() {
     store.create_session(root).await.unwrap();
     let mut root_launch = launch();
     root_launch.capabilities.multiplayer = false;
+    root_launch.cwd = directory.path().to_path_buf();
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
         root,

@@ -5666,7 +5666,7 @@ impl SubagentCoordinator {
     /// Lazily start one metadata-only child after an explicit action targets
     /// it. Concurrent callers either own the wake transition or wait for the
     /// command channel installed by that owner.
-    async fn ensure_child_actor(&self, session_id: Uuid) -> Result<()> {
+    async fn ensure_child_actor(&self, session_id: Uuid) -> Result<mpsc::Sender<HostCommand>> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let wake = {
@@ -5684,9 +5684,9 @@ impl SubagentCoordinator {
                     .get_mut(&session_id)
                     .with_context(|| format!("unknown subagent session {session_id}"))?;
                 let terminal = entry.snapshot.status.is_terminal();
-                if entry.commands.is_some() {
+                if let Some(commands) = entry.commands.clone() {
                     if !terminal {
-                        return Ok(());
+                        return Ok(commands);
                     }
                     // A stopping actor still owns its channel; wait for it to
                     // exit before starting a fresh actor on the same session.
@@ -5744,7 +5744,17 @@ impl SubagentCoordinator {
                     }
                     return Err(error);
                 }
-                return Ok(());
+                let table = self.table.lock().await;
+                let entry = table.entries.get(&session_id);
+                return match entry.and_then(|entry| entry.commands.clone()) {
+                    Some(commands) => Ok(commands),
+                    None => Err(anyhow::anyhow!(
+                        "subagent {} stopped while starting: {:?} {:?}",
+                        entry.map_or("<unknown>", |entry| entry.snapshot.task_name.as_str()),
+                        entry.map(|entry| entry.snapshot.status),
+                        entry.and_then(|entry| entry.snapshot.detail.clone()),
+                    )),
+                };
             }
             anyhow::ensure!(
                 tokio::time::Instant::now() < deadline,
@@ -7279,13 +7289,7 @@ impl SubagentCoordinator {
         command: impl FnOnce(Uuid) -> HostCommand,
     ) -> Result<()> {
         let id = self.table.lock().await.resolve(target)?;
-        self.ensure_child_actor(id).await?;
-        let table = self.table.lock().await;
-        let entry = table.entries.get(&id).expect("resolved subagent exists");
-        let sender = entry.commands.clone().ok_or_else(|| {
-            anyhow::anyhow!("subagent {} is still starting", entry.snapshot.task_name)
-        })?;
-        drop(table);
+        let sender = self.ensure_child_actor(id).await?;
         sender
             .send(command(id))
             .await
