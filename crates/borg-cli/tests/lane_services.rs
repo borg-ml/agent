@@ -897,6 +897,11 @@ fn cold_restart_ends_the_old_backend_and_its_children_first() {
     let old_child: Value =
         serde_json::from_slice(&std::fs::read(markers.join(format!("{old}.json"))).unwrap())
             .unwrap();
+    let previous_markers: std::collections::HashSet<_> = std::fs::read_dir(&markers)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
     f.run(&["restart", "cold-editor"]);
     // The replacement records its own child as it starts; by then both old
     // processes must be gone.
@@ -904,6 +909,7 @@ fn cold_restart_ends_the_old_backend_and_its_children_first() {
         std::fs::read_dir(&markers)
             .unwrap()
             .flatten()
+            .filter(|entry| !previous_markers.contains(&entry.file_name()))
             .filter_map(|entry| {
                 entry
                     .file_name()
