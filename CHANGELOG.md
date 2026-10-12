@@ -5,6 +5,16 @@ Git comparison.
 
 ## Unreleased (since 0.15.7)
 
+### Providers
+
+- Use Borg-owned Rust HTTP/SSE transport for Claude subscriptions instead of
+  the JavaScript connector, keeping model turns inside Borg without API-key
+  fallback.
+- Handle Claude subscription browser login, credential refresh, authentication
+  status, and usage natively, without requiring the Claude CLI.
+- Draft Claude commit messages through the model-only subscription provider
+  rather than an external agent loop.
+
 ### Terminal
 
 - Color the compaction marker and “Compacted context” title orange, and render
@@ -20,6 +30,10 @@ Git comparison.
   compilation, verification, audits, and patch application.
 
 ### Reliability
+
+- Keep the command sender returned by subagent startup, avoiding a second
+  lookup that could race with actor shutdown. Report children that stop during
+  startup explicitly.
 
 - Acknowledge stop requests and abort generation independently of slow journal
   writes and full command queues. Save interruption state and clean up tools

@@ -1456,89 +1456,71 @@ fn commit_message_prompt(stat: &str, diff: &str) -> String {
     )
 }
 
-/// Draft with native GPT model access or the unchanged Claude CLI route.
+/// Draft through Borg's model-only subscription providers. No external agent loop.
 /// Returns None on failure so the caller can use its deterministic fallback.
 fn draft_commit_message(
-    cwd: &Path,
+    _cwd: &Path,
     model: &CommitMessageModel,
     stat: &str,
     diff: &str,
 ) -> Option<String> {
-    use std::io::Write;
-    let prompt = commit_message_prompt(stat, diff);
-    let output = if model.model.starts_with("claude") {
-        let mut child = Command::new("claude")
-            .args([
-                "-p",
-                "--model",
-                &model.model,
-                "--effort",
-                &model.effort,
-                "--no-session-persistence",
-                // The diff is in the prompt: no tools, and no MCP servers to start.
-                "--tools",
-                "",
-                "--strict-mcp-config",
-            ])
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+    #[cfg(not(feature = "subscription-adapters"))]
+    {
+        let _ = (model, stat, diff);
+        None
+    }
+    #[cfg(feature = "subscription-adapters")]
+    {
+        use borg_provider::provider::{
+            ClaudeModelProvider, CodexModelProvider, ModelMessage, ModelTurnRequest,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .ok()?;
-        child.stdin.take()?.write_all(prompt.as_bytes()).ok()?;
-        child.wait_with_output().ok()?
-    } else {
-        #[cfg(not(feature = "subscription-adapters"))]
-        return None;
-        #[cfg(feature = "subscription-adapters")]
-        {
-            use borg_provider::provider::{CodexModelProvider, ModelMessage, ModelTurnRequest};
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .ok()?;
-            return runtime.block_on(async {
-                tokio::time::timeout(std::time::Duration::from_secs(90), async {
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                let request = ModelTurnRequest {
+                    fast: false,
+                    ultrafast: false,
+                    request_id: Some(uuid::Uuid::new_v4().to_string()),
+                    session_id: None,
+                    prompt_cache_key: None,
+                    turn_routing: Default::default(),
+                    messages: vec![ModelMessage::user(commit_message_prompt(stat, diff))],
+                    tools: Vec::new(),
+                    output_schema: None,
+                };
+                let result = if model.model.starts_with("claude") {
+                    let account = ClaudeModelProvider::account_identity(None).await.ok()?;
+                    ClaudeModelProvider {
+                        model: model.model.clone(),
+                        effort: Some(model.effort.clone()),
+                    }
+                    .model_turn_for_account(request, None, None, None, Some(&account))
+                    .await
+                    .ok()?
+                } else {
                     let account = CodexModelProvider::account_identity().await.ok()?;
-                    let provider = CodexModelProvider {
+                    CodexModelProvider {
                         model: model.model.clone(),
                         effort: model.effort.clone(),
-                    };
-                    let result = provider
-                        .model_turn_for_account(
-                            ModelTurnRequest {
-                                fast: false,
-                                ultrafast: false,
-                                request_id: Some(uuid::Uuid::new_v4().to_string()),
-                                session_id: None,
-                                prompt_cache_key: None,
-                                turn_routing: Default::default(),
-                                messages: vec![ModelMessage::user(prompt)],
-                                tools: Vec::new(),
-                                output_schema: None,
-                            },
-                            None,
-                            &account,
-                        )
-                        .await
-                        .ok()?;
-                    let (content, _, calls) = result.assistant_parts()?;
-                    if !calls.is_empty() {
-                        return None;
                     }
-                    clean_commit_message(content.as_deref()?)
-                })
-                .await
-                .ok()
-                .flatten()
-            });
-        }
-    };
-    if !output.status.success() {
-        return None;
+                    .model_turn_for_account(request, None, &account)
+                    .await
+                    .ok()?
+                };
+                let (content, _, calls) = result.assistant_parts()?;
+                if !calls.is_empty() {
+                    return None;
+                }
+                clean_commit_message(content.as_deref()?)
+            })
+            .await
+            .ok()
+            .flatten()
+        })
     }
-    clean_commit_message(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Strip code fences and surrounding whitespace; reject empty drafts.

@@ -1334,6 +1334,13 @@ async fn probe_provider(
         && borg_provider::credentials::opencode_go_api_key().is_some();
     let (version, subscription_authenticated) = if native_go {
         (None, true)
+    } else if provider == CodingProvider::Claude {
+        (
+            None,
+            borg_provider::provider::read_claude_subscription_status()
+                .await
+                .unwrap_or(false),
+        )
     } else if provider == CodingProvider::Codex {
         (
             None,
@@ -1637,6 +1644,7 @@ async fn probe_provider(
         // on a separately installed `borg` executable being discoverable in a
         // service user's PATH.
         CodingProvider::Codex
+        | CodingProvider::Claude
         | CodingProvider::Anthropic
         | CodingProvider::Kimi
         | CodingProvider::Glm
@@ -1871,11 +1879,17 @@ async fn provider_auth_status(provider: CodingProvider) -> Result<String> {
             .to_string(),
         ),
         CodingProvider::Claude => {
-            runtime_output(
-                borg_provider::Runtime::Claude,
-                &["auth", "status", "--json"],
-            )
-            .await
+            #[cfg(feature = "subscription-adapters")]
+            {
+                let authority = borg_provider::claude_subscription::AuthAuthority::resolve(None)?;
+                Ok(borg_provider::claude_subscription::status(authority)
+                    .await?
+                    .to_string())
+            }
+            #[cfg(not(feature = "subscription-adapters"))]
+            {
+                bail!("Claude subscription adapter is unavailable")
+            }
         }
         CodingProvider::OpenCode => {
             runtime_output(borg_provider::Runtime::OpenCode, &["providers", "list"]).await
@@ -2049,9 +2063,7 @@ fn provider_login_command(provider: CodingProvider, mut command: Command) -> Res
     }
     match provider {
         CodingProvider::Codex => bail!("ChatGPT subscription login is handled natively"),
-        CodingProvider::Claude => {
-            command.args(["auth", "login"]);
-        }
+        CodingProvider::Claude => bail!("Claude subscription login is handled natively"),
         CodingProvider::OpenCode => {
             command.args(["providers", "login"]);
         }
@@ -2075,7 +2087,7 @@ fn provider_login_command(provider: CodingProvider, mut command: Command) -> Res
 }
 
 pub async fn login_provider(provider: CodingProvider) -> Result<()> {
-    if provider == CodingProvider::Codex {
+    if matches!(provider, CodingProvider::Codex | CodingProvider::Claude) {
         return login_provider_with_output(provider, |line| println!("{line}")).await;
     }
     let command = Command::new(provider.executable());
@@ -2126,6 +2138,24 @@ pub async fn login_provider_with_output(
     provider: CodingProvider,
     mut on_output: impl FnMut(&str) + Send,
 ) -> Result<()> {
+    #[cfg(feature = "subscription-adapters")]
+    if provider == CodingProvider::Claude {
+        let authority = borg_provider::claude_subscription::AuthAuthority::resolve(None)?;
+        let login = borg_provider::claude_subscription::begin_browser_login(authority).await?;
+        on_output(&format!(
+            "Open {} to connect your Claude subscription (expires in 10 minutes).",
+            login.authorize_url()
+        ));
+        login.complete().await?;
+        if let Some(cache) = PROVIDER_CAPABILITIES_CACHE.get() {
+            cache.lock().await.clear();
+        }
+        if let Some(cache) = crate::provider_usage::PROVIDER_USAGE_CACHE.get() {
+            cache.lock().await.clear();
+        }
+        on_output("Connected Claude subscription. Saved API credentials were kept.");
+        return Ok(());
+    }
     if provider == CodingProvider::Codex {
         let login = borg_provider::openai_subscription::begin_device_login().await?;
         on_output(&format!(
@@ -6895,16 +6925,7 @@ mod tests {
     #[test]
     fn native_provider_login_commands_use_non_terminal_flows() {
         assert!(provider_login_command(CodingProvider::Codex, Command::new("codex")).is_err());
-        let claude =
-            provider_login_command(CodingProvider::Claude, Command::new("claude")).unwrap();
-        assert_eq!(
-            claude
-                .as_std()
-                .get_args()
-                .map(|argument| argument.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-            ["auth", "login"]
-        );
+        assert!(provider_login_command(CodingProvider::Claude, Command::new("claude")).is_err());
     }
     use crate::{RuntimeMcpServer, WorkspaceFilesystemOperation};
 

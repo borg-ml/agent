@@ -2,8 +2,6 @@ use std::{
     collections::HashSet,
     fs,
     path::{Component, Path, PathBuf},
-    process::{Output, Stdio},
-    time::Duration,
 };
 
 use crate::{ProviderAuthBundle, ProviderAuthFile, ProviderAuthProvider};
@@ -11,7 +9,6 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use tokio::process::Command;
 
 use crate::bounded_io::read_open_file_bytes_with_limit;
 
@@ -21,8 +18,6 @@ const CLAUDE_CREDENTIALS_REL_PATH: &str = ".claude/.credentials.json";
 const CODEX_AUTH_REL_PATH: &str = ".codex/auth.json";
 const PROVIDER_AUTH_FILE_MAX_BYTES: usize = 1024 * 1024;
 const PROVIDER_AUTH_JWT_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
-const PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV: &str = "BORG_PROVIDER_AUTH_VALIDATION_TIMEOUT_SECS";
-const DEFAULT_PROVIDER_AUTH_VALIDATION_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Default)]
 pub struct ProviderAuthValidation {
@@ -312,48 +307,31 @@ pub async fn validate_home(
 }
 
 async fn validate_claude_home(home_dir: &Path) -> Result<ProviderAuthValidation> {
-    let mut cmd = crate::provider_bin::command(crate::provider_bin::Runtime::Claude).await?;
-    cmd.args(["auth", "status", "--json"])
-        .env("HOME", home_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = run_provider_auth_status_command(&mut cmd, "claude auth status").await?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let (value, parse_error) = match serde_json::from_str::<Value>(&stdout) {
-        Ok(value) => (value, None),
-        Err(error) => (Value::Null, Some(error)),
-    };
-    let ok = output.status.success()
-        && parse_error.is_none()
-        && value
-            .get("loggedIn")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-    Ok(ProviderAuthValidation {
-        ok,
-        auth_kind: auth_kind_for_provider(ProviderAuthProvider::Claude, Some(&value)),
-        account_email: value
-            .get("email")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        account_label: value
-            .get("orgName")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        expires_at: None,
-        last_error: if ok {
-            String::new()
-        } else if let Some(error) = parse_error {
-            format!("failed to parse claude auth status JSON: {error}; stdout: {stdout}")
-        } else if !stderr.is_empty() {
-            stderr
-        } else {
-            stdout
-        },
-    })
+    #[cfg(not(feature = "claude"))]
+    {
+        let _ = home_dir;
+        anyhow::bail!("Claude subscription adapter is unavailable");
+    }
+    #[cfg(feature = "claude")]
+    {
+        use crate::claude_subscription::{AuthAuthority, CredentialStore};
+        // Bundle-relative home is an explicit file authority, not ambient config.
+        let authority = AuthAuthority::selected(home_dir.join(".claude"), CredentialStore::File)?;
+        let value = crate::claude_subscription::status(authority).await?;
+        let ok = value["loggedIn"].as_bool().unwrap_or(false);
+        Ok(ProviderAuthValidation {
+            ok,
+            auth_kind: auth_kind_for_provider(ProviderAuthProvider::Claude, Some(&value)),
+            account_email: value["email"].as_str().unwrap_or("").to_owned(),
+            account_label: value["orgName"].as_str().unwrap_or("").to_owned(),
+            expires_at: None,
+            last_error: if ok {
+                String::new()
+            } else {
+                "Claude subscription login required".into()
+            },
+        })
+    }
 }
 
 async fn validate_openai_home(home_dir: &Path) -> Result<ProviderAuthValidation> {
@@ -391,58 +369,6 @@ async fn validate_openai_home(home_dir: &Path) -> Result<ProviderAuthValidation>
     })
 }
 
-async fn run_provider_auth_status_command(command: &mut Command, label: &str) -> Result<Output> {
-    run_provider_auth_status_command_with_timeout(
-        command,
-        label,
-        provider_auth_validation_timeout()?,
-    )
-    .await
-}
-
-async fn run_provider_auth_status_command_with_timeout(
-    command: &mut Command,
-    label: &str,
-    timeout: Duration,
-) -> Result<Output> {
-    command.stdin(Stdio::null()).kill_on_drop(true);
-    tokio::time::timeout(timeout, command.output())
-        .await
-        .map_err(|_| anyhow!("{label} timed out after {}s", timeout.as_secs_f64()))?
-        .with_context(|| format!("run {label}"))
-}
-
-fn provider_auth_validation_timeout() -> Result<Duration> {
-    let raw = match std::env::var(PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV) {
-        Ok(raw) => raw,
-        Err(std::env::VarError::NotPresent) => {
-            return Ok(Duration::from_secs(
-                DEFAULT_PROVIDER_AUTH_VALIDATION_TIMEOUT_SECS,
-            ));
-        }
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(anyhow!(
-                "{PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV} contains invalid unicode"
-            ));
-        }
-    };
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(Duration::from_secs(
-            DEFAULT_PROVIDER_AUTH_VALIDATION_TIMEOUT_SECS,
-        ));
-    }
-    match raw.parse::<u64>() {
-        Ok(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
-        Ok(_) => Err(anyhow!(
-            "{PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV} must be positive"
-        )),
-        Err(error) => Err(anyhow!(
-            "invalid {PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV}: {error}"
-        )),
-    }
-}
-
 pub fn should_revalidate(
     last_validated_at: Option<DateTime<Utc>>,
     expires_at: Option<DateTime<Utc>>,
@@ -474,41 +400,6 @@ pub fn normalize_provider(raw: &str) -> Result<ProviderAuthProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(previous) = self.previous.as_ref() {
-                    std::env::set_var(self.key, previous);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
 
     #[test]
     fn bundle_requires_expected_paths() {
@@ -697,76 +588,6 @@ mod tests {
             std::fs::write(directory.join("auth.json"), document.to_string()).unwrap();
             assert!(!validate_openai_home(home.path()).await.unwrap().ok);
         }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn provider_auth_status_command_never_consumes_composer_input() {
-        let input = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(input.path(), "unsent composer text").unwrap();
-        let mut command = Command::new("cat");
-        command.stdin(Stdio::from(std::fs::File::open(input.path()).unwrap()));
-        let output = run_provider_auth_status_command_with_timeout(
-            &mut command,
-            "test noninteractive auth status",
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
-        assert!(output.status.success());
-        assert!(
-            output.stdout.is_empty(),
-            "auth probes must not read user input"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn provider_auth_status_command_times_out_hanging_process() {
-        let mut command = Command::new("sleep");
-        command.arg("5");
-        let started = std::time::Instant::now();
-
-        let error = run_provider_auth_status_command_with_timeout(
-            &mut command,
-            "test provider auth status",
-            Duration::from_millis(100),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(error.to_string().contains("timed out"));
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "timeout should fire promptly"
-        );
-    }
-
-    #[test]
-    fn provider_auth_validation_timeout_rejects_invalid_config() {
-        let _guard = EnvGuard::unset(PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV);
-        assert_eq!(
-            provider_auth_validation_timeout().unwrap(),
-            Duration::from_secs(DEFAULT_PROVIDER_AUTH_VALIDATION_TIMEOUT_SECS)
-        );
-
-        let _guard = EnvGuard::set(PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV, " 45 ");
-        assert_eq!(
-            provider_auth_validation_timeout().unwrap(),
-            Duration::from_secs(45)
-        );
-
-        let _guard = EnvGuard::set(PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV, " ");
-        assert_eq!(
-            provider_auth_validation_timeout().unwrap(),
-            Duration::from_secs(DEFAULT_PROVIDER_AUTH_VALIDATION_TIMEOUT_SECS)
-        );
-
-        let _guard = EnvGuard::set(PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV, "0");
-        assert!(provider_auth_validation_timeout().is_err());
-
-        let _guard = EnvGuard::set(PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV, "soon");
-        assert!(provider_auth_validation_timeout().is_err());
     }
 
     #[test]

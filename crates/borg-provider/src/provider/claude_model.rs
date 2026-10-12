@@ -1,4 +1,4 @@
-//! Borg-owned Claude turns using the shared subscription model connector.
+//! Borg-owned Claude turns using direct entitled subscription HTTP/SSE.
 
 use std::{path::Path, time::Instant};
 
@@ -15,7 +15,10 @@ use super::{
     anthropic_messages::{
         AnthropicStreamState, anthropic_error_kind, apply_stream_event, messages_request_body,
     },
-    claude_connector::{Capabilities, Connector, MAX_FRAME_BYTES, MAX_RESPONSE_BYTES},
+    claude_connector::Capabilities,
+    claude_native_client::NativeConnector as Connector,
+    claude_subscription_protocol,
+    claude_subscription_transport::{self, MAX_FRAME_BYTES, MAX_RESPONSE_BYTES, SseFrame},
 };
 use crate::runtime::{CostBasis, elapsed_millis_u64};
 
@@ -87,7 +90,7 @@ impl ClaudeModelProvider {
         .await
     }
 
-    /// Refresh through the same pinned subscription connector; never execute the reply.
+    /// Refresh through the same entitled subscription transport; never execute the reply.
     pub async fn refresh_prompt_cache_for_account(
         &self,
         request: ModelTurnRequest,
@@ -120,7 +123,7 @@ impl ClaudeModelProvider {
         let trace = ProviderAttemptTrace {
             invocation: ProviderInvocation {
                 provider_label: "claude-subscription".into(),
-                executable: "shared-claude-model-connector".into(),
+                executable: claude_subscription_transport::ENDPOINT.into(),
                 args: Vec::new(),
                 cwd: None,
                 model: Some(self.model.clone()),
@@ -216,13 +219,27 @@ impl ClaudeModelProvider {
                 "auth": "subscription_oauth", "agent_loop": "borg",
             }),
         );
-        let mut cancellation = connector.cancellation_guard(id.clone());
         let response = connector
-            .infer(&json!({
-                "id": id, "session_id": session, "parent_agent_id": parent_agent_id,
-                "account_identity": info.account_identity, "body": body,
-            }))
+            .post(&body, &id, &session, parent_agent_id)
             .await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let message =
+                format!("Claude subscription request failed (HTTP {status}); no API-key fallback");
+            return Err(ModelFailure {
+                kind: anthropic_error_kind(status, &message),
+                message,
+            }
+            .into());
+        }
+        if let Some((five_hour, weekly)) = claude_subscription_transport::grace(response.headers())
+        {
+            publish(
+                &progress,
+                "claude_usage_grace",
+                json!({"five_hour":five_hour,"weekly":weekly}),
+            );
+        }
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::new();
         let mut received = 0usize;
@@ -233,98 +250,56 @@ impl ClaudeModelProvider {
             received = received.saturating_add(chunk.len());
             ensure!(
                 received <= MAX_RESPONSE_BYTES,
-                "Claude response exceeded the connector limit"
+                "Claude response exceeded the stream limit"
             );
             buffer.extend_from_slice(&chunk);
-            let mut consumed = 0;
-            while let Some(end) = buffer[consumed..].iter().position(|byte| *byte == b'\n') {
-                let end = consumed + end;
-                ensure!(
-                    end - consumed <= MAX_FRAME_BYTES,
-                    "Claude event exceeded the connector limit"
-                );
-                let frame: Value = serde_json::from_slice(&buffer[consumed..end])
-                    .map_err(|_| ModelFailure::lost("Invalid Claude connector event"))?;
-                ensure!(
-                    frame["id"] == id,
-                    "Claude connector returned another request's stream"
-                );
-                ensure!(!complete, "Claude connector sent data after completion");
-                match frame["type"].as_str() {
-                    Some("started") => {
-                        ensure!(
-                            frame["account_identity"] == info.account_identity,
-                            "Claude connector changed account identity"
-                        );
-                        trace.invocation.args = vec![format!("pid={}", info.pid)];
-                    }
-                    Some("grace") => {
-                        publish(
-                            &progress,
-                            "claude_usage_grace",
-                            json!({
-                                "five_hour": frame["five_hour"], "weekly": frame["weekly"],
-                            }),
-                        );
-                    }
-                    Some("event") => {
-                        let event = &frame["event"];
-                        let kind = event["type"]
-                            .as_str()
-                            .context("Claude event omitted its type")?;
-                        if let Some(indexes) = frame.get("narration_block_indexes") {
-                            ensure!(
-                                kind == "content_block_stop",
-                                "unexpected native narration metadata"
-                            );
-                            state.set_narration_block_indexes(indexes);
-                        }
-                        apply_stream_event(&mut state, kind, event, progress.as_ref());
-                        if matches!(kind, "message_start" | "message_delta") {
-                            publish_usage(&progress, &id, &state, false);
-                        }
-                        if let Some((message, kind)) = state.take_error() {
-                            return Err(ModelFailure { message, kind }.into());
-                        }
-                    }
-                    Some("done") => {
-                        state
-                            .validate_complete()
-                            .map_err(|message| ModelFailure::lost(&message))?;
-                        complete = true;
-                    }
-                    Some("cancelled") => {
-                        return Err(ModelFailure::lost("Claude model request cancelled").into());
-                    }
-                    Some("error") => {
-                        let message = frame["message"]
-                            .as_str()
-                            .unwrap_or("Claude model request failed")
-                            .to_string();
-                        let status = frame["status"].as_u64().unwrap_or(500) as u16;
-                        return Err(ModelFailure {
-                            kind: anthropic_error_kind(status, &message),
-                            message,
-                        }
-                        .into());
-                    }
-                    _ => return Err(ModelFailure::lost("Unknown Claude connector event").into()),
+            while let Some(frame) = claude_subscription_transport::take_event(&mut buffer)
+                .map_err(|_| ModelFailure::lost("Invalid Claude subscription event"))?
+            {
+                let SseFrame::Event(event) = frame else {
+                    continue;
+                };
+                let kind = event["type"]
+                    .as_str()
+                    .context("Claude event omitted its type")?;
+                if kind == "ping" {
+                    continue;
                 }
-                consumed = end + 1;
+                ensure!(!complete, "Claude sent data after message completion");
+                if kind == "content_block_stop" {
+                    let raw = state.raw_response();
+                    let indexes = claude_subscription_protocol::narration_block_indexes(
+                        raw["content"]
+                            .as_array()
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                    );
+                    state.set_narration_block_indexes(&json!(indexes));
+                }
+                apply_stream_event(&mut state, kind, &event, progress.as_ref());
+                if matches!(kind, "message_start" | "message_delta") {
+                    publish_usage(&progress, &id, &state, false);
+                }
+                if let Some((message, kind)) = state.take_error() {
+                    return Err(ModelFailure { message, kind }.into());
+                }
+                if kind == "message_stop" {
+                    state
+                        .validate_complete()
+                        .map_err(|message| ModelFailure::lost(&message))?;
+                    complete = true;
+                }
             }
-            buffer.drain(..consumed);
             ensure!(
                 buffer.len() <= MAX_FRAME_BYTES,
-                "Claude event exceeded the connector limit"
+                "Claude event exceeded the stream limit"
             );
         }
         if !complete || !buffer.is_empty() {
-            return Err(ModelFailure::lost(
-                "Claude connector disconnected before completing the response",
-            )
-            .into());
+            return Err(
+                ModelFailure::lost("Claude disconnected before completing the response").into(),
+            );
         }
-        cancellation.complete();
         publish_usage(&progress, &id, &state, true);
         let mut message = state.assistant_message();
         if let ModelMessage::Assistant {

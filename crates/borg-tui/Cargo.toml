@@ -11,7 +11,7 @@ authors.workspace = true
 publish = false
 
 [features]
-subscription-adapters = ["borg-provider/codex"]
+subscription-adapters = ["borg-provider/subscription-adapters"]
 
 [dependencies]
 anyhow.workspace = true

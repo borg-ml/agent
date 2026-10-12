@@ -1,3 +1,5 @@
+#[cfg(feature = "claude")]
+pub mod claude_subscription;
 pub mod credentials;
 pub mod image_tiles;
 pub mod local;
