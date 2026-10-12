@@ -75,6 +75,7 @@ pub(super) fn prepare(
     Ok(PreparedRequest { headers, bytes })
 }
 
+#[cfg_attr(test, expect(dead_code))]
 fn http_client() -> Result<&'static reqwest::Client> {
     static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
     if let Some(client) = HTTP.get() {
@@ -92,6 +93,7 @@ fn http_client() -> Result<&'static reqwest::Client> {
 
 /// The enclosing provider owns account/replay guards and one pre-event 401 retry.
 /// Dropping this future or its response stream cancels HTTP, not a helper RPC.
+#[cfg_attr(test, expect(dead_code))]
 pub(super) async fn send(request: PreparedRequest) -> Result<reqwest::Response> {
     ensure!(
         !request.headers.contains_key("x-api-key"),

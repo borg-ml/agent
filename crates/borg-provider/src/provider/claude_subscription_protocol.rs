@@ -344,6 +344,7 @@ pub(super) fn inference_headers(
 }
 
 /// GET query only; no network calls. Bootstrap uses a different UA from inference.
+#[cfg_attr(test, expect(dead_code))]
 pub(super) fn bootstrap_query(model: &str, entrypoint: &str) -> [(String, String); 2] {
     [
         ("entrypoint".into(), entrypoint.into()),
@@ -445,7 +446,7 @@ fn is_narration_signature(signature: &str) -> bool {
     if padded.len() % 4 == 1 {
         return false;
     }
-    while padded.len() % 4 != 0 {
+    while !padded.len().is_multiple_of(4) {
         padded.push('=');
     }
     let decoder = base64::engine::GeneralPurpose::new(

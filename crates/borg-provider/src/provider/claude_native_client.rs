@@ -66,7 +66,6 @@ impl Default for VerifiedPolicy {
 /// An already activated, validated first-party `cc` snapshot. No feature payload means
 /// off; this client does not fetch/activate the served picker opportunistically.
 pub(super) struct VerifiedServedCatalog {
-    pub identity: AccountIdentity,
     pub rows: Vec<ServedModel>,
     pub enforced_default_model: Option<String>,
 }
@@ -96,7 +95,9 @@ pub(super) struct NativeInfo {
 pub(super) struct NativeConnector {
     authority: AuthAuthority,
     bound: AccountIdentity,
+    #[cfg_attr(test, expect(dead_code))]
     device_id: Arc<String>,
+    #[cfg_attr(test, expect(dead_code))]
     http: reqwest::Client,
     state: Arc<Mutex<State>>,
 }
@@ -142,38 +143,6 @@ impl NativeConnector {
     /// Tokens must never be logged or persisted outside their selected auth authority.
     pub async fn access(&self) -> Result<SubscriptionAccess> {
         auth::access(self.authority.clone(), self.bound.clone(), None).await
-    }
-
-    pub async fn set_verified_policy(&self, mut policy: VerifiedPolicy) {
-        let mut state = self.state.lock().await;
-        policy.hipaa |= state.policy.hipaa;
-        if policy.hipaa || !policy.allow_model_catalog {
-            state.served = None;
-        }
-        state.policy = policy;
-    }
-
-    pub async fn set_verified_served_catalog(
-        &self,
-        catalog: Option<VerifiedServedCatalog>,
-    ) -> Result<()> {
-        if let Some(catalog) = &catalog {
-            ensure!(
-                catalog.identity == self.bound,
-                "Claude served catalog belongs to another account/organization"
-            );
-            ensure!(
-                catalog.rows.iter().any(|r| !r.disabled && !r.deprecated),
-                "Claude served catalog has no offered rows"
-            );
-        }
-        let mut state = self.state.lock().await;
-        ensure!(
-            catalog.is_none() || (!state.policy.hipaa && state.policy.allow_model_catalog),
-            "Claude policy forbids activating served catalog"
-        );
-        state.served = catalog;
-        Ok(())
     }
 
     pub async fn info(&self, model: Option<&str>) -> Result<NativeInfo> {
@@ -649,18 +618,17 @@ fn model_capabilities(
     }
     if defaults["override_user_effort"].as_bool() == Some(true)
         && defaults["name"].as_str().is_some_and(matches)
+        && let Some(required) = defaults["default_effort_level"].as_str()
     {
-        if let Some(required) = defaults["default_effort_level"].as_str() {
+        ensure!(
+            EFFORTS.contains(&required),
+            "unknown enforced Claude organization effort"
+        );
+        if let Some(effort) = effort {
             ensure!(
-                EFFORTS.contains(&required),
-                "unknown enforced Claude organization effort"
+                effort == required,
+                "Claude explicit effort conflicts with enforced organization effort"
             );
-            if let Some(effort) = effort {
-                ensure!(
-                    effort == required,
-                    "Claude explicit effort conflicts with enforced organization effort"
-                );
-            }
         }
     }
     facts.capabilities.betas = baseline_betas(&canonical, policy);

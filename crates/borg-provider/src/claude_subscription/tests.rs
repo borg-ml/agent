@@ -29,10 +29,10 @@ pub(super) async fn injected_fetch(
             .try_with(|queue| queue.lock().unwrap().pop_front())
             .ok()
             .flatten();
-        if let Some((authority, document)) = write {
-            if let Err(error) = authority.save(&document).await {
-                return Some(Err(error));
-            }
+        if let Some((authority, document)) = write
+            && let Err(error) = authority.save(&document).await
+        {
+            return Some(Err(error));
         }
     }
     Some(response)
