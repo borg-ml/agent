@@ -95,6 +95,6 @@ pub(super) fn record_account_verification(selected: Option<&Path>, success: bool
     }
     #[cfg(not(unix))]
     {
-        let _ = (directory, path);
+        let _ = (directory, &path);
     }
 }
