@@ -13519,13 +13519,9 @@ fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
     });
 
     assert!(transcript.toggle_tool_run_expansion(0));
-    let lines = transcript.lines(80);
-    let thinking_rows = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.to_string().contains("Reasoning"))
-        .map(|(row, _)| row)
-        .collect::<Vec<_>>();
+    let render = transcript.render_with_tool_run_viewport(80, 100, None, None, None);
+    let lines = &render.0;
+    let thinking_rows = render.1.iter().map(|(_, row, _)| *row).collect::<Vec<_>>();
     let message_header = lines
         .iter()
         .position(|line| line.to_string().contains("borg"))
@@ -14740,7 +14736,7 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     assert!(!rendered.contains("Reasoned (1)"), "{rendered}");
     assert!(rendered.contains("◦ Reasoned"), "{rendered}");
     assert!(rendered.contains("  ▾ Run (2)"), "{rendered}");
-    assert!(rendered.contains("  ▾ Watch (2)"), "{rendered}");
+    assert!(rendered.contains("  ▸ Watch (2)"), "{rendered}");
     assert!(
         rendered.contains("\n  19:38  agent · /root/v391_scaling_audit · started"),
         "{rendered}"
@@ -14759,6 +14755,7 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     assert!(transcript.toggle_action_run_expansion(0));
     assert!(!transcript.tool_run_expanded(0));
     transcript.toggle_tool(0);
+    assert!(transcript.toggle_action_run_expansion(10));
     let expanded_child = render(&transcript);
     assert!(text(&expanded_child).contains("Reasoning block 0"));
     assert_eq!(
