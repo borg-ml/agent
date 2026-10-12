@@ -55,7 +55,7 @@ pub(super) fn decode_rgb(data: &[u8]) -> Result<Decoded> {
 }
 
 /// Downscale a capture that exceeds the 4 MiB attachment bound; returns (png, scale).
-fn fit_image(data: Vec<u8>) -> Result<(Vec<u8>, f64)> {
+pub(super) fn fit_image(data: Vec<u8>) -> Result<(Vec<u8>, f64)> {
     if data.len() <= MAX_IMAGE_BYTES {
         return Ok((data, 1.0));
     }

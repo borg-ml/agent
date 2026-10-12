@@ -928,11 +928,9 @@ impl Helper {
         let shot = backend.call(request)?;
         let data = std::fs::read(&path);
         let _ = std::fs::remove_file(&path);
-        let data = data?;
-        ensure!(
-            data.len() <= super::MAX_IMAGE_BYTES,
-            "screenshot exceeds 4 MiB; use a smaller private display or window capture"
-        );
+        // A detailed full-HD frame can encode above the attachment bound:
+        // downscale it like a desktop capture instead of refusing it.
+        let (data, scale) = super::capture::fit_image(data?)?;
         let mut result = json!({
             "scope": if window_id.is_some() { "window" } else { "desktop" },
             "display": "private", "width": shot["width"], "height": shot["height"],
@@ -945,6 +943,11 @@ impl Helper {
         });
         if let Some(id) = window_id {
             result["window_id"] = id.clone();
+        }
+        if scale < 1.0 {
+            // Pixel coordinates in this image map to display/window pixels by 1/scale.
+            result["image_scale"] = json!(scale);
+            result["note"] = json!("downscaled to fit 4 MiB; divide image x,y by image_scale for pointer ops");
         }
         if let Some(cursor) = shot.get("cursor") {
             result["cursor"] = cursor.clone();
