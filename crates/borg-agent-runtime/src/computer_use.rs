@@ -1,6 +1,7 @@
 //! Session-owned native desktop helper. Handles never survive a helper restart.
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -176,7 +177,7 @@ impl ComputerUse {
         }
     }
 
-    pub(crate) async fn call(&self, arguments: Value) -> Result<Value> {
+    pub(crate) async fn call(self: &Arc<Self>, arguments: Value) -> Result<Value> {
         let op = arguments
             .get("op")
             .and_then(Value::as_str)
@@ -217,6 +218,34 @@ impl ComputerUse {
             "computer-use request exceeds 128 KiB"
         );
         request.push(b"\n"[0]);
+        // Starting a private display, launching into it and tearing it down
+        // wait on child processes; everything else is a bounded desktop call.
+        let limit = match op {
+            "start_display" | "launch" | "stop_display" | "attach_display" => {
+                Duration::from_secs(45)
+            }
+            _ => Duration::from_secs(15),
+        };
+        // A launch owns a shared display. Finish its exchange even if the caller
+        // is cancelled, so dropping a tool future cannot kill the desktop worker
+        // or leave an unread response for the next observation.
+        let response = if op == "launch" {
+            let desktop = self.clone();
+            tokio::spawn(async move { desktop.exchange(request, limit).await }).await??
+        } else {
+            self.exchange(request, limit).await?
+        };
+        ensure!(
+            response["ok"] == true,
+            "{}",
+            response["error"]
+                .as_str()
+                .unwrap_or("desktop operation failed")
+        );
+        Ok(response["result"].clone())
+    }
+
+    async fn exchange(&self, request: Vec<u8>, limit: Duration) -> Result<Value> {
         let mut slot = self.process.lock().await;
         // Keep the child out of the registry during I/O: cancellation, timeout,
         // malformed output and broken pipes all drop/kill it, invalidating handles.
@@ -246,14 +275,6 @@ impl ComputerUse {
                 }
             }
         };
-        // Starting a private display, launching into it and tearing it down
-        // wait on child processes; everything else is a bounded desktop call.
-        let limit = match op {
-            "start_display" | "launch" | "stop_display" | "attach_display" => {
-                Duration::from_secs(45)
-            }
-            _ => Duration::from_secs(15),
-        };
         let response: Value = tokio::time::timeout(limit, async {
             process.stdin.write_all(&request).await?;
             process.stdin.flush().await?;
@@ -281,15 +302,10 @@ impl ComputerUse {
             "invalid desktop helper response"
         );
         *slot = Some(process);
-        ensure!(
-            response["ok"] == true,
-            "{}",
-            response["error"]
-                .as_str()
-                .unwrap_or("desktop operation failed")
-        );
-        self.remember_observation(&response["result"]).await;
-        Ok(response["result"].clone())
+        if response["ok"] == true {
+            self.remember_observation(&response["result"]).await;
+        }
+        Ok(response)
     }
 
     /// Refuse to act on a consequential element unless the caller states that
@@ -588,9 +604,73 @@ mod tests {
         }
     }
 
+    // Cancelling a launch must retain its worker and drain the pending response,
+    // not kill a reused display or feed launch's response to the next request.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelled_launch_keeps_worker_and_response_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let gate = tokio::net::UnixListener::bind(directory.path().join("gate")).unwrap();
+        let mut child = Command::new("python3")
+            .args([
+                "-u",
+                "-c",
+                r#"
+import json, socket, sys
+request = json.loads(sys.stdin.readline())
+gate = socket.socket(socket.AF_UNIX)
+gate.connect(sys.argv[1])
+gate.sendall(b'ready')
+gate.recv(1)
+print(json.dumps({'ok': True, 'result': {'op': request['op']}}), flush=True)
+for line in sys.stdin:
+    print(json.dumps({'ok': True, 'result': {'op': json.loads(line)['op']}}), flush=True)
+"#,
+            ])
+            .arg(directory.path().join("gate"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let desktop = Arc::new(ComputerUse::default());
+        *desktop.process.lock().await = Some(DesktopProcess {
+            stdin: child.stdin.take().unwrap(),
+            stdout: BufReader::new(child.stdout.take().unwrap()),
+            child,
+        });
+        let caller = {
+            let desktop = desktop.clone();
+            tokio::spawn(async move { desktop.call(json!({"op": "launch"})).await })
+        };
+        let (mut gate, _) = tokio::time::timeout(Duration::from_secs(5), gate.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut ready = [0; 5];
+        gate.read_exact(&mut ready).await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        gate.write_all(b"x").await.unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            desktop.call(json!({"op": "capabilities"})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response["op"], "capabilities");
+        assert_eq!(
+            desktop.process.lock().await.as_ref().unwrap().child.id(),
+            pid
+        );
+        desktop.stop().await;
+    }
+
     #[tokio::test]
     async fn consequential_click_is_refused_before_any_helper_runs() {
-        let desktop = ComputerUse::default();
+        let desktop = Arc::new(ComputerUse::default());
         desktop
             .seed_observation(
                 "w1",

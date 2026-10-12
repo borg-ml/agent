@@ -27,6 +27,9 @@ const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Serve requests until stdin closes, then tear down the private display.
 pub fn run_helper() -> Result<()> {
+    if std::env::args_os().nth(2).as_deref() == Some(std::ffi::OsStr::new("--private-app")) {
+        return private::run_app();
+    }
     let mut helper = Helper::new();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
@@ -43,7 +46,6 @@ pub fn run_helper() -> Result<()> {
         stdout.write_all(b"\n")?;
         stdout.flush()?;
     }
-    helper.stop_display();
     Ok(())
 }
 
@@ -102,6 +104,12 @@ struct Helper {
     private: Option<BorgDisplay>,
     private_apps: HashMap<u32, PrivateApp>,
     private_pointer: Option<String>,
+}
+
+impl Drop for Helper {
+    fn drop(&mut self) {
+        self.stop_display();
+    }
 }
 
 impl Helper {

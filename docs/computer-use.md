@@ -123,6 +123,12 @@ session-owned headless display served by `borg-display`, a small Borg
 compositor shipped beside `borg`. The display starts on demand, is reused for
 the session, and is torn down with it (also when the helper is killed); apps
 launched into it are killed at teardown unless `detached`.
+Cancelling a `launch` call does not stop a reused display: the bounded launch
+exchange finishes in the background, and the app remains session-managed.
+Observe the display and its session apps before retrying. Non-detached launches
+use a process-group supervisor (`pid` in the launch result); their window PIDs
+still identify the actual apps. The group is terminated on display or helper
+loss, including descendants left behind when a launcher shell exits.
 
 - Rendering is on the GPU: GLES on the boot VGA render node, with dmabuf so
   Vulkan/GL clients render directly. X11-only apps (`x11: true`) run through

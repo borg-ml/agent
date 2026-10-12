@@ -2,6 +2,8 @@
 //! (borg-display) whose owner control socket carries every input event and
 //! capture, so nothing here touches the user's seat, pointer, focus or screen.
 
+mod supervisor;
+
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
@@ -18,6 +20,47 @@ use super::a11y::merge;
 use super::capture::attachment;
 use super::input::{button_code, notches, parse_keys};
 use super::{Helper, arg_or_zero, number, run, which, window_id};
+
+pub(super) fn run_app() -> Result<()> {
+    use std::os::fd::FromRawFd;
+    let args: Vec<_> = std::env::args_os().skip(3).collect();
+    ensure!(args.len() >= 3, "private app arguments are required");
+    let fd: i32 = args[1]
+        .to_str()
+        .context("invalid startup descriptor")?
+        .parse()?;
+    let mut startup = Some(unsafe { UnixStream::from_raw_fd(fd) });
+    // Do not leak the report socket into the actual application.
+    ensure!(
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0,
+        "cannot seal startup descriptor"
+    );
+    let result = supervisor::run(Path::new(&args[0]), &args[2..], || {
+        let mut report = startup.take().expect("startup report");
+        if report.write_all(b"{\"ok\":true}\n").is_err() {
+            unsafe {
+                libc::killpg(0, libc::SIGKILL);
+            }
+        }
+    });
+    if let Some(mut report) = startup {
+        let response =
+            json!({"ok": false, "error": result.as_ref().err().map(|error| format!("{error:#}"))});
+        let _ = writeln!(report, "{response}");
+    }
+    let code = result?;
+    if code < 0 {
+        unsafe {
+            libc::signal(-code, libc::SIG_DFL);
+            let mut mask = std::mem::zeroed();
+            libc::sigemptyset(&mut mask);
+            libc::sigaddset(&mut mask, -code);
+            libc::sigprocmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut());
+            libc::raise(-code);
+        }
+    }
+    std::process::exit(code);
+}
 
 pub(in crate::computer_use) const PREFIX: &str = "pd:";
 const SCRUBBED_DISPLAY_ENV: &[&str] = &[
@@ -37,11 +80,12 @@ const ALTERNATIVE_BACKENDS: &[&str] = &["sway", "cage", "labwc", "weston"];
 
 pub(super) struct PrivateApp {
     child: std::sync::Arc<std::sync::Mutex<Child>>,
+    detached: bool,
     #[cfg(test)]
     reaped: std::sync::mpsc::Receiver<()>,
 }
 impl PrivateApp {
-    fn new(child: Child) -> Self {
+    fn new(child: Child, detached: bool) -> Self {
         let child = std::sync::Arc::new(std::sync::Mutex::new(child));
         let reaper = child.clone();
         #[cfg(test)]
@@ -50,7 +94,10 @@ impl PrivateApp {
         // for the foreground API; the lock is never held while sleeping.
         std::thread::spawn(move || {
             loop {
-                let status = reaper.lock().unwrap_or_else(|e| e.into_inner()).try_wait();
+                let status = app_status(
+                    &mut reaper.lock().unwrap_or_else(|e| e.into_inner()),
+                    detached,
+                );
                 if !matches!(status, Ok(None)) {
                     #[cfg(test)]
                     let _ = done.send(());
@@ -61,6 +108,7 @@ impl PrivateApp {
         });
         Self {
             child,
+            detached,
             #[cfg(test)]
             reaped,
         }
@@ -69,6 +117,36 @@ impl PrivateApp {
         self.child.lock().unwrap_or_else(|e| e.into_inner()).id()
     }
 }
+// Observe exit without reaping first: a zombie pins its PID/PGID, so killing
+// leftover group members cannot signal a later, unrelated reused process ID.
+fn app_status(
+    child: &mut Child,
+    detached: bool,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    if !detached {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            if unsafe { info.si_pid() } == 0 {
+                return Ok(None);
+            }
+            unsafe {
+                libc::killpg(child.id() as i32, libc::SIGKILL);
+            }
+        } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ECHILD) {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    child.try_wait()
+}
+
 trait ManagedChild {
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
     fn signal_group(&mut self, signal: i32);
@@ -87,15 +165,14 @@ impl ManagedChild for Child {
 }
 impl ManagedChild for PrivateApp {
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        self.child
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .try_wait()
+        app_status(
+            &mut self.child.lock().unwrap_or_else(|e| e.into_inner()),
+            self.detached,
+        )
     }
     fn signal_group(&mut self, signal: i32) {
         let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
-        // The lock prevents reaping/pid reuse between this check and killpg.
-        if matches!(child.try_wait(), Ok(None)) {
+        if matches!(app_status(&mut child, self.detached), Ok(None)) {
             unsafe {
                 libc::killpg(child.id() as i32, signal);
             }
@@ -626,9 +703,14 @@ impl Helper {
     }
 
     pub(super) fn stop_display(&mut self) -> Value {
-        let mut terminated: Vec<u32> = self.private_apps.keys().copied().collect();
+        let mut apps: Vec<PrivateApp> = self
+            .private_apps
+            .drain()
+            .map(|(_, app)| app)
+            .filter(|app| !app.detached)
+            .collect();
+        let mut terminated: Vec<u32> = apps.iter().map(PrivateApp::id).collect();
         terminated.sort_unstable();
-        let mut apps: Vec<PrivateApp> = self.private_apps.drain().map(|(_, app)| app).collect();
         terminate_groups(
             &mut apps.iter_mut().collect::<Vec<_>>(),
             Duration::from_secs(3),
@@ -745,8 +827,16 @@ impl Helper {
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         ));
         let log = std::fs::File::create(&log_path)?;
-        let mut command = Command::new(&argv[0]);
-        command.args(&argv[1..]);
+        let (mut command, startup) = if detached {
+            let mut command = Command::new(&argv[0]);
+            command.args(&argv[1..]);
+            detach(&mut command, false);
+            (command, None)
+        } else {
+            let (command, startup) =
+                supervisor::command(&argv, &backend.directory.join("control"))?;
+            (command, Some(startup))
+        };
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }
@@ -762,14 +852,21 @@ impl Helper {
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
-        detach(&mut command, !detached);
         let app = command
             .spawn()
             .map_err(|error| anyhow!("cannot launch {}: {error}", argv[0]))?;
-        let app = PrivateApp::new(app);
+        drop(command);
+        let app = PrivateApp::new(app, detached);
         let pid = app.id();
         // Detached apps are not killed at teardown; still reap them here.
         self.private_apps.insert(pid, app);
+        if let Some(startup) = startup
+            && let Err(error) = supervisor::started(startup)
+        {
+            let mut app = self.private_apps.remove(&pid).expect("launched");
+            terminate_groups(&mut [&mut app], Duration::from_secs(1));
+            return Err(error.context(format!("cannot launch {}", argv[0])));
+        }
         let deadline = Instant::now() + Duration::from_secs_f64(wait);
         let found = loop {
             let found: Vec<Value> = self
@@ -971,7 +1068,8 @@ impl Helper {
         if scale < 1.0 {
             // Pixel coordinates in this image map to display/window pixels by 1/scale.
             result["image_scale"] = json!(scale);
-            result["note"] = json!("downscaled to fit 4 MiB; divide image x,y by image_scale for pointer ops");
+            result["note"] =
+                json!("downscaled to fit 4 MiB; divide image x,y by image_scale for pointer ops");
         }
         if let Some(cursor) = shot.get("cursor") {
             result["cursor"] = cursor.clone();
@@ -1314,11 +1412,31 @@ mod reaping_tests {
     }
 
     #[test]
+    fn helper_drop_kills_session_apps_but_not_detached_apps() {
+        let mut helper = Helper::new();
+        let mut pids = Vec::new();
+        for detached in [false, true] {
+            let mut command = Command::new("sleep");
+            command.arg("60");
+            detach(&mut command, false);
+            let app = PrivateApp::new(command.spawn().unwrap(), detached);
+            pids.push(app.id());
+            helper.private_apps.insert(app.id(), app);
+        }
+        drop(helper);
+        assert!(!Path::new(&format!("/proc/{}", pids[0])).exists());
+        assert!(Path::new(&format!("/proc/{}", pids[1])).exists());
+        unsafe {
+            libc::killpg(pids[1] as i32, libc::SIGKILL);
+        }
+    }
+
+    #[test]
     fn private_app_teardown_keeps_reaper_lock_available() {
         let mut command = Command::new("sh");
         command.args(["-c", "exec sleep 60"]);
         detach(&mut command, true);
-        let mut app = PrivateApp::new(command.spawn().unwrap());
+        let mut app = PrivateApp::new(command.spawn().unwrap(), false);
         terminate_groups(&mut [&mut app], Duration::from_millis(100));
         assert!(app.try_wait().unwrap().is_some());
         app.reaped.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1326,7 +1444,7 @@ mod reaping_tests {
     #[test]
     fn private_app_is_reaped_without_another_request() {
         let child = Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap();
-        let mut app = PrivateApp::new(child);
+        let mut app = PrivateApp::new(child, false);
         let pid = app.id();
         app.reaped.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
