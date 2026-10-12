@@ -154,16 +154,24 @@ fn handle_request(state: &mut State, request: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .context("op is required")?;
     match op {
-        "info" => Ok(json!({
-            "width": state.size.0,
-            "height": state.size.1,
-            "gl_renderer": state.renderer_info.gl_renderer,
-            "render_node": state.renderer_info.render_node,
-            "hardware": state.renderer_info.hardware,
-            "dmabuf": state.renderer_info.dmabuf,
-            "pointer": {"x": state.pointer_location.x, "y": state.pointer_location.y},
-            "pointer_constraint": constraint_name(state.active_constraint()),
-        })),
+        "info" => {
+            let _ = state
+                .reset_gate
+                .check(|| crate::gpu::reset_status(&mut state.renderer, state.reset_probe));
+            Ok(json!({
+                "renderer_lost": state.reset_gate.lost,
+                "reset_detection": state.context_owner.is_some() && state.reset_probe.is_some(),
+                "renderer_error": state.reset_gate.lost.then_some(crate::gpu::LOST),
+                "width": state.size.0,
+                "height": state.size.1,
+                "gl_renderer": state.renderer_info.gl_renderer,
+                "render_node": state.renderer_info.render_node,
+                "hardware": state.renderer_info.hardware,
+                "dmabuf": state.renderer_info.dmabuf,
+                "pointer": {"x": state.pointer_location.x, "y": state.pointer_location.y},
+                "pointer_constraint": constraint_name(state.active_constraint()),
+            }))
+        }
         "windows" => Ok(json!({"windows": windows(state)})),
         "focus" => {
             let window = window_arg(state, request)?;
@@ -233,6 +241,9 @@ fn handle_request(state: &mut State, request: &Value) -> Result<Value> {
             Ok(json!({"typed": text.chars().count()}))
         }
         "screenshot" => {
+            state
+                .reset_gate
+                .check(|| crate::gpu::reset_status(&mut state.renderer, state.reset_probe))?;
             let path = request
                 .get("path")
                 .and_then(Value::as_str)

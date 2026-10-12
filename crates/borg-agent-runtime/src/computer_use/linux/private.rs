@@ -360,6 +360,12 @@ impl BorgDisplay {
         }
     }
 
+    fn reset_error(&self) -> Option<&'static str> {
+        log_tail(&self.directory.join("display.log"), 8192)
+            .contains("GPU reset: renderer lost")
+            .then_some("GPU reset: renderer lost; the private display's GPU context was lost and client buffers may also be lost; stop_display and relaunch apps")
+    }
+
     fn running(&mut self) -> bool {
         !self.closed && self.process.as_mut().is_none_or(running)
     }
@@ -367,7 +373,9 @@ impl BorgDisplay {
     fn call(&mut self, request: Value) -> Result<Value> {
         ensure!(
             self.running(),
-            "the private display exited; call start_display again"
+            "{}",
+            self.reset_error()
+                .unwrap_or("the private display exited; call start_display again")
         );
         let mut line = Vec::new();
         let sent = (|| -> std::io::Result<()> {
@@ -382,11 +390,19 @@ impl BorgDisplay {
         })();
         if let Err(error) = sent {
             self.closed = true;
-            bail!("private display control failed: {error}");
+            bail!(
+                "{}: {error}",
+                self.reset_error()
+                    .unwrap_or("private display control failed")
+            );
         }
         if line.is_empty() {
             self.closed = true;
-            bail!("the private display exited; call start_display again");
+            bail!(
+                "{}",
+                self.reset_error()
+                    .unwrap_or("the private display exited; call start_display again")
+            );
         }
         let response: Value = serde_json::from_slice(&line)?;
         if response["ok"] != true {
@@ -520,14 +536,20 @@ impl Helper {
     fn require_private(&mut self) -> Result<&mut BorgDisplay> {
         ensure!(
             self.private_running(),
-            "the private display is not running; call start_display or launch"
+            "{}",
+            self.private
+                .as_ref()
+                .and_then(BorgDisplay::reset_error)
+                .unwrap_or("the private display is not running; call start_display or launch")
         );
         Ok(self.private.as_mut().expect("running"))
     }
 
     pub(super) fn display_status(&mut self, info: Option<Value>) -> Result<Value> {
         if !self.private_running() {
-            return Ok(json!({"display": "private", "running": false}));
+            return Ok(json!({"display": "private", "running": false,
+                "renderer_lost": self.private.as_ref().and_then(BorgDisplay::reset_error).is_some(),
+                "renderer_error": self.private.as_ref().and_then(BorgDisplay::reset_error)}));
         }
         let backend = self.private.as_mut().expect("running");
         let info = match info {
@@ -555,6 +577,8 @@ impl Helper {
                   "x11_display": x11, "width": info["width"], "height": info["height"],
                   "gpu_accelerated": info["hardware"], "gl_renderer": info["gl_renderer"],
                   "render_node": info["render_node"], "dmabuf": info["dmabuf"],
+                  "renderer_lost": info["renderer_lost"], "renderer_error": info["renderer_error"],
+                  "reset_detection": info["reset_detection"],
                   "session_apps": apps,
                   "coordinate_space": "private display pixels, top-left origin, scale 1"}),
         )
@@ -1247,7 +1271,7 @@ impl Helper {
         if binary.is_none() {
             status["reason"] = json!(DISPLAY_MISSING);
         }
-        if self.private_running() {
+        if self.private.is_some() {
             let running = self.display_status(None)?;
             merge(&mut status, running);
         }
@@ -1258,6 +1282,37 @@ impl Helper {
 #[cfg(test)]
 mod reaping_tests {
     use super::*;
+    // Compiler checks cannot protect this cross-process failure diagnosis:
+    // after compositor exit, a reset must not become a generic missing display.
+    #[test]
+    fn exited_display_retains_gpu_reset_diagnosis() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut display = BorgDisplay {
+            display_id: String::new(),
+            owned: true,
+            directory: directory.path().to_owned(),
+            wayland_display: String::new(),
+            process: None,
+            stream: None,
+            reader: None,
+            closed: true,
+            x11: None,
+        };
+        assert!(display.reset_error().is_none());
+        std::fs::write(
+            directory.path().join("display.log"),
+            "borg-display: GPU reset: renderer lost (reset status 0x8255)\n",
+        )
+        .unwrap();
+        assert!(
+            display
+                .call(json!({"op": "screenshot"}))
+                .unwrap_err()
+                .to_string()
+                .contains("GPU reset: renderer lost")
+        );
+    }
+
     #[test]
     fn private_app_teardown_keeps_reaper_lock_available() {
         let mut command = Command::new("sh");

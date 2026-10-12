@@ -7,6 +7,8 @@
 mod compositor;
 #[cfg(target_os = "linux")]
 mod control;
+#[cfg(target_os = "linux")]
+mod gpu;
 
 #[cfg(target_os = "linux")]
 fn main() {

@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use calloop::signals::{Signal, Signals};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::drm::DrmNode;
-use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
+use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::renderer::gles::{GlesRenderer, ffi};
 use smithay::backend::renderer::{ImportDma, utils::on_commit_buffer_handler};
 use smithay::desktop::{
@@ -78,6 +78,9 @@ pub(crate) struct State {
     pub(crate) size: (i32, i32),
     pub(crate) renderer: GlesRenderer,
     pub(crate) renderer_info: RendererInfo,
+    pub(crate) reset_probe: Option<crate::gpu::ResetStatus>,
+    pub(crate) reset_gate: crate::gpu::ResetGate,
+    pub(crate) context_owner: Option<crate::gpu::ContextOwner>,
     pub(crate) pointer_location: Point<f64, Logical>,
     /// The cursor the focused client asked for, drawn into screenshots on request.
     pub(crate) cursor: CursorImageStatus,
@@ -212,11 +215,9 @@ pub(crate) fn run() -> Result<()> {
 
     let (device, node) = select_device(args.render_node.as_ref())?;
     let hardware = !device.is_software() && node.is_some();
-    let mut renderer = unsafe {
-        let egl = EGLDisplay::new(device).context("creating the EGL display")?;
-        let context = EGLContext::new(&egl).context("creating the EGL context")?;
-        GlesRenderer::new(context).context("creating the GLES renderer")?
-    };
+    let egl = unsafe { EGLDisplay::new(device) }.context("creating the EGL display")?;
+    let (mut renderer, context_owner) = crate::gpu::renderer(egl)?;
+    let reset_probe = crate::gpu::reset_probe(&mut renderer)?;
     let gl_renderer = renderer
         .with_context(|gl| unsafe {
             let name = gl.GetString(ffi::RENDERER);
@@ -349,6 +350,9 @@ pub(crate) fn run() -> Result<()> {
         output,
         size: args.size,
         renderer,
+        reset_gate: Default::default(),
+        reset_probe,
+        context_owner,
         renderer_info: renderer_info.clone(),
         pointer_location: (0.0, 0.0).into(),
         cursor: CursorImageStatus::default_named(),
@@ -367,6 +371,9 @@ pub(crate) fn run() -> Result<()> {
         "{}",
         serde_json::json!({
             "ready": true,
+            "reset_detection": state.context_owner.is_some() && state.reset_probe.is_some(),
+            "renderer_lost": false,
+            "renderer_error": null,
             "wayland_display": socket_name,
             "control": args.control,
             "width": args.size.0,
@@ -629,7 +636,12 @@ impl DmabufHandler for State {
         dmabuf: Dmabuf,
         notifier: ImportNotifier,
     ) {
-        if self.renderer.import_dmabuf(&dmabuf, None).is_ok() {
+        if self
+            .reset_gate
+            .check(|| crate::gpu::reset_status(&mut self.renderer, self.reset_probe))
+            .is_ok()
+            && self.renderer.import_dmabuf(&dmabuf, None).is_ok()
+        {
             let _ = notifier.successful::<State>();
         } else {
             notifier.failed();
