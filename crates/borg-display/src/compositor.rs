@@ -203,6 +203,16 @@ fn select_device(requested: Option<&PathBuf>) -> Result<(EGLDevice, Option<DrmNo
         .context("no EGL device is available for headless rendering")
 }
 
+fn register_input_protocols(
+    display: &DisplayHandle,
+) -> smithay::wayland::text_input::TextInputManagerState {
+    RelativePointerManagerState::new::<State>(display);
+    PointerConstraintsState::new::<State>(display);
+    // SDL 3.4.4 requires this global to enable text input. Without an input
+    // method, Smithay keeps keyboard delivery (and SDL's xkb text fallback).
+    smithay::wayland::text_input::TextInputManagerState::new::<State>(display)
+}
+
 pub(crate) fn run() -> Result<()> {
     // Exit with the helper that owns this display, even before it connects.
     unsafe {
@@ -258,8 +268,7 @@ pub(crate) fn run() -> Result<()> {
     let output_manager_state = OutputManagerState::new_with_xdg_output::<State>(&display_handle);
     let data_device_state = DataDeviceState::new::<State>(&display_handle);
     ViewporterState::new::<State>(&display_handle);
-    RelativePointerManagerState::new::<State>(&display_handle);
-    PointerConstraintsState::new::<State>(&display_handle);
+    register_input_protocols(&display_handle);
     let mut seat_state = SeatState::new();
     let mut seat = seat_state.new_wl_seat(&display_handle, "borg-private");
     seat.add_keyboard(XkbConfig::default(), 400, 30)
@@ -768,3 +777,26 @@ delegate_xdg_shell!(State);
 delegate_viewporter!(State);
 delegate_relative_pointer!(State);
 delegate_pointer_constraints!(State);
+
+smithay::delegate_text_input_manager!(State);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // SDL 3.4.4 refuses SDL_StartTextInput without this registry global.
+    // Check startup registration without requiring EGL or a GPU; SDL probes
+    // separately verify real text delivery, not just successful compilation.
+    #[test]
+    fn startup_advertises_text_input_v3() {
+        let display = Display::<State>::new().unwrap();
+        let handle = display.handle();
+        let manager = register_input_protocols(&handle);
+        let info = handle
+            .backend_handle()
+            .global_info(manager.global())
+            .unwrap();
+        assert_eq!(info.interface.name, "zwp_text_input_manager_v3");
+        assert_eq!(info.version, 1);
+    }
+}
