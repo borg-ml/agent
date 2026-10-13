@@ -14942,3 +14942,57 @@ connection: close
         }
     }
 }
+
+#[cfg(test)]
+mod prompt_retry_contract {
+    use super::*;
+
+    // Retransmitted prompts must reuse the canonical admission without waking
+    // an actor twice; compilation cannot verify the durable duplicate boundary.
+    #[tokio::test]
+    async fn prompt_retry_preserves_admission_and_refuses_changed_intent() {
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let session = Uuid::new_v4();
+        let message = Uuid::new_v4();
+        store.create_session(session).await.unwrap();
+        assert!(
+            admit_remote_prompt(
+                &store,
+                session,
+                message,
+                "one prompt",
+                &[],
+                crate::PromptDelivery::Queue
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !admit_remote_prompt(
+                &store,
+                session,
+                message,
+                "one prompt",
+                &[],
+                crate::PromptDelivery::Queue
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            admit_remote_prompt(
+                &store,
+                session,
+                message,
+                "different intent",
+                &[],
+                crate::PromptDelivery::Queue
+            )
+            .await
+            .is_err()
+        );
+        let messages = store.events_after(session, 0, 10).await.unwrap().into_iter().filter(|event| matches!(event.kind, crate::SessionEventKind::Message { message_id, .. } if message_id == message)).count();
+        assert_eq!(messages, 1);
+        scratch.discard().await;
+    }
+}
