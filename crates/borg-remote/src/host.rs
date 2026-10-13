@@ -15202,6 +15202,32 @@ mod prompt_retry_contract {
         let session = Uuid::new_v4();
         let message = Uuid::new_v4();
         store.create_session(session).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                session,
+                0,
+                crate::SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(SessionEvent::new(
+                session,
+                0,
+                crate::SessionEventKind::SessionConfigured {
+                    cwd: PathBuf::from("/tmp"),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: false,
+                    ultrafast: false,
+                    permission_mode: PermissionMode::Manual,
+                    response_language: crate::ResponseLanguage::Auto,
+                    speed_support: Default::default(),
+                },
+            ))
+            .await
+            .unwrap();
         assert!(
             admit_remote_prompt(
                 &store,
