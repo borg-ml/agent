@@ -37,21 +37,23 @@ impl PostgresAuthority {
     /// not a new delta. Terminal rows are recovered from the canonical journal.
     pub async fn text_deltas_after(&self, session:Uuid, after:u64)->Result<Vec<(u64,crate::SessionEvent)>> {
         use sqlx::Row;
-        let rows=sqlx::query("select c.revision,c.body,s.event_json from session_live_text_chunks c join session_live_state s using(session_id,live_key) where c.session_id=$1 and c.revision>$2 order by c.revision limit 128")
+        let rows=sqlx::query("select revision,body,event_json from (select c.revision,c.body,s.event_json from session_live_text_chunks c join session_live_state s using(session_id,live_key) where c.session_id=$1 and c.revision>$2 union all select s.revision,null::bytea,s.event_json from session_live_state s where s.session_id=$1 and s.revision>$2 and s.live_key not like 'message:%' and s.live_key<>'reasoning') live order by revision limit 128")
             .bind(session).bind(i64::try_from(after)?).fetch_all(&self.pool).await?;
         let mut result=Vec::with_capacity(rows.len());
         let mut bytes=0;
         for row in rows {
-            let body:Vec<u8>=row.try_get("body")?;
-            bytes+=body.len();
-            if bytes>1_048_576 {break}
-            let delta=String::from_utf8(body)?;
+            let body:Option<Vec<u8>>=row.try_get("body")?;
             let mut event:crate::SessionEvent=serde_json::from_value(row.try_get("event_json")?)?;
+            bytes+=body.as_ref().map_or(0,Vec::len)+serde_json::to_vec(&event)?.len();
+            if bytes>1_048_576 {break}
+            if let Some(body)=body {
+            let delta=String::from_utf8(body)?;
             event.kind=match event.kind {
                 crate::SessionEventKind::Message{message_id,..}=>crate::SessionEventKind::MessageDelta{message_id,delta},
                 crate::SessionEventKind::ReasoningDelta{..}=>crate::SessionEventKind::ReasoningTextDelta{delta},
                 _=>continue,
             };
+            }
             result.push((u64::try_from(row.try_get::<i64,_>("revision")?)?,event));
         }
         Ok(result)

@@ -478,7 +478,7 @@ impl PostgresSessionStore {
         transaction: &mut Transaction<'_, Postgres>,
         event: &SessionEvent,
     ) -> Result<bool> {
-        let (message_id, text) = match &event.kind {
+        let (message_id, _text) = match &event.kind {
             SessionEventKind::Message {
                 message_id,
                 actor: crate::EventActor::Assistant,

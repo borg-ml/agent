@@ -420,3 +420,7 @@ create table if not exists session_live_text_chunks (
 );
 
 create index if not exists idx_live_text_revision on session_live_text_chunks(session_id,revision);
+
+create index if not exists idx_session_request_revision
+ on session_events(session_id,event_kind,sequence desc)
+ where event_kind in ('approval_requested','provider_interaction_requested');

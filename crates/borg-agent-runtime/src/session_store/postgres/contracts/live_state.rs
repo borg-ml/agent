@@ -895,7 +895,7 @@ async fn append_chunks_survive_reopen_and_archive_partial_without_quadratic_stor
     let reopened = crate::PostgresSessionStore::connect_with_pool_size(&scratch.url,2).await.unwrap();
     let live = reopened.live_events_after(session,0).await.unwrap();
     assert!(matches!(&live[0].event.kind,SessionEventKind::Message{text,..} if text == &"λ".repeat(128*64)));
-    reopened.append(SessionEvent::new(session,0,SessionEventKind::StatusChanged {status:SessionStatus::Idle,detail:None})).await.unwrap();
+    reopened.append(SessionEvent::new(session,0,SessionEventKind::StatusChanged {status:SessionStatus::Ready,detail:None})).await.unwrap();
     assert!(reopened.read(session).await.unwrap().iter().any(|e| matches!(&e.kind,SessionEventKind::Message{text,status:MessageStatus::Failed,..} if text == &"λ".repeat(128*64))));
     drop(reopened);
     drop(store);

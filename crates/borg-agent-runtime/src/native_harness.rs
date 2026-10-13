@@ -3343,9 +3343,9 @@ async fn call_model_streaming_with_timeout(
         // still unpublished when the model moves on. Give that tail its own
         // deadline instead of letting it wait for an unrelated boundary event.
         let pending_text_flush = (text.len() != emitted_text_len)
-            .then(|| crate::agent::live_output_interval().saturating_sub(last_text_emit.elapsed()));
+            .then(|| Duration::from_millis(75).saturating_sub(last_text_emit.elapsed()));
         let pending_reasoning_flush = (!pending_reasoning.is_empty()).then(|| {
-            crate::agent::live_output_interval().saturating_sub(last_reasoning_emit.elapsed())
+            Duration::from_millis(75).saturating_sub(last_reasoning_emit.elapsed())
         });
         tokio::select! {
             biased;
@@ -3411,7 +3411,7 @@ async fn call_model_streaming_with_timeout(
             () = tokio::time::sleep(pending_text_flush.unwrap_or_default()),
                 if pending_text_flush.is_some() =>
             {
-                send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
+                send_live_assistant_text(context.events, context.assistant_message_id, &text[emitted_text_len..]).await;
                 emitted_text_len = text.len();
                 last_text_emit = Instant::now();
             }
@@ -3420,9 +3420,7 @@ async fn call_model_streaming_with_timeout(
             {
                 send(
                     context.events,
-                    SessionEventKind::ReasoningDelta {
-                        text: reasoning_accumulated.clone(),
-                    },
+                    SessionEventKind::ReasoningTextDelta { delta: std::mem::take(&mut pending_reasoning) },
                 )
                 .await;
                 pending_reasoning.clear();
@@ -3439,7 +3437,7 @@ async fn call_model_streaming_with_timeout(
                 if text.len() != emitted_text_len
                     && progress.as_ref().is_some_and(progress_follows_live_text)
                 {
-                    send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
+                    send_live_assistant_text(context.events, context.assistant_message_id, &text[emitted_text_len..]).await;
                     emitted_text_len = text.len();
                     last_text_emit = Instant::now();
                 }
@@ -3455,9 +3453,7 @@ async fn call_model_streaming_with_timeout(
                     if !pending_reasoning.is_empty() {
                         send(
                             context.events,
-                            SessionEventKind::ReasoningDelta {
-                                text: reasoning_accumulated.clone(),
-                            },
+                            SessionEventKind::ReasoningTextDelta { delta: std::mem::take(&mut pending_reasoning) },
                         )
                         .await;
                         pending_reasoning.clear();
@@ -3465,18 +3461,10 @@ async fn call_model_streaming_with_timeout(
                     }
                     let delta = String::from_utf8_lossy(&chunk);
                     text.push_str(&delta);
-                    send(
-                        context.events,
-                        SessionEventKind::MessageDelta {
-                            message_id: context.assistant_message_id,
-                            delta: delta.into_owned(),
-                        },
-                    )
-                    .await;
-                    if last_text_emit.elapsed() >= crate::agent::live_output_interval()
-                        || chunk.ends_with(b"\n")
+                    if last_text_emit.elapsed() >= Duration::from_millis(75)
+
                     {
-                        send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
+                        send_live_assistant_text(context.events, context.assistant_message_id, &text[emitted_text_len..]).await;
                         emitted_text_len = text.len();
                         last_text_emit = Instant::now();
                     }
@@ -3502,14 +3490,12 @@ async fn call_model_streaming_with_timeout(
                         }
                         if !pending_reasoning.is_empty()
                             && last_reasoning_emit.elapsed()
-                            >= crate::agent::live_output_interval()
+                            >= Duration::from_millis(75)
                             || pending_reasoning.ends_with('\n')
                         {
                             send(
                                 context.events,
-                                SessionEventKind::ReasoningDelta {
-                                    text: reasoning_accumulated.clone(),
-                                },
+                                SessionEventKind::ReasoningTextDelta { delta: std::mem::take(&mut pending_reasoning) },
                             )
                             .await;
                             pending_reasoning.clear();
@@ -3520,9 +3506,7 @@ async fn call_model_streaming_with_timeout(
                 Some(ProviderProgress::ProviderEvent { kind, payload, .. }) => {
                     if kind == "item/completed:reasoning" {
                         if !pending_reasoning.is_empty() {
-                            send(context.events, SessionEventKind::ReasoningDelta {
-                                text: reasoning_accumulated.clone(),
-                            }).await;
+                            send(context.events, SessionEventKind::ReasoningTextDelta { delta: std::mem::take(&mut pending_reasoning) }).await;
                             pending_reasoning.clear();
                         }
                         send(context.events, SessionEventKind::ReasoningCompleted).await;
@@ -3614,15 +3598,13 @@ async fn call_model_streaming_with_timeout(
             if !pending_reasoning.is_empty() {
                 send(
                     context.events,
-                    SessionEventKind::ReasoningDelta {
-                        text: reasoning_accumulated.clone(),
-                    },
+                    SessionEventKind::ReasoningTextDelta { delta: std::mem::take(&mut pending_reasoning) },
                 )
                 .await;
                 pending_reasoning.clear();
             }
             if text.len() != emitted_text_len {
-                send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
+                send_live_assistant_text(context.events, context.assistant_message_id, &text[emitted_text_len..]).await;
             }
             let mut outcome = completed
                 .take()
@@ -3658,15 +3640,12 @@ async fn send_live_assistant_text(
     assistant_message_id: Uuid,
     text: &str,
 ) {
+    if text.is_empty() { return; }
     send(
         events,
-        SessionEventKind::Message {
+        SessionEventKind::MessageDelta {
             message_id: assistant_message_id,
-            actor: EventActor::Assistant,
-            text: text.to_string(),
-            attachments: Vec::new(),
-            status: MessageStatus::InProgress,
-            delivery: None,
+            delta: text.to_string(),
         },
     )
     .await;

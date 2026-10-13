@@ -20093,11 +20093,26 @@ async fn assert_immediate_interrupt(control_backlog: usize) {
 /// durable sequence the actor writes -- and every replay taken from that
 /// journal -- differs from what the coordinator emitted, or a child's later
 /// state is recorded before its earlier one.
+async fn forwarding_coordinator(root: Uuid) -> (crate::session_store::postgres::testing::ScratchDatabase, SubagentCoordinator) {
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let launch = LaunchSession {
+        request_id: root, cwd: PathBuf::from("/tmp"), provider: CodingProvider::Codex,
+        model: None, effort: None, fast: None, ultrafast: None,
+        response_language: crate::ResponseLanguage::Auto, permission_mode: crate::PermissionMode::Manual,
+        name: None, initial_prompt: None, capabilities: Default::default(),
+        subagent_concurrency_limit: None, extension_skill_roots: Vec::new(), team_policy: None,
+    };
+    let coordinator = SubagentCoordinator::new_with_store_and_executor("/tmp", root, launch, 1, Arc::new(HungProviderExecutor), Arc::new(store)).unwrap();
+    (scratch, coordinator)
+}
+
 #[tokio::test]
 async fn forwarded_child_activity_keeps_the_coordinator_order() {
     let (activity_tx, activity_rx) = broadcast::channel(8);
     let (forwarded_tx, mut forwarded_rx) = mpsc::channel(8);
-    let forwarder = tokio::spawn(forward_child_activity(activity_rx, forwarded_tx, None));
+    let root = Uuid::new_v4();
+    let (scratch, coordinator) = forwarding_coordinator(root).await;
+    let forwarder = tokio::spawn(forward_child_activity(activity_rx, forwarded_tx, None, coordinator, root));
     let children: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
     for child in &children {
         activity_tx
@@ -20117,6 +20132,7 @@ async fn forwarded_child_activity_keeps_the_coordinator_order() {
     // waiting on a source that can never speak again.
     drop(activity_tx);
     forwarder.await.unwrap();
+    scratch.discard().await;
 }
 
 // A nested actor receives its own child's lifecycle, never sibling or
@@ -20127,10 +20143,9 @@ async fn forwarded_nested_child_activity_preserves_lifecycle_and_parent_boundary
     let child = Uuid::new_v4();
     let (activity_tx, activity_rx) = broadcast::channel(32);
     let (forwarded_tx, mut forwarded_rx) = mpsc::channel(16);
+    let (scratch, coordinator) = forwarding_coordinator(parent).await;
     let forwarder = tokio::spawn(forward_child_activity(
-        activity_rx,
-        forwarded_tx,
-        Some(parent),
+        activity_rx, forwarded_tx, Some(parent), coordinator, parent,
     ));
     let mut agent = watched_child(child);
     agent.parent_session_id = parent;
@@ -20183,6 +20198,7 @@ async fn forwarded_nested_child_activity_preserves_lifecycle_and_parent_boundary
         }
     }
     forwarder.await.unwrap();
+    scratch.discard().await;
     assert_eq!(
         lives,
         vec![
