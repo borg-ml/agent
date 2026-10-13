@@ -2195,6 +2195,16 @@ pub(crate) async fn run_host_with_resolved_store(
                             epoch = updated;
                             sync.update_epoch(epoch).await;
                         }
+                        crate::auth::TunnelFrame::OpenService { connection_id, ticket, nonce, proof } => {
+                            let admitted = async {
+                                let claims = crate::admission::verify_service_ticket(&ticket, &issuer, &config.host_id.to_string(), epoch, Utc::now().timestamp())?;
+                                crate::admission::verify_service_proof(&claims, &nonce, &proof)?;
+                                sync.open_service_connection(connection_id.clone(), claims).await
+                            }.await;
+                            if let Err(error) = admitted {
+                                let _ = outbound.try_send(crate::auth::TunnelFrame::Close { connection_id, reason: error.to_string() });
+                            }
+                        }
                         crate::auth::TunnelFrame::Open { connection_id, ticket } => {
                             let admitted = crate::admission::verify_ticket(&ticket, &issuer, &config.host_id.to_string(), epoch, Utc::now().timestamp());
                             match admitted {
