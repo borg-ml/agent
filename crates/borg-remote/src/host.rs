@@ -2668,7 +2668,7 @@ async fn viewer_command(
                     Command::Compact => HostCommand::Compact { session_id },
                     Command::ClearContext => HostCommand::ClearContext { session_id },
                     Command::FlushPendingInput => HostCommand::FlushPendingInput { session_id },
-                    Command::Goal { action } => HostCommand::Goal { session_id, action },
+                    Command::Goal { action } => HostCommand::Goal { session_id, action: action.try_into()? },
                     Command::Todo { action } => HostCommand::Todo { session_id, action },
                     Command::StopWatch { watch_id } => HostCommand::StopWatch {
                         session_id,
@@ -2704,7 +2704,7 @@ async fn viewer_command(
                             F::Compact => HostCommand::Compact { session_id },
                             F::ClearContext => HostCommand::ClearContext { session_id },
                             F::FlushPendingInput => HostCommand::FlushPendingInput { session_id },
-                            F::ApplyGoal(action) => HostCommand::Goal { session_id, action },
+                            F::ApplyGoal(action) => HostCommand::Goal { session_id, action: action.try_into()? },
                             F::ApplyTodo(action) => HostCommand::Todo { session_id, action },
                             F::StopWatch(watch_id) => HostCommand::StopWatch {
                                 session_id,
