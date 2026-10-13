@@ -60,6 +60,9 @@ impl SyncAuthority {
             _=>{}
         }
         if frames.is_empty(){return Ok(())}
+        for frame in &frames {
+            self.outbound.try_send(TunnelFrame::SourceAttention{frame:serde_json::to_value(frame)?}).map_err(|_|anyhow::anyhow!("attention uplink gap; durable recovery required"))?;
+        }
         let key=scope_key(self.host,Some(source));
         let connections=self.connections.lock().await;
         for(id,connection)in connections.iter(){

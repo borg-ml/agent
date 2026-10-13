@@ -40,6 +40,7 @@ pub enum TunnelFrame {
     Client { connection_id: String, frame: serde_json::Value },
     Server { connection_id: String, frame: serde_json::Value },
     Close { connection_id: String, reason: String },
+    SourceAttention { frame: serde_json::Value },
     CacheBatch { snapshots: Vec<ColdSnapshot>, headlines: Vec<SessionHeadline> },
     Revoked { epoch: u64 },
     EpochUpdate { epoch: u64 },
@@ -55,8 +56,7 @@ pub enum TunnelFrame {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ColdSnapshot { pub session_id: String, pub frame: serde_json::Value, pub synchronized_at: String }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SessionHeadline { pub session_id: String, pub parent_session_id: Option<String>, pub name: String, pub status: String, pub updated_at: String }
+pub use borg_view::wire::SessionHeadline;
 
 /// Distinct identity contract, not an unregistered-device bypass. Issued only
 /// inside the product to an independently authenticated active session owner.
