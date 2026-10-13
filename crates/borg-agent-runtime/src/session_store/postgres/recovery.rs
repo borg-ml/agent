@@ -780,6 +780,7 @@ mod tests {
                     sender_id: Uuid::new_v4(),
                     sender_name: "Peer".into(),
                     text: "Received before checkpoint".into(),
+                    from_child: None,
                 },
             ))
             .await

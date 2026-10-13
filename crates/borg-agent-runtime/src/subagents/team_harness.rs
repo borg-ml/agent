@@ -50,6 +50,7 @@ fn public_event(event: &SessionEvent) -> Option<Value> {
             sender_id,
             sender_name,
             text,
+            ..
         } => json!({
             "type": "agent_message_received", "message_id": message_id, "sender_id": sender_id,
             "sender_name": crate::secret_scrub::scrub_secrets(sender_name),

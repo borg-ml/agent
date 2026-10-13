@@ -435,6 +435,7 @@ fn resumed_history_with_roster_hides_child_reports_and_keeps_peers_in_order() {
                 sender_id,
                 sender_name: "worker".to_string(),
                 text: text.to_string(),
+                from_child: None,
             },
         )
     };
@@ -3650,7 +3651,7 @@ fn matching_tool_action_updates_refine_one_live_card() {
         },
     );
     generating.created_at = started_at;
-    let started_time = local_event_time(&generating);
+    let started_time = generating.created_at.to_rfc3339();
     transcript.apply(&generating);
     let generic = transcript
         .lines(100)
@@ -3738,7 +3739,10 @@ fn generation_status_hides_action_description_and_preserves_the_card() {
     let session_id = Uuid::new_v4();
     let started_at = Utc::now();
     let mut transcript = Transcript {
-        action_descriptors: false,
+        core: TranscriptCore {
+            action_descriptors: false,
+            ..TranscriptCore::default()
+        },
         ..Transcript::default()
     };
     let mut preparing = SessionEvent::new(
@@ -5978,7 +5982,10 @@ fn deferred_tool_input_loads_when_the_card_is_expanded() {
         "diff": "@@ -1 +1 @@\n-old\n+new"
     }]);
     let mut transcript = Transcript {
-        diff_expansion: DiffExpansionPolicy::Expanded,
+        core: TranscriptCore {
+            diff_expansion: DiffExpansionPolicy::Expanded,
+            ..TranscriptCore::default()
+        },
         ..Transcript::default()
     };
     transcript.apply(&SessionEvent::new(
@@ -6255,7 +6262,10 @@ fn active_goal_cache_key_advances_once_per_elapsed_minute() {
 #[test]
 fn focused_child_goal_view_does_not_inherit_the_director_goal() {
     let director = Transcript {
-        goal: Some(SessionGoal::new("Director work".to_string(), None)),
+        core: TranscriptCore {
+            goal: Some(SessionGoal::new("Director work".to_string(), None)),
+            ..TranscriptCore::default()
+        },
         ..Default::default()
     };
     let child = Transcript::default();
@@ -6265,7 +6275,10 @@ fn focused_child_goal_view_does_not_inherit_the_director_goal() {
     assert!(active_goal_for_view(None, Some(&director), &child).is_some());
 
     let child_with_goal = Transcript {
-        goal: Some(SessionGoal::new("Child work".to_string(), None)),
+        core: TranscriptCore {
+            goal: Some(SessionGoal::new("Child work".to_string(), None)),
+            ..TranscriptCore::default()
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -6329,10 +6342,13 @@ fn goal_toggle_updates_the_visible_status_before_the_durable_event() {
     use borg_remote::GoalAction;
 
     let mut transcript = Transcript {
-        goal: Some(SessionGoal::new(
-            "Keep the terminal responsive".to_string(),
-            None,
-        )),
+        core: TranscriptCore {
+            goal: Some(SessionGoal::new(
+                "Keep the terminal responsive".to_string(),
+                None,
+            )),
+            ..TranscriptCore::default()
+        },
         ..Default::default()
     };
 
@@ -6357,48 +6373,54 @@ fn goal_toggle_updates_the_visible_status_before_the_durable_event() {
 #[test]
 fn todo_status_counts_open_items_and_tooltip_matches_plan_order_and_clipping() {
     let transcript = Transcript {
-        todos: vec![
-            PlanItem {
-                id: Uuid::new_v4(),
-                content: "Ship the hover affordance".to_string(),
-                status: PlanItemStatus::InProgress,
-            },
-            PlanItem {
-                id: Uuid::new_v4(),
-                content: "Keep the completed item visible".to_string(),
-                status: PlanItemStatus::Completed,
-            },
-            PlanItem {
-                id: Uuid::new_v4(),
-                content: "Run the regression tests".to_string(),
-                status: PlanItemStatus::Pending,
-            },
-            PlanItem {
-                id: Uuid::new_v4(),
-                content: "Document the reload boundary".to_string(),
-                status: PlanItemStatus::Pending,
-            },
-            PlanItem {
-                id: Uuid::new_v4(),
-                content: "Archive the old screenshot".to_string(),
-                status: PlanItemStatus::Completed,
-            },
-            PlanItem {
-                id: Uuid::new_v4(),
-                content: "Publish the release notes".to_string(),
-                status: PlanItemStatus::Pending,
-            },
-        ],
+        core: TranscriptCore {
+            todos: vec![
+                PlanItem {
+                    id: Uuid::new_v4(),
+                    content: "Ship the hover affordance".to_string(),
+                    status: PlanItemStatus::InProgress,
+                },
+                PlanItem {
+                    id: Uuid::new_v4(),
+                    content: "Keep the completed item visible".to_string(),
+                    status: PlanItemStatus::Completed,
+                },
+                PlanItem {
+                    id: Uuid::new_v4(),
+                    content: "Run the regression tests".to_string(),
+                    status: PlanItemStatus::Pending,
+                },
+                PlanItem {
+                    id: Uuid::new_v4(),
+                    content: "Document the reload boundary".to_string(),
+                    status: PlanItemStatus::Pending,
+                },
+                PlanItem {
+                    id: Uuid::new_v4(),
+                    content: "Archive the old screenshot".to_string(),
+                    status: PlanItemStatus::Completed,
+                },
+                PlanItem {
+                    id: Uuid::new_v4(),
+                    content: "Publish the release notes".to_string(),
+                    status: PlanItemStatus::Pending,
+                },
+            ],
+            ..TranscriptCore::default()
+        },
         ..Transcript::default()
     };
 
     assert_eq!(transcript.todo_status().as_deref(), Some("4 to-dos"));
     let single_todo = Transcript {
-        todos: vec![PlanItem {
-            id: Uuid::new_v4(),
-            content: "Check the singular label".to_string(),
-            status: PlanItemStatus::Pending,
-        }],
+        core: TranscriptCore {
+            todos: vec![PlanItem {
+                id: Uuid::new_v4(),
+                content: "Check the singular label".to_string(),
+                status: PlanItemStatus::Pending,
+            }],
+            ..TranscriptCore::default()
+        },
         ..Transcript::default()
     };
     assert_eq!(single_todo.todo_status().as_deref(), Some("1 to-do"));
@@ -7234,11 +7256,17 @@ fn focused_transcript_configuration_switches_cwd_metadata() {
     };
     let child_id = Uuid::new_v4();
     let mut displayed = Transcript {
-        config: Some(config("/workspace/director")),
+        core: TranscriptCore {
+            config: Some(config("/workspace/director")),
+            ..TranscriptCore::default()
+        },
         ..Transcript::default()
     };
     let child = Transcript {
-        config: Some(config("/workspace/child")),
+        core: TranscriptCore {
+            config: Some(config("/workspace/child")),
+            ..TranscriptCore::default()
+        },
         ..Transcript::default()
     };
     let mut director = None;
@@ -8896,9 +8924,12 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
             },
         )
     };
-    // Legacy opt-in: mirror subagent bodies and the received agent-message row.
+    // Even an old display preference cannot embed child bodies in the parent.
     let mut transcript = Transcript {
-        show_subagent_messages: true,
+        core: TranscriptCore {
+            show_subagent_messages: true,
+            ..TranscriptCore::default()
+        },
         ..Transcript::default()
     };
     transcript.apply(&activity(1, SubagentActivityKind::Started, &agent, None));
@@ -8939,16 +8970,16 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
             kind: TranscriptActionKind::Agent,
             label,
             detail,
-            body: Some(body),
+            body: None,
             state: TranscriptActionState::Complete,
             ..
         } if label == "Agent"
             && detail == "inspect_ui · report ready"
-            && body.starts_with("Found the renderer issue")
+
     ));
     transcript.toggle_action_expansion(0);
     assert!(
-        transcript
+        !transcript
             .lines(100)
             .iter()
             .any(|line| line.to_string().contains("Found the renderer issue"))
@@ -8961,6 +8992,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
             sender_id: child_id,
             sender_name: agent.task_name.clone(),
             text: "Found the renderer issue.".to_string(),
+            from_child: None,
         },
     ));
     assert!(matches!(
@@ -8983,7 +9015,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
             },
         ))),
     ));
-    assert_eq!(transcript.order.len(), 2);
+    assert_eq!(transcript.order.len(), 1);
     assert!(matches!(
         &transcript.order[0],
         TranscriptEntry::Action {
@@ -8991,11 +9023,11 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
             label,
             detail,
             state: TranscriptActionState::Waiting,
-            body: Some(body),
+            body: None,
             ..
         } if label == "Agent"
             && detail == "inspect_ui · needs approval · Run focused tests?"
-            && body == "Cargo will compile the CLI"
+
     ));
     // A terminal activity can carry the last live snapshot from before the
     // child published its completion boundary.
@@ -9003,7 +9035,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
     agent.final_text = Some("Found the renderer issue.\nExtra detail".to_string());
     transcript.apply(&activity(5, SubagentActivityKind::Completed, &agent, None));
 
-    assert_eq!(transcript.order.len(), 2);
+    assert_eq!(transcript.order.len(), 1);
     assert_eq!(transcript.active_subagent_count(), 0);
     assert_eq!(transcript.subagents[&child_id], SubagentStatus::Ready);
     assert_eq!(
@@ -9028,11 +9060,20 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert_eq!(rendered.matches("Found the renderer issue.").count(), 1);
+    assert_eq!(rendered.matches("Found the renderer issue.").count(), 0);
+    assert!(
+        transcript.subagent_snapshots[&child_id]
+            .final_text
+            .is_none()
+    );
+    assert_eq!(
+        transcript.meta.approvals[0].source_session_id,
+        child_id.to_string()
+    );
 }
 
 #[test]
-fn subagent_activity_updates_roster_without_transcript_rows_by_default() {
+fn subagent_activity_keeps_one_summary_without_embedded_child_bodies() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
     let now = chrono::Utc::now();
@@ -9086,7 +9127,7 @@ fn subagent_activity_updates_roster_without_transcript_rows_by_default() {
         ))),
     ));
 
-    assert!(transcript.order.is_empty());
+    assert_eq!(transcript.order.len(), 1);
     assert_eq!(transcript.active_subagent_count(), 1);
     assert_eq!(
         transcript.subagent_snapshots[&child_id].task_name,
@@ -9108,12 +9149,13 @@ fn subagent_activity_updates_roster_without_transcript_rows_by_default() {
             sender_id: child_id,
             sender_name: "inspect_ui".to_string(),
             text: "Found the renderer issue.".to_string(),
+            from_child: None,
         },
     );
     transcript.apply(&receipt);
 
     // No explicit received-message row is added, yet delivery/dedup tracking runs.
-    assert!(transcript.order.is_empty());
+    assert_eq!(transcript.order.len(), 1);
     assert!(transcript.agent_messages.contains(&receipt_id));
     assert!(transcript.agent_message_senders.contains(&child_id));
 
@@ -9124,10 +9166,10 @@ fn subagent_activity_updates_roster_without_transcript_rows_by_default() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(!rendered.contains("Found the renderer issue"), "{rendered}");
-    assert!(!rendered.contains("report ready"), "{rendered}");
+    assert!(rendered.contains("report ready"), "{rendered}");
 
     transcript.apply(&activity(4, SubagentActivityKind::Completed, None));
-    assert!(transcript.order.is_empty());
+    assert_eq!(transcript.order.len(), 1);
     assert_eq!(transcript.active_subagent_count(), 0);
     assert_eq!(
         transcript.subagent_snapshots[&child_id].status,
@@ -9163,14 +9205,13 @@ fn subagent_activity_updates_roster_without_transcript_rows_by_default() {
         ));
         assert!(matches!(
             &transcript.order[0],
-            TranscriptEntry::Action { body: Some(body), .. }
-                if body.contains("Needs your attention")
+            TranscriptEntry::Action { body: None, .. }
         ));
     }
 }
 
 #[test]
-fn ready_subagent_status_updates_roster_without_notifying_the_director() {
+fn ready_subagent_status_is_a_single_body_free_summary() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
     let now = Utc::now();
@@ -9240,7 +9281,11 @@ fn ready_subagent_status_updates_roster_without_notifying_the_director() {
     );
     transcript.apply(&ready);
 
-    assert!(transcript.order.is_empty());
+    assert_eq!(transcript.order.len(), 1);
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Action { body: None, .. }
+    ));
     assert_eq!(transcript.active_subagent_count(), 0);
     assert_eq!(
         transcript.subagent_snapshots[&child_id].status,
@@ -9348,7 +9393,7 @@ fn typed_agent_action_has_an_expandable_report_and_structured_copy() {
 #[test]
 fn reasoning_snapshot_overlap_is_appended_once() {
     let mut source = "Considering code modifications\nI’m checking".to_string();
-    Transcript::merge_reasoning_snapshot(
+    TranscriptCore::merge_reasoning_snapshot(
         &mut source,
         "I’m checking the repository\nfor duplicate output",
     );
@@ -10402,7 +10447,10 @@ fn accepted_steer_moves_from_pending_input_into_the_timeline() {
 fn detached_history_rebuild_preserves_scroll_follow_state() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript {
-        follow_tail: false,
+        core: TranscriptCore {
+            follow_tail: false,
+            ..TranscriptCore::default()
+        },
         ..Transcript::default()
     };
     let event = SessionEvent::new(
@@ -10531,17 +10579,20 @@ fn optimistic_idle_submission_immediately_hides_cold_cache_guidance() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     let mut transcript = Transcript {
-        config: Some(SessionDisplayConfig {
-            cwd: PathBuf::from("/workspace"),
-            provider: CodingProvider::Codex,
-            model: Some("gpt-5.6-sol".to_string()),
-            effort: Some("high".to_string()),
-            response_language: ResponseLanguage::English,
-            fast: false,
-            ultrafast: false,
-            permission_mode: PermissionMode::FullAccess,
-            speed_support: Default::default(),
-        }),
+        core: TranscriptCore {
+            config: Some(SessionDisplayConfig {
+                cwd: PathBuf::from("/workspace"),
+                provider: CodingProvider::Codex,
+                model: Some("gpt-5.6-sol".to_string()),
+                effort: Some("high".to_string()),
+                response_language: ResponseLanguage::English,
+                fast: false,
+                ultrafast: false,
+                permission_mode: PermissionMode::FullAccess,
+                speed_support: Default::default(),
+            }),
+            ..TranscriptCore::default()
+        },
         ..Transcript::default()
     };
     transcript.live_turn_closed = true;
@@ -11240,11 +11291,15 @@ fn agent_receipt_replaces_user_projection_in_either_arrival_order() {
             sender_id: Uuid::new_v4(),
             sender_name: "reviewer".to_string(),
             text: "review result".to_string(),
+            from_child: None,
         },
     );
     for (receipt_first, replay) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut transcript = Transcript {
-            show_subagent_messages: true,
+            core: TranscriptCore {
+                show_subagent_messages: true,
+                ..TranscriptCore::default()
+            },
             ..Transcript::default()
         };
         let events = if receipt_first {
@@ -11326,6 +11381,7 @@ fn agent_message_is_visible_while_stopped_once_on_replay_and_never_human_pending
             sender_id: Uuid::new_v4(),
             sender_name: "independent reviewer".to_string(),
             text: "The review is ready.\nNo model turn was needed.".to_string(),
+            from_child: None,
         },
     );
     let stopped = SessionEvent::new(
@@ -11341,7 +11397,10 @@ fn agent_message_is_visible_while_stopped_once_on_replay_and_never_human_pending
     let events = [stopped, receipt, replay];
     // The received agent-message row is opt-in.
     let mut transcript = Transcript {
-        show_subagent_messages: true,
+        core: TranscriptCore {
+            show_subagent_messages: true,
+            ..TranscriptCore::default()
+        },
         wrap_action_rows: true,
         ..Transcript::default()
     };
@@ -12985,8 +13044,11 @@ fn adjacent_provider_notifications_render_one_compaction_card() {
 #[test]
 fn low_context_status_announces_imminent_compaction() {
     let transcript = Transcript {
-        context_remaining_percent: 20,
-        context_known: true,
+        core: TranscriptCore {
+            context_remaining_percent: 20,
+            context_known: true,
+            ..TranscriptCore::default()
+        },
         ..Default::default()
     };
 
@@ -14910,14 +14972,17 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
 #[test]
 fn active_turn_action_group_closes_after_completed_reply() {
     let mut transcript = Transcript {
-        active_turn: Some(ActiveTurnDisplayConfig {
-            message_id: Uuid::new_v4(),
-            provider: CodingProvider::Claude,
-            model: None,
-            effort: None,
-            fast: false,
-            ultrafast: false,
-        }),
+        core: TranscriptCore {
+            active_turn: Some(ActiveTurnDisplayConfig {
+                message_id: Uuid::new_v4(),
+                provider: CodingProvider::Claude,
+                model: None,
+                effort: None,
+                fast: false,
+                ultrafast: false,
+            }),
+            ..TranscriptCore::default()
+        },
         ..Transcript::default()
     };
     for _ in 0..4 {
@@ -19398,6 +19463,7 @@ fn peer_agent_message_is_visible_without_subagent_opt_in() {
             sender_id: Uuid::new_v4(),
             sender_name: "agent".to_string(),
             text: "From session 94a66b94: steer orphaning confirmed.\nSecond line\nThird line\nREPORT_END".to_string(),
+            from_child: None,
         },
     );
     // Default transcript: child subagent reports are hidden ...

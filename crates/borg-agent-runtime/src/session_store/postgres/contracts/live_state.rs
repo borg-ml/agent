@@ -166,7 +166,7 @@ async fn live_state_coalesces_between_durable_anchors_and_boundaries() {
             session_id,
             0,
             SessionEventKind::ReasoningDelta {
-                text: "carefully".to_string(),
+                text: "thinking carefully".to_string(),
             },
         ))
         .await
@@ -882,20 +882,64 @@ async fn append_chunks_survive_reopen_and_archive_partial_without_quadratic_stor
     let session = Uuid::new_v4();
     let message = Uuid::new_v4();
     store.create_session(session).await.unwrap();
-    store.append(SessionEvent::new(session,0,SessionEventKind::StatusChanged {status:SessionStatus::Running,detail:None})).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
     for _ in 0..128 {
-        store.append(SessionEvent::new(session,0,SessionEventKind::MessageDelta {message_id:message,delta:"λ".repeat(64)})).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                session,
+                0,
+                SessionEventKind::MessageDelta {
+                    message_id: message,
+                    delta: "λ".repeat(64),
+                },
+            ))
+            .await
+            .unwrap();
     }
-    let bytes: i64 = sqlx::query_scalar("select sum(octet_length(body))::bigint from session_live_text_chunks where session_id=$1")
-        .bind(session).fetch_one(store.pool()).await.unwrap();
-    assert_eq!(bytes,128*64*2);
-    let metadata_bytes: i32 = sqlx::query_scalar("select octet_length(event_json::text) from session_live_state where session_id=$1")
-        .bind(session).fetch_one(store.pool()).await.unwrap();
+    let bytes: i64 = sqlx::query_scalar(
+        "select sum(octet_length(body))::bigint from session_live_text_chunks where session_id=$1",
+    )
+    .bind(session)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(bytes, 128 * 64 * 2);
+    let metadata_bytes: i32 = sqlx::query_scalar(
+        "select octet_length(event_json::text) from session_live_state where session_id=$1",
+    )
+    .bind(session)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
     assert!(metadata_bytes < 1024);
-    let reopened = crate::PostgresSessionStore::connect_with_pool_size(&scratch.url,2).await.unwrap();
-    let live = reopened.live_events_after(session,0).await.unwrap();
-    assert!(matches!(&live[0].event.kind,SessionEventKind::Message{text,..} if text == &"λ".repeat(128*64)));
-    reopened.append(SessionEvent::new(session,0,SessionEventKind::StatusChanged {status:SessionStatus::Ready,detail:None})).await.unwrap();
+    let reopened = crate::PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+        .await
+        .unwrap();
+    let live = reopened.live_events_after(session, 0).await.unwrap();
+    assert!(
+        matches!(&live[0].event.kind,SessionEventKind::Message{text,..} if text == &"λ".repeat(128*64))
+    );
+    reopened
+        .append(SessionEvent::new(
+            session,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
     assert!(reopened.read(session).await.unwrap().iter().any(|e| matches!(&e.kind,SessionEventKind::Message{text,status:MessageStatus::Failed,..} if text == &"λ".repeat(128*64))));
     drop(reopened);
     drop(store);

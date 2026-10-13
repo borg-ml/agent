@@ -365,7 +365,7 @@ pub enum AgentTurnControl {
     },
     Approval {
         approval_id: String,
-        decision: crate::ApprovalDecision,
+        resolution: crate::ApprovalResolution,
     },
     ProviderInteractionResponse {
         interaction_id: String,
@@ -2775,9 +2775,9 @@ fn map_controls(
                     }
                     AgentTurnControl::Approval {
                         approval_id,
-                        decision,
+                        resolution,
                     } => {
-                        let decision = match decision {
+                        let decision = match resolution.decision {
                             crate::ApprovalDecision::AllowOnce => ChatApprovalDecision::ApproveOnce,
                             crate::ApprovalDecision::AllowSession => {
                                 ChatApprovalDecision::ApproveSession
@@ -2787,6 +2787,7 @@ fn map_controls(
                         tx.send(ChatStreamControl::Approval {
                             approval_id,
                             decision,
+                            edited_input: resolution.edited_input,
                         })
                         .await
                         .is_ok()

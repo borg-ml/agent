@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/borg-view",
     "crates/borg-core",
     "crates/borg-dictation",
     "crates/borg-agent-runtime",

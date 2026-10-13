@@ -510,6 +510,9 @@ pub(crate) struct RuntimeSessionStore {
     store: Arc<dyn SessionStore>,
     context_events: Vec<SessionEvent>,
     context_complete: bool,
+    // Actor authority metadata, never pruned with model context.
+    approval_request_event: Option<Uuid>,
+    question_request_event: Option<Uuid>,
     workspace_projection: Option<WorkspaceProjection>,
     workspace_projector: Option<(Arc<tokio::sync::Notify>, AbortTask)>,
     projection_diagnostics: VecDeque<SessionEvent>,
@@ -845,10 +848,27 @@ impl RuntimeSessionStore {
         context_events: Vec<SessionEvent>,
         context_complete: bool,
     ) -> Self {
+        let approval_request_event = context_events
+            .iter()
+            .rev()
+            .find(|event| matches!(event.kind, SessionEventKind::ApprovalRequested { .. }))
+            .map(|event| event.id);
+        let question_request_event = context_events
+            .iter()
+            .rev()
+            .find(|event| {
+                matches!(
+                    event.kind,
+                    SessionEventKind::ProviderInteractionRequested { .. }
+                )
+            })
+            .map(|event| event.id);
         Self {
             store,
             context_events,
             context_complete,
+            approval_request_event,
+            question_request_event,
             workspace_projection: None,
             workspace_projector: None,
             projection_diagnostics: VecDeque::new(),
@@ -1049,6 +1069,15 @@ impl RuntimeSessionStore {
 
     /// Fold a persisted event into the live context, exactly as `append` does.
     async fn absorb_appended(&mut self, event: &SessionEvent) -> Result<()> {
+        match &event.kind {
+            SessionEventKind::ApprovalRequested { .. } => {
+                self.approval_request_event = Some(event.id)
+            }
+            SessionEventKind::ProviderInteractionRequested { .. } => {
+                self.question_request_event = Some(event.id)
+            }
+            _ => {}
+        }
         if let SessionEventKind::AgentMessageReceived { message_id, .. } = &event.kind {
             self.received_agent_messages.insert(*message_id);
         }
@@ -2677,6 +2706,8 @@ async fn run_agent_session_store_kernel_inner(
     let _receipt_collector = workspace_projection.as_ref().map(|projection| {
         AbortTask(tokio::spawn(collect_agent_message_receipts(
             Arc::clone(&projection.store),
+            Arc::clone(&journal.store),
+            session_id,
             projection.agent_participant_id,
             journal.received_agent_messages.clone(),
             receipt_tx,
@@ -6136,12 +6167,11 @@ async fn run_agent_session_store_kernel_inner(
                         return Ok(());
                     };
                     if command.session_id() != Some(session_id) {
-                        if owns_team && let HostCommand::TeamPrompt { session_id: child, message_id, .. } = command {
-                            if let Err(error) = subagents.as_ref().expect("team manager")
+                        if owns_team && let HostCommand::TeamPrompt { session_id: child, message_id, .. } = command
+                            && let Err(error) = subagents.as_ref().expect("team manager")
                                 .deliver_child_message(child, message_id).await {
                                 tracing::warn!(%child, %message_id, %error, "child message handoff failed");
                             }
-                        }
                         continue;
                     }
                     match command {
@@ -6539,8 +6569,14 @@ async fn run_agent_session_store_kernel_inner(
                         HostCommand::Approve {
                             approval_id,
                             decision,
+                            expected_request,
+                            acknowledgement,
+                            edited_input,
                             ..
-                        } if !interrupted && pending_approval.as_ref().map(|pending| pending.id.as_str()) == Some(approval_id.as_str()) => {
+                        } if !interrupted && pending_approval.as_ref().map(|pending| pending.id.as_str()) == Some(approval_id.as_str())
+                            && acknowledgement.as_ref().is_none_or(|ack| ack.is_waiting())
+                            && approval_request_matches(&journal, expected_request, false)
+                            && (edited_input.is_none() || pending_approval.as_ref().is_some_and(|pending| pending.response.is_none())) => {
                             let pending = pending_approval.take().expect("matching approval");
                             record(
                                 &mut journal,
@@ -6560,27 +6596,30 @@ async fn run_agent_session_store_kernel_inner(
                                     detail: None,
                                 },
                             ).await?;
-                            if let Some(response) = pending.response {
-                                if response.send(decision).is_ok() && decision != crate::ApprovalDecision::Deny {
-                                    turn_had_side_effects = true;
-                                }
+                            let delivered = if let Some(response) = pending.response {
+                                let delivered = response.send(decision).is_ok();
+                                if delivered && decision != crate::ApprovalDecision::Deny { turn_had_side_effects = true; }
+                                delivered
                             } else {
-                                control_tx
-                                    .send(AgentTurnControl::Approval {
-                                        approval_id,
-                                        decision,
-                                    })
-                                    .await
-                                    .ok();
+                                control_tx.send(AgentTurnControl::Approval {
+                                    approval_id, resolution: crate::ApprovalResolution { decision, edited_input },
+                                }).await.is_ok()
+                            };
+                            if let Some(ack) = acknowledgement {
+                                ack.complete(if delivered { Ok(()) } else { Err("approval executor stopped".into()) });
                             }
                             watchdog.note_output();
                         }
                         HostCommand::RespondToProviderInteraction {
                             interaction_id,
                             response,
+                            expected_request,
+                            acknowledgement,
                             ..
                         } if pending_provider_interaction.as_deref()
-                            == Some(interaction_id.as_str()) =>
+                            == Some(interaction_id.as_str())
+                            && acknowledgement.as_ref().is_none_or(|ack| ack.is_waiting())
+                            && approval_request_matches(&journal, expected_request, true) =>
                         {
                             pending_provider_interaction = None;
                             watchdog.note_output();
@@ -6594,13 +6633,20 @@ async fn run_agent_session_store_kernel_inner(
                                 },
                             )
                             .await?;
-                            control_tx
+                            let delivered = control_tx
                                 .send(AgentTurnControl::ProviderInteractionResponse {
                                     interaction_id,
                                     response,
                                 })
                                 .await
-                                .ok();
+                                .is_ok();
+                            if let Some(ack) = acknowledgement { ack.complete(if delivered { Ok(()) } else { Err("question executor stopped".into()) }); }
+                        }
+                        HostCommand::Approve { acknowledgement, .. }
+                        | HostCommand::RespondToProviderInteraction { acknowledgement, .. } => {
+                            if let Some(ack) = acknowledgement {
+                                ack.complete(Err("request stale, interrupted, or edited input unsupported".into()));
+                            }
                         }
                         command @ (HostCommand::Goal { .. } | HostCommand::AgentGoal { .. }) => {
                             let action = match command {
@@ -6854,8 +6900,6 @@ async fn run_agent_session_store_kernel_inner(
                         }
                         HostCommand::ReleaseRetainedContext { .. }
                         | HostCommand::Launch { .. }
-                        | HostCommand::Approve { .. }
-                        | HostCommand::RespondToProviderInteraction { .. }
                         | HostCommand::WorkspaceFilesystem { .. }
                         | HostCommand::CancelWorkspaceFilesystem { .. }
                         | HostCommand::WorkspaceCommand { .. }
@@ -13164,6 +13208,8 @@ pub(crate) fn subject_life(status: SubagentStatus) -> SubjectLife {
 // runtime. Only the actor receiving these rows may append its journal.
 async fn collect_agent_message_receipts(
     store: Arc<dyn WorkspaceStore>,
+    sessions: Arc<dyn SessionStore>,
+    session_id: Uuid,
     recipient_id: Uuid,
     mut seen: HashSet<Uuid>,
     receipts: mpsc::Sender<SessionEventKind>,
@@ -13191,12 +13237,14 @@ async fn collect_agent_message_receipts(
                             && sender.kind == crate::ParticipantKind::Agent
                         {
                             let message_id = message.id;
+                            let from_child = sessions.is_descendant(session_id, sender.id).await?;
                             receipts
                                 .send(SessionEventKind::AgentMessageReceived {
                                     message_id,
                                     sender_id: sender.id,
                                     sender_name: sender.display_name,
                                     text: message.body.text,
+                                    from_child: Some(from_child),
                                 })
                                 .await
                                 .context("receipt actor closed")?;
@@ -13270,9 +13318,14 @@ async fn forward_child_activity(
                     match coordinator.activity_recovery_page(session_id, cursor).await {
                         Ok((page, next)) => {
                             for activity in page {
-                                if forwarded.send(activity).await.is_err() { return; }
+                                if forwarded.send(activity).await.is_err() {
+                                    return;
+                                }
                             }
-                            match next { Some(next) => cursor = Some(next), None => break }
+                            match next {
+                                Some(next) => cursor = Some(next),
+                                None => break,
+                            }
                         }
                         Err(error) => {
                             tracing::error!(%session_id, %error, "child activity recovery failed; retaining roster cursor");
@@ -13305,11 +13358,6 @@ async fn record_subagent_activity(
     watches: &crate::watch::Watches,
     activity: SubagentActivity,
 ) -> Result<()> {
-    // Child streams belong only to the child journal. Parent summaries change
-    // at durable lifecycle/attention boundaries, never on each text token.
-    if let SubagentActivity::SessionEvent { event, .. } = &activity {
-        if event.kind.persistence() != crate::EventPersistence::Durable { return Ok(()) }
-    }
     // A child's assistant message is a mutable live projection until its
     // Complete boundary. Marking the first in-progress snapshot as projected
     // suppresses every later snapshot with the same ID, including the durable
@@ -13363,6 +13411,7 @@ async fn record_subagent_activity(
                 sender_id: *sender_id,
                 sender_name: task_name.clone(),
                 text: text.clone(),
+                from_child: Some(true),
             },
         )
         .await?;
@@ -13379,7 +13428,7 @@ async fn record_subagent_activity(
             let Some(agent) = subagents.get(event.session_id).await else {
                 return Ok(());
             };
-            (SubagentActivityKind::Updated, agent, None)
+            (SubagentActivityKind::Updated, agent, Some(Box::new(event)))
         }
     };
     // The snapshot the journal is about to record, so a watch cannot be told a
@@ -13394,12 +13443,14 @@ async fn record_subagent_activity(
         .await;
     let mut agent = agent;
     agent.final_text = None;
-    if let Some(detail) = &mut agent.detail {
-        if detail.len() > 4096 {
-            let mut end = 4096;
-            while !detail.is_char_boundary(end) { end -= 1; }
-            detail.truncate(end);
+    if let Some(detail) = &mut agent.detail
+        && detail.len() > 4096
+    {
+        let mut end = 4096;
+        while !detail.is_char_boundary(end) {
+            end -= 1;
         }
+        detail.truncate(end);
     }
     let kind = SessionEventKind::SubagentActivity {
         activity: kind,
@@ -14342,6 +14393,22 @@ fn goal_token_usage(kind: &SessionEventKind, native_turns: &mut HashMap<Uuid, u6
         }
         _ => None,
     }
+}
+
+/// Called only by the actor, before consuming a pending request or its response channel.
+fn approval_request_matches(
+    journal: &RuntimeSessionStore,
+    expected: Option<Uuid>,
+    question: bool,
+) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    (if question {
+        journal.question_request_event
+    } else {
+        journal.approval_request_event
+    }) == Some(expected)
 }
 
 fn track_approval(kind: &SessionEventKind, pending: &mut Option<PendingApproval>) {

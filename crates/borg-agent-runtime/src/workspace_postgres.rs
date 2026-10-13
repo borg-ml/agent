@@ -446,6 +446,14 @@ impl PostgresWorkspaceStore {
             is_message,
         )
         .await?;
+        if is_message {
+            // Commit-coupled outbox wake: hosts upload undelivered messages
+            // when one commits, from whichever process authored it.
+            sqlx::query("select pg_notify('borg_workspace_outbox', $1)")
+                .bind(event.workspace_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+        }
         transaction.commit().await?;
         Ok(event)
     }

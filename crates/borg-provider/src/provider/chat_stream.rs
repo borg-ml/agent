@@ -283,6 +283,7 @@ pub enum ChatStreamControl {
     Approval {
         approval_id: String,
         decision: ChatApprovalDecision,
+        edited_input: Option<String>,
     },
     ProviderInteractionResponse {
         interaction_id: String,

@@ -525,7 +525,14 @@ impl PostgresSessionStore {
         let original_event = event.clone();
         let message_fragment = matches!(&event.kind, SessionEventKind::MessageDelta { .. });
         if let SessionEventKind::MessageDelta { message_id, delta } = &event.kind {
-            event.kind = SessionEventKind::Message { message_id: *message_id, actor: crate::EventActor::Assistant, text: delta.clone(), status: MessageStatus::InProgress, attachments: Vec::new(), delivery: None };
+            event.kind = SessionEventKind::Message {
+                message_id: *message_id,
+                actor: crate::EventActor::Assistant,
+                text: delta.clone(),
+                status: MessageStatus::InProgress,
+                attachments: Vec::new(),
+                delivery: None,
+            };
         }
         let reasoning_fragment = matches!(&event.kind, SessionEventKind::ReasoningTextDelta { .. });
         if let SessionEventKind::ReasoningTextDelta { delta } = &event.kind {
@@ -573,28 +580,61 @@ impl PostgresSessionStore {
             .await?;
             if live_key != "context_window" {
                 transaction.commit().await?;
-                return Ok(event);
+                return Ok(original_event);
             }
         }
 
-        self.anchor_assistant_message(&mut transaction, &event)
+        let anchored = self
+            .anchor_assistant_message(&mut transaction, &event)
             .await?;
 
         let revision = current_revision.saturating_add(1);
         let mut stored_event = event.clone();
         let streamed = match &event.kind {
             SessionEventKind::ReasoningDelta { text } => Some((text.as_str(), reasoning_fragment)),
-            SessionEventKind::Message { text, actor: crate::EventActor::Assistant, status: MessageStatus::InProgress, .. } => Some((text.as_str(), message_fragment)),
+            SessionEventKind::Message {
+                text,
+                actor: crate::EventActor::Assistant,
+                status: MessageStatus::InProgress,
+                ..
+            } => Some((text.as_str(), message_fragment)),
             _ => None,
         };
         if streamed.is_some() {
-            if let Some(prior) = super::live_text::seed_inline(&mut transaction, &event, &live_key).await? {
+            if let Some(prior) =
+                super::live_text::seed_inline(&mut transaction, &event, &live_key).await?
+            {
                 stored_event.id = prior.id;
                 stored_event.created_at = prior.created_at;
             }
             match &mut stored_event.kind {
-                SessionEventKind::ReasoningDelta { text } | SessionEventKind::Message { text, .. } => text.clear(),
+                SessionEventKind::ReasoningDelta { text }
+                | SessionEventKind::Message { text, .. } => text.clear(),
                 _ => {}
+            }
+        }
+        // The first nonblank reasoning frame adds one durable display anchor,
+        // so the block keeps its transcript position; later frames stay live.
+        if let SessionEventKind::ReasoningDelta { text } = &event.kind
+            && !text.trim().is_empty()
+        {
+            let visible: bool = sqlx::query_scalar(
+                "select exists(select 1 from session_live_text_chunks \
+                 where session_id = $1 and live_key = $2 \
+                 and btrim(convert_from(body, 'UTF8')) <> '')",
+            )
+            .bind(event.session_id)
+            .bind(&live_key)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !visible {
+                let mut snapshot = stored_event.clone();
+                snapshot.kind = SessionEventKind::ReasoningDelta { text: text.clone() };
+                self.append_durable_in_transaction(
+                    &mut transaction,
+                    reasoning_snapshot(&snapshot, &state, false, snapshot.created_at),
+                )
+                .await?;
             }
         }
 
@@ -614,7 +654,15 @@ impl PostgresSessionStore {
         .execute(&mut *transaction)
         .await?;
         if let Some((text, fragment)) = streamed {
-            super::live_text::append(&mut transaction, &event, &live_key, text, fragment, revision).await?;
+            super::live_text::append(
+                &mut transaction,
+                &event,
+                &live_key,
+                text,
+                fragment,
+                revision,
+            )
+            .await?;
         }
         sqlx::query("update sessions set live_revision = $1, updated_at = $2 where id = $3")
             .bind(revision)
@@ -624,8 +672,26 @@ impl PostgresSessionStore {
             .await?;
         super::publication::notify(&mut transaction, event.session_id).await?;
         transaction.commit().await?;
-        // Return the committed input delta; reconstruct only on explicit reads.
-        Ok(original_event)
+        // Return the committed input, not the reconstructed stream. Snapshots
+        // keep the live key's identity and start time so clients do not
+        // restart its timer; the first fragment of a newly anchored message
+        // is returned as that message so it replaces the empty anchor.
+        let mut committed = original_event;
+        if streamed.is_some() {
+            committed.id = stored_event.id;
+            committed.created_at = stored_event.created_at;
+        }
+        if anchored && let SessionEventKind::MessageDelta { message_id, delta } = &committed.kind {
+            committed.kind = SessionEventKind::Message {
+                message_id: *message_id,
+                actor: crate::EventActor::Assistant,
+                text: delta.clone(),
+                status: MessageStatus::InProgress,
+                attachments: Vec::new(),
+                delivery: None,
+            };
+        }
+        Ok(committed)
     }
 
     /// Decode one `session_events` row into an event, hot or cold.
@@ -870,7 +936,9 @@ impl PostgresSessionStore {
 #[async_trait]
 impl SessionStore for PostgresSessionStore {
     fn postgres_authority(&self) -> Option<super::publication::PostgresAuthority> {
-        Some(super::publication::PostgresAuthority { pool: self.pool().clone() })
+        Some(super::publication::PostgresAuthority {
+            pool: self.pool().clone(),
+        })
     }
     async fn create_session(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now();
@@ -901,8 +969,9 @@ impl SessionStore for PostgresSessionStore {
         match event.kind.persistence() {
             EventPersistence::Ephemeral => {
                 event.sequence = 0;
-                if matches!(&event.kind, SessionEventKind::ReasoningTextDelta { delta } | SessionEventKind::MessageDelta { delta, .. } if !delta.is_empty()) {
-                    self.append_live(event.clone()).await?;
+                if matches!(&event.kind, SessionEventKind::ReasoningTextDelta { delta } | SessionEventKind::MessageDelta { delta, .. } if !delta.is_empty())
+                {
+                    return self.append_live(event).await;
                 }
                 Ok(event)
             }

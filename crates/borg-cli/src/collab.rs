@@ -594,16 +594,22 @@ async fn join(value: &str) -> Result<()> {
                         session_id: id,
                         approval_id: pending_approval.clone().context("no approval is pending")?,
                         decision: ApprovalDecision::AllowOnce,
+
+                        expected_request: None, acknowledgement: None, edited_input: None,
                     },
                     "/approve-session" => HostCommand::Approve {
                         session_id: id,
                         approval_id: pending_approval.clone().context("no approval is pending")?,
                         decision: ApprovalDecision::AllowSession,
+
+                        expected_request: None, acknowledgement: None, edited_input: None,
                     },
                     "/deny" => HostCommand::Approve {
                         session_id: id,
                         approval_id: pending_approval.clone().context("no approval is pending")?,
                         decision: ApprovalDecision::Deny,
+
+                        expected_request: None, acknowledgement: None, edited_input: None,
                     },
                     text if !text.is_empty() => HostCommand::Prompt {
                         session_id: id,

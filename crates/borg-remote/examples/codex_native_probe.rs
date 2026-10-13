@@ -167,7 +167,9 @@ async fn probe() -> Result<()> {
                                 } else {
                                     ApprovalDecision::Deny
                                 },
-                            })
+                            expected_request: None, acknowledgement: None,
+                edited_input: None,
+})
                             .await?;
                         ensure!(
                             allowed,
@@ -396,7 +398,9 @@ async fn control_probe() -> Result<()> {
                                 commands.send(HostCommand::Approve {
                                     session_id, approval_id,
                                     decision: if allowed { ApprovalDecision::AllowOnce } else { ApprovalDecision::Deny },
-                                }).await?;
+                                expected_request: None, acknowledgement: None,
+                edited_input: None,
+}).await?;
                                 ensure!(allowed, "unexpected process approval");
                                 approved = true;
                             }

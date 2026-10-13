@@ -868,6 +868,9 @@ impl LocalSessionClient {
                     .clone()
                     .context("this session is not waiting for approval")?,
                 decision,
+                expected_request: None,
+                acknowledgement: None,
+                edited_input: None,
             },
             FrontendCommand::RespondToProviderInteraction(response) => {
                 HostCommand::RespondToProviderInteraction {
@@ -879,6 +882,8 @@ impl LocalSessionClient {
                         .clone()
                         .context("this session is not waiting for provider input")?,
                     response,
+                    expected_request: None,
+                    acknowledgement: None,
                 }
             }
             FrontendCommand::ApplyGoal(action) => HostCommand::Goal { session_id, action },

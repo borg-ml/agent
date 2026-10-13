@@ -27,17 +27,17 @@ use crate::receipt::{ReceiptBackend, ReceiptState};
 use crate::session::AbortTask;
 use crate::{
     AgentTurnExecutor, Audience, CodingProvider, DirectoryInstance, HostCapabilities, HostCommand,
-    HostCommandEnvelope, HostExecutionProfile, HostHeartbeat, HostResourceLimits,
-    HostShellCommandOutcome, HostShellCommandRequest, HostShellCommandResponse, LaunchSession,
-    LspPathPolicy, OpenTerminalOutcome, OpenTerminalRequest, OpenTerminalResponse, Participant,
-    ParticipantKind, PermissionMode, ProviderAuthMethod, ProviderCapability,
-    REMOTE_PROTOCOL_VERSION, RemoteHost, RemoteHostIdentity, RuntimeMcpContext, SessionEvent,
-    SessionLiveEvent, SessionPayloadRef, SessionStore, SessionWriterLease, WorkspaceAttachment,
-    WorkspaceCommandErrorCode, WorkspaceCommandOutcome, WorkspaceCommandRequest,
-    WorkspaceCommandResponse, WorkspaceEventKind, WorkspaceFilesystemErrorCode,
-    WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest, WorkspaceFilesystemResponse,
-    WorkspaceRole, WorkspaceStore, execute_host_shell_command_with_limits,
-    execute_workspace_command_with_limits, execute_workspace_filesystem_with_limits,
+    HostExecutionProfile, HostHeartbeat, HostResourceLimits, HostShellCommandOutcome,
+    HostShellCommandRequest, HostShellCommandResponse, LaunchSession, LspPathPolicy,
+    OpenTerminalOutcome, OpenTerminalRequest, OpenTerminalResponse, Participant, ParticipantKind,
+    PermissionMode, ProviderAuthMethod, ProviderCapability, REMOTE_PROTOCOL_VERSION, RemoteHost,
+    RemoteHostIdentity, RuntimeMcpContext, SessionEvent, SessionStore, SessionWriterLease,
+    WorkspaceAttachment, WorkspaceCommandErrorCode, WorkspaceCommandOutcome,
+    WorkspaceCommandRequest, WorkspaceCommandResponse, WorkspaceEventKind,
+    WorkspaceFilesystemErrorCode, WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest,
+    WorkspaceFilesystemResponse, WorkspaceRole, WorkspaceStore,
+    execute_host_shell_command_with_limits, execute_workspace_command_with_limits,
+    execute_workspace_filesystem_with_limits,
     run_agent_session_with_store_and_writer_and_lsp_policy,
 };
 
@@ -1582,6 +1582,9 @@ pub(crate) async fn run_host_with_resolved_store(
     let _operations = AbortTask(host_transport::spawn(run_host_operation_loop(
         client.clone(), config.clone(), Arc::clone(&receipts), session_root.clone(),
     )));
+    let _workspace_recovery = AbortTask(host_transport::spawn(run_host_workspace_recovery_loop(
+        client.clone(), config.clone(), Arc::clone(&session_store), Arc::clone(&sessions), session_root.clone(),
+    )));
     let (commands, mut command_rx) = mpsc::channel(128);
     let context = DispatchContext {
         client, config: config.clone(), session_root, sessions: Arc::clone(&sessions),
@@ -1694,6 +1697,7 @@ pub(crate) async fn run_host_with_resolved_store(
                     Some(true) => {
                         let authority = Arc::clone(&sync);
                         let transport = host_transport::get(config.host_id)?;
+                        transport.wakes().reconnected();
                         host_transport::spawn(async move {
                             if let Err(error) = transport.announce_routes().await { tracing::warn!(%error, "route announcement deferred"); }
                             for (session, request) in transport.registrations() {
@@ -1723,6 +1727,12 @@ pub(crate) async fn run_host_with_resolved_store(
                         }
                         crate::auth::TunnelFrame::RegisteredSession { registration_id, error, .. } => {
                             host_transport::get(config.host_id)?.registered(&registration_id, error);
+                        }
+                        crate::auth::TunnelFrame::CollaborationChanged { session_id } => {
+                            match Uuid::parse_str(&session_id) {
+                                Ok(session_id) => host_transport::get(config.host_id)?.wakes().collaboration_changed(session_id),
+                                Err(error) => tracing::warn!(%error, "relay sent an invalid collaboration session id"),
+                            }
                         }
                         crate::auth::TunnelFrame::EpochUpdate { epoch: updated } => {
                             ensure!(updated >= epoch, "relay revocation epoch regressed");
@@ -2010,6 +2020,7 @@ async fn viewer_command(
             message: "effect was started; automatic replay refused".into(),
         },
         crate::command_ledger::Admission::New => {
+            let mut approval_unconfirmed = false;
             let translate = async {
                 let session_id = session_id.context("command requires session scope")?;
                 let command = match viewer.command {
@@ -2032,21 +2043,22 @@ async fn viewer_command(
                             },
                         }
                     }
-                    Command::Approval { approval_id, source_session_id, decision, edited_input, .. } => {
+                    Command::Approval { approval_id, source_session_id, target_revision, decision, edited_input } => {
                         ensure!(Uuid::parse_str(&source_session_id)? == session_id, "approval source differs from scope");
-                        ensure!(edited_input.is_none(), "runtime does not support edited approval input");
-                        HostCommand::Approve { session_id, approval_id, decision: match decision {
+                        HostCommand::Approve { session_id, approval_id, expected_request: Some(Uuid::parse_str(&target_revision)?), acknowledgement: None, edited_input, decision: match decision {
                             borg_view::wire::Decision::Once => crate::ApprovalDecision::AllowOnce,
                             borg_view::wire::Decision::Session => crate::ApprovalDecision::AllowSession,
                             borg_view::wire::Decision::Deny => crate::ApprovalDecision::Deny,
-                        } }
+                        }
+}
                     }
-                    Command::RespondToQuestion { approval_id, source_session_id, text, .. } => {
+                    Command::RespondToQuestion { approval_id, source_session_id, target_revision, text } => {
                         ensure!(Uuid::parse_str(&source_session_id)? == session_id, "question source differs from scope");
                         let state = context.session_store.state(session_id).await?;
                         ensure!(state.pending_provider_interaction_id.as_deref() == Some(approval_id.as_str()), "question is no longer pending");
                         let response = viewer_provider_interaction_response(state.pending_provider_interaction_kind.as_deref().context("question kind unavailable")?, state.pending_provider_interaction_payload.as_ref().context("question payload unavailable")?, &text)?;
-                        HostCommand::RespondToProviderInteraction { session_id, interaction_id: approval_id, response }
+                        HostCommand::RespondToProviderInteraction { session_id, interaction_id: approval_id, response, expected_request: Some(Uuid::parse_str(&target_revision)?), acknowledgement: None,
+}
                     }
                     Command::NewSession { cwd } => {
                         let mut request = scope_registration(context.session_store.as_ref(), session_id).await?.context("session launch configuration unavailable")?;
@@ -2146,7 +2158,7 @@ async fn viewer_command(
                             F::Compact => HostCommand::Compact { session_id },
                             F::ClearContext => HostCommand::ClearContext { session_id },
                             F::FlushPendingInput => HostCommand::FlushPendingInput { session_id },
-                            F::ApplyGoal(action) => HostCommand::Goal { session_id, action: action.try_into()? },
+                            F::ApplyGoal(action) => HostCommand::Goal { session_id, action },
                             F::ApplyTodo(action) => HostCommand::Todo { session_id, action },
                             F::StopWatch(watch_id) => HostCommand::StopWatch {
                                 session_id,
@@ -2193,13 +2205,34 @@ async fn viewer_command(
                         }
                     }
                 };
-                ensure!(
-                    dispatch(context.clone(), command).await,
-                    "command admission interrupted"
-                );
+                let mut command = command;
+                let receipt = match &mut command {
+                    HostCommand::Approve { acknowledgement, .. }
+                    | HostCommand::RespondToProviderInteraction { acknowledgement, .. } => {
+                        let (ack, receipt) = crate::ApprovalAcknowledgement::channel();
+                        *acknowledgement = Some(ack);
+                        Some(receipt)
+                    }
+                    _ => None,
+                };
+                approval_unconfirmed = receipt.is_some();
+                ensure!(dispatch(context.clone(), command).await, "command admission interrupted");
+                if let Some(receipt) = receipt {
+                    let actor_result = tokio::time::timeout(Duration::from_secs(30), receipt).await
+                        .context("approval actor receipt timeout")?
+                        .context("approval actor stopped without receipt")?;
+                    approval_unconfirmed = false;
+                    actor_result.map_err(anyhow::Error::msg)?;
+                }
                 Ok::<_, anyhow::Error>(CommandOutcome::Applied)
             }
             .await;
+            if approval_unconfirmed {
+                // Preserve Started/InDoubt: loss of the actor receipt is not a definitive rejection.
+                return Err(translate
+                    .err()
+                    .unwrap_or_else(|| anyhow::anyhow!("approval receipt lost")));
+            }
             let outcome = match translate {
                 Ok(outcome) => outcome,
                 Err(error) => CommandOutcome::Rejected {
@@ -2395,45 +2428,57 @@ async fn run_host_operation_loop(
     receipts: Arc<dyn ReceiptBackend>,
     session_root: PathBuf,
 ) {
+    enum Step {
+        Progress,
+        Idle,
+        Retry,
+    }
+    let wakes = host_transport::get(config.host_id)
+        .map(|transport| transport.wakes())
+        .unwrap_or_default();
     loop {
-        let result: Result<bool> = async {
+        let result: Result<Step> = async {
             // A receipt marked Started is only indeterminate after its worker
             // has released ownership. Never race another live host worker.
             let Some(_owner) =
                 SessionWriterLease::try_acquire(session_root.join("host-operations.lock"))?
             else {
-                return Ok(false);
+                return Ok(Step::Retry);
             };
             let Some((request_id, value)) = receipts.next_host_operation(config.host_id).await?
             else {
-                return Ok(false);
+                return Ok(Step::Idle);
             };
             let command = match serde_json::from_value::<HostCommand>(value) {
                 Ok(command) if deferred_host_operation_id(&command) == Some(request_id) => command,
                 _ => {
                     receipts.quarantine_host_operation(config.host_id, request_id).await?;
                     tracing::error!(%request_id, "unsupported host operation quarantined; retained in host_operation_queue");
-                    return Ok(true);
+                    return Ok(Step::Progress);
                 }
             };
             let Some(_operation_owner) = SessionWriterLease::try_acquire(
                 session_root.join(format!("host-operation-{request_id}.lock")),
-            )? else { return Ok(false) };
+            )? else { return Ok(Step::Retry) };
             if !execute_host_operation(&client, &config, receipts.as_ref(), &command).await {
-                return Ok(false);
+                return Ok(Step::Retry);
             }
             receipts
                 .finish_host_operation(config.host_id, request_id)
                 .await?;
-            Ok(true)
+            Ok(Step::Progress)
         }
         .await;
         match result {
-            Ok(true) => continue,
-            Ok(false) => {}
-            Err(error) => tracing::warn!(%error, "host operation remains queued for recovery"),
+            Ok(Step::Progress) => continue,
+            // Enqueueing an operation wakes this loop; an empty queue waits.
+            Ok(Step::Idle) => wakes.operations.notified().await,
+            Ok(Step::Retry) => tokio::time::sleep(Duration::from_secs(1)).await,
+            Err(error) => {
+                tracing::warn!(%error, "host operation remains queued for recovery");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -2548,6 +2593,29 @@ async fn run_host_workspace_recovery_loop(
             }
         }
     };
+    let wakes = host_transport::get(config.host_id)
+        .map(|transport| transport.wakes())
+        .unwrap_or_default();
+    // Listen before the first scan so a message committed in between still wakes it.
+    let mut outbox = match store.postgres_authority() {
+        Some(authority) => {
+            let listener = async {
+                let mut listener =
+                    sqlx::postgres::PgListener::connect_with(&authority.pool).await?;
+                listener.listen("borg_workspace_outbox").await?;
+                Ok::<_, sqlx::Error>(listener)
+            }
+            .await;
+            match listener {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    tracing::warn!(%error, "hosted message recovery cannot listen for new messages");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
     let mut after = None;
     let mut retry_at = HashMap::new();
     let mut syncs: HashMap<Uuid, JournalSync> = HashMap::new();
@@ -2605,7 +2673,41 @@ async fn run_host_workspace_recovery_loop(
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        if after.is_some() {
+            continue;
+        }
+        // Undelivered messages appear when a session ends or the relay comes
+        // back; between those, only deferred sessions owe a timed retry.
+        let retry = retry_at
+            .values()
+            .chain(
+                syncs
+                    .values()
+                    .flat_map(|sync| sync.workspace_retry_at.values()),
+            )
+            .min()
+            .copied();
+        tokio::select! {
+            _ = wakes.recovery.notified() => {}
+            notification = async {
+                match outbox.as_mut() {
+                    Some(listener) => listener.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // The listener reconnects itself; a lost notification is
+                // covered by rescanning now.
+                if let Err(error) = notification {
+                    tracing::warn!(%error, "hosted message recovery notification failed");
+                }
+            }
+            _ = async {
+                match retry {
+                    Some(retry) => tokio::time::sleep_until(tokio::time::Instant::from_std(retry)).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+        }
     }
 }
 
@@ -2979,60 +3081,60 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
         tracing::warn!(%error, "expired owner command refused before mutation");
         return false;
     }
-    if !matches!(command, HostCommand::Launch { .. }) {
-        if let Some(session_id) = command.session_id() {
-            let root = match session_store.owning_root_session(session_id).await {
-                Ok(root) => root.unwrap_or(session_id),
-                Err(error) => {
-                    tracing::warn!(%error, "cannot resolve local session owner");
-                    return false;
-                }
-            };
-            let socket = crate::session_control_socket_path(&session_root, root);
-            if crate::session_control_socket_is_reachable(&socket).await {
-                match session_store.host_launch_owner(root).await {
-                    Ok(Some((host, origin)))
-                        if host == config.host_id
-                            && host_relay_origin(&config).ok().as_ref() == Some(&origin) => {}
-                    _ => return false,
-                }
-                if let HostCommand::Prompt {
-                    session_id,
-                    message_id,
-                    text,
-                    attachments,
-                    delivery,
-                    ..
-                } = &command
-                {
-                    match session_store
-                        .contains_message(*session_id, *message_id)
-                        .await
-                    {
-                        Ok(true) => {
-                            return admit_remote_prompt(
-                                session_store.as_ref(),
-                                *session_id,
-                                *message_id,
-                                text,
-                                attachments,
-                                *delivery,
-                            )
-                            .await
-                            .is_ok();
-                        }
-                        Ok(false) => {}
-                        Err(_) => return false,
-                    }
-                }
-
-                if check_owner_deadline(&command).is_err() {
-                    return false;
-                }
-                return crate::send_local_session_command(&socket, session_id, command)
-                    .await
-                    .is_ok();
+    if !matches!(command, HostCommand::Launch { .. })
+        && let Some(session_id) = command.session_id()
+    {
+        let root = match session_store.owning_root_session(session_id).await {
+            Ok(root) => root.unwrap_or(session_id),
+            Err(error) => {
+                tracing::warn!(%error, "cannot resolve local session owner");
+                return false;
             }
+        };
+        let socket = crate::session_control_socket_path(&session_root, root);
+        if crate::session_control_socket_is_reachable(&socket).await {
+            match session_store.host_launch_owner(root).await {
+                Ok(Some((host, origin)))
+                    if host == config.host_id
+                        && host_relay_origin(&config).ok().as_ref() == Some(&origin) => {}
+                _ => return false,
+            }
+            if let HostCommand::Prompt {
+                session_id,
+                message_id,
+                text,
+                attachments,
+                delivery,
+                ..
+            } = &command
+            {
+                match session_store
+                    .contains_message(*session_id, *message_id)
+                    .await
+                {
+                    Ok(true) => {
+                        return admit_remote_prompt(
+                            session_store.as_ref(),
+                            *session_id,
+                            *message_id,
+                            text,
+                            attachments,
+                            *delivery,
+                        )
+                        .await
+                        .is_ok();
+                    }
+                    Ok(false) => {}
+                    Err(_) => return false,
+                }
+            }
+
+            if check_owner_deadline(&command).is_err() {
+                return false;
+            }
+            return crate::send_local_session_command(&socket, session_id, command)
+                .await
+                .is_ok();
         }
     }
     if let Some(request_id) = deferred_host_operation_id(&command) {
@@ -3040,7 +3142,12 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             .enqueue_host_command(config.host_id, request_id, &command)
             .await
         {
-            Ok(()) => true,
+            Ok(()) => {
+                if let Ok(transport) = host_transport::get(config.host_id) {
+                    transport.wakes().operations.notify_one();
+                }
+                true
+            }
             Err(error) => {
                 tracing::warn!(%error, %request_id, "failed to durably enqueue host operation; retaining relay command");
                 false
@@ -4655,6 +4762,12 @@ async fn spawn_host_session(
             }
         }
         sessions_for_cleanup.lock().await.remove(&session_id);
+        // Messages this session could not deliver now belong to recovery.
+        if let Ok(transport) = host_transport::get(config.host_id) {
+            let wakes = transport.wakes();
+            wakes.release_collaboration(session_id);
+            wakes.recovery.notify_one();
+        }
     });
     tx
 }
@@ -4825,7 +4938,7 @@ async fn run_session(
             )
             .await?;
     }
-    let store: Arc<dyn SessionStore> = durable_store.clone();
+    let _store: Arc<dyn SessionStore> = durable_store.clone();
     let mut sync = JournalSync::new(attachment.is_some(), session_root.clone());
     sync.uploaded_workspace_sequences = durable_store
         .host_workspace_cursors(config.host_id, session_id)
@@ -4877,15 +4990,29 @@ async fn run_session(
         )
         .await
     }));
+    let wakes = host_transport::get(config.host_id)
+        .ok()
+        .map(|transport| transport.wakes());
+    let collaboration = wakes
+        .as_ref()
+        .map(|wakes| wakes.collaboration(session_id))
+        .unwrap_or_default();
     let supervised = tokio::time::timeout_at(session_deadline, async {
         loop {
+            // Event-driven: actor output flushes the outbox, a relay wake
+            // refreshes inbox/directory/roster, and only failures schedule retries.
+            let mut deadline = sync.next_deadline();
+            if !bootstrap_finished {
+                deadline = deadline.min(Instant::now() + Duration::from_secs(1));
+            }
             tokio::select! {
                 event = event_rx.recv() => {
                     if event.is_none() {
                         break;
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                _ = collaboration.notified() => sync.wake(),
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
             }
             if !bootstrap_finished {
                 match finish_ready_host_bootstrap(durable_store.as_ref(), session_id, initial_prompt_id).await {
@@ -5298,6 +5425,30 @@ struct JournalSync {
 }
 
 impl JournalSync {
+    /// Not due again until the relay wakes this session or the tunnel reconnects.
+    fn idle() -> Instant {
+        Instant::now() + Duration::from_secs(24 * 60 * 60)
+    }
+    /// The relay changed this session's inbox, directory or roster.
+    fn wake(&mut self) {
+        let now = Instant::now();
+        self.next_inbox_sync = now;
+        self.next_instance_directory_sync = now;
+        self.next_workspace_roster_sync = now;
+    }
+    /// The earliest retry or wake-independent deadline this sync still owes.
+    fn next_deadline(&self) -> Instant {
+        [
+            self.next_inbox_sync,
+            self.next_instance_directory_sync,
+            self.next_workspace_roster_sync,
+        ]
+        .into_iter()
+        .chain(self.workspace_retry_at.values().copied())
+        .chain(self.inbox_retry_at.values().copied())
+        .min()
+        .unwrap_or_else(Self::idle)
+    }
     fn new(workspace_relay_available: bool, journal_root: PathBuf) -> Self {
         Self {
             workspace_retry_at: HashMap::new(),
@@ -5401,7 +5552,8 @@ pub async fn sync_remote_session(
             &journal_root,
             &mut HashMap::new(),
         )
-        .await?,
+        .await?
+        .is_some(),
         "relay does not support the agent inbox yet"
     );
     if send_pending {
@@ -5438,6 +5590,8 @@ pub async fn sync_remote_session(
     Ok(count)
 }
 
+/// `Ok(None)`: the relay has no inbox. `Ok(Some(more))`: a page was drained
+/// and `more` says another page may be waiting.
 async fn sync_relay_inbox(
     client: &Client,
     config: &HostConfig,
@@ -5446,7 +5600,7 @@ async fn sync_relay_inbox(
     participant_id: Uuid,
     journal_root: &Path,
     retry_at: &mut HashMap<Uuid, Instant>,
-) -> Result<bool> {
+) -> Result<Option<bool>> {
     let path = format!("/api/remote/host/sessions/{session_id}/inbox");
     let response = client
         .get(endpoint(&config.server, &path))
@@ -5454,10 +5608,11 @@ async fn sync_relay_inbox(
         .send()
         .await?;
     if response.status() == StatusCode::NOT_FOUND {
-        return Ok(false);
+        return Ok(None);
     }
     let inbox: RelayInbox = response.error_for_status()?.json().await?;
     retry_at.retain(|_, retry| *retry > Instant::now());
+    let mut admitted = false;
     for incoming in inbox.messages {
         let message_id = incoming.id;
         if retry_at.contains_key(&message_id) {
@@ -5504,8 +5659,9 @@ async fn sync_relay_inbox(
             .send()
             .await?
             .error_for_status()?;
+        admitted = true;
     }
-    Ok(true)
+    Ok(Some(admitted))
 }
 
 /// Bring a relayed message's images into this host's store, proven.
@@ -5688,7 +5844,7 @@ async fn flush_workspace_messages(
     };
     let participant_id = binding.participant_id;
     if Instant::now() >= sync.next_inbox_sync {
-        let delay = match sync_relay_inbox(
+        sync.next_inbox_sync = match sync_relay_inbox(
             client,
             config,
             store,
@@ -5699,20 +5855,19 @@ async fn flush_workspace_messages(
         )
         .await
         {
-            Ok(true) => Duration::from_secs(1),
-            Ok(false) => Duration::from_secs(30),
+            Ok(Some(true)) => Instant::now(),
+            Ok(Some(false) | None) => JournalSync::idle(),
             Err(error) => {
                 tracing::warn!(%error, %session_id, "remote agent inbox synchronization failed");
-                Duration::from_secs(5)
+                Instant::now() + Duration::from_secs(5)
             }
         };
-        sync.next_inbox_sync = Instant::now() + delay;
     }
     if Instant::now() >= sync.next_instance_directory_sync {
         match sync_instance_directory(client, config, store, session_id).await {
             Ok(_) => {
                 sync.instance_relay_available = true;
-                sync.next_instance_directory_sync = Instant::now() + Duration::from_secs(30);
+                sync.next_instance_directory_sync = JournalSync::idle();
             }
             Err(error) => {
                 let missing = error
@@ -5723,8 +5878,11 @@ async fn flush_workspace_messages(
                 } else {
                     tracing::warn!(%error, "instance directory synchronization failed");
                 }
-                sync.next_instance_directory_sync =
-                    Instant::now() + Duration::from_secs(if missing { 30 } else { 5 });
+                sync.next_instance_directory_sync = if missing {
+                    JournalSync::idle()
+                } else {
+                    Instant::now() + Duration::from_secs(5)
+                };
             }
         }
     }
@@ -5766,7 +5924,7 @@ async fn flush_workspace_messages(
                 match persisted {
                     Ok(()) => {
                         sync.workspace_relay_available = true;
-                        sync.next_workspace_roster_sync = Instant::now() + Duration::from_secs(30);
+                        sync.next_workspace_roster_sync = JournalSync::idle();
                     }
                     Err(error) => {
                         tracing::warn!(%error, "workspace roster synchronization failed; retaining previous availability");
@@ -5776,7 +5934,7 @@ async fn flush_workspace_messages(
             }
             Ok(response) if response.status() == StatusCode::NOT_FOUND => {
                 sync.workspace_relay_available = false;
-                sync.next_workspace_roster_sync = Instant::now() + Duration::from_secs(30);
+                sync.next_workspace_roster_sync = JournalSync::idle();
             }
             Ok(response) => {
                 tracing::warn!(
@@ -6220,6 +6378,7 @@ fn platform() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU16, Ordering};
 
     use crate::session_store::postgres::PostgresSessionStore;
     use crate::session_store::postgres::testing::ScratchDatabase;
@@ -6428,7 +6587,7 @@ mod tests {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let (path, _) = read_http_request(&mut stream).await;
                 let response = if attempt % 2 == 0 {
-                    assert!(path.ends_with("/inbox"));
+                    assert!(path.ends_with("/inbox"), "unexpected relay request {path}");
                     format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
@@ -6474,6 +6633,7 @@ mod tests {
             )
             .await
             .unwrap()
+            .is_some()
         );
         server.await.unwrap();
         let pending = workspace
@@ -6813,6 +6973,7 @@ mod tests {
             )
             .await
             .unwrap()
+            .is_some()
         );
         assert!(
             recipient_workspace
@@ -7475,124 +7636,129 @@ mod tests {
 
     #[tokio::test]
     async fn hosted_duration_limit_settles_work_without_publication() {
-        use tokio::sync::Notify;
-        struct PendingExecutor(Arc<Notify>, Arc<Notify>);
-        struct NotifyDrop(Arc<Notify>);
-        impl Drop for NotifyDrop {
-            fn drop(&mut self) {
-                self.0.notify_one();
+        let host = Uuid::new_v4();
+        with_test_transport(host, |_frames| async move {
+            use tokio::sync::Notify;
+            struct PendingExecutor(Arc<Notify>, Arc<Notify>);
+            struct NotifyDrop(Arc<Notify>);
+            impl Drop for NotifyDrop {
+                fn drop(&mut self) {
+                    self.0.notify_one();
+                }
             }
-        }
-        #[async_trait::async_trait]
-        impl AgentTurnExecutor for PendingExecutor {
-            async fn execute(
-                &self,
-                _turn: crate::AgentTurn,
-                _events: mpsc::Sender<crate::SessionEventKind>,
-                _controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
-            ) -> Result<crate::AgentTurnResult> {
-                let _drop = NotifyDrop(Arc::clone(&self.1));
-                self.0.notify_one();
-                std::future::pending().await
+            #[async_trait::async_trait]
+            impl AgentTurnExecutor for PendingExecutor {
+                async fn execute(
+                    &self,
+                    _turn: crate::AgentTurn,
+                    _events: mpsc::Sender<crate::SessionEventKind>,
+                    _controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
+                ) -> Result<crate::AgentTurnResult> {
+                    let _drop = NotifyDrop(Arc::clone(&self.1));
+                    self.0.notify_one();
+                    std::future::pending().await
+                }
             }
-        }
-        let root = tempdir().unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = test_config(root.path());
-        config.server = format!("http://{}", listener.local_addr().unwrap());
-        config.resource_limits.max_session_seconds = 8;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap();
-        let id = Uuid::new_v4();
-        let launch = bootstrap_test_launch(root.path());
-        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
-        persist_launch_metadata(&config, &store, id, &launch, None)
-            .await
-            .unwrap();
-        store.begin_host_bootstrap(id).await.unwrap();
-        let started = Arc::new(Notify::new());
-        let dropped = Arc::new(Notify::new());
-        let executor: Arc<dyn AgentTurnExecutor> =
-            Arc::new(PendingExecutor(Arc::clone(&started), Arc::clone(&dropped)));
-        let factory: HostExecutorFactory = Arc::new(move |_, _| Ok(Arc::clone(&executor)));
-        let (_commands, rx) = mpsc::channel(8);
-        let mut supervisor = AbortTask(host_transport::spawn(run_session(
-            client.clone(),
-            config.clone(),
-            root.path().to_path_buf(),
-            factory,
-            HostSessionLaunch {
-                session_id: id,
-                request: launch,
-                attachment: None,
-            },
-            rx,
-            host_store(&scratch).await,
-        )));
-        tokio::time::timeout(Duration::from_secs(30), started.notified())
-            .await
-            .unwrap();
-        assert!(
-            SessionWriterLease::try_acquire(root.path().join(format!("{id}.lock")))
-                .unwrap()
-                .is_none()
-        );
-        tokio::time::timeout(Duration::from_secs(10), &mut supervisor.0)
-            .await
-            .expect("a blocked relay upload must not postpone duration settlement")
-            .unwrap()
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), dropped.notified())
-            .await
-            .expect("expiry must cancel the provider turn before releasing ownership");
-        assert!(
-            SessionWriterLease::try_acquire(root.path().join(format!("{id}.lock")))
-                .unwrap()
-                .is_some()
-        );
-        drop(store);
-        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
-            .await
-            .unwrap();
-        let state = store.state(id).await.unwrap();
-        assert_eq!(
-            state.status,
-            Some(crate::SessionStatus::Failed),
-            "duration expiry must be durable, not restartable unfinished work"
-        );
-        assert!(store.pending_actions(id, 8).await.unwrap().is_empty());
-        assert!(
-            store
-                .pending_host_launch_metadata(8)
+            let root = tempdir().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = test_config_for(root.path(), host);
+            config.server = format!("http://{}", listener.local_addr().unwrap());
+            let _relay = spawn_not_found_relay(listener);
+            config.resource_limits.max_session_seconds = 8;
+            let client = Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap();
+            let id = Uuid::new_v4();
+            let launch = bootstrap_test_launch(root.path());
+            let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+            persist_launch_metadata(&config, &store, id, &launch, None)
                 .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            store
-                .pending_host_journals(None, 8)
+                .unwrap();
+            store.begin_host_bootstrap(id).await.unwrap();
+            let started = Arc::new(Notify::new());
+            let dropped = Arc::new(Notify::new());
+            let executor: Arc<dyn AgentTurnExecutor> =
+                Arc::new(PendingExecutor(Arc::clone(&started), Arc::clone(&dropped)));
+            let factory: HostExecutorFactory = Arc::new(move |_, _| Ok(Arc::clone(&executor)));
+            let (_commands, rx) = mpsc::channel(8);
+            let mut supervisor = AbortTask(host_transport::spawn(run_session(
+                client.clone(),
+                config.clone(),
+                root.path().to_path_buf(),
+                factory,
+                HostSessionLaunch {
+                    session_id: id,
+                    request: launch,
+                    attachment: None,
+                },
+                rx,
+                host_store(&scratch).await,
+            )));
+            tokio::time::timeout(Duration::from_secs(30), started.notified())
                 .await
+                .unwrap();
+            assert!(
+                SessionWriterLease::try_acquire(root.path().join(format!("{id}.lock")))
+                    .unwrap()
+                    .is_none()
+            );
+            tokio::time::timeout(Duration::from_secs(10), &mut supervisor.0)
+                .await
+                .expect("a blocked relay upload must not postpone duration settlement")
                 .unwrap()
-                .contains(&id)
-        );
-        let sessions = Arc::new(Mutex::new(HashMap::new()));
-        let forbidden: HostExecutorFactory =
-            Arc::new(|_, _| panic!("expired work must not restart"));
-        resume_pending_host_sessions(
-            0,
-            &client,
-            &config,
-            root.path(),
-            &sessions,
-            &host_store(&scratch).await,
-            &forbidden,
-        )
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+                .await
+                .expect("expiry must cancel the provider turn before releasing ownership");
+            assert!(
+                SessionWriterLease::try_acquire(root.path().join(format!("{id}.lock")))
+                    .unwrap()
+                    .is_some()
+            );
+            drop(store);
+            let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+                .await
+                .unwrap();
+            let state = store.state(id).await.unwrap();
+            assert_eq!(
+                state.status,
+                Some(crate::SessionStatus::Failed),
+                "duration expiry must be durable, not restartable unfinished work"
+            );
+            assert!(store.pending_actions(id, 8).await.unwrap().is_empty());
+            assert!(
+                store
+                    .pending_host_launch_metadata(8)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .pending_host_journals(None, 8)
+                    .await
+                    .unwrap()
+                    .contains(&id)
+            );
+            let sessions = Arc::new(Mutex::new(HashMap::new()));
+            let forbidden: HostExecutorFactory =
+                Arc::new(|_, _| panic!("expired work must not restart"));
+            resume_pending_host_sessions(
+                0,
+                &client,
+                &config,
+                root.path(),
+                &sessions,
+                &host_store(&scratch).await,
+                &forbidden,
+            )
+            .await
+            .unwrap();
+            assert!(sessions.lock().await.is_empty());
+            scratch.discard().await;
+        })
         .await
-        .unwrap();
-        assert!(sessions.lock().await.is_empty());
-        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -7841,123 +8007,128 @@ mod tests {
 
     #[tokio::test]
     async fn recovered_host_session_cannot_reset_its_elapsed_duration_budget() {
-        let root = tempdir().unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = test_config(root.path());
-        config.server = format!("http://{}", listener.local_addr().unwrap());
-        config.resource_limits.max_session_seconds = 10;
-        let id = Uuid::new_v4();
-        let launch = bootstrap_test_launch(root.path());
-        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
-        persist_launch_metadata(&config, &store, id, &launch, None)
-            .await
-            .unwrap();
-        store.create_session(id).await.unwrap();
-        let mut start = SessionEvent::new(id, 0, crate::SessionEventKind::SessionStarted);
-        start.created_at = Utc::now() - chrono::Duration::seconds(60);
-        store.append(start).await.unwrap();
-        store
-            .append(SessionEvent::new(
+        let host = Uuid::new_v4();
+        with_test_transport(host, |_frames| async move {
+            let root = tempdir().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = test_config_for(root.path(), host);
+            config.server = format!("http://{}", listener.local_addr().unwrap());
+            config.resource_limits.max_session_seconds = 10;
+            let id = Uuid::new_v4();
+            let launch = bootstrap_test_launch(root.path());
+            let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+            persist_launch_metadata(&config, &store, id, &launch, None)
+                .await
+                .unwrap();
+            store.create_session(id).await.unwrap();
+            let mut start = SessionEvent::new(id, 0, crate::SessionEventKind::SessionStarted);
+            start.created_at = Utc::now() - chrono::Duration::seconds(60);
+            store.append(start).await.unwrap();
+            store
+                .append(SessionEvent::new(
+                    id,
+                    0,
+                    crate::SessionEventKind::SessionConfigured {
+                        cwd: launch.cwd.clone(),
+                        provider: launch.provider,
+                        model: None,
+                        effort: None,
+                        fast: false,
+                        ultrafast: false,
+                        response_language: launch.response_language,
+                        permission_mode: launch.permission_mode,
+                        speed_support: Default::default(),
+                    },
+                ))
+                .await
+                .unwrap();
+            admit_remote_prompt(
+                &store,
                 id,
-                0,
-                crate::SessionEventKind::SessionConfigured {
-                    cwd: launch.cwd.clone(),
-                    provider: launch.provider,
-                    model: None,
-                    effort: None,
-                    fast: false,
-                    ultrafast: false,
-                    response_language: launch.response_language,
-                    permission_mode: launch.permission_mode,
-                    speed_support: Default::default(),
-                },
-            ))
-            .await
-            .unwrap();
-        admit_remote_prompt(
-            &store,
-            id,
-            launch.request_id,
-            "unfinished work",
-            &[],
-            crate::PromptDelivery::Queue,
-        )
-        .await
-        .unwrap();
-        drop(store);
-        let writer = SessionWriterLease::acquire(root.path().join(format!("{id}.lock"))).unwrap();
-        let (_held_tx, held_rx) = mpsc::channel(1);
-        assert!(
-            run_session(
-                Client::new(),
-                config.clone(),
-                root.path().to_path_buf(),
-                Arc::new(|_, _| panic!("a live writer must fence expiry")),
-                HostSessionLaunch {
-                    session_id: id,
-                    request: launch.clone(),
-                    attachment: None
-                },
-                held_rx,
-                host_store(&scratch).await,
+                launch.request_id,
+                "unfinished work",
+                &[],
+                crate::PromptDelivery::Queue,
             )
             .await
-            .is_err()
-        );
-        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
-            .await
             .unwrap();
-        assert_ne!(
-            store.state(id).await.unwrap().status,
-            Some(crate::SessionStatus::Failed)
-        );
-        assert_eq!(store.pending_actions(id, 8).await.unwrap().len(), 1);
-        drop(store);
-        drop(writer);
-        let (_commands, rx) = mpsc::channel(1);
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            run_session(
-                Client::new(),
-                config.clone(),
-                root.path().to_path_buf(),
-                Arc::new(|_, _| panic!("an expired session must not construct a provider")),
-                HostSessionLaunch {
-                    session_id: id,
-                    request: launch,
-                    attachment: None,
-                },
-                rx,
-                host_store(&scratch).await,
-            ),
-        )
-        .await;
-        assert!(
-            result.is_ok(),
-            "expired recovery must settle locally before contacting an unavailable relay"
-        );
-        result.unwrap().unwrap();
-        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
-            .await
-            .unwrap();
-        assert_eq!(
-            store.state(id).await.unwrap().status,
-            Some(crate::SessionStatus::Failed)
-        );
-        assert!(store.pending_actions(id, 8).await.unwrap().is_empty());
-        assert!(
-            store
-                .pending_host_launch_metadata(8)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            drop(store);
+            let writer =
+                SessionWriterLease::acquire(root.path().join(format!("{id}.lock"))).unwrap();
+            let (_held_tx, held_rx) = mpsc::channel(1);
+            assert!(
+                run_session(
+                    Client::new(),
+                    config.clone(),
+                    root.path().to_path_buf(),
+                    Arc::new(|_, _| panic!("a live writer must fence expiry")),
+                    HostSessionLaunch {
+                        session_id: id,
+                        request: launch.clone(),
+                        attachment: None
+                    },
+                    held_rx,
+                    host_store(&scratch).await,
+                )
                 .await
                 .is_err()
-        );
-        scratch.discard().await;
+            );
+            let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+                .await
+                .unwrap();
+            assert_ne!(
+                store.state(id).await.unwrap().status,
+                Some(crate::SessionStatus::Failed)
+            );
+            assert_eq!(store.pending_actions(id, 8).await.unwrap().len(), 1);
+            drop(store);
+            drop(writer);
+            let (_commands, rx) = mpsc::channel(1);
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                run_session(
+                    Client::new(),
+                    config.clone(),
+                    root.path().to_path_buf(),
+                    Arc::new(|_, _| panic!("an expired session must not construct a provider")),
+                    HostSessionLaunch {
+                        session_id: id,
+                        request: launch,
+                        attachment: None,
+                    },
+                    rx,
+                    host_store(&scratch).await,
+                ),
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "expired recovery must settle locally before contacting an unavailable relay"
+            );
+            result.unwrap().unwrap();
+            let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+                .await
+                .unwrap();
+            assert_eq!(
+                store.state(id).await.unwrap().status,
+                Some(crate::SessionStatus::Failed)
+            );
+            assert!(store.pending_actions(id, 8).await.unwrap().is_empty());
+            assert!(
+                store
+                    .pending_host_launch_metadata(8)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+            scratch.discard().await;
+        })
+        .await
     }
 
     #[tokio::test]
@@ -7972,8 +8143,8 @@ mod tests {
             let _server = AbortTask(host_transport::spawn(async move {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
-                    let (path, _) = read_http_request(&mut socket).await;
-                    assert!(path.ends_with("/runtime-context"));
+                    // Runtime context and collaboration catch-up are optional here.
+                    let _ = read_http_request(&mut socket).await;
                     socket.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
                 }
             }));
@@ -8155,70 +8326,73 @@ mod tests {
 
     #[tokio::test]
     async fn hosted_actor_is_owned_on_stop_or_cancellation() {
-        use tokio::sync::Notify;
-        struct PendingExecutor {
-            started: Arc<Notify>,
-            dropped: Arc<Notify>,
-        }
-        struct NotifyDrop(Arc<Notify>);
-        impl Drop for NotifyDrop {
-            fn drop(&mut self) {
-                self.0.notify_one();
+        let host = Uuid::new_v4();
+        with_test_transport(host, |_frames| async move {
+            use tokio::sync::Notify;
+            struct PendingExecutor {
+                started: Arc<Notify>,
+                dropped: Arc<Notify>,
             }
-        }
-        #[async_trait::async_trait]
-        impl AgentTurnExecutor for PendingExecutor {
-            async fn execute(
-                &self,
-                _turn: crate::AgentTurn,
-                _events: mpsc::Sender<crate::SessionEventKind>,
-                _controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
-            ) -> Result<crate::AgentTurnResult> {
-                let _lifetime = NotifyDrop(Arc::clone(&self.dropped));
-                self.started.notify_one();
-                std::future::pending().await
+            struct NotifyDrop(Arc<Notify>);
+            impl Drop for NotifyDrop {
+                fn drop(&mut self) {
+                    self.0.notify_one();
+                }
             }
-        }
-        let root = tempdir().unwrap();
-        let mut config = test_config(root.path());
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        config.server = format!("http://{}", listener.local_addr().unwrap());
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let started = Arc::new(Notify::new());
-        let dropped = Arc::new(Notify::new());
-        let executor: Arc<dyn AgentTurnExecutor> = Arc::new(PendingExecutor {
-            started: Arc::clone(&started),
-            dropped: Arc::clone(&dropped),
-        });
-        let factory: HostExecutorFactory = Arc::new(move |_, _| Ok(Arc::clone(&executor)));
-        let session_id = Uuid::new_v4();
-        let (commands, rx) = mpsc::channel(8);
-        // The actor and this test must share one journal: the projection this
-        // test corrupts below is the one the actor reads.
-        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
-        let mut supervisor = AbortTask(host_transport::spawn(run_session(
-            client.clone(),
-            config.clone(),
-            root.path().to_path_buf(),
-            Arc::clone(&factory),
-            HostSessionLaunch {
-                session_id,
-                request: bootstrap_test_launch(root.path()),
-                attachment: None,
-            },
-            rx,
-            host_store(&scratch).await,
-        )));
-        tokio::time::timeout(Duration::from_secs(30), started.notified())
-            .await
-            .unwrap();
-        // Corrupt only a disposable live projection, not the authoritative
-        // journal. The row is valid jsonb the column accepts but not a valid
-        // event, so the projection read fails where the journal still reads.
-        sqlx::query(
+            #[async_trait::async_trait]
+            impl AgentTurnExecutor for PendingExecutor {
+                async fn execute(
+                    &self,
+                    _turn: crate::AgentTurn,
+                    _events: mpsc::Sender<crate::SessionEventKind>,
+                    _controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
+                ) -> Result<crate::AgentTurnResult> {
+                    let _lifetime = NotifyDrop(Arc::clone(&self.dropped));
+                    self.started.notify_one();
+                    std::future::pending().await
+                }
+            }
+            let root = tempdir().unwrap();
+            let mut config = test_config_for(root.path(), host);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            config.server = format!("http://{}", listener.local_addr().unwrap());
+            let _relay = spawn_not_found_relay(listener);
+            let client = Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap();
+            let started = Arc::new(Notify::new());
+            let dropped = Arc::new(Notify::new());
+            let executor: Arc<dyn AgentTurnExecutor> = Arc::new(PendingExecutor {
+                started: Arc::clone(&started),
+                dropped: Arc::clone(&dropped),
+            });
+            let factory: HostExecutorFactory = Arc::new(move |_, _| Ok(Arc::clone(&executor)));
+            let session_id = Uuid::new_v4();
+            let (commands, rx) = mpsc::channel(8);
+            // The actor and this test must share one journal: the projection this
+            // test corrupts below is the one the actor reads.
+            let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+            let mut supervisor = AbortTask(host_transport::spawn(run_session(
+                client.clone(),
+                config.clone(),
+                root.path().to_path_buf(),
+                Arc::clone(&factory),
+                HostSessionLaunch {
+                    session_id,
+                    request: bootstrap_test_launch(root.path()),
+                    attachment: None,
+                },
+                rx,
+                host_store(&scratch).await,
+            )));
+            tokio::time::timeout(Duration::from_secs(30), started.notified())
+                .await
+                .unwrap();
+            // Corrupt only a disposable live projection, not the authoritative
+            // journal. The row is valid jsonb the column accepts but not a valid
+            // event, so the projection read fails where the journal still reads.
+            sqlx::query(
             "insert into session_live_state(session_id,live_key,revision,event_json,updated_at) \
              values($1,$2,$3,$4,$5)",
         )
@@ -8230,80 +8404,82 @@ mod tests {
         .execute(store.pool())
         .await
         .unwrap();
-        assert!(store.live_events_after(session_id, 0).await.is_err());
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        assert!(
-            !supervisor.0.is_finished(),
-            "a projection read failure must not abandon the actor"
-        );
-        assert!(
-            SessionWriterLease::try_acquire(root.path().join(format!("{session_id}.lock")))
-                .unwrap()
-                .is_none()
-        );
-        sqlx::query("delete from session_live_state where session_id=$1 and live_key=$2")
-            .bind(session_id)
-            .bind("injected")
-            .execute(store.pool())
-            .await
-            .unwrap();
-        let _marker = store
-            .append(SessionEvent::new(
-                session_id,
-                0,
-                crate::SessionEventKind::Error {
-                    message: "sync recovery marker".to_string(),
-                },
-            ))
-            .await
-            .unwrap();
-        commands
-            .send(HostCommand::Stop { session_id })
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(8), &mut supervisor.0)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), dropped.notified())
-            .await
-            .unwrap();
-        assert_eq!(
-            store.state(session_id).await.unwrap().status,
-            Some(crate::SessionStatus::Stopped)
-        );
-        {
-            let id = Uuid::new_v4();
-            let (_commands, rx) = mpsc::channel(8);
-            let mut supervisor = AbortTask(host_transport::spawn(run_session(
-                client.clone(),
-                config.clone(),
-                root.path().to_path_buf(),
-                Arc::clone(&factory),
-                HostSessionLaunch {
-                    session_id: id,
-                    request: bootstrap_test_launch(root.path()),
-                    attachment: None,
-                },
-                rx,
-                host_store(&scratch).await,
-            )));
-            tokio::time::timeout(Duration::from_secs(30), started.notified())
+            assert!(store.live_events_after(session_id, 0).await.is_err());
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert!(
+                !supervisor.0.is_finished(),
+                "a projection read failure must not abandon the actor"
+            );
+            assert!(
+                SessionWriterLease::try_acquire(root.path().join(format!("{session_id}.lock")))
+                    .unwrap()
+                    .is_none()
+            );
+            sqlx::query("delete from session_live_state where session_id=$1 and live_key=$2")
+                .bind(session_id)
+                .bind("injected")
+                .execute(store.pool())
                 .await
                 .unwrap();
-            supervisor.0.abort();
-            assert!((&mut supervisor.0).await.unwrap_err().is_cancelled());
-            tokio::time::timeout(Duration::from_secs(2), dropped.notified())
+            let _marker = store
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    crate::SessionEventKind::Error {
+                        message: "sync recovery marker".to_string(),
+                    },
+                ))
                 .await
-                .expect("host supervisor must not detach its actor or provider turn");
-            assert!(
-                SessionWriterLease::try_acquire(root.path().join(format!("{id}.lock")))
-                    .unwrap()
-                    .is_some()
+                .unwrap();
+            commands
+                .send(HostCommand::Stop { session_id })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(8), &mut supervisor.0)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+                .await
+                .unwrap();
+            assert_eq!(
+                store.state(session_id).await.unwrap().status,
+                Some(crate::SessionStatus::Stopped)
             );
-        }
-        scratch.discard().await;
+            {
+                let id = Uuid::new_v4();
+                let (_commands, rx) = mpsc::channel(8);
+                let mut supervisor = AbortTask(host_transport::spawn(run_session(
+                    client.clone(),
+                    config.clone(),
+                    root.path().to_path_buf(),
+                    Arc::clone(&factory),
+                    HostSessionLaunch {
+                        session_id: id,
+                        request: bootstrap_test_launch(root.path()),
+                        attachment: None,
+                    },
+                    rx,
+                    host_store(&scratch).await,
+                )));
+                tokio::time::timeout(Duration::from_secs(30), started.notified())
+                    .await
+                    .unwrap();
+                supervisor.0.abort();
+                assert!((&mut supervisor.0).await.unwrap_err().is_cancelled());
+                tokio::time::timeout(Duration::from_secs(2), dropped.notified())
+                    .await
+                    .expect("host supervisor must not detach its actor or provider turn");
+                assert!(
+                    SessionWriterLease::try_acquire(root.path().join(format!("{id}.lock")))
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            scratch.discard().await;
+        })
+        .await
     }
 
     #[tokio::test]
@@ -8808,9 +8984,11 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_pages_past_lease_blocked_launches_to_acknowledged_work() {
+        let host = Uuid::new_v4();
+        with_test_transport(host, |_frames| async move {
         let root = tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = test_config(root.path());
+        let mut config = test_config_for(root.path(), host);
         config.server = format!("http://{}", listener.local_addr().unwrap());
         config.resource_limits.max_concurrent_sessions = 1;
         let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
@@ -8985,6 +9163,8 @@ mod tests {
                 .is_err()
         );
         scratch.discard().await;
+    })
+        .await
     }
 
     #[tokio::test]
@@ -9376,8 +9556,10 @@ mod tests {
 
     #[tokio::test]
     async fn inactive_commands_respect_capacity_and_stop_without_starting_an_actor() {
+        let host = Uuid::new_v4();
+        with_test_transport(host, |_frames| async move {
         let root = tempdir().unwrap();
-        let mut config = test_config(root.path());
+        let mut config = test_config_for(root.path(), host);
         config.resource_limits.max_concurrent_sessions = 1;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         config.server = format!("http://{}", listener.local_addr().unwrap());
@@ -9535,7 +9717,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let (path, _) = read_http_request(&mut stream).await;
-        assert!(path.ends_with("/runtime-context"));
+        assert!(path.ends_with("/runtime-context"), "unexpected relay request {path}");
         stream
             .write_all(
                 b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
@@ -9645,48 +9827,20 @@ connection: close
             "terminal retry cannot resurrect an actor after capacity frees"
         );
         scratch.discard().await;
+    })
+        .await
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn queued_shell_does_not_block_controls_and_recovers_results_without_reexecution() {
+        let host = Uuid::new_v4();
+        with_test_transport(host, |mut frames| async move {
         let root = tempdir().unwrap();
-        let mut config = test_config(root.path());
+        let mut config = test_config_for(root.path(), host);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         config.server = format!("http://{}", listener.local_addr().unwrap());
-        let (first_post_tx, first_post_rx) = tokio::sync::oneshot::channel();
-        let (drop_response_tx, drop_response_rx) = tokio::sync::oneshot::channel();
-        let server = host_transport::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let (path, body) = read_http_request(&mut stream).await;
-            assert_eq!(path, "/api/remote/host/shell-command-results");
-            let first: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(first["outcome"]["type"], "success");
-            first_post_tx.send(()).unwrap();
-            drop_response_rx.await.unwrap();
-            drop(stream);
-            let mut responses = Vec::new();
-            for expected in [
-                "/api/remote/host/shell-command-results",
-                "/api/remote/host/workspace-command-results",
-                "/api/remote/host/workspace-command-results",
-            ] {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let (path, body) = read_http_request(&mut stream).await;
-                assert_eq!(path, expected);
-                responses.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                    .await
-                    .unwrap();
-            }
-            assert_eq!(
-                responses[0], first,
-                "terminal receipt replays the exact result"
-            );
-            assert_eq!(responses[1]["outcome"]["code"], "indeterminate");
-            assert_eq!(responses[2]["outcome"]["code"], "cancelled");
-        });
+        let _relay = spawn_not_found_relay(listener);
         let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
         // Kept alongside the trait handle purely so the assertion below can
         // read `quarantine_reason` directly. The queue API deliberately does
@@ -9694,6 +9848,35 @@ connection: close
         // on, not inspect -- so the probe reaches past the trait on purpose.
         let probe_pool = postgres.pool().clone();
         let store: Arc<dyn SessionStore> = Arc::new(postgres);
+        host_transport::get(host)
+            .unwrap()
+            .set_ledger(
+                crate::command_ledger::CommandLedger::open(probe_pool.clone())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+        // Terminal results leave through the tunnel; collect them by command.
+        let mut published = HashMap::<String, serde_json::Value>::new();
+        let result_for = async |frames: &mut mpsc::UnboundedReceiver<crate::auth::TunnelFrame>,
+                                    published: &mut HashMap<String, serde_json::Value>,
+                                    id: Uuid| {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(outcome) = published.get(&id.to_string()) {
+                        return outcome.clone();
+                    }
+                    if let Some(crate::auth::TunnelFrame::HostCommandResult {
+                        command_id, outcome, ..
+                    }) = frames.recv().await
+                    {
+                        published.insert(command_id, outcome);
+                    }
+                }
+            })
+            .await
+            .expect("terminal result must be published through the tunnel")
+        };
         // Same authority as the journal, obtained the way production does.
         let receipts = store.receipt_store().await.unwrap();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -9902,15 +10085,12 @@ connection: close
             ReceiptState::Terminal(_)
         ));
         fs::write(root.path().join("release"), "go").unwrap();
-        tokio::time::timeout(Duration::from_secs(5), first_post_rx)
-            .await
-            .unwrap()
-            .unwrap();
+        let shell = result_for(&mut frames, &mut published, request.request_id).await;
+        assert_eq!(shell["outcome"]["type"], "success");
         first.abort();
         second.abort();
         let _ = first.await;
         let _ = second.await;
-        drop_response_tx.send(()).unwrap();
         assert!(
             receipts
                 .next_host_operation(config.host_id)
@@ -9932,10 +10112,14 @@ connection: close
             Arc::clone(&receipts),
             root.path().to_path_buf(),
         )));
-        tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .unwrap()
-            .unwrap();
+        assert_eq!(
+            result_for(&mut frames, &mut published, uncertain.request_id).await["outcome"]["code"],
+            "indeterminate"
+        );
+        assert_eq!(
+            result_for(&mut frames, &mut published, cancelled.request_id).await["outcome"]["code"],
+            "cancelled"
+        );
         tokio::time::timeout(Duration::from_secs(5), async {
             while receipts
                 .next_host_operation(config.host_id)
@@ -9966,6 +10150,8 @@ connection: close
             "unsupported command is retained, not executed or silently deleted"
         );
         scratch.discard().await;
+    })
+        .await
     }
 
     #[tokio::test]
@@ -10191,7 +10377,10 @@ connection: close
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let (path, body) = read_http_request(&mut socket).await;
                 let shared = path.ends_with("/workspace/messages");
-                assert!(path.ends_with("/messages"));
+                assert!(
+                    path.ends_with("/messages"),
+                    "unexpected relay request {path}"
+                );
                 sent.send((
                     shared,
                     serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
@@ -10352,6 +10541,8 @@ connection: close
 
     #[tokio::test]
     async fn stopped_host_recovers_final_messages_without_an_actor_or_pending_journal() {
+        let host = Uuid::new_v4();
+        with_test_transport(host, |_frames| async move {
         let root = tempdir().unwrap();
         let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         // Current-v5 databases acquire the additive table without losing their journal.
@@ -10374,7 +10565,7 @@ connection: close
         let session_id = Uuid::new_v4();
         let recipient = Uuid::new_v4();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = test_config(root.path());
+        let mut config = test_config_for(root.path(), host);
         config.server = format!("http://{}", listener.local_addr().unwrap());
         config.resource_limits.max_concurrent_sessions = 1;
         store.create_session(session_id).await.unwrap();
@@ -10605,6 +10796,8 @@ connection: close
             "active actors keep their own uploader"
         );
         sessions.lock().await.remove(&session_id);
+        // A finished session hands its undelivered messages to recovery.
+        host_transport::get(host).unwrap().wakes().recovery.notify_one();
         let active_id = Uuid::new_v4();
         sessions.lock().await.insert(active_id, tx);
         let delivered = tokio::time::timeout(Duration::from_secs(5), received.recv()).await
@@ -10883,6 +11076,8 @@ connection: close
             "message recovery must not consume another actor slot"
         );
         scratch.discard().await;
+    })
+        .await
     }
 
     #[tokio::test]
@@ -11063,11 +11258,13 @@ connection: close
 
     #[tokio::test]
     async fn acknowledged_bootstrap_failure_replays_after_restart_without_execution() {
+        let host = Uuid::new_v4();
+        with_test_transport(host, |_frames| async move {
         let root = tempdir().unwrap();
         let session_id = Uuid::new_v4();
         let launch = bootstrap_test_launch(root.path());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = test_config(root.path());
+        let mut config = test_config_for(root.path(), host);
         config.server = format!("http://{}", listener.local_addr().unwrap());
         let (context_seen_tx, context_seen_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -11134,9 +11331,13 @@ connection: close
             store.state(session_id).await.unwrap().status,
             Some(crate::SessionStatus::Failed)
         );
-        assert_eq!(
-            store.pending_host_launch_metadata(8).await.unwrap().len(),
-            1
+        // Rejection settles locally; the tunnel publishes the journal.
+        assert!(
+            store
+                .pending_host_launch_metadata(8)
+                .await
+                .unwrap()
+                .is_empty()
         );
         drop(store);
         let store: Arc<dyn SessionStore> = Arc::new(
@@ -11167,9 +11368,9 @@ connection: close
             serde_json::to_value(store.events_after(session_id, 0, 10).await.unwrap()).unwrap(),
             serde_json::to_value(failed).unwrap()
         );
-        // Offline bootstrap settlement must not weaken the relay command ACK fence.
+        // A settled launch replays as acknowledged without executing again.
         assert!(
-            !dispatch(
+            dispatch(
                 DispatchContext {
                     client: client.clone(),
                     config: config.clone(),
@@ -11196,6 +11397,8 @@ connection: close
         );
         server.await.unwrap();
         scratch.discard().await;
+    })
+        .await
     }
 
     #[tokio::test]
@@ -11341,10 +11544,12 @@ connection: close
 
     #[tokio::test]
     async fn rejected_launch_is_durable_replayable_and_does_not_block_stop() {
+        let host = Uuid::new_v4();
+        with_test_transport(host, |_frames| async move {
         for rejection in ["capacity", "oversized", "malformed", "expired"] {
             let oversized = rejection == "oversized";
             let root = tempdir().unwrap();
-            let mut config = test_config(root.path());
+            let mut config = test_config_for(root.path(), host);
             config.resource_limits.max_concurrent_sessions = 1;
             let session_id = Uuid::new_v4();
             let active_id = Uuid::new_v4();
@@ -11593,8 +11798,8 @@ connection: close
                     .unwrap(),
             );
             assert!(
-                !dispatch(context(&session_store), launch_command()).await,
-                "failed failure upload must retain the launch for retry"
+                dispatch(context(&session_store), launch_command()).await,
+                "a locally durable rejection acknowledges the relay command"
             );
             let failure = session_store.events_after(session_id, 0, 10).await.unwrap();
             assert_eq!(failure.len(), 1);
@@ -11737,6 +11942,8 @@ connection: close
             assert!(sessions.lock().await.is_empty());
             scratch.discard().await;
         }
+    })
+        .await
     }
 
     #[tokio::test]
@@ -12315,6 +12522,55 @@ connection: close
         );
     }
 
+    /// Run a test inside an authenticated tunnel for `host` that acknowledges
+    /// session registrations and hands every other outbound frame to the test.
+    async fn with_test_transport<T, F>(host: Uuid, test: T) -> F::Output
+    where
+        T: FnOnce(mpsc::UnboundedReceiver<crate::auth::TunnelFrame>) -> F,
+        F: std::future::Future,
+    {
+        let (outbound, mut frames) = mpsc::channel(64);
+        let (sink, observed) = mpsc::unbounded_channel();
+        let transport = host_transport::Transport::new(host, outbound);
+        let acknowledger = transport.clone();
+        let _registrations = AbortTask(tokio::spawn(async move {
+            while let Some(frame) = frames.recv().await {
+                match frame {
+                    crate::auth::TunnelFrame::RegisterSession {
+                        registration_id, ..
+                    } => acknowledger.registered(&registration_id, None),
+                    other => {
+                        let _ = sink.send(other);
+                    }
+                }
+            }
+        }));
+        host_transport::CURRENT
+            .scope(transport, test(observed))
+            .await
+    }
+
+    /// A relay that implements none of the optional HTTP endpoints.
+    fn spawn_not_found_relay(listener: TcpListener) -> AbortTask<()> {
+        AbortTask(tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let _ = read_http_request(&mut socket).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        }))
+    }
+
+    fn test_config_for(root: &Path, host_id: Uuid) -> HostConfig {
+        HostConfig {
+            host_id,
+            ..test_config(root)
+        }
+    }
+
     fn test_config(root: &Path) -> HostConfig {
         HostConfig {
             server: "http://localhost".to_string(),
@@ -12343,6 +12599,9 @@ mod prompt_retry_contract {
             session_id: Uuid::new_v4(),
             approval_id: "pending".into(),
             decision: crate::ApprovalDecision::AllowOnce,
+            expected_request: None,
+            acknowledgement: None,
+            edited_input: None,
         };
         assert!(validate_owner_deadline(&command, None, 100).is_err());
         assert!(validate_owner_deadline(&command, Some(100), 100).is_err());
@@ -12352,6 +12611,8 @@ mod prompt_retry_contract {
             session_id: Uuid::new_v4(),
             interaction_id: "pending".into(),
             response: serde_json::json!({}),
+            expected_request: None,
+            acknowledgement: None,
         };
         assert!(validate_owner_deadline(&question, None, 100).is_err());
     }

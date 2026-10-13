@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use base64::Engine as _;
 use borg_core::compaction::{CompactionBudgetPolicy, EffectiveCompactionBudget};
@@ -22,8 +22,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    AgentTurn, AgentTurnControl, AgentTurnResult, ApprovalDecision, EventActor, ExecutionProvider,
-    HarnessMode, MessageStatus, PermissionMode, SessionEventKind, SessionStatus,
+    AgentTurn, AgentTurnControl, AgentTurnResult, ApprovalDecision, ApprovalResolution, EventActor,
+    ExecutionProvider, HarnessMode, MessageStatus, PermissionMode, SessionEventKind, SessionStatus,
     agent::NativeCompactionProgress,
 };
 
@@ -3343,9 +3343,9 @@ async fn call_model_streaming_with_timeout(
         // still unpublished when the model moves on. Give that tail its own
         // deadline instead of letting it wait for an unrelated boundary event.
         let pending_text_flush = (text.len() != emitted_text_len)
-            .then(|| Duration::from_millis(75).saturating_sub(last_text_emit.elapsed()));
+            .then(|| crate::agent::live_output_interval().saturating_sub(last_text_emit.elapsed()));
         let pending_reasoning_flush = (!pending_reasoning.is_empty()).then(|| {
-            Duration::from_millis(75).saturating_sub(last_reasoning_emit.elapsed())
+            crate::agent::live_output_interval().saturating_sub(last_reasoning_emit.elapsed())
         });
         tokio::select! {
             biased;
@@ -3411,7 +3411,7 @@ async fn call_model_streaming_with_timeout(
             () = tokio::time::sleep(pending_text_flush.unwrap_or_default()),
                 if pending_text_flush.is_some() =>
             {
-                send_live_assistant_text(context.events, context.assistant_message_id, &text[emitted_text_len..]).await;
+                send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
                 emitted_text_len = text.len();
                 last_text_emit = Instant::now();
             }
@@ -3420,7 +3420,9 @@ async fn call_model_streaming_with_timeout(
             {
                 send(
                     context.events,
-                    SessionEventKind::ReasoningTextDelta { delta: std::mem::take(&mut pending_reasoning) },
+                    SessionEventKind::ReasoningDelta {
+                        text: reasoning_accumulated.clone(),
+                    },
                 )
                 .await;
                 pending_reasoning.clear();
@@ -3437,7 +3439,7 @@ async fn call_model_streaming_with_timeout(
                 if text.len() != emitted_text_len
                     && progress.as_ref().is_some_and(progress_follows_live_text)
                 {
-                    send_live_assistant_text(context.events, context.assistant_message_id, &text[emitted_text_len..]).await;
+                    send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
                     emitted_text_len = text.len();
                     last_text_emit = Instant::now();
                 }
@@ -3453,7 +3455,9 @@ async fn call_model_streaming_with_timeout(
                     if !pending_reasoning.is_empty() {
                         send(
                             context.events,
-                            SessionEventKind::ReasoningTextDelta { delta: std::mem::take(&mut pending_reasoning) },
+                            SessionEventKind::ReasoningDelta {
+                                text: reasoning_accumulated.clone(),
+                            },
                         )
                         .await;
                         pending_reasoning.clear();
@@ -3461,10 +3465,18 @@ async fn call_model_streaming_with_timeout(
                     }
                     let delta = String::from_utf8_lossy(&chunk);
                     text.push_str(&delta);
-                    if last_text_emit.elapsed() >= Duration::from_millis(75)
-
+                    send(
+                        context.events,
+                        SessionEventKind::MessageDelta {
+                            message_id: context.assistant_message_id,
+                            delta: delta.into_owned(),
+                        },
+                    )
+                    .await;
+                    if last_text_emit.elapsed() >= crate::agent::live_output_interval()
+                        || chunk.ends_with(b"\n")
                     {
-                        send_live_assistant_text(context.events, context.assistant_message_id, &text[emitted_text_len..]).await;
+                        send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
                         emitted_text_len = text.len();
                         last_text_emit = Instant::now();
                     }
@@ -3490,12 +3502,14 @@ async fn call_model_streaming_with_timeout(
                         }
                         if !pending_reasoning.is_empty()
                             && last_reasoning_emit.elapsed()
-                            >= Duration::from_millis(75)
+                            >= crate::agent::live_output_interval()
                             || pending_reasoning.ends_with('\n')
                         {
                             send(
                                 context.events,
-                                SessionEventKind::ReasoningTextDelta { delta: std::mem::take(&mut pending_reasoning) },
+                                SessionEventKind::ReasoningDelta {
+                                    text: reasoning_accumulated.clone(),
+                                },
                             )
                             .await;
                             pending_reasoning.clear();
@@ -3506,7 +3520,9 @@ async fn call_model_streaming_with_timeout(
                 Some(ProviderProgress::ProviderEvent { kind, payload, .. }) => {
                     if kind == "item/completed:reasoning" {
                         if !pending_reasoning.is_empty() {
-                            send(context.events, SessionEventKind::ReasoningTextDelta { delta: std::mem::take(&mut pending_reasoning) }).await;
+                            send(context.events, SessionEventKind::ReasoningDelta {
+                                text: reasoning_accumulated.clone(),
+                            }).await;
                             pending_reasoning.clear();
                         }
                         send(context.events, SessionEventKind::ReasoningCompleted).await;
@@ -3598,13 +3614,15 @@ async fn call_model_streaming_with_timeout(
             if !pending_reasoning.is_empty() {
                 send(
                     context.events,
-                    SessionEventKind::ReasoningTextDelta { delta: std::mem::take(&mut pending_reasoning) },
+                    SessionEventKind::ReasoningDelta {
+                        text: reasoning_accumulated.clone(),
+                    },
                 )
                 .await;
                 pending_reasoning.clear();
             }
             if text.len() != emitted_text_len {
-                send_live_assistant_text(context.events, context.assistant_message_id, &text[emitted_text_len..]).await;
+                send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
             }
             let mut outcome = completed
                 .take()
@@ -3640,12 +3658,15 @@ async fn send_live_assistant_text(
     assistant_message_id: Uuid,
     text: &str,
 ) {
-    if text.is_empty() { return; }
     send(
         events,
-        SessionEventKind::MessageDelta {
+        SessionEventKind::Message {
             message_id: assistant_message_id,
-            delta: text.to_string(),
+            actor: EventActor::Assistant,
+            text: text.to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
         },
     )
     .await;
@@ -3742,7 +3763,7 @@ async fn execute_tool(
     harness: &NativeHarness,
     runtime: &NativeToolRuntime,
     tool_call: &ModelToolCall,
-    input: Value,
+    mut input: Value,
     approval_context: NativeApprovalContext<'_>,
     events: &mpsc::Sender<SessionEventKind>,
     controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
@@ -3778,6 +3799,7 @@ async fn execute_tool(
     // who chose Manual actually reviews file writes and self-extension, and Auto
     // routes them through the automatic reviewer.
     let mutating_builtin = mutating_builtin_approval(&tool_call.function.name, &input);
+    let mut approval_granted = false;
     if (shell_command.is_some()
         || matches!(
             tool_call.function.name.as_str(),
@@ -3836,8 +3858,11 @@ async fn execute_tool(
                 ),
             )
         };
-        let decision = match runtime.permission {
-            PermissionMode::FullAccess => ApprovalDecision::AllowOnce,
+        let resolution = match runtime.permission {
+            PermissionMode::FullAccess => ApprovalResolution {
+                decision: ApprovalDecision::AllowOnce,
+                edited_input: None,
+            },
             PermissionMode::Manual => {
                 request_tool_approval(title, &detail, approval_command.clone(), events, controls)
                     .await?
@@ -3885,10 +3910,13 @@ async fn execute_tool(
                             },
                         )
                         .await;
-                        if review.allow {
-                            ApprovalDecision::AllowOnce
-                        } else {
-                            ApprovalDecision::Deny
+                        ApprovalResolution {
+                            decision: if review.allow {
+                                ApprovalDecision::AllowOnce
+                            } else {
+                                ApprovalDecision::Deny
+                            },
+                            edited_input: None,
                         }
                     }
                     Err(error) => {
@@ -3906,7 +3934,7 @@ async fn execute_tool(
                 }
             }
         };
-        match decision {
+        match resolution.decision {
             ApprovalDecision::Deny => {
                 return Ok((
                     json!({ "error": "tool execution was denied by the approval policy" })
@@ -3916,6 +3944,20 @@ async fn execute_tool(
                 ));
             }
             ApprovalDecision::AllowOnce | ApprovalDecision::AllowSession => {}
+        }
+        approval_granted = true;
+        if let Some(edited_input) = resolution.edited_input {
+            match tool_call.function.name.as_str() {
+                "exec" | "exec_command" => input["cmd"] = Value::String(edited_input),
+                "watch" if shell_command.is_some() => {
+                    input["command"] = Value::String(edited_input)
+                }
+                _ => {
+                    input = serde_json::from_str(&edited_input)
+                        .context("edited tool input must be a JSON object")?;
+                    ensure!(input.is_object(), "edited tool input must be a JSON object");
+                }
+            }
         }
         // Approval/status delivery can yield while a new control is queued.
         while let Some(control) = controls
@@ -3929,17 +3971,20 @@ async fn execute_tool(
         }
     }
 
-    let workflow_approved = matches!(
-        tool_call.function.name.as_str(),
-        "run_workflow"
-            | "run_blu_workflow"
-            | "run_blu_extension"
-            | "runtime_exec"
-            | "computer_use"
-            | "lane_job"
-            | "lane_service"
-            | "watch"
-    ) && runtime.permission != PermissionMode::FullAccess;
+    // Tools the native gate already reviewed (or deliberately leaves to the
+    // dispatcher, such as agent watches) must not be prompted for again.
+    let workflow_approved = approval_granted
+        || (matches!(
+            tool_call.function.name.as_str(),
+            "run_workflow"
+                | "run_blu_workflow"
+                | "run_blu_extension"
+                | "runtime_exec"
+                | "computer_use"
+                | "lane_job"
+                | "lane_service"
+                | "watch"
+        ) && runtime.permission != PermissionMode::FullAccess);
     // Accepted shell/runtime batches can already have effects. Read steers at
     // their next boundary instead of killing the batch; Interrupt still cancels.
     let effectful_batch = matches!(
@@ -4221,7 +4266,7 @@ async fn request_tool_approval(
     command: Option<String>,
     events: &mpsc::Sender<SessionEventKind>,
     controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
-) -> Result<ApprovalDecision> {
+) -> Result<ApprovalResolution> {
     let approval_id = Uuid::new_v4().to_string();
     send(
         events,
@@ -4245,7 +4290,7 @@ async fn request_tool_approval(
         match next_control(controls).await {
             Some(AgentTurnControl::Approval {
                 approval_id: received,
-                decision,
+                resolution,
             }) if received == approval_id => {
                 send(
                     events,
@@ -4255,7 +4300,7 @@ async fn request_tool_approval(
                     },
                 )
                 .await;
-                return Ok(decision);
+                return Ok(resolution);
             }
             Some(AgentTurnControl::Interrupt) => bail!("native provider turn interrupted"),
             Some(AgentTurnControl::Steer { ack, .. }) => {
@@ -6374,6 +6419,132 @@ mod tests {
         );
     }
 
+    // Execution effects, not just transport, guard against accepting an edit
+    // while accidentally dispatching the original input.
+    #[tokio::test]
+    async fn approved_edits_replace_executed_input_and_invalid_edits_fail_closed() {
+        for (tool, original, edited, invalid) in [
+            (
+                "exec",
+                json!({"cmd": "touch original"}),
+                "touch replacement",
+                false,
+            ),
+            (
+                "write_file",
+                json!({"path": "original", "content": "old"}),
+                r#"{"path":"replacement","content":"new"}"#,
+                false,
+            ),
+            (
+                "write_file",
+                json!({"path": "original", "content": "old"}),
+                "[]",
+                true,
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            // Shell effects use absolute paths so they cannot land in the
+            // test's working directory; file tools are workspace-relative.
+            let (original, edited) = if tool == "exec" {
+                (
+                    json!({"cmd": format!("touch '{}'", root.path().join("original").display())}),
+                    format!("touch '{}'", root.path().join("replacement").display()),
+                )
+            } else {
+                (original, edited.to_string())
+            };
+            let session_id = Uuid::new_v4();
+            let dispatcher = crate::AgentToolDispatcher::new(
+                crate::session::SessionGoalTools::disconnected(),
+                crate::session::SessionTodoTools::disconnected(),
+                None,
+                crate::LspService::new(root.path()),
+                crate::CodingProvider::Codex,
+                session_id,
+                false,
+                None,
+                None,
+                root.path().to_path_buf(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                crate::native_process::ProcessManager::default(),
+                PermissionMode::Manual,
+            );
+            let (events_tx, mut events_rx) = mpsc::channel(16);
+            dispatcher.set_turn_events(&events_tx);
+            let runtime = NativeToolRuntime {
+                permission: PermissionMode::Manual,
+                agent_tools: dispatcher.clone(),
+                mcp: Arc::new(
+                    crate::native_mcp::NativeMcpRuntime::start(session_id, Vec::new())
+                        .await
+                        .unwrap(),
+                ),
+                context: Arc::new(
+                    crate::native_context::NativeContext::load(
+                        root.path().to_path_buf(),
+                        Vec::new(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                harness: HarnessMode::Borg,
+            };
+            let call = ModelToolCall::function("edited".into(), tool.into(), original.to_string());
+            let (control_tx, control_rx) = mpsc::channel(1);
+            let task = tokio::spawn(async move {
+                execute_tool(
+                    &NativeHarness::default(),
+                    &runtime,
+                    &call,
+                    original,
+                    NativeApprovalContext {
+                        provider: crate::CodingProvider::Codex,
+                        model: "test-model",
+                        fast: false,
+                        ultrafast: false,
+                    },
+                    &events_tx,
+                    &mut Some(control_rx),
+                    &mut ProviderCallUsage::default(),
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(event) = events_rx.recv().await {
+                    if let SessionEventKind::ApprovalRequested { approval_id, .. } = event {
+                        control_tx
+                            .send(AgentTurnControl::Approval {
+                                approval_id,
+                                resolution: ApprovalResolution {
+                                    decision: ApprovalDecision::AllowOnce,
+                                    edited_input: Some(edited),
+                                },
+                            })
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                }
+                let result = task.await.unwrap();
+                if invalid {
+                    assert!(result.is_err());
+                } else {
+                    let (output, is_error, _) = result.unwrap();
+                    assert!(!is_error, "{tool} replacement execution failed: {output}");
+                }
+            })
+            .await
+            .expect("approval and dispatch must finish");
+            assert!(!root.path().join("original").exists());
+            assert_eq!(root.path().join("replacement").exists(), !invalid);
+        }
+    }
+
     // A real worker and dispatch boundary are needed: a helper-only test would
     // miss runtime_exec being wired to the wrong cancellation policy again.
     #[tokio::test]
@@ -6515,7 +6686,10 @@ mod tests {
                     control_tx
                         .send(AgentTurnControl::Approval {
                             approval_id: "capture-sync".into(),
-                            decision: ApprovalDecision::Deny,
+                            resolution: ApprovalResolution {
+                                decision: ApprovalDecision::Deny,
+                                edited_input: None,
+                            },
                         })
                         .await
                         .unwrap();
@@ -6609,7 +6783,10 @@ mod tests {
             Duration::from_secs(1),
             control_tx.send(AgentTurnControl::Approval {
                 approval_id: "capture-sync".to_string(),
-                decision: ApprovalDecision::Deny,
+                resolution: ApprovalResolution {
+                    decision: ApprovalDecision::Deny,
+                    edited_input: None,
+                },
             }),
         )
         .await
@@ -6685,7 +6862,10 @@ mod tests {
                     Duration::from_secs(1),
                     control_tx.send(AgentTurnControl::Approval {
                         approval_id: "capture-sync".to_string(),
-                        decision: ApprovalDecision::Deny,
+                        resolution: ApprovalResolution {
+                            decision: ApprovalDecision::Deny,
+                            edited_input: None,
+                        },
                     }),
                 )
                 .await
@@ -11183,7 +11363,10 @@ mod tests {
             controls_tx
                 .send(AgentTurnControl::Approval {
                     approval_id: "capture-sync".to_string(),
-                    decision: ApprovalDecision::Deny,
+                    resolution: ApprovalResolution {
+                        decision: ApprovalDecision::Deny,
+                        edited_input: None,
+                    },
                 })
                 .await
                 .unwrap();
@@ -11555,7 +11738,10 @@ mod tests {
             self.controls
                 .send(AgentTurnControl::Approval {
                     approval_id: "capture-sync".to_string(),
-                    decision: ApprovalDecision::Deny,
+                    resolution: ApprovalResolution {
+                        decision: ApprovalDecision::Deny,
+                        edited_input: None,
+                    },
                 })
                 .await
                 .unwrap();

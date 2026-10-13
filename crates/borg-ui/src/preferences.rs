@@ -1,3 +1,4 @@
+pub use borg_view::policy::{DiffExpansionPolicy, ResponseStreaming};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -105,23 +106,8 @@ pub enum DictationIconStyle {
     Emoji,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DiffExpansionPolicy {
-    Expanded,
-    Collapsed,
-    UntilNextAction,
-}
-
 /// How a reply appears while it streams: a finished block at a time, or every
 /// token as it arrives.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResponseStreaming {
-    Paragraph,
-    #[default]
-    Token,
-}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

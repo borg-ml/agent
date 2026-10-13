@@ -15034,13 +15034,13 @@ async fn borg_tool_approvals_route_and_cancel_without_provider_controls() {
             )
             .await
         });
-        let approval_id = loop {
+        let (approval_id, request_event) = loop {
             let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
             if let SessionEventKind::ApprovalRequested { approval_id, .. } = event.kind {
-                break approval_id;
+                break (approval_id, event.id);
             }
         };
         assert!(
@@ -15052,9 +15052,53 @@ async fn borg_tool_approvals_route_and_cancel_without_provider_controls() {
                 session_id,
                 approval_id: "unrelated".into(),
                 decision: crate::ApprovalDecision::AllowOnce,
+                expected_request: Some(request_event),
+                acknowledgement: None,
+                edited_input: None,
             })
             .await
             .unwrap();
+        let (abandoned_ack, abandoned_receipt) = crate::ApprovalAcknowledgement::channel();
+        drop(abandoned_receipt);
+        command_tx
+            .send(HostCommand::Approve {
+                session_id,
+                approval_id: approval_id.clone(),
+                decision: crate::ApprovalDecision::AllowOnce,
+                expected_request: Some(request_event),
+                acknowledgement: Some(abandoned_ack),
+                edited_input: None,
+            })
+            .await
+            .unwrap();
+        for (expected_request, edited_input) in [
+            (Some(Uuid::new_v4()), None),
+            (Some(request_event), Some("replacement".to_string())),
+        ] {
+            let (ack, receipt) = crate::ApprovalAcknowledgement::channel();
+            command_tx
+                .send(HostCommand::Approve {
+                    session_id,
+                    approval_id: approval_id.clone(),
+                    decision: crate::ApprovalDecision::AllowOnce,
+                    expected_request,
+                    edited_input,
+                    acknowledgement: Some(ack),
+                })
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), receipt)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+            assert!(
+                result.lock().unwrap().is_none(),
+                "rejected commands must leave approval pending"
+            );
+        }
         match outcome {
             "disconnect" => cancel.cancel(),
             "interrupt" => {
@@ -15067,6 +15111,9 @@ async fn borg_tool_approvals_route_and_cancel_without_provider_controls() {
                         session_id,
                         approval_id: approval_id.clone(),
                         decision: crate::ApprovalDecision::AllowOnce,
+                        expected_request: Some(request_event),
+                        acknowledgement: None,
+                        edited_input: None,
                     })
                     .await
                     .unwrap();
@@ -15080,6 +15127,9 @@ async fn borg_tool_approvals_route_and_cancel_without_provider_controls() {
                     } else {
                         crate::ApprovalDecision::Deny
                     },
+                    expected_request: Some(request_event),
+                    acknowledgement: None,
+                    edited_input: None,
                 })
                 .await
                 .unwrap(),
@@ -17817,6 +17867,8 @@ async fn a_pending_provider_interaction_suspends_the_watchdog() {
             session_id,
             interaction_id: "interaction-1".to_string(),
             response: json!("main"),
+            expected_request: None,
+            acknowledgement: None,
         })
         .await
         .unwrap();
@@ -20093,16 +20145,39 @@ async fn assert_immediate_interrupt(control_backlog: usize) {
 /// durable sequence the actor writes -- and every replay taken from that
 /// journal -- differs from what the coordinator emitted, or a child's later
 /// state is recorded before its earlier one.
-async fn forwarding_coordinator(root: Uuid) -> (crate::session_store::postgres::testing::ScratchDatabase, SubagentCoordinator) {
+async fn forwarding_coordinator(
+    root: Uuid,
+) -> (
+    crate::session_store::postgres::testing::ScratchDatabase,
+    SubagentCoordinator,
+) {
     let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
     let launch = LaunchSession {
-        request_id: root, cwd: PathBuf::from("/tmp"), provider: CodingProvider::Codex,
-        model: None, effort: None, fast: None, ultrafast: None,
-        response_language: crate::ResponseLanguage::Auto, permission_mode: crate::PermissionMode::Manual,
-        name: None, initial_prompt: None, capabilities: Default::default(),
-        subagent_concurrency_limit: None, extension_skill_roots: Vec::new(), team_policy: None,
+        request_id: root,
+        cwd: PathBuf::from("/tmp"),
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        fast: None,
+        ultrafast: None,
+        response_language: crate::ResponseLanguage::Auto,
+        permission_mode: crate::PermissionMode::Manual,
+        name: None,
+        initial_prompt: None,
+        capabilities: Default::default(),
+        subagent_concurrency_limit: None,
+        extension_skill_roots: Vec::new(),
+        team_policy: None,
     };
-    let coordinator = SubagentCoordinator::new_with_store_and_executor("/tmp", root, launch, 1, Arc::new(HungProviderExecutor), Arc::new(store)).unwrap();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        "/tmp",
+        root,
+        launch,
+        1,
+        Arc::new(HungProviderExecutor),
+        Arc::new(store),
+    )
+    .unwrap();
     (scratch, coordinator)
 }
 
@@ -20112,7 +20187,13 @@ async fn forwarded_child_activity_keeps_the_coordinator_order() {
     let (forwarded_tx, mut forwarded_rx) = mpsc::channel(8);
     let root = Uuid::new_v4();
     let (scratch, coordinator) = forwarding_coordinator(root).await;
-    let forwarder = tokio::spawn(forward_child_activity(activity_rx, forwarded_tx, None, coordinator, root));
+    let forwarder = tokio::spawn(forward_child_activity(
+        activity_rx,
+        forwarded_tx,
+        None,
+        coordinator,
+        root,
+    ));
     let children: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
     for child in &children {
         activity_tx
@@ -20145,7 +20226,11 @@ async fn forwarded_nested_child_activity_preserves_lifecycle_and_parent_boundary
     let (forwarded_tx, mut forwarded_rx) = mpsc::channel(16);
     let (scratch, coordinator) = forwarding_coordinator(parent).await;
     let forwarder = tokio::spawn(forward_child_activity(
-        activity_rx, forwarded_tx, Some(parent), coordinator, parent,
+        activity_rx,
+        forwarded_tx,
+        Some(parent),
+        coordinator,
+        parent,
     ));
     let mut agent = watched_child(child);
     agent.parent_session_id = parent;
@@ -22627,6 +22712,7 @@ async fn peer_receipts_survive_disabled_subagents_stop_and_replay() {
                     sender_id,
                     sender_name,
                     text,
+                    ..
                 } = event.kind
                 {
                     assert_ne!(message_id, hidden_id);
@@ -22718,6 +22804,7 @@ async fn peer_receipts_survive_disabled_subagents_stop_and_replay() {
                             sender_id,
                             sender_name,
                             text,
+                            ..
                         } if message_id == wake_id => {
                             assert_eq!(sender_id, peer);
                             assert_eq!(sender_name, "Authenticated peer");
@@ -23828,4 +23915,75 @@ async fn replacement_acknowledged_attachment_can_be_removed_and_queue_is_preserv
         matches!(store.prompt_event(session_id, message_id, "message").await.unwrap().unwrap().kind,
         SessionEventKind::Message { delivery: Some(PromptDelivery::Queue), attachments, .. } if attachments.is_empty())
     );
+}
+
+#[tokio::test]
+async fn approval_request_revision_is_exact_and_stale_check_does_not_consume_pending() {
+    let session_id = Uuid::new_v4();
+    let (scratch, _store, mut journal) = runtime_store(session_id).await;
+    let request = journal
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ApprovalRequested {
+                approval_id: "current".into(),
+                title: "tool".into(),
+                detail: "input".into(),
+                command: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let (sender, mut receiver) = oneshot::channel();
+    let pending = PendingApproval {
+        id: "current".into(),
+        response: Some(sender),
+    };
+    assert!(!approval_request_matches(
+        &journal,
+        Some(Uuid::new_v4()),
+        false
+    ));
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    journal.context_events.clear();
+    assert!(
+        approval_request_matches(&journal, Some(request.id), false),
+        "context eviction must not revoke pending request identity"
+    );
+    let reused = journal
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ApprovalRequested {
+                approval_id: "current".into(),
+                title: "replacement request".into(),
+                detail: "input".into(),
+                command: None,
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(!approval_request_matches(&journal, Some(request.id), false));
+    assert!(approval_request_matches(&journal, Some(reused.id), false));
+    pending
+        .response
+        .unwrap()
+        .send(crate::ApprovalDecision::AllowOnce)
+        .unwrap();
+    assert_eq!(receiver.await.unwrap(), crate::ApprovalDecision::AllowOnce);
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn approval_actor_receipt_completes_once_across_clones() {
+    let (ack, receiver) = crate::ApprovalAcknowledgement::channel();
+    let clone = ack.clone();
+    assert!(ack.is_waiting());
+    ack.complete(Err("stale request".into()));
+    clone.complete(Ok(()));
+    assert!(!ack.is_waiting());
+    assert_eq!(receiver.await.unwrap(), Err("stale request".into()));
 }

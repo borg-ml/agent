@@ -4601,6 +4601,8 @@ async fn run_local_agent_session(
                                 session_id,
                                 approval_id,
                                 decision: ApprovalDecision::Deny,
+
+                                expected_request: None, acknowledgement: None, edited_input: None,
                             },
                         );
                     } else if !detached_from_terminal
@@ -4622,6 +4624,8 @@ async fn run_local_agent_session(
                                 session_id,
                                 interaction_id,
                                 response: cancelled_provider_interaction_response(&kind),
+
+                                expected_request: None, acknowledgement: None,
                             },
                         );
                     } else if pending_provider_interaction.is_some() && !can_prompt {
@@ -4634,6 +4638,8 @@ async fn run_local_agent_session(
                                 session_id,
                                 interaction_id,
                                 response: cancelled_provider_interaction_response(&kind),
+
+                                expected_request: None, acknowledgement: None,
                             },
                         );
                     } else if !detached_from_terminal
@@ -4701,6 +4707,8 @@ async fn run_local_agent_session(
                             session_id,
                             approval_id,
                             decision: ApprovalDecision::Deny,
+
+                            expected_request: None, acknowledgement: None, edited_input: None,
                         }).await.ok();
                     }
                     if let Some((interaction_id, kind, _)) =
@@ -4711,6 +4719,8 @@ async fn run_local_agent_session(
                                 session_id,
                                 interaction_id,
                                 response: cancelled_provider_interaction_response(&kind),
+
+                                expected_request: None, acknowledgement: None,
                             })
                             .await
                             .ok();
@@ -4736,6 +4746,8 @@ async fn run_local_agent_session(
                             session_id,
                             approval_id,
                             decision,
+
+                            expected_request: None, acknowledgement: None, edited_input: None,
                         }).await.ok();
                     } else {
                         print!("  Choose y or n › ");
@@ -4753,6 +4765,8 @@ async fn run_local_agent_session(
                                     session_id,
                                     interaction_id,
                                     response,
+
+                                    expected_request: None, acknowledgement: None,
                                 })
                                 .await
                                 .ok();
@@ -5481,6 +5495,8 @@ async fn run_local_agent_session(
                                     session_id,
                                     approval_id,
                                     decision,
+
+                                    expected_request: None, acknowledgement: None, edited_input: None,
                                 },
                             );
                         }
@@ -6634,6 +6650,8 @@ async fn run_local_agent_session(
                                             session_id,
                                             interaction_id,
                                             response,
+
+                                            expected_request: None, acknowledgement: None,
                                         },
                                     );
                                 }

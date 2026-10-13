@@ -14,6 +14,7 @@ publish = false
 subscription-adapters = ["borg-provider/subscription-adapters"]
 
 [dependencies]
+borg-view = { path = "../borg-view" }
 anyhow.workspace = true
 arboard = { version = "3.6", features = ["wayland-data-control"] }
 base64.workspace = true

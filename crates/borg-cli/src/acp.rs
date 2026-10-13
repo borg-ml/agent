@@ -475,6 +475,9 @@ async fn respond_prompt(
                         session_id: session.id,
                         approval_id,
                         decision,
+                        expected_request: None,
+                        acknowledgement: None,
+                        edited_input: None,
                     })
                     .await
                     .map_err(|_| Error::internal_error())?;

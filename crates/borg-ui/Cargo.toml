@@ -11,6 +11,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+borg-view = { path = "../borg-view" }
 anyhow.workspace = true
 async-channel = "2.5"
 borg-provider = { path = "../borg-provider" }

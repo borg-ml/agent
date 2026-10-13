@@ -1,31 +1,56 @@
 //! One authenticated outbound socket; TLS uses system trust roots. No credential
 //! URLs, HTTP event upload, or command polling belongs to this transport.
-use anyhow::{Result,ensure,bail};
-use futures::{SinkExt,StreamExt};
+use crate::{
+    HostConfig,
+    auth::{Authentication, TunnelFrame},
+};
+use anyhow::{Result, bail, ensure};
+use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use crate::{HostConfig,auth::{Authentication,TunnelFrame}};
 
 pub const TERMINAL_AUTH_EXIT: i32 = 78;
 #[derive(Debug)]
 pub struct TerminalAuthentication(pub String);
 impl std::fmt::Display for TerminalAuthentication {
-    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result { f.write_str(&self.0) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 impl std::error::Error for TerminalAuthentication {}
 
-pub async fn connect(config:&HostConfig, inbound:mpsc::Sender<TunnelFrame>, outbound:&mut mpsc::Receiver<TunnelFrame>)->Result<()> {
-    let mut url=url::Url::parse(&config.server)?;
-    ensure!(url.scheme()=="https","host tunnel requires verified HTTPS/WSS");
-    ensure!(url.username().is_empty() && url.password().is_none(),"credentials forbidden in host route");
-    url.set_scheme("wss").map_err(|_|anyhow::anyhow!("invalid WSS route"))?;
-    url.set_path("/api/remote/ws/host");url.set_query(None);url.set_fragment(None);
-    let (socket,_)=tokio::time::timeout(std::time::Duration::from_secs(10),tokio_tungstenite::connect_async(url.as_str())).await??;
-    let (mut sink,mut stream)=socket.split();
-    let auth=serde_json::to_string(&Authentication::Host{host_id:config.host_id.to_string(),token:config.host_token.clone()})?;
+pub async fn connect(
+    config: &HostConfig,
+    inbound: mpsc::Sender<TunnelFrame>,
+    outbound: &mut mpsc::Receiver<TunnelFrame>,
+) -> Result<()> {
+    let mut url = url::Url::parse(&config.server)?;
+    ensure!(
+        url.scheme() == "https",
+        "host tunnel requires verified HTTPS/WSS"
+    );
+    ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "credentials forbidden in host route"
+    );
+    url.set_scheme("wss")
+        .map_err(|_| anyhow::anyhow!("invalid WSS route"))?;
+    url.set_path("/api/remote/ws/host");
+    url.set_query(None);
+    url.set_fragment(None);
+    let (socket, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio_tungstenite::connect_async(url.as_str()),
+    )
+    .await??;
+    let (mut sink, mut stream) = socket.split();
+    let auth = serde_json::to_string(&Authentication::Host {
+        host_id: config.host_id.to_string(),
+        token: config.host_token.clone(),
+    })?;
     sink.send(Message::Text(auth.into())).await?;
-    let mut heartbeat=tokio::time::interval(std::time::Duration::from_secs(5));
-    let mut last_received=tokio::time::Instant::now();
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut last_received = tokio::time::Instant::now();
     loop {
         tokio::select! {
             incoming=stream.next()=> {

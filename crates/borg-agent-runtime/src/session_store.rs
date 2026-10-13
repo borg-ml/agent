@@ -1485,7 +1485,9 @@ pub struct ClaimedActionTransition {
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     /// Exact durable PostgreSQL authority, unavailable for non-PG stores.
-    fn postgres_authority(&self) -> Option<postgres::publication::PostgresAuthority> { None }
+    fn postgres_authority(&self) -> Option<postgres::publication::PostgresAuthority> {
+        None
+    }
     async fn create_session(&self, session_id: Uuid) -> Result<()>;
     /// Durable per-workspace relay upload cursors for one host session.
     async fn host_workspace_cursors(

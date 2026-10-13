@@ -1519,11 +1519,21 @@ pub enum HostCommand {
         session_id: Uuid,
         approval_id: String,
         decision: ApprovalDecision,
+        /// Request event UUID, checked by the actor before resolving remote input.
+        expected_request: Option<Uuid>,
+        #[serde(skip)]
+        #[ts(skip)]
+        acknowledgement: Option<ApprovalAcknowledgement>,
+        edited_input: Option<String>,
     },
     RespondToProviderInteraction {
         session_id: Uuid,
         interaction_id: String,
         response: Value,
+        expected_request: Option<Uuid>,
+        #[serde(skip)]
+        #[ts(skip)]
+        acknowledgement: Option<ApprovalAcknowledgement>,
     },
     Goal {
         session_id: Uuid,
@@ -2296,6 +2306,42 @@ pub enum PromptDelivery {
     Queue,
 }
 
+type ApprovalReceiptSender =
+    std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>>;
+/// In-process actor receipt. Clones share a single completion; never serialized.
+#[derive(Debug, Clone)]
+pub struct ApprovalAcknowledgement(ApprovalReceiptSender);
+
+impl ApprovalAcknowledgement {
+    pub fn channel() -> (Self, tokio::sync::oneshot::Receiver<Result<(), String>>) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        (
+            Self(std::sync::Arc::new(std::sync::Mutex::new(Some(sender)))),
+            receiver,
+        )
+    }
+    pub fn is_waiting(&self) -> bool {
+        self.0
+            .lock()
+            .expect("approval receipt lock")
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed())
+    }
+
+    pub fn complete(&self, result: Result<(), String>) {
+        if let Some(sender) = self.0.lock().expect("approval receipt lock").take() {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+/// Executor resolution: replacement input is consumed by the executor, never replayed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ApprovalResolution {
+    pub decision: ApprovalDecision,
+    pub edited_input: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -2775,6 +2821,12 @@ pub enum SessionEventKind {
         sender_id: Uuid,
         sender_name: String,
         text: String,
+        /// Whether the sender was this session's own descendant when the
+        /// receipt was recorded. Recorded once so views never infer it from
+        /// a bounded child cache; absent in journals from before this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        from_child: Option<bool>,
     },
     /// Legacy journal compatibility only; ignored during replay.
     UserStopChanged {

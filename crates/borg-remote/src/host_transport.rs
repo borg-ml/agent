@@ -16,6 +16,14 @@ pub(super) struct Transport {
     tasks: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
     ledger: Arc<OnceLock<crate::command_ledger::CommandLedger>>,
     routes: Arc<Mutex<Vec<crate::auth::HostRoute>>>,
+    wakes: Arc<Wakes>,
+}
+/// Durable work is woken by the event that creates it, never by a timer scan.
+#[derive(Default)]
+pub(super) struct Wakes {
+    pub operations: tokio::sync::Notify,
+    pub recovery: tokio::sync::Notify,
+    collaboration: Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>,
 }
 #[derive(Default)]
 struct RegistrationState {
@@ -52,7 +60,11 @@ impl Transport {
             tasks: Arc::default(),
             ledger: Arc::default(),
             routes: Arc::default(),
+            wakes: Arc::default(),
         }
+    }
+    pub fn wakes(&self) -> Arc<Wakes> {
+        Arc::clone(&self.wakes)
     }
     pub fn set_ledger(&self, ledger: crate::command_ledger::CommandLedger) -> Result<()> {
         ensure!(
@@ -155,7 +167,7 @@ impl Transport {
                     .send(TunnelFrame::RegisterSession {
                         registration_id: registration_id.clone(),
                         session_id: session_id.to_string(),
-                        request,
+                        request: Box::new(request),
                     })
                     .await?;
             }
@@ -164,13 +176,13 @@ impl Transport {
         .await
         .map_err(anyhow::Error::from)
         .and_then(|result| result);
-        if result.is_err() {
-            if let Some(pending) = self.state.lock().unwrap().pending.remove(&registration_id) {
-                for waiter in pending.waiters {
-                    let _ = waiter.send(Err(anyhow::anyhow!(
-                        "registration interrupted; retry metadata on the next connection"
-                    )));
-                }
+        if result.is_err()
+            && let Some(pending) = self.state.lock().unwrap().pending.remove(&registration_id)
+        {
+            for waiter in pending.waiters {
+                let _ = waiter.send(Err(anyhow::anyhow!(
+                    "registration interrupted; retry metadata on the next connection"
+                )));
             }
         }
         result
@@ -206,12 +218,12 @@ impl Transport {
     pub fn registered(&self, id: &str, error: Option<String>) {
         let mut state = self.state.lock().unwrap();
         if let Some(pending) = state.pending.remove(id) {
-            if error.is_none() && state.generation == pending.generation {
-                if let Some(entry) = state.catalog.get_mut(&pending.session) {
-                    if entry.digest == pending.digest {
-                        entry.acknowledged = Some(pending.generation);
-                    }
-                }
+            if error.is_none()
+                && state.generation == pending.generation
+                && let Some(entry) = state.catalog.get_mut(&pending.session)
+                && entry.digest == pending.digest
+            {
+                entry.acknowledged = Some(pending.generation);
             }
             for waiter in pending.waiters {
                 let _ = waiter.send(
@@ -221,6 +233,35 @@ impl Transport {
                 );
             }
         }
+    }
+}
+impl Wakes {
+    /// The wake a session's collaboration sync waits on; the relay signals it
+    /// when inbox, directory or roster state for that session changed.
+    pub fn collaboration(&self, session: Uuid) -> Arc<tokio::sync::Notify> {
+        Arc::clone(
+            self.collaboration
+                .lock()
+                .unwrap()
+                .entry(session)
+                .or_default(),
+        )
+    }
+    pub fn release_collaboration(&self, session: Uuid) {
+        self.collaboration.lock().unwrap().remove(&session);
+    }
+    pub fn collaboration_changed(&self, session: Uuid) {
+        if let Some(wake) = self.collaboration.lock().unwrap().get(&session) {
+            wake.notify_one();
+        }
+    }
+    /// After a reconnect every session catches up on what it missed.
+    pub fn reconnected(&self) {
+        for wake in self.collaboration.lock().unwrap().values() {
+            wake.notify_one();
+        }
+        self.recovery.notify_one();
+        self.operations.notify_one();
     }
 }
 pub(super) fn get(host: Uuid) -> Result<Transport> {

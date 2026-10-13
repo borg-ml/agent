@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 
 /// Ed25519 signature covers the exact UTF-8 claims bytes, base64url without padding.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SignedTicket { pub claims: String, pub signature: String }
+pub struct SignedTicket {
+    pub claims: String,
+    pub signature: String,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TicketClaims {
     pub version: u32,
@@ -20,42 +23,111 @@ pub struct TicketClaims {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Permission { Read, Control }
+pub enum Permission {
+    Read,
+    Control,
+}
 /// First frame only. Proof signs `borg.remote.auth.v2\n{ticket_id}\n{nonce}`.
 /// Ticket IDs are consumed atomically at relay admission. Direct hosts independently
 /// consume ticket IDs, so route switching requires a fresh ticket.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Authentication {
-    Client { ticket: SignedTicket, nonce: String, proof: String },
-    Host { host_id: String, token: String },
+    Client {
+        ticket: SignedTicket,
+        nonce: String,
+        proof: String,
+    },
+    Host {
+        host_id: String,
+        token: String,
+    },
 }
 /// One outbound host socket muxes devices; relay never changes the inner view frame.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TunnelFrame {
-    Open { connection_id: String, ticket: SignedTicket },
+    Open {
+        connection_id: String,
+        ticket: SignedTicket,
+    },
     /// Private relay owner-service ingress; never accepted from viewer Client frames.
-    OpenService { connection_id: String, ticket: SignedTicket, nonce: String, proof: String },
-    Client { connection_id: String, frame: serde_json::Value },
-    Server { connection_id: String, frame: serde_json::Value },
-    Close { connection_id: String, reason: String },
-    SourceAttention { frame: serde_json::Value },
-    CacheBatch { snapshots: Vec<ColdSnapshot>, headlines: Vec<SessionHeadline> },
-    Revoked { epoch: u64 },
-    EpochUpdate { epoch: u64 },
-    AuthenticationRejected { reason: String },
+    OpenService {
+        connection_id: String,
+        ticket: SignedTicket,
+        nonce: String,
+        proof: String,
+    },
+    Client {
+        connection_id: String,
+        frame: serde_json::Value,
+    },
+    Server {
+        connection_id: String,
+        frame: serde_json::Value,
+    },
+    Close {
+        connection_id: String,
+        reason: String,
+    },
+    SourceAttention {
+        frame: serde_json::Value,
+    },
+    CacheBatch {
+        snapshots: Vec<ColdSnapshot>,
+        headlines: Vec<SessionHeadline>,
+    },
+    Revoked {
+        epoch: u64,
+    },
+    EpochUpdate {
+        epoch: u64,
+    },
+    AuthenticationRejected {
+        reason: String,
+    },
     /// Trusted relay owner-service ingress only; viewer Client frames cannot emit this.
-    HostCommand { command_id: String, command: borg_agent_runtime::HostCommand, not_after: Option<i64> },
-    HostCommandAccepted { command_id: String },
-    HostCommandResult { command_id: String, outcome: serde_json::Value, error: Option<String> },
-    Routes { routes: Vec<HostRoute> },
-    Heartbeat { heartbeat: borg_agent_runtime::HostHeartbeat },
-    RegisterSession { registration_id: String, session_id: String, request: borg_agent_runtime::LaunchSession },
-    RegisteredSession { registration_id: String, session_id: String, error: Option<String> },
+    HostCommand {
+        command_id: String,
+        command: borg_agent_runtime::HostCommand,
+        not_after: Option<i64>,
+    },
+    HostCommandAccepted {
+        command_id: String,
+    },
+    HostCommandResult {
+        command_id: String,
+        outcome: serde_json::Value,
+        error: Option<String>,
+    },
+    Routes {
+        routes: Vec<HostRoute>,
+    },
+    Heartbeat {
+        heartbeat: borg_agent_runtime::HostHeartbeat,
+    },
+    RegisterSession {
+        registration_id: String,
+        session_id: String,
+        request: Box<borg_agent_runtime::LaunchSession>,
+    },
+    RegisteredSession {
+        registration_id: String,
+        session_id: String,
+        error: Option<String>,
+    },
+    /// Relay to host: inbox, directory or roster state for this session
+    /// changed. The host fetches it now instead of polling on a timer.
+    CollaborationChanged {
+        session_id: String,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ColdSnapshot { pub session_id: String, pub frame: serde_json::Value, pub synchronized_at: String }
+pub struct ColdSnapshot {
+    pub session_id: String,
+    pub frame: serde_json::Value,
+    pub synchronized_at: String,
+}
 pub use borg_view::wire::SessionHeadline;
 
 /// Distinct identity contract, not an unregistered-device bypass. Issued only
@@ -75,12 +147,18 @@ pub struct ServiceTicketClaims {
     pub revocation_epoch: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all="snake_case")]
-pub enum ServicePurpose { ProductView }
+#[serde(rename_all = "snake_case")]
+pub enum ServicePurpose {
+    ProductView,
+}
 // Read-only by definition: service grants cannot command/approve/configure.
 // Proof: `borg.remote.service.v2\n{ticket_id}\n{nonce}` signed by the ephemeral
 // service key whose public key is included in relay-signed ServiceTicketClaims.
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HostRoute { pub url: String, pub server_name: String, pub protocol: u32 }
+pub struct HostRoute {
+    pub url: String,
+    pub server_name: String,
+    pub protocol: u32,
+}
