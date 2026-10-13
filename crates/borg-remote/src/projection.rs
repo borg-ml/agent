@@ -65,10 +65,10 @@ impl ProjectionStore {
     }
 
     pub async fn commit_rows(&self, scope: &str, expected_revision: i64, state: &ProjectionCheckpoint, frame: &[u8], rows: Vec<crate::row_index::RowMutation<'_>>) -> Result<()> {
-        self.commit_full(scope, expected_revision, state, frame, rows, Vec::new(), None).await
+        self.commit_full(scope, expected_revision, state, frame, rows, Vec::new(), None, None).await
     }
 
-    pub async fn commit_full(&self, scope: &str, expected_revision: i64, state: &ProjectionCheckpoint, frame: &[u8], rows: Vec<crate::row_index::RowMutation<'_>>, texts: Vec<(&str,&str,&str,&str)>, turn: Option<(&str,&[u8])>) -> Result<()> {
+    pub async fn commit_full(&self, scope: &str, expected_revision: i64, state: &ProjectionCheckpoint, frame: &[u8], rows: Vec<crate::row_index::RowMutation<'_>>, texts: Vec<(&str,&str,&str,&str,bool)>, turn: Option<(&str,&[u8])>, asset:Option<(uuid::Uuid,uuid::Uuid,uuid::Uuid,&[u8])>) -> Result<()> {
         ensure!(state.revision == expected_revision.checked_add(1).ok_or_else(|| anyhow::anyhow!("revision exhausted"))?, "noncontiguous projection revision");
         ensure!(state.reducer.len() <= ACTIVE_CHECKPOINT_BYTES, "active checkpoint exceeds budget");
         ensure!(frame.len() <= REPLAY_BYTES, "projection frame exceeds wire budget");
@@ -79,9 +79,13 @@ impl ProjectionStore {
             .execute(&mut *tx).await?.rows_affected();
         ensure!(changed == 1, "projection checkpoint conflict");
         for row in rows { crate::row_index::apply(&mut tx, scope, row).await?; }
-        for (id,field,revision,text) in texts { crate::row_index::persist_text(&mut tx, scope, id, field, revision, text).await?; }
+        for (id,field,revision,text,replace) in texts { crate::row_index::persist_text(&mut tx, scope, id, field, revision, text, replace).await?; }
         sqlx::query("insert into remote_view_replay values($1,$2,$3,$4)")
             .bind(scope).bind(&state.epoch).bind(state.revision).bind(frame).execute(&mut *tx).await?;
+        if let Some((id,session,event,body))=asset {
+            sqlx::query("insert into session_payloads(id,session_id,event_id,payload_kind,payload,byte_len,created_at) values($1,$2,$3,'final_text',$4,$5,now())")
+                .bind(id).bind(session).bind(event).bind(body).bind(body.len() as i64).execute(&mut *tx).await?;
+        }
         if let Some((message,turn))=turn {
             sqlx::query("insert into remote_turn_results values($1,$2,$3) on conflict(scope,message_id) do update set frame=excluded.frame")
                 .bind(scope).bind(message).bind(turn).execute(&mut *tx).await?;
@@ -120,5 +124,33 @@ pub fn scope_key(host_id: uuid::Uuid, session_id: Option<uuid::Uuid>) -> String 
     match session_id {
         Some(session) => format!("host:{host_id}/session:{session}"),
         None => format!("host:{host_id}/host"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Real PostgreSQL is necessary: a compiler/mock cannot prove that a row
+    // conflict rolls back its checkpoint or that bounded replay reports a gap.
+    #[tokio::test]
+    async fn projection_conflict_rolls_back_checkpoint_and_replay_is_bounded() {
+        let (scratch,store)=crate::session_store::postgres::testing::session_store().await;
+        let projection=ProjectionStore::open(store.pool().clone()).await.unwrap();
+        let key=scope_key(uuid::Uuid::new_v4(),Some(uuid::Uuid::new_v4()));
+        let mut state=ProjectionCheckpoint{epoch:uuid::Uuid::new_v4().to_string(),revision:0,source_sequence:0,source_live_revision:0,reducer:Vec::new()};
+        assert!(projection.initialize(&key,&state).await.unwrap());
+        state.revision=1;state.source_sequence=1;
+        let invalid=crate::row_index::RowMutation::Advance{id:"missing",expected_revision:0,revision:1,bytes:1};
+        assert!(projection.commit_rows(&key,0,&state,b"one",vec![invalid]).await.is_err());
+        assert_eq!(projection.load(&key).await.unwrap().unwrap().revision,0);
+        assert!(projection.replay(&key,&state.epoch,0).await.unwrap().unwrap().is_empty());
+        for revision in 1..=129 {
+            state.revision=revision;state.source_sequence=revision;
+            projection.commit(&key,revision-1,&state,b"patch").await.unwrap();
+        }
+        assert!(projection.replay(&key,&state.epoch,0).await.unwrap().is_none());
+        assert_eq!(projection.replay(&key,&state.epoch,1).await.unwrap().unwrap().len(),128);
+        assert!(projection.replay(&key,"other_epoch",129).await.unwrap().is_none());
+        drop(projection);drop(store);scratch.discard().await;
     }
 }

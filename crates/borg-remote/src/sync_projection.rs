@@ -6,6 +6,9 @@ pub(super) struct Projector {pub reducer:ViewReducer,pub state:ProjectionCheckpo
 fn field_name(field:&borg_view::checkpoint::CheckpointTextField)->Result<String> {
     Ok(serde_json::to_value(field)?.as_str().ok_or_else(||anyhow::anyhow!("invalid text field"))?.to_owned())
 }
+fn preview(text:&mut String) {
+    if text.len()>4096 {let mut end=4096;while !text.is_char_boundary(end) {end-=1;}text.truncate(end);}
+}
 impl SyncAuthority {
     pub(super) async fn projector(&self,session:Uuid)->Result<Projector> {
         let key=scope_key(self.host,Some(session));
@@ -28,21 +31,32 @@ impl SyncAuthority {
         Ok(Projector{reducer,state,text_heads:HashMap::new()})
     }
     pub(super) async fn project(&self,projector:&mut Projector,event:crate::SessionEvent,live_revision:Option<u64>)->Result<()> {
-        let scope=Scope::Session{session_id:event.session_id.to_string()};
-        let key=scope_key(self.host,Some(event.session_id));
         let base=projector.reducer.cursor().clone();
         let sequence=event.sequence;
+        let event_id=event.id;
+        let source_session=event.session_id;
         let turn=match &event.kind {
             crate::SessionEventKind::TurnStarted{message_id,..}=>Some((*message_id,None)),
             crate::SessionEventKind::TurnCompleted{message_id,provider_session_id,final_text,error}=>Some((*message_id,Some((provider_session_id.clone(),final_text.clone(),error.clone())))),
             _=>None,
         };
         let ops=projector.reducer.apply(event);
+        self.persist_ops(projector,source_session,event_id,sequence,live_revision,base,ops,turn).await
+    }
+    async fn persist_ops(&self,projector:&mut Projector,source_session:Uuid,event_id:Uuid,sequence:u64,live_revision:Option<u64>,base:Cursor,ops:Vec<ViewOp>,turn:Option<(Uuid,Option<(Option<String>,String,Option<String>)>)>)->Result<()> {
+        let scope=Scope::Session{session_id:source_session.to_string()};
+        let key=scope_key(self.host,Some(source_session));
         let cursor=projector.reducer.cursor().clone();
+        let closed_rows=ops.iter().filter_map(|op|match op {
+            ViewOp::RowUpsert{row}=>match &row.body {
+                RowBody::Message{status,..}|RowBody::Reasoning{status,..}|RowBody::Tool{status,..}|RowBody::Diff{status,..} if matches!(status,borg_view::wire::Lifecycle::Complete|borg_view::wire::Lifecycle::Stopped|borg_view::wire::Lifecycle::Failed)=>Some(row.id.as_str()),
+                _=>None,
+            },_=>None,
+        }).collect::<std::collections::HashSet<_>>();
         let checkpoint=projector.reducer.checkpoint()?;
         let references=projector.reducer.checkpoint_texts();
         let text_fields=references.iter().map(|(reference,_)|field_name(&reference.field)).collect::<Result<Vec<_>>>()?;
-        let texts=references.iter().zip(&text_fields).filter(|((r,_),field)|projector.text_heads.get(&(r.row_id.clone(),(*field).clone()))!=Some(&(r.revision.clone(),r.bytes))).map(|((r,text),field)|(r.row_id.as_str(),field.as_str(),r.revision.as_str(),*text)).collect();
+        let texts=references.iter().zip(&text_fields).filter(|((r,_),field)|projector.text_heads.get(&(r.row_id.clone(),(*field).clone()))!=Some(&(r.revision.clone(),r.bytes))).map(|((r,text),field)|(r.row_id.as_str(),field.as_str(),r.revision.as_str(),*text,closed_rows.contains(r.row_id.as_str()))).collect();
         let next_heads=references.iter().zip(&text_fields).map(|((r,_),field)|((r.row_id.clone(),field.clone()),(r.revision.clone(),r.bytes))).collect();
         let mut metadata=Vec::new();
         for op in &ops {
@@ -50,7 +64,18 @@ impl SyncAuthority {
                 let mut row=row.clone();
                 match &mut row.body {
                     RowBody::Message{text,..}|RowBody::Reasoning{text,..}=>text.clear(),
-                    RowBody::Tool{input,output_preview,..}=>{*input=None;*output_preview=None;}
+                    RowBody::Tool{input,output_preview,..}=>{if let Some(text)=input {preview(text);}if let Some(text)=output_preview {preview(text);}}
+                    RowBody::TeamReport{text,..}=>text.clear(),
+                    RowBody::Diff{patch,..}=>patch.clear(),
+                    RowBody::ActionGroup{actions,..}=>for action in actions {
+                        use borg_view::wire::ActionRow;
+                        match action {
+                            ActionRow::Lifecycle{body,..}=>if let Some(text)=body {preview(text);},
+                            ActionRow::Information{text,..}|ActionRow::Activity{text}=>preview(text),
+                            ActionRow::Compaction{summary,..}=>preview(summary),
+                            _=>{}
+                        }
+                    },
                     _=>{}
                 }
                 let position=row.history_before.split(':').collect::<Vec<_>>();
@@ -71,17 +96,24 @@ impl SyncAuthority {
         let state=ProjectionCheckpoint {epoch:cursor.epoch.clone(),revision:cursor.revision.parse()?,source_sequence:projector.state.source_sequence.max(sequence as i64),source_live_revision:live_revision.map(|r|r as i64).unwrap_or(projector.state.source_live_revision),reducer:checkpoint};
         let mut turn_frames=Vec::new();
         let mut turn_encoded=None;
+        let mut final_payload=None;
         if let Some((message,completion))=turn {
             for command in self.ledger.prompt_commands(self.host,Uuid::parse_str(match &scope {Scope::Session{session_id}=>session_id,Scope::Host=>unreachable!()})?,message).await? {
                 let marker=match &completion {
                     None=>ServerFrame::TurnStarted{scope:scope.clone(),command_id:command.to_string(),message_id:message.to_string()},
-                    Some((provider,final_text,error))=>ServerFrame::TurnCompleted{scope:scope.clone(),command_id:command.to_string(),message_id:message.to_string(),provider_session_id:provider.clone(),final_text:final_text.clone(),error:error.clone(),usage:projector.reducer.turn_usage(&message).cloned()},
+                    Some((provider,final_text,error))=>{
+                        let final_text_asset=if final_text.len()>512*1024 {
+                            let (reference,payload)=assets::final_asset(source_session,event_id,final_text);
+                            final_payload=Some(payload);Some(reference)
+                        } else {None};
+                        ServerFrame::TurnCompleted{scope:scope.clone(),command_id:command.to_string(),message_id:message.to_string(),provider_session_id:provider.clone(),final_text:if final_text_asset.is_some(){String::new()}else{final_text.clone()},final_text_asset,error:error.clone(),usage:projector.reducer.turn_usage(&message).cloned()}
+                    },
                 };
                 turn_encoded=Some((message.to_string(),serde_json::to_vec(&marker)?));
                 turn_frames.push(marker);
             }
         }
-        self.projection.commit_full(&key,projector.state.revision,&state,&encoded,rows,texts,turn_encoded.as_ref().map(|(id,body)|(id.as_str(),body.as_slice()))).await?;
+        self.projection.commit_full(&key,projector.state.revision,&state,&encoded,rows,texts,turn_encoded.as_ref().map(|(id,body)|(id.as_str(),body.as_slice())),final_payload.as_ref().map(|(id,session,event,body)|(*id,*session,*event,body.as_slice()))).await?;
         projector.state=state;
         projector.text_heads=next_heads;
         let mut connections=self.connections.lock().await;
@@ -128,6 +160,8 @@ impl SyncAuthority {
             for (revision,event) in deltas {self.project(projector,event,Some(revision)).await?;}
             if count<128 {break}
         }
+        self.lift_child_metadata(session).await?;
+        self.publish_headline(session).await?;
         // Bound idle reducer memory independently from roster/thread count.
         let mut projectors=self.projectors.lock().await;
         if projectors.len()>128 {
@@ -137,6 +171,32 @@ impl SyncAuthority {
                 !connections.values().any(|connection|connection.subscriptions.contains_key(&key))
             });
             if let Some(id)=idle {projectors.remove(&id);}
+        }
+        Ok(())
+    }
+    async fn lift_child_metadata(&self,child:Uuid)->Result<()> {
+        let parent:Option<Uuid>=sqlx::query_scalar("select owner_session_id from sessions where id=$1").bind(child).fetch_one(&self.pg.pool).await?;
+        let Some(parent)=parent else{return Ok(())};
+        let mut projectors=self.projectors.lock().await;
+        let (child_cursor,child_meta)={let child=projectors.get(&child).ok_or_else(||anyhow::anyhow!("child projection missing"))?;(child.reducer.cursor().clone(),child.reducer.snapshot().meta)};
+        if !projectors.contains_key(&parent){projectors.insert(parent,self.projector(parent).await?);}
+        let projector=projectors.get_mut(&parent).expect("parent initialized");
+        if !projector.reducer.core.subagent_snapshots.contains_key(&child) {
+            let sequence:Option<i64>=sqlx::query_scalar("select sequence from session_events where session_id=$1 and subagent_session_id=$2 and event_kind='subagent_activity' order by sequence desc limit 1")
+                .bind(parent).bind(child).fetch_optional(&self.pg.pool).await?;
+            if let Some(sequence)=sequence {
+                for event in self.store.events_after(parent,sequence.saturating_sub(1) as u64,1).await? {
+                    if let crate::SessionEventKind::SubagentActivity{agent,..}=event.kind {
+                        let status=agent.status;
+                        projector.reducer.core.upsert_subagent_snapshot_with_status(&agent,status);
+                    }
+                }
+            } else {return Ok(())} // Parent creation notification will reconcile refs.
+        }
+        let base=projector.reducer.cursor().clone();
+        let ops=projector.reducer.apply_child_meta(child,child_cursor,&child_meta)?;
+        if !ops.is_empty() {
+            self.persist_ops(projector,parent,Uuid::nil(),projector.state.source_sequence as u64,None,base,ops,None).await?;
         }
         Ok(())
     }
@@ -222,7 +282,8 @@ pub(super) async fn run_publisher(weak:std::sync::Weak<SyncAuthority>,mut listen
 
 impl SyncAuthority {
     pub(super) async fn subscribe(&self,id:&str,claims:&ConnectionClaims,subscription:borg_view::wire::Subscription)->Result<()> {
-        let session=self.authorize(claims,&subscription.scope,false).await?.ok_or_else(||anyhow::anyhow!("host headline scope not available"))?;
+        if matches!(subscription.scope,Scope::Host){return self.subscribe_host(id,claims,subscription.after).await}
+        let session=self.authorize(claims,&subscription.scope,false).await?.ok_or_else(||anyhow::anyhow!("session scope required"))?;
         let key=scope_key(self.host,Some(session));
         // Publisher and subscription both lock projector before connections.
         // Register before reading tail, while publication for this scope is held.
@@ -249,6 +310,12 @@ impl SyncAuthority {
         Ok(())
     }
     pub(super) async fn history(&self,id:&str,claims:&ConnectionClaims,scope:Scope,before:String,limit:usize)->Result<()> {
+        if matches!(scope,Scope::Host) {
+            self.authorize(claims,&scope,false).await?;
+            let sessions=self.host_page(claims,Some(Uuid::parse_str(&before)?)).await?;
+            let before=sessions.last().map(|session|session.session_id.clone());
+            return self.emit(id,ServerFrame::HostHistoryPage{scope,sessions,before});
+        }
         let session=self.authorize(claims,&scope,false).await?.ok_or_else(||anyhow::anyhow!("history requires session scope"))?;
         ensure!((1..=75).contains(&limit),"history limit exceeds budget");
         let key=scope_key(self.host,Some(session));
@@ -259,7 +326,21 @@ impl SyncAuthority {
         let position=position.ok_or_else(||anyhow::anyhow!("unknown history anchor"))?;
         let page=crate::row_index::page(&self.pg.pool,&key,(position.0,position.1,position.2.as_str()),limit).await?;
         let mut rows=Vec::with_capacity(page.len());
-        for (_,_,_,metadata) in page {let row:borg_view::wire::Row=serde_json::from_slice(&metadata)?;rows.push(row);}
+        for (_,_,_,metadata) in page {
+            let mut row:borg_view::wire::Row=serde_json::from_slice(&metadata)?;
+            let field=match &row.body {
+                RowBody::Message{..}=>Some("message"),RowBody::Reasoning{..}=>Some("tool_input"),
+                RowBody::TeamReport{..}=>Some("action_body"),RowBody::Diff{..}=>Some("tool_input"),_=>None,
+            };
+            if let Some(field)=field {
+                if row.text_state.as_ref().is_none_or(|state|state.bytes!="0") {
+                    let (bytes,_)=crate::row_index::field_page(&self.pg.pool,&key,&row.id,field,0,4096).await?;
+                    let text=match std::str::from_utf8(&bytes) {Ok(text)=>text.to_owned(),Err(error) if error.error_len().is_none()=>std::str::from_utf8(&bytes[..error.valid_up_to()])?.to_owned(),Err(error)=>return Err(error.into())};
+                    match &mut row.body {RowBody::Message{text:body,..}|RowBody::Reasoning{text:body,..}|RowBody::TeamReport{text:body,..}=>*body=text,RowBody::Diff{patch,..}=>*patch=text,_=>{}}
+                }
+            }
+            rows.push(row);
+        }
         rows.reverse();
         let before=rows.first().map(|row|row.history_before.clone());
         self.emit(id,ServerFrame::HistoryPage{scope,rows,before})?;

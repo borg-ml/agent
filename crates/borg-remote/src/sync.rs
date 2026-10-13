@@ -13,6 +13,10 @@ pub struct ViewerCommand {
 }
 #[path="sync_projection.rs"]
 mod projector;
+#[path="sync_assets.rs"]
+mod assets;
+#[path="sync_host.rs"]
+mod host_index;
 
 #[derive(Clone)]
 enum ConnectionClaims { Device(TicketClaims), Service(crate::auth::ServiceTicketClaims) }
@@ -21,6 +25,8 @@ impl ConnectionClaims {
     fn epoch(&self)->u64 {match self {Self::Device(c)=>c.revocation_epoch,Self::Service(c)=>c.revocation_epoch}}
     fn host(&self)->&str {match self {Self::Device(c)=>&c.host_id,Self::Service(c)=>&c.host_id}}
     fn principal(&self)->&str {match self {Self::Device(c)=>&c.principal_id,Self::Service(c)=>&c.principal_id}}
+    fn allows(&self,session:Uuid)->bool {match self {Self::Device(c)=>c.session_ids.is_empty()||c.session_ids.iter().any(|id|id==&session.to_string()),Self::Service(c)=>c.session_id==session.to_string()}}
+    fn allowlist(&self)->Result<Option<Vec<Uuid>>> {match self {Self::Device(c) if c.session_ids.is_empty()=>Ok(None),Self::Device(c)=>Ok(Some(c.session_ids.iter().map(|id|Uuid::parse_str(id)).collect::<std::result::Result<Vec<_>,_>>()?)),Self::Service(c)=>Ok(Some(vec![Uuid::parse_str(&c.session_id)?]))}}
     fn device(&self)->Option<&str> {match self {Self::Device(c)=>Some(&c.device_id),Self::Service(_)=>None}}
 }
 struct Delivery { sent:Cursor, pending:VecDeque<(u64,usize)>, bytes:usize }
@@ -38,6 +44,7 @@ impl SyncAuthority {
         let authority=store.postgres_authority().ok_or_else(||anyhow::anyhow!("canonical host sync requires PostgreSQL authority"))?;
         let listener=authority.subscribe_committed().await?;
         let this=Arc::new(Self {host,epoch:AtomicU64::new(epoch),stopped:AtomicBool::new(false),relay_online:AtomicBool::new(false),catalog_recovery:Arc::new(AtomicBool::new(true)),publisher_wake:tokio::sync::Notify::new(),projection:ProjectionStore::open(authority.pool.clone()).await?,ledger:crate::command_ledger::CommandLedger::open(authority.pool.clone()).await?,pg:authority,projectors:Mutex::new(HashMap::new()),store,outbound,commands,direct_outputs:std::sync::RwLock::new(HashMap::new()),connections:Mutex::new(HashMap::new())});
+        this.initialize_host_index().await?;
         let weak=Arc::downgrade(&this);
         crate::host::spawn_transport_task(async move { projector::run_publisher(weak,listener).await; });
         Ok(this)
@@ -84,9 +91,9 @@ impl SyncAuthority {
         if let Ok(mut outputs)=self.direct_outputs.write() {outputs.remove(id);}
     }
     fn emit_scope(&self,id:&str,delivery:&mut Delivery,frame:ServerFrame)->Result<()> {
-        let cursor=match &frame {ServerFrame::Patch{base,cursor,..}=>{
+        let cursor=match &frame {ServerFrame::Patch{base,cursor,..}|ServerFrame::HostPatch{base,cursor,..}=>{
             ensure!(base==&delivery.sent,"scope delivery cursor gap");cursor.clone()
-        },ServerFrame::Snapshot{view,..}=>view.cursor.clone(),_=>return self.emit(id,frame)};
+        },ServerFrame::Snapshot{view,..}=>view.cursor.clone(),ServerFrame::HostSnapshot{cursor,..}=>cursor.clone(),_=>return self.emit(id,frame)};
         let bytes=serde_json::to_vec(&frame)?.len();
         ensure!(delivery.pending.len()<128 && delivery.bytes.checked_add(bytes).is_some_and(|n|n<=1_048_576),"unacknowledged scope budget exceeded");
         let revision=cursor.revision.parse::<u64>()?;
@@ -140,7 +147,7 @@ impl SyncAuthority {
         ensure!(!self.stopped.load(Ordering::Acquire) && claims.expiry()>chrono::Utc::now().timestamp() && claims.epoch()==self.epoch.load(Ordering::Acquire),"expired/revoked authority");
         let session=match scope {Scope::Host=>None,Scope::Session{session_id}=>Some(Uuid::parse_str(session_id)?)};
         match claims {
-            ConnectionClaims::Device(ticket)=>crate::admission::authorize_scope(ticket,session.as_ref().map(|s|s.to_string()).as_deref(),operate)?,
+            ConnectionClaims::Device(ticket)=>if session.is_some()||operate {crate::admission::authorize_scope(ticket,session.as_ref().map(|s|s.to_string()).as_deref(),operate)?},
             ConnectionClaims::Service(ticket)=>ensure!(!operate && session.map(|s|s.to_string()).as_deref()==Some(ticket.session_id.as_str()),"service authority is read-only exact-session"),
         }
         if let Some(session)=session {
@@ -170,7 +177,7 @@ impl SyncAuthority {
         ensure!(claims.expiry()>chrono::Utc::now().timestamp(),"expired viewer");
         match frame {
             ClientFrame::Command {command_id,scope,command}=>{
-                let session=self.authorize(&claims,&scope,!matches!(&command,Command::AssetPage{..})).await?;
+                let session=self.authorize(&claims,&scope,true).await?;
                 let id_uuid=Uuid::parse_str(&command_id)?;
                 let key=scope_key(self.host,session);
                 if let Some(bytes)=self.ledger.terminal(self.host,id_uuid,&key,claims.principal(),&serde_json::to_vec(&command)?).await? {
@@ -221,6 +228,7 @@ impl SyncAuthority {
                     self.emit(id,frame)?;
                 }
             }
+            ClientFrame::AssetPage{scope,request_id,asset_id,offset,max_bytes}=>self.asset_page(id,&claims,scope,request_id,asset_id,offset,max_bytes).await?,
             ClientFrame::SubscribeInbox{}=>return Err(anyhow::anyhow!("inbox is relay-only")),
             ClientFrame::Presence{scope,..}=>{self.authorize(&claims,&scope,false).await?;}
 

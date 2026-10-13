@@ -103,11 +103,11 @@ pub async fn initialize_text_fields(pool: &sqlx::PgPool) -> Result<()> {
 
 /// Persist only the newly appended suffix, or one explicit replacement at a
 /// lifecycle correction. Revision labels refer to the reducer's row version.
-pub async fn persist_text(tx: &mut Transaction<'_,Postgres>,scope:&str,id:&str,field:&str,revision:&str,text:&str)->Result<()> {
+pub async fn persist_text(tx: &mut Transaction<'_,Postgres>,scope:&str,id:&str,field:&str,revision:&str,text:&str,replace:bool)->Result<()> {
     let prior: Option<i64> = sqlx::query_scalar("select text_bytes from remote_view_text_heads where scope=$1 and row_id=$2 and field=$3 for update")
         .bind(scope).bind(id).bind(field).fetch_optional(&mut **tx).await?;
     let mut offset=prior.unwrap_or(0) as usize;
-    if offset>text.len() {
+    if replace || offset>text.len() {
         sqlx::query("delete from remote_view_field_chunks where scope=$1 and row_id=$2 and field=$3").bind(scope).bind(id).bind(field).execute(&mut **tx).await?;
         offset=0;
     }

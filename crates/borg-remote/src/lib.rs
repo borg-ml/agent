@@ -24,7 +24,7 @@ pub use command::{
 };
 pub use host::{
     DirectListenerConfig, HostConfig, HostExecutorFactory, enroll_host, login_provider, login_provider_with_output,
-    mirror_local_session, probe_capabilities, probe_provider_admission_capabilities,
+    mirror_local_session, register_existing_session, probe_capabilities, probe_provider_admission_capabilities,
     probe_provider_capabilities, provider_credentials_present,
     provider_subscription_credentials_present, run_host, run_host_with_executor_factory,
     sync_remote_session,
