@@ -5,7 +5,10 @@ description: "Build and test Cargo worktrees with bounded RAM, private targets a
 
 # Cargo native lane
 
-Run from the worktree root, not the canonical dirty checkout. The adapter is
+Use explicit `--project /absolute/worktree/root` for a worktree other than the
+session workspace. `borg call` invokes the session-scoped workflow: shell `cd`
+does not change its project default. Verify the submitted JobSpec `cwd` and
+target directory before treating a result as worktree evidence. The adapter is
 the `native` Blu workflow (`extensions/native/workflows/native.blu`), exposed
 as the tool `ext__native__run` and the command `/ext:native:run`. It takes one
 `arguments` string and needs no Python. As a tool, also pass a fresh
@@ -14,12 +17,15 @@ as the tool `ext__native__run` and the command `/ext:native:run`. It takes one
 It plans `cargo check|build|test` with `-j` (at most 6, from MemAvailable with
 an 8 GiB reserve plus 2 GiB fixed job overhead), sets `CARGO_TARGET_DIR` to
 this worktree's `target/` (a `--target-dir` outside the worktree is refused)
-and does not use `--release`. `BORG_NATIVE_MAX_JOBS=2` lowers both `-j` and its
+and does not use `--release`. Use `--jobs 2` in workflow arguments to lower both
+`-j` and lane RAM reservation. Shell environment prefixes on `borg call` do not
+configure the session-scoped workflow. `BORG_NATIVE_MAX_JOBS=2` set in the
+workflow host environment also lowers both `-j` and its
 lane RAM reservation; it cannot lower the 8 GiB admission floor. Raw Cargo
 flags go after `--`; test-harness flags need a second `--`.
 
 ```text
-/ext:native:run cargo test -p borg-agent-runtime -- -- --skip NAME
+/ext:native:run --project /absolute/worktree/root cargo test -p borg-agent-runtime -- -- --skip NAME
 /ext:native:run cargo check -- --workspace
 /ext:native:run --dry-run cargo build          # print the JobSpec only
 /ext:native:run postgres cargo test -p borg-agent-runtime
