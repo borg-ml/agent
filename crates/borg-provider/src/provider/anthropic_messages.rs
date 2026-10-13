@@ -1000,6 +1000,16 @@ pub(crate) fn apply_stream_event(
                     match field {
                         "text" => send_text(progress, text),
                         "thinking" if !state.defer_thinking => send_reasoning(progress, text),
+                        "thinking" | "signature"
+                            if block["type"] == "thinking" && !text.is_empty() =>
+                        {
+                            if let Some(sender) = progress {
+                                let _ = sender.send(ProviderProgress::Phase {
+                                    name: "transport_activity".into(),
+                                    input: Value::Null,
+                                });
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1873,9 +1883,14 @@ mod tests {
                     &json!({"index":index,"delta":{"type":"signature_delta","signature":format!("opaque-{index}")}}),
                     Some(&sender),
                 );
+                for _ in 0..2 {
+                    assert!(matches!(receiver.try_recv(),
+                        Ok(ProviderProgress::Phase { name, input })
+                        if name == "transport_activity" && input.is_null()));
+                }
                 assert!(
                     receiver.try_recv().is_err(),
-                    "do not select a channel before native classification"
+                    "hidden deltas must not expose text"
                 );
                 state.set_narration_block_indexes(&if index == 1 && classified {
                     json!([1])

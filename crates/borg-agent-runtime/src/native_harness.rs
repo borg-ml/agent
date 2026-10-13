@@ -3299,6 +3299,27 @@ async fn call_model_streaming(
     request: ModelTurnRequest,
     context: ModelStreamContext<'_>,
 ) -> Result<NativeModelOutcome> {
+    call_model_streaming_with_timeout(
+        model_client,
+        provider,
+        model,
+        effort,
+        request,
+        context,
+        crate::agent::stalled_reasoning_timeout(),
+    )
+    .await
+}
+
+async fn call_model_streaming_with_timeout(
+    model_client: &dyn NativeModelClient,
+    provider: crate::CodingProvider,
+    model: &str,
+    effort: Option<&str>,
+    request: ModelTurnRequest,
+    context: ModelStreamContext<'_>,
+    reasoning_timeout: Duration,
+) -> Result<NativeModelOutcome> {
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
     let call = model_client.model_turn(provider, model, effort, request, Some(progress_tx));
     tokio::pin!(call);
@@ -3309,6 +3330,8 @@ async fn call_model_streaming(
     let mut reasoning_accumulated = String::new();
     let mut last_reasoning_emit = Instant::now() - Duration::from_millis(50);
     let mut progress_open = true;
+    let mut saw_reasoning_output = false;
+    let mut last_provider_output = tokio::time::Instant::now();
     // A provider may complete the foreground model result while retaining a
     // progress sender for provider-owned background work. Do not let the
     // foreground result become a Ready status until that event stream closes.
@@ -3325,12 +3348,66 @@ async fn call_model_streaming(
             crate::agent::live_output_interval().saturating_sub(last_reasoning_emit.elapsed())
         });
         tokio::select! {
+            biased;
             result = &mut call, if completed.is_none() => {
                 completed = Some(result
                     .map(Box::new)
                     .map(NativeModelOutcome::Completed)
                     .map_err(anyhow::Error::new));
             }
+            control = next_control(context.controls), if !control_applied => match control {
+                Some(AgentTurnControl::Interrupt) => {
+                    // Escape still cancels immediately. It just no longer
+                    // leaves a half-written tool call as a live row.
+                    cancel_preparing_tool_calls(
+                        context.events,
+                        context.coding_provider,
+                        &mut preparing,
+                    )
+                    .await;
+                    completed = Some(Err(anyhow::anyhow!("native provider turn interrupted")));
+                    control_applied = true;
+                    progress_rx.close();
+                }
+                Some(control) => {
+                    let preempt =
+                        matches!(&control, AgentTurnControl::Steer { preempt: true, .. } | AgentTurnControl::Steer { human: true, .. });
+                    let Some(captured) = CapturedSteer::from_control(control) else {
+                        continue;
+                    };
+                    if captured.admission.is_recalled() {
+                        let _ = captured.ack.send(Err("steer was recalled before delivery".to_string()));
+                        continue;
+                    }
+                    if completed.is_some() {
+                        context.queued_steer.push(captured);
+                        if preempt {
+                            control_applied = true;
+                            progress_rx.close();
+                        }
+                        continue;
+                    }
+                    if !preempt {
+                        // Background input waits for the current response; it
+                        // must not repeatedly cancel useful foreground work.
+                        context.queued_steer.push(captured);
+                        continue;
+                    }
+                    // Preemption owes a terminal event for any tool preview
+                    // abandoned before execution.
+                    cancel_preparing_tool_calls(
+                        context.events,
+                        context.coding_provider,
+                        &mut preparing,
+                    )
+                    .await;
+                    completed = Some(Ok(NativeModelOutcome::Steered { captured, partial_text: String::new() }));
+                    // Stop generation, but drain already received deltas before returning.
+                    control_applied = true;
+                    progress_rx.close();
+                }
+                None => control_applied = true,
+            },
             () = tokio::time::sleep(pending_text_flush.unwrap_or_default()),
                 if pending_text_flush.is_some() =>
             {
@@ -3352,6 +3429,9 @@ async fn call_model_streaming(
                 last_reasoning_emit = Instant::now();
             }
             progress = progress_rx.recv(), if progress_open => {
+                if progress.is_some() {
+                    last_provider_output = tokio::time::Instant::now();
+                }
                 // The model wrote this text before whatever comes next, so it
                 // has to reach the screen first. Publishing the other event
                 // while a tail is withheld strands a truncated message until
@@ -3412,6 +3492,7 @@ async fn call_model_streaming(
                     {
                         if let Some(delta) = normalize_reasoning_delta(&mut reasoning_accumulated, &text)
                         {
+                            saw_reasoning_output = true;
                             pending_reasoning.push_str(&delta);
                             send(
                                 context.events,
@@ -3513,58 +3594,15 @@ async fn call_model_streaming(
                 None => progress_open = false,
                 }
             },
-            control = next_control(context.controls), if !control_applied => match control {
-                Some(AgentTurnControl::Interrupt) => {
-                    // Escape still cancels immediately. It just no longer
-                    // leaves a half-written tool call as a live row.
-                    cancel_preparing_tool_calls(
-                        context.events,
-                        context.coding_provider,
-                        &mut preparing,
-                    )
-                    .await;
-                    completed = Some(Err(anyhow::anyhow!("native provider turn interrupted")));
-                    control_applied = true;
-                    progress_rx.close();
-                }
-                Some(control) => {
-                    let preempt =
-                        matches!(&control, AgentTurnControl::Steer { preempt: true, .. } | AgentTurnControl::Steer { human: true, .. });
-                    let Some(captured) = CapturedSteer::from_control(control) else {
-                        continue;
-                    };
-                    if captured.admission.is_recalled() {
-                        let _ = captured.ack.send(Err("steer was recalled before delivery".to_string()));
-                        continue;
-                    }
-                    if completed.is_some() {
-                        context.queued_steer.push(captured);
-                        if preempt {
-                            control_applied = true;
-                            progress_rx.close();
-                        }
-                        continue;
-                    }
-                    if !preempt {
-                        // Background input waits for the current response; it
-                        // must not repeatedly cancel useful foreground work.
-                        context.queued_steer.push(captured);
-                        continue;
-                    }
-                    // Preemption owes a terminal event for any tool preview
-                    // abandoned before execution.
-                    cancel_preparing_tool_calls(
-                        context.events,
-                        context.coding_provider,
-                        &mut preparing,
-                    )
-                    .await;
-                    completed = Some(Ok(NativeModelOutcome::Steered { captured, partial_text: String::new() }));
-                    // Stop generation, but drain already received deltas before returning.
-                    control_applied = true;
-                    progress_rx.close();
-                }
-                None => {}
+            () = tokio::time::sleep(reasoning_timeout.saturating_sub(last_provider_output.elapsed())),
+                if saw_reasoning_output && completed.is_none() =>
+            {
+                completed = Some(Err(anyhow::anyhow!(
+                    "the model stopped responding after {}s of reasoning; the turn was cancelled",
+                    reasoning_timeout.as_secs()
+                )));
+                control_applied = true;
+                progress_rx.close();
             }
         }
 
@@ -7371,6 +7409,134 @@ mod tests {
         assert!(grace.load(std::sync::atomic::Ordering::Relaxed));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn native_reasoning_stall_cancels_but_provider_activity_keeps_it_live() {
+        struct Waiting {
+            progress: Mutex<Option<mpsc::UnboundedSender<ProviderProgress>>>,
+        }
+        #[async_trait]
+        impl NativeModelClient for Waiting {
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                _request: ModelTurnRequest,
+                progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                *self.progress.lock().unwrap() = progress;
+                std::future::pending().await
+            }
+        }
+        for active in [false, true] {
+            let client = Arc::new(Waiting {
+                progress: Mutex::new(None),
+            });
+            let (events, mut receiver) = mpsc::channel(64);
+            let (controls_tx, controls_rx) = mpsc::channel(1);
+            let cloned = client.clone();
+            let task = tokio::spawn(async move {
+                let mut controls = Some(controls_rx);
+                let mut queued = Vec::new();
+                call_model_streaming_with_timeout(
+                    cloned.as_ref(),
+                    crate::CodingProvider::Codex,
+                    "test",
+                    None,
+                    ModelTurnRequest {
+                        fast: false,
+                        ultrafast: false,
+                        request_id: None,
+                        session_id: None,
+                        prompt_cache_key: None,
+                        turn_routing: Default::default(),
+                        messages: Vec::new(),
+                        tools: Vec::new(),
+                        output_schema: None,
+                    },
+                    ModelStreamContext {
+                        coding_provider: crate::CodingProvider::Codex,
+                        assistant_message_id: Uuid::new_v4(),
+                        events: &events,
+                        controls: &mut controls,
+                        queued_steer: &mut queued,
+                        grace_wrapup: None,
+                    },
+                    Duration::from_millis(100),
+                )
+                .await
+            });
+            tokio::task::yield_now().await;
+            let progress = client.progress.lock().unwrap().take().unwrap();
+            // Silence without exposed reasoning must never arm the guard.
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(!task.is_finished());
+            progress
+                .send(ProviderProgress::ProviderEvent {
+                    kind: "reasoning_delta".into(),
+                    payload: json!({"text": "thinking"}),
+                    raw_payload: Box::new(None),
+                    stream_channel: None,
+                    content_text: None,
+                    provider_item_id: None,
+                    tool_use_id: None,
+                    tool_name: None,
+                    model: None,
+                    effort: None,
+                })
+                .unwrap();
+            progress
+                .send(ProviderProgress::ToolCallGenerating {
+                    id: Some("call".into()),
+                })
+                .unwrap();
+            progress
+                .send(ProviderProgress::Bytes {
+                    stream: ProviderProgressStream::Stdout,
+                    chunk: b"partial".to_vec(),
+                })
+                .unwrap();
+            tokio::task::yield_now().await;
+            if active {
+                for _ in 0..4 {
+                    tokio::time::advance(Duration::from_millis(60)).await;
+                    progress
+                        .send(ProviderProgress::Phase {
+                            name: "transport_activity".into(),
+                            input: Value::Null,
+                        })
+                        .unwrap();
+                    tokio::task::yield_now().await;
+                    assert!(
+                        !task.is_finished(),
+                        "any provider activity resets the deadline"
+                    );
+                }
+                controls_tx.send(AgentTurnControl::Interrupt).await.unwrap();
+            } else {
+                tokio::time::advance(Duration::from_millis(101)).await;
+            }
+            let error = task.await.unwrap().err().unwrap().to_string();
+            assert!(error.contains(if active {
+                "interrupted"
+            } else {
+                "stopped responding"
+            }));
+            let mut emitted = Vec::new();
+            while let Some(event) = receiver.recv().await {
+                emitted.push(event);
+            }
+            assert!(emitted.iter().any(|event| matches!(event,
+                SessionEventKind::Message { text, .. } if text == "partial")));
+            assert!(emitted.iter().any(|event| matches!(event,
+                SessionEventKind::ProviderEvent { kind, .. } if kind == "action/preparing_cancelled")));
+            assert!(
+                progress.is_closed(),
+                "generation receiver closes on cancellation"
+            );
+        }
+    }
+
     #[derive(Clone)]
     struct HoldingProgressClient {
         held_progress: Arc<Mutex<Option<mpsc::UnboundedSender<ProviderProgress>>>>,
@@ -7387,6 +7553,20 @@ mod tests {
             progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
         ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
             let progress = progress.expect("native streaming always supplies progress");
+            progress
+                .send(ProviderProgress::ProviderEvent {
+                    kind: "reasoning_delta".into(),
+                    payload: json!({"text": "thinking"}),
+                    raw_payload: Box::new(None),
+                    stream_channel: None,
+                    content_text: None,
+                    provider_item_id: None,
+                    tool_use_id: None,
+                    tool_name: None,
+                    model: None,
+                    effort: None,
+                })
+                .unwrap();
             progress
                 .send(ProviderProgress::ProviderEvent {
                     kind: "background_task_live".to_string(),
@@ -7446,7 +7626,7 @@ mod tests {
         let mut task = tokio::spawn(async move {
             let mut controls = Some(controls_rx);
             let mut queued_steer = Vec::new();
-            let outcome = call_model_streaming(
+            let outcome = call_model_streaming_with_timeout(
                 &client,
                 crate::CodingProvider::OpenRouter,
                 "test-model",
@@ -7470,6 +7650,7 @@ mod tests {
                     queued_steer: &mut queued_steer,
                     grace_wrapup: None,
                 },
+                Duration::from_millis(1),
             )
             .await;
             (outcome, queued_steer)
@@ -7518,6 +7699,10 @@ mod tests {
         assert!(!queued_steer[0].admission.is_accepted());
         assert!(received.try_recv().is_err());
         held_progress.lock().unwrap().take();
+        assert!(matches!(events_rx.recv().await,
+            Some(SessionEventKind::ReasoningTextDelta { delta }) if delta == "thinking"));
+        assert!(matches!(events_rx.recv().await,
+            Some(SessionEventKind::ReasoningDelta { text }) if text == "thinking"));
         assert!(matches!(
             events_rx.recv().await,
             Some(SessionEventKind::ProviderEvent {
