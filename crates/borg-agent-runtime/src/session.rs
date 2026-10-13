@@ -3375,6 +3375,21 @@ async fn run_agent_session_store_kernel_inner(
                                 };
                 match command {
                     Some(HostCommand::TeamPrompt {
+                        session_id: child,
+                        message_id,
+                        ..
+                    }) if child != session_id && owns_team => {
+                        if let Err(error) = subagents
+                            .as_ref()
+                            .expect("team manager")
+                            .deliver_child_message(child, message_id)
+                            .await
+                        {
+                            tracing::warn!(%child, %message_id, %error, "child message handoff failed");
+                        }
+                        continue;
+                    }
+                    Some(HostCommand::TeamPrompt {
                         session_id: command_session_id,
                         message_id,
                         text,
@@ -6119,6 +6134,12 @@ async fn run_agent_session_store_kernel_inner(
                         return Ok(());
                     };
                     if command.session_id() != Some(session_id) {
+                        if owns_team && let HostCommand::TeamPrompt { session_id: child, message_id, .. } = command {
+                            if let Err(error) = subagents.as_ref().expect("team manager")
+                                .deliver_child_message(child, message_id).await {
+                                tracing::warn!(%child, %message_id, %error, "child message handoff failed");
+                            }
+                        }
                         continue;
                     }
                     match command {
@@ -6205,6 +6226,7 @@ async fn run_agent_session_store_kernel_inner(
                                 let team = matches!(waiting, HostCommand::TeamPrompt { .. });
                                 match waiting {
                                     HostCommand::TeamPrompt {
+                                        session_id: command_session_id,
                                         message_id,
                                         text,
                                         attachments,
@@ -6213,13 +6235,14 @@ async fn run_agent_session_store_kernel_inner(
                                         ..
                                     }
                                     | HostCommand::Prompt {
+                                        session_id: command_session_id,
                                         message_id,
                                         text,
                                         attachments,
                                         output_schema,
                                         delivery,
                                         ..
-                                    } if steers_active_provider_turn(
+                                    } if command_session_id == session_id && steers_active_provider_turn(
                                         launch.provider,
                                         delivery,
                                         executor.uses_native_harness(launch.provider),

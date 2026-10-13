@@ -1498,6 +1498,11 @@ pub trait SessionStore: Send + Sync {
         cursors: &HashMap<Uuid, u64>,
     ) -> Result<()>;
     async fn register_child_session(&self, owner_session_id: Uuid, session_id: Uuid) -> Result<()>;
+    /// The manager at the top of the canonical ownership chain, not a workspace
+    /// or a fork ancestor. Hosted children do not have their own control socket.
+    async fn owning_root_session(&self, _session_id: Uuid) -> Result<Option<Uuid>> {
+        Ok(None)
+    }
     /// Read-only ownership scope, not fork lineage or workspace membership.
     async fn is_descendant(&self, _parent: Uuid, _target: Uuid) -> Result<bool> {
         Ok(false)

@@ -3972,6 +3972,470 @@ async fn independent_sessions_share_workspace_broadcasts_exactly_once() {
     scratch.discard().await;
 }
 
+// A hosted child has no socket. Exercise the real root socket and both root
+// actor loops; type checking cannot catch delivery into the wrong journal or
+// a retry executing twice. No provider is called by this executor.
+#[cfg(unix)]
+#[tokio::test]
+async fn cross_workspace_child_messages_use_the_root_manager_and_child_journal() {
+    let directory = tempfile::Builder::new()
+        .prefix("borg-child-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = Uuid::new_v4();
+    let sender = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(sender).await.unwrap();
+    bind_test_team(directory.path(), store.as_ref(), sender, &[]).await;
+    let mut request = launch();
+    request.cwd = directory.path().to_path_buf();
+    let executor = Arc::new(ControlledPeerExecutor {
+        calls: Arc::new(AtomicUsize::new(0)),
+        first_started: Arc::new(tokio::sync::Notify::new()),
+        release_first: Arc::new(tokio::sync::Notify::new()),
+    });
+    let sender_team = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        sender,
+        request.clone(),
+        2,
+        executor.clone(),
+        store.clone(),
+    )
+    .unwrap();
+    let writer =
+        crate::SessionWriterLease::acquire(directory.path().join(format!("{root}.lock"))).unwrap();
+    let socket = crate::session_control_socket_path(directory.path(), root);
+    let (commands, receiver) = mpsc::channel(64);
+    let (events, mut output) = mpsc::channel(1024);
+    let server = crate::LocalSessionControlServer::start_with_durable_prompt_admissions(
+        socket.clone(),
+        root,
+        &writer,
+        commands.clone(),
+        None,
+        store.clone(),
+    )
+    .unwrap();
+    let actor_root = directory.path().to_path_buf();
+    let actor_store = store.clone();
+    let actor_executor = executor.clone();
+    let actor = tokio::spawn(async move {
+        crate::run_agent_session_with_store_and_writer(
+            &actor_root,
+            root,
+            request,
+            receiver,
+            events,
+            actor_executor,
+            actor_store,
+            writer,
+        )
+        .await
+    });
+    async fn next(output: &mut mpsc::Receiver<SessionEvent>) -> SessionEvent {
+        tokio::time::timeout(Duration::from_secs(20), output.recv())
+            .await
+            .unwrap()
+            .expect("root actor ended")
+    }
+    loop {
+        if matches!(
+            next(&mut output).await.kind,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    let ensure_id = Uuid::new_v4();
+    commands
+        .send(HostCommand::Subagent {
+            session_id: root,
+            action: crate::SubagentAction::Ensure {
+                request_id: ensure_id,
+                task_name: "recipient".into(),
+                provider: CodingProvider::Codex,
+                model: Some(
+                    CodingProvider::Codex
+                        .model_catalog()
+                        .unwrap()
+                        .default_model
+                        .into(),
+                ),
+                effort: Some("high".into()),
+            },
+        })
+        .await
+        .unwrap();
+    let child = loop {
+        if let SessionEventKind::SubagentControl {
+            request_id,
+            outcome,
+        } = next(&mut output).await.kind
+            && request_id == ensure_id
+        {
+            let crate::SubagentControlOutcome::Accepted { agent } = outcome else {
+                panic!("child ensure failed: {outcome:?}");
+            };
+            break agent.session_id;
+        }
+    };
+    assert_eq!(store.owning_root_session(child).await.unwrap(), Some(root));
+    assert!(!crate::session_control_socket_path(directory.path(), child).exists());
+
+    // Hold a root turn while its manager delivers to the child. The root must
+    // not consume the child's prompt or wait for its own model turn to finish.
+    let started = executor.first_started.notified();
+    let root_message_id = Uuid::new_v4();
+    commands
+        .send(HostCommand::Prompt {
+            session_id: root,
+            message_id: root_message_id,
+            text: "hold root turn".into(),
+            attachments: vec![],
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), started)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for active in [true, false] {
+        if !active {
+            executor.release_first.notify_one();
+            loop {
+                if matches!(
+                    next(&mut output).await.kind,
+                    SessionEventKind::StatusChanged {
+                        status: SessionStatus::Ready,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        }
+        let message_id = if active {
+            let (message, receipt) = sender_team
+                .persist_team_message(
+                    sender,
+                    child,
+                    "/root",
+                    "child handoff while root steers",
+                    PromptDelivery::Steer,
+                    DeliveryMode::Wake,
+                    TeamMessageOptions::default(),
+                )
+                .await
+                .unwrap();
+            // Both sends are synchronous: the root's steer batch must leave
+            // the child's following handoff for its own session dispatch.
+            let mut permits = commands.reserve_many(2).await.unwrap();
+            permits.next().unwrap().send(HostCommand::Prompt {
+                session_id: root,
+                message_id: root_message_id,
+                text: "hold root turn".into(),
+                attachments: vec![],
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            });
+            permits.next().unwrap().send(HostCommand::TeamPrompt {
+                session_id: child,
+                message_id: message.message_id,
+                text: message.text,
+                attachments: message.attachments,
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            });
+            receipt.unwrap().message_id
+        } else {
+            let receipt = sender_team.call_tool_as(sender, "followup_task", json!({
+                "target": format!("participant:{child}"), "message": "child handoff while root idle"
+            })).await.unwrap();
+            assert_eq!(receipt["delivery_state"], "dispatched");
+            serde_json::from_value(receipt["message_id"].clone()).unwrap()
+        };
+        ids.push(message_id);
+        // Retry carries no new authority or content, including local file paths.
+        let retry = HostCommand::TeamPrompt {
+            session_id: child,
+            message_id,
+            text: "forged wire content".into(),
+            attachments: vec![PathBuf::from("/must/not/open")],
+            output_schema: Some(json!({"forged": true})),
+            delivery: PromptDelivery::Queue,
+        };
+        crate::send_local_session_command(&socket, child, retry.clone())
+            .await
+            .unwrap();
+        loop {
+            let event = next(&mut output).await;
+            if let SessionEventKind::SubagentActivity {
+                event: Some(event), ..
+            } = event.kind
+                && matches!(event.kind, SessionEventKind::TurnCompleted { message_id: id, error: None, .. } if id == message_id)
+            {
+                break;
+            }
+        }
+        crate::send_local_session_command(&socket, child, retry)
+            .await
+            .unwrap();
+        assert!(store.contains_message(child, message_id).await.unwrap());
+        assert!(!store.contains_message(root, message_id).await.unwrap());
+    }
+    commands
+        .send(HostCommand::Stop { session_id: root })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), actor)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        executor.calls.load(Ordering::SeqCst),
+        3,
+        "one root turn and one turn per durable child message"
+    );
+    let history = store.read(child).await.unwrap();
+    for id in ids {
+        assert_eq!(history.iter().filter(|event| matches!(event.kind, SessionEventKind::TurnStarted { message_id, .. } if message_id == id)).count(), 1);
+        assert!(history.iter().any(|event| matches!(&event.kind, SessionEventKind::Message {
+            message_id, actor: EventActor::System, text, attachments, ..
+        } if *message_id == id && text.contains(&format!("participant:{sender}")) && !text.contains("forged") && attachments.is_empty())));
+    }
+    drop(server);
+    scratch.discard().await;
+}
+
+// The socket exception is message-only and rooted in canonical ownership, not
+// workspace membership. These checks guard a new control-plane trust boundary.
+#[cfg(unix)]
+#[tokio::test]
+async fn child_message_handoff_is_message_only_and_preserves_idle_delivery() {
+    let directory = tempfile::Builder::new()
+        .prefix("borg-child-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = Uuid::new_v4();
+    let sender = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    for id in [root, sender] {
+        store.create_session(id).await.unwrap();
+    }
+    let team = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        4,
+        Arc::new(RecordingPeerExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+    let sender_team = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        sender,
+        launch(),
+        4,
+        Arc::new(RecordingPeerExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+    let (parent, child) = {
+        let mut table = team.table.lock().await;
+        let parent = table.reserve("parent", &launch()).unwrap().session_id;
+        let child = table
+            .reserve_as(parent, "recipient", &launch())
+            .unwrap()
+            .session_id;
+        table.entries.get_mut(&child).unwrap().snapshot.status = SubagentStatus::Ready;
+        (parent, child)
+    };
+    bind_test_team(directory.path(), store.as_ref(), root, &[parent]).await;
+    bind_test_team(directory.path(), store.as_ref(), sender, &[]).await;
+    let child_workspace = Uuid::new_v4();
+    store
+        .create_session_in_workspace(child, child_workspace)
+        .await
+        .unwrap();
+    store
+        .workspace_store()
+        .await
+        .unwrap()
+        .unwrap()
+        .ensure_execution_workspace(
+            child_workspace,
+            "different workspace",
+            crate::local_human_participant_id("Human"),
+            "Human",
+            child,
+            "Worker",
+        )
+        .await
+        .unwrap();
+    store.register_child_session(parent, child).await.unwrap();
+    team.join_team_workspace(child, "/root/parent/recipient")
+        .await
+        .unwrap();
+    assert_eq!(store.owning_root_session(child).await.unwrap(), Some(root));
+    let writer =
+        crate::SessionWriterLease::acquire(directory.path().join(format!("{root}.lock"))).unwrap();
+    let socket = crate::session_control_socket_path(directory.path(), root);
+    let (commands, mut receiver) = mpsc::channel(8);
+    let _server = crate::LocalSessionControlServer::start_with_durable_prompt_admissions(
+        socket.clone(),
+        root,
+        &writer,
+        commands,
+        None,
+        store.clone(),
+    )
+    .unwrap();
+    let receipt = sender_team.call_tool_as(sender, "send_message", json!({
+        "target": format!("participant:{child}"), "message": "idle notification", "wake": false, "delivery": "queue"
+    })).await.unwrap();
+    assert_eq!(receipt["delivery_state"], "dispatched");
+    let message_id: Uuid = serde_json::from_value(receipt["message_id"].clone()).unwrap();
+    assert!(
+        matches!(receiver.recv().await.unwrap(), HostCommand::TeamPrompt { session_id, message_id: id, .. } if session_id == child && id == message_id)
+    );
+    for _ in 0..2 {
+        team.deliver_child_message(child, message_id).await.unwrap();
+    }
+    {
+        let table = team.table.lock().await;
+        let entry = &table.entries[&child];
+        assert!(entry.commands.is_none());
+        assert_eq!(entry.inbox.len(), 1);
+        assert_eq!(entry.inbox[0].delivery, PromptDelivery::Queue);
+    }
+    assert!(!store.contains_message(child, message_id).await.unwrap());
+    let handoff = |session_id, message_id| HostCommand::TeamPrompt {
+        session_id,
+        message_id,
+        text: "ignored".into(),
+        attachments: vec![],
+        output_schema: None,
+        delivery: PromptDelivery::Steer,
+    };
+    for command in [
+        HostCommand::Prompt {
+            session_id: child,
+            message_id,
+            text: "not authorized".into(),
+            attachments: vec![],
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        },
+        HostCommand::Stop { session_id: child },
+        HostCommand::Configure {
+            session_id: child,
+            action: crate::SessionConfigAction::SetEffort {
+                effort: "low".into(),
+            },
+        },
+        handoff(sender, message_id),    // unrelated session
+        handoff(parent, message_id),    // owned, but not this message's audience
+        handoff(child, Uuid::new_v4()), // not a durable message
+    ] {
+        assert!(
+            crate::send_local_session_command(&socket, command.session_id().unwrap(), command)
+                .await
+                .is_err()
+        );
+    }
+    assert!(receiver.try_recv().is_err());
+    // A later wake drains the already queued notification without relabeling it.
+    let (child_commands, mut child_receiver) = mpsc::channel(4);
+    let followup = sender_team
+        .route_followup_task_with_options_as(
+            sender,
+            &format!("participant:{child}"),
+            "wake queued work",
+            TeamMessageOptions::default(),
+        )
+        .await
+        .unwrap()
+        .receipt
+        .unwrap();
+    {
+        let mut table = team.table.lock().await;
+        table.max_children = 0;
+        table.entries.get_mut(&child).unwrap().dormant = true;
+    }
+    assert!(
+        team.deliver_child_message(child, followup.message_id)
+            .await
+            .is_err()
+    );
+    {
+        let mut table = team.table.lock().await;
+        let entry = table.entries.get_mut(&child).unwrap();
+        assert_eq!(
+            entry.inbox.len(),
+            2,
+            "failed wake preserves both durable identities"
+        );
+        entry.commands = Some(child_commands);
+        entry.dormant = false;
+    }
+    team.deliver_child_message(child, followup.message_id)
+        .await
+        .unwrap();
+    for (expected_id, expected_delivery) in [
+        (message_id, PromptDelivery::Queue),
+        (followup.message_id, PromptDelivery::Steer),
+    ] {
+        assert!(
+            matches!(child_receiver.try_recv().unwrap(), HostCommand::TeamPrompt { message_id, delivery, .. }
+            if message_id == expected_id && delivery == expected_delivery)
+        );
+    }
+    team.table
+        .lock()
+        .await
+        .entries
+        .get_mut(&child)
+        .unwrap()
+        .commands = None;
+    let wake = sender_team
+        .route_followup_task_with_options_as(
+            sender,
+            &format!("participant:{child}"),
+            "do not restart a stopped worker",
+            TeamMessageOptions::default(),
+        )
+        .await
+        .unwrap()
+        .receipt
+        .unwrap();
+    team.table
+        .lock()
+        .await
+        .entries
+        .get_mut(&child)
+        .unwrap()
+        .snapshot
+        .status = SubagentStatus::Stopped;
+    team.deliver_child_message(child, wake.message_id)
+        .await
+        .unwrap();
+    assert!(team.table.lock().await.entries[&child].commands.is_none());
+    assert_eq!(
+        team.table.lock().await.entries[&child].snapshot.status,
+        SubagentStatus::Stopped
+    );
+    scratch.discard().await;
+}
+
 #[tokio::test]
 async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel() {
     #[cfg(unix)]

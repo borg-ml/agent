@@ -1294,7 +1294,39 @@ async fn handle_control_connection(
         }
         let command: HostCommand = serde_json::from_slice(&payload)?;
         if command.session_id() != Some(session_id) {
-            bail!("command targets a different session");
+            // The real manager may carry a durable message to its child, but
+            // this exception grants no child prompt/configuration/control authority.
+            let HostCommand::TeamPrompt {
+                session_id: child_id,
+                message_id,
+                ..
+            } = &command
+            else {
+                bail!("command targets a different session");
+            };
+            let store = store
+                .as_ref()
+                .context("child delivery requires a durable journal")?;
+            anyhow::ensure!(
+                store.owning_root_session(*child_id).await? == Some(session_id),
+                "message targets a child of a different manager"
+            );
+            let binding = store
+                .workspace_binding(*child_id)
+                .await?
+                .context("child has no workspace binding")?;
+            let workspace = store
+                .workspace_store()
+                .await?
+                .context("child delivery requires a workspace journal")?;
+            anyhow::ensure!(
+                workspace
+                    .message_deliveries(*message_id)
+                    .await?
+                    .iter()
+                    .any(|delivery| delivery.recipient_id == binding.participant_id),
+                "message is not addressed to this child"
+            );
         }
         anyhow::ensure!(
             !matches!(command, HostCommand::RecoverPendingInput { .. }),

@@ -4414,49 +4414,53 @@ impl SubagentCoordinator {
                 let WorkspaceEventKind::Message { message, .. } = event.kind else {
                     continue;
                 };
-                let (actor, reply_target) =
-                    match self.task_name_for_session(message.author_id).await {
-                        Ok(task_name) => (task_name.clone(), task_name),
-                        Err(_) => (
-                            workspace_store
-                                .participant(message.author_id)
-                                .await?
-                                .map(|participant| {
-                                    format!("{} ({})", participant.display_name, message.author_id)
-                                })
-                                .unwrap_or_else(|| message.author_id.to_string()),
-                            format!("participant:{}", message.author_id),
-                        ),
-                    };
-                // Replay resolves the captured bytes from this host's store,
-                // which is why a message still delivers its images long after
-                // the sender's original file is gone.
-                let attachments =
-                    resolve_message_attachments(&self.journal_root, &message.body.attachments)
-                        .await?;
                 messages.push((
                     ordering,
-                    TeamInboxMessage {
-                        message_id: message.id,
-                        text: attributed_team_message(
-                            &actor,
-                            &reply_target,
-                            &message.body.text,
-                            Some(message.id),
-                        ),
-                        report_text: message.body.text,
-                        sender_session_id: message.author_id,
-                        delivery: match delivery.mode {
-                            DeliveryMode::Boundary | DeliveryMode::Wake => PromptDelivery::Steer,
-                            DeliveryMode::NextTurn | DeliveryMode::Notify => PromptDelivery::Queue,
-                        },
-                        attachments,
-                    },
+                    self.workspace_inbox_message(message, delivery.mode).await?,
                 ));
             }
         }
         messages.sort_by_key(|(ordering, _)| *ordering);
         Ok(messages.into_iter().map(|(_, message)| message).collect())
+    }
+
+    async fn workspace_inbox_message(
+        &self,
+        message: crate::workspace::WorkspaceMessage,
+        mode: DeliveryMode,
+    ) -> Result<TeamInboxMessage> {
+        let (actor, reply_target) = match self.task_name_for_session(message.author_id).await {
+            Ok(task_name) => (task_name.clone(), task_name),
+            Err(_) => (
+                self.workspace_store()
+                    .await?
+                    .participant(message.author_id)
+                    .await?
+                    .map(|participant| {
+                        format!("{} ({})", participant.display_name, message.author_id)
+                    })
+                    .unwrap_or_else(|| message.author_id.to_string()),
+                format!("participant:{}", message.author_id),
+            ),
+        };
+        let attachments =
+            resolve_message_attachments(&self.journal_root, &message.body.attachments).await?;
+        Ok(TeamInboxMessage {
+            message_id: message.id,
+            text: attributed_team_message(
+                &actor,
+                &reply_target,
+                &message.body.text,
+                Some(message.id),
+            ),
+            report_text: message.body.text,
+            sender_session_id: message.author_id,
+            delivery: match mode {
+                DeliveryMode::Boundary | DeliveryMode::Wake => PromptDelivery::Steer,
+                DeliveryMode::NextTurn | DeliveryMode::Notify => PromptDelivery::Queue,
+            },
+            attachments,
+        })
     }
 
     pub(crate) async fn unread_messages_for_session(
@@ -6463,36 +6467,8 @@ impl SubagentCoordinator {
             .session_message_needs_relay(actor_session_id, id)
             .await?;
         if local_id.is_none() {
-            let socket_path = crate::session_control_socket_path(&self.journal_root, id);
             let dispatched_locally =
-                if !relay_pending && tokio::fs::try_exists(&socket_path).await.unwrap_or(false) {
-                    match crate::send_local_session_command(
-                        &socket_path,
-                        id,
-                        HostCommand::TeamPrompt {
-                            session_id: id,
-                            message_id: inbox_message.message_id,
-                            text: inbox_message.text.clone(),
-                            attachments: inbox_message.attachments.clone(),
-                            output_schema: None,
-                            delivery: inbox_message.delivery,
-                        },
-                    )
-                    .await
-                    {
-                        Ok(()) => true,
-                        Err(error) => {
-                            tracing::debug!(
-                                %error,
-                                target_session_id = %id,
-                                "durable session message awaits the recipient boundary"
-                            );
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
+                !relay_pending && self.dispatch_session_message(id, inbox_message).await;
             return Ok(RoutedTeamMessage {
                 receipt,
                 dispatched_locally,
@@ -6662,36 +6638,8 @@ impl SubagentCoordinator {
             .session_message_needs_relay(actor_session_id, id)
             .await?;
         if local_id.is_none() {
-            let socket_path = crate::session_control_socket_path(&self.journal_root, id);
             let dispatched_locally =
-                if !relay_pending && tokio::fs::try_exists(&socket_path).await.unwrap_or(false) {
-                    match crate::send_local_session_command(
-                        &socket_path,
-                        id,
-                        HostCommand::TeamPrompt {
-                            session_id: id,
-                            message_id: inbox_message.message_id,
-                            text: inbox_message.text,
-                            attachments: inbox_message.attachments,
-                            output_schema: None,
-                            delivery: PromptDelivery::Steer,
-                        },
-                    )
-                    .await
-                    {
-                        Ok(()) => true,
-                        Err(error) => {
-                            tracing::debug!(
-                                %error,
-                                target_session_id = %id,
-                                "durable follow-up awaits the recipient boundary"
-                            );
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
+                !relay_pending && self.dispatch_session_message(id, inbox_message).await;
             return Ok(RoutedTeamMessage {
                 receipt,
                 dispatched_locally,
@@ -6733,6 +6681,138 @@ impl SubagentCoordinator {
             relay_pending,
             awaiting_wake: false,
         })
+    }
+
+    async fn dispatch_session_message(&self, session_id: Uuid, message: TeamInboxMessage) -> bool {
+        // Persistence already succeeded. A failed best-effort handoff must
+        // not hide the receipt and invite a second message with a new ID.
+        let result: Result<()> = async {
+            let owner = self
+                .store
+                .owning_root_session(session_id)
+                .await?
+                .unwrap_or(session_id);
+            let socket = crate::session_control_socket_path(&self.journal_root, owner);
+            crate::send_local_session_command(
+                &socket,
+                session_id,
+                HostCommand::TeamPrompt {
+                    session_id,
+                    message_id: message.message_id,
+                    text: message.text,
+                    attachments: message.attachments,
+                    output_schema: None,
+                    delivery: message.delivery,
+                },
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::debug!(%error, %session_id, "durable message awaits its manager");
+            return false;
+        }
+        true
+    }
+
+    /// A cross-process handoff names only a durable message. The receiving
+    /// manager, not the sender's wire payload, supplies its content and mode.
+    pub(crate) async fn deliver_child_message(&self, child: Uuid, message_id: Uuid) -> Result<()> {
+        ensure!(
+            self.table.lock().await.entries.contains_key(&child),
+            "unknown owned child"
+        );
+        ensure!(
+            self.store.owning_root_session(child).await? == Some(self.root_session_id),
+            "message targets a child of a different manager"
+        );
+        let binding = self
+            .store
+            .workspace_binding(child)
+            .await?
+            .context("child has no workspace binding")?;
+        let workspace = self.workspace_store().await?;
+        let delivery = workspace
+            .message_deliveries(message_id)
+            .await?
+            .into_iter()
+            .find(|delivery| delivery.recipient_id == binding.participant_id)
+            .context("message is not addressed to this child")?;
+        if matches!(
+            delivery.state,
+            crate::DeliveryState::Acknowledged
+                | crate::DeliveryState::Recalled
+                | crate::DeliveryState::Failed
+        ) || self.store.contains_message(child, message_id).await?
+        {
+            return Ok(());
+        }
+        let event = workspace
+            .replay(
+                delivery.workspace_id,
+                binding.participant_id,
+                delivery.sequence.saturating_sub(1),
+                1,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("missing durable child message")?;
+        let WorkspaceEventKind::Message { message, .. } = event.kind else {
+            bail!("child delivery does not reference a message");
+        };
+        ensure!(
+            message.id == message_id,
+            "child delivery references a different message"
+        );
+        let inbox_message = self.workspace_inbox_message(message, delivery.mode).await?;
+        let wake = delivery.mode == DeliveryMode::Wake;
+        {
+            let mut table = self.table.lock().await;
+            let entry = table
+                .entries
+                .get_mut(&child)
+                .context("unknown owned child")?;
+            if !entry
+                .inbox
+                .iter()
+                .any(|queued| queued.message_id == message_id)
+            {
+                entry.inbox.push(inbox_message);
+            }
+            // A peer message is not permission to restart a stopped worker.
+            if entry.snapshot.status.is_terminal()
+                || (!wake
+                    && !matches!(
+                        entry.snapshot.status,
+                        SubagentStatus::Running
+                            | SubagentStatus::WaitingForApproval
+                            | SubagentStatus::Starting
+                    ))
+            {
+                return Ok(());
+            }
+        }
+        // Queue first so an unavailable actor or exhausted concurrency leaves
+        // the original message ready for a later handoff, without a new ID.
+        if wake {
+            self.ensure_child_actor(child).await?;
+        }
+        let mut table = self.table.lock().await;
+        let entry = table
+            .entries
+            .get_mut(&child)
+            .context("unknown owned child")?;
+        if entry.commands.is_some() {
+            let mut messages = std::mem::take(&mut entry.inbox).into_iter();
+            while let Some(message) = messages.next() {
+                if let Err(error) = send_prompt(entry, child, message).await {
+                    entry.inbox.extend(messages);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn session_message_needs_relay(&self, sender: Uuid, recipient: Uuid) -> Result<bool> {

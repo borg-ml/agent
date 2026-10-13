@@ -1860,6 +1860,19 @@ impl SessionStore for PostgresSessionStore {
         PostgresSessionStore::register_child_session(self, owner_session_id, session_id).await
     }
 
+    async fn owning_root_session(&self, session_id: Uuid) -> Result<Option<Uuid>> {
+        Ok(sqlx::query_scalar(
+            "with recursive owners(id, owner_session_id) as (\
+                 select id, owner_session_id from sessions where id = $1 \
+                 union select s.id, s.owner_session_id from sessions s \
+                 join owners o on s.id = o.owner_session_id) \
+             select id from owners where owner_session_id is null",
+        )
+        .bind(session_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+
     async fn is_descendant(&self, parent: Uuid, target: Uuid) -> Result<bool> {
         Ok(sqlx::query_scalar(
             "with recursive owned(id) as (select id from sessions where owner_session_id = $1 \
