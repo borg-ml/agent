@@ -4778,7 +4778,9 @@ fn authorize_workspace_command(
         return Ok(());
     };
     let kind = match command {
-        HostCommand::Prompt { .. } | HostCommand::ReplaceRecalledPrompt { .. } => crate::ParticipantCommandKind::Prompt,
+        HostCommand::Prompt { .. } | HostCommand::ReplaceRecalledPrompt { .. } => {
+            crate::ParticipantCommandKind::Prompt
+        }
         HostCommand::TeamPrompt { .. }
         | HostCommand::RecoverPendingInput { .. }
         | HostCommand::Broadcast { .. }
