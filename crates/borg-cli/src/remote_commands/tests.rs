@@ -2297,7 +2297,7 @@ fn owned_resume_presents_stopped_state_as_ready_while_rehydrating() {
 
 #[tokio::test]
 #[cfg(unix)]
-async fn obsolete_owner_handoff_releases_and_reacquires_the_writer_lease() {
+async fn obsolete_owner_handoff_refuses_a_current_owner_without_sending_stop() {
     let root = short_socket_tempdir();
     let session_id = Uuid::new_v4();
     let journal_path = root.path().join(format!("{session_id}.lock"));
@@ -2309,19 +2309,20 @@ async fn obsolete_owner_handoff_releases_and_reacquires_the_writer_lease() {
     let _server =
         LocalSessionControlServer::start(socket_path.clone(), session_id, &writer, commands)
             .unwrap();
-    let release = tokio::spawn(async move {
-        assert!(matches!(
-            received.recv().await,
-            Some(HostCommand::Stop { session_id: target }) if target == session_id
-        ));
-        drop(writer);
-    });
-
-    let replacement = stop_stale_local_owner_and_acquire(&journal_path, &socket_path, session_id)
+    let error = stop_stale_local_owner_and_acquire(&journal_path, &socket_path, session_id)
         .await
-        .unwrap();
-    release.await.unwrap();
-    drop(replacement);
+        .unwrap_err();
+    assert!(error.to_string().contains("not verified obsolete"));
+    assert!(
+        received.try_recv().is_err(),
+        "a current owner must not receive Stop"
+    );
+    assert!(
+        SessionWriterLease::try_acquire(&journal_path)
+            .unwrap()
+            .is_none()
+    );
+    drop(writer);
 }
 
 #[tokio::test]
@@ -2429,7 +2430,7 @@ async fn obsolete_owner_handoff_uses_a_free_lease_when_its_socket_is_gone() {
 
 #[tokio::test]
 #[cfg(unix)]
-async fn obsolete_owner_handoff_waits_for_a_lease_after_its_socket_disappears() {
+async fn obsolete_owner_handoff_refuses_an_unverified_owner_after_its_socket_disappears() {
     let root = short_socket_tempdir();
     let session_id = Uuid::new_v4();
     let journal_path = root.path().join(format!("{session_id}.lock"));
@@ -2438,19 +2439,25 @@ async fn obsolete_owner_handoff_waits_for_a_lease_after_its_socket_disappears() 
         .unwrap()
         .unwrap();
 
-    let handoff = tokio::spawn(async move {
-        stop_stale_local_owner_and_acquire(&journal_path, &socket_path, session_id).await
-    });
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    let error = stop_stale_local_owner_and_acquire(&journal_path, &socket_path, session_id)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not verified obsolete"));
+    assert!(
+        SessionWriterLease::try_acquire(&journal_path)
+            .unwrap()
+            .is_none()
+    );
     drop(writer);
-
-    let replacement = handoff.await.unwrap().unwrap();
+    let replacement = stop_stale_local_owner_and_acquire(&journal_path, &socket_path, session_id)
+        .await
+        .unwrap();
     drop(replacement);
 }
 
 #[tokio::test]
 #[cfg(unix)]
-async fn obsolete_owner_handoff_waits_for_a_lease_after_connection_refused() {
+async fn obsolete_owner_handoff_refuses_an_unverified_owner_after_connection_refused() {
     let root = short_socket_tempdir();
     let session_id = Uuid::new_v4();
     let lock_path = root.path().join(format!("{session_id}.lock"));
@@ -2467,14 +2474,19 @@ async fn obsolete_owner_handoff_waits_for_a_lease_after_connection_refused() {
         io::ErrorKind::ConnectionRefused
     );
 
-    let handoff = tokio::spawn(async move {
-        stop_stale_local_owner_and_acquire(&lock_path, &socket_path, session_id).await
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!handoff.is_finished());
+    let error = stop_stale_local_owner_and_acquire(&lock_path, &socket_path, session_id)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not verified obsolete"));
+    assert!(
+        SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .is_none()
+    );
     drop(writer);
-
-    let replacement = handoff.await.unwrap().unwrap();
+    let replacement = stop_stale_local_owner_and_acquire(&lock_path, &socket_path, session_id)
+        .await
+        .unwrap();
     drop(replacement);
 }
 
