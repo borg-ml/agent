@@ -15137,6 +15137,63 @@ connection: close
 mod prompt_retry_contract {
     use super::*;
 
+    // Reconnect and new-session metadata must use the committed chosen settings,
+    // not silently restore the provider/speed values from the original launch.
+    #[tokio::test]
+    async fn scope_registration_preserves_current_committed_configuration() {
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let session = Uuid::new_v4();
+        store.create_session(session).await.unwrap();
+        let original: LaunchSession = serde_json::from_value(serde_json::json!({
+            "request_id":Uuid::new_v4(), "cwd":"/tmp", "provider":CodingProvider::Codex,
+            "permission_mode":PermissionMode::Manual, "model":"original-model", "initial_prompt":"do not retransmit"
+        })).unwrap();
+        store
+            .persist_owned_host_launch_metadata(
+                session,
+                &serde_json::json!({"request":original,"attachment":null}),
+                Uuid::new_v4(),
+                "https://example.invalid",
+            )
+            .await
+            .unwrap();
+        store
+            .append(SessionEvent::new(
+                session,
+                0,
+                crate::SessionEventKind::SessionConfigured {
+                    cwd: PathBuf::from("/tmp"),
+                    provider: CodingProvider::Claude,
+                    model: Some("current-model".into()),
+                    effort: Some("high".into()),
+                    fast: true,
+                    ultrafast: false,
+                    permission_mode: PermissionMode::Manual,
+                    response_language: crate::ResponseLanguage::Auto,
+                    speed_support: Default::default(),
+                },
+            ))
+            .await
+            .unwrap();
+        let request = scope_registration(&store, session).await.unwrap().unwrap();
+        assert_eq!(request.provider, CodingProvider::Claude);
+        assert_eq!(request.model.as_deref(), Some("current-model"));
+        assert_eq!(request.effort.as_deref(), Some("high"));
+        assert_eq!(request.fast, Some(true));
+        assert_eq!(request.ultrafast, Some(false));
+        assert_eq!(request.request_id, session);
+        assert!(request.initial_prompt.is_none());
+        assert_eq!(
+            store
+                .load_host_launch_metadata(session)
+                .await
+                .unwrap()
+                .unwrap()["request"]["initial_prompt"],
+            "do not retransmit"
+        );
+        scratch.discard().await;
+    }
+
     // Retransmitted prompts must reuse the canonical admission without waking
     // an actor twice; compilation cannot verify the durable duplicate boundary.
     #[tokio::test]
