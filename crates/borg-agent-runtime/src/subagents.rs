@@ -2391,7 +2391,7 @@ impl AgentToolDispatcher {
                     .context("watchers are unavailable for this session")?;
                 if !args.agents.is_empty() {
                     let team = self.subagents.as_ref().context(
-                        "agent watches require your own children; use followup_task and wait_agent for peers",
+                        "agent watches require your own children; use followup_task and get_message_status for peer replies",
                     )?;
                     let mut subjects = Vec::with_capacity(args.agents.len());
                     for subject in &args.agents {
@@ -2400,7 +2400,7 @@ impl AgentToolDispatcher {
                             agent.as_ref().is_some_and(
                                 |agent| agent.parent_session_id == self.actor_session_id
                             ),
-                            "watch cannot observe {subject}: it is not your child; use followup_task and wait_agent for peers"
+                            "watch cannot observe {subject}: it is not your child; use followup_task and get_message_status for peer replies"
                         );
                         subjects.push(agent.expect("authorized child"));
                     }
