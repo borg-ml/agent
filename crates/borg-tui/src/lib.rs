@@ -3528,7 +3528,7 @@ impl BorgTerminal {
     }
 
     pub fn has_active_queued_prompts(&self) -> bool {
-        !self.active_queued_prompts().is_empty()
+        !self.visible_queued_prompts().is_empty()
     }
 
     pub fn has_empty_composer_text(&self) -> bool {
@@ -5140,6 +5140,22 @@ impl BorgTerminal {
         }
     }
 
+    /// Queued prompts still shown as pending input. A prompt leaves the list
+    /// the moment Up recalls it into the composer, not when the session
+    /// acknowledges the recall, so the move is one atomic step on screen.
+    fn visible_queued_prompts(&self) -> Vec<PendingPromptProjection> {
+        let target = self.focused_child;
+        self.active_queued_prompts()
+            .iter()
+            .filter(|prompt| {
+                !self
+                    .provisional_recalls
+                    .contains(&(target, prompt.message_id))
+            })
+            .cloned()
+            .collect()
+    }
+
     fn active_queued_prompts_mut(&mut self) -> &mut Vec<PendingPromptProjection> {
         if let Some(child) = self.focused_child {
             self.child_queued_prompts.entry(child).or_default()
@@ -5562,7 +5578,7 @@ impl BorgTerminal {
     }
 
     fn has_pending_input_for_escape(&self) -> bool {
-        self.active_queued_prompts()
+        self.visible_queued_prompts()
             .iter()
             .any(|prompt| prompt.actor == EventActor::User)
     }
@@ -7016,7 +7032,7 @@ impl BorgTerminal {
                         return Ok(UiAction::None);
                     }
                     if !background_hover_suppressed {
-                        if !self.active_queued_prompts().is_empty()
+                        if !self.visible_queued_prompts().is_empty()
                             && self
                                 .pending_input_header_area
                                 .is_some_and(|area| area.contains(pointer))
@@ -8777,7 +8793,7 @@ impl BorgTerminal {
                 })
             },
         );
-        let queued_prompts = self.active_queued_prompts().to_vec();
+        let queued_prompts = self.visible_queued_prompts();
         // Keep the first draft anchored in the splash composition area. Moving
         // it to the chat footer on the first keystroke makes the whole screen
         // jump before the user has actually submitted anything.

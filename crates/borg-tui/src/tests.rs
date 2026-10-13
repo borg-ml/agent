@@ -12193,6 +12193,9 @@ async fn escape_flushes_pending_queue_without_latching_a_stop_and_keeps_the_comp
     ));
     // A slow owner must not delay visible restoration or Enter's send intent.
     assert_eq!(terminal.composer.text, "recall me");
+    // Recall is one step on screen: the prompt leaves pending input as it
+    // enters the composer, before the session acknowledges it.
+    assert!(!terminal.has_active_queued_prompts());
     assert!(matches!(
         terminal
             .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
