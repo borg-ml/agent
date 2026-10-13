@@ -13,6 +13,8 @@ pub mod row_index;
 pub mod auth;
 pub mod admission;
 pub mod command_ledger;
+pub mod tunnel;
+pub mod sync;
 
 pub use borg_agent_runtime::*;
 
@@ -21,7 +23,7 @@ pub use command::{
     execute_workspace_command_with_limits,
 };
 pub use host::{
-    HostConfig, HostExecutorFactory, enroll_host, login_provider, login_provider_with_output,
+    DirectListenerConfig, HostConfig, HostExecutorFactory, enroll_host, login_provider, login_provider_with_output,
     mirror_local_session, probe_capabilities, probe_provider_admission_capabilities,
     probe_provider_capabilities, provider_credentials_present,
     provider_subscription_credentials_present, run_host, run_host_with_executor_factory,

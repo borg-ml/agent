@@ -3,7 +3,7 @@
 use anyhow::{Result, ensure};
 use sqlx::{PgPool, Row};
 
-pub const ACTIVE_CHECKPOINT_BYTES: usize = 65_536;
+pub const ACTIVE_CHECKPOINT_BYTES: usize = 1_048_576;
 
 pub const REPLAY_FRAMES: i64 = 128;
 pub const REPLAY_BYTES: usize = 1_048_576;
@@ -34,6 +34,8 @@ impl ProjectionStore {
             primary key(scope, revision));")
             .execute(&pool).await?;
         crate::row_index::initialize(&pool).await?;
+        crate::row_index::initialize_text_fields(&pool).await?;
+        sqlx::query("create table if not exists remote_turn_results(scope text not null,message_id text not null,frame bytea not null,primary key(scope,message_id))").execute(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -63,6 +65,10 @@ impl ProjectionStore {
     }
 
     pub async fn commit_rows(&self, scope: &str, expected_revision: i64, state: &ProjectionCheckpoint, frame: &[u8], rows: Vec<crate::row_index::RowMutation<'_>>) -> Result<()> {
+        self.commit_full(scope, expected_revision, state, frame, rows, Vec::new(), None).await
+    }
+
+    pub async fn commit_full(&self, scope: &str, expected_revision: i64, state: &ProjectionCheckpoint, frame: &[u8], rows: Vec<crate::row_index::RowMutation<'_>>, texts: Vec<(&str,&str,&str,&str)>, turn: Option<(&str,&[u8])>) -> Result<()> {
         ensure!(state.revision == expected_revision.checked_add(1).ok_or_else(|| anyhow::anyhow!("revision exhausted"))?, "noncontiguous projection revision");
         ensure!(state.reducer.len() <= ACTIVE_CHECKPOINT_BYTES, "active checkpoint exceeds budget");
         ensure!(frame.len() <= REPLAY_BYTES, "projection frame exceeds wire budget");
@@ -73,8 +79,13 @@ impl ProjectionStore {
             .execute(&mut *tx).await?.rows_affected();
         ensure!(changed == 1, "projection checkpoint conflict");
         for row in rows { crate::row_index::apply(&mut tx, scope, row).await?; }
+        for (id,field,revision,text) in texts { crate::row_index::persist_text(&mut tx, scope, id, field, revision, text).await?; }
         sqlx::query("insert into remote_view_replay values($1,$2,$3,$4)")
             .bind(scope).bind(&state.epoch).bind(state.revision).bind(frame).execute(&mut *tx).await?;
+        if let Some((message,turn))=turn {
+            sqlx::query("insert into remote_turn_results values($1,$2,$3) on conflict(scope,message_id) do update set frame=excluded.frame")
+                .bind(scope).bind(message).bind(turn).execute(&mut *tx).await?;
+        }
         // Keep at most 128 frames and 1 MiB total, including the newest frame.
         sqlx::query("delete from remote_view_replay where scope=$1 and revision in (select revision from (select revision,row_number() over(order by revision desc) n,sum(octet_length(frame)) over(order by revision desc) bytes from remote_view_replay where scope=$1) r where n>$2 or bytes>$3)")
             .bind(scope).bind(REPLAY_FRAMES).bind(REPLAY_BYTES as i64).execute(&mut *tx).await?;

@@ -76,3 +76,21 @@ pub fn issuer_key(encoded: &str) -> Result<VerifyingKey> {
     let bytes: [u8;32] = URL_SAFE_NO_PAD.decode(encoded)?.try_into().map_err(|_| anyhow::anyhow!("invalid relay public key"))?;
     Ok(VerifyingKey::from_bytes(&bytes)?)
 }
+
+pub fn verify_service_ticket(ticket:&SignedTicket,issuer:&VerifyingKey,host_id:&str,epoch:u64,now:i64)->Result<crate::auth::ServiceTicketClaims> {
+    ensure!(ticket.claims.len()<=16_384 && ticket.signature.len()<=128,"oversized service admission");
+    let bytes=URL_SAFE_NO_PAD.decode(&ticket.claims)?;
+    let signature=Signature::from_slice(&URL_SAFE_NO_PAD.decode(&ticket.signature)?)?;
+    issuer.verify_strict(&bytes,&signature).context("invalid service ticket signature")?;
+    let claims:crate::auth::ServiceTicketClaims=serde_json::from_slice(&bytes)?;
+    ensure!(claims.version==2 && claims.host_id==host_id && claims.revocation_epoch==epoch && claims.purpose==crate::auth::ServicePurpose::ProductView,"invalid service authority");
+    ensure!(claims.issued_at<=now && claims.expires_at>now && claims.expires_at.checked_sub(claims.issued_at).is_some_and(|ttl|ttl>0&&ttl<=300),"invalid service ticket lifetime");
+    ensure!(!claims.ticket_id.is_empty() && !claims.principal_id.is_empty() && uuid::Uuid::parse_str(&claims.session_id).is_ok(),"invalid service identity/scope");
+    Ok(claims)
+}
+pub fn verify_service_proof(claims:&crate::auth::ServiceTicketClaims,nonce:&str,proof:&str)->Result<()> {
+    ensure!(!nonce.is_empty() && nonce.len()<=256 && !nonce.contains('\n') && !claims.ticket_id.contains('\n') && proof.len()<=128,"invalid service proof nonce");
+    let key=issuer_key(&claims.service_public_key)?;
+    let signature=Signature::from_slice(&URL_SAFE_NO_PAD.decode(proof)?)?;
+    key.verify_strict(format!("borg.remote.service.v2\n{}\n{}",claims.ticket_id,nonce).as_bytes(),&signature).context("invalid service proof")
+}
