@@ -34,8 +34,20 @@ Git comparison.
   and optional edited input, so a stale or replayed approval cannot run work.
 - Store streamed text as append-only chunks, so long replies and reasoning no
   longer rewrite the whole message on every update.
+- Share background execution across safe tool calls, persistent runtime and
+  shell commands. Slow calls detach after a short wait, expose retrievable and
+  cancellable jobs in the UI, and group completion wakes. Optional `async`
+  controls detachment while ordered mutations stay synchronous.
+- Keep team plan reads off the workspace write lock, and batch messages to
+  distinct local recipients concurrently without reordering aliases of one agent.
+- Move past Claude subscription quota refusals to the configured fallback
+  instead of retrying them as broken connections.
 
 ### Terminal
+
+- Recall pending input into the composer immediately and atomically. Sending
+  recalled edits moves them back to pending on the first Enter, with recovery
+  on failure and protection for drafts typed while acknowledgement is pending.
 
 - Recall queued input directly into an editable draft and replace it atomically
   on Enter, preserving attachments and text entered while the recall completes.
