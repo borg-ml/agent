@@ -273,7 +273,7 @@ local function parse(argv)
             break
         end
     end
-    local options = { project = ".", target_dir = "target", build_dir = "build", extra = {} }
+    local options = { project = ".", target_dir = "target", build_dir = "build", extra = {}, packages = {} }
     for index = split + 1, #argv do
         options.extra[#options.extra + 1] = argv[index]
     end
@@ -282,12 +282,22 @@ local function parse(argv)
         local word = argv[index]
         local flag, inline = word:match("^(%-%-[%w%-]+)=(.*)$")
         if flag and VALUED[flag] then
-            options[VALUED[flag]], given[VALUED[flag]] = inline, true
+            if VALUED[flag] == "package" then
+                options.packages[#options.packages + 1] = inline
+                given.package = true
+            else
+                options[VALUED[flag]], given[VALUED[flag]] = inline, true
+            end
         elseif VALUED[word] then
             if index + 1 >= split then
                 fail(word .. " requires a value")
             end
-            options[VALUED[word]], given[VALUED[word]] = argv[index + 1], true
+            if VALUED[word] == "package" then
+                options.packages[#options.packages + 1] = argv[index + 1]
+                given.package = true
+            else
+                options[VALUED[word]], given[VALUED[word]] = argv[index + 1], true
+            end
             index = index + 1
         elseif word == "--dry-run" then
             options.dry_run = true
@@ -407,9 +417,9 @@ local function lane(options)
         env.CARGO_TARGET_DIR = f.output
         env.CARGO_BUILD_JOBS = tostring(job_count)
         command = { "cargo", options.operation, "-j", env.CARGO_BUILD_JOBS }
-        if options.package then
+        for _, package in ipairs(options.packages) do
             command[#command + 1] = "-p"
-            command[#command + 1] = options.package
+            command[#command + 1] = package
         end
     elseif kind == "cmake" and options.operation == "configure" then
         per_job = 2 * GIB
@@ -531,7 +541,11 @@ local function lane(options)
     if not free or free < 60 * GIB then
         fail(string.format("free disk on output filesystem below 60 GiB: %.1f GiB", (free or 0) / GIB))
     end
-    if lane_name == "cargo-test" and options.package == "borg-agent-runtime" and not env.BORG_TEST_SESSIONS_URL then
+    local tests_runtime = false
+    for _, package in ipairs(options.packages) do
+        tests_runtime = tests_runtime or package == "borg-agent-runtime"
+    end
+    if lane_name == "cargo-test" and tests_runtime and not env.BORG_TEST_SESSIONS_URL then
         fail("BORG_TEST_SESSIONS_URL required; use `postgres cargo test -p borg-agent-runtime`")
     end
     if not borg then

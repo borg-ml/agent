@@ -2157,6 +2157,44 @@ return receipt
                 ])));
             }
         }
+        let result = runner.clone().with_invocation_arguments(json!({
+            "arguments": "cargo check -p borg-tui --package=borg -p borg-agent-runtime --dry-run"
+        })).run(BluWorkflowRequest {
+            workflow_id: Uuid::new_v4(), name: "native:native".into(), source: source.to_string(),
+        }).await.unwrap();
+        assert!(result.success, "{result:?}");
+        let plan: Value = serde_json::from_str(result.values[0].as_str().unwrap()).unwrap();
+        let argv = plan["argv"].as_array().unwrap();
+        assert!(
+            argv.ends_with(&[
+                json!("-p"),
+                json!("borg-tui"),
+                json!("-p"),
+                json!("borg"),
+                json!("-p"),
+                json!("borg-agent-runtime"),
+            ]),
+            "{argv:?}"
+        );
+        let result = runner
+            .clone()
+            .with_invocation_arguments(json!({
+                "arguments": "cargo test -p borg-agent-runtime -p borg-tui"
+            }))
+            .run(BluWorkflowRequest {
+                workflow_id: Uuid::new_v4(),
+                name: "native:native".into(),
+                source: source.replace("manifest=1", r"manifest=1\\nfree=300000000000"),
+            })
+            .await
+            .unwrap();
+        assert!(!result.success, "{result:?}");
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("BORG_TEST_SESSIONS_URL required")
+        );
         // Explicit values (including empty) and harness CLI overrides survive
         // planning; the defaults must not silently change user concurrency.
         let explicit = source.replace(
