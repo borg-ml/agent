@@ -509,6 +509,7 @@ pub(crate) struct RuntimeSessionStore {
     context_events: Vec<SessionEvent>,
     context_complete: bool,
     workspace_projection: Option<WorkspaceProjection>,
+    workspace_projector: Option<(Arc<tokio::sync::Notify>, AbortTask)>,
     projection_diagnostics: VecDeque<SessionEvent>,
     plan_projection_generation: u64,
     received_agent_messages: HashSet<Uuid>,
@@ -588,6 +589,7 @@ impl WorkspaceProjection {
     /// falsely declare the projection complete and would scramble workspace
     /// ordering. The source session remains authoritative while the lagging
     /// event is picked up by `repair`.
+    #[cfg(test)]
     async fn project(&self, event: &SessionEvent) -> Result<()> {
         if event.sequence == 0 {
             return Ok(());
@@ -846,6 +848,7 @@ impl RuntimeSessionStore {
             context_events,
             context_complete,
             workspace_projection: None,
+            workspace_projector: None,
             projection_diagnostics: VecDeque::new(),
             plan_projection_generation: 0,
             received_agent_messages: HashSet::new(),
@@ -939,6 +942,79 @@ impl RuntimeSessionStore {
             });
         }
         Ok(state)
+    }
+
+    async fn settle_workspace_projection(&mut self, event: &SessionEvent) -> Result<()> {
+        let Some(projection) = &self.workspace_projection else {
+            return Ok(());
+        };
+        let Err(error) = projection
+            .repair(Arc::clone(&self.store), event.session_id)
+            .await
+        else {
+            return Ok(());
+        };
+        let diagnostic = format!(
+            "workspace projection delivery failed for session event {} (sequence {}): {error:#}",
+            event.id, event.sequence
+        );
+        tracing::warn!(
+            session_id = %event.session_id,
+            session_sequence = event.sequence,
+            error = %error,
+            "failed to update repairable workspace projection"
+        );
+        // The workspace projection is repairable and must not make the
+        // session actor fail. Persist the failure directly in the source
+        // journal (without recursively attempting the same projection) so
+        // reconnect and repair tooling can diagnose the missing delivery.
+        let diagnostic_event = self
+            .store
+            .append(SessionEvent::new(
+                event.session_id,
+                0,
+                SessionEventKind::Error {
+                    message: diagnostic,
+                },
+            ))
+            .await?;
+        self.projection_diagnostics.push_back(diagnostic_event);
+        Ok(())
+    }
+
+    /// Mirror the journal into the team workspace off the actor's write path.
+    ///
+    /// Every session in a team serialises on the shared workspace row, so an
+    /// inline projection made each append wait behind every other session's
+    /// commit: about 360ms per event with thirteen children, which withheld the
+    /// root's own turn output until an interrupt drained it. Wakes coalesce, so
+    /// a burst lands as one batched `repair` under a single workspace lock.
+    fn wake_workspace_projector(&mut self, session_id: Uuid) {
+        let Some(projection) = &self.workspace_projection else {
+            return;
+        };
+        let (wake, _) = self.workspace_projector.get_or_insert_with(|| {
+            let wake = Arc::new(tokio::sync::Notify::new());
+            let (projection, store, notified) = (
+                projection.clone(),
+                Arc::clone(&self.store),
+                Arc::clone(&wake),
+            );
+            let task = tokio::spawn(async move {
+                loop {
+                    notified.notified().await;
+                    if let Err(error) = projection.repair(Arc::clone(&store), session_id).await {
+                        tracing::warn!(
+                            %session_id,
+                            %error,
+                            "workspace projection failed; the source session remains authoritative"
+                        );
+                    }
+                }
+            });
+            (wake, AbortTask(task))
+        });
+        wake.notify_one();
     }
 
     fn take_projection_diagnostics(&mut self) -> VecDeque<SessionEvent> {
@@ -1039,34 +1115,15 @@ impl RuntimeSessionStore {
         self.retain_system_override(std::slice::from_mut(&mut event))
             .await?;
         let event = self.store.append(event).await?;
-        if let Some(projection) = &self.workspace_projection
-            && let Err(error) = projection.project(&event).await
+        if self.workspace_projection.is_some()
+            && WorkspaceProjection::needs_delivery_transition(&event)
         {
-            let diagnostic = format!(
-                "workspace projection delivery failed for session event {} (sequence {}): {error:#}",
-                event.id, event.sequence
-            );
-            tracing::warn!(
-                session_id = %event.session_id,
-                session_sequence = event.sequence,
-                error = %error,
-                "failed to update repairable workspace projection"
-            );
-            // The workspace projection is repairable and must not make the
-            // session actor fail. Persist the failure directly in the source
-            // journal (without recursively attempting the same projection) so
-            // reconnect and repair tooling can diagnose the missing delivery.
-            let diagnostic_event = self
-                .store
-                .append(SessionEvent::new(
-                    event.session_id,
-                    0,
-                    SessionEventKind::Error {
-                        message: diagnostic,
-                    },
-                ))
-                .await?;
-            self.projection_diagnostics.push_back(diagnostic_event);
+            // A delivery boundary settles team-message state that inbox reads
+            // depend on, so it catches the mirror up before the append returns:
+            // one batched pass, not one lock per event.
+            self.settle_workspace_projection(&event).await?;
+        } else {
+            self.wake_workspace_projector(event.session_id);
         }
         self.absorb_appended(&event).await?;
         match &event.kind {
@@ -6918,25 +6975,6 @@ async fn run_agent_session_store_kernel_inner(
                         | HostCommand::OpenTerminal { .. } => {}
                     }
                 }
-                // The actor owns the journal; an append from another task
-                // would leave the live context behind and change replay.
-                activity = child_activity_rx.recv(), if child_activity_open => {
-                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "child_activity", provider_events.len() + provider_carry.len());
-                    let Some(activity) = activity else {
-                        // The forwarder is gone, so nothing can arrive on this
-                        // channel again.
-                        child_activity_open = false;
-                        continue;
-                    };
-                    record_subagent_activity(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        subagents.as_ref().expect("child activity requires coordinator"),
-                        &watches,
-                        activity,
-                    ).await?;
-                }
                 message = root_message_rx.recv(), if owns_team => {
                     let _trace = SessionBranchTrace::begin(trace_loop, session_id, "root_message", provider_events.len() + provider_carry.len());
                     match message {
@@ -7367,6 +7405,28 @@ async fn run_agent_session_store_kernel_inner(
                 _ = work_plan_tick.tick() => {
                     let _trace = SessionBranchTrace::begin(trace_loop, session_id, "work_plan_refresh", provider_events.len() + provider_carry.len());
                     work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
+                }
+                // Last in the biased select: with many children this channel is
+                // almost always ready, and above provider output it withheld the
+                // root's own turn until an interrupt drained it. The actor owns
+                // the journal; an append from another task would leave the live
+                // context behind and change replay.
+                activity = child_activity_rx.recv(), if child_activity_open => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "child_activity", provider_events.len() + provider_carry.len());
+                    let Some(activity) = activity else {
+                        // The forwarder is gone, so nothing can arrive on this
+                        // channel again.
+                        child_activity_open = false;
+                        continue;
+                    };
+                    record_subagent_activity(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        subagents.as_ref().expect("child activity requires coordinator"),
+                        &watches,
+                        activity,
+                    ).await?;
                 }
             }
         }

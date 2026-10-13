@@ -1594,9 +1594,13 @@ async fn projection_delivery_failure_is_durable_and_does_not_fail_the_session_ap
         &mut runtime,
         &event_tx,
         session_id,
-        SessionEventKind::StatusChanged {
-            status: SessionStatus::Running,
-            detail: Some("turn phase: awaiting provider".to_string()),
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "deliver this".to_string(),
+            status: MessageStatus::Complete,
+            attachments: Vec::new(),
+            delivery: None,
         },
     )
     .await
