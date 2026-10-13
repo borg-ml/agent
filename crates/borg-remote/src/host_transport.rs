@@ -2,7 +2,7 @@ use crate::auth::TunnelFrame;
 use anyhow::{Result, ensure};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -14,6 +14,8 @@ pub(super) struct Transport {
     pub outbound: mpsc::Sender<TunnelFrame>,
     state: Arc<Mutex<RegistrationState>>,
     tasks: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+    ledger: Arc<OnceLock<crate::command_ledger::CommandLedger>>,
+    routes: Arc<Mutex<Vec<crate::auth::HostRoute>>>,
 }
 #[derive(Default)]
 struct RegistrationState {
@@ -48,7 +50,30 @@ impl Transport {
             outbound,
             state: Arc::default(),
             tasks: Arc::default(),
+            ledger: Arc::default(),
+            routes: Arc::default(),
         }
+    }
+    pub fn set_ledger(&self, ledger: crate::command_ledger::CommandLedger) -> Result<()> {
+        ensure!(
+            self.ledger.set(ledger).is_ok(),
+            "host command ledger already configured"
+        );
+        Ok(())
+    }
+    pub fn ledger(&self) -> Result<crate::command_ledger::CommandLedger> {
+        self.ledger
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("host command ledger missing"))
+    }
+    pub fn set_routes(&self, routes: Vec<crate::auth::HostRoute>) {
+        *self.routes.lock().unwrap() = routes;
+    }
+    pub async fn announce_routes(&self) -> Result<()> {
+        let routes = self.routes.lock().unwrap().clone();
+        self.outbound.send(TunnelFrame::Routes { routes }).await?;
+        Ok(())
     }
     pub async fn register(
         &self,

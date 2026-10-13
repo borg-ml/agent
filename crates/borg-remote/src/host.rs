@@ -1628,6 +1628,7 @@ pub(crate) async fn run_host_with_resolved_store(
     let ledger = crate::command_ledger::CommandLedger::open(authority.pool.clone()).await?;
     let (outbound, mut outgoing) = mpsc::channel(128);
     let transport = host_transport::Transport::new(config.host_id, outbound.clone());
+    transport.set_ledger(ledger.clone())?;
     host_transport::CURRENT.scope(transport.clone(), async move {
     let _shutdown = host_transport::StopOnDrop(transport.clone());
     let _heartbeat = AbortTask(host_transport::spawn(run_host_heartbeat_loop(
@@ -1745,6 +1746,7 @@ pub(crate) async fn run_host_with_resolved_store(
                         let authority = Arc::clone(&sync);
                         let transport = host_transport::get(config.host_id)?;
                         host_transport::spawn(async move {
+                            if let Err(error) = transport.announce_routes().await { tracing::warn!(%error, "route announcement deferred"); }
                             for (session, request) in transport.registrations() {
                                 if let Err(error) = transport.register(session, request).await { tracing::debug!(%error, "registration replay deferred"); break; }
                             }
@@ -2320,6 +2322,48 @@ fn check_owner_deadline(command: &HostCommand) -> Result<()> {
     Ok(())
 }
 
+async fn terminal_owner_effect(
+    context: &DispatchContext,
+    command: &HostCommand,
+) -> Result<Option<serde_json::Value>> {
+    macro_rules! terminal {
+        ($request:expr, $response:ty) => {
+            match context
+                .receipts
+                .load::<_, $response>($request.request_id, $request)
+                .await?
+            {
+                ReceiptState::Terminal(response) => Some(serde_json::to_value(response)?),
+                ReceiptState::Conflict | ReceiptState::Corrupt => {
+                    bail!("operation receipt conflicts or is corrupt")
+                }
+                _ => None,
+            }
+        };
+    }
+    Ok(match command {
+        HostCommand::ShellCommand { request } => terminal!(request, HostShellCommandResponse),
+        HostCommand::WorkspaceCommand { request } => terminal!(request, WorkspaceCommandResponse),
+        HostCommand::WorkspaceFilesystem { request } => {
+            terminal!(request, WorkspaceFilesystemResponse)
+        }
+        HostCommand::OpenTerminal { request } => terminal!(request, OpenTerminalResponse),
+        _ => None,
+    })
+}
+
+fn owner_frame(command_id: String, outcome: serde_json::Value) -> crate::auth::TunnelFrame {
+    if outcome.get("status").and_then(serde_json::Value::as_str) == Some("accepted") {
+        crate::auth::TunnelFrame::HostCommandAccepted { command_id }
+    } else {
+        crate::auth::TunnelFrame::HostCommandResult {
+            command_id,
+            outcome,
+            error: None,
+        }
+    }
+}
+
 async fn owner_command(
     ledger: &crate::command_ledger::CommandLedger,
     context: DispatchContext,
@@ -2328,61 +2372,64 @@ async fn owner_command(
     not_after: Option<i64>,
 ) -> crate::auth::TunnelFrame {
     let run = async {
+        let host = context.config.host_id;
         let id = Uuid::parse_str(&command_id)?;
         let encoded = serde_json::to_vec(&command)?;
-        let admission = ledger.admit(context.config.host_id, id, "host", "owner:trusted-relay", &encoded).await?;
-        if !matches!(admission, crate::command_ledger::Admission::Terminal(_)) {
-            let validation = validate_owner_deadline(&command, not_after, Utc::now().timestamp()).and_then(|()| {
-                ensure!(owner_effect_id(&command).is_none_or(|request| request == id), "owner command ID differs from effect request ID");
-                Ok(())
-            });
-            if let Err(error) = validation {
-                let outcome = serde_json::json!({"status":"rejected","error":error.to_string(),"retryable":false});
-                if matches!(admission, crate::command_ledger::Admission::New) {
-                    ledger.finish(context.config.host_id, id, &serde_json::to_vec(&outcome)?).await?;
-                }
-                return Ok(outcome);
-            }
+        let admission = ledger.admit(host, id, "host", "owner:trusted-relay", &encoded).await?;
+        if let crate::command_ledger::Admission::Terminal(bytes) = admission {
+            return Ok(owner_frame(command_id.clone(), serde_json::from_slice(&bytes)?));
         }
-        if matches!(admission, crate::command_ledger::Admission::New | crate::command_ledger::Admission::InDoubt) {
-            if let HostCommand::Prompt { session_id, message_id, .. } = &command {
-                ledger.bind_prompt(context.config.host_id, id, *session_id, *message_id).await?;
-            }
+        let validation = validate_owner_deadline(&command, not_after, Utc::now().timestamp()).and_then(|()| {
+            ensure!(owner_effect_id(&command).is_none_or(|request| request == id), "owner command ID differs from effect request ID");
+            Ok(())
+        });
+        if let Err(error) = validation {
+            let outcome = serde_json::json!({"status":"rejected","error":error.to_string(),"retryable":false});
+            if matches!(admission, crate::command_ledger::Admission::New) { ledger.finish(host, id, &serde_json::to_vec(&outcome)?).await?; }
+            return Ok(owner_frame(command_id.clone(), outcome));
         }
-        match admission {
-            crate::command_ledger::Admission::Terminal(bytes) => Ok(serde_json::from_slice(&bytes)?),
-            crate::command_ledger::Admission::InDoubt if matches!(command, HostCommand::Prompt { .. }) => {
-                if let HostCommand::Prompt { session_id, message_id, text, attachments, delivery, .. } = &command {
-                    if context.session_store.contains_message(*session_id, *message_id).await? {
-                        admit_remote_prompt(context.session_store.as_ref(), *session_id, *message_id, text, attachments, *delivery).await?;
-                        return Ok(serde_json::json!({"status":"accepted"}));
-                    }
-                }
-                ensure!(OWNER_NOT_AFTER.scope(not_after, dispatch(context, command)).await, "prompt retry admission interrupted");
-                Ok(serde_json::json!({"status":"accepted"}))
+        if let HostCommand::Prompt { session_id, message_id, .. } = &command {
+            ledger.bind_prompt(host, id, *session_id, *message_id).await?;
+        }
+        if owner_effect_id(&command).is_some() {
+            if let Some(outcome) = terminal_owner_effect(&context, &command).await? {
+                ensure!(upload_host_action_result(&context.client, &context.config, "", &command, id, &outcome).await, "terminal operation publication interrupted");
+                return Ok(owner_frame(command_id.clone(), outcome));
             }
-            crate::command_ledger::Admission::InDoubt => Ok(serde_json::json!({"status":"interrupted", "retryable":false})),
-            crate::command_ledger::Admission::New => {
-                let host = context.config.host_id;
-                let handled = OWNER_NOT_AFTER.scope(not_after, dispatch(context, command)).await;
-                let outcome = serde_json::json!({"status":if handled { "accepted" } else { "interrupted" }, "retryable":false});
+            if matches!(admission, crate::command_ledger::Admission::InDoubt) {
+                if context.receipts.queued_host_operation(host, id).await?.is_some() {
+                    return Ok(crate::auth::TunnelFrame::HostCommandAccepted { command_id: command_id.clone() });
+                }
+                let outcome = serde_json::json!({"status":"interrupted","retryable":false});
                 ledger.finish(host, id, &serde_json::to_vec(&outcome)?).await?;
-                Ok::<_, anyhow::Error>(outcome)
+                return Ok(owner_frame(command_id.clone(), outcome));
             }
+            ensure!(OWNER_NOT_AFTER.scope(not_after, dispatch(context.clone(), command)).await, "operation admission interrupted; unsafe replay refused");
+            if let Some(bytes) = ledger.terminal(host, id, "host", "owner:trusted-relay", &encoded).await? {
+                return Ok(owner_frame(command_id.clone(), serde_json::from_slice(&bytes)?));
+            }
+            return Ok(crate::auth::TunnelFrame::HostCommandAccepted { command_id: command_id.clone() });
         }
+        let outcome = if matches!(admission, crate::command_ledger::Admission::InDoubt) {
+            if let HostCommand::Prompt { session_id, message_id, text, attachments, delivery, .. } = &command {
+                if context.session_store.contains_message(*session_id, *message_id).await? {
+                    admit_remote_prompt(context.session_store.as_ref(), *session_id, *message_id, text, attachments, *delivery).await?;
+                } else { ensure!(OWNER_NOT_AFTER.scope(not_after, dispatch(context, command)).await, "prompt retry interrupted"); }
+                serde_json::json!({"status":"accepted"})
+            } else { serde_json::json!({"status":"interrupted","retryable":false}) }
+        } else {
+            let handled = OWNER_NOT_AFTER.scope(not_after, dispatch(context, command)).await;
+            let outcome = serde_json::json!({"status":if handled {"accepted"} else {"interrupted"},"retryable":false});
+            ledger.finish(host, id, &serde_json::to_vec(&outcome)?).await?;
+            outcome
+        };
+        Ok::<_, anyhow::Error>(owner_frame(command_id.clone(), outcome))
     }.await;
-    match run {
-        Ok(outcome) => crate::auth::TunnelFrame::HostCommandResult {
-            command_id,
-            outcome,
-            error: None,
-        },
-        Err(error) => crate::auth::TunnelFrame::HostCommandResult {
-            command_id,
-            outcome: serde_json::Value::Null,
-            error: Some(error.to_string()),
-        },
-    }
+    run.unwrap_or_else(|error| crate::auth::TunnelFrame::HostCommandResult {
+        command_id,
+        outcome: serde_json::Value::Null,
+        error: Some(error.to_string()),
+    })
 }
 
 fn deferred_host_operation_id(command: &HostCommand) -> Option<Uuid> {
@@ -2508,6 +2555,7 @@ async fn execute_host_operation(
                 client,
                 config,
                 "/api/remote/host/shell-command-results",
+                command,
                 response.request_id,
                 &response,
             )
@@ -2521,6 +2569,7 @@ async fn execute_host_operation(
                 client,
                 config,
                 "/api/remote/host/workspace-command-results",
+                command,
                 response.request_id,
                 &response,
             )
@@ -3175,6 +3224,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             &client,
             &config,
             "/api/remote/host/terminal-results",
+            &command,
             response.request_id,
             &response,
         )
@@ -3184,43 +3234,15 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
         let Some(response) = filesystem_response(receipts.as_ref(), &config, request).await else {
             return false;
         };
-        let result = client
-            .post(endpoint(
-                &config.server,
-                "/api/remote/host/filesystem-results",
-            ))
-            .bearer_auth(&config.host_token)
-            .json(&response)
-            .send()
-            .await;
-        let uploaded = match result {
-            Ok(result) if result.status().is_success() => true,
-            Ok(result) if matches!(result.status(), StatusCode::NOT_FOUND | StatusCode::GONE) => {
-                tracing::warn!(
-                    status = %result.status(),
-                    request_id = %response.request_id,
-                    "filesystem request no longer exists on the relay; acknowledging terminal result"
-                );
-                true
-            }
-            Ok(result) => {
-                tracing::warn!(
-                    status = %result.status(),
-                    request_id = %response.request_id,
-                    "filesystem result upload failed"
-                );
-                false
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    request_id = %response.request_id,
-                    "filesystem result upload failed"
-                );
-                false
-            }
-        };
-        return uploaded;
+        return upload_host_action_result(
+            &client,
+            &config,
+            "/api/remote/host/filesystem-results",
+            &command,
+            response.request_id,
+            &response,
+        )
+        .await;
     }
     if let HostCommand::CancelWorkspaceFilesystem { .. } = &command {
         return true;
@@ -3303,7 +3325,6 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                     session_store.as_ref(),
                     session_id,
                     "launch already rejected",
-                    true,
                 )
                 .await;
             }
@@ -3343,7 +3364,6 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                 session_store.as_ref(),
                 session_id,
                 &reason,
-                true,
             )
             .await;
         }
@@ -3639,7 +3659,6 @@ async fn stored_host_session_state(
     }
 }
 
-// Recovery-only local success is not permission to acknowledge a relay command.
 async fn reject_host_launch(
     client: &Client,
     config: &HostConfig,
@@ -3647,19 +3666,14 @@ async fn reject_host_launch(
     store: &dyn SessionStore,
     session_id: Uuid,
     reason: &str,
-    publish_before_ack: bool,
 ) -> bool {
-    let result: Result<bool> = async {
+    let result: Result<()> = async {
         let _writer = SessionWriterLease::acquire(session_root.join(format!("{session_id}.lock")))?;
-        if publish_before_ack {
-            ensure_host_launch_owner(client, config, store, session_id).await?;
-        } else {
-            validate_stored_host_identity(config, store, session_id).await?;
-            ensure!(
-                store.host_launch_owner(session_id).await?.is_some(),
-                "unverified launch cannot be settled offline"
-            );
-        }
+        ensure_host_launch_owner(client, config, store, session_id).await?;
+        ensure!(
+            store.host_launch_owner(session_id).await?.is_some(),
+            "unverified launch cannot be settled"
+        );
         if !store.contains_session(session_id).await? {
             store.create_session(session_id).await?;
         }
@@ -3683,49 +3697,19 @@ async fn reject_host_launch(
                     0,
                     crate::SessionEventKind::StatusChanged {
                         status: crate::SessionStatus::Failed,
-                        detail: Some(reason.to_string()),
+                        detail: Some(reason.to_owned()),
                     },
                 ))
                 .await?;
         }
-        if !publish_before_ack {
-            // Recovery settles locally; the independent journal worker owns publication.
-            store.settle_terminal_host_session(session_id).await?;
-            return Ok(true);
-        }
-        // Do not acknowledge rejection until the browser can observe it. An
-        // exact retry replays the same journal instead of starting the launch.
-        let mut cursor = 0;
-        loop {
-            let events = store.events_after(session_id, cursor, 1_024).await?;
-            if !matches!(
-                upload_event_page(
-                    client,
-                    config,
-                    store,
-                    &events,
-                    &mut cursor,
-                    Duration::from_secs(5)
-                )
-                .await?,
-                EventUploadOutcome::Complete
-            ) {
-                return Ok(false);
-            }
-            if events.len() < 1_024 {
-                store.settle_terminal_host_session(session_id).await?;
-                return Ok(true);
-            }
-        }
+        store.settle_terminal_host_session(session_id).await?;
+        Ok(())
     }
     .await;
-    match result {
-        Ok(handled) => handled,
-        Err(error) => {
-            tracing::warn!(%error, %session_id, publish_before_ack, "failed to settle rejected launch; retaining it for retry");
-            false
-        }
+    if let Err(error) = &result {
+        tracing::warn!(%error, %session_id, "failed to settle rejected launch");
     }
+    result.is_ok()
 }
 
 async fn admit_remote_prompt(
@@ -3765,16 +3749,57 @@ async fn upload_host_action_result<T: Serialize>(
     client: &Client,
     config: &HostConfig,
     path: &str,
+    command: &HostCommand,
     request_id: Uuid,
     response: &T,
 ) -> bool {
     let _ = (client, path);
     let result = async {
-        host_transport::get(config.host_id)?
+        ensure!(
+            owner_effect_id(command) == Some(request_id),
+            "terminal operation identity mismatch"
+        );
+        let transport = host_transport::get(config.host_id)?;
+        let ledger = transport.ledger()?;
+        let outcome = serde_json::to_value(response)?;
+        let encoded = serde_json::to_vec(command)?;
+        let result = serde_json::to_vec(&outcome)?;
+        match ledger
+            .admit(
+                config.host_id,
+                request_id,
+                "host",
+                "owner:trusted-relay",
+                &encoded,
+            )
+            .await?
+        {
+            crate::command_ledger::Admission::Terminal(bytes) => {
+                ensure!(bytes == result, "terminal operation result changed")
+            }
+            _ => {
+                if let Err(error) = ledger.finish(config.host_id, request_id, &result).await {
+                    ensure!(
+                        ledger
+                            .terminal(
+                                config.host_id,
+                                request_id,
+                                "host",
+                                "owner:trusted-relay",
+                                &encoded
+                            )
+                            .await?
+                            == Some(result),
+                        "{error}"
+                    );
+                }
+            }
+        }
+        transport
             .outbound
             .send(crate::auth::TunnelFrame::HostCommandResult {
                 command_id: request_id.to_string(),
-                outcome: serde_json::to_value(response)?,
+                outcome,
                 error: None,
             })
             .await?;
@@ -4642,7 +4667,6 @@ async fn resume_pending_host_sessions(
                 session_store.as_ref(),
                 session_id,
                 "launch already rejected",
-                false,
             )
             .await;
             continue;
@@ -4686,7 +4710,6 @@ async fn resume_pending_host_sessions(
                     session_store.as_ref(),
                     session_id,
                     &rejected_launch.reason,
-                    false,
                 )
                 .await;
                 continue;
@@ -4710,7 +4733,6 @@ async fn resume_pending_host_sessions(
                     session_store.as_ref(),
                     session_id,
                     &error.to_string(),
-                    false,
                 )
                 .await;
             } else {
@@ -4790,7 +4812,6 @@ async fn spawn_host_session(
                             store.as_ref(),
                             session_id,
                             "remote session failed during startup; check host logs",
-                            true,
                         )
                         .await;
                     }
@@ -9433,8 +9454,7 @@ mod tests {
                 root.path(),
                 store.as_ref(),
                 unstarted,
-                "wrong host startup failed",
-                true,
+                "wrong host startup failed"
             )
             .await
         );

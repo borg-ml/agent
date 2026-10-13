@@ -108,6 +108,11 @@ pub(super) fn start(
         config.server_name,
         config.bind_address.port()
     );
+    super::host_transport::get(host)?.set_routes(vec![crate::auth::HostRoute {
+        url: route.clone(),
+        server_name: config.server_name.clone(),
+        protocol: borg_view::wire::PROTOCOL_VERSION,
+    }]);
     let router = Router::new()
         .route("/.well-known/borg-remote", get(descriptor))
         .route("/preflight", get(preflight))
