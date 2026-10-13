@@ -352,7 +352,7 @@ impl PersistentRuntimeWorker {
         let cancellation = cancellation.unwrap_or_default();
         ensure!(
             !cancellation.is_cancelled(),
-            "persistent runtime was cancelled"
+            "persistent runtime was cancelled before execution; this request did not run"
         );
         ensure!(
             (self.runtime == "python" && requested_runtime == "python")
@@ -379,7 +379,7 @@ impl PersistentRuntimeWorker {
 
         let mut process = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => bail!("persistent runtime was cancelled"),
+            _ = cancellation.cancelled() => bail!("persistent runtime was cancelled before execution; this request did not run"),
             process = self.process.lock() => process,
         };
         let (result, worker_failed) = {
@@ -421,7 +421,7 @@ impl PersistentRuntimeWorker {
             chain.push(self.worker_id);
             let result = tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => Err(anyhow::anyhow!("persistent runtime was cancelled")),
+                _ = cancellation.cancelled() => Err(anyhow::anyhow!("persistent runtime was cancelled; execution may be partial, effects are not rolled back and the live namespace is lost. Reconcile partial effects before resuming; do not rerun the whole batch")),
                 result = RUNTIME_HOST_CALL_CHAIN.scope(chain, execute_request(
                     process.as_mut().expect("persistent Python process exists"),
                     &request_id,

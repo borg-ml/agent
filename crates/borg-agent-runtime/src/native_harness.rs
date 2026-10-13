@@ -3961,13 +3961,14 @@ async fn execute_tool(
             | "lane_service"
             | "watch"
     ) && runtime.permission != PermissionMode::FullAccess;
-    // A shell command is cancelled by an interrupt but not by a steer: the
-    // model reads the steer after its command finishes, which is what a user
-    // typing a correction mid-build expects. Without a token here an interrupt
-    // only dropped the future while the process ran on to its timeout.
-    let shell_exec = matches!(tool_call.function.name.as_str(), "exec" | "exec_command");
+    // Accepted shell/runtime batches can already have effects. Read steers at
+    // their next boundary instead of killing the batch; Interrupt still cancels.
+    let effectful_batch = matches!(
+        tool_call.function.name.as_str(),
+        "exec" | "exec_command" | "runtime_exec"
+    );
     let call_cancel = (external_mcp
-        || shell_exec
+        || effectful_batch
         || matches!(
             tool_call.function.name.as_str(),
             "run_workflow"
@@ -3986,7 +3987,7 @@ async fn execute_tool(
         workflow_approved,
         call_cancel.clone(),
     );
-    await_tool_with_controls(call, call_cancel, !shell_exec, controls).await
+    await_tool_with_controls(call, call_cancel, !effectful_batch, controls).await
 }
 
 async fn await_tool_with_controls(
@@ -6392,6 +6393,204 @@ mod tests {
             is_error && cancel.is_cancelled(),
             "failed tools must not disarm cleanup"
         );
+    }
+
+    // A real worker and dispatch boundary are needed: a helper-only test would
+    // miss runtime_exec being wired to the wrong cancellation policy again.
+    #[tokio::test]
+    async fn runtime_batch_survives_steers_and_reports_partial_effects_on_cancellation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let python = std::env::var("BORG_PYTHON_RUNTIME")
+            .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.into());
+        if !tokio::process::Command::new(python)
+            .arg("--version")
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        for mode in ["finish", "interrupt", "cancel"] {
+            let root = tempfile::tempdir().unwrap();
+            let session_id = Uuid::new_v4();
+            let dispatcher = crate::AgentToolDispatcher::new(
+                crate::session::SessionGoalTools::disconnected(),
+                crate::session::SessionTodoTools::disconnected(),
+                None,
+                crate::LspService::new(root.path()),
+                crate::CodingProvider::Codex,
+                session_id,
+                false,
+                None,
+                None,
+                root.path().to_path_buf(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                crate::native_process::ProcessManager::default(),
+                PermissionMode::FullAccess,
+            );
+            let (events_tx, mut events_rx) = mpsc::channel(16);
+            dispatcher.set_turn_events(&events_tx);
+            let runtime = NativeToolRuntime {
+                permission: PermissionMode::FullAccess,
+                agent_tools: dispatcher.clone(),
+                mcp: Arc::new(
+                    crate::native_mcp::NativeMcpRuntime::start(session_id, Vec::new())
+                        .await
+                        .unwrap(),
+                ),
+                context: Arc::new(
+                    crate::native_context::NativeContext::load(
+                        root.path().to_path_buf(),
+                        Vec::new(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                harness: HarnessMode::Borg,
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let code = format!(
+                "answer = 41\nborg.write_file(path='first', content='accepted')\n\
+                 import socket\nsock = socket.create_connection(('127.0.0.1', {}))\n\
+                 sock.sendall(b'R')\nsock.recv(1)\nsock.close()\n\
+                 borg.write_file(path='second', content='finished')\nanswer += 1\nanswer",
+                listener.local_addr().unwrap().port(),
+            );
+            let input = json!({"code": code});
+            let call =
+                ModelToolCall::function("batch".into(), "runtime_exec".into(), input.to_string());
+            let (control_tx, control_rx) = mpsc::channel(1);
+            let cancel = CancellationToken::new();
+            let call_cancel = cancel.clone();
+            let task = tokio::spawn(async move {
+                if mode == "cancel" {
+                    return runtime
+                        .call("runtime_exec", input, false, Some(call_cancel))
+                        .await
+                        .map(|value| (value.to_string(), false, Vec::new()));
+                }
+                execute_tool(
+                    &NativeHarness::default(),
+                    &runtime,
+                    &call,
+                    input,
+                    NativeApprovalContext {
+                        provider: crate::CodingProvider::Codex,
+                        model: "test-model",
+                        fast: false,
+                        ultrafast: false,
+                    },
+                    &events_tx,
+                    &mut Some(control_rx),
+                    &mut ProviderCallUsage::default(),
+                )
+                .await
+            });
+            let mut peer = tokio::time::timeout(Duration::from_secs(5), async {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                assert_eq!(peer.read_u8().await.unwrap(), b'R');
+                peer
+            })
+            .await
+            .expect("worker must reach the boundary after its first effect");
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("first")).unwrap(),
+                "accepted"
+            );
+            let mut parent_id = None;
+            while let Ok(event) = events_rx.try_recv() {
+                if let SessionEventKind::ToolCompleted {
+                    parent_tool_call_id,
+                    is_error,
+                    ..
+                } = event
+                {
+                    assert!(!is_error);
+                    parent_id = parent_tool_call_id;
+                }
+            }
+            let parent_id = parent_id.expect("the first effect has a nested tool receipt");
+            if mode == "cancel" {
+                cancel.cancel();
+            } else {
+                // Capacity one gives a deterministic happens-before: the approval
+                // send completes only after the preceding steer was captured.
+                for human in [false, true] {
+                    let (ack, _acknowledged) = tokio::sync::oneshot::channel();
+                    control_tx
+                        .send(AgentTurnControl::Steer {
+                            message_id: Uuid::new_v4(),
+                            text: "additional reference".into(),
+                            attachments: Vec::new(),
+                            admission: borg_provider::provider::SteerAdmission::pending(),
+                            preempt: false,
+                            human,
+                            ack,
+                        })
+                        .await
+                        .unwrap();
+                    control_tx
+                        .send(AgentTurnControl::Approval {
+                            approval_id: "capture-sync".into(),
+                            decision: ApprovalDecision::Deny,
+                        })
+                        .await
+                        .unwrap();
+                }
+                if mode == "interrupt" {
+                    control_tx.send(AgentTurnControl::Interrupt).await.unwrap();
+                } else {
+                    peer.write_all(b"F").await.unwrap();
+                }
+            }
+            let result = tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("stopping must not wait for the blocked worker")
+                .unwrap();
+            if mode == "finish" {
+                let (output, is_error, steers) = result.unwrap();
+                assert!(!is_error, "{output}");
+                assert_eq!(serde_json::from_str::<Value>(&output).unwrap()["value"], 42);
+                assert_eq!(steers.len(), 2);
+                assert_eq!(
+                    dispatcher
+                        .call("runtime_exec", json!({"code":"answer"}))
+                        .await
+                        .unwrap()["value"],
+                    42
+                );
+            } else {
+                let error = format!(
+                    "{:#}",
+                    result.err().expect("cancellation must stop the batch")
+                );
+                if mode == "cancel" {
+                    assert!(
+                        error.contains(&parent_id),
+                        "recovery must identify the actual receipts: {error}"
+                    );
+                    assert!(
+                        error.contains("1 host call(s)") && error.contains("effects may remain"),
+                        "{error}"
+                    );
+                    assert!(
+                        !error.contains("Did you mean") && !error.contains("Expected:"),
+                        "{error}"
+                    );
+                    assert!(
+                        error.contains("namespace is lost") && error.contains("do not rerun"),
+                        "{error}"
+                    );
+                } else {
+                    assert!(error.contains("interrupted"), "{error}");
+                }
+            }
+            assert_eq!(root.path().join("second").exists(), mode == "finish");
+        }
     }
 
     #[tokio::test]

@@ -2011,7 +2011,8 @@ impl AgentToolDispatcher {
             Ok(value) => return Ok(value),
             Err(error) => error,
         };
-        let specs = self.mcp_specs(true);
+        let mut specs = self.mcp_specs(true);
+        specs.push(runtime_exec_spec());
         let spec = specs
             .iter()
             .find(|spec| spec.get("name").and_then(Value::as_str) == Some(name));
@@ -3131,7 +3132,10 @@ impl AgentToolDispatcher {
             "persistent runtime requires Full Access or an explicit approval"
         );
         if let Some(cancel) = cancellation.as_ref() {
-            ensure!(!cancel.is_cancelled(), "persistent runtime was cancelled");
+            ensure!(
+                !cancel.is_cancelled(),
+                "persistent runtime was cancelled before execution; this request did not run"
+            );
         }
         let runtime_worker = match runtime {
             "python" => {
@@ -3158,7 +3162,7 @@ impl AgentToolDispatcher {
         // locals do not propagate into that new task.
         runtime_worker.ensure_not_reentrant()?;
         let cancellation = cancellation.unwrap_or_default().child_token();
-        let host: Arc<dyn RuntimeHost> = Arc::new(DispatcherRuntimeHost {
+        let host = Arc::new(DispatcherRuntimeHost {
             parent_tool_call_id: Uuid::new_v4().to_string(),
             session_id: self.actor_session_id,
             root: self.runtime_root.clone(),
@@ -3179,8 +3183,16 @@ impl AgentToolDispatcher {
         let execution = crate::persistent_runtime::inherit_runtime_host_call_chain(async move {
             Ok(serde_json::to_value(
                 runtime_worker
-                    .execute_as(runtime, &args.code, timeout_ms, host, Some(cancellation))
-                    .await?,
+                    .execute_as(runtime, &args.code, timeout_ms, host.clone(), Some(cancellation))
+                    .await
+                    .map_err(|error| anyhow::anyhow!(
+                        "{error:#}\nRuntime dispatched {} host call(s); completed or in-flight effects may remain. \
+                         Inspect query_history for nested tool receipts with parent_tool_call_id={}, \
+                         then verify affected state (for example list_agents or get_message_status) \
+                         before resuming only unfinished work. Direct code effects may not have tool receipts.",
+                        host.host_calls.load(Ordering::Relaxed),
+                        host.parent_tool_call_id,
+                    ))?,
             )?)
         });
         match &self.watches {
