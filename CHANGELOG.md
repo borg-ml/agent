@@ -19,6 +19,19 @@ Git comparison.
 - Draft Claude commit messages through the model-only subscription provider
   rather than an external agent loop.
 
+### Remote
+
+- Rebuild remote sessions on one shared view: the terminal, the web client and
+  the relay render the same projection, resume from cursors with bounded
+  snapshots, and keep subagent reports private to their parent.
+- Run hosts over a single authenticated tunnel. Commands, results and session
+  registration flow through a durable command ledger, and hosts wake on relay
+  and database notifications instead of polling.
+- Answer approvals against the exact request revision, with acknowledgement
+  and optional edited input, so a stale or replayed approval cannot run work.
+- Store streamed text as append-only chunks, so long replies and reasoning no
+  longer rewrite the whole message on every update.
+
 ### Terminal
 
 - Recall queued input directly into an editable draft and replace it atomically
