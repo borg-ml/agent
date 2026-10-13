@@ -3938,10 +3938,10 @@ impl BorgTerminal {
                 if !paths.contains(attachment) {
                     paths.push(attachment.clone());
                 }
-                if let Some((_, _, submitted_attachments)) = &mut self.recall_submission {
-                    if !submitted_attachments.contains(attachment) {
-                        submitted_attachments.push(attachment.clone());
-                    }
+                if let Some((_, _, submitted_attachments)) = &mut self.recall_submission
+                    && !submitted_attachments.contains(attachment)
+                {
+                    submitted_attachments.push(attachment.clone());
                 }
             }
             self.composer.restore(text, paths);
