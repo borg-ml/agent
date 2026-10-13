@@ -7,6 +7,10 @@ Git comparison.
 
 ### Providers
 
+- Add first-class Muse Wonder and Wonder Full selection with subscription-aware
+  authentication and streaming.
+- Finish native Claude refusals gracefully while preserving replay state.
+
 - Use Borg-owned Rust HTTP/SSE transport for Claude subscriptions instead of
   the JavaScript connector, keeping model turns inside Borg without API-key
   fallback.
@@ -16,6 +20,13 @@ Git comparison.
   rather than an external agent loop.
 
 ### Terminal
+
+- Recall queued input directly into an editable draft and replace it atomically
+  on Enter, preserving attachments and text entered while the recall completes.
+- Preserve interrupted and redirected partial replies and abandoned tool-call
+  outcomes across resume.
+- Associate shell-edit receipts with the correct command when process events
+  arrive before tool-start events.
 
 - Color the compaction marker and “Compacted context” title orange, and render
   the compaction summary in a darker grey.
@@ -30,6 +41,11 @@ Git comparison.
   compilation, verification, audits, and patch application.
 
 ### Reliability
+
+- Project team workspace events in background batches so busy subagent teams
+  cannot hold back the root session's streamed output.
+- Add explicit `borg update --force` handoff of verified obsolete local workers,
+  including same-version local rebuilds. Plain updates do not interrupt work.
 
 - Keep the command sender returned by subagent startup, avoiding a second
   lookup that could race with actor shutdown. Report children that stop during
@@ -48,6 +64,11 @@ Git comparison.
   messages with no visible text or tool calls.
 - Keep opaque GPT reasoning during replay without resurrecting native tool calls
   that request repair removed.
+
+### Tooling
+
+- Preserve repeated Cargo package selectors in native workflows and check every
+  selected runtime package for the PostgreSQL fixture requirement.
 
 ## 0.15.7 (2026-10-11)
 
