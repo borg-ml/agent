@@ -9,8 +9,6 @@ Git comparison.
 
 - Add first-class Muse Wonder and Wonder Full selection with subscription-aware
   authentication and streaming.
-- Finish native Claude refusals gracefully while preserving replay state.
-
 - Use Borg-owned Rust HTTP/SSE transport for Claude subscriptions instead of
   the JavaScript connector, keeping model turns inside Borg without API-key
   fallback.
@@ -21,6 +19,17 @@ Git comparison.
 - Show Claude subscription usage reliably in `/usage` and `/status`: refresh it
   from every Claude response and keep the last known values, with their age,
   when Claude throttles a usage refresh.
+- Retry throttled Claude account checks (HTTP 429/5xx), honouring Retry-After,
+  and then reconnect instead of failing turns as if the subscription were
+  unavailable.
+- Move past Claude subscription quota refusals to the configured fallback
+  instead of retrying them as broken connections.
+- Finish native Claude refusals gracefully while preserving replay state.
+- Stop suggesting reauthentication when a Claude account lookup merely fails.
+- Give each retried model request its own identity and keep the cause of a
+  dropped connection.
+- Bound stalled native reasoning streams while still counting hidden transport
+  activity as progress.
 
 ### Remote
 
@@ -34,31 +43,47 @@ Git comparison.
   and optional edited input, so a stale or replayed approval cannot run work.
 - Store streamed text as append-only chunks, so long replies and reasoning no
   longer rewrite the whole message on every update.
+- Serve optional direct TLS viewer sessions verified against native roots, and
+  admit service tunnel connections with a signed purpose and proof.
+- Reject insecure relay configuration before a daemon starts, and reconnect an
+  overloaded host without cancelling its running sessions.
+- Create remote sessions with the host's current provider, model and speed
+  settings.
+
+### Agents and tools
+
 - Share background execution across safe tool calls, persistent runtime and
   shell commands. Slow calls detach after a short wait, expose retrievable and
   cancellable jobs in the UI, and group completion wakes. Optional `async`
   controls detachment while ordered mutations stay synchronous.
-- Keep team plan reads off the workspace write lock, and batch messages to
-  distinct local recipients concurrently without reordering aliases of one agent.
-- Move past Claude subscription quota refusals to the configured fallback
-  instead of retrying them as broken connections.
-- Retry throttled Claude account checks (HTTP 429/5xx), honouring Retry-After,
-  and then reconnect instead of failing turns as if the subscription were
-  unavailable.
+- Run message batches to distinct local recipients concurrently, without
+  reordering messages sent to one agent under different names.
+- Keep team plan reads off the workspace write lock.
+- Let team reports and Borg's own notices wait for the tools already queued
+  instead of cancelling them as "user steering"; only a person's message
+  redirects a turn before its tools start.
+- Keep shell and runtime batches that have already started running when the
+  turn is steered; an explicit stop still cancels them.
+- Keep finished watcher results retrievable for a bounded time after they end.
+- Deliver peer messages to hosted children through their real owner, and return
+  queued peer reports at explicit `wait_agent` boundaries.
+- Let a parent control the goals of its own descendants.
+- Keep subagent starts alive when the caller is cancelled, keep the command
+  sender returned at startup, and report children that stop during startup.
+- Restore declared argument types for direct capability calls and accept
+  untyped JSON arguments.
+- Resume admitted native work after a restart without duplicating its prompt.
 
 ### Terminal
 
-- Recall pending input into the composer immediately and atomically. Sending
-  recalled edits moves them back to pending on the first Enter, with recovery
-  on failure and protection for drafts typed while acknowledgement is pending.
-
-- Recall queued input directly into an editable draft and replace it atomically
-  on Enter, preserving attachments and text entered while the recall completes.
+- Recall pending input into the composer immediately and atomically, preserving
+  attachments. Sending the edited text moves it back to pending on the first
+  Enter, with recovery on failure and protection for text typed meanwhile.
 - Preserve interrupted and redirected partial replies and abandoned tool-call
   outcomes across resume.
 - Associate shell-edit receipts with the correct command when process events
   arrive before tool-start events.
-
+- Make Esc flush pending input and interrupt as quickly as Esc stop.
 - Color the compaction marker and “Compacted context” title orange, and render
   the compaction summary in a darker grey.
 - Separate the compaction preview from its title with a wider gap, strip Markdown
@@ -70,6 +95,16 @@ Git comparison.
   labels without re-rendering the unrelated transcript tail.
 - Use progressive and past-tense labels for more actions, including builds,
   compilation, verification, audits, and patch application.
+- Show the "borging" status on 1 in 1000 runs instead of 1 in 100.
+
+### Desktop
+
+- Downscale oversized private-display screenshots instead of refusing them, and
+  report the applied image scale.
+- Keep private displays across launch cancellation and supervise launched app
+  groups.
+- Guard private-display rendering against GPU context resets, and advertise
+  text-input-v3 so SDL Wayland apps accept typed text.
 
 ### Reliability
 
@@ -77,16 +112,14 @@ Git comparison.
   cannot hold back the root session's streamed output.
 - Add explicit `borg update --force` handoff of verified obsolete local workers,
   including same-version local rebuilds. Plain updates do not interrupt work.
-
-- Keep the command sender returned by subagent startup, avoiding a second
-  lookup that could race with actor shutdown. Report children that stop during
-  startup explicitly.
-
 - Acknowledge stop requests and abort generation independently of slow journal
   writes and full command queues. Save interruption state and clean up tools
   separately, without waiting indefinitely for an aborted turn.
 - Cancel a running tool when its turn is aborted, while preserving commands
-  intentionally left running after a successful background yield.
+  intentionally left running after a successful background yield. A stop no
+  longer latches beyond the turn it cancelled.
+- Preserve acknowledged journal commits and interrupted assistant text.
+- Bound native process output stored in journal previews.
 
 ### Reasoning
 
@@ -100,6 +133,9 @@ Git comparison.
 
 - Preserve repeated Cargo package selectors in native workflows and check every
   selected runtime package for the PostgreSQL fixture requirement.
+- Preserve out-of-memory evidence from lane jobs before their scope is
+  collected.
+- Update `quinn-proto` to the patched 0.11.18.
 
 ## 0.15.7 (2026-10-11)
 

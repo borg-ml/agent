@@ -1335,7 +1335,7 @@ impl NativeHarness {
                     // A steer collected from an earlier chunk preempts the
                     // chunks that have not started. This one has not started
                     // yet, so it is the boundary the steer was waiting for.
-                    let outcomes = if !pending_steer.is_empty() {
+                    let outcomes = if redirects(&pending_steer) {
                         None
                     } else {
                         let reads = futures::future::join_all(chunk.iter().map(
@@ -1397,7 +1397,7 @@ impl NativeHarness {
                 }
             } else {
                 for (tool_call, input) in tool_calls.iter().zip(inputs) {
-                    let (output, is_error, steer) = if !pending_steer.is_empty() {
+                    let (output, is_error, steer) = if redirects(&pending_steer) {
                         let (output, is_error) = skipped_tool_result();
                         (output, is_error, Vec::new())
                     } else {
@@ -3783,13 +3783,21 @@ async fn execute_tool(
     controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
     usage: &mut ProviderCallUsage,
 ) -> Result<(String, bool, Vec<CapturedSteer>)> {
+    // Team reports and Borg's own notices wait for this call; only a person's
+    // redirect skips tools that have not started.
+    let mut carried = Vec::new();
     while let Some(control) = controls
         .as_mut()
         .and_then(|controls| controls.try_recv().ok())
     {
         if let Some(steer) = accept_tool_boundary_control(control)? {
+            if !redirects(std::slice::from_ref(&steer)) {
+                carried.push(steer);
+                continue;
+            }
+            carried.push(steer);
             let (output, is_error) = skipped_tool_result();
-            return Ok((output, is_error, vec![steer]));
+            return Ok((output, is_error, carried));
         }
     }
     let external_mcp = runtime.mcp.contains(&tool_call.function.name);
@@ -3898,6 +3906,7 @@ async fn execute_tool(
                     &tool_call.function.name,
                     &review_input,
                     controls,
+                    &mut carried,
                 )
                 .await
                 {
@@ -3905,8 +3914,9 @@ async fn execute_tool(
                         bail!("native provider turn interrupted")
                     }
                     Ok(AutomaticReviewOutcome::Steered(steer)) => {
+                        carried.push(steer);
                         let (output, is_error) = skipped_tool_result();
-                        return Ok((output, is_error, vec![steer]));
+                        return Ok((output, is_error, carried));
                     }
                     Ok(AutomaticReviewOutcome::Reviewed(review)) => {
                         absorb_usage(usage, &review.usage);
@@ -3954,7 +3964,7 @@ async fn execute_tool(
                     json!({ "error": "tool execution was denied by the approval policy" })
                         .to_string(),
                     true,
-                    Vec::new(),
+                    carried,
                 ));
             }
             ApprovalDecision::AllowOnce | ApprovalDecision::AllowSession => {}
@@ -3979,8 +3989,12 @@ async fn execute_tool(
             .and_then(|controls| controls.try_recv().ok())
         {
             if let Some(steer) = accept_tool_boundary_control(control)? {
-                let (output, is_error) = skipped_tool_result();
-                return Ok((output, is_error, vec![steer]));
+                let redirect = redirects(std::slice::from_ref(&steer));
+                carried.push(steer);
+                if redirect {
+                    let (output, is_error) = skipped_tool_result();
+                    return Ok((output, is_error, carried));
+                }
             }
         }
     }
@@ -4025,7 +4039,10 @@ async fn execute_tool(
         workflow_approved,
         call_cancel.clone(),
     );
-    await_tool_with_controls(call, call_cancel, !effectful_batch, controls).await
+    let (output, is_error, mut steers) =
+        await_tool_with_controls(call, call_cancel, !effectful_batch, controls).await?;
+    carried.append(&mut steers);
+    Ok((output, is_error, carried))
 }
 
 async fn await_tool_with_controls(
@@ -4135,6 +4152,7 @@ async fn review_tool_automatically(
     tool_name: &str,
     input: &Value,
     controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
+    carried: &mut Vec<CapturedSteer>,
 ) -> Result<AutomaticReviewOutcome> {
     let request = ModelTurnRequest {
         fast: context.fast,
@@ -4181,7 +4199,10 @@ async fn review_tool_automatically(
                 Some(AgentTurnControl::Interrupt) => return Ok(AutomaticReviewOutcome::Interrupted),
                 Some(control) => {
                     if let Some(steer) = accept_tool_boundary_control(control)? {
-                        return Ok(AutomaticReviewOutcome::Steered(steer));
+                        if redirects(std::slice::from_ref(&steer)) {
+                            return Ok(AutomaticReviewOutcome::Steered(steer));
+                        }
+                        carried.push(steer);
                     }
                 }
                 None => {}
@@ -4377,6 +4398,11 @@ fn accept_tool_boundary_control(control: AgentTurnControl) -> Result<Option<Capt
         AgentTurnControl::Interrupt => bail!("native provider turn interrupted"),
         control => Ok(CapturedSteer::from_control(control)),
     }
+}
+
+/// A person's steer redirects the turn; other steers wait for the batch.
+fn redirects(steers: &[CapturedSteer]) -> bool {
+    steers.iter().any(|steer| steer.human || steer.preempt)
 }
 
 fn skipped_tool_result() -> (String, bool) {
@@ -6331,6 +6357,7 @@ mod tests {
                     "exec",
                     &json!({"cmd":"must not execute"}),
                     &mut Some(control_rx),
+                    &mut Vec::new(),
                 )
                 .await
             });
