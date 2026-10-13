@@ -2173,8 +2173,8 @@ pub(crate) async fn run_host_with_resolved_store(
     let mut epoch = config.revocation_epoch;
     let mut direct = config.direct_listener.clone().map(|listener| direct_listener::start(listener, config.host_id, issuer, Arc::clone(&sync)).map(AbortTask)).transpose()?;
     let _dispatcher = AbortTask(host_transport::spawn(async move {
-        while let Some((command_id, command)) = command_rx.recv().await {
-            let result = owner_command(&ledger, context.clone(), command_id, command).await;
+        while let Some((command_id, command, not_after)) = command_rx.recv().await {
+            let result = owner_command(&ledger, context.clone(), command_id, command, not_after).await;
             if let Err(error) = transport.outbound.send(result).await {
                 tracing::warn!(%error, "owner result transport stopped");
                 break;
@@ -2249,8 +2249,8 @@ pub(crate) async fn run_host_with_resolved_store(
             frame = incoming.recv() => {
                 let Some(frame) = frame else { bail!("host tunnel ingress stopped") };
                 match frame {
-                        crate::auth::TunnelFrame::HostCommand { command_id, command } => {
-                            match commands.try_send((command_id, command)) {
+                        crate::auth::TunnelFrame::HostCommand { command_id, command, not_after } => {
+                            match commands.try_send((command_id, command, not_after)) {
                                 Ok(()) => {},
                                 Err(mpsc::error::TrySendError::Full(_)) => {
                                     restart_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
@@ -2786,16 +2786,73 @@ async fn viewer_command(
     })
 }
 
+tokio::task_local! { static OWNER_NOT_AFTER: Option<i64>; }
+
+fn owner_effect_id(command: &HostCommand) -> Option<Uuid> {
+    match command {
+        HostCommand::WorkspaceFilesystem { request } => Some(request.request_id),
+        HostCommand::WorkspaceCommand { request } => Some(request.request_id),
+        HostCommand::ShellCommand { request } => Some(request.request_id),
+        HostCommand::OpenTerminal { request } => Some(request.request_id),
+        _ => None,
+    }
+}
+
+fn validate_owner_deadline(command: &HostCommand, not_after: Option<i64>, now: i64) -> Result<()> {
+    let fenced = matches!(
+        command,
+        HostCommand::Approve { .. }
+            | HostCommand::RespondToProviderInteraction { .. }
+            | HostCommand::Subagent {
+                action: crate::SubagentAction::Approve { .. },
+                ..
+            }
+    );
+    ensure!(
+        !fenced || not_after.is_some(),
+        "approval or question command requires a deadline"
+    );
+    if let Some(deadline) = not_after {
+        ensure!(deadline > now, "owner command deadline expired");
+        ensure!(
+            !fenced || deadline <= now.saturating_add(15),
+            "approval deadline exceeds 15-second window"
+        );
+    }
+    Ok(())
+}
+
+fn check_owner_deadline(command: &HostCommand) -> Result<()> {
+    if let Ok(deadline) = OWNER_NOT_AFTER.try_with(|deadline| *deadline) {
+        validate_owner_deadline(command, deadline, Utc::now().timestamp())?;
+    }
+    Ok(())
+}
+
 async fn owner_command(
     ledger: &crate::command_ledger::CommandLedger,
     context: DispatchContext,
     command_id: String,
     command: HostCommand,
+    not_after: Option<i64>,
 ) -> crate::auth::TunnelFrame {
     let run = async {
         let id = Uuid::parse_str(&command_id)?;
         let encoded = serde_json::to_vec(&command)?;
         let admission = ledger.admit(context.config.host_id, id, "host", "owner:trusted-relay", &encoded).await?;
+        if !matches!(admission, crate::command_ledger::Admission::Terminal(_)) {
+            let validation = validate_owner_deadline(&command, not_after, Utc::now().timestamp()).and_then(|()| {
+                ensure!(owner_effect_id(&command).is_none_or(|request| request == id), "owner command ID differs from effect request ID");
+                Ok(())
+            });
+            if let Err(error) = validation {
+                let outcome = serde_json::json!({"status":"rejected","error":error.to_string(),"retryable":false});
+                if matches!(admission, crate::command_ledger::Admission::New) {
+                    ledger.finish(context.config.host_id, id, &serde_json::to_vec(&outcome)?).await?;
+                }
+                return Ok(outcome);
+            }
+        }
         if matches!(admission, crate::command_ledger::Admission::New | crate::command_ledger::Admission::InDoubt) {
             if let HostCommand::Prompt { session_id, message_id, .. } = &command {
                 ledger.bind_prompt(context.config.host_id, id, *session_id, *message_id).await?;
@@ -2810,13 +2867,13 @@ async fn owner_command(
                         return Ok(serde_json::json!({"status":"accepted"}));
                     }
                 }
-                ensure!(dispatch(context, command).await, "prompt retry admission interrupted");
+                ensure!(OWNER_NOT_AFTER.scope(not_after, dispatch(context, command)).await, "prompt retry admission interrupted");
                 Ok(serde_json::json!({"status":"accepted"}))
             }
             crate::command_ledger::Admission::InDoubt => Ok(serde_json::json!({"status":"interrupted", "retryable":false})),
             crate::command_ledger::Admission::New => {
                 let host = context.config.host_id;
-                let handled = dispatch(context, command).await;
+                let handled = OWNER_NOT_AFTER.scope(not_after, dispatch(context, command)).await;
                 let outcome = serde_json::json!({"status":if handled { "accepted" } else { "interrupted" }, "retryable":false});
                 ledger.finish(host, id, &serde_json::to_vec(&outcome)?).await?;
                 Ok::<_, anyhow::Error>(outcome)
@@ -3432,13 +3489,11 @@ pub(crate) async fn register_child(
 /// The terminal remains the process owner and journal authority. This task
 /// only registers the session, uploads its durable suffix, and forwards typed
 /// commands from web/mobile clients.
-pub async fn mirror_local_session(
+pub async fn register_existing_session(
     config_path: &Path,
-    store: Arc<dyn crate::SessionStore>,
+    store: Arc<dyn SessionStore>,
     session_id: Uuid,
     request: LaunchSession,
-    commands: mpsc::Sender<HostCommand>,
-    mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let config: HostConfig = serde_json::from_slice(&fs::read(config_path)?)?;
     config.validate()?;
@@ -3462,6 +3517,18 @@ pub async fn mirror_local_session(
         .bind(session_id.to_string())
         .execute(&authority.pool)
         .await?;
+    Ok(())
+}
+
+pub async fn mirror_local_session(
+    config_path: &Path,
+    store: Arc<dyn crate::SessionStore>,
+    session_id: Uuid,
+    request: LaunchSession,
+    commands: mpsc::Sender<HostCommand>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    register_existing_session(config_path, store, session_id, request).await?;
     let _ = commands; // The canonical local-control socket remains the actor ingress.
     while !*shutdown.borrow() {
         if shutdown.changed().await.is_err() {
@@ -3559,6 +3626,10 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
         receipts,
         executor_factory,
     } = context;
+    if let Err(error) = check_owner_deadline(&command) {
+        tracing::warn!(%error, "expired owner command refused before mutation");
+        return false;
+    }
     if !matches!(command, HostCommand::Launch { .. }) {
         if let Some(session_id) = command.session_id() {
             let root = match session_store.owning_root_session(session_id).await {
@@ -3606,6 +3677,9 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                     }
                 }
 
+                if check_owner_deadline(&command).is_err() {
+                    return false;
+                }
                 return crate::send_local_session_command(&socket, session_id, command)
                     .await
                     .is_ok();
@@ -4021,10 +4095,17 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                 }
             }
         }
-        if session.send(command).await.is_err() {
-            tracing::warn!(%session_id, "remote session actor stopped before command delivery; retaining it for relay retry");
+        let permit = match session.reserve().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                tracing::warn!(%error, %session_id, "remote session actor stopped before command admission");
+                return false;
+            }
+        };
+        if check_owner_deadline(&command).is_err() {
             return false;
         }
+        permit.send(command);
         return true;
     }
     true
@@ -15136,6 +15217,27 @@ connection: close
 #[cfg(test)]
 mod prompt_retry_contract {
     use super::*;
+
+    // Approval-related mutations must not survive an absent, expired, or
+    // unbounded owner-service deadline; cached terminal lookup is separate.
+    #[test]
+    fn owner_approval_deadline_is_short_and_required() {
+        let command = HostCommand::Approve {
+            session_id: Uuid::new_v4(),
+            approval_id: "pending".into(),
+            decision: crate::ApprovalDecision::AllowOnce,
+        };
+        assert!(validate_owner_deadline(&command, None, 100).is_err());
+        assert!(validate_owner_deadline(&command, Some(100), 100).is_err());
+        assert!(validate_owner_deadline(&command, Some(115), 100).is_ok());
+        assert!(validate_owner_deadline(&command, Some(116), 100).is_err());
+        let question = HostCommand::RespondToProviderInteraction {
+            session_id: Uuid::new_v4(),
+            interaction_id: "pending".into(),
+            response: serde_json::json!({}),
+        };
+        assert!(validate_owner_deadline(&question, None, 100).is_err());
+    }
 
     // Reconnect and new-session metadata must use the committed chosen settings,
     // not silently restore the provider/speed values from the original launch.
