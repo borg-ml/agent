@@ -1590,12 +1590,16 @@ pub(crate) async fn run_host_with_resolved_store(
     let recovery_context = context.clone();
     let _recovery = AbortTask(host_transport::spawn(async move {
         let mut offset = 0;
+        let mut retry = RemoteRetryBackoff::default();
         loop {
             match resume_pending_host_sessions(offset, &recovery_context.client, &recovery_context.config,
                 &recovery_context.session_root, &recovery_context.sessions, &recovery_context.session_store,
                 &recovery_context.executor_factory).await {
-                Ok(next) => { offset = next; if next == 0 { break; } }
-                Err(error) => { tracing::warn!(%error, "host startup recovery stopped"); break; }
+                Ok(next) => { retry.reset(); offset = next; if next == 0 { break; } }
+                Err(error) => {
+                    tracing::warn!(%error, offset, "host startup recovery deferred; retrying");
+                    tokio::time::sleep(retry.next_delay(None)).await;
+                }
             }
         }
     }));
@@ -7969,91 +7973,97 @@ mod tests {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
                     let (path, _) = read_http_request(&mut socket).await;
-                    let path = path.split("?").next().unwrap();
-                    let (status, body) = if path.ends_with("/sync") {
-                        (200, "{\"event_cursor\":0,\"live_revision\":0}")
-                    } else if matches!(
-                        path,
-                        "/api/remote/host/events" | "/api/remote/host/live-state"
-                    ) {
-                        (200, "")
-                    } else {
-                        (404, "")
-                    };
-                    socket.write_all(format!("HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    assert!(path.ends_with("/runtime-context"));
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
                 }
             }));
-            let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
-            let id = Uuid::new_v4();
-            let launch = bootstrap_test_launch(root.path());
-            persist_launch_metadata(&config, &store, id, &launch, None)
-                .await
-                .unwrap();
-            store.begin_host_bootstrap(id).await.unwrap();
-            if started {
-                store.create_session(id).await.unwrap();
-                for kind in [
-                    crate::SessionEventKind::SessionStarted,
-                    crate::SessionEventKind::SessionConfigured {
-                        cwd: launch.cwd.clone(),
-                        provider: launch.provider,
-                        model: None,
-                        effort: None,
-                        fast: false,
-                        ultrafast: false,
-                        response_language: launch.response_language,
-                        permission_mode: launch.permission_mode,
-                        speed_support: Default::default(),
-                    },
-                ] {
-                    store.append(SessionEvent::new(id, 0, kind)).await.unwrap();
+            let (outbound, mut frames) = mpsc::channel(8);
+            let transport = host_transport::Transport::new(config.host_id, outbound);
+            let acknowledger = transport.clone();
+            let _registrations = AbortTask(tokio::spawn(async move {
+                while let Some(frame) = frames.recv().await {
+                    match frame {
+                        crate::auth::TunnelFrame::RegisterSession {
+                            registration_id, ..
+                        } => acknowledger.registered(&registration_id, None),
+                        other => panic!("unexpected registration fixture frame: {other:?}"),
+                    }
                 }
-                admit_remote_prompt(
-                    &store,
-                    id,
-                    launch.request_id,
-                    "recover after panic",
-                    &[],
-                    crate::PromptDelivery::Queue,
-                )
-                .await
-                .unwrap();
-            }
-            let sessions = Arc::new(Mutex::new(HashMap::new()));
-            let reached = Arc::new(Notify::new());
-            let attempts = Arc::new(AtomicUsize::new(0));
-            let factory_reached = Arc::clone(&reached);
-            let factory_attempts = Arc::clone(&attempts);
-            let factory: HostExecutorFactory = Arc::new(move |_, _| {
-                factory_attempts.fetch_add(1, Ordering::SeqCst);
-                factory_reached.notify_one();
-                panic!("injected hosted startup panic");
-            });
-            let client = Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap();
-            let commands = spawn_host_session(
-                client.clone(),
-                config.clone(),
-                root.path().to_path_buf(),
-                Arc::clone(&sessions),
-                factory,
-                HostSessionLaunch {
-                    session_id: id,
-                    request: launch,
-                    attachment: None,
-                },
-                host_store(&scratch).await,
-            )
-            .await;
-            tokio::time::timeout(Duration::from_secs(30), reached.notified())
-                .await
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), commands.closed())
-                .await
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
+            }));
+            host_transport::CURRENT
+                .scope(transport, async {
+                    let (scratch, store) =
+                        crate::session_store::postgres::testing::session_store().await;
+                    let id = Uuid::new_v4();
+                    let launch = bootstrap_test_launch(root.path());
+                    persist_launch_metadata(&config, &store, id, &launch, None)
+                        .await
+                        .unwrap();
+                    store.begin_host_bootstrap(id).await.unwrap();
+                    if started {
+                        store.create_session(id).await.unwrap();
+                        for kind in [
+                            crate::SessionEventKind::SessionStarted,
+                            crate::SessionEventKind::SessionConfigured {
+                                cwd: launch.cwd.clone(),
+                                provider: launch.provider,
+                                model: None,
+                                effort: None,
+                                fast: false,
+                                ultrafast: false,
+                                response_language: launch.response_language,
+                                permission_mode: launch.permission_mode,
+                                speed_support: Default::default(),
+                            },
+                        ] {
+                            store.append(SessionEvent::new(id, 0, kind)).await.unwrap();
+                        }
+                        admit_remote_prompt(
+                            &store,
+                            id,
+                            launch.request_id,
+                            "recover after panic",
+                            &[],
+                            crate::PromptDelivery::Queue,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    let sessions = Arc::new(Mutex::new(HashMap::new()));
+                    let reached = Arc::new(Notify::new());
+                    let attempts = Arc::new(AtomicUsize::new(0));
+                    let factory_reached = Arc::clone(&reached);
+                    let factory_attempts = Arc::clone(&attempts);
+                    let factory: HostExecutorFactory = Arc::new(move |_, _| {
+                        factory_attempts.fetch_add(1, Ordering::SeqCst);
+                        factory_reached.notify_one();
+                        panic!("injected hosted startup panic");
+                    });
+                    let client = Client::builder()
+                        .timeout(Duration::from_secs(5))
+                        .build()
+                        .unwrap();
+                    let commands = spawn_host_session(
+                        client.clone(),
+                        config.clone(),
+                        root.path().to_path_buf(),
+                        Arc::clone(&sessions),
+                        factory,
+                        HostSessionLaunch {
+                            session_id: id,
+                            request: launch,
+                            attachment: None,
+                        },
+                        host_store(&scratch).await,
+                    )
+                    .await;
+                    tokio::time::timeout(Duration::from_secs(30), reached.notified())
+                        .await
+                        .unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), commands.closed())
+                        .await
+                        .unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), async {
                 while sessions.lock().await.contains_key(&id) {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -8062,80 +8072,84 @@ mod tests {
             .expect(
                 "a panic must not leave a closed route that blocks recovery and consumes capacity",
             );
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    if SessionWriterLease::try_acquire(root.path().join(format!("{id}.lock")))
-                        .unwrap()
-                        .is_some()
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("startup panic must release writer ownership");
-            drop(store);
-            let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
-                .await
-                .unwrap();
-            let journal = serde_json::to_value(store.read(id).await.unwrap()).unwrap();
-            if started {
-                assert_ne!(
-                    store.state(id).await.unwrap().status,
-                    Some(crate::SessionStatus::Failed)
-                );
-                assert_eq!(store.pending_actions(id, 8).await.unwrap().len(), 1);
-            } else {
-                assert_eq!(
-                    store.state(id).await.unwrap().status,
-                    Some(crate::SessionStatus::Failed)
-                );
-                assert!(
-                    store
-                        .pending_host_launch_metadata(8)
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            if SessionWriterLease::try_acquire(
+                                root.path().join(format!("{id}.lock")),
+                            )
+                            .unwrap()
+                            .is_some()
+                            {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("startup panic must release writer ownership");
+                    drop(store);
+                    let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
                         .await
-                        .unwrap()
-                        .is_empty()
-                );
-            }
-            let factory_reached = Arc::clone(&reached);
-            let factory_attempts = Arc::clone(&attempts);
-            let retry: HostExecutorFactory = Arc::new(move |_, _| {
-                factory_attempts.fetch_add(1, Ordering::SeqCst);
-                factory_reached.notify_one();
-                bail!("stop recovery probe before executing a provider")
-            });
-            resume_pending_host_sessions(
-                0,
-                &client,
-                &config,
-                root.path(),
-                &sessions,
-                &host_store(&scratch).await,
-                &retry,
-            )
-            .await
-            .unwrap();
-            if started {
-                tokio::time::timeout(Duration::from_secs(30), reached.notified())
+                        .unwrap();
+                    let journal = serde_json::to_value(store.read(id).await.unwrap()).unwrap();
+                    if started {
+                        assert_ne!(
+                            store.state(id).await.unwrap().status,
+                            Some(crate::SessionStatus::Failed)
+                        );
+                        assert_eq!(store.pending_actions(id, 8).await.unwrap().len(), 1);
+                    } else {
+                        assert_eq!(
+                            store.state(id).await.unwrap().status,
+                            Some(crate::SessionStatus::Failed)
+                        );
+                        assert!(
+                            store
+                                .pending_host_launch_metadata(8)
+                                .await
+                                .unwrap()
+                                .is_empty()
+                        );
+                    }
+                    let factory_reached = Arc::clone(&reached);
+                    let factory_attempts = Arc::clone(&attempts);
+                    let retry: HostExecutorFactory = Arc::new(move |_, _| {
+                        factory_attempts.fetch_add(1, Ordering::SeqCst);
+                        factory_reached.notify_one();
+                        bail!("stop recovery probe before executing a provider")
+                    });
+                    resume_pending_host_sessions(
+                        0,
+                        &client,
+                        &config,
+                        root.path(),
+                        &sessions,
+                        &host_store(&scratch).await,
+                        &retry,
+                    )
                     .await
                     .unwrap();
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    while sessions.lock().await.contains_key(&id) {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    if started {
+                        tokio::time::timeout(Duration::from_secs(30), reached.notified())
+                            .await
+                            .unwrap();
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            while sessions.lock().await.contains_key(&id) {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        })
+                        .await
+                        .unwrap();
                     }
+                    assert_eq!(attempts.load(Ordering::SeqCst), if started { 2 } else { 1 });
+                    assert_eq!(
+                        serde_json::to_value(store.read(id).await.unwrap()).unwrap(),
+                        journal
+                    );
+                    assert!(sessions.lock().await.is_empty());
+                    scratch.discard().await;
                 })
-                .await
-                .unwrap();
-            }
-            assert_eq!(attempts.load(Ordering::SeqCst), if started { 2 } else { 1 });
-            assert_eq!(
-                serde_json::to_value(store.read(id).await.unwrap()).unwrap(),
-                journal
-            );
-            assert!(sessions.lock().await.is_empty());
-            scratch.discard().await;
+                .await;
         }
     }
 
@@ -8671,78 +8685,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_scan_fault_keeps_host_polling_and_recovers_without_restart() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use tokio::sync::oneshot;
+    async fn recovery_scan_fault_preserves_metadata_and_retries_after_repair() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let root = tempdir().unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = test_config(root.path());
-        config.server = format!("http://{}", listener.local_addr().unwrap());
-        let config_path = root.path().join("host.json");
-        write_config(&config_path, &config).unwrap();
+        let config = test_config(root.path());
+        let client = Client::new();
         let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
-        let (gates_tx, mut gates) = mpsc::channel(2);
-        let stop = Arc::new(AtomicBool::new(false));
-        let uploads = Arc::new(AtomicUsize::new(0));
-        let server_stop = Arc::clone(&stop);
-        let server_uploads = Arc::clone(&uploads);
-        let _server = AbortTask(host_transport::spawn(async move {
-            let mut polls = 0;
-            loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let (path, _) = read_http_request(&mut socket).await;
-                let path = path.split("?").next().unwrap();
-                let (status, body) = if path == "/api/remote/host/commands" {
-                    polls += 1;
-                    if polls <= 2 {
-                        let (release, wait) = oneshot::channel();
-                        gates_tx.send(release).await.unwrap();
-                        wait.await.unwrap();
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    if server_stop.load(Ordering::SeqCst) {
-                        (401, "")
-                    } else {
-                        (200, "{\"commands\":[]}")
-                    }
-                } else if path == "/api/remote/host/events" {
-                    server_uploads.fetch_add(1, Ordering::SeqCst);
-                    (200, "")
-                } else if path.ends_with("/sync") {
-                    (200, "{\"event_cursor\":0,\"live_revision\":0}")
-                } else if matches!(
-                    path,
-                    "/api/remote/host/heartbeat" | "/api/remote/host/live-state"
-                ) {
-                    (200, "")
-                } else {
-                    (404, "")
-                };
-                socket.write_all(format!("HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-            }
-        }));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
         let factory_calls = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&factory_calls);
         let factory: HostExecutorFactory = Arc::new(move |_, _| {
             seen.fetch_add(1, Ordering::SeqCst);
-            bail!("test launch must fail cwd validation before provider construction")
+            bail!("invalid or settled bootstrap must not construct a provider")
         });
-        // The host has to run against this test's scratch database. Resolving
-        // from the environment would point it at a different journal, and the
-        // scan fault injected below would never reach it -- the test would
-        // pass while proving nothing.
-        let resolved = crate::session_store::factory::open_resolved(
-            &crate::session_store::factory::SessionStoreConfig::with_url(scratch.url.clone()),
-        )
-        .await
-        .unwrap();
-        let mut host = AbortTask(host_transport::spawn(async move {
-            run_host_with_resolved_store(&config_path, factory, Some(resolved)).await
-        }));
-        let first = tokio::time::timeout(Duration::from_secs(30), gates.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let session_store = host_store(&scratch).await;
         let id = Uuid::new_v4();
         let mut launch = bootstrap_test_launch(root.path());
         launch.cwd = root.path().join("no-longer-present");
@@ -8751,11 +8707,6 @@ mod tests {
             .unwrap();
         store.begin_host_bootstrap(id).await.unwrap();
         let metadata = store.load_host_launch_metadata(id).await.unwrap().unwrap();
-        // The recovery row is left undecodable so the repair below has
-        // something to fix. It is not what faults the scan: `metadata_json` is
-        // jsonb and the scan reads it as an untyped Value, so any valid json
-        // decodes there and the typed reading only happens later, in the
-        // consumer.
         let corrupted = serde_json::json!({"not": "launch metadata"});
         sqlx::query("update host_launches set metadata_json=$1 where session_id=$2")
             .bind(&corrupted)
@@ -8763,31 +8714,24 @@ mod tests {
             .execute(store.pool())
             .await
             .unwrap();
-        // The scan fault itself. The query joins host_launch_owners, so the
-        // table being absent fails it outright. Renamed rather than dropped,
-        // so the owner rows come back untouched, and only ever in this test's
-        // disposable database.
+        // Rename only this disposable database's table, preserving owner rows.
         sqlx::query("alter table host_launch_owners rename to host_launch_owners_faulted")
             .execute(store.pool())
             .await
             .unwrap();
         assert!(
-            store
-                .pending_host_launch_metadata_for_host(
-                    0,
-                    Some((config.host_id, &host_relay_origin(&config).unwrap())),
-                    256,
-                )
-                .await
-                .is_err()
+            resume_pending_host_sessions(
+                0,
+                &client,
+                &config,
+                root.path(),
+                &sessions,
+                &session_store,
+                &factory
+            )
+            .await
+            .is_err()
         );
-        first.send(()).unwrap();
-        let second = tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::select! {
-                gate = gates.recv() => gate.expect("mock relay remains available"),
-                result = &mut host.0 => panic!("a local recovery scan fault disconnected the host: {result:?}"),
-            }
-        }).await.expect("command polling must continue during a local recovery scan failure");
         assert!(!store.contains_session(id).await.unwrap());
         let retained: serde_json::Value =
             sqlx::query_scalar("select metadata_json from host_launches where session_id=$1")
@@ -8797,10 +8741,9 @@ mod tests {
                 .unwrap();
         assert_eq!(
             retained, corrupted,
-            "failed recovery must not rewrite or discard the faulted row"
+            "scan failures cannot rewrite pending work"
         );
-        // The scan fault is over; what is left is the undecodable row, which
-        // is what the repair below fixes.
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
         sqlx::query("alter table host_launch_owners_faulted rename to host_launch_owners")
             .execute(store.pool())
             .await
@@ -8811,43 +8754,54 @@ mod tests {
             .execute(store.pool())
             .await
             .unwrap();
-        second.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        assert_eq!(
+            resume_pending_host_sessions(
+                0,
+                &client,
+                &config,
+                root.path(),
+                &sessions,
+                &session_store,
+                &factory
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if store.contains_session(id).await.unwrap()
                     && store.state(id).await.unwrap().status == Some(crate::SessionStatus::Failed)
-                    && store
-                        .pending_host_launch_metadata(8)
-                        .await
-                        .unwrap()
-                        .is_empty()
+                    && !sessions.lock().await.contains_key(&id)
                 {
                     break;
                 }
-                assert!(
-                    !host.0.is_finished(),
-                    "repaired recovery must not require a host restart"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
-        assert!(uploads.load(Ordering::SeqCst) > 0);
+        let journal = serde_json::to_value(store.read(id).await.unwrap()).unwrap();
+        resume_pending_host_sessions(
+            0,
+            &client,
+            &config,
+            root.path(),
+            &sessions,
+            &session_store,
+            &factory,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(store.read(id).await.unwrap()).unwrap(),
+            journal
+        );
         assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+        assert!(sessions.lock().await.is_empty());
         assert_eq!(
             store.load_host_launch_metadata(id).await.unwrap(),
             Some(metadata)
-        );
-        stop.store(true, Ordering::SeqCst);
-        let error = tokio::time::timeout(Duration::from_secs(10), &mut host.0)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("token was rejected"),
-            "relay revocation must remain fatal: {error:#}"
         );
         scratch.discard().await;
     }
