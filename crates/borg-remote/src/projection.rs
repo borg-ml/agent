@@ -3,6 +3,8 @@
 use anyhow::{Result, ensure};
 use sqlx::{PgPool, Row};
 
+pub const ACTIVE_CHECKPOINT_BYTES: usize = 65_536;
+
 pub const REPLAY_FRAMES: i64 = 128;
 pub const REPLAY_BYTES: usize = 1_048_576;
 
@@ -12,6 +14,7 @@ pub struct ProjectionCheckpoint {
     pub revision: i64,
     pub source_sequence: i64,
     pub source_live_revision: i64,
+    /// Bounded active identity/lifecycle state, never historical rows or text.
     pub reducer: Vec<u8>,
 }
 
@@ -30,6 +33,7 @@ impl ProjectionStore {
             epoch text not null, revision bigint not null, frame bytea not null,
             primary key(scope, revision));")
             .execute(&pool).await?;
+        crate::row_index::initialize(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -45,6 +49,7 @@ impl ProjectionStore {
     }
 
     pub async fn initialize(&self, scope: &str, state: &ProjectionCheckpoint) -> Result<bool> {
+        ensure!(state.reducer.len() <= ACTIVE_CHECKPOINT_BYTES, "active checkpoint exceeds budget");
         ensure!(state.revision == 0 && state.source_sequence >= 0 && state.source_live_revision >= 0, "invalid initial checkpoint");
         Ok(sqlx::query("insert into remote_view_checkpoints values($1,$2,$3,$4,$5,$6) on conflict do nothing")
             .bind(scope).bind(&state.epoch).bind(state.revision).bind(state.source_sequence)
@@ -54,7 +59,12 @@ impl ProjectionStore {
     /// Atomically persist reducer, source watermarks and already encoded typed
     /// wire frame. Oversized frames require a bounded snapshot, not publication.
     pub async fn commit(&self, scope: &str, expected_revision: i64, state: &ProjectionCheckpoint, frame: &[u8]) -> Result<()> {
+        self.commit_rows(scope, expected_revision, state, frame, Vec::new()).await
+    }
+
+    pub async fn commit_rows(&self, scope: &str, expected_revision: i64, state: &ProjectionCheckpoint, frame: &[u8], rows: Vec<crate::row_index::RowMutation<'_>>) -> Result<()> {
         ensure!(state.revision == expected_revision.checked_add(1).ok_or_else(|| anyhow::anyhow!("revision exhausted"))?, "noncontiguous projection revision");
+        ensure!(state.reducer.len() <= ACTIVE_CHECKPOINT_BYTES, "active checkpoint exceeds budget");
         ensure!(frame.len() <= REPLAY_BYTES, "projection frame exceeds wire budget");
         let mut tx = self.pool.begin().await?;
         let changed = sqlx::query("update remote_view_checkpoints set revision=$3,source_sequence=$4,source_live_revision=$5,reducer=$6 where scope=$1 and epoch=$2 and revision=$7 and source_sequence<=$4 and source_live_revision<=$5")
@@ -62,6 +72,7 @@ impl ProjectionStore {
             .bind(state.source_live_revision).bind(&state.reducer).bind(expected_revision)
             .execute(&mut *tx).await?.rows_affected();
         ensure!(changed == 1, "projection checkpoint conflict");
+        for row in rows { crate::row_index::apply(&mut tx, scope, row).await?; }
         sqlx::query("insert into remote_view_replay values($1,$2,$3,$4)")
             .bind(scope).bind(&state.epoch).bind(state.revision).bind(frame).execute(&mut *tx).await?;
         // Keep at most 128 frames and 1 MiB total, including the newest frame.

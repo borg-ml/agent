@@ -1089,7 +1089,7 @@ pub async fn enroll_host(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .unwrap_or_else(hostname);
-    let execution_profile = configured_execution_profile();
+    let execution_profile = configured_execution_profile()?;
     let resource_limits = configured_resource_limits();
     let capabilities = probe_capabilities_with_profile(roots.clone(), execution_profile).await;
     let response = Client::new()
@@ -1130,7 +1130,15 @@ pub async fn enroll_host(
 }
 
 pub async fn probe_capabilities(roots: Vec<PathBuf>) -> HostCapabilities {
-    probe_capabilities_with_profile(roots, configured_execution_profile()).await
+    match configured_execution_profile() {
+        Ok(profile) => probe_capabilities_with_profile(roots, profile).await,
+        Err(error) => {
+            tracing::error!(%error, "host execution disabled");
+            let mut capabilities = probe_capabilities_with_profile(roots, HostExecutionProfile::IsolatedHosted).await;
+            capabilities.can_launch = false;
+            capabilities
+        }
+    }
 }
 
 async fn probe_capabilities_with_profile(
@@ -1230,22 +1238,16 @@ fn bounded_limit_env(name: &str, default: u64, min: u64, max: u64) -> u64 {
     }
 }
 
-fn configured_execution_profile() -> HostExecutionProfile {
-    match std::env::var("BORG_HOST_EXECUTION_PROFILE")
+fn configured_execution_profile() -> Result<HostExecutionProfile> {
+    Ok(match std::env::var("BORG_HOST_EXECUTION_PROFILE")
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
         .as_deref()
     {
         Some("isolated_hosted" | "isolated" | "hosted") => HostExecutionProfile::IsolatedHosted,
         Some("trusted_user" | "trusted" | "local") | None => HostExecutionProfile::TrustedUser,
-        Some(value) => {
-            tracing::warn!(
-                value,
-                "invalid BORG_HOST_EXECUTION_PROFILE; using trusted_user"
-            );
-            HostExecutionProfile::TrustedUser
-        }
-    }
+        Some(value) => bail!("invalid BORG_HOST_EXECUTION_PROFILE: {value}"),
+    })
 }
 
 /// Probe every provider lane concurrently and return only secret-free

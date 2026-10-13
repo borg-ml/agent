@@ -40,6 +40,12 @@ pub enum TunnelFrame {
     Close { connection_id: String, reason: String },
     CacheBatch { snapshots: Vec<ColdSnapshot>, headlines: Vec<SessionHeadline> },
     Revoked { epoch: u64 },
+    /// Trusted relay owner-service ingress only; viewer Client frames cannot emit this.
+    HostCommand { command_id: String, command: borg_agent_runtime::HostCommand },
+    HostCommandResult { command_id: String, outcome: serde_json::Value, error: Option<String> },
+    Heartbeat { heartbeat: borg_agent_runtime::HostHeartbeat },
+    RegisterSession { registration_id: String, session_id: String, request: borg_agent_runtime::LaunchSession },
+    RegisteredSession { registration_id: String, session_id: String, error: Option<String> },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ColdSnapshot { pub session_id: String, pub frame: serde_json::Value, pub synchronized_at: String }

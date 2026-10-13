@@ -9,6 +9,7 @@
 mod command;
 mod host;
 pub mod projection;
+pub mod row_index;
 pub mod auth;
 pub mod admission;
 

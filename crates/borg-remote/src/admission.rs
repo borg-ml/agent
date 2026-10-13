@@ -41,3 +41,33 @@ pub async fn consume_ticket(pool: &sqlx::PgPool, claims: &TicketClaims, now: i64
     ensure!(inserted == 1, "admission ticket already consumed");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    // Compiler checks cannot guard audience/expiry/scope enforcement or prove
+    // modified signed claims are refused: these are admission security contracts.
+    #[test]
+    fn signed_admission_rejects_tampering_expiry_wrong_host_and_scope() {
+        let signer = SigningKey::from_bytes(&[7;32]);
+        let claims = TicketClaims {
+            version:2,ticket_id:"t".into(),principal_id:"p".into(),device_id:"d".into(),host_id:"h".into(),
+            session_ids:vec!["s".into()],permission:Permission::Read,
+            device_public_key:URL_SAFE_NO_PAD.encode(signer.verifying_key().as_bytes()),
+            issued_at:100,expires_at:200,revocation_epoch:3,
+        };
+        let bytes = serde_json::to_vec(&claims).unwrap();
+        let mut ticket = SignedTicket {claims:URL_SAFE_NO_PAD.encode(&bytes),signature:URL_SAFE_NO_PAD.encode(signer.sign(&bytes).to_bytes())};
+        let accepted = verify_ticket(&ticket,&signer.verifying_key(),"h",3,150).unwrap();
+        assert!(authorize_scope(&accepted,Some("s"),false).is_ok());
+        assert!(authorize_scope(&accepted,Some("other"),false).is_err());
+        assert!(authorize_scope(&accepted,Some("s"),true).is_err());
+        assert!(verify_ticket(&ticket,&signer.verifying_key(),"other",3,150).is_err());
+        assert!(verify_ticket(&ticket,&signer.verifying_key(),"h",4,150).is_err());
+        assert!(verify_ticket(&ticket,&signer.verifying_key(),"h",3,200).is_err());
+        ticket.claims=URL_SAFE_NO_PAD.encode(b"{}");
+        assert!(verify_ticket(&ticket,&signer.verifying_key(),"h",3,150).is_err());
+    }
+}
