@@ -224,10 +224,24 @@ impl ClaudeModelProvider {
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let message =
-                format!("Claude subscription request failed (HTTP {status}); no API-key fallback");
+            let mut response = response;
+            let mut details = Vec::new();
+            while details.len() < 16 * 1024 {
+                let Some(chunk) = response.chunk().await? else {
+                    break;
+                };
+                let remaining = 16 * 1024 - details.len();
+                details.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+            let details = String::from_utf8_lossy(&details);
+            let message = format!(
+                "Claude subscription request failed (HTTP {status}){}: {details}; no API-key fallback",
+                if status == 429 { " rate_limit" } else { "" },
+            );
             return Err(ModelFailure {
-                kind: anthropic_error_kind(status, &message),
+                // Subscription quota refusals must reach the session's route
+                // fallback, not the transport reconnection retry loop.
+                kind: subscription_error_kind(status, &message),
                 message,
             }
             .into());
@@ -480,6 +494,14 @@ fn publish_usage(
     );
 }
 
+fn subscription_error_kind(status: u16, message: &str) -> ProviderErrorKind {
+    if status == 429 {
+        ProviderErrorKind::Fatal
+    } else {
+        anthropic_error_kind(status, message)
+    }
+}
+
 #[derive(Debug)]
 struct ModelFailure {
     message: String,
@@ -503,6 +525,20 @@ impl std::error::Error for ModelFailure {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Subscription quota exhaustion is a route refusal, not a broken
+    // connection: reconnect retries must not prevent the configured fallback.
+    #[test]
+    fn subscription_quota_refusal_is_not_reconnectable() {
+        assert_eq!(
+            subscription_error_kind(429, "rate_limit_error: five-hour usage limit reached"),
+            ProviderErrorKind::Fatal
+        );
+        assert_eq!(
+            subscription_error_kind(529, "overloaded_error"),
+            ProviderErrorKind::ConnectionLost
+        );
+    }
 
     #[test]
     fn subscription_refresh_preserves_prefix_and_rejects_budget_thinking() {

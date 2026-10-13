@@ -20746,6 +20746,11 @@ impl AgentTurnExecutor for LimitedProviderExecutor {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_usage_limit_continues_the_turn_on_the_next_fallback_route() {
+    assert_usage_limit_fallback(CodingProvider::Codex, CodingProvider::Claude).await;
+    assert_usage_limit_fallback(CodingProvider::Claude, CodingProvider::Codex).await;
+}
+
+async fn assert_usage_limit_fallback(first: CodingProvider, next: CodingProvider) {
     // With a chain configured, an hour-long limit on the first route must not
     // stop the session: the same turn continues on the next route at once.
     let root = tempdir().unwrap();
@@ -20757,13 +20762,13 @@ async fn a_usage_limit_continues_the_turn_on_the_next_fallback_route() {
     let (event_tx, mut event_rx) = mpsc::channel(256);
     let runs = Arc::new(Mutex::new(Vec::new()));
     let executor = Arc::new(LimitedProviderExecutor {
-        limited: CodingProvider::Codex,
+        limited: first,
         runs: Arc::clone(&runs),
     });
     let capabilities = crate::SessionCapabilities {
         model_fallback: vec![
-            crate::ModelRoute::parse("codex").unwrap(),
-            crate::ModelRoute::parse("claude").unwrap(),
+            crate::ModelRoute::parse(first.catalog_backend()).unwrap(),
+            crate::ModelRoute::parse(next.catalog_backend()).unwrap(),
         ],
         ..Default::default()
     };
@@ -20778,7 +20783,7 @@ async fn a_usage_limit_continues_the_turn_on_the_next_fallback_route() {
                 LaunchSession {
                     request_id: Uuid::new_v4(),
                     cwd,
-                    provider: CodingProvider::Codex,
+                    provider: first,
                     model: None,
                     effort: None,
                     fast: Some(false),
@@ -20815,10 +20820,7 @@ async fn a_usage_limit_continues_the_turn_on_the_next_fallback_route() {
     .await
     .expect("the turn finishes on the fallback route without waiting for the reset");
     assert!(fell_back, "the switch is journaled");
-    assert_eq!(
-        *runs.lock().unwrap(),
-        vec![CodingProvider::Codex, CodingProvider::Claude]
-    );
+    assert_eq!(*runs.lock().unwrap(), vec![first, next]);
     command_tx
         .send(HostCommand::Stop { session_id })
         .await
