@@ -167,6 +167,21 @@ async fn live_subagent_count_tracks_lifecycle_and_descendant_scope() {
         crate::native_process::ProcessManager::default(),
         PermissionMode::FullAccess,
     );
+    assert!(
+        dispatcher
+            .independent_message_targets(&[
+                &format!("session:{child}"),
+                &format!("session:{sibling}")
+            ])
+            .await
+    );
+    assert!(
+        !dispatcher
+            .independent_message_targets(&["child", &format!("session:{child}")])
+            .await,
+        "aliases for one recipient must not execute concurrently"
+    );
+    assert!(!dispatcher.independent_message_targets(&["unknown"]).await);
     assert!(dispatcher.subagent_count_prompt().await.starts_with(
         "Live subagent counts — direct children: running=0, starting=1, inactive=1; all descendants: running=1, starting=1, inactive=1."
     ));

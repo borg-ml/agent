@@ -1314,10 +1314,24 @@ impl NativeHarness {
                 && tool_calls.iter().all(|call| {
                     runtime.execution_class(&call.function.name) == ToolExecutionClass::ReadOnly
                 });
+            // Sends to distinct local recipients are independent. Resolve
+            // aliases before batching so two names for one agent retain order.
+            let parallel_sends = if tool_calls.len() > 1
+                && inputs.iter().all(|input| input.is_ok())
+                && tool_calls.iter().all(|call| matches!(call.function.name.as_str(), "send_message" | "followup_task"))
+            {
+                let targets: Option<Vec<_>> = inputs.iter().map(|input| {
+                    input.as_ref().ok()?.get("target")?.as_str()
+                }).collect();
+                match targets {
+                    Some(targets) => runtime.agent_tools.independent_message_targets(&targets).await,
+                    None => false,
+                }
+            } else { false };
             let mut trailing_context_tokens = 0_u64;
-            if parallel_reads {
+            if parallel_reads || parallel_sends {
                 let pairs = tool_calls.iter().zip(&inputs).collect::<Vec<_>>();
-                for chunk in pairs.chunks(4) {
+                for chunk in pairs.chunks(if parallel_sends { 32 } else { 4 }) {
                     // A steer collected from an earlier chunk preempts the
                     // chunks that have not started. This one has not started
                     // yet, so it is the boundary the steer was waiting for.

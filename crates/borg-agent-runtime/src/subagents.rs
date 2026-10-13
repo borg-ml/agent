@@ -1015,6 +1015,23 @@ impl AgentToolDispatcher {
         self
     }
 
+    pub(crate) async fn independent_message_targets(&self, targets: &[&str]) -> bool {
+        let Some(team) = &self.subagents else {
+            return false;
+        };
+        let table = team.table.lock().await;
+        let mut recipients = std::collections::BTreeSet::new();
+        for target in targets {
+            let Ok(recipient) = table.resolve(target) else {
+                return false;
+            };
+            if !recipients.insert(recipient) {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(crate) fn with_watches(mut self, watches: crate::watch::Watches) -> Self {
         self.watches = Some(watches);
         self
