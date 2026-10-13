@@ -2141,8 +2141,12 @@ pub(crate) async fn run_host_with_resolved_store(
     let viewer_outbound = outbound.clone();
     let _viewer = AbortTask(host_transport::spawn(async move {
         while let Some(viewer) = viewer_rx.recv().await {
-            let frame = viewer_command(&viewer_ledger, viewer_context.clone(), viewer).await;
-            if let Ok(frame) = frame { let _ = viewer_outbound.send(frame).await; }
+            let connection_id = viewer.connection_id.clone();
+            let frame = match viewer_command(&viewer_ledger, viewer_context.clone(), viewer).await {
+                Ok(frame) => frame,
+                Err(error) => crate::auth::TunnelFrame::Close { connection_id, reason: error.to_string() },
+            };
+            if viewer_outbound.send(frame).await.is_err() { break; }
         }
     }));
     let issuer = crate::admission::issuer_key(&config.relay_public_key)?;
