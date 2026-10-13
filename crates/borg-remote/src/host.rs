@@ -1,3 +1,6 @@
+#[path = "direct_listener.rs"]
+mod direct_listener;
+pub use direct_listener::DirectListenerConfig;
 #[path = "host_transport.rs"]
 mod host_transport;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -49,6 +52,8 @@ pub struct HostConfig {
     pub host_token: String,
     pub relay_public_key: String,
     pub revocation_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_listener: Option<DirectListenerConfig>,
     pub name: String,
     pub roots: Vec<PathBuf>,
     /// The security boundary this host was enrolled to provide. Older host
@@ -870,6 +875,7 @@ pub async fn enroll_host(
         host_token: enrolled.host_token,
         relay_public_key: enrolled.relay_public_key,
         revocation_epoch: enrolled.revocation_epoch,
+        direct_listener: None,
         name,
         roots,
         execution_profile,
@@ -2151,6 +2157,7 @@ pub(crate) async fn run_host_with_resolved_store(
     }));
     let issuer = crate::admission::issuer_key(&config.relay_public_key)?;
     let mut epoch = config.revocation_epoch;
+    let mut direct = config.direct_listener.clone().map(|listener| direct_listener::start(listener, config.host_id, issuer, Arc::clone(&sync)).map(AbortTask)).transpose()?;
     let _dispatcher = AbortTask(host_transport::spawn(async move {
         while let Some((command_id, command)) = command_rx.recv().await {
             let result = owner_command(&ledger, context.clone(), command_id, command).await;
@@ -2175,6 +2182,15 @@ pub(crate) async fn run_host_with_resolved_store(
                 let failure = loop {
             tokio::select! {
                 result = &mut socket.0 => break result.context("host socket task failed")?,
+                result = async {
+                    match direct.as_mut() {
+                        Some(task) => (&mut task.0).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    result.context("direct listener task failed")?.context("direct listener failed")?;
+                    bail!("direct listener stopped unexpectedly");
+                },
                 frame = outgoing.recv() => {
                     let Some(frame) = frame else { return Ok(()) };
                     if socket_tx.try_send(frame).is_err() { break Err(anyhow::anyhow!("host egress overflow")); }
@@ -15067,6 +15083,7 @@ connection: close
             host_token: "test".to_string(),
             relay_public_key: "".into(),
             revocation_epoch: 0,
+            direct_listener: None,
             name: "test".to_string(),
             roots: vec![root.to_path_buf()],
             execution_profile: HostExecutionProfile::TrustedUser,
