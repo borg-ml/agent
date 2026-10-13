@@ -2661,6 +2661,8 @@ async fn run_agent_session_store_kernel_inner(
             subagent_activity_rx,
             child_activity_tx,
             (!owns_team).then_some(session_id),
+            subagents.as_ref().expect("enabled coordinator").clone(),
+            session_id,
         )))
     });
     let mut root_message_rx = subagents
@@ -13239,6 +13241,8 @@ async fn forward_child_activity(
     mut activity: broadcast::Receiver<SubagentActivity>,
     forwarded: mpsc::Sender<SubagentActivity>,
     parent: Option<Uuid>,
+    coordinator: SubagentCoordinator,
+    session_id: Uuid,
 ) {
     loop {
         match activity.recv().await {
@@ -13259,10 +13263,27 @@ async fn forward_child_activity(
                     return;
                 }
             }
-            // A reader that fell behind loses activity where it was lost before
-            // this task existed; the ones that did arrive still have to be
-            // forwarded.
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(%session_id, skipped, "child activity lag; recovering canonical roster");
+                let mut cursor = None;
+                loop {
+                    match coordinator.activity_recovery_page(session_id, cursor).await {
+                        Ok((page, next)) => {
+                            for activity in page {
+                                if forwarded.send(activity).await.is_err() { return; }
+                            }
+                            match next { Some(next) => cursor = Some(next), None => break }
+                        }
+                        Err(error) => {
+                            tracing::error!(%session_id, %error, "child activity recovery failed; retaining roster cursor");
+                            tokio::select! {
+                                _ = forwarded.closed() => return,
+                                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                            }
+                        }
+                    }
+                }
+            }
             Err(broadcast::error::RecvError::Closed) => return,
         }
     }
@@ -13284,6 +13305,11 @@ async fn record_subagent_activity(
     watches: &crate::watch::Watches,
     activity: SubagentActivity,
 ) -> Result<()> {
+    // Child streams belong only to the child journal. Parent summaries change
+    // at durable lifecycle/attention boundaries, never on each text token.
+    if let SubagentActivity::SessionEvent { event, .. } = &activity {
+        if event.kind.persistence() != crate::EventPersistence::Durable { return Ok(()) }
+    }
     // A child's assistant message is a mutable live projection until its
     // Complete boundary. Marking the first in-progress snapshot as projected
     // suppresses every later snapshot with the same ID, including the durable
@@ -13353,7 +13379,7 @@ async fn record_subagent_activity(
             let Some(agent) = subagents.get(event.session_id).await else {
                 return Ok(());
             };
-            (SubagentActivityKind::Updated, agent, Some(Box::new(event)))
+            (SubagentActivityKind::Updated, agent, None)
         }
     };
     // The snapshot the journal is about to record, so a watch cannot be told a
@@ -13366,6 +13392,15 @@ async fn record_subagent_activity(
             &agent.task_name,
         )
         .await;
+    let mut agent = agent;
+    agent.final_text = None;
+    if let Some(detail) = &mut agent.detail {
+        if detail.len() > 4096 {
+            let mut end = 4096;
+            while !detail.is_char_boundary(end) { end -= 1; }
+            detail.truncate(end);
+        }
+    }
     let kind = SessionEventKind::SubagentActivity {
         activity: kind,
         agent,

@@ -5928,6 +5928,22 @@ impl SubagentCoordinator {
             .collect()
     }
 
+    /// Recover bounded child activity from canonical journals after broadcast lag.
+    pub(crate) async fn activity_recovery_page(&self, parent: Uuid, after: Option<Uuid>) -> Result<(Vec<SubagentActivity>, Option<Uuid>)> {
+        let ids = self.store.descendant_sessions(parent, after, 64).await?;
+        let next = if ids.len() == 64 { ids.last().copied() } else { None };
+        let mut activity = Vec::with_capacity(ids.len());
+        for id in ids {
+            let agent = self.get(id).await.with_context(|| format!("canonical child {id} absent from coordinator"))?;
+            let state = self.store.state(id).await?;
+            let events = self.store.events_after(id, state.latest_sequence.saturating_sub(1), 1).await?;
+            for event in events {
+                activity.push(SubagentActivity::SessionEvent { parent_session_id: agent.parent_session_id, task_name: agent.task_name.clone(), event });
+            }
+        }
+        Ok((activity, next))
+    }
+
     pub async fn get(&self, session_id: Uuid) -> Option<SubagentSnapshot> {
         self.table
             .lock()

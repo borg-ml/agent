@@ -12,6 +12,7 @@ pub mod projection;
 pub mod row_index;
 pub mod auth;
 pub mod admission;
+pub mod command_ledger;
 
 pub use borg_agent_runtime::*;
 
