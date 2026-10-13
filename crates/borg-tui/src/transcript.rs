@@ -3119,6 +3119,15 @@ impl Transcript {
                     }
                     let _ = name;
                 }
+                // The process-start event can precede ToolStarted. The returned
+                // process ID, not the foreground tool at launch, identifies its owner.
+                if tool_can_start_background_process(&source_name_for_process)
+                    && let (Some(index), Some(process_id)) =
+                        (tool_index, decoded_session_id(output))
+                    && let Some(process) = self.runtime_processes.get_mut(&process_id)
+                {
+                    process.tool_index = Some(index);
+                }
                 if let (Some(index), Some(handle)) = (tool_index, output_handle.as_ref()) {
                     let is_native_process = Uuid::parse_str(handle)
                         .ok()
@@ -8483,5 +8492,100 @@ mod model_request_tests {
             serde_json::json!({"request_id": "request", "complete": true}),
         ));
         assert!(transcript.model_request.is_none());
+    }
+
+    #[test]
+    fn process_started_before_tool_is_bound_by_exec_result() {
+        check_process_result_binding(true);
+    }
+
+    #[test]
+    fn diff_like_test_stdout_without_changes_does_not_invent_edit() {
+        check_process_result_binding(false);
+    }
+
+    fn check_process_result_binding(has_changes: bool) {
+        let session = Uuid::new_v4();
+        let process = Uuid::new_v4();
+        let mut transcript = Transcript::default();
+        let kinds = [
+            SessionEventKind::ToolStarted {
+                tool_call_id: "prior".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "prior.rs"}),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+            SessionEventKind::RuntimeProcessStarted {
+                process_id: process,
+                pid: 42,
+                command: "python3 rewrite.py; cargo test".into(),
+                cwd: PathBuf::from("/workspace"),
+            },
+            SessionEventKind::ToolStarted {
+                tool_call_id: "edit".into(),
+                name: "exec".into(),
+                input: serde_json::json!({"cmd": "python3 rewrite.py; cargo test"}),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "edit".into(),
+                output: serde_json::json!({"session_id": process, "running": true}).to_string(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+            SessionEventKind::RuntimeProcessCompleted {
+                process_id: process,
+                pid: 42,
+                status: borg_remote::RuntimeProcessStatus::TimedOut,
+                exit_code: None,
+                timed_out: true,
+                stdout:
+                    "test output\ndiff --git a/unowned.rs b/unowned.rs\n@@ -1 +1 @@\n-old\n+unowned"
+                        .into(),
+                stderr: String::new(),
+                stdout_omitted_bytes: 0,
+                stderr_omitted_bytes: 0,
+                error: None,
+                changes: if has_changes {
+                    vec![borg_remote::CommandChange {
+                        path: "target.rs".into(),
+                        added: 1,
+                        removed: 1,
+                        diff: "@@ -1 +1 @@\n-old\n+new".into(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            },
+        ];
+        for (sequence, kind) in kinds.into_iter().enumerate() {
+            transcript.apply(&SessionEvent::new(session, sequence as u64 + 1, kind));
+        }
+        assert_eq!(
+            transcript.originating_tool_call_id(process).as_deref(),
+            Some("edit")
+        );
+        assert!(!transcript.command_edit_rows.contains_key("prior"));
+        if !has_changes {
+            assert!(transcript.command_edit_rows.is_empty());
+            assert_eq!(transcript.order.len(), 2);
+            assert!(matches!(&transcript.order[0], TranscriptEntry::Tool {
+                source_name, output_view: None, ..
+            } if source_name == "read_file"));
+            assert!(matches!(&transcript.order[1], TranscriptEntry::Tool {
+                output_view: Some((_, output)), ..
+            } if output.contains("+unowned")));
+            return;
+        }
+        let index = transcript.command_edit_rows["edit"];
+        assert!(matches!(&transcript.order[index], TranscriptEntry::Tool {
+            code_view: Some((language, diff)), ..
+        } if language == "diff:rs" && diff.contains("+new") && !diff.contains("test output")));
+        assert_eq!(transcript.command_edit_rows.len(), 1);
     }
 }
