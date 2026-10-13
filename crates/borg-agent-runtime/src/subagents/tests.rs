@@ -8485,6 +8485,137 @@ async fn wait_agent_returns_on_a_child_report_and_on_waiting_input() {
     scratch.discard().await;
 }
 
+// A child has no root_inbox and may be waiting solely for a peer. Exercise
+// its durable recipient inbox, including a report that arrives after polling
+// the wait, without turning routine queue delivery into a tool interrupt.
+#[tokio::test]
+async fn childless_wait_reads_queued_peer_reports_before_and_during_the_wait() {
+    for during_wait in [false, true] {
+        let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
+        coordinator
+            .followup_task_as(worker, "/root", "please report progress")
+            .await
+            .unwrap();
+        assert!(coordinator.awaiting_reply.lock().unwrap().contains(&worker));
+        let (steer, _) = coordinator
+            .persist_team_message(
+                root,
+                worker,
+                "/root",
+                "a separate new assignment",
+                PromptDelivery::Steer,
+                DeliveryMode::Boundary,
+                TeamMessageOptions::default(),
+            )
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let start_wait = || {
+            let coordinator = coordinator.clone();
+            let entered = entered.clone();
+            tokio::spawn(async move {
+                let wait =
+                    coordinator.wait_for(worker, Duration::from_secs(1800), WaitSignals::default());
+                tokio::pin!(wait);
+                std::future::poll_fn(|cx| {
+                    let result = std::future::Future::poll(wait.as_mut(), cx);
+                    if result.is_pending() {
+                        entered.notify_one();
+                    }
+                    result
+                })
+                .await
+            })
+        };
+        let waiting = if during_wait {
+            let waiting = start_wait();
+            tokio::time::timeout(Duration::from_secs(3), entered.notified())
+                .await
+                .unwrap();
+            Some(waiting)
+        } else {
+            None
+        };
+        let (report, _) = coordinator
+            .persist_team_message(
+                root,
+                worker,
+                "/root",
+                "repair is ready",
+                PromptDelivery::Queue,
+                DeliveryMode::NextTurn,
+                TeamMessageOptions::default(),
+            )
+            .await
+            .unwrap();
+        // No activity or steer is injected: durable-only reports must be found
+        // by the existing five-second recheck, even for a child with no children.
+        let bound = Duration::from_secs(if during_wait { 8 } else { 3 });
+        let result = tokio::time::timeout(bound, waiting.unwrap_or_else(start_wait))
+            .await
+            .expect("queued peer reports must not burn a childless 30-minute wait")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["reason"], "child_message");
+        assert_eq!(result["total_children"], 0);
+        assert_eq!(result["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            result["messages"][0]["message_id"],
+            report.message_id.to_string()
+        );
+        assert_eq!(result["messages"][0]["text"], "repair is ready");
+        assert!(
+            !coordinator.take_awaiting_reply(worker),
+            "a returned report clears the outstanding reply wait"
+        );
+        let unread = coordinator
+            .unread_messages_for_session(worker)
+            .await
+            .unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(
+            unread[0].message_id, steer.message_id,
+            "wait must not consume a new assignment"
+        );
+        assert_eq!(
+            coordinator
+                .unread_messages_for_session(root)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a child's wait must not read or acknowledge another recipient's inbox"
+        );
+        let repeated = coordinator
+            .wait_for(worker, Duration::from_millis(100), WaitSignals::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            repeated["messages"],
+            json!([]),
+            "the report is returned once"
+        );
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(3),
+            coordinator.wait_for(
+                worker,
+                Duration::from_secs(1800),
+                WaitSignals {
+                    cancel: Some(cancel),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("explicit cancellation must still end a child wait promptly")
+        .unwrap();
+        assert_eq!(stopped["reason"], "cancelled");
+        scratch.discard().await;
+    }
+}
+
 #[tokio::test]
 async fn wait_agent_batches_new_reports_without_acknowledging_omitted_messages() {
     let (_directory, scratch, coordinator, root, worker) = waiting_team().await;

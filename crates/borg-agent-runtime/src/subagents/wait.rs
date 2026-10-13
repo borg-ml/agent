@@ -145,7 +145,7 @@ impl SubagentCoordinator {
         let mut wakes = self.subscribe_root_messages();
         let mut wakes_open = self.is_root_session(actor);
 
-        let unseen = self.unseen(actor).await;
+        let unseen = self.unseen(actor).await?;
         if !unseen.is_empty() {
             return self.report(actor, "child_update", unseen, started).await;
         }
@@ -175,19 +175,19 @@ impl SubagentCoordinator {
                 biased;
                 _ = cancel.cancelled() => {
                     let reason = if input_waiting(&input) && !reported.swap(true, Ordering::AcqRel) { "input_pending" } else { "cancelled" };
-                    let unseen = self.unseen(actor).await;
+                    let unseen = self.unseen(actor).await?;
                     return self.report(actor, reason, unseen, started).await;
                 }
                 () = input_arrives(&mut input, &reported) => {
                     self.take_awaiting_reply(actor);
-                    let unseen = self.unseen(actor).await;
+                    let unseen = self.unseen(actor).await?;
                     return self.report(actor, "input_pending", unseen, started).await;
                 }
                 message = wakes.recv(), if wakes_open => match message {
                     Ok(_) => {
                         reported.store(true, Ordering::Release);
                         self.take_awaiting_reply(actor);
-                        let unseen = self.unseen(actor).await;
+                        let unseen = self.unseen(actor).await?;
                         return self.report(actor, "input_pending", unseen, started).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => check = true,
@@ -206,7 +206,7 @@ impl SubagentCoordinator {
                         // The change can vanish while coalescing: the child
                         // resumed work, or its message was delivered as input.
                         // An empty result reads as a dropped message.
-                        let unseen = self.unseen(actor).await;
+                        let unseen = self.unseen(actor).await?;
                         if !unseen.is_empty() {
                             return self.report(actor, "child_update", unseen, started).await;
                         }
@@ -217,11 +217,11 @@ impl SubagentCoordinator {
                         continue;
                     }
                     let reason = if until < deadline { "no_active_children" } else { "timeout" };
-                    let unseen = self.unseen(actor).await;
+                    let unseen = self.unseen(actor).await?;
                     return self.report(actor, reason, unseen, started).await;
                 }
             }
-            if check && settle_at.is_none() && !self.unseen(actor).await.is_empty() {
+            if check && settle_at.is_none() && !self.unseen(actor).await?.is_empty() {
                 settle_at = Some(tokio::time::Instant::now() + COALESCE);
             }
         }
@@ -256,12 +256,18 @@ impl SubagentCoordinator {
             .collect()
     }
 
-    async fn unseen(&self, actor: Uuid) -> Unseen {
+    async fn unseen(&self, actor: Uuid) -> Result<Unseen> {
         let children = self.children(actor).await;
         let inbox = if self.is_root_session(actor) {
             self.root_inbox.lock().await.clone()
         } else {
-            Vec::new()
+            // Explicit waits are a read boundary, even for hosted children.
+            // Steers still belong to the session's normal input delivery.
+            self.unread_messages_for_session(actor)
+                .await?
+                .into_iter()
+                .filter(|message| message.delivery == PromptDelivery::Queue)
+                .collect()
         };
         let cursors = self.wait_cursors.lock().await;
         let cursor = cursors.get(&actor);
@@ -288,7 +294,7 @@ impl SubagentCoordinator {
                 ));
             }
         }
-        Unseen { changes, messages }
+        Ok(Unseen { changes, messages })
     }
 
     /// Build the result and remember what it showed.
@@ -313,14 +319,24 @@ impl SubagentCoordinator {
                 .messages
                 .extend(unseen.messages.iter().map(|(id, ..)| *id));
         }
-        if self.is_root_session(actor) && !unseen.messages.is_empty() {
-            // Reports shown here are read: acknowledge them so
-            // list_unread_team_messages does not return them again. Wake
-            // messages are left to the steer that delivers them.
-            let inbox = self
-                .root_inbox
-                .lock()
-                .await
+        if !unseen.messages.is_empty() {
+            self.take_awaiting_reply(actor);
+            // Acknowledge only reports returned here. A hosted child's images
+            // remain pending for normal delivery; this result only shows text.
+            let inbox = if self.is_root_session(actor) {
+                self.root_inbox.lock().await.clone()
+            } else {
+                self.unread_messages_for_session(actor)
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::debug!(%error, "wait_agent could not read acknowledgement candidates");
+                        Vec::new()
+                    })
+                    .into_iter()
+                    .filter(|message| message.attachments.is_empty())
+                    .collect()
+            };
+            let inbox = inbox
                 .iter()
                 .map(|message| message.message_id)
                 .collect::<HashSet<_>>();
