@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub(super) struct Transport {
+    host: Uuid,
     pub outbound: mpsc::Sender<TunnelFrame>,
     catalog: Arc<Mutex<HashMap<Uuid, crate::LaunchSession>>>,
     tasks: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
@@ -17,8 +18,9 @@ pub(super) struct Transport {
 }
 tokio::task_local! { pub(super) static CURRENT: Transport; }
 impl Transport {
-    pub fn new(outbound: mpsc::Sender<TunnelFrame>) -> Self {
+    pub fn new(host: Uuid, outbound: mpsc::Sender<TunnelFrame>) -> Self {
         Self {
+            host,
             outbound,
             registrations: Arc::default(),
             catalog: Arc::default(),
@@ -26,10 +28,14 @@ impl Transport {
         }
     }
     pub async fn register(&self, session_id: Uuid, request: crate::LaunchSession) -> Result<()> {
-        self.catalog
-            .lock()
-            .unwrap()
-            .insert(session_id, request.clone());
+        {
+            let mut catalog = self.catalog.lock().unwrap();
+            ensure!(
+                catalog.contains_key(&session_id) || catalog.len() < 128,
+                "host registration capacity exceeded"
+            );
+            catalog.insert(session_id, request.clone());
+        }
         let registration_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         self.registrations
@@ -74,10 +80,12 @@ impl Transport {
         }
     }
 }
-pub(super) fn get(_host: Uuid) -> Result<Transport> {
-    CURRENT
+pub(super) fn get(host: Uuid) -> Result<Transport> {
+    let transport = CURRENT
         .try_with(Clone::clone)
-        .map_err(|_| anyhow::anyhow!("authenticated host tunnel is not running"))
+        .map_err(|_| anyhow::anyhow!("authenticated host tunnel is not running"))?;
+    ensure!(transport.host == host, "host transport authority mismatch");
+    Ok(transport)
 }
 pub(super) fn spawn<F>(future: F) -> tokio::task::JoinHandle<F::Output>
 where
@@ -98,4 +106,36 @@ where
         tasks.push(task.abort_handle());
     }
     task
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // A compiler check cannot prove spawned actors inherit socket authority or
+    // that revocation cancels their work rather than leaving detached effects.
+    #[tokio::test]
+    async fn inherited_authority_and_terminal_cancellation() {
+        let host = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(128);
+        let transport = Transport::new(host, tx);
+        CURRENT
+            .scope(transport.clone(), async {
+                spawn(async move {
+                    assert!(get(host).is_ok());
+                    assert!(get(Uuid::new_v4()).is_err());
+                })
+                .await
+                .unwrap();
+                let (started, ready) = oneshot::channel();
+                let actor = spawn(async move {
+                    started.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                });
+                ready.await.unwrap();
+                transport.stop_tasks();
+                assert!(actor.await.unwrap_err().is_cancelled());
+            })
+            .await;
+        assert!(get(host).is_err());
+    }
 }

@@ -2108,7 +2108,7 @@ pub(crate) async fn run_host_with_resolved_store(
         .context("remote host requires PostgreSQL journal authority")?;
     let ledger = crate::command_ledger::CommandLedger::open(authority.pool.clone()).await?;
     let (outbound, mut outgoing) = mpsc::channel(128);
-    let transport = host_transport::Transport::new(outbound.clone());
+    let transport = host_transport::Transport::new(config.host_id, outbound.clone());
     host_transport::CURRENT.scope(transport.clone(), async move {
     let _heartbeat = AbortTask(host_transport::spawn(run_host_heartbeat_loop(
         client.clone(), config.clone(), acknowledged, Arc::clone(&sessions), capabilities,
@@ -2290,6 +2290,57 @@ async fn viewer_command(
                             },
                         }
                     }
+                    Command::Configure {
+                        provider,
+                        model,
+                        effort,
+                        fast,
+                        ultrafast,
+                        permission_mode,
+                        response_language,
+                    } => {
+                        if let Some(permission_mode) = permission_mode {
+                            ensure!(
+                                dispatch(
+                                    context.clone(),
+                                    HostCommand::Configure {
+                                        session_id,
+                                        action: crate::SessionConfigAction::SetPermissionMode {
+                                            permission_mode
+                                        }
+                                    }
+                                )
+                                .await,
+                                "permission configuration interrupted"
+                            );
+                        }
+                        if let Some(response_language) = response_language {
+                            ensure!(
+                                dispatch(
+                                    context.clone(),
+                                    HostCommand::Configure {
+                                        session_id,
+                                        action: crate::SessionConfigAction::SetResponseLanguage {
+                                            language: response_language
+                                        }
+                                    }
+                                )
+                                .await,
+                                "language configuration interrupted"
+                            );
+                        }
+                        HostCommand::Configure {
+                            session_id,
+                            action: crate::SessionConfigAction::SetAgent {
+                                request_id: viewer.command_id,
+                                provider,
+                                model,
+                                effort,
+                                fast,
+                                ultrafast,
+                            },
+                        }
+                    }
                     Command::Interrupt => HostCommand::Interrupt { session_id },
                     Command::Compact => HostCommand::Compact { session_id },
                     Command::ClearContext => HostCommand::ClearContext { session_id },
@@ -2318,7 +2369,11 @@ async fn viewer_command(
                         let state = context.session_store.state(session_id).await?;
                         match borg_view::intent::parse_submission(
                             &text,
-                            state.provider.context("session provider unavailable")?,
+                            state
+                                .configuration
+                                .as_ref()
+                                .context("session configuration unavailable")?
+                                .provider,
                             crate::PromptDelivery::Steer,
                             &[],
                         )? {
@@ -2962,6 +3017,16 @@ async fn notify_systemd(arguments: &[&str]) -> bool {
     }
 }
 
+pub(crate) async fn register_child(
+    host: Uuid,
+    session_id: Uuid,
+    request: LaunchSession,
+) -> Result<()> {
+    host_transport::get(host)?
+        .register(session_id, request)
+        .await
+}
+
 /// Mirror a terminal-owned session through the enrolled host relay.
 ///
 /// The terminal remains the process owner and journal authority. This task
@@ -3168,7 +3233,7 @@ pub async fn mirror_local_session(
     };
     tokio::select! {
         () = presence => unreachable!(),
-        () = control => unreachable!(),
+        result = control => result,
         result = journal => result,
     }
 }
