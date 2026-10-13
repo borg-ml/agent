@@ -254,3 +254,40 @@ async fn connection(mut socket: WebSocket, state: ListenerState) {
         tracing::debug!(%error, connection_id=%id, "direct client disconnected");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Serving a self-signed leaf must fail before accepting clients. A compiler
+    // check cannot enforce the native-root trust boundary during TLS setup.
+    #[test]
+    fn native_roots_reject_self_signed_listener() {
+        let root = tempfile::tempdir().unwrap();
+        let chain = root.path().join("certificate.pem");
+        std::fs::write(&chain, SELF_SIGNED_CERTIFICATE).unwrap();
+        let config = DirectListenerConfig {
+            bind_address: "127.0.0.1:9443".parse().unwrap(),
+            server_name: "borg-direct-test.invalid".into(),
+            certificate_chain: chain,
+            private_key: root.path().join("unread-private-key.pem"),
+        };
+        let error = tls_config(&config).unwrap_err();
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<rustls::Error>(),
+            Some(rustls::Error::InvalidCertificate(_))
+        )));
+    }
+    const SELF_SIGNED_CERTIFICATE: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBwjCCAWigAwIBAgIUb79GXMJdg+AVQnWDanudAlZ1cBswCgYIKoZIzj0EAwIw
+IzEhMB8GA1UEAwwYYm9yZy1kaXJlY3QtdGVzdC5pbnZhbGlkMCAXDTI2MTAxMzA3
+MzA1MloYDzIxMjYwOTE5MDczMDUyWjAjMSEwHwYDVQQDDBhib3JnLWRpcmVjdC10
+ZXN0LmludmFsaWQwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQyMpx82OLvvaB5
+TjW+KlUKk+7jTOUgN9ShiAkOf/HhwlAkuc9PvMAQCKakK9B8xjCjpmIwivNPgzPq
+vkSSPYUSo3gwdjAdBgNVHQ4EFgQUTLecF9sGz837NRDn09uK13p5QQcwHwYDVR0j
+BBgwFoAUTLecF9sGz837NRDn09uK13p5QQcwDwYDVR0TAQH/BAUwAwEB/zAjBgNV
+HREEHDAaghhib3JnLWRpcmVjdC10ZXN0LmludmFsaWQwCgYIKoZIzj0EAwIDSAAw
+RQIgMNoCSSI2/kkApa9pQAVV1L3ZfTz3C2gOQG6kkV7EqXUCIQCRhgwhJTRCzmlQ
+gQFw1DzzmTYQWGnVhUUjVmNg2qBuIQ==
+-----END CERTIFICATE-----
+"#;
+}
