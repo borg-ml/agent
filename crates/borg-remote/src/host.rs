@@ -2560,6 +2560,18 @@ async fn viewer_command(
                                 ledger.bind_prompt(context.config.host_id, viewer.command_id, session_id, viewer.command_id).await?;
                                 HostCommand::Prompt { session_id, message_id: viewer.command_id, text, attachments, delivery, output_schema: None }
                             },
+                            F::ControlPeer { target, intent, attachments, delivery } => {
+                                use borg_view::intent::{PeerTarget, PeerIntent};
+                                ensure!(attachments.is_empty(), "peer prompt attachments require typed asset references");
+                                let (task_name, provider) = match target { PeerTarget::Claude => ("/root/claude", CodingProvider::Claude), PeerTarget::Gpt => ("/root/gpt", CodingProvider::Codex) };
+                                let action = match intent {
+                                    PeerIntent::Ensure => crate::SubagentAction::Ensure { request_id: viewer.command_id, task_name: task_name.into(), provider, model: None, effort: None },
+                                    PeerIntent::Clear => crate::SubagentAction::ClearContext { request_id: viewer.command_id, target: task_name.into() },
+                                    PeerIntent::Rotate { model, effort } => crate::SubagentAction::Rotate { request_id: viewer.command_id, task_name: task_name.into(), provider, model, effort },
+                                    PeerIntent::Prompt(text) => crate::SubagentAction::Prompt { request_id: viewer.command_id, target: task_name.into(), message_id: viewer.command_id, text, attachments, delivery },
+                                };
+                                HostCommand::Subagent { session_id, action }
+                            }
                             F::Quit => return Ok(CommandOutcome::ClientLocal { effect: borg_view::wire::ClientEffect::CloseView }),
                             F::NewSession => {
                                 let Some(StoredHostLaunch::Launch(metadata)) = load_launch_metadata(context.session_store.as_ref(), session_id).await? else { bail!("session launch configuration unavailable") };
@@ -3372,6 +3384,12 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             };
             let socket = crate::session_control_socket_path(&session_root, root);
             if crate::session_control_socket_is_reachable(&socket).await {
+                match session_store.host_launch_owner(root).await {
+                    Ok(Some((host, origin)))
+                        if host == config.host_id
+                            && host_relay_origin(&config).ok().as_ref() == Some(&origin) => {}
+                    _ => return false,
+                }
                 if let HostCommand::Prompt {
                     session_id,
                     message_id,
@@ -3402,12 +3420,6 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                     }
                 }
 
-                match session_store.host_launch_owner(root).await {
-                    Ok(Some((host, origin)))
-                        if host == config.host_id
-                            && host_relay_origin(&config).ok().as_ref() == Some(&origin) => {}
-                    _ => return false,
-                }
                 return crate::send_local_session_command(&socket, session_id, command)
                     .await
                     .is_ok();
