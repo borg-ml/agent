@@ -2332,6 +2332,63 @@ async fn viewer_command(
         .await?
     {
         crate::command_ledger::Admission::Terminal(bytes) => serde_json::from_slice(&bytes)?,
+        crate::command_ledger::Admission::InDoubt
+            if matches!(viewer.command, Command::Prompt { .. }) =>
+        {
+            let session = session_id.context("prompt requires session scope")?;
+            ledger
+                .bind_prompt(
+                    context.config.host_id,
+                    viewer.command_id,
+                    session,
+                    viewer.command_id,
+                )
+                .await?;
+            if let Command::Prompt {
+                text,
+                attachments,
+                delivery,
+            } = &viewer.command
+            {
+                let attachments = viewer_attachments(&context, session, attachments).await?;
+                let delivery = match delivery {
+                    borg_view::wire::Delivery::Queue => crate::PromptDelivery::Queue,
+                    borg_view::wire::Delivery::Steer => crate::PromptDelivery::Steer,
+                };
+                if context
+                    .session_store
+                    .contains_message(session, viewer.command_id)
+                    .await?
+                {
+                    admit_remote_prompt(
+                        context.session_store.as_ref(),
+                        session,
+                        viewer.command_id,
+                        text,
+                        &attachments,
+                        delivery,
+                    )
+                    .await?;
+                } else {
+                    ensure!(
+                        dispatch(
+                            context.clone(),
+                            HostCommand::Prompt {
+                                session_id: session,
+                                message_id: viewer.command_id,
+                                text: text.clone(),
+                                attachments,
+                                delivery,
+                                output_schema: None
+                            }
+                        )
+                        .await,
+                        "prompt admission interrupted"
+                    );
+                }
+            }
+            CommandOutcome::Applied
+        }
         crate::command_ledger::Admission::InDoubt => CommandOutcome::Rejected {
             code: "interrupted".into(),
             message: "effect was started; automatic replay refused".into(),
@@ -2345,6 +2402,7 @@ async fn viewer_command(
                         delivery,
                         attachments,
                     } => {
+                        ledger.bind_prompt(context.config.host_id, viewer.command_id, session_id, viewer.command_id).await?;
                         let attachments = viewer_attachments(&context, session_id, &attachments).await?;
                         HostCommand::Prompt {
                             session_id,
@@ -2366,7 +2424,7 @@ async fn viewer_command(
                         ensure!(offset >= 0, "invalid asset offset");
                         let pool = context.session_store.postgres_authority().context("missing payload authority")?.pool;
                         let row = sqlx::query("select byte_len, substring(payload from $3 for $4) as page from session_payloads where session_id=$1 and id=$2")
-                            .bind(session_id).bind(id).bind(offset.checked_add(1).context("asset offset overflow")?).bind(i32::try_from(max_bytes)?).fetch_optional(&pool).await?.context("asset outside session scope")?;
+                            .bind(session_id).bind(id).bind(i32::try_from(offset.checked_add(1).context("asset offset overflow")?)?).bind(i32::try_from(max_bytes)?).fetch_optional(&pool).await?.context("asset outside session scope")?;
                         let total: i64 = row.try_get("byte_len")?;
                         ensure!(offset <= total, "asset offset exceeds length");
                         let bytes: Vec<u8> = row.try_get("page")?;
@@ -2482,7 +2540,7 @@ async fn viewer_command(
                                 .context("session configuration unavailable")?
                                 .provider,
                             crate::PromptDelivery::Steer,
-                            &[],
+                            &state.todos,
                         )? {
                             F::Interrupt => HostCommand::Interrupt { session_id },
                             F::Compact => HostCommand::Compact { session_id },
@@ -2498,14 +2556,19 @@ async fn viewer_command(
                                 text,
                                 attachments,
                                 delivery,
-                            } => HostCommand::Prompt {
-                                session_id,
-                                message_id: viewer.command_id,
-                                text,
-                                attachments,
-                                delivery,
-                                output_schema: None,
+                            } => {
+                                ledger.bind_prompt(context.config.host_id, viewer.command_id, session_id, viewer.command_id).await?;
+                                HostCommand::Prompt { session_id, message_id: viewer.command_id, text, attachments, delivery, output_schema: None }
                             },
+                            F::Quit => return Ok(CommandOutcome::ClientLocal { effect: borg_view::wire::ClientEffect::CloseView }),
+                            F::NewSession => {
+                                let Some(StoredHostLaunch::Launch(metadata)) = load_launch_metadata(context.session_store.as_ref(), session_id).await? else { bail!("session launch configuration unavailable") };
+                                let mut request = metadata.request;
+                                request.request_id = viewer.command_id;
+                                request.initial_prompt = None;
+                                request.cwd = validate_host_cwd(&context.config.roots, &request.cwd)?;
+                                HostCommand::Launch { session_id: viewer.command_id, request: Box::new(request), attachment: None }
+                            }
                             F::RecallQueuedPrompt(message_id) => HostCommand::RecallQueuedPrompt { session_id, message_id },
                             F::ApplyAgentTodo { target_session_id, action } => HostCommand::AgentTodo { session_id, target_session_id, action },
                             F::RunExtension { command, arguments } => HostCommand::ExtensionCommand { session_id, invocation_id: viewer.command_id, command, arguments },
@@ -2518,7 +2581,6 @@ async fn viewer_command(
                             _ => bail!("slash intent requires client-local behavior or revision-bound approval; use typed control"),
                         }
                     }
-                    _ => bail!("command requires an unsupported canonical operation"),
                 };
                 ensure!(
                     dispatch(context.clone(), command).await,
@@ -2567,8 +2629,24 @@ async fn owner_command(
     let run = async {
         let id = Uuid::parse_str(&command_id)?;
         let encoded = serde_json::to_vec(&command)?;
-        match ledger.admit(context.config.host_id, id, "host", "owner:trusted-relay", &encoded).await? {
+        let admission = ledger.admit(context.config.host_id, id, "host", "owner:trusted-relay", &encoded).await?;
+        if matches!(admission, crate::command_ledger::Admission::New | crate::command_ledger::Admission::InDoubt) {
+            if let HostCommand::Prompt { session_id, message_id, .. } = &command {
+                ledger.bind_prompt(context.config.host_id, id, *session_id, *message_id).await?;
+            }
+        }
+        match admission {
             crate::command_ledger::Admission::Terminal(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            crate::command_ledger::Admission::InDoubt if matches!(command, HostCommand::Prompt { .. }) => {
+                if let HostCommand::Prompt { session_id, message_id, text, attachments, delivery, .. } = &command {
+                    if context.session_store.contains_message(*session_id, *message_id).await? {
+                        admit_remote_prompt(context.session_store.as_ref(), *session_id, *message_id, text, attachments, *delivery).await?;
+                        return Ok(serde_json::json!({"status":"accepted"}));
+                    }
+                }
+                ensure!(dispatch(context, command).await, "prompt retry admission interrupted");
+                Ok(serde_json::json!({"status":"accepted"}))
+            }
             crate::command_ledger::Admission::InDoubt => Ok(serde_json::json!({"status":"interrupted", "retryable":false})),
             crate::command_ledger::Admission::New => {
                 let host = context.config.host_id;
@@ -3292,19 +3370,47 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                     return false;
                 }
             };
-            let socket = crate::local_control::session_control_socket_path(&session_root, root);
-            if crate::local_control::session_control_socket_is_reachable(&socket).await {
+            let socket = crate::session_control_socket_path(&session_root, root);
+            if crate::session_control_socket_is_reachable(&socket).await {
+                if let HostCommand::Prompt {
+                    session_id,
+                    message_id,
+                    text,
+                    attachments,
+                    delivery,
+                    ..
+                } = &command
+                {
+                    match session_store
+                        .contains_message(*session_id, *message_id)
+                        .await
+                    {
+                        Ok(true) => {
+                            return admit_remote_prompt(
+                                session_store.as_ref(),
+                                *session_id,
+                                *message_id,
+                                text,
+                                attachments,
+                                *delivery,
+                            )
+                            .await
+                            .is_ok();
+                        }
+                        Ok(false) => {}
+                        Err(_) => return false,
+                    }
+                }
+
                 match session_store.host_launch_owner(root).await {
                     Ok(Some((host, origin)))
                         if host == config.host_id
                             && host_relay_origin(&config).ok().as_ref() == Some(&origin) => {}
                     _ => return false,
                 }
-                return crate::local_control::send_local_session_command(
-                    &socket, session_id, command,
-                )
-                .await
-                .is_ok();
+                return crate::send_local_session_command(&socket, session_id, command)
+                    .await
+                    .is_ok();
             }
         }
     }
@@ -3698,7 +3804,8 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             delivery,
             ..
         } = &command
-            && let Err(error) = admit_remote_prompt(
+        {
+            match admit_remote_prompt(
                 session_store.as_ref(),
                 session_id,
                 *message_id,
@@ -3707,9 +3814,14 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                 *delivery,
             )
             .await
-        {
-            tracing::warn!(%error, %session_id, %message_id, "failed to durably admit remote prompt; retaining it for relay retry");
-            return false;
+            {
+                Ok(true) => {}
+                Ok(false) => return true,
+                Err(error) => {
+                    tracing::warn!(%error, %session_id, %message_id, "failed prompt admission");
+                    return false;
+                }
+            }
         }
         if session.send(command).await.is_err() {
             tracing::warn!(%session_id, "remote session actor stopped before command delivery; retaining it for relay retry");
@@ -3876,7 +3988,7 @@ async fn admit_remote_prompt(
     text: &str,
     attachments: &[PathBuf],
     delivery: crate::PromptDelivery,
-) -> Result<()> {
+) -> Result<bool> {
     let workspace_durable = match store.workspace_store().await? {
         Some(workspace) => workspace.contains_message(message_id).await?,
         None => false,
@@ -3884,22 +3996,22 @@ async fn admit_remote_prompt(
     // A workspace copy does not replace validation of an existing local admission.
     // Action lookup is session-local; inherited and inbox-only messages stay actionless.
     if !workspace_durable || store.action(session_id, message_id).await?.is_some() {
-        store
-            .admit_prompt(SessionEvent::new(
-                session_id,
-                0,
-                crate::SessionEventKind::Message {
-                    message_id,
-                    actor: crate::EventActor::User,
-                    text: text.to_string(),
-                    attachments: attachments.to_vec(),
-                    status: crate::MessageStatus::Queued,
-                    delivery: Some(delivery),
-                },
-            ))
-            .await?;
+        let event = SessionEvent::new(
+            session_id,
+            0,
+            crate::SessionEventKind::Message {
+                message_id,
+                actor: crate::EventActor::User,
+                text: text.to_string(),
+                attachments: attachments.to_vec(),
+                status: crate::MessageStatus::Queued,
+                delivery: Some(delivery),
+            },
+        );
+        let id = event.id;
+        return Ok(store.admit_prompt(event).await?.id == id);
     }
-    Ok(())
+    Ok(false)
 }
 
 async fn upload_host_action_result<T: Serialize>(
@@ -4736,8 +4848,8 @@ async fn resume_pending_host_sessions(
             .owning_root_session(session_id)
             .await?
             .unwrap_or(session_id);
-        let socket = crate::local_control::session_control_socket_path(session_root, root);
-        if crate::local_control::session_control_socket_is_reachable(&socket).await {
+        let socket = crate::session_control_socket_path(session_root, root);
+        if crate::session_control_socket_is_reachable(&socket).await {
             continue;
         }
         // Never restore a second actor while a canonical writer owns the journal.
