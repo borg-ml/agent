@@ -325,19 +325,7 @@ impl Watches {
                 "runtime could not background: session watchers stopped or watcher limit reached"
             );
         }
-        entries.retain(|_, entry| entry.info.running || entry.runtime || entry.pending_report);
-        let mut completed: Vec<_> = entries
-            .values()
-            .filter(|entry| entry.runtime && !entry.info.running)
-            .map(|entry| (entry.info.started_at, entry.info.watch_id))
-            .collect();
-        completed.sort_unstable();
-        for (_, id) in completed
-            .iter()
-            .take(completed.len().saturating_sub(MAX_WATCHES - 1))
-        {
-            entries.remove(id);
-        }
+        prune_completed_watches(&mut entries);
         let info = WatchInfo {
             watch_id: Uuid::new_v4(),
             label: format!("{runtime} runtime"),
@@ -441,7 +429,7 @@ impl Watches {
             entries.values().filter(|entry| entry.info.running).count() < MAX_WATCHES,
             "at most {MAX_WATCHES} watchers can run; stop one first"
         );
-        entries.retain(|_, entry| entry.info.running || entry.runtime || entry.pending_report);
+        prune_completed_watches(&mut entries);
         if let Some(process) = attached {
             ensure!(
                 !entries
@@ -563,7 +551,7 @@ impl Watches {
             entries.values().filter(|entry| entry.info.running).count() < MAX_WATCHES,
             "at most {MAX_WATCHES} watchers can run; stop one first"
         );
-        entries.retain(|_, entry| entry.info.running || entry.runtime || entry.pending_report);
+        prune_completed_watches(&mut entries);
         let info = WatchInfo {
             watch_id: Uuid::new_v4(),
             label: args.label,
@@ -741,6 +729,7 @@ impl Watches {
                     && entry.info.running
                 {
                     entry.info.running = false;
+                    entry.info.result = report.as_ref().map(|text| json!({"output": text}));
                     entry.pending_report = true;
                     self.changed.notify_one();
                 }
@@ -813,6 +802,26 @@ impl Watches {
                 )
                 .await;
         }
+    }
+}
+
+// Reading a terminal process retires it. Keep recent results retrievable even
+// while the session is still busy and has not consumed the report notification.
+fn prune_completed_watches(entries: &mut BTreeMap<Uuid, WatchEntry>) {
+    entries.retain(|_, entry| {
+        entry.info.running || entry.info.result.is_some() || entry.pending_report
+    });
+    let mut completed: Vec<_> = entries
+        .values()
+        .filter(|entry| !entry.info.running && !entry.pending_report)
+        .map(|entry| (entry.info.started_at, entry.info.watch_id))
+        .collect();
+    completed.sort_unstable();
+    for (_, id) in completed
+        .iter()
+        .take(completed.len().saturating_sub(MAX_WATCHES - 1))
+    {
+        entries.remove(id);
     }
 }
 
@@ -1619,6 +1628,128 @@ mod tests {
         assert_eq!(stopped[0].watch_id, info.watch_id);
         watches.cancel.cancel();
         scratch.discard().await;
+    }
+
+    // A real finished process is consumed by attachment. A full notification
+    // channel proves result recovery cannot depend on its later model delivery.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attaching_after_exit_keeps_a_retrievable_result_before_notification() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = tempfile::tempdir().unwrap();
+        let gate = root.path().join("gate");
+        let path = std::ffi::CString::new(gate.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a live, NUL-terminated local temporary path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let owner = Uuid::new_v4();
+        let processes = ProcessManager::default();
+        let mut updates = processes.subscribe_output();
+        let process = processes
+            .exec(
+                owner,
+                root.path(),
+                "read gate < gate; printf 'committed\\n'; printf 'pushed' >&2; exit 7".into(),
+                None,
+                Some(0),
+                None,
+                5000,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(process.running);
+        tokio::fs::write(gate, b"go\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while updates.recv().await.unwrap() != (process.session_id, None) {}
+        })
+        .await
+        .expect("process must finish before watcher attachment");
+
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send("busy turn".to_string()).await.unwrap();
+        let watches = Watches::new(processes.clone(), tx, owner);
+        watches
+            .start(
+                owner,
+                root.path(),
+                WatchArgs {
+                    session_id: Some(process.session_id),
+                    label: "Commit and push".into(),
+                    ..Default::default()
+                },
+                None,
+                5000,
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let changed = watches.changed.notified();
+                let info = watches.list().await.remove(0);
+                if !info.running {
+                    break info;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            terminal.event_count, 0,
+            "notification channel is still blocked"
+        );
+        let result = terminal
+            .result
+            .expect("the consumed process result must be retrievable");
+        let report = result["output"].as_str().unwrap();
+        assert!(
+            report.contains("committed\n") && report.contains("pushed"),
+            "{report}"
+        );
+        assert!(report.contains("Some(7)"), "{report}");
+        assert!(
+            processes
+                .write_stdin(owner, process.session_id, None, false, Some(0), None)
+                .await
+                .is_err()
+        );
+        assert_eq!(watches.list().await[0].result.as_ref(), Some(&result));
+        assert_eq!(rx.recv().await.unwrap(), "busy turn");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            report
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let changed = watches.changed.notified();
+                if watches.list().await[0].event_count == 1 {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .unwrap();
+        // Once delivered, a new watcher must not immediately erase recovery.
+        watches
+            .start_agents(agent_args(
+                vec![Uuid::new_v4()],
+                Some(NotifyOn::Exit),
+                Aggregate::All,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            watches.list_for(&[process.session_id]).await[0]
+                .result
+                .as_ref(),
+            Some(&result)
+        );
+        watches.cancel.cancel();
     }
 
     #[tokio::test]
