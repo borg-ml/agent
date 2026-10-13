@@ -2631,10 +2631,14 @@ impl Transcript {
                         replaced_text = true;
                         *complete =
                             matches!(*status, MessageStatus::Complete | MessageStatus::Failed);
-                        // A durable redelivery of the same message carries the
-                        // text the provider really ended on, so the row is no
-                        // longer a stranded fragment.
-                        *user_interrupted = false;
+                        // Only a final response replaces an interrupted fragment.
+                        // Failed snapshots are archived just before their boundary.
+                        if *status == MessageStatus::Complete {
+                            *user_interrupted = false;
+                        }
+                        if *actor == EventActor::Assistant && *status == MessageStatus::Failed {
+                            *complete = false;
+                        }
                         if let Some(attachments) = numbered_attachments {
                             *stored_attachments = attachments;
                         }
@@ -2723,10 +2727,9 @@ impl Transcript {
                             effort: display_message_effort(effort, fast, ultrafast),
                             time: event_time,
                             status: *status,
-                            complete: matches!(
-                                *status,
-                                MessageStatus::Complete | MessageStatus::Failed
-                            ),
+                            complete: *status == MessageStatus::Complete
+                                || (*status == MessageStatus::Failed
+                                    && *actor != EventActor::Assistant),
                             user_interrupted: false,
                             redirected: false,
                         },
@@ -5155,7 +5158,9 @@ impl Transcript {
             else {
                 continue;
             };
-            if *status != MessageStatus::InProgress {
+            if *status != MessageStatus::InProgress
+                && !(*status == MessageStatus::Failed && !*complete)
+            {
                 continue;
             }
             *status = MessageStatus::Complete;

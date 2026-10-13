@@ -21067,3 +21067,74 @@ fn compaction_preview_separates_title_and_renders_markdown_without_changing_summ
         matches!(&transcript.order[0], TranscriptEntry::Compaction { summary: stored, .. } if stored == summary)
     );
 }
+
+#[tokio::test]
+#[ignore = "requires BORG_TEST_SESSIONS_URL"]
+async fn interrupted_outcomes_render_identically_after_journal_replay() {
+    use borg_remote::{PostgresSessionStore, SessionStore};
+    let url = std::env::var("BORG_TEST_SESSIONS_URL").expect("test PostgreSQL fixture");
+    let store = PostgresSessionStore::connect(&url).await.unwrap();
+    let session = Uuid::new_v4();
+    let prompt = Uuid::new_v4();
+    let reply = Uuid::new_v4();
+    store.create_session(session).await.unwrap();
+    let message = |id, text: &str| SessionEventKind::Message {
+        message_id: id,
+        actor: EventActor::Assistant,
+        text: text.into(),
+        attachments: Vec::new(),
+        status: MessageStatus::InProgress,
+        delivery: None,
+    };
+    let provider = |kind: &str| SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Codex,
+        kind: kind.into(),
+        payload: serde_json::json!({"tool_call_id":"abandoned", "label":"inspect"}),
+    };
+    let mut live = Transcript::default();
+    let events = [
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Running,
+            detail: None,
+        },
+        turn_started(session, 0, prompt).kind,
+        message(reply, "I was going to"),
+        message(reply, "I was going to edit that"),
+        provider("native_steer_applied"),
+        message(Uuid::new_v4(), "Instead I will"),
+        provider("action/preparing"),
+        SessionEventKind::TurnCompleted {
+            message_id: prompt,
+            provider_session_id: None,
+            final_text: String::new(),
+            error: Some("turn interrupted".into()),
+        },
+    ];
+    for kind in events {
+        let event = store
+            .append(SessionEvent::new(session, 0, kind))
+            .await
+            .unwrap();
+        live.apply(&event);
+    }
+    let mut replay = Transcript::default();
+    for event in transcript_history_in_display_order(&store.read(session).await.unwrap()) {
+        replay.apply(&event);
+    }
+    let render = |transcript: &Transcript| {
+        transcript
+            .lines(100)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let rendered = render(&live);
+    assert!(rendered.contains("redirected by follow-up"), "{rendered}");
+    assert!(rendered.contains("user interrupted"), "{rendered}");
+    assert!(
+        rendered.contains("Stopped generating tool call"),
+        "{rendered}"
+    );
+    assert_eq!(render(&replay), rendered);
+}

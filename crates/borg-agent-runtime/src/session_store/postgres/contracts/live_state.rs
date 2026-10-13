@@ -51,22 +51,25 @@ async fn parallel_generation_status_survives_reconnect_and_clears_per_call() {
         }
     }
     let live = store.live_events_after(session_id, 0).await.unwrap();
-    assert_eq!(live.len(), 4);
-    for (events, id) in live.as_chunks::<2>().0.iter().zip(["a", "b"]) {
+    assert_eq!(live.len(), 2);
+    for (event, id) in live.iter().zip(["a", "b"]) {
         assert!(
-            matches!(&events[0].event.kind, SessionEventKind::ProviderEvent { kind, payload, .. }
-            if kind == "action/preparing" && payload["tool_call_id"] == id)
-        );
-        assert!(
-            matches!(&events[1].event.kind, SessionEventKind::ProviderEvent { kind, payload, .. }
+            matches!(&event.event.kind, SessionEventKind::ProviderEvent { kind, payload, .. }
             if kind == "action/generation_status" && payload["tool_call_id"] == id && payload["waiting"] == true)
         );
     }
+    let durable = store.read(session_id).await.unwrap();
     assert_eq!(
-        store.read(session_id).await.unwrap().len(),
-        3,
-        "live status must not grow the durable conversation"
+        durable.len(),
+        5,
+        "attempts are facts; waiting status is not"
     );
+    for (event, id) in durable[3..].iter().zip(["a", "b"]) {
+        assert!(
+            matches!(&event.kind, SessionEventKind::ProviderEvent { kind, payload, .. }
+            if kind == "action/preparing" && payload["tool_call_id"] == id)
+        );
+    }
     store
         .append(SessionEvent::new(
             session_id,
@@ -82,7 +85,7 @@ async fn parallel_generation_status_survives_reconnect_and_clears_per_call() {
         .await
         .unwrap();
     let live = store.live_events_after(session_id, 0).await.unwrap();
-    assert_eq!(live.len(), 2);
+    assert_eq!(live.len(), 1);
     assert!(live.iter().all(|event| matches!(&event.event.kind, SessionEventKind::ProviderEvent { payload, .. } if payload["tool_call_id"] == "b")));
     store
         .append(SessionEvent::new(

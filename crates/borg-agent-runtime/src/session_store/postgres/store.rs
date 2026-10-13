@@ -314,7 +314,11 @@ impl PostgresSessionStore {
             }
         }
 
-        if event.sequence == 0 && event.kind.clears_live_turn_state() {
+        if event.sequence == 0
+            && (event.kind.clears_live_turn_state()
+                || matches!(&event.kind, SessionEventKind::ProviderEvent { kind, .. }
+                    if kind == crate::session::NATIVE_STEER_APPLIED))
+        {
             let messages: Vec<serde_json::Value> = sqlx::query_scalar(
                 "select event_json from session_live_state \
                  where session_id = $1 and live_key like 'message:%' order by revision",
@@ -338,6 +342,12 @@ impl PostgresSessionStore {
                     Box::pin(self.append_durable_in_transaction(transaction, message)).await?;
                 }
             }
+            sqlx::query(
+                "delete from session_live_state where session_id = $1 and live_key like 'message:%'",
+            )
+            .bind(event.session_id)
+            .execute(&mut **transaction)
+            .await?;
             row = sqlx::query(
                 "select inherited_event_count, next_sequence, state_json from sessions where id = $1",
             )

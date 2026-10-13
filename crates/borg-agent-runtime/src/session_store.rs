@@ -329,11 +329,14 @@ impl SessionEventKind {
             Self::ProviderEvent { kind, .. } if kind == crate::session::NATIVE_STEER_APPLIED => {
                 EventPersistence::Durable
             }
+            // The attempted call and its abandonment remain visible after replay.
+            // Waiting indicators are still coalesced progress, not journal facts.
             Self::ProviderEvent { kind, .. }
-                if kind == "action/preparing"
-                    || kind == "action/preparing_cancelled"
-                    || kind == "action/generation_status" =>
+                if kind == "action/preparing" || kind == "action/preparing_cancelled" =>
             {
+                EventPersistence::Durable
+            }
+            Self::ProviderEvent { kind, .. } if kind == "action/generation_status" => {
                 EventPersistence::Coalesced
             }
             Self::ProviderEvent { .. } => EventPersistence::Ephemeral,
