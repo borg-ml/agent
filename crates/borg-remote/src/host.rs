@@ -2607,8 +2607,7 @@ async fn viewer_command(
                         HostCommand::RespondToProviderInteraction { session_id, interaction_id: approval_id, response }
                     }
                     Command::NewSession { cwd } => {
-                        let Some(StoredHostLaunch::Launch(metadata)) = load_launch_metadata(context.session_store.as_ref(), session_id).await? else { bail!("session launch configuration unavailable") };
-                        let mut request = metadata.request;
+                        let mut request = scope_registration(context.session_store.as_ref(), session_id).await?.context("session launch configuration unavailable")?;
                         request.cwd = validate_host_cwd(&context.config.roots, Path::new(&cwd))?;
                         request.request_id = viewer.command_id;
                         request.initial_prompt = None;
@@ -2733,8 +2732,7 @@ async fn viewer_command(
                             }
                             F::Quit => return Ok(CommandOutcome::ClientLocal { effect: borg_view::wire::ClientEffect::CloseView }),
                             F::NewSession => {
-                                let Some(StoredHostLaunch::Launch(metadata)) = load_launch_metadata(context.session_store.as_ref(), session_id).await? else { bail!("session launch configuration unavailable") };
-                                let mut request = metadata.request;
+                                let mut request = scope_registration(context.session_store.as_ref(), session_id).await?.context("session launch configuration unavailable")?;
                                 request.request_id = viewer.command_id;
                                 request.initial_prompt = None;
                                 request.cwd = validate_host_cwd(&context.config.roots, &request.cwd)?;
