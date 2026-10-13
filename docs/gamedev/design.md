@@ -158,7 +158,7 @@ execution. Use one authority for each fact.
 | Low RAM, disk full, or divergent mount | Measure `MemAvailable` and output filesystem free bytes; reserve budgets, fail with actionable gate reason and clean only owned stale outputs |
 | Service crash/health check failure | Bounded restart backoff; keep healthy A backend if B fails, publish degraded status |
 | Exclusive job while editor client active | Request yield, wait for client drain and resource release; cancel/time out rather than write behind editor |
-| Agent interrupted/human stop | Keep job and scoped lock authority separate; watch wake must respect explicit human stop; resume with status ID |
+| Agent interrupted/human stop | Keep job and scoped lock authority separate; Stop cancels the current turn; resume with status ID |
 | Disconnected/unauthorized adapter | Reject path/command/MCP escalation before launch; preserve prior healthy service where possible |
 | Partial freeze ack or dirty tree | Remain proposed, no forced rebase/removal; escalate to owner or abort and release gate |
 

@@ -64,9 +64,6 @@ fn public_event(event: &SessionEvent) -> Option<Value> {
             json!({"type": "status_changed", "status": status,
             "detail": detail.as_deref().map(crate::secret_scrub::scrub_secrets)})
         }
-        SessionEventKind::UserStopChanged { engaged } => {
-            json!({"type": "user_stop_changed", "engaged": engaged})
-        }
         _ => return None,
     };
     Some(
@@ -135,12 +132,11 @@ fn canonical_summary(id: Uuid, state: &crate::SessionState) -> Value {
         "execution_goal_warning": execution_goal_warning(state.goal.as_ref(), matches!(state.status, Some(crate::SessionStatus::Starting | crate::SessionStatus::Running))),
         "assignment_goal_observation": assignment_goal_observation(state),
         "remaining_tokens": state.goal.as_ref().and_then(|goal| goal.token_budget.map(|budget| budget.saturating_sub(goal.tokens_used))), "usage": state.usage, "assigned_plan": plan,
-        "plan_revision": state.plan_workspace_revision, "user_stopped": state.user_stopped,
+        "plan_revision": state.plan_workspace_revision,
         "pending_approval_id": state.pending_approval_id,
         "pending_decision_id": state.pending_provider_interaction_id,
         "pending_decision_kind": state.pending_provider_interaction_kind,
-        "wait_reason": if state.user_stopped { Some("explicit_user_stop") }
-            else if state.pending_approval_id.is_some() { Some("pending_approval") }
+        "wait_reason": if state.pending_approval_id.is_some() { Some("pending_approval") }
             else if state.pending_provider_interaction_id.is_some() { Some("pending_decision") }
             else if state.usage_limit_retry.is_some() { Some("provider_usage_limit_retry") }
             else { None },
@@ -159,7 +155,6 @@ pub(super) fn scrub_value(value: &mut Value) {
 fn validate_goal_action(
     action: &crate::GoalAction,
     state: Option<&crate::SessionState>,
-    resume_own_interrupt: bool,
 ) -> Result<()> {
     if let crate::GoalAction::Set {
         objective,
@@ -183,10 +178,6 @@ fn validate_goal_action(
             crate::GoalAction::Resume => {
                 let goal = state.goal.as_ref().context("child has no goal")?;
                 ensure!(
-                    !state.user_stopped || resume_own_interrupt,
-                    "explicit human stop requires human resume authorization"
-                );
-                ensure!(
                     state.pending_approval_id.is_none()
                         && state.pending_provider_interaction_id.is_none(),
                     "child has a pending approval or decision"
@@ -200,10 +191,6 @@ fn validate_goal_action(
                 );
             }
             crate::GoalAction::Set { .. } => {
-                ensure!(
-                    !state.user_stopped,
-                    "explicit human stop requires human resume authorization"
-                );
                 ensure!(
                     state.pending_approval_id.is_none()
                         && state.pending_provider_interaction_id.is_none(),
@@ -242,7 +229,7 @@ impl SubagentCoordinator {
             let state = self.store.state(id).await?;
             return Ok(
                 json!({"session_id": id, "goal": public_goal(state.goal.as_ref()),
-                "revision": state.latest_sequence, "user_stopped": state.user_stopped,
+                "revision": state.latest_sequence,
                 "assignment_goal_observation": assignment_goal_observation(&state),
                 "execution_status": state.status,
                 "execution_goal_warning": execution_goal_warning(state.goal.as_ref(), matches!(state.status, Some(crate::SessionStatus::Starting | crate::SessionStatus::Running))),
@@ -251,51 +238,12 @@ impl SubagentCoordinator {
         }
         let action = args.goal_action.context("goal_action is required")?;
         let state = self.store.state(id).await?;
-        let resume_own_interrupt = matches!(action, crate::GoalAction::Resume)
-            && !self.root_launch.capabilities.subagent_resume_guard
-            && self
-                .table
-                .lock()
-                .await
-                .entries
-                .get(&id)
-                .is_some_and(|entry| entry.snapshot.interrupted_by == Some(actor));
-        validate_goal_action(&action, Some(&state), resume_own_interrupt)?;
-        if resume_own_interrupt {
-            self.ensure_child_actor(id).await?;
-            let mut table = self.table.lock().await;
-            let entry = table
-                .entries
-                .get_mut(&id)
-                .context("child no longer exists")?;
-            // Recheck under the same lock used by human interruption before lifting this caller's stop.
-            ensure!(
-                entry.snapshot.interrupted_by == Some(actor),
-                "interruption changed; explicit human stop requires human resume authorization"
-            );
-            let commands = entry
-                .commands
-                .as_ref()
-                .context("subagent is still starting")?;
-            commands
-                .send(HostCommand::ResumeFromInterrupt { session_id: id })
-                .await
-                .map_err(|_| anyhow::anyhow!("subagent command channel closed"))?;
-            commands
-                .send(HostCommand::AgentGoal {
-                    session_id: id,
-                    action,
-                })
-                .await
-                .map_err(|_| anyhow::anyhow!("subagent command channel closed"))?;
-            entry.snapshot.interrupted_by = None;
-        } else {
-            self.send_command(&id.to_string(), |session_id| HostCommand::AgentGoal {
-                session_id,
-                action,
-            })
-            .await?;
-        }
+        validate_goal_action(&action, Some(&state))?;
+        self.send_command(&id.to_string(), |session_id| HostCommand::AgentGoal {
+            session_id,
+            action,
+        })
+        .await?;
         Ok(json!({"session_id": id, "accepted": true, "applied": null,
             "before_revision": state.latest_sequence,
             "caveat": "Queued to the owning child actor, not proof of application. Read get_agent_goal to verify. Pause/clear do not interrupt a running turn; interrupt_agent is separate. Use only for explicit human-authorized goal management."}))
@@ -594,7 +542,7 @@ impl SubagentCoordinator {
                         .goal_action
                         .as_ref()
                         .context("goal_action is required")?;
-                    validate_goal_action(action, None, false)?;
+                    validate_goal_action(action, None)?;
                 }
                 "interrupt_agent" => ensure!(
                     item.message.is_empty() && item.configuration.is_none(),
@@ -685,8 +633,7 @@ impl SubagentCoordinator {
                 continue;
             }
             let actor_state = self.store.state(actor).await?;
-            let gated = actor_state.user_stopped
-                || actor_state.pending_approval_id.is_some()
+            let gated = actor_state.pending_approval_id.is_some()
                 || actor_state.pending_provider_interaction_id.is_some()
                 || actor_state.goal.as_ref().is_some_and(|goal| {
                     goal.token_budget
@@ -694,7 +641,7 @@ impl SubagentCoordinator {
                 });
             if gated {
                 state["gate"] =
-                    json!("caller stop/approval/decision/budget gate prevents further submission");
+                    json!("caller approval/decision/budget gate prevents further submission");
                 self.save_batch(actor, id, entry.revision, state).await?;
                 break;
             }

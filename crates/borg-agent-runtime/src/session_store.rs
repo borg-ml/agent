@@ -432,8 +432,6 @@ impl SessionEventKind {
                 | Self::SessionTitled { .. }
                 | Self::TurnStarted { .. }
                 | Self::StatusChanged { .. }
-                // A fork is a fresh human-initiated branch and never inherits
-                // the parent's user-stop gate.
                 | Self::UserStopChanged { .. }
                 | Self::SubagentActivity { .. }
                 | Self::SubagentControl { .. }
@@ -871,12 +869,6 @@ pub struct SessionState {
     pub first_prompt: Option<String>,
     pub latest_prompt: Option<String>,
     pub latest_response: Option<String>,
-    /// Explicit user-stop gate. Set true by a human Escape and cleared only by
-    /// an explicit human prompt or goal resume (`UserStopChanged`). Persisted
-    /// so the session actor re-engages the gate after a reload and never lets
-    /// background input override a stop until the human re-engages.
-    #[serde(default)]
-    pub user_stopped: bool,
     pub usage_limit_retry: Option<PendingUsageLimitRetry>,
 }
 
@@ -1298,12 +1290,8 @@ impl SessionState {
             } if !text.trim().is_empty() => {
                 self.latest_response = Some(text.trim().to_string());
             }
-            SessionEventKind::UserStopChanged { engaged } => {
-                if *engaged {
-                    self.usage_limit_retry = None;
-                }
-                self.user_stopped = *engaged;
-            }
+            // Legacy journals retain this event, but it no longer changes state.
+            SessionEventKind::UserStopChanged { .. } => {}
             _ => {}
         }
         Ok(())
@@ -1314,9 +1302,6 @@ impl SessionState {
         state.latest_sequence = inherited_event_count;
         state.status = None;
         state.status_detail = None;
-        // A fork is a fresh human-initiated branch; it never inherits a
-        // parent's user-stop gate.
-        state.user_stopped = false;
         state.usage_limit_retry = None;
         // A conversation fork is not an assignment or identity transfer.
         state.todos.clear();

@@ -433,9 +433,8 @@ inspected the pixels. This path requires updated Agent relay code on the sending
 and receiving machines and an updated relay server; syncing does not upgrade a
 running executable.
 
-An explicit user stop takes precedence over background wake requests until a
-human sends new input or explicitly resumes the session. This stop state is
-durable across session reloads and is separate from goal status.
+Stop cancels the current turn; later explicit wake requests can start another turn.
+Goal pause state remains durable across session reloads.
 
 Incoming messages appear as read-only **Agent message** entries with their sender
 and full body, even while the recipient is stopped. Receipt is independent of

@@ -79,8 +79,7 @@ already queued at the turn boundary, and reports arriving while parked, are
 recorded in the durable transcript without spending model turns. They remain
 context for the next real wake.
 
-An explicit user stop holds automatic continuation and watcher output until a
-human returns. A yield is also cleared when its goal leaves the active state.
+A yield is cleared when its goal leaves the active state.
 
 While yielded, the session stops emitting its automatic goal-continuation
 prompt, so **no model turn runs until something real arrives**. It is not a

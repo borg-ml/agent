@@ -231,8 +231,7 @@ job ID immediately, then `watch` runs `borg lane job wait ID` with
 and the agent calls `await_watchers` **only** when no other work is actionable.
 On exit the watcher emits terminal result/log pointer even for failure, and
 wakes a yielded goal; if already terminal it exits immediately. `await_watchers`
-is opt-in, requires an active goal and a live watch; an explicit human stop
-preempts wake. Existing `watch` is session-scoped and max four watches; avoid
+is opt-in and requires an active goal and a live watch. Existing `watch` is session-scoped and max four watches; avoid
 one watcher per ticket by allowing a batch `job wait --any ID...` and implement
 first-party typed watch subjects in runtime if necessary. For another agent's
 completion use `watch` with `agents` / `wait_agent`, **not** a file/port watch.

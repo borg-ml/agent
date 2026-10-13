@@ -95,7 +95,7 @@ these capabilities.
 `control_agent_goal({target, goal_action: {type: "set", objective, token_budget}})`
 sets a goal through its owning actor. Use `type: "pause"`, `"resume"`, or `"clear"`
 for the other actions. Only the director can mutate descendant goals, and only
-under explicit human authorization. Resume/set cannot release a human stop.
+under explicit human authorization.
 Clear detaches the goal while retaining journal history. Pause/clear do not
 interrupt a running turn: use `interrupt_agent` separately when stopping work.
 A control receipt confirms queuing, not application; read the goal again to

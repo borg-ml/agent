@@ -2026,115 +2026,6 @@ async fn a_child_without_a_lane_inherits_the_parent_live_lane() {
     scratch.discard().await;
 }
 
-#[tokio::test]
-async fn a_human_stopped_worker_is_not_reused_for_a_new_task() {
-    // A human stop journals `Ready` in the same breath it latches the gate,
-    // so a stopped worker was claimed here like any idle one. The assignment
-    // then arrived as a team message -- and therefore as `System` -- which
-    // the user-stop gate holds: the roster showed the new task name on a
-    // worker that silently never ran it. Both halves matter. The stop must
-    // survive untouched, and the new task must still get done.
-    let directory = tempdir().unwrap();
-    let root = Uuid::new_v4();
-    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
-    let store = Arc::new(store);
-    store.create_session(root).await.unwrap();
-    let prompts = Arc::new(StdMutex::new(Vec::new()));
-    let executor = RecordingPeerExecutor {
-        prompts: Arc::clone(&prompts),
-    };
-    let mut root_launch = launch();
-    root_launch.capabilities.multiplayer = false;
-    root_launch.cwd = directory.path().to_path_buf();
-    // Two slots, so declining to reuse can actually spawn instead of being
-    // refused by the concurrency cap and passing for the wrong reason.
-    let coordinator = SubagentCoordinator::new_with_store_and_executor(
-        directory.path(),
-        root,
-        root_launch,
-        2,
-        Arc::new(executor),
-        store.clone(),
-    )
-    .unwrap();
-
-    let first = coordinator
-        .call_tool(
-            "spawn_agent",
-            json!({
-                "action": "delegate task",
-                "task_name": "first_task",
-                "message": "Complete the first bounded task."
-            }),
-        )
-        .await
-        .unwrap();
-    let stopped_session = Uuid::parse_str(first["session_id"].as_str().unwrap()).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if coordinator.get(stopped_session).await.unwrap().status == SubagentStatus::Ready {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("first assignment should complete");
-
-    // The human interrupts this worker. Only the durable gate is engaged;
-    // the roster status stays `Ready`, which is precisely what made the
-    // worker claimable for someone else's task.
-    store
-        .append(SessionEvent::new(
-            stopped_session,
-            0,
-            SessionEventKind::UserStopChanged { engaged: true },
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        coordinator.get(stopped_session).await.unwrap().status,
-        SubagentStatus::Ready,
-        "the stop leaves the worker Ready; the reuse gate cannot rely on status"
-    );
-
-    let second = coordinator
-        .call_tool(
-            "spawn_agent",
-            json!({
-                "action": "delegate task",
-                "task_name": "second_task",
-                "message": "Complete the second bounded task."
-            }),
-        )
-        .await
-        .unwrap();
-
-    // The approved assignment is not swallowed: it runs on a fresh worker.
-    assert_eq!(second["reused"], false);
-    let second_session = Uuid::parse_str(second["session_id"].as_str().unwrap()).unwrap();
-    assert_ne!(second_session, stopped_session);
-    assert_eq!(second["assignment_task_name"], "/root/second_task");
-
-    // The stop is not contaminated into the new task: the stopped worker
-    // keeps its own identity, and the new name resolves to the new worker.
-    assert_eq!(
-        coordinator.get(stopped_session).await.unwrap().task_name,
-        "/root/first_task"
-    );
-    assert_eq!(
-        coordinator.get(second_session).await.unwrap().task_name,
-        "/root/second_task"
-    );
-    assert!(
-        store.state(stopped_session).await.unwrap().user_stopped,
-        "the human stop must survive the handoff untouched"
-    );
-
-    coordinator.stop_all().await;
-    scratch.discard().await;
-}
-
 /// Every roster worker is the director's child, so a team member that
 /// delegates must not claim one. It used to take whichever compatible worker
 /// was idle -- the director's, with unrelated context and a last answer the
@@ -8249,7 +8140,7 @@ async fn wait_agent_times_out_with_a_status_line_per_child_and_accepts_long_wait
 }
 
 #[tokio::test]
-async fn only_the_interrupting_agent_resumes_an_interrupted_child() {
+async fn followups_reach_an_interrupted_child() {
     let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
     let (commands, mut received) = mpsc::channel(8);
     coordinator
@@ -8274,7 +8165,7 @@ async fn only_the_interrupting_agent_resumes_an_interrupted_child() {
         }
     };
 
-    // A human stop (the UI path) is not released by an agent's follow-up.
+    // A follow-up reaches the child after a UI interruption.
     coordinator.interrupt("worker").await.unwrap();
     assert!(matches!(
         received.recv().await,
@@ -8294,8 +8185,7 @@ async fn only_the_interrupting_agent_resumes_an_interrupted_child() {
         received.recv().await,
         Some(HostCommand::Interrupt { .. })
     ));
-    // The child's stop report journals this snapshot; it must name the
-    // interrupter so a restarted parent can still resume the child.
+    // The snapshot records the interrupter for the current turn.
     assert_eq!(
         coordinator
             .resolve_snapshot("worker")
@@ -8350,11 +8240,7 @@ async fn only_the_interrupting_agent_resumes_an_interrupted_child() {
     assert_eq!(waited["changes"], json!([]), "{waited}");
     assert!(matches!(
         received.recv().await,
-        Some(HostCommand::ResumeFromInterrupt { session_id }) if session_id == worker
-    ));
-    assert!(matches!(
-        received.recv().await,
-        Some(HostCommand::TeamPrompt { text, .. }) if text.contains("the stop is lifted")
+        Some(HostCommand::TeamPrompt { text, .. }) if text.contains("resume with the smaller fix")
     ));
     followup("one more thing").await;
     assert!(matches!(
@@ -8365,10 +8251,8 @@ async fn only_the_interrupting_agent_resumes_an_interrupted_child() {
     scratch.discard().await;
 }
 
-/// Failure mode: the parent interrupts a child, the human then stops it too,
-/// and the parent's next follow-up lifts the human's stop.
 #[tokio::test]
-async fn a_human_stop_after_an_agent_interrupt_still_holds() {
+async fn followup_after_a_ui_interrupt_reaches_the_child() {
     let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
     let (commands, mut received) = mpsc::channel(8);
     coordinator
@@ -8902,30 +8786,6 @@ async fn team_harness_batch_recovers_partial_receipts_without_duplicate_followup
             .await
             .is_err()
     );
-    store
-        .append(SessionEvent::new(
-            root,
-            0,
-            SessionEventKind::UserStopChanged { engaged: true },
-        ))
-        .await
-        .unwrap();
-    let mut gated = request.clone();
-    gated["idempotency_key"] = json!("stopped-caller");
-    let pending = coordinator
-        .call_tool_as(root, "team_batch", gated.clone())
-        .await
-        .unwrap();
-    assert_eq!(pending["receipt"]["results"][0]["state"], "pending");
-    assert_eq!(pending["progress"]["submitted"], 0);
-    assert!(rx.try_recv().is_err(), "human stop must prevent submission");
-    gated["cancel"] = json!(true);
-    let cancelled_pending = coordinator
-        .call_tool_as(root, "team_batch", gated)
-        .await
-        .unwrap();
-    assert_eq!(cancelled_pending["receipt"]["cancelled"], true);
-    assert_eq!(cancelled_pending["progress"]["submitted"], 0);
     let mut cancelled = request;
     cancelled["cancel"] = json!(true);
     assert_eq!(
@@ -8948,14 +8808,6 @@ async fn team_harness_batch_recovers_partial_receipts_without_duplicate_followup
             .to_string()
             .contains("director")
     );
-    store
-        .append(SessionEvent::new(
-            root,
-            0,
-            SessionEventKind::UserStopChanged { engaged: false },
-        ))
-        .await
-        .unwrap();
     let interrupt = json!({"idempotency_key":"interrupt-once", "operations":[{"session_id":child,"operation":"interrupt_agent"}]});
     let interrupted = coordinator
         .call_tool_as(root, "team_batch", interrupt.clone())
@@ -9632,7 +9484,7 @@ async fn parent_goal_control_routes_real_actions_and_denies_unrelated_callers() 
     let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
     let store = Arc::new(store);
     store.create_session(root).await.unwrap();
-    let mut coordinator = SubagentCoordinator::new_with_store_and_executor(
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
         root,
         launch(),
@@ -9698,25 +9550,6 @@ async fn parent_goal_control_routes_real_actions_and_denies_unrelated_callers() 
             other => panic!("wrong command: {other:?}"),
         }
     }
-    store
-        .append(SessionEvent::new(
-            child,
-            0,
-            SessionEventKind::UserStopChanged { engaged: true },
-        ))
-        .await
-        .unwrap();
-    assert!(
-        coordinator
-            .call_tool_as(
-                root,
-                "control_agent_goal",
-                json!({"target":"worker","goal_action":{"type":"resume"}})
-            )
-            .await
-            .is_err()
-    );
-    assert!(rx.try_recv().is_err());
     coordinator
         .call_tool_as(root, "interrupt_agent", json!({"target":"worker"}))
         .await
@@ -9725,57 +9558,7 @@ async fn parent_goal_control_routes_real_actions_and_denies_unrelated_callers() 
         rx.recv().await,
         Some(HostCommand::Interrupt { .. })
     ));
-    assert!(
-        coordinator.table.lock().await.entries[&child]
-            .snapshot
-            .interrupted_by
-            .is_none(),
-        "an agent interruption cannot claim an existing human stop"
-    );
-    assert!(
-        coordinator
-            .call_tool_as(
-                root,
-                "control_agent_goal",
-                json!({"target":"worker","goal_action":{"type":"resume"}})
-            )
-            .await
-            .is_err()
-    );
-    store
-        .append(SessionEvent::new(
-            child,
-            0,
-            SessionEventKind::UserStopChanged { engaged: false },
-        ))
-        .await
-        .unwrap();
-    coordinator
-        .call_tool_as(root, "interrupt_agent", json!({"target":"worker"}))
-        .await
-        .unwrap();
-    assert!(matches!(
-        rx.recv().await,
-        Some(HostCommand::Interrupt { .. })
-    ));
-    store
-        .append(SessionEvent::new(
-            child,
-            0,
-            SessionEventKind::UserStopChanged { engaged: true },
-        ))
-        .await
-        .unwrap();
     let resume = json!({"target":"worker","goal_action":{"type":"resume"}});
-    coordinator.root_launch.capabilities.subagent_resume_guard = true;
-    assert!(
-        coordinator
-            .call_tool_as(root, "control_agent_goal", resume.clone())
-            .await
-            .is_err()
-    );
-    assert!(rx.try_recv().is_err());
-    coordinator.root_launch.capabilities.subagent_resume_guard = false;
     let mut limited = goal.clone();
     limited.status = crate::GoalStatus::BudgetLimited;
     store
@@ -9809,25 +9592,8 @@ async fn parent_goal_control_routes_real_actions_and_denies_unrelated_callers() 
         .await
         .unwrap();
     assert!(
-        matches!(rx.recv().await, Some(HostCommand::ResumeFromInterrupt { session_id }) if session_id == child)
-    );
-    assert!(
         matches!(rx.recv().await, Some(HostCommand::AgentGoal { session_id, action: crate::GoalAction::Resume }) if session_id == child)
     );
-    assert!(
-        coordinator.table.lock().await.entries[&child]
-            .snapshot
-            .interrupted_by
-            .is_none()
-    );
-    store
-        .append(SessionEvent::new(
-            child,
-            0,
-            SessionEventKind::UserStopChanged { engaged: false },
-        ))
-        .await
-        .unwrap();
     coordinator
         .call_tool_as(root, "interrupt_agent", json!({"target":"worker"}))
         .await
@@ -9836,29 +9602,6 @@ async fn parent_goal_control_routes_real_actions_and_denies_unrelated_callers() 
         rx.recv().await,
         Some(HostCommand::Interrupt { .. })
     ));
-    store
-        .append(SessionEvent::new(
-            child,
-            0,
-            SessionEventKind::UserStopChanged { engaged: true },
-        ))
-        .await
-        .unwrap();
-    coordinator.interrupt("worker").await.unwrap();
-    assert!(matches!(
-        rx.recv().await,
-        Some(HostCommand::Interrupt { .. })
-    ));
-    assert!(
-        coordinator
-            .call_tool_as(root, "control_agent_goal", resume)
-            .await
-            .is_err()
-    );
-    assert!(
-        rx.try_recv().is_err(),
-        "a later human stop remains authoritative"
-    );
     assert_eq!(store.state(child).await.unwrap().goal.unwrap().id, goal.id);
     scratch.discard().await;
 }
@@ -10138,7 +9881,7 @@ fn message_tool_requires_explicit_notification_or_wake_choice() {
 }
 
 #[tokio::test]
-async fn a_parent_controls_its_childs_goal_but_cannot_lift_a_human_stop() {
+async fn a_parent_controls_its_childs_goal() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
     let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
@@ -10191,21 +9934,18 @@ async fn a_parent_controls_its_childs_goal_but_cannot_lift_a_human_stop() {
         rx.recv().await,
         Some(HostCommand::AgentGoal { session_id, .. }) if session_id == grandchild
     ));
-    store
-        .append(SessionEvent::new(
-            grandchild,
-            0,
-            SessionEventKind::UserStopChanged { engaged: true },
-        ))
-        .await
-        .unwrap();
     let resume = json!({"target": grandchild, "goal_action": {"type": "resume"}});
-    let refused = coordinator
+    coordinator
         .call_tool_as(child, "control_agent_goal", resume)
         .await
-        .unwrap_err();
-    assert!(refused.to_string().contains("human resume authorization"));
-    assert!(rx.try_recv().is_err());
+        .unwrap();
+    assert!(matches!(
+        rx.recv().await,
+        Some(HostCommand::AgentGoal {
+            action: crate::GoalAction::Resume,
+            ..
+        })
+    ));
 }
 
 #[tokio::test]
@@ -10329,29 +10069,6 @@ async fn team_batch_goal_handoff_is_ordered_authorized_and_not_replayed() {
             "rejected resume must not admit a later wake, including on replay"
         );
     }
-    store
-        .append(SessionEvent::new(
-            child,
-            0,
-            SessionEventKind::UserStopChanged { engaged: true },
-        ))
-        .await
-        .unwrap();
-    let stopped = coordinator.call_tool_as(root, "team_batch", json!({"idempotency_key": "human-stopped", "operations": [
-        {"session_id": child, "operation": "control_agent_goal", "goal_action": {"type": "set", "objective": "new work"}}]
-    })).await.unwrap();
-    assert_eq!(
-        stopped["receipt"]["results"][0]["state"],
-        "failed_or_uncertain"
-    );
-    assert!(
-        stopped["receipt"]["results"][0]["error"]
-            .as_str()
-            .unwrap()
-            .contains("explicit human stop")
-    );
-    assert!(rx.try_recv().is_err());
-    assert!(store.state(child).await.unwrap().user_stopped);
     scratch.discard().await;
 }
 

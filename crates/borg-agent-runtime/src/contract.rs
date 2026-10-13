@@ -1043,10 +1043,6 @@ pub struct ModelRoute {
 pub struct SessionCapabilities {
     pub multiplayer: bool,
     pub subagents: bool,
-    /// Require a director's follow-up before resuming a goal it interrupted.
-    /// Human stops, approval gates, and budget limits remain enforced.
-    #[serde(default)]
-    pub subagent_resume_guard: bool,
     pub autonomous_team: bool,
     pub shared_work: bool,
     pub presence: bool,
@@ -1125,7 +1121,6 @@ impl Default for SessionCapabilities {
         Self {
             multiplayer: true,
             subagents: true,
-            subagent_resume_guard: false,
             autonomous_team: true,
             shared_work: true,
             presence: true,
@@ -1506,7 +1501,7 @@ pub enum HostCommand {
         text: String,
     },
     /// End the active turn at once and start the queued human prompts. Unlike
-    /// `Interrupt`, this neither latches a user stop nor pauses the goal.
+    /// `Interrupt`, this does not pause the goal.
     FlushPendingInput {
         session_id: Uuid,
     },
@@ -1580,13 +1575,6 @@ pub enum HostCommand {
     ReleaseRetainedContext {
         session_id: Uuid,
     },
-    /// The agent that interrupted this child is giving it new work, which
-    /// releases the stop latch that interrupt engaged. Host-local: only the
-    /// team coordinator sends it, immediately ahead of that follow-up. A stop
-    /// the human made is not released this way.
-    ResumeFromInterrupt {
-        session_id: Uuid,
-    },
     Stop {
         session_id: Uuid,
     },
@@ -1636,7 +1624,6 @@ impl HostCommand {
             | Self::Compact { session_id }
             | Self::ClearContext { session_id }
             | Self::ReleaseRetainedContext { session_id }
-            | Self::ResumeFromInterrupt { session_id }
             | Self::Stop { session_id } => Some(*session_id),
             Self::WorkspaceFilesystem { .. }
             | Self::CancelWorkspaceFilesystem { .. }
@@ -2789,13 +2776,7 @@ pub enum SessionEventKind {
         sender_name: String,
         text: String,
     },
-    /// Durable record of the explicit user-stop gate toggling. Engaged by a
-    /// human Escape (turn boundary, active turn, or idle reconnect wait);
-    /// cleared only by an explicit human prompt or an explicit goal resume.
-    /// While engaged, no background input (team Steer/Queue prompts, queued
-    /// internal prompts, watch events, autonomy jobs, automatic retries)
-    /// may open a provider turn. Survives session-actor reload so the
-    /// NEVER-override-Escape contract holds across restarts.
+    /// Legacy journal compatibility only; ignored during replay.
     UserStopChanged {
         engaged: bool,
     },

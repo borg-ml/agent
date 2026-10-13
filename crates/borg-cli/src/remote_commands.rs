@@ -424,14 +424,6 @@ fn spawn_revert_fork(
     let fork_id = Uuid::new_v4();
     tokio::spawn(async move {
         store.fork_before(session_id, fork_id, sequence).await?;
-        // Reverting opens an editable draft, not permission to resume inherited work.
-        store
-            .append(SessionEvent::new(
-                fork_id,
-                0,
-                SessionEventKind::UserStopChanged { engaged: true },
-            ))
-            .await?;
         Ok(fork_id)
     })
 }
@@ -11064,7 +11056,6 @@ fn remote_command_name(command: &HostCommand) -> &'static str {
         HostCommand::Compact { .. } => "compact",
         HostCommand::ClearContext { .. } => "clear context",
         HostCommand::ReleaseRetainedContext { .. } => "release retained context",
-        HostCommand::ResumeFromInterrupt { .. } => "resume from interrupt",
         HostCommand::Stop { .. } => "stop",
         HostCommand::WorkspaceFilesystem { .. } => "workspace filesystem",
         HostCommand::CancelWorkspaceFilesystem { .. } => "cancel workspace filesystem",

@@ -2526,16 +2526,6 @@ async fn run_agent_session_store_kernel_inner(
     let mut work_plan_refresh = WorkPlanRefresh::default();
     let mut work_plan_tick = tokio::time::interval(Duration::from_secs(2));
     work_plan_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Explicit user-stop gate. A human Escape engages it; only an explicit
-    // human prompt or goal resume clears it. While engaged, no background
-    // input (team Steer/Queue prompts, queued internal prompts, watch
-    // events, autonomy jobs, automatic retries) may open a provider turn.
-    // Re-engaged from durable state so a reload never overrides the stop.
-    let mut user_stop = state.user_stopped;
-    // Ids of the User prompts that were already queued at the instant Escape
-    // was received. They still run, but they do not clear the latch; only
-    // input that arrives afterward counts as the human re-engaging.
-    let mut stale_user_prompts: HashSet<Uuid> = HashSet::new();
     let mut goal_active_since = goal
         .as_ref()
         .is_some_and(|goal| goal.status.is_active())
@@ -2567,9 +2557,7 @@ async fn run_agent_session_store_kernel_inner(
         )
         .await?;
     }
-    if user_stop {
-        snapshot_stale_user_prompts(&mut stale_user_prompts, &pending);
-    }
+
     let mut deferred_commands = VecDeque::new();
     let mut team_message_ids = HashSet::new();
     // A provider can acknowledge a turn and then terminate without producing
@@ -2865,13 +2853,12 @@ async fn run_agent_session_store_kernel_inner(
                 Err(oneshot::error::TryRecvError::Empty) => {}
             }
         }
-        if user_stop || watches.yielded().is_some() {
+        if watches.yielded().is_some() {
             settle_non_waking_team_notifications(
                 &mut journal,
                 &events,
                 session_id,
                 &mut pending,
-                user_stop,
                 usage_limit_continuation_id,
             )
             .await?;
@@ -2885,7 +2872,6 @@ async fn run_agent_session_store_kernel_inner(
                 &mut commands,
                 &mut deferred_commands,
                 &mut team_message_ids,
-                &mut stale_user_prompts,
             )
             .await?;
             if interrupted_at_boundary {
@@ -2911,7 +2897,7 @@ async fn run_agent_session_store_kernel_inner(
                     &mut goal_active_since,
                 )
                 .await?;
-                set_user_stop(&mut journal, &events, session_id, &mut user_stop, true).await?;
+
                 if usage_limit_continuation_id.is_some() {
                     drop_usage_limit_continuation(&mut pending, &mut usage_limit_continuation_id);
                     next_ready_detail.get_or_insert_with(|| {
@@ -2926,18 +2912,12 @@ async fn run_agent_session_store_kernel_inner(
             // only after an explicit interrupt, so one provider turn sees all
             // queued input that was submitted together.
             coalesce_queued_prompts(&mut pending);
-            // `collect_input_at_turn_boundary` can queue a team notification
-            // into `pending` after this iteration's top-of-loop settle pass
-            // already ran. Settle again so a report held during a stop is
-            // committed to the transcript before the human prompt selected
-            // below clears the gate.
-            if user_stop || watches.yielded().is_some() {
+            if watches.yielded().is_some() {
                 settle_non_waking_team_notifications(
                     &mut journal,
                     &events,
                     session_id,
                     &mut pending,
-                    user_stop,
                     usage_limit_continuation_id,
                 )
                 .await?;
@@ -2950,7 +2930,7 @@ async fn run_agent_session_store_kernel_inner(
         // pausing the goal drops it, and so does the last named watcher dying:
         // a stopped or silent watcher never sends another event, so waiting on
         // one would strand the session.
-        let ended_wait = if user_stop || !goal_is_active {
+        let ended_wait = if !goal_is_active {
             watches.resume().map(|wait| ("goal_inactive", wait))
         } else {
             watches
@@ -3017,18 +2997,13 @@ async fn run_agent_session_store_kernel_inner(
             continue;
         }
         let next = if !usage_limit_retry_waiting
-            && let Some(prompt) = pop_next_pending_prompt(
-                &mut pending,
-                goal_is_active
-                    || !user_stop
-                    || network_retry_message_id.is_some()
-                    || usage_limit_continuation_id.is_some(),
-            ) {
+            && let Some(prompt) = pop_next_pending_prompt(&mut pending, true)
+        {
             Some(prompt)
         } else if !usage_limit_retry_waiting && let Ok(text) = watch_events_rx.try_recv() {
             Some(watch_prompt(text, &mut watch_events_rx))
         } else if !usage_limit_retry_waiting
-            && !user_stop
+
             // A host command is already waiting. Automatic goal work is the
             // lowest-priority reason to open a turn, and it is the only one
             // that regenerates itself, so letting it win here is not a delay
@@ -3128,9 +3103,8 @@ async fn run_agent_session_store_kernel_inner(
                                     }
                                     _ = usage_limit_wait, if retry_not_before.is_some() => {
                                         retry_not_before = None;
-                                        let goal_is_active = goal.as_ref().is_some_and(|goal| goal.status == GoalStatus::Active);
-                                        break pop_next_pending_prompt(&mut pending, goal_is_active || !user_stop || network_retry_message_id.is_some() || usage_limit_continuation_id.is_some()).or_else(|| {
-                                            (!user_stop && watches.yielded().is_none()).then_some(()).and_then(|()| goal.as_ref()
+                                        break pop_next_pending_prompt(&mut pending, true).or_else(|| {
+                                            (watches.yielded().is_none()).then_some(()).and_then(|()| goal.as_ref()
                                                 .filter(|goal| goal_allows_automatic_continuation(goal)))
                                                 .map(|active_goal| QueuedPrompt {
                                                     message_id: Uuid::new_v4(),
@@ -3265,13 +3239,7 @@ async fn run_agent_session_store_kernel_inner(
                                         let Some(dispatch) = autonomy else {
                                             continue;
                                         };
-                                        if user_stop {
-                                            // Blu workflows never reach the admission funnel.
-                                            let _ = dispatch.result.send(Err(anyhow::anyhow!(
-                                                "session stopped by the user; autonomy job was not run"
-                                            )));
-                                            continue;
-                                        }
+
                                         if dispatch.job.kind == "blu_workflow" {
                                             let request = match autonomy_blu_workflow(&dispatch.job, session_id) {
                                                 Ok(request) => request,
@@ -3478,10 +3446,9 @@ async fn run_agent_session_store_kernel_inner(
                                 .is_some_and(|team| team.take_awaiting_reply(session_id));
                         if actor == EventActor::System
                             && !is_autonomy
-                            && (user_stop
-                                || (delivery == PromptDelivery::Queue
-                                    && !answers_followup
-                                    && watches.yielded().is_some()))
+                            && (delivery == PromptDelivery::Queue
+                                && !answers_followup
+                                && watches.yielded().is_some())
                         {
                             settle_team_notification(
                                 &mut journal,
@@ -3582,9 +3549,7 @@ async fn run_agent_session_store_kernel_inner(
                             &mut goal_active_since,
                         )
                         .await?;
-                        snapshot_stale_user_prompts(&mut stale_user_prompts, &pending);
-                        set_user_stop(&mut journal, &events, session_id, &mut user_stop, true)
-                            .await?;
+
                         if let Some(interrupt) = &commands.interrupt {
                             interrupt.settle();
                             commands.interrupt_delivered = false;
@@ -3809,27 +3774,12 @@ async fn run_agent_session_store_kernel_inner(
                             ..
                         }),
                     ) if command_session_id == session_id => {
-                        let (action, from_agent) = match command {
-                            HostCommand::Goal { action, .. } => (action, false),
-                            HostCommand::AgentGoal { action, .. } => (action, true),
+                        let action = match command {
+                            HostCommand::Goal { action, .. } => action,
+                            HostCommand::AgentGoal { action, .. } => action,
                             _ => unreachable!(),
                         };
-                        if from_agent
-                            && user_stop
-                            && matches!(action, GoalAction::Set { .. } | GoalAction::Resume)
-                        {
-                            record(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                SessionEventKind::Error {
-                                    message: "Agent goal change rejected: explicit human stop"
-                                        .into(),
-                                },
-                            )
-                            .await?;
-                            continue;
-                        }
+
                         let explicit_resume =
                             matches!(action, GoalAction::Set { .. } | GoalAction::Resume);
                         let resume_pending_retry =
@@ -3863,9 +3813,7 @@ async fn run_agent_session_store_kernel_inner(
                                 usage_wait_prompts = None;
                             }
                             // Explicit human resume or new objective.
-                            set_user_stop(&mut journal, &events, session_id, &mut user_stop, false)
-                                .await?;
-                            stale_user_prompts.clear();
+
                             record(
                                 &mut journal,
                                 &events,
@@ -4389,16 +4337,6 @@ async fn run_agent_session_store_kernel_inner(
                         journal.retain_latest_turn_checkpoint();
                         retained_context = None;
                     }
-                    Some(HostCommand::ResumeFromInterrupt {
-                        session_id: command_session_id,
-                    }) if command_session_id == session_id => {
-                        // The interrupting parent's follow-up is next in this
-                        // queue; without this it would be settled as a
-                        // background notification behind the stop latch.
-                        set_user_stop(&mut journal, &events, session_id, &mut user_stop, false)
-                            .await?;
-                        stale_user_prompts.clear();
-                    }
                     Some(HostCommand::Stop {
                         session_id: command_session_id,
                     }) if command_session_id == session_id => {
@@ -4454,9 +4392,7 @@ async fn run_agent_session_store_kernel_inner(
                             )
                             .await?;
                         }
-                        snapshot_stale_user_prompts(&mut stale_user_prompts, &pending);
-                        set_user_stop(&mut journal, &events, session_id, &mut user_stop, true)
-                            .await?;
+
                         record(
                             &mut journal,
                             &events,
@@ -4542,22 +4478,7 @@ async fn run_agent_session_store_kernel_inner(
         }) {
             network_retry_message_id = Some(prompt.message_id);
         }
-        // Single chokepoint for the user-stop gate: every background admission
-        // path funnels through here, so after a human Escape nothing but an
-        // explicit human prompt reaches provider admission.
-        if user_stop && prompt.actor != EventActor::User {
-            hold_background_prompt_during_user_stop(
-                &mut journal,
-                &events,
-                session_id,
-                prompt,
-                &mut autonomy_prompt_ids,
-                &mut autonomy_completions,
-            )
-            .await?;
-            retry_not_before = None;
-            continue;
-        }
+
         // Steering only has meaning while a provider turn is active. Input
         // selected here starts a new turn, even when the frontend submitted
         // it through its immediate-send path. Persist it as queued before
@@ -4565,21 +4486,15 @@ async fn run_agent_session_store_kernel_inner(
         // an already-consumed active-turn steer.
         if prompt.actor == EventActor::User {
             prompt.delivery = PromptDelivery::Queue;
-            // A human prompt that arrived after the stop clears the gate; one
-            // already queued when the stop engaged runs without clearing it.
-            if !stale_user_prompts.remove(&prompt.message_id) {
-                resume_interrupted_goal_on_human_input(
-                    &mut journal,
-                    &events,
-                    session_id,
-                    &mut goal,
-                    &mut goal_active_since,
-                    &mut user_stop,
-                    launch.capabilities.resume_paused_goal_on_message,
-                )
-                .await?;
-                stale_user_prompts.clear();
-            }
+            resume_interrupted_goal_on_human_input(
+                &mut journal,
+                &events,
+                session_id,
+                &mut goal,
+                &mut goal_active_since,
+                launch.capabilities.resume_paused_goal_on_message,
+            )
+            .await?;
         }
         let autonomy_job_id = autonomy_prompt_ids
             .remove(&prompt.message_id)
@@ -6103,7 +6018,7 @@ async fn run_agent_session_store_kernel_inner(
                             !steer.admission.is_accepted()
                                 && matches!(steer.state, PendingSteerState::RetryAtBoundary { .. })
                         });
-                        if held && !earlier_in_flight && !context_compaction_in_progress && !user_stop && !interrupted {
+                        if held && !earlier_in_flight && !context_compaction_in_progress && !interrupted {
                             retry_pending_steers(
                                 &control_tx,
                                 &steer_result_tx,
@@ -6132,7 +6047,7 @@ async fn run_agent_session_store_kernel_inner(
                             }
                             let boundary_already_passed = pending_steers[index].attempt_boundary
                                 < steer_boundary_generation;
-                            if boundary_already_passed && !context_compaction_in_progress && !user_stop && !interrupted {
+                            if boundary_already_passed && !context_compaction_in_progress && !interrupted {
                                 retry_pending_steers(
                                     &control_tx,
                                     &steer_result_tx,
@@ -6348,43 +6263,7 @@ async fn run_agent_session_store_kernel_inner(
                                 } else {
                                     EventActor::User
                                 };
-                                if user_stop {
-                                    if actor == EventActor::System {
-                                        // A background wake cannot steer a stopped
-                                        // session's turn; keep it visible only.
-                                        let settled = QueuedPrompt {
-                                            message_id,
-                                            text,
-                                            actor,
-                                            attachments,
-                                            output_schema,
-                                            delivery: PromptDelivery::Steer,
-                                            visible: true,
-                                            interrupt_batch: false,
-                                            batch: Vec::new(),
-                                        };
-                                        if settled.visible {
-                                            statuses.extend(settled.batch_entries().into_iter().map(
-                                                |entry| {
-                                                    (
-                                                        entry,
-                                                        MessageStatus::Complete,
-                                                        settled.delivery,
-                                                    )
-                                                },
-                                            ));
-                                        }
-                                        continue;
-                                    }
-                                    // New human input on the active path is the
-                                    // resume authority: clear the durable latch.
-                                    resume_interrupted_goal_on_human_input(
-                                        &mut journal, &events, session_id, &mut goal,
-                                        &mut goal_active_since, &mut user_stop,
-                                        launch.capabilities.resume_paused_goal_on_message,
-                                    ).await?;
-                                    stale_user_prompts.clear();
-                                }
+
                                 let prompt = QueuedPrompt {
                                     message_id,
                                     text,
@@ -6416,7 +6295,7 @@ async fn run_agent_session_store_kernel_inner(
                             record_prompt_statuses(&mut journal, &events, session_id, statuses)
                                 .await?;
                             let handing_over = !context_compaction_in_progress
-                                && !user_stop
+
                                 && !interrupted;
                             for (index, (prompt, admission, acknowledgement_id, will_send)) in
                                 admitted.into_iter().enumerate()
@@ -6488,34 +6367,7 @@ async fn run_agent_session_store_kernel_inner(
                             } else {
                                 EventActor::User
                             };
-                            if user_stop {
-                                if actor == EventActor::System {
-                                    settle_team_notification(
-                                        &mut journal,
-                                        &events,
-                                        session_id,
-                                        QueuedPrompt {
-                                            message_id,
-                                            text,
-                                            actor,
-                                            attachments,
-                                            output_schema,
-                                            delivery: PromptDelivery::Queue,
-                                            visible: true,
-                                            interrupt_batch: false,
-                                            batch: Vec::new(),
-                                        },
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                resume_interrupted_goal_on_human_input(
-                                    &mut journal, &events, session_id, &mut goal,
-                                    &mut goal_active_since, &mut user_stop,
-                                    launch.capabilities.resume_paused_goal_on_message,
-                                ).await?;
-                                stale_user_prompts.clear();
-                            }
+
                             if admission_state == PromptAdmissionState::New {
                                 record(
                                     &mut journal,
@@ -6573,8 +6425,6 @@ async fn run_agent_session_store_kernel_inner(
                             if !pending.iter().any(|queued| queued.actor == EventActor::User) {
                                 continue;
                             }
-                            // Explicit flush ends the old turn immediately and admits pending input,
-                            // without latching user-stop or pausing the goal.
                             let cooperative = if control_tx.try_send(AgentTurnControl::Interrupt).is_ok() {
                                 tokio::time::timeout(Duration::from_millis(10), &mut running.0).await.ok()
                             } else {
@@ -6715,23 +6565,13 @@ async fn run_agent_session_store_kernel_inner(
                                 .await
                                 .ok();
                         }
-                        HostCommand::ResumeFromInterrupt { session_id: command_session_id }
-                            if command_session_id == session_id => {
-                            set_user_stop(&mut journal, &events, session_id, &mut user_stop, false).await?;
-                            stale_user_prompts.clear();
-                        }
                         command @ (HostCommand::Goal { .. } | HostCommand::AgentGoal { .. }) => {
-                            let (action, from_agent) = match command {
-                                HostCommand::Goal { action, .. } => (action, false),
-                                HostCommand::AgentGoal { action, .. } => (action, true),
+                            let action = match command {
+                                HostCommand::Goal { action, .. } => action,
+                                HostCommand::AgentGoal { action, .. } => action,
                                 _ => unreachable!(),
                             };
-                            if from_agent && user_stop && matches!(action, GoalAction::Set { .. } | GoalAction::Resume) {
-                                record(&mut journal, &events, session_id, SessionEventKind::Error {
-                                    message: "Agent goal change rejected: explicit human stop".into(),
-                                }).await?;
-                                continue;
-                            }
+
                             let objective_changed = matches!(action, GoalAction::Set { .. });
                             apply_goal_action(
                                 &mut journal,
@@ -6746,24 +6586,9 @@ async fn run_agent_session_store_kernel_inner(
                                 .as_ref()
                                 .filter(|goal| goal.status == GoalStatus::Active)
                             {
-                                // A human resume or a new objective that lands
-                                // while a turn is already running must release
-                                // the stop latch exactly as the idle handler
-                                // does. Otherwise the goal reads `active` while
-                                // the latch still parks every automatic
-                                // continuation at the next boundary, and the
-                                // session stops with an apparently active goal.
                                 let steer = objective_changed
                                     .then(|| objective_updated_prompt(active_goal));
-                                set_user_stop(
-                                    &mut journal,
-                                    &events,
-                                    session_id,
-                                    &mut user_stop,
-                                    false,
-                                )
-                                .await?;
-                                stale_user_prompts.clear();
+
                                 if let Some(text) = steer
                                     && provider_supports_active_turn_control(
                                         launch.provider,
@@ -6825,10 +6650,6 @@ async fn run_agent_session_store_kernel_inner(
                                 commands.interrupt_delivered = false;
                             }
                             tracing::info!(%session_id, "session interrupt received (active turn)");
-                            snapshot_stale_user_prompts(&mut stale_user_prompts, &pending);
-                            stale_user_prompts.extend(
-                                pending_steers.iter().map(|steer| steer.prompt.message_id),
-                            );
                             retry_not_before = None;
                             // Let a responsive turn flush its tail and continuation within
                             // one frame, never behind journal I/O or a full control queue.
@@ -6855,12 +6676,8 @@ async fn run_agent_session_store_kernel_inner(
                                         &mut journal, &events, session_id, &mut goal,
                                         &mut goal_active_since,
                                     ).await?;
-                                    // The latch and the phase it puts the turn in
-                                    // are one step: one transaction, so the
-                                    // settlement the person is waiting on costs
-                                    // one commit rather than two.
                                     let mut terminal = Vec::new();
-                                    terminal.extend(stage_user_stop(&mut user_stop, true));
+
                                     terminal.push(SessionEventKind::StatusChanged {
                                         status: SessionStatus::Running,
                                         detail: Some(TurnPhase::Cancelling.detail().to_string()),
@@ -7001,7 +6818,6 @@ async fn run_agent_session_store_kernel_inner(
                             return Ok(());
                         }
                         HostCommand::ReleaseRetainedContext { .. }
-                        | HostCommand::ResumeFromInterrupt { .. }
                         | HostCommand::Launch { .. }
                         | HostCommand::Approve { .. }
                         | HostCommand::RespondToProviderInteraction { .. }
@@ -7168,8 +6984,7 @@ async fn run_agent_session_store_kernel_inner(
                         session_id,
                         &mut goal,
                         &mut goal_active_since,
-                        !user_stop
-                            && retry_not_before.is_none()
+                        retry_not_before.is_none()
                             && usage_wait_prompts.is_none()
                             && usage_limit_continuation_id.is_none(),
                         request.request,
@@ -7408,7 +7223,7 @@ async fn run_agent_session_store_kernel_inner(
                         session_id,
                     )
                     .await?;
-                    if retry_steers && !context_compaction_in_progress && !user_stop && !interrupted {
+                    if retry_steers && !context_compaction_in_progress && !interrupted {
                         steer_boundary_generation = steer_boundary_generation.saturating_add(1);
                         retry_pending_steers(
                             &control_tx,
@@ -11006,8 +10821,6 @@ fn coalesce_pending_team_notifications(
         visible |= prompt.visible;
         batch.extend(prompt.batch_entries());
     }
-    // The merged prompt stays in the class it came from: still System, still
-    // Queue, so it cannot inherit human priority or pass the user-stop gate.
     combined.text = text;
     combined.attachments = attachments;
     combined.batch = batch;
@@ -11123,21 +10936,11 @@ async fn settle_team_notification(
     Ok(())
 }
 
-/// A root stopped with Escape, or explicitly yielded to watchers, must not
-/// spend provider turns replying to queued internal reports. Otherwise a
-/// report wakes the root whether or not its goal is active, so a paused goal
-/// still merges and re-evaluates the work its agents deliver. A settled report
-/// remains present in the durable transcript/subagent projection and becomes
-/// context for later turns, but it cannot seize the boundary from a human or
-/// make Escape advance to another invisible system turn. While the user-stop
-/// gate is engaged this also settles `Steer`-delivery reports that would
-/// otherwise be retained for a root turn.
 async fn settle_non_waking_team_notifications(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
     pending: &mut VecDeque<QueuedPrompt>,
-    user_stop: bool,
     usage_limit_continuation_id: Option<Uuid>,
 ) -> Result<()> {
     let mut retained = VecDeque::with_capacity(pending.len());
@@ -11147,7 +10950,7 @@ async fn settle_non_waking_team_notifications(
         // notification; it must survive until its turn starts.
         if prompt.actor == EventActor::System
             && Some(prompt.message_id) != usage_limit_continuation_id
-            && (user_stop || prompt.delivery == PromptDelivery::Queue)
+            && prompt.delivery == PromptDelivery::Queue
         {
             if prompt.visible {
                 for entry in prompt.batch_entries() {
@@ -11442,7 +11245,6 @@ async fn collect_input_at_turn_boundary(
     commands: &mut HostCommandInbox,
     deferred: &mut VecDeque<HostCommand>,
     team_message_ids: &mut HashSet<Uuid>,
-    stale_user_prompts: &mut HashSet<Uuid>,
 ) -> Result<bool> {
     // Let input already emitted by the TUI reach the actor before promoting a
     // queued prompt into a turn. Prompt, Up, and Escape must stay ordered at
@@ -11583,10 +11385,6 @@ async fn collect_input_at_turn_boundary(
             } if command_session_id == session_id => {
                 tracing::info!(%session_id, "session interrupt received (pending commands)");
                 interrupted = true;
-                // Snapshot at the exact point Escape is seen: prompts drained
-                // from `ready` after this are post-Escape input and must stay
-                // able to clear the latch.
-                snapshot_stale_user_prompts(stale_user_prompts, pending);
             }
             command => {
                 deferred.push_back(command);
@@ -13275,7 +13073,7 @@ async fn apply_model_goal_request(
             ModelGoalStatus::Active => {
                 anyhow::ensure!(
                     resume_allowed,
-                    "cannot reactivate a goal during an explicit user stop or pending retry/usage wait"
+                    "cannot reactivate a goal during a pending retry/usage wait"
                 );
                 let current = require_goal(goal)?;
                 anyhow::ensure!(
@@ -13479,10 +13277,6 @@ async fn record_subagent_activity(
     {
         return Ok(());
     }
-    // Surface a completed child report as a standalone `AgentMessageReceived`
-    // projection before the child lookup, so agent-to-root messages stay
-    // visible even from an unknown sender and regardless of the user-stop
-    // gate. It is not a consumed prompt and never admits a provider turn.
     if let SubagentActivity::SessionEvent {
         task_name,
         event:
@@ -13879,23 +13673,17 @@ async fn pause_active_goal(
     Ok(())
 }
 
-/// Fresh human input releases an Escape stop so the session answers again,
-/// and with `resume_paused_goal_on_message` also picks a goal back up: new
-/// direction is what a blocked goal waits for. That resume is off by default,
-/// so a message never silently restarts goal work and `/goal resume` stays the
-/// explicit way back. A standalone /goal pause always stays paused.
 async fn resume_interrupted_goal_on_human_input(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
     goal: &mut Option<SessionGoal>,
     active_since: &mut Option<Instant>,
-    user_stop: &mut bool,
     resume_goal: bool,
 ) -> Result<()> {
     if resume_goal
         && goal.as_ref().is_some_and(|goal| {
-            goal.status == GoalStatus::Blocked || (*user_stop && goal.status == GoalStatus::Paused)
+            goal.status == GoalStatus::Blocked || goal.status == GoalStatus::Paused
         })
     {
         apply_goal_action(
@@ -13907,75 +13695,6 @@ async fn resume_interrupted_goal_on_human_input(
             GoalAction::Resume,
         )
         .await?;
-    }
-    set_user_stop(journal, events, session_id, user_stop, false).await
-}
-
-/// Toggle the explicit user-stop gate and persist the transition. Engaged by a
-/// human Escape; cleared only by an explicit human prompt or goal resume. A
-/// no-op when the gate is already in the requested state.
-async fn set_user_stop(
-    journal: &mut RuntimeSessionStore,
-    events: &mpsc::Sender<SessionEvent>,
-    session_id: Uuid,
-    user_stop: &mut bool,
-    engaged: bool,
-) -> Result<()> {
-    if let Some(kind) = stage_user_stop(user_stop, engaged) {
-        record(journal, events, session_id, kind).await?;
-    }
-    Ok(())
-}
-
-/// Engage or release the stop latch and hand back the event that records it,
-/// without writing. Callers settling several events as one step put it in the
-/// same transaction instead; see `record_all`.
-fn stage_user_stop(user_stop: &mut bool, engaged: bool) -> Option<SessionEventKind> {
-    if *user_stop == engaged {
-        return None;
-    }
-    *user_stop = engaged;
-    Some(SessionEventKind::UserStopChanged { engaged })
-}
-
-/// Record which User prompts were already queued at the instant Escape was
-/// received. Called at every Escape-receipt site, never later, so input that
-/// arrives after the Escape is not misclassified as pre-stop. Active-turn
-/// callers also fold in the ids of still-uncommitted steers, which belong to
-/// the very turn being stopped.
-fn snapshot_stale_user_prompts(stale: &mut HashSet<Uuid>, pending: &VecDeque<QueuedPrompt>) {
-    stale.clear();
-    stale.extend(
-        pending
-            .iter()
-            .filter(|prompt| prompt.actor == EventActor::User)
-            .map(|prompt| prompt.message_id),
-    );
-}
-
-/// Dispose of a background prompt that tried to open a provider turn while the
-/// user-stop gate is engaged. Visible system notifications are still recorded
-/// so they remain in the transcript and become context for the next
-/// human-initiated turn; autonomy jobs are failed back to their caller;
-/// invisible internal prompts are dropped.
-async fn hold_background_prompt_during_user_stop(
-    journal: &mut RuntimeSessionStore,
-    events: &mpsc::Sender<SessionEvent>,
-    session_id: Uuid,
-    prompt: QueuedPrompt,
-    autonomy_prompt_ids: &mut HashSet<Uuid>,
-    autonomy_completions: &mut HashMap<Uuid, oneshot::Sender<Result<Value>>>,
-) -> Result<()> {
-    if autonomy_prompt_ids.remove(&prompt.message_id) {
-        if let Some(result) = autonomy_completions.remove(&prompt.message_id) {
-            let _ = result.send(Err(anyhow::anyhow!(
-                "session stopped by the user; autonomy job was not run"
-            )));
-        }
-        return Ok(());
-    }
-    if prompt.visible && prompt.actor == EventActor::System {
-        settle_team_notification(journal, events, session_id, prompt).await?;
     }
     Ok(())
 }

@@ -50,8 +50,8 @@ The small source regression contract guards absent metadata with no lease, a
 held exact child lease, malformed/dangling metadata despite that lease, and
 lease release.
 A compiler cannot protect this process-ownership boundary. It was added but NOT
-RUN under the source-only restriction. The explicit human-stop admission gate in
-`session.rs` is unchanged; background messages cannot bypass it.
+RUN under the source-only restriction. That historical validation predates removal of the persistent stop latch.
+Stop now cancels the current turn without gating future background wakes.
 
 Static diff/ownership inspection only. The original Rust LSP was configured
 explicitly with Cargo build scripts, proc macros and check-on-save disabled. The first pull

@@ -67,7 +67,7 @@ pub(crate) async fn run(files: Vec<PathBuf>, session: Option<Uuid>) -> Result<()
         }).await?;
         println!(
             "{}",
-            json!({"message_id": message_id, "session_id": session_id, "images": count, "status": "admitted", "note": "Recipient pixel inspection is not yet verified; explicit user stop remains authoritative."})
+            json!({"message_id": message_id, "session_id": session_id, "images": count, "status": "admitted", "note": "Recipient pixel inspection is not yet verified."})
         );
     } else {
         let expected = attachments.len() as u64;

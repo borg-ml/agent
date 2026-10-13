@@ -4771,7 +4771,6 @@ fn authorize_workspace_command(
             | HostCommand::RecoverPendingInput { .. }
             | HostCommand::Broadcast { .. }
             | HostCommand::BroadcastInstances { .. }
-            | HostCommand::ResumeFromInterrupt { .. }
     ) {
         bail!("host-local commands cannot be remotely authorized");
     }
@@ -4783,8 +4782,7 @@ fn authorize_workspace_command(
         HostCommand::TeamPrompt { .. }
         | HostCommand::RecoverPendingInput { .. }
         | HostCommand::Broadcast { .. }
-        | HostCommand::BroadcastInstances { .. }
-        | HostCommand::ResumeFromInterrupt { .. } => {
+        | HostCommand::BroadcastInstances { .. } => {
             unreachable!("rejected above")
         }
         HostCommand::RecallQueuedPrompt { .. } => crate::ParticipantCommandKind::RecallQueuedPrompt,

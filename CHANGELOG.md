@@ -129,8 +129,7 @@ Git comparison.
 ### Subagents
 
 - Let directors resume their own recorded interruptions directly by default.
-  Set `[capabilities] subagent_resume_guard = true` to require the stricter
-  follow-up handshake. Actual human stops, approvals, and budgets stay protected.
+  Approvals and budgets stay protected; Stop cancels the current turn.
 - Honor authorized resume while an interrupted turn is still winding down.
 
 ### Edits

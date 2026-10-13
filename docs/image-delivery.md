@@ -21,7 +21,7 @@ borg image /absolute/path/capture.png --session SESSION_UUID
 ```
 
 Use the actual session UUID, not a project name. The host-local team prompt
-preserves explicit user-stop behavior. Its receipt says `admitted`: the recipient
+uses normal cancellation and goal-state semantics. Its receipt says `admitted`: the recipient
 must still confirm actual pixel visibility before claiming visual acceptance.
 This does not change provider, credentials, or billing. The selected provider
 must support images.
