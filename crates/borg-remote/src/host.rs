@@ -1,3 +1,5 @@
+#[path = "host_transport.rs"]
+mod host_transport;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
@@ -768,166 +770,10 @@ async fn upload_event_page(
     uploaded_sequence: &mut u64,
     timeout: Duration,
 ) -> Result<EventUploadOutcome> {
-    let compact_events = events
-        .iter()
-        .map(compact_event_payloads_for_upload)
-        .collect::<Result<Vec<_>>>()?;
-    let remote_events = compact_events
-        .iter()
-        .map(prepare_event_upload)
-        .collect::<Vec<_>>();
-    let mut ranges = event_upload_ranges(&remote_events)?;
-    while let Some(range) = ranges.pop_front() {
-        let batch = &remote_events[range.clone()];
-        let runtime_batch = relay_event_batch_payload(batch)?;
-        if !upload_event_payloads(client, config, store, &compact_events[range.clone()], batch)
-            .await?
-        {
-            return Ok(EventUploadOutcome::Retryable);
-        }
-        let response = client
-            .post(endpoint(&config.server, "/api/remote/host/events"))
-            .bearer_auth(&config.host_token)
-            .timeout(timeout)
-            .query(&[("protocol", "1")])
-            .json(&runtime_batch)
-            .send()
-            .await;
-        match response {
-            Ok(response) if response.status().is_success() => {
-                if let Some(last) = batch.last() {
-                    *uploaded_sequence = last.sequence;
-                }
-            }
-            Ok(response)
-                if response.status() == StatusCode::PAYLOAD_TOO_LARGE && batch.len() > 1 =>
-            {
-                let middle = range.start + range.len() / 2;
-                tracing::warn!(
-                    session_id = %batch[0].session_id,
-                    first_sequence = batch[0].sequence,
-                    last_sequence = batch[batch.len() - 1].sequence,
-                    events = batch.len(),
-                    "remote event batch was too large; splitting in order"
-                );
-                ranges.push_front(middle..range.end);
-                ranges.push_front(range.start..middle);
-            }
-            Ok(response) if response.status() == StatusCode::PAYLOAD_TOO_LARGE => {
-                let event_bytes = serde_json::to_vec(&runtime_batch)?.len();
-                let event_kind = serde_json::to_value(&batch[0].kind)?
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string();
-                tracing::error!(
-                    session_id = %batch[0].session_id,
-                    sequence = batch[0].sequence,
-                    %event_kind,
-                    event_bytes,
-                    "remote relay rejected irreducible session event; durable event was not skipped and sync is blocked"
-                );
-                return Ok(EventUploadOutcome::Blocked {
-                    session_id: batch[0].session_id,
-                    sequence: batch[0].sequence,
-                    event_kind,
-                    event_bytes,
-                });
-            }
-            Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                return Err(response.error_for_status().unwrap_err())
-                    .context("remote host token was rejected; enroll this host again");
-            }
-            Ok(response) if response.status() == StatusCode::CONFLICT => {
-                let error = response.error_for_status_ref().unwrap_err();
-                let detail = response.text().await.unwrap_or_default();
-                return Err(error).with_context(|| format!(
-                    "remote event replay conflicted with the durable journal for session {}: {detail}",
-                    batch[0].session_id
-                ));
-            }
-            Ok(response)
-                if response.status().is_client_error()
-                    && response.status() != StatusCode::REQUEST_TIMEOUT
-                    && response.status() != StatusCode::TOO_MANY_REQUESTS =>
-            {
-                let status = response.status();
-                let detail = response
-                    .text()
-                    .await
-                    .unwrap_or_default()
-                    .chars()
-                    .take(512)
-                    .collect::<String>();
-                let event_kind = serde_json::to_value(&batch[0].kind)?
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string();
-                if is_unstoreable_rejection(&detail) {
-                    tracing::warn!(
-                        %status,
-                        %detail,
-                        session_id = %batch[0].session_id,
-                        sequence = batch[0].sequence,
-                        %event_kind,
-                        "remote relay cannot store this event shape; replaying past it so \
-                         the rest of the journal stays reachable"
-                    );
-                    // Past this one event only, so a neighbour in the same batch
-                    // is still offered rather than dropped with it.
-                    *uploaded_sequence = batch[0].sequence;
-                    return Ok(EventUploadOutcome::Skipped {
-                        sequence: batch[0].sequence,
-                    });
-                }
-                tracing::error!(
-                    %status,
-                    %detail,
-                    session_id = %batch[0].session_id,
-                    sequence = batch[0].sequence,
-                    %event_kind,
-                    "remote relay permanently rejected a journal event; pausing replay"
-                );
-                return Ok(EventUploadOutcome::Blocked {
-                    session_id: batch[0].session_id,
-                    sequence: batch[0].sequence,
-                    event_kind,
-                    event_bytes: serde_json::to_vec(&batch[0])?.len(),
-                });
-            }
-            Ok(response) => {
-                let status = response.status();
-                let detail = response
-                    .text()
-                    .await
-                    .unwrap_or_default()
-                    .chars()
-                    .take(512)
-                    .collect::<String>();
-                tracing::warn!(
-                    %status,
-                    %detail,
-                    session_id = %batch[0].session_id,
-                    first_sequence = batch[0].sequence,
-                    last_sequence = batch[batch.len() - 1].sequence,
-                    events = batch.len(),
-                    "remote event upload failed; journaled for replay"
-                );
-                return Ok(EventUploadOutcome::Retryable);
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    session_id = %batch[0].session_id,
-                    first_sequence = batch[0].sequence,
-                    last_sequence = batch[batch.len() - 1].sequence,
-                    events = batch.len(),
-                    "remote event upload failed; journaled for replay"
-                );
-                return Ok(EventUploadOutcome::Retryable);
-            }
-        }
+    // The committed journal is served by sync; no relay event copy exists.
+    let _ = (client, config, store, timeout);
+    if let Some(last) = events.last() {
+        *uploaded_sequence = last.sequence;
     }
     Ok(EventUploadOutcome::Complete)
 }
@@ -966,114 +812,12 @@ async fn upload_live_state(
     session_id: Uuid,
     uploaded_revision: &mut u64,
 ) -> Result<bool> {
+    let _ = (client, config);
     let live = store
         .live_events_after(session_id, *uploaded_revision)
         .await?;
-    if live.is_empty() {
-        return Ok(true);
-    }
-    // Walk the batch as a work queue so a permanent rejection can be bisected
-    // down to the single offending event instead of discarding everything the
-    // relay would have accepted. Ranges stay in revision order, so the cursor
-    // only ever moves forward.
-    let mut ranges: VecDeque<Range<usize>> = VecDeque::new();
-    ranges.push_back(0..live.len());
-    while let Some(range) = ranges.pop_front() {
-        let batch = &live[range.clone()];
-        let response = client
-            .post(endpoint(&config.server, "/api/remote/host/live-state"))
-            .bearer_auth(&config.host_token)
-            .json(&LiveStateBatch {
-                session_id,
-                events: batch,
-            })
-            .send()
-            .await;
-        match response {
-            Ok(response) if response.status().is_success() => {
-                if let Some(last) = batch.last() {
-                    *uploaded_revision = last.revision;
-                }
-            }
-            Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                return Err(response.error_for_status().unwrap_err())
-                    .context("remote host token was rejected; enroll this host again");
-            }
-            Ok(response)
-                if is_permanent_live_state_rejection(response.status()) && batch.len() > 1 =>
-            {
-                // Bisect in order: the left half is retried first so the cursor
-                // keeps advancing over the events the relay does accept.
-                let middle = range.start + range.len() / 2;
-                tracing::debug!(
-                    status = %response.status(),
-                    %session_id,
-                    first_revision = batch[0].revision,
-                    last_revision = batch[batch.len() - 1].revision,
-                    events = batch.len(),
-                    "remote relay rejected a live-state batch; bisecting to isolate the event"
-                );
-                ranges.push_front(middle..range.end);
-                ranges.push_front(range.start..middle);
-            }
-            Ok(response) if is_permanent_live_state_rejection(response.status()) => {
-                // One irreducible event the relay will never accept. Skip it so
-                // the live stream cannot wedge forever on a poison batch, and
-                // log the response body - a bare status is what let thousands of
-                // these failures go undiagnosed.
-                let status = response.status();
-                let event_kind = live_event_kind(&batch[0]);
-                let detail = response
-                    .text()
-                    .await
-                    .unwrap_or_default()
-                    .chars()
-                    .take(512)
-                    .collect::<String>();
-                let skipped = SKIPPED_LIVE_STATE_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::warn!(
-                    %status,
-                    %detail,
-                    %session_id,
-                    revision = batch[0].revision,
-                    %event_kind,
-                    skipped_live_state_events = skipped,
-                    "remote relay permanently rejected a live-state event; skipping it to keep the live stream moving"
-                );
-                *uploaded_revision = batch[0].revision;
-            }
-            Ok(response) => {
-                let status = response.status();
-                let detail = response
-                    .text()
-                    .await
-                    .unwrap_or_default()
-                    .chars()
-                    .take(512)
-                    .collect::<String>();
-                tracing::warn!(
-                    %status,
-                    %detail,
-                    %session_id,
-                    first_revision = batch[0].revision,
-                    last_revision = batch[batch.len() - 1].revision,
-                    events = batch.len(),
-                    "remote live-state upload failed; retained for replay"
-                );
-                return Ok(false);
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    %session_id,
-                    first_revision = batch[0].revision,
-                    last_revision = batch[batch.len() - 1].revision,
-                    events = batch.len(),
-                    "remote live-state upload failed; retained for replay"
-                );
-                return Ok(false);
-            }
-        }
+    if let Some(last) = live.last() {
+        *uploaded_revision = last.revision;
     }
     Ok(true)
 }
@@ -1141,7 +885,8 @@ pub async fn probe_capabilities(roots: Vec<PathBuf>) -> HostCapabilities {
         Ok(profile) => probe_capabilities_with_profile(roots, profile).await,
         Err(error) => {
             tracing::error!(%error, "host execution disabled");
-            let mut capabilities = probe_capabilities_with_profile(roots, HostExecutionProfile::IsolatedHosted).await;
+            let mut capabilities =
+                probe_capabilities_with_profile(roots, HostExecutionProfile::IsolatedHosted).await;
             capabilities.can_launch = false;
             capabilities
         }
@@ -1246,15 +991,17 @@ fn bounded_limit_env(name: &str, default: u64, min: u64, max: u64) -> u64 {
 }
 
 fn configured_execution_profile() -> Result<HostExecutionProfile> {
-    Ok(match std::env::var("BORG_HOST_EXECUTION_PROFILE")
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("isolated_hosted" | "isolated" | "hosted") => HostExecutionProfile::IsolatedHosted,
-        Some("trusted_user" | "trusted" | "local") | None => HostExecutionProfile::TrustedUser,
-        Some(value) => bail!("invalid BORG_HOST_EXECUTION_PROFILE: {value}"),
-    })
+    Ok(
+        match std::env::var("BORG_HOST_EXECUTION_PROFILE")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("isolated_hosted" | "isolated" | "hosted") => HostExecutionProfile::IsolatedHosted,
+            Some("trusted_user" | "trusted" | "local") | None => HostExecutionProfile::TrustedUser,
+            Some(value) => bail!("invalid BORG_HOST_EXECUTION_PROFILE: {value}"),
+        },
+    )
 }
 
 /// Probe every provider lane concurrently and return only secret-free
@@ -2234,8 +1981,8 @@ pub async fn login_provider_with_output(
         .take()
         .context("provider login stderr missing")?;
     let (line_tx, mut line_rx) = mpsc::unbounded_channel();
-    let stdout_task = tokio::spawn(stream_provider_login_output(stdout, line_tx.clone()));
-    let stderr_task = tokio::spawn(stream_provider_login_output(stderr, line_tx.clone()));
+    let stdout_task = host_transport::spawn(stream_provider_login_output(stdout, line_tx.clone()));
+    let stderr_task = host_transport::spawn(stream_provider_login_output(stderr, line_tx.clone()));
     drop(line_tx);
     while let Some(line) = line_rx.recv().await {
         on_output(&line);
@@ -2356,138 +2103,322 @@ pub(crate) async fn run_host_with_resolved_store(
     let mut capabilities =
         probe_capabilities_with_profile(config.roots.clone(), config.execution_profile).await;
     capabilities.resource_limits = config.resource_limits.clone();
-    let _heartbeat = AbortTask(tokio::spawn(run_host_heartbeat_loop(
-        client.clone(),
-        config.clone(),
-        Arc::clone(&acknowledged),
-        Arc::clone(&sessions),
-        capabilities,
+    let authority = session_store
+        .postgres_authority()
+        .context("remote host requires PostgreSQL journal authority")?;
+    let ledger = crate::command_ledger::CommandLedger::open(authority.pool.clone()).await?;
+    let (outbound, mut outgoing) = mpsc::channel(128);
+    let transport = host_transport::Transport::new(outbound.clone());
+    host_transport::CURRENT.scope(transport.clone(), async move {
+    let _heartbeat = AbortTask(host_transport::spawn(run_host_heartbeat_loop(
+        client.clone(), config.clone(), acknowledged, Arc::clone(&sessions), capabilities,
     )));
-    let _journal_recovery = AbortTask(tokio::spawn(run_host_journal_recovery_loop(
-        client.clone(),
-        config.clone(),
-        Arc::clone(&session_store),
-        Arc::clone(&sessions),
+    let _operations = AbortTask(host_transport::spawn(run_host_operation_loop(
+        client.clone(), config.clone(), Arc::clone(&receipts), session_root.clone(),
     )));
-    let _workspace_recovery = AbortTask(tokio::spawn(run_host_workspace_recovery_loop(
-        client.clone(),
-        config.clone(),
-        Arc::clone(&session_store),
-        Arc::clone(&sessions),
-        session_root.clone(),
-    )));
-    let operations = AbortTask(tokio::spawn(run_host_operation_loop(
-        client.clone(),
-        config.clone(),
-        Arc::clone(&receipts),
-        session_root.clone(),
-    )));
-    let mut command_poll_backoff = RemoteRetryBackoff::default();
-    let mut recovery_offset = 0;
-    loop {
-        ensure!(
-            !operations.0.is_finished(),
-            "remote host operation worker stopped"
-        );
-        match resume_pending_host_sessions(
-            recovery_offset,
-            &client,
-            &config,
-            &session_root,
-            &sessions,
-            &session_store,
-            &executor_factory,
-        )
-        .await
-        {
-            Ok(next_offset) => recovery_offset = next_offset,
-            Err(error) => {
-                tracing::warn!(%error, recovery_offset, "host session recovery failed; retaining scan position and continuing command polling");
+    let (commands, mut command_rx) = mpsc::channel(128);
+    let context = DispatchContext {
+        client, config: config.clone(), session_root, sessions: Arc::clone(&sessions),
+        session_store, receipts, executor_factory,
+    };
+    let recovery_context = context.clone();
+    let _recovery = AbortTask(host_transport::spawn(async move {
+        let mut offset = 0;
+        loop {
+            match resume_pending_host_sessions(offset, &recovery_context.client, &recovery_context.config,
+                &recovery_context.session_root, &recovery_context.sessions, &recovery_context.session_store,
+                &recovery_context.executor_factory).await {
+                Ok(next) => { offset = next; if next == 0 { break; } }
+                Err(error) => { tracing::warn!(%error, "host startup recovery stopped"); break; }
             }
         }
-        let command_cursor = acknowledged.lock().await.sequence;
-        let response = client
-            .get(endpoint(&config.server, "/api/remote/host/commands"))
-            .bearer_auth(&config.host_token)
-            .query(&[
-                ("after", command_cursor.to_string()),
-                ("wait_seconds", "20".to_string()),
-                ("protocol", "1".to_string()),
-            ])
-            .send()
-            .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                let retry_delay = command_poll_backoff.next_delay(None);
-                tracing::warn!(
-                    %error,
-                    retry_seconds = retry_delay.as_secs(),
-                    "remote command poll failed; retrying"
-                );
-                tokio::time::sleep(retry_delay).await;
-                continue;
-            }
-        };
-        if response.status() == StatusCode::UNAUTHORIZED {
-            bail!("remote host token was rejected; enroll this host again");
+    }));
+    let (viewer_tx, mut viewer_rx) = mpsc::channel(128);
+    let sync = crate::sync::SyncAuthority::open(config.host_id, config.revocation_epoch, Arc::clone(&context.session_store), outbound.clone(), viewer_tx).await?;
+    let viewer_context = context.clone();
+    let viewer_ledger = ledger.clone();
+    let viewer_outbound = outbound.clone();
+    let _viewer = AbortTask(host_transport::spawn(async move {
+        while let Some(viewer) = viewer_rx.recv().await {
+            let frame = viewer_command(&viewer_ledger, viewer_context.clone(), viewer).await;
+            if let Ok(frame) = frame { let _ = viewer_outbound.send(frame).await; }
         }
-        if !response.status().is_success() {
-            let retry_delay = command_poll_backoff.next_delay(response_retry_after(&response));
-            tracing::warn!(
-                status = %response.status(),
-                retry_seconds = retry_delay.as_secs(),
-                "remote command poll failed"
-            );
-            tokio::time::sleep(retry_delay).await;
-            continue;
-        }
-        let commands: CommandsResponse = match response.json().await {
-            Ok(commands) => commands,
-            Err(error) => {
-                tracing::warn!(%error, "invalid remote command response; retrying without advancing cursor");
-                tokio::time::sleep(command_poll_backoff.next_delay(None)).await;
-                continue;
-            }
-        };
-        let commands = match commands.into_ordered() {
-            Ok(commands) => commands,
-            Err(error) => {
-                tracing::warn!(%error, "invalid remote command envelope; retrying without advancing cursor");
-                tokio::time::sleep(command_poll_backoff.next_delay(None)).await;
-                continue;
-            }
-        };
-        command_poll_backoff.reset();
-        for envelope in commands {
-            let sequence = envelope.sequence;
-            let claim_token = envelope.claim_token;
-            let handled = dispatch(
-                DispatchContext {
-                    client: client.clone(),
-                    config: config.clone(),
-                    session_root: session_root.clone(),
-                    sessions: sessions.clone(),
-                    session_store: Arc::clone(&session_store),
-                    receipts: Arc::clone(&receipts),
-                    executor_factory: Arc::clone(&executor_factory),
-                },
-                envelope.command,
-            )
-            .await;
-            if !handled {
-                tokio::time::sleep(Duration::from_secs(2)).await;
+    }));
+    let issuer = crate::admission::issuer_key(&config.relay_public_key)?;
+    let mut epoch = config.revocation_epoch;
+    let _dispatcher = AbortTask(host_transport::spawn(async move {
+        while let Some((command_id, command)) = command_rx.recv().await {
+            let result = owner_command(&ledger, context.clone(), command_id, command).await;
+            if let Err(error) = transport.outbound.send(result).await {
+                tracing::warn!(%error, "owner result transport stopped");
                 break;
             }
-            advance_host_acknowledgement(
-                &host_state_path,
-                config.host_id,
-                &acknowledged,
-                sequence,
-                claim_token,
-            )
-            .await?;
         }
+    }));
+    let mut retry = RemoteRetryBackoff::default();
+    loop {
+        let (incoming_tx, mut incoming) = mpsc::channel(128);
+        let (socket_tx, socket_rx) = mpsc::channel(128);
+        let socket_config = config.clone();
+        let mut socket = AbortTask(host_transport::spawn(async move {
+            crate::tunnel::connect(&socket_config, incoming_tx, socket_rx).await
+        }));
+        for registration in host_transport::get(config.host_id)?.registrations() {
+                    if socket_tx.try_send(registration).is_err() { bail!("registration catalog exceeds connection budget"); }
+                }
+                let failure = loop {
+            tokio::select! {
+                result = &mut socket.0 => break result.context("host socket task failed")?,
+                frame = outgoing.recv() => {
+                    let Some(frame) = frame else { return Ok(()) };
+                    if socket_tx.try_send(frame).is_err() { break Err(anyhow::anyhow!("host egress overflow")); }
+                }
+                frame = incoming.recv() => {
+                    let Some(frame) = frame else { continue };
+                    match frame {
+                        crate::auth::TunnelFrame::HostCommand { command_id, command } => {
+                            if commands.try_send((command_id, command)).is_err() {
+                                break Err(anyhow::anyhow!("owner command ingress overflow"));
+                            }
+                        }
+                        crate::auth::TunnelFrame::RegisteredSession { registration_id, error, .. } => {
+                            host_transport::get(config.host_id)?.registered(&registration_id, error);
+                        }
+                        crate::auth::TunnelFrame::EpochUpdate { epoch: updated } => {
+                            ensure!(updated >= epoch, "relay revocation epoch regressed");
+                            epoch = updated;
+                            sync.update_epoch(epoch).await;
+                        }
+                        crate::auth::TunnelFrame::Open { connection_id, ticket } => {
+                            let admitted = crate::admission::verify_ticket(&ticket, &issuer, &config.host_id.to_string(), epoch, Utc::now().timestamp());
+                            match admitted {
+                                Ok(claims) => { if let Err(error) = sync.open_connection(connection_id.clone(), claims).await {
+                                    let _ = outbound.try_send(crate::auth::TunnelFrame::Close { connection_id, reason: error.to_string() });
+                                } }
+                                Err(error) => { let _ = outbound.try_send(crate::auth::TunnelFrame::Close { connection_id, reason: error.to_string() }); }
+                            }
+                        }
+                        crate::auth::TunnelFrame::Client { connection_id, frame } => {
+                            let result = async { sync.handle(&connection_id, serde_json::from_value(frame)?).await }.await;
+                            match result {
+                                Ok(frames) => for frame in frames { let _ = outbound.try_send(crate::auth::TunnelFrame::Server { connection_id: connection_id.clone(), frame: serde_json::to_value(frame)? }); },
+                                Err(error) => { sync.close_connection(&connection_id).await; let _ = outbound.try_send(crate::auth::TunnelFrame::Close { connection_id, reason: error.to_string() }); }
+                            }
+                        }
+                        crate::auth::TunnelFrame::Close { connection_id, .. } => sync.close_connection(&connection_id).await,
+                        _ => {}
+                    }
+                }
+            }
+        };
+        if let Err(error) = failure {
+            if error.downcast_ref::<crate::tunnel::TerminalAuthentication>().is_some() {
+                for (id, sender) in sessions.lock().await.iter() {
+                    let _ = sender.try_send(HostCommand::Stop { session_id: *id });
+                }
+                host_transport::get(config.host_id)?.stop_tasks();
+                return Err(error);
+            }
+            tracing::warn!(%error, "host tunnel disconnected");
+        }
+        tokio::time::sleep(retry.next_delay(None)).await;
+    }
+    }).await
+}
+
+async fn viewer_command(
+    ledger: &crate::command_ledger::CommandLedger,
+    context: DispatchContext,
+    viewer: crate::sync::ViewerCommand,
+) -> Result<crate::auth::TunnelFrame> {
+    use borg_view::wire::{Command, CommandOutcome, Cursor, Scope, ServerFrame};
+    let session_id = match &viewer.scope {
+        Scope::Session { session_id } => Some(Uuid::parse_str(session_id)?),
+        Scope::Host => None,
+    };
+    let scope = crate::projection::scope_key(context.config.host_id, session_id);
+    let projection = crate::projection::ProjectionStore::open(
+        context
+            .session_store
+            .postgres_authority()
+            .context("missing PostgreSQL authority")?
+            .pool,
+    )
+    .await?;
+    let head = projection
+        .load(&scope)
+        .await?
+        .context("scope projection is not initialized")?;
+    let encoded = serde_json::to_vec(&viewer.command)?;
+    let outcome = match ledger
+        .admit(
+            context.config.host_id,
+            viewer.command_id,
+            &scope,
+            &viewer.principal,
+            &encoded,
+        )
+        .await?
+    {
+        crate::command_ledger::Admission::Terminal(bytes) => serde_json::from_slice(&bytes)?,
+        crate::command_ledger::Admission::InDoubt => CommandOutcome::Rejected {
+            code: "interrupted".into(),
+            message: "effect was started; automatic replay refused".into(),
+        },
+        crate::command_ledger::Admission::New => {
+            let translate = async {
+                let session_id = session_id.context("command requires session scope")?;
+                let command = match viewer.command {
+                    Command::Prompt {
+                        text,
+                        delivery,
+                        attachments,
+                    } => {
+                        ensure!(
+                            attachments.is_empty(),
+                            "attachment hydration is not available"
+                        );
+                        HostCommand::Prompt {
+                            session_id,
+                            message_id: viewer.command_id,
+                            text,
+                            attachments: Vec::new(),
+                            output_schema: None,
+                            delivery: match delivery {
+                                borg_view::wire::Delivery::Steer => crate::PromptDelivery::Steer,
+                                borg_view::wire::Delivery::Queue => crate::PromptDelivery::Queue,
+                            },
+                        }
+                    }
+                    Command::Interrupt => HostCommand::Interrupt { session_id },
+                    Command::Compact => HostCommand::Compact { session_id },
+                    Command::ClearContext => HostCommand::ClearContext { session_id },
+                    Command::FlushPendingInput => HostCommand::FlushPendingInput { session_id },
+                    Command::Goal { action } => HostCommand::Goal { session_id, action },
+                    Command::Todo { action } => HostCommand::Todo { session_id, action },
+                    Command::StopWatch { watch_id } => HostCommand::StopWatch {
+                        session_id,
+                        watch_id: Uuid::parse_str(&watch_id)?,
+                    },
+                    Command::RecallQueuedPrompt {
+                        message_id,
+                        replacement,
+                    } => {
+                        ensure!(
+                            replacement.is_none(),
+                            "recall replacement requires canonical recall result"
+                        );
+                        HostCommand::RecallQueuedPrompt {
+                            session_id,
+                            message_id: message_id.map(|id| Uuid::parse_str(&id)).transpose()?,
+                        }
+                    }
+                    Command::Slash { text } => {
+                        use borg_view::intent::FrontendCommand as F;
+                        let state = context.session_store.state(session_id).await?;
+                        match borg_view::intent::parse_submission(
+                            &text,
+                            state.provider.context("session provider unavailable")?,
+                            crate::PromptDelivery::Steer,
+                            &[],
+                        )? {
+                            F::Interrupt => HostCommand::Interrupt { session_id },
+                            F::Compact => HostCommand::Compact { session_id },
+                            F::ClearContext => HostCommand::ClearContext { session_id },
+                            F::FlushPendingInput => HostCommand::FlushPendingInput { session_id },
+                            F::ApplyGoal(action) => HostCommand::Goal { session_id, action },
+                            F::ApplyTodo(action) => HostCommand::Todo { session_id, action },
+                            F::StopWatch(watch_id) => HostCommand::StopWatch {
+                                session_id,
+                                watch_id,
+                            },
+                            F::SubmitPrompt {
+                                text,
+                                attachments,
+                                delivery,
+                            } => HostCommand::Prompt {
+                                session_id,
+                                message_id: viewer.command_id,
+                                text,
+                                attachments,
+                                delivery,
+                                output_schema: None,
+                            },
+                            _ => bail!("slash intent is not supported by remote command bridge"),
+                        }
+                    }
+                    _ => bail!("command requires an unsupported canonical operation"),
+                };
+                ensure!(
+                    dispatch(context.clone(), command).await,
+                    "command admission interrupted"
+                );
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            let outcome = match translate {
+                Ok(()) => CommandOutcome::Applied,
+                Err(error) => CommandOutcome::Rejected {
+                    code: "unsupported_or_interrupted".into(),
+                    message: error.to_string(),
+                },
+            };
+            ledger
+                .finish(
+                    context.config.host_id,
+                    viewer.command_id,
+                    &serde_json::to_vec(&outcome)?,
+                )
+                .await?;
+            outcome
+        }
+    };
+    Ok(crate::auth::TunnelFrame::Server {
+        connection_id: viewer.connection_id,
+        frame: serde_json::to_value(ServerFrame::Result {
+            command_id: viewer.command_id.to_string(),
+            scope: viewer.scope,
+            cursor: Cursor {
+                epoch: head.epoch,
+                revision: head.revision.to_string(),
+            },
+            outcome,
+        })?,
+    })
+}
+
+async fn owner_command(
+    ledger: &crate::command_ledger::CommandLedger,
+    context: DispatchContext,
+    command_id: String,
+    command: HostCommand,
+) -> crate::auth::TunnelFrame {
+    let run = async {
+        let id = Uuid::parse_str(&command_id)?;
+        let encoded = serde_json::to_vec(&command)?;
+        match ledger.admit(context.config.host_id, id, "host", "owner:trusted-relay", &encoded).await? {
+            crate::command_ledger::Admission::Terminal(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            crate::command_ledger::Admission::InDoubt => Ok(serde_json::json!({"status":"interrupted", "retryable":false})),
+            crate::command_ledger::Admission::New => {
+                let host = context.config.host_id;
+                let handled = dispatch(context, command).await;
+                let outcome = serde_json::json!({"status":if handled { "accepted" } else { "interrupted" }, "retryable":false});
+                ledger.finish(host, id, &serde_json::to_vec(&outcome)?).await?;
+                Ok::<_, anyhow::Error>(outcome)
+            }
+        }
+    }.await;
+    match run {
+        Ok(outcome) => crate::auth::TunnelFrame::HostCommandResult {
+            command_id,
+            outcome,
+            error: None,
+        },
+        Err(error) => crate::auth::TunnelFrame::HostCommandResult {
+            command_id,
+            outcome: serde_json::Value::Null,
+            error: Some(error.to_string()),
+        },
     }
 }
 
@@ -3055,90 +2986,11 @@ pub async fn mirror_local_session(
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(35))
         .build()?;
-    let registration = serde_json::json!({
-        "session_id": session_id,
-        "command_scope": "session_v1",
-        "request": request,
-    });
-    let mut registration_backoff = RemoteRetryBackoff::default();
-    let (scoped_commands, command_cursor) = loop {
-        let response = client
-            .post(endpoint(&config.server, "/api/remote/host/sessions"))
-            .bearer_auth(&config.host_token)
-            .json(&registration)
-            .send()
-            .await;
-        let retry_delay = match response {
-            Ok(response) if response.status().is_success() => {
-                let registered: RegisterSessionResponse = match response.json().await {
-                    Ok(registered) => registered,
-                    Err(error) => {
-                        let retry_delay = registration_backoff.next_delay(None);
-                        tracing::warn!(
-                            %error,
-                            retry_seconds = retry_delay.as_secs(),
-                            "invalid local session registration response; retrying"
-                        );
-                        if wait_for_mirror_shutdown(&mut shutdown, retry_delay).await {
-                            return Ok(());
-                        }
-                        continue;
-                    }
-                };
-                let scoped_commands = registered.command_scope.as_deref() == Some("session_v1");
-                if !scoped_commands {
-                    tracing::warn!(%session_id, "relay lacks session-scoped commands; mirroring read-only until the relay is upgraded");
-                }
-                break (
-                    scoped_commands,
-                    merge_reconnect_cursors(
-                        (
-                            registered.command_cursor,
-                            registered.event_cursor,
-                            registered.live_revision,
-                        ),
-                        None,
-                    ),
-                );
-            }
-            Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                bail!("remote host token was rejected; enroll this host again");
-            }
-            Ok(response)
-                if response.status().is_server_error()
-                    || response.status() == StatusCode::TOO_MANY_REQUESTS =>
-            {
-                let retry_delay = registration_backoff.next_delay(response_retry_after(&response));
-                tracing::warn!(
-                    status = %response.status(),
-                    retry_seconds = retry_delay.as_secs(),
-                    "local session registration failed; retrying"
-                );
-                retry_delay
-            }
-            Ok(response) => {
-                let status = response.status();
-                let detail = response.text().await.unwrap_or_default().trim().to_string();
-                if detail.is_empty() {
-                    bail!("remote session registration was rejected ({status})");
-                }
-                bail!("remote session registration was rejected ({status}): {detail}");
-            }
-            Err(error) => {
-                let retry_delay = registration_backoff.next_delay(None);
-                tracing::warn!(
-                    %error,
-                    retry_seconds = retry_delay.as_secs(),
-                    "local session registration failed; retrying"
-                );
-                retry_delay
-            }
-        };
-        if wait_for_mirror_shutdown(&mut shutdown, retry_delay).await {
-            return Ok(());
-        }
-    };
-
+    host_transport::get(config.host_id)?
+        .register(session_id, request)
+        .await?;
+    let scoped_commands = false;
+    let command_cursor = (0, 0, 0);
     if let Some(binding) = store.workspace_binding(session_id).await? {
         store
             .attach_workspace(crate::SessionWorkspaceBinding {
@@ -3212,156 +3064,7 @@ pub async fn mirror_local_session(
             tokio::time::sleep(delay).await;
         }
     };
-    let control = async {
-        if !scoped_commands {
-            return std::future::pending().await;
-        }
-        let mut command_claim_token = None;
-        let mut command_poll_backoff = RemoteRetryBackoff::default();
-        loop {
-            if *command_shutdown.borrow() {
-                // Stop accepting work while the independent journal task flushes.
-                return std::future::pending().await;
-            }
-
-            let request = client
-                .get(endpoint(&config.server, "/api/remote/host/commands"))
-                .bearer_auth(&config.host_token)
-                .query(&[
-                    ("session_id", session_id.to_string()),
-                    ("after", command_cursor.to_string()),
-                    ("wait_seconds", "20".to_string()),
-                    ("protocol", "1".to_string()),
-                ])
-                .send();
-            let response = tokio::select! {
-                response = request => Some(response),
-                changed = command_shutdown.changed() => {
-                    if changed.is_err() || *command_shutdown.borrow() {
-                        None
-                    } else {
-                        continue;
-                    }
-                }
-            };
-            let Some(response) = response else {
-                return std::future::pending().await;
-            };
-            let response = match response {
-                Ok(response) if response.status().is_success() => response,
-                Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                    bail!("remote host token was rejected; enroll this host again");
-                }
-                Ok(response) if response.status() == StatusCode::CONFLICT => {
-                    bail!(
-                        "remote event replay conflicted with the durable remote journal: {}",
-                        response.text().await.unwrap_or_default()
-                    );
-                }
-                Ok(response) => {
-                    let retry_delay =
-                        command_poll_backoff.next_delay(response_retry_after(&response));
-                    tracing::warn!(
-                        status = %response.status(),
-                        retry_seconds = retry_delay.as_secs(),
-                        "local session command poll failed"
-                    );
-                    if wait_for_mirror_shutdown(&mut command_shutdown, retry_delay).await {
-                        continue;
-                    }
-                    continue;
-                }
-                Err(error) => {
-                    let retry_delay = command_poll_backoff.next_delay(None);
-                    tracing::warn!(
-                        %error,
-                        retry_seconds = retry_delay.as_secs(),
-                        "local session command poll failed"
-                    );
-                    if wait_for_mirror_shutdown(&mut command_shutdown, retry_delay).await {
-                        continue;
-                    }
-                    continue;
-                }
-            };
-            let response: CommandsResponse = match response.json().await {
-                Ok(commands) => commands,
-                Err(error) => {
-                    tracing::warn!(%error, "invalid remote command response; retrying without advancing cursor");
-                    wait_for_mirror_shutdown(
-                        &mut command_shutdown,
-                        command_poll_backoff.next_delay(None),
-                    )
-                    .await;
-                    continue;
-                }
-            };
-            let ordered_commands = match response.into_ordered() {
-                Ok(commands) => commands,
-                Err(error) => {
-                    tracing::warn!(%error, "invalid remote command envelope; retrying without advancing cursor");
-                    wait_for_mirror_shutdown(
-                        &mut command_shutdown,
-                        command_poll_backoff.next_delay(None),
-                    )
-                    .await;
-                    continue;
-                }
-            };
-            command_poll_backoff.reset();
-            for envelope in ordered_commands {
-                let sequence = envelope.sequence;
-                let claim_token = envelope.claim_token;
-                ensure!(
-                    envelope.command.session_id() == Some(session_id),
-                    "relay returned a command outside the requested session scope"
-                );
-                if let HostCommand::Prompt {
-                    message_id,
-                    text,
-                    attachments,
-                    delivery,
-                    ..
-                } = &envelope.command
-                    && let Err(error) = admit_remote_prompt(
-                        store.as_ref(),
-                        session_id,
-                        *message_id,
-                        text,
-                        attachments,
-                        *delivery,
-                    )
-                    .await
-                {
-                    tracing::warn!(%error, %session_id, %message_id, "remote prompt admission failed; retaining command for retry");
-                    wait_for_mirror_shutdown(&mut command_shutdown, Duration::from_secs(2)).await;
-                    break;
-                }
-                if commands.send(envelope.command).await.is_err() {
-                    return Ok(());
-                }
-                let (acknowledged_sequence, acknowledged_token) = update_acknowledged_command(
-                    command_cursor,
-                    command_claim_token,
-                    sequence,
-                    claim_token,
-                );
-                command_cursor = acknowledged_sequence;
-                command_claim_token = acknowledged_token;
-                *acknowledged.lock().await = HostAcknowledgement {
-                    sequence: command_cursor,
-                    claim_token: command_claim_token,
-                };
-            }
-        }
-    };
-    let control = async {
-        if let Err(error) = control.await {
-            tracing::warn!(%error, %session_id, "remote controls stopped; journal mirroring remains active");
-        }
-        // Closing the command receiver must not cancel the terminal journal flush.
-        std::future::pending::<()>().await
-    };
+    let control = async { std::future::pending::<Result<()>>().await };
     let journal = async {
         // A run of unstoreable events means the relay is rejecting the journal
         // wholesale; past this many, blocking is safer than skipping.
@@ -3502,35 +3205,26 @@ async fn heartbeat(
     active_session_ids: Vec<Uuid>,
     session_id: Option<Uuid>,
 ) -> Result<()> {
-    let response = client
-        .post(endpoint(&config.server, "/api/remote/host/heartbeat"))
-        .query(
-            &session_id
-                .into_iter()
-                .map(|id| ("session_id", id))
-                .collect::<Vec<_>>(),
-        )
-        .bearer_auth(&config.host_token)
-        .json(&HostHeartbeat {
-            name: config.name.clone(),
-            platform: platform(),
-            hostname: hostname(),
-            capabilities,
-            acknowledged_command_sequence,
-            acknowledged_command_claim_token,
-            active_session_ids,
-            identity: Some(RemoteHostIdentity {
-                host_id: config.host_id,
-                hostname: hostname(),
+    let _ = (client, session_id);
+    host_transport::get(config.host_id)?
+        .outbound
+        .send(crate::auth::TunnelFrame::Heartbeat {
+            heartbeat: HostHeartbeat {
+                name: config.name.clone(),
                 platform: platform(),
-            }),
+                hostname: hostname(),
+                capabilities,
+                acknowledged_command_sequence,
+                acknowledged_command_claim_token,
+                active_session_ids,
+                identity: Some(RemoteHostIdentity {
+                    host_id: config.host_id,
+                    hostname: hostname(),
+                    platform: platform(),
+                }),
+            },
         })
-        .send()
-        .await
-        .context("failed to send remote host heartbeat")?;
-    if !response.status().is_success() {
-        bail!("remote host heartbeat failed with {}", response.status());
-    }
+        .await?;
     Ok(())
 }
 
@@ -3539,34 +3233,14 @@ async fn load_session_sync(
     config: &HostConfig,
     session_id: Uuid,
 ) -> Result<SessionSyncResponse> {
-    let response = client
-        .get(endpoint(
-            &config.server,
-            &format!("/api/remote/host/sessions/{session_id}/sync"),
-        ))
-        .bearer_auth(&config.host_token)
-        .send()
-        .await
-        .context("failed to load remote session sync cursor")?;
-    if response.status() == StatusCode::UNAUTHORIZED {
-        bail!("remote host token was rejected; enroll this host again");
-    }
-    if matches!(response.status(), StatusCode::NOT_FOUND | StatusCode::GONE) {
-        return Err(response.error_for_status().unwrap_err())
-            .context("remote session journal is unavailable on the relay");
-    }
-    if !response.status().is_success() {
-        bail!(
-            "remote session sync cursor failed with {}",
-            response.status()
-        );
-    }
-    response
-        .json()
-        .await
-        .context("Borg returned an invalid session sync cursor")
+    let _ = (client, config, session_id);
+    Ok(SessionSyncResponse {
+        event_cursor: 0,
+        live_revision: 0,
+    })
 }
 
+#[derive(Clone)]
 struct DispatchContext {
     client: Client,
     config: HostConfig,
@@ -4188,27 +3862,23 @@ async fn upload_host_action_result<T: Serialize>(
     request_id: Uuid,
     response: &T,
 ) -> bool {
-    match client
-        .post(endpoint(&config.server, path))
-        .bearer_auth(&config.host_token)
-        .json(response)
-        .send()
-        .await
-    {
-        Ok(result) if result.status().is_success() => true,
-        Ok(result) if matches!(result.status(), StatusCode::NOT_FOUND | StatusCode::GONE) => {
-            tracing::warn!(status = %result.status(), %request_id, "remote host action is no longer present on the relay");
-            true
-        }
-        Ok(result) => {
-            tracing::warn!(status = %result.status(), %request_id, "remote host action result upload failed");
-            false
-        }
-        Err(error) => {
-            tracing::warn!(%error, %request_id, "remote host action result upload failed");
-            false
-        }
+    let _ = (client, path);
+    let result = async {
+        host_transport::get(config.host_id)?
+            .outbound
+            .send(crate::auth::TunnelFrame::HostCommandResult {
+                command_id: request_id.to_string(),
+                outcome: serde_json::to_value(response)?,
+                error: None,
+            })
+            .await?;
+        Ok::<_, anyhow::Error>(())
     }
+    .await;
+    if let Err(error) = &result {
+        tracing::warn!(%error, "host result publication failed");
+    }
+    result.is_ok()
 }
 
 async fn filesystem_response(
@@ -4841,7 +4511,7 @@ fn host_relay_origin(config: &HostConfig) -> Result<String> {
 }
 
 async fn ensure_host_launch_owner(
-    client: &Client,
+    _client: &Client,
     config: &HostConfig,
     store: &dyn SessionStore,
     session_id: Uuid,
@@ -4852,10 +4522,7 @@ async fn ensure_host_launch_owner(
     {
         // An unowned legacy row is not authorization. The relay checks both
         // session ID and host credentials before any local ownership mutation.
-        load_session_sync(client, config, session_id).await?;
-        store
-            .claim_legacy_host_launch_owner(session_id, config.host_id, &host_relay_origin(config)?)
-            .await?;
+        bail!("legacy unowned host launch requires explicit re-admission");
     }
     Ok(())
 }
@@ -5168,8 +4835,8 @@ async fn spawn_host_session(
     sessions.lock().await.insert(session_id, tx.clone());
     let sessions_for_cleanup = sessions.clone();
     let cleanup_store = Arc::clone(&durable_store);
-    tokio::spawn(async move {
-        let mut supervisor = AbortTask(tokio::spawn(run_session(
+    host_transport::spawn(async move {
+        let mut supervisor = AbortTask(host_transport::spawn(run_session(
             client.clone(),
             config.clone(),
             session_root.clone(),
@@ -5278,6 +4945,9 @@ async fn run_session(
         attachment,
     } = launch_request;
     launch.cwd = validate_host_cwd(&config.roots, &launch.cwd)?;
+    host_transport::get(config.host_id)?
+        .register(session_id, launch.clone())
+        .await?;
     discard_serialized_extension_roots(&mut launch);
     ensure_host_launch_owner(&client, &config, durable_store.as_ref(), session_id).await?;
     // Expired recovery must not depend on relay availability or create a provider.
@@ -5418,7 +5088,7 @@ async fn run_session(
         .map(|_| launch.request_id);
     let mut bootstrap_finished = false;
     let actor_writer = Arc::clone(&writer);
-    let mut actor = AbortTask(tokio::spawn(async move {
+    let mut actor = AbortTask(host_transport::spawn(async move {
         run_agent_session_with_store_and_writer_and_lsp_policy(
             &actor_session_root,
             session_id,
@@ -7117,7 +6787,7 @@ mod tests {
                 serde_json::json!({"commands": [second, first]}).to_string(),
             ];
             let (polls_tx, mut polls) = mpsc::channel(8);
-            let _server = AbortTask(tokio::spawn(async move {
+            let _server = AbortTask(host_transport::spawn(async move {
                 let mut count = 0;
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
@@ -7180,7 +6850,7 @@ mod tests {
             .unwrap();
             let (commands, mut received) = mpsc::channel(4);
             let (shutdown, stopped) = watch::channel(false);
-            let mut worker = AbortTask(tokio::spawn(async move {
+            let mut worker = AbortTask(host_transport::spawn(async move {
                 if mirrored {
                     mirror_local_session(
                         &worker_config,
@@ -7303,7 +6973,7 @@ mod tests {
     ) -> (String, tokio::task::JoinHandle<Vec<Vec<u64>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        let server = host_transport::spawn(async move {
             let mut delivered = Vec::new();
             for status in statuses {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -7359,7 +7029,7 @@ mod tests {
         let (first_upload_tx, first_upload_rx) = tokio::sync::oneshot::channel();
         let (poll_started_tx, poll_started_rx) = tokio::sync::oneshot::channel();
         let (second_upload_tx, second_upload_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
+        let server = host_transport::spawn(async move {
             let mut poll_started_tx = Some(poll_started_tx);
             let mut second_upload_tx = Some(second_upload_tx);
             let mut held_polls = Vec::new();
@@ -7607,7 +7277,7 @@ mod tests {
         };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mirror_store: Arc<dyn SessionStore> = store.clone();
-        let mirror = tokio::spawn(async move {
+        let mirror = host_transport::spawn(async move {
             mirror_local_session(
                 &config_path,
                 mirror_store,
@@ -7702,7 +7372,7 @@ mod tests {
         }]}).to_string();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        let server = host_transport::spawn(async move {
             for attempt in 0..4 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let (path, _) = read_http_request(&mut stream).await;
@@ -7890,7 +7560,7 @@ mod tests {
         let relay = Arc::new(std::sync::Mutex::new(Relay::default()));
         let relay_message_id = Uuid::new_v4();
         let relay_channel = Uuid::new_v4();
-        let server = tokio::spawn({
+        let server = host_transport::spawn({
             let relay = Arc::clone(&relay);
             async move {
                 loop {
@@ -8271,7 +7941,7 @@ mod tests {
             ]
         })
         .to_string();
-        let server = tokio::spawn(async move {
+        let server = host_transport::spawn(async move {
             let mut requests = Vec::new();
             let mut retry_attempted = false;
             let mut directory_attempted = false;
@@ -8726,7 +8396,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        let server = host_transport::spawn(async move {
             let (mut payload_stream, _) = listener.accept().await.unwrap();
             let (payload_path, payload_body) = read_http_request(&mut payload_stream).await;
             payload_stream
@@ -8808,7 +8478,7 @@ mod tests {
             server: format!("http://{}", listener.local_addr().unwrap()),
             ..test_config(root.path())
         };
-        let server = AbortTask(tokio::spawn(async move {
+        let server = AbortTask(host_transport::spawn(async move {
             let mut paths = Vec::new();
             for _ in 0..3 {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -8998,7 +8668,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        let server = host_transport::spawn(async move {
             let mut handlers = tokio::task::JoinSet::new();
             for _ in 0..5 {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -9143,7 +8813,7 @@ mod tests {
     ) -> (String, tokio::task::JoinHandle<Vec<Vec<u64>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        let server = host_transport::spawn(async move {
             let mut delivered = Vec::new();
             for status in statuses {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -9608,7 +9278,7 @@ mod tests {
             Arc::clone(&release),
             Arc::clone(&uploaded),
         );
-        let _server = AbortTask(tokio::spawn(async move {
+        let _server = AbortTask(host_transport::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let (path, body) = read_http_request(&mut socket).await;
@@ -9656,7 +9326,7 @@ mod tests {
             Arc::new(PendingExecutor(Arc::clone(&started), Arc::clone(&dropped)));
         let factory: HostExecutorFactory = Arc::new(move |_, _| Ok(Arc::clone(&executor)));
         let (_commands, rx) = mpsc::channel(8);
-        let mut supervisor = AbortTask(tokio::spawn(run_session(
+        let mut supervisor = AbortTask(host_transport::spawn(run_session(
             client.clone(),
             config.clone(),
             root.path().to_path_buf(),
@@ -10133,7 +9803,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let mut config = test_config(root.path());
             config.server = format!("http://{}", listener.local_addr().unwrap());
-            let _server = AbortTask(tokio::spawn(async move {
+            let _server = AbortTask(host_transport::spawn(async move {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
                     let (path, _) = read_http_request(&mut socket).await;
@@ -10342,7 +10012,7 @@ mod tests {
         let uploaded = Arc::new(AtomicU64::new(0));
         let server_rejection = Arc::clone(&rejection);
         let server_uploaded = Arc::clone(&uploaded);
-        let _server = AbortTask(tokio::spawn(async move {
+        let _server = AbortTask(host_transport::spawn(async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let (path, request) = read_http_request(&mut stream).await;
@@ -10386,7 +10056,7 @@ mod tests {
         // The actor and this test must share one journal: the projection this
         // test corrupts below is the one the actor reads.
         let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
-        let mut supervisor = AbortTask(tokio::spawn(run_session(
+        let mut supervisor = AbortTask(host_transport::spawn(run_session(
             client.clone(),
             config.clone(),
             root.path().to_path_buf(),
@@ -10475,7 +10145,7 @@ mod tests {
             rejection.store(200, Ordering::SeqCst);
             let id = Uuid::new_v4();
             let (_commands, rx) = mpsc::channel(8);
-            let mut supervisor = AbortTask(tokio::spawn(run_session(
+            let mut supervisor = AbortTask(host_transport::spawn(run_session(
                 client.clone(),
                 config.clone(),
                 root.path().to_path_buf(),
@@ -10577,7 +10247,7 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let gate = Arc::clone(&release);
         let (sent, mut requests) = mpsc::channel(8);
-        let _server = AbortTask(tokio::spawn(async move {
+        let _server = AbortTask(host_transport::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let (path, _) = read_http_request(&mut socket).await;
@@ -10647,7 +10317,7 @@ mod tests {
             "legacy proof must not block command polling"
         );
         mode.store(200, Ordering::SeqCst);
-        let mut recovery = AbortTask(tokio::spawn(run_host_journal_recovery_loop(
+        let mut recovery = AbortTask(host_transport::spawn(run_host_journal_recovery_loop(
             client.clone(),
             config.clone(),
             Arc::clone(&store),
@@ -10701,7 +10371,7 @@ mod tests {
         mode.store(0, Ordering::SeqCst);
         let task_store = Arc::clone(&store);
         let task_config = config.clone();
-        let mut authorization = AbortTask(tokio::spawn(async move {
+        let mut authorization = AbortTask(host_transport::spawn(async move {
             ensure_host_launch_owner(&client, &task_config, task_store.as_ref(), racing).await
         }));
         assert_eq!(
@@ -10807,7 +10477,7 @@ mod tests {
         store.begin_host_bootstrap(session_id).await.unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&requests);
-        let _server = AbortTask(tokio::spawn(async move {
+        let _server = AbortTask(host_transport::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 read_http_request(&mut socket).await;
@@ -11045,7 +10715,7 @@ mod tests {
         let uploads = Arc::new(AtomicUsize::new(0));
         let server_stop = Arc::clone(&stop);
         let server_uploads = Arc::clone(&uploads);
-        let _server = AbortTask(tokio::spawn(async move {
+        let _server = AbortTask(host_transport::spawn(async move {
             let mut polls = 0;
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -11095,7 +10765,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut host = AbortTask(tokio::spawn(async move {
+        let mut host = AbortTask(host_transport::spawn(async move {
             run_host_with_resolved_store(&config_path, factory, Some(resolved)).await
         }));
         let first = tokio::time::timeout(Duration::from_secs(30), gates.recv())
@@ -11963,7 +11633,7 @@ mod tests {
         sessions.lock().await.insert(active_id, tx);
         // A second host can already be awaiting context before this host stops the session.
         let (_stale_tx, stale_rx) = mpsc::channel(1);
-        let stale_startup = tokio::spawn(run_session(
+        let stale_startup = host_transport::spawn(run_session(
             client.clone(),
             config.clone(),
             root.path().to_path_buf(),
@@ -12061,7 +11731,7 @@ connection: close
         config.server = format!("http://{}", listener.local_addr().unwrap());
         let (first_post_tx, first_post_rx) = tokio::sync::oneshot::channel();
         let (drop_response_tx, drop_response_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
+        let server = host_transport::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let (path, body) = read_http_request(&mut stream).await;
             assert_eq!(path, "/api/remote/host/shell-command-results");
@@ -12208,7 +11878,7 @@ connection: close
                 .unwrap(),
             ReceiptState::Missing
         ));
-        let first = tokio::spawn(run_host_operation_loop(
+        let first = host_transport::spawn(run_host_operation_loop(
             client.clone(),
             config.clone(),
             Arc::clone(&receipts),
@@ -12226,7 +11896,7 @@ connection: close
                 .unwrap()
                 .is_none()
         );
-        let second = tokio::spawn(run_host_operation_loop(
+        let second = host_transport::spawn(run_host_operation_loop(
             client.clone(),
             config.clone(),
             Arc::clone(&receipts),
@@ -12331,7 +12001,7 @@ connection: close
             .unwrap();
         // Same authority as the journal, obtained the way production does.
         let receipts = store.receipt_store().await.unwrap();
-        let _worker = AbortTask(tokio::spawn(run_host_operation_loop(
+        let _worker = AbortTask(host_transport::spawn(run_host_operation_loop(
             client,
             config.clone(),
             Arc::clone(&receipts),
@@ -12429,7 +12099,7 @@ connection: close
         let status = Arc::new(AtomicU16::new(404));
         let server_status = Arc::clone(&status);
         let (sent, mut requests) = mpsc::channel(8);
-        let _server = AbortTask(tokio::spawn(async move {
+        let _server = AbortTask(host_transport::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let (path, body) = read_http_request(&mut socket).await;
@@ -12600,7 +12270,7 @@ connection: close
         let status = Arc::new(AtomicU16::new(503));
         let server_status = Arc::clone(&status);
         let (sent, mut received) = mpsc::channel(32);
-        let _server = AbortTask(tokio::spawn(async move {
+        let _server = AbortTask(host_transport::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let (path, body) = read_http_request(&mut socket).await;
@@ -12912,7 +12582,7 @@ connection: close
         let (sent, mut received) = mpsc::channel(8);
         let status = Arc::new(AtomicU16::new(503));
         let server_status = Arc::clone(&status);
-        let _server = AbortTask(tokio::spawn(async move {
+        let _server = AbortTask(host_transport::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let (path, body) = read_http_request(&mut socket).await;
@@ -13027,7 +12697,7 @@ connection: close
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = mpsc::channel(1);
         sessions.lock().await.insert(session_id, tx.clone());
-        let mut worker = AbortTask(tokio::spawn(run_host_workspace_recovery_loop(
+        let mut worker = AbortTask(host_transport::spawn(run_host_workspace_recovery_loop(
             client.clone(),
             config.clone(),
             Arc::clone(&store),
@@ -13237,7 +12907,7 @@ connection: close
             .await
             .unwrap();
         status.store(404, Ordering::SeqCst);
-        let mut worker = AbortTask(tokio::spawn(run_host_workspace_recovery_loop(
+        let mut worker = AbortTask(host_transport::spawn(run_host_workspace_recovery_loop(
             client.clone(),
             config.clone(),
             Arc::clone(&store),
@@ -13330,7 +13000,7 @@ connection: close
         config.server = format!("http://{}", listener.local_addr().unwrap());
         config.resource_limits.max_concurrent_sessions = 1;
         let (confirmed_tx, confirmed_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
+        let server = host_transport::spawn(async move {
             let mut uploads = Vec::new();
             for step in 0..5 {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -13459,7 +13129,7 @@ connection: close
         let active_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel(1);
         sessions.lock().await.insert(active_id, tx);
-        let _recovery = AbortTask(tokio::spawn(run_host_journal_recovery_loop(
+        let _recovery = AbortTask(host_transport::spawn(run_host_journal_recovery_loop(
             client,
             config,
             Arc::clone(&store),
@@ -13670,7 +13340,7 @@ connection: close
             unpublished.contains(&expired) && unpublished.contains(&locked),
             "journal recovery must discover failures after bootstrap markers are removed"
         );
-        let server = tokio::spawn(async move {
+        let server = host_transport::spawn(async move {
             let mut uploads = Vec::new();
             for status in ["503 Service Unavailable", "200 OK"] {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -13740,7 +13410,7 @@ connection: close
         config.server = format!("http://{}", listener.local_addr().unwrap());
         let (context_seen_tx, context_seen_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
+        let server = host_transport::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let (path, _) = read_http_request(&mut stream).await;
             assert_eq!(
