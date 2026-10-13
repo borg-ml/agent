@@ -2179,6 +2179,7 @@ pub(crate) async fn run_host_with_resolved_store(
     }));
     let (incoming_tx, mut incoming) = mpsc::channel(128);
     let (lifecycle_tx, mut lifecycle) = mpsc::channel(8);
+    let (restart_tx, mut restart_rx) = watch::channel(0_u64);
     let socket_config = config.clone();
     let socket_transport = host_transport::get(config.host_id)?;
     let mut socket = AbortTask(host_transport::spawn(async move {
@@ -2186,7 +2187,13 @@ pub(crate) async fn run_host_with_resolved_store(
         loop {
             let _ = lifecycle_tx.try_send(true);
             let connected_at = Instant::now();
-            let result = crate::tunnel::connect(&socket_config, incoming_tx.clone(), &mut outgoing).await;
+            let result = tokio::select! {
+                result = crate::tunnel::connect(&socket_config, incoming_tx.clone(), &mut outgoing) => result,
+                changed = restart_rx.changed() => {
+                    changed.context("host reconnect control stopped")?;
+                    Err(anyhow::anyhow!("owner ingress overflow; reconnect without cancelling actors"))
+                }
+            };
             socket_transport.connection_lost();
             if let Err(error) = result {
                 if error.downcast_ref::<crate::tunnel::TerminalAuthentication>().is_some() { return Err(error); }
@@ -2239,8 +2246,15 @@ pub(crate) async fn run_host_with_resolved_store(
                 let Some(frame) = frame else { bail!("host tunnel ingress stopped") };
                 match frame {
                         crate::auth::TunnelFrame::HostCommand { command_id, command } => {
-                            if commands.try_send((command_id, command)).is_err() {
-                                break Err(anyhow::anyhow!("owner command ingress overflow"));
+                            match commands.try_send((command_id, command)) {
+                                Ok(()) => {},
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    restart_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    sync.shutdown().await;
+                                    bail!("owner command dispatcher stopped");
+                                }
                             }
                         }
                         crate::auth::TunnelFrame::RegisteredSession { registration_id, error, .. } => {
