@@ -2199,11 +2199,13 @@ pub(crate) async fn run_host_with_resolved_store(
                         let _ = sender.try_send(HostCommand::Stop { session_id: *id });
                     }
                 }
+                sync.update_epoch(epoch).await;
                 return Err(error);
             }
             result = async {
                 match direct.as_mut() { Some(task) => (&mut task.0).await, None => std::future::pending().await }
             } => {
+                sync.update_epoch(epoch).await;
                 result.context("direct listener task failed")?.context("direct listener failed")?;
                 bail!("direct listener stopped unexpectedly");
             }
