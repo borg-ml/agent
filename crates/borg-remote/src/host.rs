@@ -2144,15 +2144,25 @@ pub(crate) async fn run_host_with_resolved_store(
     let sync = crate::sync::SyncAuthority::open(config.host_id, config.revocation_epoch, Arc::clone(&context.session_store), outbound.clone(), viewer_tx).await?;
     let viewer_context = context.clone();
     let viewer_ledger = ledger.clone();
+    let viewer_authority = Arc::clone(&sync);
     let viewer_outbound = outbound.clone();
     let _viewer = AbortTask(host_transport::spawn(async move {
         while let Some(viewer) = viewer_rx.recv().await {
             let connection_id = viewer.connection_id.clone();
+            let scope = viewer.scope.clone();
             let frame = match viewer_command(&viewer_ledger, viewer_context.clone(), viewer).await {
                 Ok(frame) => frame,
-                Err(error) => crate::auth::TunnelFrame::Close { connection_id, reason: error.to_string() },
+                Err(error) => {
+                    let _ = viewer_authority.emit(&connection_id, borg_view::wire::ServerFrame::Gap { scope, reason: error.to_string() });
+                    viewer_authority.close_connection(&connection_id).await;
+                    let _ = viewer_outbound.try_send(crate::auth::TunnelFrame::Close { connection_id, reason: error.to_string() });
+                    continue;
+                }
             };
-            if viewer_outbound.send(frame).await.is_err() { break; }
+            if let Err(error) = viewer_authority.emit(&connection_id, frame) {
+                viewer_authority.close_connection(&connection_id).await;
+                let _ = viewer_outbound.try_send(crate::auth::TunnelFrame::Close { connection_id, reason: error.to_string() });
+            }
         }
     }));
     let issuer = crate::admission::issuer_key(&config.relay_public_key)?;
@@ -2199,13 +2209,13 @@ pub(crate) async fn run_host_with_resolved_store(
                         let _ = sender.try_send(HostCommand::Stop { session_id: *id });
                     }
                 }
-                sync.update_epoch(epoch).await;
+                sync.shutdown().await;
                 return Err(error);
             }
             result = async {
                 match direct.as_mut() { Some(task) => (&mut task.0).await, None => std::future::pending().await }
             } => {
-                sync.update_epoch(epoch).await;
+                sync.shutdown().await;
                 result.context("direct listener task failed")?.context("direct listener failed")?;
                 bail!("direct listener stopped unexpectedly");
             }
@@ -2429,7 +2439,7 @@ async fn viewer_command(
     ledger: &crate::command_ledger::CommandLedger,
     context: DispatchContext,
     viewer: crate::sync::ViewerCommand,
-) -> Result<crate::auth::TunnelFrame> {
+) -> Result<borg_view::wire::ServerFrame> {
     use borg_view::wire::{Command, CommandOutcome, Cursor, Scope, ServerFrame};
     let session_id = match &viewer.scope {
         Scope::Session { session_id } => Some(Uuid::parse_str(session_id)?),
@@ -2749,17 +2759,14 @@ async fn viewer_command(
             outcome
         }
     };
-    Ok(crate::auth::TunnelFrame::Server {
-        connection_id: viewer.connection_id,
-        frame: serde_json::to_value(ServerFrame::Result {
-            command_id: viewer.command_id.to_string(),
-            scope: viewer.scope,
-            cursor: Cursor {
-                epoch: head.epoch,
-                revision: head.revision.to_string(),
-            },
-            outcome,
-        })?,
+    Ok(ServerFrame::Result {
+        command_id: viewer.command_id.to_string(),
+        scope: viewer.scope,
+        cursor: Cursor {
+            epoch: head.epoch,
+            revision: head.revision.to_string(),
+        },
+        outcome,
     })
 }
 
