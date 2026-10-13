@@ -100,6 +100,9 @@ pub(super) fn start(
         "direct listener requires an explicit nonzero port"
     );
     let tls = tls_config(&config)?;
+    let listener = std::net::TcpListener::bind(config.bind_address)
+        .context("failed to bind verified direct listener")?;
+    listener.set_nonblocking(true)?;
     let route = format!(
         "wss://{}:{}/ws",
         config.server_name,
@@ -117,8 +120,8 @@ pub(super) fn start(
             connections: Arc::new(Semaphore::new(128)),
         });
     Ok(super::spawn_transport_task(async move {
-        axum_server::bind_rustls(
-            config.bind_address,
+        axum_server::from_tcp_rustls(
+            listener,
             axum_server::tls_rustls::RustlsConfig::from_config(tls),
         )
         .serve(router.into_make_service())
