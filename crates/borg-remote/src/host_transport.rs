@@ -17,6 +17,12 @@ pub(super) struct Transport {
     registrations: Arc<Mutex<HashMap<String, oneshot::Sender<Result<()>>>>>,
 }
 tokio::task_local! { pub(super) static CURRENT: Transport; }
+pub(super) struct StopOnDrop(pub Transport);
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.stop_tasks();
+    }
+}
 impl Transport {
     pub fn new(host: Uuid, outbound: mpsc::Sender<TunnelFrame>) -> Self {
         Self {

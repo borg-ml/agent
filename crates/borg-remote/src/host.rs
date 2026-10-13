@@ -2110,6 +2110,7 @@ pub(crate) async fn run_host_with_resolved_store(
     let (outbound, mut outgoing) = mpsc::channel(128);
     let transport = host_transport::Transport::new(config.host_id, outbound.clone());
     host_transport::CURRENT.scope(transport.clone(), async move {
+    let _shutdown = host_transport::StopOnDrop(transport.clone());
     let _heartbeat = AbortTask(host_transport::spawn(run_host_heartbeat_loop(
         client.clone(), config.clone(), acknowledged, Arc::clone(&sessions), capabilities,
     )));
@@ -2157,6 +2158,7 @@ pub(crate) async fn run_host_with_resolved_store(
     }));
     let mut retry = RemoteRetryBackoff::default();
     loop {
+        let connected_at = Instant::now();
         let (incoming_tx, mut incoming) = mpsc::channel(128);
         let (socket_tx, socket_rx) = mpsc::channel(128);
         let socket_config = config.clone();
@@ -2221,7 +2223,10 @@ pub(crate) async fn run_host_with_resolved_store(
             }
             tracing::warn!(%error, "host tunnel disconnected");
         }
-        tokio::time::sleep(retry.next_delay(None)).await;
+        sync.update_epoch(epoch).await;
+        if connected_at.elapsed() >= Duration::from_secs(60) { retry.reset(); }
+        let jitter = Duration::from_millis(u64::from(Uuid::new_v4().as_bytes()[0]) * 4);
+        tokio::time::sleep(retry.next_delay(None) + jitter).await;
     }
     }).await
 }
