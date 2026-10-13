@@ -2235,6 +2235,93 @@ pub(crate) async fn run_host_with_resolved_store(
     }).await
 }
 
+fn viewer_cancelled_provider_interaction_response(kind: &str) -> serde_json::Value {
+    if kind == "mcp_elicitation" {
+        serde_json::json!({ "action": "cancel" })
+    } else {
+        serde_json::json!({ "answers": {} })
+    }
+}
+
+fn viewer_provider_interaction_response(
+    kind: &str,
+    payload: &serde_json::Value,
+    input: &str,
+) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context as _;
+
+    if input.eq_ignore_ascii_case("/cancel") {
+        return Ok(viewer_cancelled_provider_interaction_response(kind));
+    }
+    if kind == "mcp_elicitation" {
+        if input.eq_ignore_ascii_case("/decline") {
+            return Ok(serde_json::json!({ "action": "decline" }));
+        }
+        let content = match serde_json::from_str::<serde_json::Value>(input) {
+            Ok(value) => value,
+            Err(_) => {
+                let properties = payload
+                    .get("requestedSchema")
+                    .and_then(|schema| schema.get("properties"))
+                    .and_then(serde_json::Value::as_object)
+                    .context(
+                        "Enter JSON matching the requested form, or use /decline or /cancel",
+                    )?;
+                anyhow::ensure!(
+                    properties.len() == 1,
+                    "Enter a JSON object matching the requested form, or use /decline or /cancel"
+                );
+                let key = properties.keys().next().expect("one property");
+                serde_json::json!({ key: input })
+            }
+        };
+        return Ok(serde_json::json!({ "action": "accept", "content": content }));
+    }
+    let questions = payload
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+        .context("Provider user-input request did not include questions")?;
+    if questions.len() == 1 {
+        let id = questions[0]
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .context("Provider user-input question did not include an id")?;
+        return Ok(serde_json::json!({ "answers": { (id): { "answers": [input] } } }));
+    }
+    let value: serde_json::Value = serde_json::from_str(input).context(
+        "Answer multiple questions with a JSON object keyed by question id, or use /cancel",
+    )?;
+    if value.get("answers").is_some() {
+        return Ok(value);
+    }
+    let values = value
+        .as_object()
+        .context("Multiple answers must be a JSON object keyed by question id")?;
+    let mut answers = serde_json::Map::new();
+    for question in questions {
+        let id = question
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .context("Provider user-input question did not include an id")?;
+        let answer = values
+            .get(id)
+            .with_context(|| format!("Missing answer for question {id}"))?;
+        let answer_values = match answer {
+            serde_json::Value::Array(values) => values.clone(),
+            value => vec![value.clone()],
+        };
+        anyhow::ensure!(
+            answer_values.iter().all(serde_json::Value::is_string),
+            "Answer for {id} must be a string or an array of strings"
+        );
+        answers.insert(
+            id.to_string(),
+            serde_json::json!({ "answers": answer_values }),
+        );
+    }
+    Ok(serde_json::json!({ "answers": answers }))
+}
+
 async fn viewer_attachments(
     context: &DispatchContext,
     session: Uuid,
@@ -2445,7 +2532,10 @@ async fn viewer_command(
                     }
                     Command::RespondToQuestion { approval_id, source_session_id, text, .. } => {
                         ensure!(Uuid::parse_str(&source_session_id)? == session_id, "question source differs from scope");
-                        HostCommand::RespondToProviderInteraction { session_id, interaction_id: approval_id, response: serde_json::json!({"text":text}) }
+                        let state = context.session_store.state(session_id).await?;
+                        ensure!(state.pending_provider_interaction_id.as_deref() == Some(approval_id.as_str()), "question is no longer pending");
+                        let response = viewer_provider_interaction_response(state.pending_provider_interaction_kind.as_deref().context("question kind unavailable")?, state.pending_provider_interaction_payload.as_ref().context("question payload unavailable")?, &text)?;
+                        HostCommand::RespondToProviderInteraction { session_id, interaction_id: approval_id, response }
                     }
                     Command::NewSession { cwd } => {
                         let Some(StoredHostLaunch::Launch(metadata)) = load_launch_metadata(context.session_store.as_ref(), session_id).await? else { bail!("session launch configuration unavailable") };
