@@ -1119,13 +1119,16 @@ impl NativeHarness {
                 continue;
             }
             if tool_calls.is_empty() {
-                if result.finish_reason != "stop" {
+                if !matches!(result.finish_reason.as_str(), "stop" | "refusal") {
                     bail!(
                         "native provider ended the turn with unexpected finish reason `{}`",
                         result.finish_reason
                     );
                 }
-                let final_text = content.clone().unwrap_or_default();
+                let mut final_text = content.clone().unwrap_or_default();
+                if result.finish_reason == "refusal" && final_text.trim().is_empty() {
+                    final_text = "The model declined to respond to this request.".into();
+                }
                 if final_text.trim().is_empty() {
                     if replying_while_parked {
                         // Nothing more to say is a fine answer to "reply if
@@ -8861,6 +8864,62 @@ mod tests {
         })
         .await
         .expect("the harness turn finished inside the timeout")
+    }
+
+    #[tokio::test]
+    async fn refusal_completes_once_and_preserves_native_replay() {
+        struct Refusing {
+            message: ModelMessage,
+            calls: Mutex<usize>,
+        }
+        #[async_trait]
+        impl NativeModelClient for Refusing {
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                _request: ModelTurnRequest,
+                _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                *self.calls.lock().unwrap() += 1;
+                Ok(ModelTurnResult {
+                    message: self.message.clone(),
+                    finish_reason: "refusal".into(),
+                    usage: ProviderCallUsage::default(),
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        for content in [Some("I cannot help with that request.".into()), None] {
+            let message = ModelMessage::assistant(content.clone(), None, None, Vec::new());
+            let client = Arc::new(Refusing {
+                message: message.clone(),
+                calls: Mutex::new(0),
+            });
+            let (events, completed) = run_turn_events(
+                client.clone(),
+                crate::CodingProvider::Codex,
+                root.path().into(),
+                Uuid::new_v4(),
+                Vec::new(),
+                HashMap::new(),
+                "request",
+                "",
+                "",
+            )
+            .await;
+            assert!(completed, "refusal must complete without a fatal error");
+            assert_eq!(*client.calls.lock().unwrap(), 1, "refusal must not retry");
+            assert!(events.iter().any(|event| matches!(event,
+                SessionEventKind::Message { actor: EventActor::Assistant, text, status: MessageStatus::Complete, .. }
+                if content.as_ref().map_or(!text.trim().is_empty(), |original| text == original))));
+            assert!(events.iter().any(|event| matches!(event,
+                SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "native_model_message" && *payload == serde_json::to_value(&message).unwrap())));
+        }
     }
 
     #[tokio::test]
