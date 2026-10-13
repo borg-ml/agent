@@ -16447,6 +16447,218 @@ async fn monitor_event_wakes_an_idle_session_without_an_active_goal() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn native_connection_retries_preserve_work_without_repeating_admitted_input() {
+    use borg_provider::provider::{ModelMessage, ModelToolCall};
+
+    struct RetryExecutor(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for RetryExecutor {
+        fn uses_native_harness(&self, _: CodingProvider) -> bool {
+            true
+        }
+
+        async fn execute(
+            &self,
+            turn: AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            _: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            let attempt = self.0.fetch_add(1, Ordering::AcqRel);
+            if attempt == 0 {
+                // Initialization failed before the native prompt was journaled.
+                anyhow::bail!("Codex subscription connection failed");
+            }
+            let input = crate::native_harness::native_user_message(
+                &turn.cwd,
+                &turn.prompt,
+                &turn.attachments,
+            )
+            .await?;
+            let mut request = turn.conversation;
+            request.push(input.clone());
+            crate::native_harness::canonicalize_native_messages(&mut request);
+            let copies = |needle: &str| {
+                request
+                    .iter()
+                    .map(|message| match message {
+                        ModelMessage::User { content, .. } => content.matches(needle).count(),
+                        _ => 0,
+                    })
+                    .sum::<usize>()
+            };
+            assert_eq!(copies("finish the original task"), 1, "attempt {attempt}");
+            if attempt >= 2 {
+                assert_eq!(
+                    copies("also preserve the new steering"),
+                    1,
+                    "attempt {attempt}"
+                );
+                assert_eq!(
+                    request
+                        .iter()
+                        .filter(|message| matches!(message,
+                            ModelMessage::Tool { tool_call_id, content, .. }
+                                if tool_call_id == "completed-work" && content == "already done"
+                        ))
+                        .count(),
+                    1,
+                    "completed tool context must survive every retry"
+                );
+                assert_eq!(
+                    request
+                        .iter()
+                        .map(|message| match message {
+                            ModelMessage::User { attachments, .. } => attachments.len(),
+                            _ => 0,
+                        })
+                        .sum::<usize>(),
+                    1,
+                    "new pixels are delivered once, then replayed"
+                );
+            }
+            let mut produced = vec![input];
+            if attempt == 1 {
+                produced.extend([
+                    ModelMessage::assistant(
+                        None,
+                        None,
+                        None,
+                        vec![ModelToolCall::function(
+                            "completed-work".into(),
+                            "exec".into(),
+                            r#"{"cmd":"touch done"}"#.into(),
+                        )],
+                    ),
+                    ModelMessage::Tool {
+                        tool_call_id: "completed-work".into(),
+                        content: "already done".into(),
+                        attachments: Vec::new(),
+                    },
+                ]);
+            }
+            for message in produced {
+                events
+                    .send(SessionEventKind::ProviderEvent {
+                        provider: CodingProvider::Codex,
+                        kind: "native_model_message".into(),
+                        payload: serde_json::to_value(message)?,
+                    })
+                    .await?;
+            }
+            if attempt < 4 {
+                anyhow::bail!("Codex subscription connection failed");
+            }
+            Ok(AgentTurnResult {
+                provider_session_id: None,
+                final_text: "done".into(),
+            })
+        }
+    }
+
+    let root = tempdir().unwrap();
+    let image = root.path().join("steering.png");
+    std::fs::write(&image, real_png_bytes()).unwrap();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let followup_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let executor = Arc::new(RetryExecutor(AtomicUsize::new(0)));
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        let store = Arc::clone(&store);
+        let executor = Arc::clone(&executor);
+        async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    ultrafast: None,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                    name: None,
+                    initial_prompt: Some("finish the original task".into()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                store,
+            )
+            .await
+        }
+    });
+    let mut completed = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+            .await
+            .expect("native retries settle")
+            .expect("session remains attached");
+        match event.kind {
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "network_retry" && payload["attempt"] == 2 =>
+            {
+                command_tx
+                    .send(HostCommand::Prompt {
+                        session_id,
+                        message_id: followup_id,
+                        text: "also preserve the new steering".into(),
+                        attachments: vec![image.clone()],
+                        output_schema: None,
+                        delivery: PromptDelivery::Queue,
+                    })
+                    .await
+                    .unwrap();
+            }
+            SessionEventKind::Message {
+                actor: EventActor::User,
+                message_id,
+                text,
+                attachments,
+                status: MessageStatus::Complete,
+                ..
+            } => {
+                if message_id == followup_id {
+                    assert_eq!(text, "also preserve the new steering");
+                    assert_eq!(attachments, vec![image.clone()]);
+                } else {
+                    assert_eq!(text, "finish the original task");
+                }
+                completed.push(message_id);
+            }
+            SessionEventKind::Message {
+                status: MessageStatus::Failed,
+                ..
+            } => panic!("native retry failed"),
+            SessionEventKind::TurnCompleted { error: None, .. } => break,
+            _ => {}
+        }
+    }
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+    assert_eq!(executor.0.load(Ordering::Acquire), 5);
+    assert_eq!(completed, vec![message_id, followup_id]);
+    scratch.discard().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn connection_retry_with_queued_followup_continues_completed_work() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();

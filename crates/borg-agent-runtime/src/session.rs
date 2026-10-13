@@ -5151,12 +5151,9 @@ async fn run_agent_session_store_kernel_inner(
             prompt_delta.push_str(RESUMED_TURN_CONTINUATION);
             resumed_turn_message_id = None;
         } else if network_retry_message_id == Some(prompt.message_id) {
-            // The request above is re-delivered under its original id so that
-            // cancelling, crash recovery and the message lifecycle all keep
-            // working. That makes the wording load-bearing: without explicitly
-            // demoting it from instruction to history, a resend reads as "do
-            // this again", and for an unattended agent "again" can mean
-            // re-running a command that already took effect.
+            // Keep the original lifecycle id, but resume the work rather than
+            // ask for it again. Native retries keep admitted input in history;
+            // only input not yet journaled is re-delivered with this reminder.
             let recovery = "\n\nThe previous attempt lost its network connection after it may already have run tools and made progress. Treat the request above as work already in progress, not as a new instruction to carry out from the start. The conversation above records what was actually done: continue from there, do not repeat completed actions, and do not restate finished work. Before re-running any command that was interrupted, check whether it already took effect.";
             provider_prompt.push_str(recovery);
             prompt_delta.push_str(recovery);
@@ -5949,6 +5946,21 @@ async fn run_agent_session_store_kernel_inner(
                                 pending.push_front(continuation);
                             } else if retry {
                                 let mut retry_prompt = prompt.clone();
+                                if network_retry && native_provider && journal.context_events().iter().rev()
+                                    .take_while(|event| !matches!(event.kind, SessionEventKind::TurnStarted { .. }))
+                                    .any(|event| matches!(&event.kind,
+                                        SessionEventKind::ProviderEvent { kind, payload, .. }
+                                            if kind == "native_model_message"
+                                                && payload.get("role").and_then(Value::as_str) == Some("user")))
+                                {
+                                    // The native history already holds this input and any
+                                    // completed tools. Keep originals for lifecycle settlement,
+                                    // not as fresh instructions on each reconnect. A queued
+                                    // follow-up can still add its own text and attachments.
+                                    retry_prompt.batch = retry_prompt.batch_entries();
+                                    retry_prompt.text.clear();
+                                    retry_prompt.attachments.clear();
+                                }
                                 retry_prompt.delivery = if network_retry && prompt.actor == EventActor::System {
                                     PromptDelivery::Steer
                                 } else { PromptDelivery::Queue };
