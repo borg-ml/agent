@@ -71,6 +71,10 @@ async fn shell_jobs_retrieve_output_and_cancel_the_owned_process() {
         .await
         .unwrap();
     assert_eq!(result["background"], true);
+    assert_eq!(
+        result["watch_id"], result["session_id"],
+        "one command must have one job identity"
+    );
     let job = Uuid::parse_str(result["watch_id"].as_str().unwrap()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

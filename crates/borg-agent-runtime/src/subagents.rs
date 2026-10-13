@@ -1448,7 +1448,8 @@ impl AgentToolDispatcher {
                 let cancel = CancellationToken::new();
                 let terminate = cancel.clone();
                 let provider = self.execution_provider();
-                let job = watches.run_job(&label, name, async move {
+                let job = watches.run_job_with_id(
+                        process_id,&label, name, async move {
                     tokio::select! {
                         outcome = execution => outcome,
                         _ = terminate.cancelled() => {

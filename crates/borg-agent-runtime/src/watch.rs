@@ -331,6 +331,26 @@ impl Watches {
         execution_cancel: CancellationToken,
         foreground: Duration,
     ) -> Result<Value> {
+        self.run_job_with_id(
+            Uuid::new_v4(),
+            label,
+            command,
+            execution,
+            execution_cancel,
+            foreground,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_job_with_id(
+        &self,
+        job_id: Uuid,
+        label: &str,
+        command: &str,
+        execution: impl std::future::Future<Output = Result<Value>> + Send + 'static,
+        execution_cancel: CancellationToken,
+        foreground: Duration,
+    ) -> Result<Value> {
         ensure!(!self.cancel.is_cancelled(), "session watchers have stopped");
         let started_at = chrono::Utc::now();
         let mut execution = Box::pin(execution);
@@ -352,7 +372,7 @@ impl Watches {
         }
         prune_completed_watches(&mut entries);
         let info = WatchInfo {
-            watch_id: Uuid::new_v4(),
+            watch_id: job_id,
             label: label.to_owned(),
             command: command.to_owned(),
             running: true,
