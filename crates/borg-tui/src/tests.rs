@@ -12143,7 +12143,12 @@ async fn escape_flushes_pending_queue_without_latching_a_stop_and_keeps_the_comp
     let recalled_id = terminal.queued_prompts[0].message_id;
     terminal.composer.replace_text("edited while waiting");
     let attachment = PathBuf::from("/tmp/recalled-image.png");
-    terminal.reconcile_recalled_prompt(None, recalled_id, "recall me", &[attachment.clone()]);
+    terminal.reconcile_recalled_prompt(
+        None,
+        recalled_id,
+        "recall me",
+        std::slice::from_ref(&attachment),
+    );
     assert!(terminal.composer.text.starts_with("edited while waiting"));
     assert_eq!(
         terminal
