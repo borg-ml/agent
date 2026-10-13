@@ -18,6 +18,9 @@ Git comparison.
   status, and usage natively, without requiring the Claude CLI.
 - Draft Claude commit messages through the model-only subscription provider
   rather than an external agent loop.
+- Show Claude subscription usage reliably in `/usage` and `/status`: refresh it
+  from every Claude response and keep the last known values, with their age,
+  when Claude throttles a usage refresh.
 
 ### Remote
 
