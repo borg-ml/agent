@@ -2735,13 +2735,7 @@ impl LaneStore {
         let mut command = if scoped {
             let mut command = Command::new("systemd-run");
             command
-                .args([
-                    "--user",
-                    "--scope",
-                    "--quiet",
-                    "--collect",
-                    "--expand-environment=no",
-                ])
+                .args(["--user", "--scope", "--quiet", "--expand-environment=no"])
                 .arg(format!("--unit={unit}"));
             if let Some(max) = spec.memory_max_bytes {
                 command.args(["-p", &format!("MemoryMax={max}")]);
@@ -2824,7 +2818,21 @@ impl LaneStore {
         let (end, note) = loop {
             if let Some(status) = child.try_wait()? {
                 let code = status.code().unwrap_or(128 + status.signal().unwrap_or(9));
-                break (JobEnd::Exited(code), "finished".to_owned());
+                // Read failed-scope evidence before permitting its collection.
+                let oom = scoped
+                    && !status.success()
+                    && Command::new("systemctl")
+                        .args(["--user", "show", &unit, "-p", "Result", "--value"])
+                        .output()
+                        .is_ok_and(|output| {
+                            output.status.success()
+                                && output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout)
+                                    == b"oom-kill"
+                        });
+                break (
+                    JobEnd::Exited(code),
+                    if oom { "oom-kill" } else { "finished" }.to_owned(),
+                );
             }
             let size = fs::metadata(self.job_dir(id).join("output.log")).map_or(0, |m| m.len());
             let cpu = workload_cpu(cpu_cgroup.as_deref(), scoped, leader);
@@ -2894,6 +2902,13 @@ impl LaneStore {
         // The leader is gone; no process of this workload may outlive it into
         // the next holder's lease (a compiler it started, for example).
         self.kill_workload(id, &unit, scoped, leader, "killed leftover pids")?;
+        if scoped {
+            let _ = Command::new("systemctl")
+                .args(["--user", "reset-failed", &unit])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         self.run_post_for_job(&spec, id, exclusive, &end, &note)?;
         let _ = lease;
         Ok((end, note))

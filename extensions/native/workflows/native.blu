@@ -13,7 +13,7 @@ local GIB = 1024 * 1024 * 1024
 local MIB = 1024 * 1024
 local null = {}
 
-local USAGE = "native: usage: [--project DIR] [--target-dir DIR] [--build-dir DIR] [--reserve-disk-gib N] [--dry-run] "
+local USAGE = "native: usage: [--project DIR] [--jobs N] [--target-dir DIR] [--build-dir DIR] [--reserve-disk-gib N] [--dry-run] "
     .. "(cargo check|build|test [-p PKG] | cmake configure|build [--target T] | "
     .. "ctest test [--exclude-label L] [--label L] [--regex R] | postgres cargo test [-p PKG] | "
     .. "service show|start [--data-dir DIR] [--port N]) [-- EXTRA...]"
@@ -249,7 +249,7 @@ local function words(text)
 end
 
 local VALUED = {
-    ["--project"] = "project", ["--target-dir"] = "target_dir", ["--build-dir"] = "build_dir",
+    ["--jobs"] = "max_jobs", ["--project"] = "project", ["--target-dir"] = "target_dir", ["--build-dir"] = "build_dir",
     ["-p"] = "package", ["--package"] = "package", ["--target"] = "target",
     ["--exclude-label"] = "exclude_label", ["--label"] = "label", ["--regex"] = "regex",
     ["--data-dir"] = "data_dir", ["--port"] = "port",
@@ -320,7 +320,7 @@ local function parse(argv)
         fail(USAGE:sub(9))
     end
     for key in pairs(given) do
-        if not ALLOWED[options.tool][key] and key ~= "project" and key ~= "target_dir" and key ~= "build_dir" then
+        if not ALLOWED[options.tool][key] and key ~= "max_jobs" and key ~= "project" and key ~= "target_dir" and key ~= "build_dir" then
             fail("option for " .. key .. " does not apply to " .. options.tool)
         end
     end
@@ -334,7 +334,7 @@ local function parse(argv)
     return options
 end
 
-local function jobs(f, bytes_per_job)
+local function jobs(f, bytes_per_job, requested_jobs)
     if not f.mem_kb then
         fail("MemAvailable unavailable; cannot size native jobs")
     end
@@ -348,6 +348,13 @@ local function jobs(f, bytes_per_job)
     cap = cap and tonumber(cap)
     if not cap or cap < 1 or cap > 6 then
         fail("BORG_NATIVE_MAX_JOBS must be between 1 and 6")
+    end
+    if requested_jobs then
+        local requested = tonumber(requested_jobs)
+        if not requested or requested < 1 or requested > 6 or requested % 1 ~= 0 then
+            fail("--jobs must be an integer between 1 and 6")
+        end
+        cap = math.min(cap, requested)
     end
     return math.min(cap, tonumber(f.cpus), ram // bytes_per_job)
 end
@@ -413,7 +420,7 @@ local function lane(options)
     local env, command, per_job, job_count = {}, nil, nil, 1
     if kind == "cargo" then
         per_job = 1536 * MIB
-        job_count = jobs(f, per_job)
+        job_count = jobs(f, per_job, options.max_jobs)
         env.CARGO_TARGET_DIR = f.output
         env.CARGO_BUILD_JOBS = tostring(job_count)
         command = { "cargo", options.operation, "-j", env.CARGO_BUILD_JOBS }
@@ -426,7 +433,7 @@ local function lane(options)
         command = { "cmake", "-S", root, "-B", f.output, "-DCMAKE_BUILD_TYPE=Release" }
     elseif kind == "cmake" then
         per_job = 2 * GIB
-        job_count = jobs(f, per_job)
+        job_count = jobs(f, per_job, options.max_jobs)
         command = { "cmake", "--build", f.output, "-j", tostring(job_count) }
         if options.target then
             command[#command + 1] = "--target"
@@ -434,7 +441,7 @@ local function lane(options)
         end
     else
         per_job = 512 * MIB
-        job_count = jobs(f, per_job)
+        job_count = jobs(f, per_job, options.max_jobs)
         command = { "ctest", "--test-dir", f.output, "-j", tostring(job_count), "--output-on-failure" }
         for _, pair in ipairs({ { "-LE", options.exclude_label }, { "-L", options.label }, { "-R", options.regex } }) do
             if pair[2] then
