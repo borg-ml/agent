@@ -3022,6 +3022,14 @@ async fn notify_systemd(arguments: &[&str]) -> bool {
     }
 }
 
+pub(crate) fn spawn_transport_task<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    host_transport::spawn(future)
+}
+
 pub(crate) async fn register_child(
     host: Uuid,
     session_id: Uuid,
@@ -3045,202 +3053,35 @@ pub async fn mirror_local_session(
     commands: mpsc::Sender<HostCommand>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let config: HostConfig = serde_json::from_slice(
-        &fs::read(config_path)
-            .with_context(|| format!("failed to read {}", config_path.display()))?,
-    )
-    .with_context(|| format!("invalid host config {}", config_path.display()))?;
+    let config: HostConfig = serde_json::from_slice(&fs::read(config_path)?)?;
     config.validate()?;
     ensure_execution_boundary(&config)?;
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(35))
-        .build()?;
-    host_transport::get(config.host_id)?
-        .register(session_id, request)
+    let authority = store
+        .postgres_authority()
+        .context("local remote registration requires PostgreSQL authority")?;
+    ensure!(
+        store.contains_session(session_id).await?,
+        "local mirror session does not exist"
+    );
+    let rejection =
+        persist_launch_metadata(&config, store.as_ref(), session_id, &request, None).await?;
+    ensure!(
+        rejection.is_none(),
+        "local session registration rejected: {}",
+        rejection.unwrap_or_default()
+    );
+    // A wakeup is only a hint: the host restores its catalog from the same PG authority.
+    sqlx::query("select pg_notify('borg_session_committed',$1)")
+        .bind(session_id.to_string())
+        .execute(&authority.pool)
         .await?;
-    let scoped_commands = false;
-    let command_cursor = (0, 0, 0);
-    if let Some(binding) = store.workspace_binding(session_id).await? {
-        store
-            .attach_workspace(crate::SessionWorkspaceBinding {
-                host_id: Some(config.host_id),
-                ..binding
-            })
-            .await?;
-    }
-    let workspace_store = store.workspace_store().await?;
-    let mut workspace_sync = JournalSync {
-        uploaded_sequence: 0,
-        uploaded_live_revision: 0,
-        workspace_retry_at: HashMap::new(),
-        uploaded_workspace_sequences: store
-            .host_workspace_cursors(config.host_id, session_id)
-            .await?,
-        workspace_relay_available: false,
-        instance_relay_available: true,
-        next_workspace_roster_sync: Instant::now(),
-        next_instance_directory_sync: Instant::now(),
-        next_inbox_sync: Instant::now(),
-        retry_at: Instant::now(),
-        journal_root: config_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("sessions"),
-        inbox_retry_at: HashMap::new(),
-    };
-
-    let mut capabilities =
-        probe_capabilities_with_profile(config.roots.clone(), config.execution_profile).await;
-    capabilities.resource_limits = config.resource_limits.clone();
-    let (mut command_cursor, mut uploaded_sequence, mut uploaded_live_revision) = command_cursor;
-    let mut command_shutdown = shutdown.clone();
-    let acknowledged = Mutex::new(HostAcknowledgement {
-        sequence: if scoped_commands { command_cursor } else { 0 },
-        claim_token: None,
-    });
-    let presence = async {
-        let mut retry = RemoteRetryBackoff::default();
-        let mut capabilities_probed_at = Instant::now();
-        loop {
-            if capabilities_probed_at.elapsed() >= Duration::from_secs(300) {
-                capabilities =
-                    probe_capabilities_with_profile(config.roots.clone(), config.execution_profile)
-                        .await;
-                capabilities.resource_limits = config.resource_limits.clone();
-                capabilities_probed_at = Instant::now();
-            }
-            let acknowledgement = *acknowledged.lock().await;
-            let delay = match heartbeat(
-                &client,
-                &config,
-                capabilities.clone(),
-                acknowledgement.sequence,
-                acknowledgement.claim_token,
-                vec![session_id],
-                scoped_commands.then_some(session_id),
-            )
-            .await
-            {
-                Ok(()) => {
-                    retry.reset();
-                    HOST_HEARTBEAT_INTERVAL
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "local session heartbeat failed");
-                    retry.next_delay(None).min(HOST_HEARTBEAT_RETRY_MAX)
-                }
-            };
-            tokio::time::sleep(delay).await;
+    let _ = commands; // The canonical local-control socket remains the actor ingress.
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            break;
         }
-    };
-    let control = async { std::future::pending::<Result<()>>().await };
-    let journal = async {
-        // A run of unstoreable events means the relay is rejecting the journal
-        // wholesale; past this many, blocking is safer than skipping.
-        const MAX_CONSECUTIVE_UNSTOREABLE_SKIPS: usize = 64;
-        let mut unstoreable_skips = 0usize;
-        let mut event_retry_at = Instant::now();
-        let mut shutdown_flush_pending = false;
-        loop {
-            let mut caught_up = false;
-            if Instant::now() >= event_retry_at {
-                let pending = store
-                    .events_after(session_id, uploaded_sequence, 1_024)
-                    .await?;
-                match upload_event_page(
-                    &client,
-                    &config,
-                    store.as_ref(),
-                    &pending,
-                    &mut uploaded_sequence,
-                    Duration::from_secs(5),
-                )
-                .await?
-                {
-                    EventUploadOutcome::Complete => {
-                        unstoreable_skips = 0;
-                        if upload_live_state(
-                            &client,
-                            &config,
-                            store.as_ref(),
-                            session_id,
-                            &mut uploaded_live_revision,
-                        )
-                        .await?
-                        {
-                            caught_up = pending.len() < 1_024;
-                            event_retry_at = Instant::now();
-                        } else {
-                            event_retry_at = Instant::now() + Duration::from_secs(2);
-                        }
-                    }
-                    EventUploadOutcome::Retryable => {
-                        event_retry_at = Instant::now() + Duration::from_secs(2);
-                    }
-                    EventUploadOutcome::Blocked { .. } => {
-                        // Keep heartbeats and remote interrupt/stop commands alive
-                        // without rereading the same irreducible event in a loop.
-                        event_retry_at = Instant::now() + Duration::from_secs(300);
-                    }
-                    EventUploadOutcome::Skipped { sequence } => {
-                        // One unstoreable event must not cost the session its
-                        // remote access forever. But a relay that rejects
-                        // everything means replay is silently discarding the
-                        // journal, so a run of them stops and blocks instead.
-                        unstoreable_skips += 1;
-                        if unstoreable_skips >= MAX_CONSECUTIVE_UNSTOREABLE_SKIPS {
-                            tracing::error!(
-                                session_id = %session_id,
-                                sequence,
-                                unstoreable_skips,
-                                "remote relay rejected a run of events; replay is blocked rather \
-                                 than skipping the rest of the journal"
-                            );
-                            event_retry_at = Instant::now() + Duration::from_secs(300);
-                        } else {
-                            event_retry_at = Instant::now();
-                        }
-                    }
-                }
-            }
-            let workspace_caught_up = flush_host_workspace_messages(
-                &client,
-                &config,
-                store.as_ref(),
-                workspace_store.as_deref(),
-                session_id,
-                None,
-                &mut workspace_sync,
-            )
-            .await?;
-            // A shutdown can arrive after this iteration read an empty suffix but
-            // before the actor commits its terminal status. Only finish after one
-            // complete upload pass that began after shutdown was observed.
-            if shutdown_flush_pending && caught_up && workspace_caught_up {
-                return Ok(());
-            }
-            if *shutdown.borrow() {
-                shutdown_flush_pending = true;
-                let retry_delay = event_retry_at.saturating_duration_since(Instant::now());
-                if retry_delay.is_zero() {
-                    tokio::task::yield_now().await;
-                } else {
-                    tokio::time::sleep(retry_delay).await;
-                }
-                continue;
-            }
-            if wait_for_mirror_shutdown(&mut shutdown, Duration::from_millis(250)).await {
-                shutdown_flush_pending = true;
-                continue;
-            }
-        }
-    };
-    tokio::select! {
-        () = presence => unreachable!(),
-        result = control => result,
-        result = journal => result,
     }
+    Ok(())
 }
 
 async fn wait_for_mirror_shutdown(shutdown: &mut watch::Receiver<bool>, delay: Duration) -> bool {
@@ -3331,6 +3172,31 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
         receipts,
         executor_factory,
     } = context;
+    if !matches!(command, HostCommand::Launch { .. }) {
+        if let Some(session_id) = command.session_id() {
+            let root = match session_store.owning_root_session(session_id).await {
+                Ok(root) => root.unwrap_or(session_id),
+                Err(error) => {
+                    tracing::warn!(%error, "cannot resolve local session owner");
+                    return false;
+                }
+            };
+            let socket = crate::local_control::session_control_socket_path(&session_root, root);
+            if crate::local_control::session_control_socket_is_reachable(&socket).await {
+                match session_store.host_launch_owner(root).await {
+                    Ok(Some((host, origin)))
+                        if host == config.host_id
+                            && host_relay_origin(&config).ok().as_ref() == Some(&origin) => {}
+                    _ => return false,
+                }
+                return crate::local_control::send_local_session_command(
+                    &socket, session_id, command,
+                )
+                .await
+                .is_ok();
+            }
+        }
+    }
     if let Some(request_id) = deferred_host_operation_id(&command) {
         return match receipts
             .enqueue_host_command(config.host_id, request_id, &command)
@@ -4755,6 +4621,20 @@ async fn resume_pending_host_sessions(
         0
     };
     for (session_id, value) in pending {
+        let root = session_store
+            .owning_root_session(session_id)
+            .await?
+            .unwrap_or(session_id);
+        let socket = crate::local_control::session_control_socket_path(session_root, root);
+        if crate::local_control::session_control_socket_is_reachable(&socket).await {
+            continue;
+        }
+        // Never restore a second actor while a canonical writer owns the journal.
+        match SessionWriterLease::acquire(session_root.join(format!("{root}.lock"))) {
+            Ok(lease) => drop(lease),
+            Err(_) => continue,
+        }
+
         if let Err(error) =
             validate_stored_host_identity(config, session_store.as_ref(), session_id).await
         {
