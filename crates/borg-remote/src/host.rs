@@ -1295,15 +1295,16 @@ async fn probe_provider_capabilities_uncached(
     managed_kimi: bool,
     mode: ProviderProbeMode,
 ) -> Vec<ProviderCapability> {
-    let (codex, claude, opencode, kimi, openrouter, compatible) = tokio::join!(
+    let (codex, claude, opencode, kimi, openrouter, compatible, muse) = tokio::join!(
         probe_provider(CodingProvider::Codex, managed_kimi, mode),
         probe_provider(CodingProvider::Claude, managed_kimi, mode),
         probe_provider(CodingProvider::OpenCode, managed_kimi, mode),
         probe_provider(CodingProvider::Kimi, managed_kimi, mode),
         probe_provider(CodingProvider::OpenRouter, managed_kimi, mode),
         probe_provider(CodingProvider::OpenAiCompatible, managed_kimi, mode),
+        probe_provider(CodingProvider::Muse, managed_kimi, mode),
     );
-    let capabilities = vec![codex, claude, opencode, kimi, openrouter, compatible];
+    let capabilities = vec![codex, claude, opencode, kimi, openrouter, compatible, muse];
     match mode {
         // Launch only needs locally available authentication routes. Starting
         // provider subprocesses to refresh subscription usage blocks first
@@ -1334,6 +1335,10 @@ async fn probe_provider(
         && borg_provider::credentials::opencode_go_api_key().is_some();
     let (version, subscription_authenticated) = if native_go {
         (None, true)
+    } else if provider == CodingProvider::Muse {
+        // The official launcher can download or prompt even for --version.
+        // Capability discovery must not start it or imply a paid entitlement.
+        (None, muse_stored_credentials_present())
     } else if provider == CodingProvider::Claude {
         (
             None,
@@ -1500,14 +1505,14 @@ async fn probe_provider(
             }
         }
         CodingProvider::Muse => {
-            if subscription_authenticated {
-                auth_methods.push(ProviderAuthMethod::Subscription);
-                detail.push("Muse Code subscription authenticated");
-                Some(BillingLane::Subscription)
-            } else if nonempty_env("META_API_KEY").is_some() {
+            if nonempty_env("META_API_KEY").is_some() {
                 auth_methods.push(ProviderAuthMethod::ApiKey);
-                detail.push("Meta API key configured");
+                detail.push("META_API_KEY overrides Muse Code account login (pay-as-you-go)");
                 Some(BillingLane::ApiKey)
+            } else if subscription_authenticated {
+                auth_methods.push(ProviderAuthMethod::ApiKey);
+                detail.push("Muse Code managed credential available; subscription entitlement and billing are determined by Muse Code");
+                None
             } else {
                 None
             }
@@ -1640,6 +1645,11 @@ async fn probe_provider(
         !auth_methods.is_empty()
     };
     let installed = match provider {
+        CodingProvider::Muse => {
+            borg_provider::provider_bin::resolve_uncached(borg_provider::Runtime::Muse)
+                .await
+                .is_ok()
+        }
         // These routes execute in Borg's native harness; they do not depend
         // on a separately installed `borg` executable being discoverable in a
         // service user's PATH.
@@ -1653,7 +1663,7 @@ async fn probe_provider(
         | CodingProvider::Vercel
         | CodingProvider::OpenAiCompatible => true,
         CodingProvider::OpenCode if native_go => true,
-        CodingProvider::OpenCode | CodingProvider::Grok | CodingProvider::Muse => match mode {
+        CodingProvider::OpenCode | CodingProvider::Grok => match mode {
             ProviderProbeMode::Admission => {
                 executable_in_path(Path::new(provider.executable())).is_some()
             }
@@ -1692,7 +1702,7 @@ pub fn provider_subscription_credentials_present(provider: CodingProvider) -> bo
             .as_ref()
             .is_some_and(opencode_auth_json_authenticated),
         CodingProvider::Grok => grok_credentials_present(),
-        CodingProvider::Muse => muse_credentials_present(),
+        CodingProvider::Muse => muse_stored_credentials_present(),
         CodingProvider::Anthropic
         | CodingProvider::Kimi
         | CodingProvider::Glm
@@ -1713,14 +1723,30 @@ fn grok_credentials_present() -> bool {
             .is_some_and(|path| path.is_file())
 }
 
-/// Muse Code stores the credential `muse auth set` / browser sign-in writes
-/// under `~/.muse`; `META_API_KEY` is the CI alternative.
+/// Muse Code uses its XDG configuration auth file, not the installation directory.
 fn muse_credentials_present() -> bool {
-    nonempty_env("META_API_KEY").is_some()
-        || std::env::var_os("HOME")
-            .filter(|home| !home.is_empty())
-            .map(|home| PathBuf::from(home).join(".muse"))
-            .is_some_and(|path| path.is_dir())
+    nonempty_env("META_API_KEY").is_some() || muse_stored_credentials_present()
+}
+
+fn muse_stored_credentials_present() -> bool {
+    let root = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(|home| PathBuf::from(home).join(".config"))
+        });
+    root.and_then(|root| read_bounded_auth_json(&root.join("muse/auth.json")))
+        .as_ref()
+        .is_some_and(muse_auth_json_authenticated)
+}
+
+fn muse_auth_json_authenticated(value: &serde_json::Value) -> bool {
+    value
+        .pointer("/providers/meta/api_key")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|key| !key.trim().is_empty())
 }
 
 /// On macOS the Claude CLI keeps its OAuth session in the login Keychain and
@@ -2087,7 +2113,11 @@ pub async fn login_provider(provider: CodingProvider) -> Result<()> {
     if matches!(provider, CodingProvider::Codex | CodingProvider::Claude) {
         return login_provider_with_output(provider, |line| println!("{line}")).await;
     }
-    let command = Command::new(provider.executable());
+    let command = if provider == CodingProvider::Muse {
+        borg_provider::provider_bin::command(borg_provider::Runtime::Muse).await?
+    } else {
+        Command::new(provider.executable())
+    };
     let status = provider_login_command(provider, command)?
         .status()
         .await
@@ -2105,6 +2135,7 @@ pub async fn login_provider(provider: CodingProvider) -> Result<()> {
         match provider {
             CodingProvider::Codex => codex_auth_status_authenticated(&auth),
             CodingProvider::Claude => claude_auth_status_authenticated(&auth),
+            CodingProvider::Muse => muse_stored_credentials_present(),
             _ => !auth.trim().is_empty(),
         },
         "{} login completed but no authenticated session is available",
@@ -2172,7 +2203,11 @@ pub async fn login_provider_with_output(
         on_output("Connected ChatGPT subscription. Saved API credentials were kept.");
         return Ok(());
     }
-    let command = Command::new(provider.executable());
+    let command = if provider == CodingProvider::Muse {
+        borg_provider::provider_bin::command(borg_provider::Runtime::Muse).await?
+    } else {
+        Command::new(provider.executable())
+    };
     let mut command = provider_login_command(provider, command)?;
     command
         .stdin(Stdio::null())
@@ -2214,6 +2249,7 @@ pub async fn login_provider_with_output(
         match provider {
             CodingProvider::Codex => codex_auth_status_authenticated(&auth),
             CodingProvider::Claude => claude_auth_status_authenticated(&auth),
+            CodingProvider::Muse => muse_stored_credentials_present(),
             _ => !auth.trim().is_empty(),
         },
         "{} login completed but no authenticated session is available",
@@ -6900,6 +6936,21 @@ mod tests {
     }
     use crate::session_store::postgres::PostgresSessionStore;
     use crate::session_store::postgres::testing::ScratchDatabase;
+
+    #[test]
+    fn muse_auth_requires_a_nonempty_meta_credential() {
+        assert!(muse_auth_json_authenticated(
+            &serde_json::json!({"schema_version":1,"providers":{"meta":{"api_key":"test-key"}}})
+        ));
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"providers":{"meta":{"api_key":" "}}}),
+            serde_json::json!({"providers":{"other":{"api_key":"test-key"}}}),
+        ] {
+            assert!(!muse_auth_json_authenticated(&value));
+        }
+    }
+
     use borg_agent_runtime::receipt_postgres::PostgresReceiptStore;
     use chrono::Duration as ChronoDuration;
     use sqlx::postgres::PgPoolOptions;

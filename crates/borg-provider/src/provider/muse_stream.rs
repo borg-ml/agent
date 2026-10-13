@@ -63,6 +63,13 @@ async fn run(
         .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+    anyhow::ensure!(
+        request.model.as_deref() != Some("muse-wonder-full-1.0")
+            || std::env::var("META_API_KEY")
+                .ok()
+                .is_none_or(|key| key.trim().is_empty()),
+        "Muse Wonder Full requires a Muse Code subscription; META_API_KEY selects pay-as-you-go billing. Unset it and sign in with muse login."
+    );
     let mut command = crate::provider_bin::command(crate::provider_bin::Runtime::Muse).await?;
     command
         .current_dir(&cwd)
@@ -82,6 +89,13 @@ async fn run(
         .filter(|m| !m.is_empty())
     {
         command.arg("--model").arg(model);
+    }
+    if let Some(effort) = request.effort.as_deref() {
+        anyhow::ensure!(
+            crate::MUSE_EFFORT_LEVELS.contains(&effort),
+            "unsupported Muse reasoning effort: {effort}"
+        );
+        command.arg("--reasoning-effort").arg(effort);
     }
     match permission {
         // A headless run has no interactive approval surface, so the policy is

@@ -2621,7 +2621,13 @@ fn model_picker_options_with_configured(
         };
         for (index, (id, label)) in catalog.selectable_models.iter().enumerate() {
             let mut option = PickerOption::new(format!("{label} · {id}"), *id);
-            option.preview = Some((*label).to_string());
+            option.preview = Some(
+                if target == CodingProvider::Muse && *id == "muse-wonder-full-1.0" {
+                    "Requires Muse Code Power Usage or Maximum Usage subscription; unavailable with pay-as-you-go API keys.".to_string()
+                } else {
+                    (*label).to_string()
+                },
+            );
             if index == 0 {
                 option.section = Some(target.label().to_string());
             }
@@ -2686,12 +2692,7 @@ fn model_picker_options_with_configured(
                 borg_provider::grok_product_model(),
             ));
         }
-        Some(CodingProvider::Muse) => {
-            options.push(PickerOption::new(
-                borg_provider::muse_product_model(),
-                borg_provider::muse_product_model(),
-            ));
-        }
+        Some(CodingProvider::Muse) => {}
         Some(CodingProvider::Glm) => {
             // The Coding Plan serves these two; older ids are silently routed
             // to them by the vendor, so offering them would mislead.
@@ -5661,7 +5662,7 @@ impl BorgTerminal {
                 "api-key" if provider == CodingProvider::Codex => "Use your saved OpenAI key, or enter one privately. Requests are billed to your OpenAI API account. Your ChatGPT login is kept.",
                 "api-key" | "replace-api-key" if provider == CodingProvider::OpenCode => "Get your subscription key at opencode.ai/auth. Go models use your Go allowance; select one in /model.",
                 "reconnect-subscription" if provider == CodingProvider::Grok => "Opens the Grok Build sign-in. SuperGrok and X Premium Plus plans are supported; set XAI_API_KEY to use the API instead.",
-                "reconnect-subscription" if provider == CodingProvider::Muse => "Opens the Muse Code sign-in with your Meta Model API account; set META_API_KEY for CI.",
+                "reconnect-subscription" if provider == CodingProvider::Muse => "Opens Muse Code account sign-in. META_API_KEY and stored API keys override subscription login and use pay-as-you-go billing.",
                 _ => "Credentials are entered privately and are never added to the conversation.",
             }.to_string());
         }

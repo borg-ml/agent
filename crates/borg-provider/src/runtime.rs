@@ -52,7 +52,20 @@ pub const CLAUDE_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
     effort_levels: &CLAUDE_EFFORT_LEVELS,
 };
 
-pub const MODEL_CATALOGS: [ProviderModelCatalog; 2] = [CODEX_MODEL_CATALOG, CLAUDE_MODEL_CATALOG];
+pub const MUSE_EFFORT_LEVELS: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+pub const MUSE_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
+    backend: "muse",
+    default_model: "muse-spark-1.2",
+    selectable_models: MUSE_MODELS,
+    effort_levels: &MUSE_EFFORT_LEVELS,
+};
+pub const MODEL_CATALOGS: [ProviderModelCatalog; 3] = [
+    CODEX_MODEL_CATALOG,
+    CLAUDE_MODEL_CATALOG,
+    MUSE_MODEL_CATALOG,
+];
 
 pub fn model_catalog_for_backend(backend: &str) -> Option<ProviderModelCatalog> {
     MODEL_CATALOGS
@@ -197,6 +210,17 @@ pub fn grok_product_model() -> &'static str {
 pub fn muse_product_model() -> &'static str {
     "muse-spark-1.2"
 }
+
+/// Muse Code models available through its subscription-compatible CLI route.
+pub const MUSE_MODELS: &[(&str, &str)] = &[
+    ("muse-wonder-1.0", "Muse Wonder"),
+    (
+        "muse-wonder-full-1.0",
+        "Muse Wonder Full (subscription only)",
+    ),
+    ("muse-spark-1.3", "Muse Spark 1.3"),
+    ("muse-spark-1.2", "Muse Spark 1.2"),
+];
 
 /// A runtime-discovered model entry for the /model picker.
 #[derive(Debug, Clone, PartialEq, Eq)]

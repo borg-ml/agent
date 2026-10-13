@@ -257,7 +257,7 @@ impl CodingProvider {
     ];
 
     /// Every provider that publishes a fixed model catalog, in picker order.
-    pub const CATALOG_PROVIDERS: [Self; 2] = [Self::Codex, Self::Claude];
+    pub const CATALOG_PROVIDERS: [Self; 3] = [Self::Codex, Self::Claude, Self::Muse];
 
     /// The provider whose catalog lists `model`, if any. Model ids are unique
     /// across catalogs, so this is what lets the model picker offer models
@@ -276,7 +276,6 @@ impl CodingProvider {
             .or_else(|| (model == borg_provider::glm_product_model()).then_some(Self::Glm))
             .or_else(|| (model == borg_provider::qwen_product_model()).then_some(Self::Qwen))
             .or_else(|| (model == borg_provider::grok_product_model()).then_some(Self::Grok))
-            .or_else(|| (model == borg_provider::muse_product_model()).then_some(Self::Muse))
             .or_else(|| {
                 model
                     .strip_prefix("opencode/")
@@ -1231,6 +1230,7 @@ pub fn provider_capabilities_prompt(capabilities: &[ProviderCapability]) -> Stri
         CodingProvider::Kimi,
         CodingProvider::OpenRouter,
         CodingProvider::OpenAiCompatible,
+        CodingProvider::Muse,
     ] {
         let Some(capability) = capabilities.iter().find(|item| item.provider == provider) else {
             prompt.push_str(&format!(
@@ -2945,6 +2945,9 @@ mod tests {
             Some(CodingProvider::OpenRouter)
         );
         assert_eq!(CodingProvider::for_model("some/openrouter-model"), None);
+        for &(model, _) in borg_provider::MUSE_MODELS {
+            assert_eq!(CodingProvider::for_model(model), Some(CodingProvider::Muse));
+        }
         assert_eq!(
             CodingProvider::for_model("opencode-go/kimi-k2.7-code"),
             Some(CodingProvider::OpenCode)

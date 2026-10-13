@@ -1990,6 +1990,19 @@ fn model_and_effort_pickers_use_the_provider_catalog() {
         assert!(values.contains(&model), "{model} missing from picker");
     }
 
+    for &(model, _) in borg_provider::MUSE_MODELS {
+        assert!(values.contains(&model), "{model} missing from picker");
+    }
+    let full = options
+        .iter()
+        .find(|option| option.value == "muse-wonder-full-1.0")
+        .unwrap();
+    assert!(full.preview.as_deref().unwrap().contains("subscription"));
+    assert_eq!(
+        effort_picker_options(Some(CodingProvider::Muse), Some("muse-wonder-1.0")),
+        borg_provider::MUSE_EFFORT_LEVELS
+    );
+
     let claude_options = model_picker_options(Some(CodingProvider::Claude), None);
     assert_eq!(claude_options[0].section.as_deref(), Some("Codex"));
     assert!(

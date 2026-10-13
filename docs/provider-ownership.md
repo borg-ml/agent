@@ -608,3 +608,23 @@ replace an already running installed process. No Claude-specific source files
 changed in this migration, and Claude runtime regressions passed in the full
 suite. These limitations remain explicit rather than gating completion on an
 unrequested credential replacement or deployment.
+
+## Muse Code
+
+Muse Wonder (`muse-wonder-1.0`) and Muse Wonder Full
+(`muse-wonder-full-1.0`) are separate model selections. Wonder Full requires
+Muse Code's Power Usage or Maximum Usage subscription; raising Wonder's
+reasoning effort does not select Full. Borg forwards the selected model and
+reasoning effort to the Muse Code CLI, without substituting another model.
+
+Select Muse and use `/login` (or run `muse login`) for Meta account sign-in.
+`META_API_KEY` and stored API keys take precedence over account login; they
+can select pay-as-you-go billing. Borg refuses Wonder Full when an environment
+API key overrides the subscription. A stored Muse credential alone does not
+prove the account's plan, so Borg leaves its billing lane unknown rather than
+claiming a verified subscription. Plan eligibility and usage limits remain
+Muse Code's responsibility. Borg does not change Contributor mode or promise
+subscription usage counters that the CLI does not expose.
+
+Meta documents these constraints in [Muse model availability](https://dev.meta.ai/docs/models#muse-wonder-availability)
+and [Muse Code authentication](https://dev.meta.ai/docs/muse-code/auth).
