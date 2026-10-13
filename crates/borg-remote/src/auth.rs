@@ -46,7 +46,9 @@ pub enum TunnelFrame {
     AuthenticationRejected { reason: String },
     /// Trusted relay owner-service ingress only; viewer Client frames cannot emit this.
     HostCommand { command_id: String, command: borg_agent_runtime::HostCommand, not_after: Option<i64> },
+    HostCommandAccepted { command_id: String },
     HostCommandResult { command_id: String, outcome: serde_json::Value, error: Option<String> },
+    Routes { routes: Vec<HostRoute> },
     Heartbeat { heartbeat: borg_agent_runtime::HostHeartbeat },
     RegisterSession { registration_id: String, session_id: String, request: borg_agent_runtime::LaunchSession },
     RegisteredSession { registration_id: String, session_id: String, error: Option<String> },
@@ -78,3 +80,7 @@ pub enum ServicePurpose { ProductView }
 // Read-only by definition: service grants cannot command/approve/configure.
 // Proof: `borg.remote.service.v2\n{ticket_id}\n{nonce}` signed by the ephemeral
 // service key whose public key is included in relay-signed ServiceTicketClaims.
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRoute { pub url: String, pub server_name: String, pub protocol: u32 }

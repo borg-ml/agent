@@ -59,7 +59,11 @@ impl CommandLedger {
         ensure!(result.len()<=1_048_576,"command result exceeds budget");
         let changed=sqlx::query("update remote_command_receipts set result=$3 where host_id=$1 and command_id=$2 and result is null")
             .bind(host).bind(id).bind(result).execute(&self.pool).await?.rows_affected();
-        ensure!(changed==1,"command result already completed or admission missing");
+        if changed==0 {
+            let existing:Option<Option<Vec<u8>>>=sqlx::query_scalar("select result from remote_command_receipts where host_id=$1 and command_id=$2")
+                .bind(host).bind(id).fetch_optional(&self.pool).await?;
+            ensure!(existing.flatten().as_deref()==Some(result),"different terminal result or admission missing");
+        }
         Ok(())
     }
 }

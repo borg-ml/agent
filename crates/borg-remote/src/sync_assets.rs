@@ -14,8 +14,8 @@ impl SyncAuthority {
             let field=match address.field {TextField::Message=>"message",TextField::Reasoning|TextField::ToolInput=>"tool_input",TextField::ToolOutput=>"tool_output"};
             let pinned=address.bytes.parse::<usize>()?;
             ensure!(start<=pinned,"asset offset exceeds captured prefix");
-            let (body,current)=crate::row_index::field_page(&self.pg.pool,&key,&address.row_id,field,start,budget.min(pinned-start).max(1)).await?;
-            ensure!(current>=pinned,"captured text prefix unavailable");
+            let (body,current)=crate::row_index::field_page_at(&self.pg.pool,&key,&address.row_id,field,Some(&address.revision),start,budget.min(pinned-start).max(1)).await?;
+            ensure!(current==pinned,"captured text prefix identity mismatch");
             (body.into_iter().take(pinned-start).collect::<Vec<_>>(),pinned,"text/plain".to_owned())
         } else {
             let payload=Uuid::parse_str(&asset_id)?;

@@ -95,41 +95,41 @@ pub async fn text_page(pool: &sqlx::PgPool, scope: &str, id: &str, offset: i64, 
 /// Field-addressed active text includes queue/held-tail references, which have
 /// no visible row. This namespace is also the `view-text:` asset authority.
 pub async fn initialize_text_fields(pool: &sqlx::PgPool) -> Result<()> {
-    sqlx::raw_sql("create table if not exists remote_view_text_heads(scope text not null,row_id text not null,field text not null,revision text not null,text_bytes bigint not null,primary key(scope,row_id,field));
-        create table if not exists remote_view_field_chunks(scope text not null,row_id text not null,field text not null,byte_offset bigint not null,body bytea not null,primary key(scope,row_id,field,byte_offset),foreign key(scope,row_id,field) references remote_view_text_heads(scope,row_id,field) on delete cascade);")
+    sqlx::raw_sql("create table if not exists remote_view_text_heads(scope text not null,row_id text not null,field text not null,revision text not null,text_bytes bigint not null,generation uuid not null,primary key(scope,row_id,field));
+        create table if not exists remote_view_field_chunks(scope text not null,row_id text not null,field text not null,generation uuid not null,byte_offset bigint not null,body bytea not null,primary key(scope,row_id,field,generation,byte_offset));")
         .execute(pool).await?;
+    sqlx::query("create table if not exists remote_view_text_versions(scope text not null,row_id text not null,field text not null,revision text not null,text_bytes bigint not null,generation uuid not null,primary key(scope,row_id,field,revision))").execute(pool).await?;
     Ok(())
 }
 
 /// Persist only the newly appended suffix, or one explicit replacement at a
 /// lifecycle correction. Revision labels refer to the reducer's row version.
 pub async fn persist_text(tx: &mut Transaction<'_,Postgres>,scope:&str,id:&str,field:&str,revision:&str,text:&str,replace:bool)->Result<()> {
-    let prior: Option<i64> = sqlx::query_scalar("select text_bytes from remote_view_text_heads where scope=$1 and row_id=$2 and field=$3 for update")
+    let prior: Option<(i64,uuid::Uuid)> = sqlx::query_as("select text_bytes,generation from remote_view_text_heads where scope=$1 and row_id=$2 and field=$3 for update")
         .bind(scope).bind(id).bind(field).fetch_optional(&mut **tx).await?;
-    let mut offset=prior.unwrap_or(0) as usize;
-    if replace || offset>text.len() {
-        sqlx::query("delete from remote_view_field_chunks where scope=$1 and row_id=$2 and field=$3").bind(scope).bind(id).bind(field).execute(&mut **tx).await?;
-        offset=0;
-    }
+    let (mut offset,mut generation)=prior.map(|(bytes,generation)|(bytes as usize,generation)).unwrap_or((0,uuid::Uuid::new_v4()));
+    if replace || offset>text.len() {offset=0;generation=uuid::Uuid::new_v4();}
     let delta=text.get(offset..).ok_or_else(||anyhow::anyhow!("text persistence offset splits UTF-8"))?;
-    sqlx::query("insert into remote_view_text_heads values($1,$2,$3,$4,$5) on conflict(scope,row_id,field) do update set revision=excluded.revision,text_bytes=excluded.text_bytes")
-        .bind(scope).bind(id).bind(field).bind(revision).bind(text.len() as i64).execute(&mut **tx).await?;
+    sqlx::query("insert into remote_view_text_heads values($1,$2,$3,$4,$5,$6) on conflict(scope,row_id,field) do update set revision=excluded.revision,text_bytes=excluded.text_bytes,generation=excluded.generation")
+        .bind(scope).bind(id).bind(field).bind(revision).bind(text.len() as i64).bind(generation).execute(&mut **tx).await?;
     if !delta.is_empty() {
-        sqlx::query("insert into remote_view_field_chunks values($1,$2,$3,$4,$5)").bind(scope).bind(id).bind(field).bind(offset as i64).bind(delta.as_bytes()).execute(&mut **tx).await?;
+        sqlx::query("insert into remote_view_field_chunks values($1,$2,$3,$4,$5,$6)").bind(scope).bind(id).bind(field).bind(generation).bind(offset as i64).bind(delta.as_bytes()).execute(&mut **tx).await?;
     }
+    sqlx::query("insert into remote_view_text_versions values($1,$2,$3,$4,$5,$6) on conflict(scope,row_id,field,revision) do update set text_bytes=excluded.text_bytes,generation=excluded.generation")
+        .bind(scope).bind(id).bind(field).bind(revision).bind(text.len() as i64).bind(generation).execute(&mut **tx).await?;
     Ok(())
 }
 
 pub async fn resolve_text(pool:&sqlx::PgPool,scope:&str,id:&str,field:&str,revision:&str,bytes:usize)->Result<String> {
     let mut tx=pool.begin().await?;
     sqlx::query("set transaction isolation level repeatable read read only").execute(&mut *tx).await?;
-    let head=sqlx::query("select revision,text_bytes from remote_view_text_heads where scope=$1 and row_id=$2 and field=$3")
+    let head=sqlx::query("select revision,text_bytes,generation from remote_view_text_heads where scope=$1 and row_id=$2 and field=$3")
         .bind(scope).bind(id).bind(field).fetch_optional(&mut *tx).await?;
     if head.is_none() && bytes==0 {return Ok(String::new())}
     let head=head.ok_or_else(||anyhow::anyhow!("missing checkpoint text"))?;
     ensure!(head.try_get::<String,_>("revision")?==revision && head.try_get::<i64,_>("text_bytes")?==bytes as i64,"checkpoint text revision/length mismatch");
-    let chunks:Vec<Vec<u8>>=sqlx::query_scalar("select body from remote_view_field_chunks where scope=$1 and row_id=$2 and field=$3 order by byte_offset")
-        .bind(scope).bind(id).bind(field).fetch_all(&mut *tx).await?;
+    let chunks:Vec<Vec<u8>>=sqlx::query_scalar("select body from remote_view_field_chunks where scope=$1 and row_id=$2 and field=$3 and generation=$4 order by byte_offset")
+        .bind(scope).bind(id).bind(field).bind(head.try_get::<uuid::Uuid,_>("generation")?).fetch_all(&mut *tx).await?;
     let mut body=Vec::with_capacity(bytes);
     for chunk in chunks {body.extend(chunk);}
     ensure!(body.len()==bytes,"checkpoint text gap");
@@ -139,19 +139,54 @@ pub async fn resolve_text(pool:&sqlx::PgPool,scope:&str,id:&str,field:&str,revis
 
 /// Reads never fetch a whole accumulated chunk from PostgreSQL into the host.
 pub async fn field_page(pool:&sqlx::PgPool,scope:&str,id:&str,field:&str,offset:usize,budget:usize)->Result<(Vec<u8>,usize)> {
+    field_page_at(pool,scope,id,field,None,offset,budget).await
+}
+pub async fn field_page_at(pool:&sqlx::PgPool,scope:&str,id:&str,field:&str,revision:Option<&str>,offset:usize,budget:usize)->Result<(Vec<u8>,usize)> {
     ensure!((1..=65_536).contains(&budget),"asset page budget exceeds limit");
     let mut tx=pool.begin().await?;
     sqlx::query("set transaction isolation level repeatable read read only").execute(&mut *tx).await?;
-    let total:Option<i64>=sqlx::query_scalar("select text_bytes from remote_view_text_heads where scope=$1 and row_id=$2 and field=$3")
-        .bind(scope).bind(id).bind(field).fetch_optional(&mut *tx).await?;
-    let total=usize::try_from(total.ok_or_else(||anyhow::anyhow!("unknown view text asset"))?)?;
+    let total:Option<(i64,uuid::Uuid)>=if let Some(revision)=revision {
+        sqlx::query_as("select text_bytes,generation from remote_view_text_versions where scope=$1 and row_id=$2 and field=$3 and revision=$4")
+            .bind(scope).bind(id).bind(field).bind(revision).fetch_optional(&mut *tx).await?
+    } else {
+        sqlx::query_as("select text_bytes,generation from remote_view_text_heads where scope=$1 and row_id=$2 and field=$3")
+            .bind(scope).bind(id).bind(field).fetch_optional(&mut *tx).await?
+    };
+    let (total,generation)=total.ok_or_else(||anyhow::anyhow!("unknown view text asset"))?;
+    let total=usize::try_from(total)?;
     ensure!(offset<=total,"asset offset outside body");
     let end=offset.checked_add(budget).ok_or_else(||anyhow::anyhow!("asset range exhausted"))?.min(total);
-    let chunks:Vec<Vec<u8>>=sqlx::query_scalar("select substring(body from (greatest($4-byte_offset,0)+1)::integer for (least(byte_offset+octet_length(body),$5)-greatest($4,byte_offset))::integer) from remote_view_field_chunks where scope=$1 and row_id=$2 and field=$3 and byte_offset<$5 and byte_offset+octet_length(body)>$4 order by byte_offset limit 65536")
-        .bind(scope).bind(id).bind(field).bind(i64::try_from(offset)?).bind(i64::try_from(end)?).fetch_all(&mut *tx).await?;
+    let chunks:Vec<Vec<u8>>=sqlx::query_scalar("select substring(body from (greatest($4-byte_offset,0)+1)::integer for (least(byte_offset+octet_length(body),$5)-greatest($4,byte_offset))::integer) from remote_view_field_chunks where scope=$1 and row_id=$2 and field=$3 and generation=$6 and byte_offset<$5 and byte_offset+octet_length(body)>$4 order by byte_offset limit 65536")
+        .bind(scope).bind(id).bind(field).bind(i64::try_from(offset)?).bind(i64::try_from(end)?).bind(generation).fetch_all(&mut *tx).await?;
     let mut bytes=Vec::with_capacity(end-offset);
     for chunk in chunks {bytes.extend(chunk);}
     ensure!(bytes.len()==end-offset,"view asset chunk gap");
     tx.commit().await?;
     Ok((bytes,total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Readonly asset addresses outlive an append/correction. A compiler cannot
+    // guard returning different bytes for an already captured public reference.
+    #[tokio::test]
+    async fn captured_prefix_survives_append_and_same_length_correction() {
+        let (scratch,store)=crate::session_store::postgres::testing::session_store().await;
+        initialize_text_fields(store.pool()).await.unwrap();
+        let mut tx=store.pool().begin().await.unwrap();
+        persist_text(&mut tx,"scope","row","message","1","λa",false).await.unwrap();
+        tx.commit().await.unwrap();
+        let mut tx=store.pool().begin().await.unwrap();
+        persist_text(&mut tx,"scope","row","message","2","λab",false).await.unwrap();
+        tx.commit().await.unwrap();
+        let mut tx=store.pool().begin().await.unwrap();
+        persist_text(&mut tx,"scope","row","message","3","xxxx",true).await.unwrap();
+        tx.commit().await.unwrap();
+        let (old,total)=field_page_at(store.pool(),"scope","row","message",Some("1"),0,64).await.unwrap();
+        assert_eq!(old,"λa".as_bytes());assert_eq!(total,3);
+        let (new,total)=field_page_at(store.pool(),"scope","row","message",Some("3"),0,64).await.unwrap();
+        assert_eq!(new,b"xxxx");assert_eq!(total,4);
+        drop(store);scratch.discard().await;
+    }
 }

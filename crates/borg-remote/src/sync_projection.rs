@@ -40,8 +40,34 @@ impl SyncAuthority {
             crate::SessionEventKind::TurnCompleted{message_id,provider_session_id,final_text,error}=>Some((*message_id,Some((provider_session_id.clone(),final_text.clone(),error.clone())))),
             _=>None,
         };
+        let attention_event=event.kind.clone();
         let ops=projector.reducer.apply(event);
-        self.persist_ops(projector,source_session,event_id,sequence,live_revision,base,ops,turn).await
+        self.persist_ops(projector,source_session,event_id,sequence,live_revision,base,ops,turn).await?;
+        self.publish_attention(source_session,&attention_event).await
+    }
+    async fn publish_attention(&self,source:Uuid,event:&crate::SessionEventKind)->Result<()> {
+        use borg_view::wire::AttentionKind;
+        let scope=Scope::Session{session_id:source.to_string()};
+        let state=self.store.state(source).await?;
+        let mut frames=Vec::new();
+        match event {
+            crate::SessionEventKind::ApprovalRequested{title,..}=>frames.push(ServerFrame::Attention{scope:scope.clone(),source_session_id:source.to_string(),kind:AttentionKind::Approval,label:title.clone()}),
+            crate::SessionEventKind::ProviderInteractionRequested{title,..}=>frames.push(ServerFrame::Attention{scope:scope.clone(),source_session_id:source.to_string(),kind:AttentionKind::Question,label:title.clone()}),
+            crate::SessionEventKind::ApprovalResolved{..} if state.pending_approval_id.is_none()=>frames.push(ServerFrame::AttentionCleared{scope:scope.clone(),source_session_id:source.to_string(),kind:AttentionKind::Approval}),
+            crate::SessionEventKind::ProviderInteractionResolved{..} if state.pending_provider_interaction_id.is_none()=>frames.push(ServerFrame::AttentionCleared{scope:scope.clone(),source_session_id:source.to_string(),kind:AttentionKind::Question}),
+            crate::SessionEventKind::TurnCompleted{error,..}=>frames.push(ServerFrame::Attention{scope:scope.clone(),source_session_id:source.to_string(),kind:if error.is_some(){AttentionKind::Error}else{AttentionKind::Done},label:if error.is_some(){"Turn failed".into()}else{"Turn complete".into()}}),
+            crate::SessionEventKind::TurnStarted{..}=>for kind in [AttentionKind::Done,AttentionKind::Error] {frames.push(ServerFrame::AttentionCleared{scope:scope.clone(),source_session_id:source.to_string(),kind});},
+            _=>{}
+        }
+        if frames.is_empty(){return Ok(())}
+        let key=scope_key(self.host,Some(source));
+        let connections=self.connections.lock().await;
+        for(id,connection)in connections.iter(){
+            if connection.subscriptions.contains_key(&key) {
+                for frame in &frames {self.emit(id,frame.clone())?;}
+            }
+        }
+        Ok(())
     }
     async fn persist_ops(&self,projector:&mut Projector,source_session:Uuid,event_id:Uuid,sequence:u64,live_revision:Option<u64>,base:Cursor,ops:Vec<ViewOp>,turn:Option<(Uuid,Option<(Option<String>,String,Option<String>)>)>)->Result<()> {
         let scope=Scope::Session{session_id:source_session.to_string()};
