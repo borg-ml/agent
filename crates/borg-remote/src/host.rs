@@ -2075,6 +2075,10 @@ pub(crate) async fn run_host_with_resolved_store(
     )
     .with_context(|| format!("invalid host config {}", config_path.display()))?;
     config.validate()?;
+    ensure!(
+        Url::parse(&config.server)?.scheme() == "https",
+        "remote host daemon requires a verified HTTPS/WSS relay route"
+    );
     ensure_execution_boundary(&config)?;
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
