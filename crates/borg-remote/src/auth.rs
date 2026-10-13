@@ -40,6 +40,8 @@ pub enum TunnelFrame {
     Close { connection_id: String, reason: String },
     CacheBatch { snapshots: Vec<ColdSnapshot>, headlines: Vec<SessionHeadline> },
     Revoked { epoch: u64 },
+    EpochUpdate { epoch: u64 },
+    AuthenticationRejected { reason: String },
     /// Trusted relay owner-service ingress only; viewer Client frames cannot emit this.
     HostCommand { command_id: String, command: borg_agent_runtime::HostCommand },
     HostCommandResult { command_id: String, outcome: serde_json::Value, error: Option<String> },

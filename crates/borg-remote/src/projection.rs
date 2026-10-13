@@ -103,3 +103,11 @@ impl ProjectionStore {
         Ok(Some(frames))
     }
 }
+
+/// Never use a shared literal `host` scope in a multi-host journal.
+pub fn scope_key(host_id: uuid::Uuid, session_id: Option<uuid::Uuid>) -> String {
+    match session_id {
+        Some(session) => format!("host:{host_id}/session:{session}"),
+        None => format!("host:{host_id}/host"),
+    }
+}

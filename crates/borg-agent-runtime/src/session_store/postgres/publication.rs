@@ -20,3 +20,14 @@ impl super::PostgresSessionStore {
         Ok(listener)
     }
 }
+
+/// Narrow capability to the exact journal database selected at startup.
+#[derive(Clone)]
+pub struct PostgresAuthority { pub pool: sqlx::PgPool }
+impl PostgresAuthority {
+    pub async fn subscribe_committed(&self) -> Result<sqlx::postgres::PgListener> {
+        let mut listener = sqlx::postgres::PgListener::connect_with(&self.pool).await?;
+        listener.listen(CHANNEL).await?;
+        Ok(listener)
+    }
+}

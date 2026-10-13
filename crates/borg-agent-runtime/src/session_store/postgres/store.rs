@@ -301,7 +301,8 @@ impl PostgresSessionStore {
             .fetch_optional(&mut **transaction)
             .await?;
             if let Some(prior) = prior {
-                let reasoning: SessionEvent = serde_json::from_value(prior)?;
+                let mut reasoning: SessionEvent = serde_json::from_value(prior)?;
+                super::live_text::materialize(transaction, &mut reasoning).await?;
                 let state: SessionState = serde_json::from_str(row.try_get("state_json")?)?;
                 let snapshot = reasoning_snapshot(&reasoning, &state, true, event.created_at);
                 Box::pin(self.append_durable_in_transaction(transaction, snapshot)).await?;
@@ -328,6 +329,7 @@ impl PostgresSessionStore {
             .await?;
             for message in messages {
                 let mut message: SessionEvent = serde_json::from_value(message)?;
+                super::live_text::materialize(transaction, &mut message).await?;
                 if let SessionEventKind::Message {
                     actor: crate::EventActor::Assistant,
                     status,
@@ -520,6 +522,11 @@ impl PostgresSessionStore {
     /// live key. Live state is a rebuildable view of an in-flight turn, so it
     /// is written outside the durable event sequence and carries no sequence.
     async fn append_live(&self, mut event: SessionEvent) -> Result<SessionEvent> {
+        let original_event = event.clone();
+        let message_fragment = matches!(&event.kind, SessionEventKind::MessageDelta { .. });
+        if let SessionEventKind::MessageDelta { message_id, delta } = &event.kind {
+            event.kind = SessionEventKind::Message { message_id: *message_id, actor: crate::EventActor::Assistant, text: delta.clone(), status: MessageStatus::InProgress, attachments: Vec::new(), delivery: None };
+        }
         let reasoning_fragment = matches!(&event.kind, SessionEventKind::ReasoningTextDelta { .. });
         if let SessionEventKind::ReasoningTextDelta { delta } = &event.kind {
             event.kind = SessionEventKind::ReasoningDelta {
@@ -574,54 +581,22 @@ impl PostgresSessionStore {
             .await?;
 
         let revision = current_revision.saturating_add(1);
-        let stored_event = if let SessionEventKind::ReasoningDelta { text } = &event.kind {
-            let prior: Option<serde_json::Value> = sqlx::query_scalar(
-                "select event_json from session_live_state \
-                 where session_id = $1 and live_key = $2",
-            )
-            .bind(event.session_id)
-            .bind(&live_key)
-            .fetch_optional(&mut *transaction)
-            .await?;
-            let prior = prior
-                .map(serde_json::from_value::<SessionEvent>)
-                .transpose()?;
-            let mut accumulated = prior
-                .as_ref()
-                .and_then(|event| match &event.kind {
-                    SessionEventKind::ReasoningDelta { text } => Some(text.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            if reasoning_fragment {
-                accumulated.push_str(text);
-            } else if text.starts_with(accumulated.as_str()) {
-                accumulated.clear();
-                accumulated.push_str(text);
-            } else if !accumulated.starts_with(text) {
-                accumulated.push_str(text);
-            }
-            // The live key is one logical action: keep its identity and start
-            // time and replace only the accumulated payload, or clients
-            // rebuilding from live state see the timer restart on every frame.
-            let first = prior.as_ref().is_none_or(|prior| {
-                matches!(&prior.kind, SessionEventKind::ReasoningDelta { text } if text.trim().is_empty())
-            });
-            let mut snapshot = prior.unwrap_or_else(|| event.clone());
-            snapshot.kind = SessionEventKind::ReasoningDelta { text: accumulated };
-            if first
-                && matches!(&snapshot.kind, SessionEventKind::ReasoningDelta { text } if !text.trim().is_empty())
-            {
-                self.append_durable_in_transaction(
-                    &mut transaction,
-                    reasoning_snapshot(&snapshot, &state, false, snapshot.created_at),
-                )
-                .await?;
-            }
-            snapshot
-        } else {
-            event.clone()
+        let mut stored_event = event.clone();
+        let streamed = match &event.kind {
+            SessionEventKind::ReasoningDelta { text } => Some((text.as_str(), reasoning_fragment)),
+            SessionEventKind::Message { text, actor: crate::EventActor::Assistant, status: MessageStatus::InProgress, .. } => Some((text.as_str(), message_fragment)),
+            _ => None,
         };
+        if streamed.is_some() {
+            if let Some(prior) = super::live_text::seed_inline(&mut transaction, &event, &live_key).await? {
+                stored_event.id = prior.id;
+                stored_event.created_at = prior.created_at;
+            }
+            match &mut stored_event.kind {
+                SessionEventKind::ReasoningDelta { text } | SessionEventKind::Message { text, .. } => text.clear(),
+                _ => {}
+            }
+        }
 
         sqlx::query(
             "insert into session_live_state \
@@ -638,6 +613,9 @@ impl PostgresSessionStore {
         .bind(event.created_at)
         .execute(&mut *transaction)
         .await?;
+        if let Some((text, fragment)) = streamed {
+            super::live_text::append(&mut transaction, &event, &live_key, text, fragment).await?;
+        }
         sqlx::query("update sessions set live_revision = $1, updated_at = $2 where id = $3")
             .bind(revision)
             .bind(event.created_at)
@@ -646,13 +624,8 @@ impl PostgresSessionStore {
             .await?;
         super::publication::notify(&mut transaction, event.session_id).await?;
         transaction.commit().await?;
-        // The COALESCED snapshot, not the frame that was passed in. A
-        // continuation keeps the identity and start time of the key it extends,
-        // so returning the caller's fresh event would hand back an id and a
-        // timestamp that exist nowhere in the store -- and a client rendering
-        // the return value would see the turn's timer restart on every frame,
-        // which is the exact effect the coalescing above exists to prevent.
-        Ok(stored_event)
+        // Return the committed input delta; reconstruct only on explicit reads.
+        Ok(original_event)
     }
 
     /// Decode one `session_events` row into an event, hot or cold.
@@ -896,6 +869,9 @@ impl PostgresSessionStore {
 
 #[async_trait]
 impl SessionStore for PostgresSessionStore {
+    fn postgres_authority(&self) -> Option<super::publication::PostgresAuthority> {
+        Some(super::publication::PostgresAuthority { pool: self.pool().clone() })
+    }
     async fn create_session(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now();
         let mut transaction = self.pool().begin().await?;
@@ -925,40 +901,8 @@ impl SessionStore for PostgresSessionStore {
         match event.kind.persistence() {
             EventPersistence::Ephemeral => {
                 event.sequence = 0;
-                if matches!(&event.kind, SessionEventKind::ReasoningTextDelta { delta } if !delta.is_empty())
-                {
+                if matches!(&event.kind, SessionEventKind::ReasoningTextDelta { delta } | SessionEventKind::MessageDelta { delta, .. } if !delta.is_empty()) {
                     self.append_live(event.clone()).await?;
-                }
-                if matches!(&event.kind, SessionEventKind::MessageDelta { delta, .. } if !delta.is_empty())
-                {
-                    let mut transaction = self.pool().begin().await?;
-                    let row =
-                        sqlx::query("select state_json from sessions where id = $1 for update")
-                            .bind(event.session_id)
-                            .fetch_one(&mut *transaction)
-                            .await?;
-                    let state: SessionState = serde_json::from_str(row.try_get("state_json")?)?;
-                    if matches!(
-                        state.status,
-                        Some(SessionStatus::Running | SessionStatus::WaitingForApproval)
-                    ) && self
-                        .anchor_assistant_message(&mut transaction, &event)
-                        .await?
-                    {
-                        let SessionEventKind::MessageDelta { message_id, delta } = &event.kind
-                        else {
-                            unreachable!("assistant delta was checked before anchoring");
-                        };
-                        event.kind = SessionEventKind::Message {
-                            message_id: *message_id,
-                            actor: crate::EventActor::Assistant,
-                            text: delta.clone(),
-                            status: MessageStatus::InProgress,
-                            attachments: Vec::new(),
-                            delivery: None,
-                        };
-                    }
-                    transaction.commit().await?;
                 }
                 Ok(event)
             }
@@ -1059,21 +1003,24 @@ impl SessionStore for PostgresSessionStore {
         session_id: Uuid,
         revision: u64,
     ) -> Result<Vec<SessionLiveEvent>> {
+        let mut transaction = self.pool().begin().await?;
         let rows = sqlx::query(
             "select revision, event_json from session_live_state \
              where session_id = $1 and revision > $2 order by revision",
         )
         .bind(session_id)
         .bind(i64::try_from(revision).unwrap_or(i64::MAX))
-        .fetch_all(self.pool())
+        .fetch_all(&mut *transaction)
         .await?;
         let mut live = Vec::with_capacity(rows.len());
         for row in rows {
             let revision: i64 = row.try_get("revision")?;
             let event: serde_json::Value = row.try_get("event_json")?;
+            let mut event: SessionEvent = serde_json::from_value(event)?;
+            super::live_text::materialize(&mut transaction, &mut event).await?;
             live.push(SessionLiveEvent {
                 revision: u64::try_from(revision).unwrap_or(0),
-                event: serde_json::from_value(event)?,
+                event,
             });
         }
         Ok(live)

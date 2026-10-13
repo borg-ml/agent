@@ -406,3 +406,15 @@ select
     e.provider_event_kind,
     e.created_at
 from session_events e;
+
+-- Growing live text is append-only; the existing live row holds metadata only.
+create table if not exists session_live_text_heads (
+ session_id uuid not null, live_key text not null, text_bytes bigint not null,
+ primary key(session_id,live_key), foreign key(session_id,live_key)
+ references session_live_state(session_id,live_key) on delete cascade
+);
+create table if not exists session_live_text_chunks (
+ session_id uuid not null, live_key text not null, byte_offset bigint not null, body bytea not null,
+ primary key(session_id,live_key,byte_offset), foreign key(session_id,live_key)
+ references session_live_text_heads(session_id,live_key) on delete cascade
+);

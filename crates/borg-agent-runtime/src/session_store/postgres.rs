@@ -27,6 +27,7 @@ pub mod harness;
 pub mod host;
 pub mod maintenance;
 pub mod publication;
+pub mod live_text;
 pub mod recovery;
 pub mod runtime;
 pub mod search;
