@@ -3863,6 +3863,18 @@ impl BorgTerminal {
         self.invalidate_transcript_render_cache();
     }
 
+    pub fn reject_recall_submission(&mut self, message_id: Uuid) {
+        self.apply_session_event(&SessionEvent::new(
+            Uuid::nil(),
+            0,
+            SessionEventKind::PromptReplacementResolved {
+                message_id,
+                sent: false,
+                originals_consumed: false,
+            },
+        ));
+    }
+
     pub fn reject_optimistic_prompt(
         &mut self,
         target: Option<Uuid>,
@@ -3964,7 +3976,9 @@ impl BorgTerminal {
                     submitted_attachments.push(attachment.clone());
                 }
             }
-            self.composer.restore(text, paths);
+            if self.recall_submission.is_none() {
+                self.composer.restore(text, paths);
+            }
             if let Some((_, submitted_text, submitted_attachments)) = &mut self.recall_submission {
                 let mut submitted = Composer::default();
                 submitted.restore(submitted_text.clone(), submitted_attachments.clone());
@@ -4374,16 +4388,11 @@ impl BorgTerminal {
                 {
                     let (_, text, attachments) =
                         self.recall_submission.take().expect("matched submission");
-                    if *sent
-                        && self.composer.expanded_text() == text
-                        && self
-                            .composer
-                            .attachments
-                            .iter()
-                            .map(|item| &item.path)
-                            .eq(attachments.iter())
-                    {
-                        self.composer.clear();
+                    if !sent {
+                        self.discard_pending_prompt(None, *message_id);
+                        if !originals_consumed {
+                            self.composer.append_recalled(text, attachments);
+                        }
                     }
                     if *sent {
                         self.provisional_recalls.clear();
@@ -11715,7 +11724,8 @@ impl BorgTerminal {
             self.notice = Some(self.transcript.selection_notice(&self.keymap));
             return Ok(UiAction::None);
         }
-        if !self.provisional_recalls.is_empty()
+        if self.recall_submission.is_none()
+            && !self.provisional_recalls.is_empty()
             && (self.keymap.matches(KeyAction::Queue, &key)
                 || self.keymap.matches(KeyAction::Send, &key))
         {
@@ -11731,18 +11741,25 @@ impl BorgTerminal {
                 .as_ref()
                 .filter(|(_, sent, images)| sent == &text && images == &attachments)
                 .map_or_else(Uuid::new_v4, |(id, _, _)| *id);
+            if text.trim().is_empty() && attachments.is_empty() {
+                return Ok(UiAction::None);
+            }
+            let delivery = if self.keymap.matches(KeyAction::Queue, &key) {
+                PromptDelivery::Queue
+            } else {
+                PromptDelivery::Steer
+            };
             self.recall_submission = Some((message_id, text.clone(), attachments.clone()));
+            self.composer.clear();
+            self.project_pending_prompt(self.focused_child, message_id, text.clone(), delivery);
+            self.persist_composer_draft();
             return Ok(UiAction::ReplaceRecalledPrompt {
                 originals: self.provisional_recall_ids(),
                 known_attachment_originals: self.acknowledged_recalls.iter().copied().collect(),
                 message_id,
                 text,
                 attachments,
-                delivery: if self.keymap.matches(KeyAction::Queue, &key) {
-                    PromptDelivery::Queue
-                } else {
-                    PromptDelivery::Steer
-                },
+                delivery,
             });
         }
         if self.keymap.matches(KeyAction::Queue, &key)

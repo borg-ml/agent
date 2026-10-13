@@ -5502,12 +5502,14 @@ async fn run_local_agent_session(
                         }
                     }
                     UiAction::ReplaceRecalledPrompt { originals, known_attachment_originals, message_id, text, attachments, delivery } => {
-                        dispatch_ui_command(&ui_interaction_tx, HostCommand::ReplaceRecalledPrompt {
+                        if !dispatch_ui_command(&ui_interaction_tx, HostCommand::ReplaceRecalledPrompt {
                             session_id,
                             replacement: borg_remote::PromptRecallReplacement {
                                 originals, known_attachment_originals, message_id, text, attachments, delivery,
                             },
-                        });
+                        }) {
+                            terminal.as_mut().expect("terminal").reject_recall_submission(message_id);
+                        }
                     }
                     UiAction::RecallQueuedPrompts { target } => {
                         if let Some(target) = target {

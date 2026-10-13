@@ -12202,6 +12202,20 @@ async fn escape_flushes_pending_queue_without_latching_a_stop_and_keeps_the_comp
             .unwrap(),
         UiAction::ReplaceRecalledPrompt { .. }
     ));
+    assert!(terminal.composer.text.is_empty());
+    assert!(terminal.has_active_queued_prompts());
+    assert!(matches!(
+        terminal
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap(),
+        UiAction::None
+    ));
+    let first_submission = terminal.recall_submission.as_ref().unwrap().0;
+    terminal.composer.replace_text("draft typed after Enter");
+    terminal.reject_recall_submission(first_submission);
+    assert!(terminal.composer.text.contains("draft typed after Enter"));
+    assert!(terminal.composer.text.contains("recall me"));
+    assert!(!terminal.has_active_queued_prompts());
     let recalled_id = terminal.queued_prompts[0].message_id;
     terminal.composer.replace_text("edited while waiting");
     let attachment = PathBuf::from("/tmp/recalled-image.png");
@@ -12230,8 +12244,12 @@ async fn escape_flushes_pending_queue_without_latching_a_stop_and_keeps_the_comp
         matches!(action, UiAction::ReplaceRecalledPrompt { known_attachment_originals, attachments, .. }
         if known_attachment_originals == vec![recalled_id] && attachments.is_empty())
     );
+    assert!(terminal.composer.text.is_empty());
+    assert!(terminal.has_active_queued_prompts());
     let submitted_id = terminal.recall_submission.as_ref().unwrap().0;
-    terminal.composer.replace_text("newer local draft");
+    // An identical new draft is still a new draft, not the sent one.
+    let newer = terminal.recall_submission.as_ref().unwrap().1.clone();
+    terminal.composer.replace_text(&newer);
     terminal.apply_session_event(&SessionEvent::new(
         session_id,
         1,
@@ -12241,7 +12259,7 @@ async fn escape_flushes_pending_queue_without_latching_a_stop_and_keeps_the_comp
             originals_consumed: false,
         },
     ));
-    assert_eq!(terminal.composer.text, "newer local draft");
+    assert_eq!(terminal.composer.text, newer);
     assert!(terminal.composer.attachments.is_empty());
     assert!(terminal.provisional_recalls.is_empty());
     terminal.shutdown().await;
