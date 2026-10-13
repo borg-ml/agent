@@ -505,7 +505,7 @@ impl PostgresSessionStore {
                 SessionEventKind::Message {
                     message_id,
                     actor: crate::EventActor::Assistant,
-                    text: text.clone(),
+                    text: String::new(),
                     status: MessageStatus::InProgress,
                     attachments: Vec::new(),
                     delivery: None,
@@ -614,7 +614,7 @@ impl PostgresSessionStore {
         .execute(&mut *transaction)
         .await?;
         if let Some((text, fragment)) = streamed {
-            super::live_text::append(&mut transaction, &event, &live_key, text, fragment).await?;
+            super::live_text::append(&mut transaction, &event, &live_key, text, fragment, revision).await?;
         }
         sqlx::query("update sessions set live_revision = $1, updated_at = $2 where id = $3")
             .bind(revision)

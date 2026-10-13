@@ -4,7 +4,7 @@ use anyhow::{Result, ensure};
 use sqlx::{Postgres, Transaction};
 use crate::{SessionEvent, SessionEventKind};
 
-pub async fn append(tx: &mut Transaction<'_,Postgres>, event: &SessionEvent, key: &str, text: &str, fragment: bool) -> Result<()> {
+pub async fn append(tx: &mut Transaction<'_,Postgres>, event: &SessionEvent, key: &str, text: &str, fragment: bool, revision: i64) -> Result<()> {
     sqlx::query("insert into session_live_text_heads values($1,$2,0) on conflict do nothing")
         .bind(event.session_id).bind(key).execute(&mut **tx).await?;
     let offset: i64 = sqlx::query_scalar("select text_bytes from session_live_text_heads where session_id=$1 and live_key=$2 for update")
@@ -14,8 +14,8 @@ pub async fn append(tx: &mut Transaction<'_,Postgres>, event: &SessionEvent, key
     };
     if delta.is_empty() { return Ok(()) }
     let next = offset.checked_add(delta.len() as i64).ok_or_else(|| anyhow::anyhow!("live text exhausted"))?;
-    sqlx::query("insert into session_live_text_chunks values($1,$2,$3,$4)")
-        .bind(event.session_id).bind(key).bind(offset).bind(delta.as_bytes()).execute(&mut **tx).await?;
+    sqlx::query("insert into session_live_text_chunks values($1,$2,$3,$4,$5)")
+        .bind(event.session_id).bind(key).bind(offset).bind(delta.as_bytes()).bind(revision).execute(&mut **tx).await?;
     sqlx::query("update session_live_text_heads set text_bytes=$3 where session_id=$1 and live_key=$2")
         .bind(event.session_id).bind(key).bind(next).execute(&mut **tx).await?;
     Ok(())
@@ -46,7 +46,7 @@ pub async fn seed_inline(tx: &mut Transaction<'_,Postgres>, event: &SessionEvent
     if !exists {
         if let Some(prior) = &prior {
             match &prior.kind {
-                SessionEventKind::Message { text, .. } | SessionEventKind::ReasoningDelta { text } => append(tx, prior, key, text, false).await?,
+                SessionEventKind::Message { text, .. } | SessionEventKind::ReasoningDelta { text } => append(tx, prior, key, text, false, 0).await?,
                 _ => {}
             }
         }
