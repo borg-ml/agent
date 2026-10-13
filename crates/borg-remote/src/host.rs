@@ -2167,37 +2167,65 @@ pub(crate) async fn run_host_with_resolved_store(
             }
         }
     }));
-    let mut retry = RemoteRetryBackoff::default();
+    let (incoming_tx, mut incoming) = mpsc::channel(128);
+    let (lifecycle_tx, mut lifecycle) = mpsc::channel(8);
+    let socket_config = config.clone();
+    let socket_transport = host_transport::get(config.host_id)?;
+    let mut socket = AbortTask(host_transport::spawn(async move {
+        let mut retry = RemoteRetryBackoff::default();
+        loop {
+            let _ = lifecycle_tx.try_send(true);
+            let connected_at = Instant::now();
+            let result = crate::tunnel::connect(&socket_config, incoming_tx.clone(), &mut outgoing).await;
+            socket_transport.connection_lost();
+            if let Err(error) = result {
+                if error.downcast_ref::<crate::tunnel::TerminalAuthentication>().is_some() { return Err(error); }
+                tracing::warn!(%error, "host tunnel disconnected; actors retained");
+            } else {
+                bail!("host tunnel unexpectedly stopped");
+            }
+            let _ = lifecycle_tx.try_send(false);
+            if connected_at.elapsed() >= Duration::from_secs(60) { retry.reset(); }
+            let jitter = Duration::from_millis(u64::from(Uuid::new_v4().as_bytes()[0]) * 4);
+            tokio::time::sleep(retry.next_delay(None) + jitter).await;
+        }
+    }));
     loop {
-        let connected_at = Instant::now();
-        let (incoming_tx, mut incoming) = mpsc::channel(128);
-        let (socket_tx, socket_rx) = mpsc::channel(128);
-        let socket_config = config.clone();
-        let mut socket = AbortTask(host_transport::spawn(async move {
-            crate::tunnel::connect(&socket_config, incoming_tx, socket_rx).await
-        }));
-        for registration in host_transport::get(config.host_id)?.registrations() {
-                    if socket_tx.try_send(registration).is_err() { bail!("registration catalog exceeds connection budget"); }
-                }
-                let failure = loop {
-            tokio::select! {
-                result = &mut socket.0 => break result.context("host socket task failed")?,
-                result = async {
-                    match direct.as_mut() {
-                        Some(task) => (&mut task.0).await,
-                        None => std::future::pending().await,
+        tokio::select! {
+            result = &mut socket.0 => {
+                let error = match result { Ok(Err(error)) => error, Ok(Ok(())) => anyhow::anyhow!("host socket supervisor stopped"), Err(error) => error.into() };
+                if error.downcast_ref::<crate::tunnel::TerminalAuthentication>().is_some() {
+                    for (id, sender) in sessions.lock().await.iter() {
+                        let _ = sender.try_send(HostCommand::Stop { session_id: *id });
                     }
-                } => {
-                    result.context("direct listener task failed")?.context("direct listener failed")?;
-                    bail!("direct listener stopped unexpectedly");
-                },
-                frame = outgoing.recv() => {
-                    let Some(frame) = frame else { return Ok(()) };
-                    if socket_tx.try_send(frame).is_err() { break Err(anyhow::anyhow!("host egress overflow")); }
                 }
-                frame = incoming.recv() => {
-                    let Some(frame) = frame else { continue };
-                    match frame {
+                return Err(error);
+            }
+            result = async {
+                match direct.as_mut() { Some(task) => (&mut task.0).await, None => std::future::pending().await }
+            } => {
+                result.context("direct listener task failed")?.context("direct listener failed")?;
+                bail!("direct listener stopped unexpectedly");
+            }
+            started = lifecycle.recv() => {
+                match started {
+                    Some(true) => {
+                        let authority = Arc::clone(&sync);
+                        let transport = host_transport::get(config.host_id)?;
+                        host_transport::spawn(async move {
+                            for (session, request) in transport.registrations() {
+                                if let Err(error) = transport.register(session, request).await { tracing::debug!(%error, "registration replay deferred"); break; }
+                            }
+                            if let Err(error) = authority.relay_reconnected().await { tracing::warn!(%error, "relay catalog rescan deferred"); }
+                        });
+                    }
+                    Some(false) => sync.relay_disconnected().await,
+                    None => bail!("host socket lifecycle channel closed"),
+                }
+            }
+            frame = incoming.recv() => {
+                let Some(frame) = frame else { bail!("host tunnel ingress stopped") };
+                match frame {
                         crate::auth::TunnelFrame::HostCommand { command_id, command } => {
                             if commands.try_send((command_id, command)).is_err() {
                                 break Err(anyhow::anyhow!("owner command ingress overflow"));
@@ -2238,25 +2266,10 @@ pub(crate) async fn run_host_with_resolved_store(
                             }
                         }
                         crate::auth::TunnelFrame::Close { connection_id, .. } => sync.close_connection(&connection_id).await,
-                        _ => {}
-                    }
+                    _ => {}
                 }
             }
-        };
-        if let Err(error) = failure {
-            if error.downcast_ref::<crate::tunnel::TerminalAuthentication>().is_some() {
-                for (id, sender) in sessions.lock().await.iter() {
-                    let _ = sender.try_send(HostCommand::Stop { session_id: *id });
-                }
-                host_transport::get(config.host_id)?.stop_tasks();
-                return Err(error);
-            }
-            tracing::warn!(%error, "host tunnel disconnected");
         }
-        sync.update_epoch(epoch).await;
-        if connected_at.elapsed() >= Duration::from_secs(60) { retry.reset(); }
-        let jitter = Duration::from_millis(u64::from(Uuid::new_v4().as_bytes()[0]) * 4);
-        tokio::time::sleep(retry.next_delay(None) + jitter).await;
     }
     }).await
 }
@@ -5278,9 +5291,12 @@ async fn run_session(
         attachment,
     } = launch_request;
     launch.cwd = validate_host_cwd(&config.roots, &launch.cwd)?;
-    host_transport::get(config.host_id)?
+    if let Err(error) = host_transport::get(config.host_id)?
         .register(session_id, launch.clone())
-        .await?;
+        .await
+    {
+        tracing::debug!(%error, %session_id, "session registration deferred to durable catalog publisher");
+    }
     discard_serialized_extension_roots(&mut launch);
     ensure_host_launch_owner(&client, &config, durable_store.as_ref(), session_id).await?;
     // Expired recovery must not depend on relay availability or create a provider.
