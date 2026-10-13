@@ -2235,6 +2235,68 @@ pub(crate) async fn run_host_with_resolved_store(
     }).await
 }
 
+async fn viewer_attachments(
+    context: &DispatchContext,
+    session: Uuid,
+    refs: &[borg_view::wire::AssetRef],
+) -> Result<Vec<PathBuf>> {
+    ensure!(
+        refs.len() <= crate::MAX_MESSAGE_ATTACHMENTS,
+        "too many attachments"
+    );
+    let mut paths = Vec::new();
+    for asset in refs {
+        let attachment = crate::MessageAttachment {
+            name: asset.id.clone(),
+            sha256: asset.id.clone(),
+            media_type: asset.media_type.clone(),
+            byte_len: asset.bytes.parse()?,
+        };
+        crate::validate_message_attachment(&attachment)?;
+        if crate::load_message_attachment(&context.session_root, &attachment)
+            .await
+            .is_err()
+        {
+            let mut response = context
+                .client
+                .get(endpoint(
+                    &context.config.server,
+                    &format!(
+                        "/api/remote/host/sessions/{session}/attachments/{}",
+                        attachment.sha256
+                    ),
+                ))
+                .bearer_auth(&context.config.host_token)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await?
+                .error_for_status()?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                ensure!(
+                    (bytes.len() as u64).saturating_add(chunk.len() as u64) <= attachment.byte_len,
+                    "attachment exceeds declared length"
+                );
+                bytes.extend_from_slice(&chunk);
+            }
+            crate::store_relayed_message_attachment(&context.session_root, &attachment, &bytes)
+                .await?;
+        }
+        let extension = match attachment.media_type.as_str() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            _ => bail!("unsupported attachment media type"),
+        };
+        paths.push(
+            context
+                .session_root
+                .join("attachments")
+                .join(format!("{}.{}", attachment.sha256, extension)),
+        );
+    }
+    Ok(paths)
+}
+
 async fn viewer_command(
     ledger: &crate::command_ledger::CommandLedger,
     context: DispatchContext,
@@ -2283,21 +2345,57 @@ async fn viewer_command(
                         delivery,
                         attachments,
                     } => {
-                        ensure!(
-                            attachments.is_empty(),
-                            "attachment hydration is not available"
-                        );
+                        let attachments = viewer_attachments(&context, session_id, &attachments).await?;
                         HostCommand::Prompt {
                             session_id,
                             message_id: viewer.command_id,
                             text,
-                            attachments: Vec::new(),
+                            attachments,
                             output_schema: None,
                             delivery: match delivery {
                                 borg_view::wire::Delivery::Steer => crate::PromptDelivery::Steer,
                                 borg_view::wire::Delivery::Queue => crate::PromptDelivery::Queue,
                             },
                         }
+                    }
+                    Command::AssetPage { asset_id, offset, max_bytes } => {
+                        use sqlx::Row;
+                        ensure!(max_bytes > 0 && max_bytes <= 65_536, "invalid asset page budget");
+                        let id = Uuid::parse_str(&asset_id)?;
+                        let offset = offset.parse::<i64>()?;
+                        ensure!(offset >= 0, "invalid asset offset");
+                        let pool = context.session_store.postgres_authority().context("missing payload authority")?.pool;
+                        let row = sqlx::query("select byte_len, substring(payload from $3 for $4) as page from session_payloads where session_id=$1 and id=$2")
+                            .bind(session_id).bind(id).bind(offset.checked_add(1).context("asset offset overflow")?).bind(i32::try_from(max_bytes)?).fetch_optional(&pool).await?.context("asset outside session scope")?;
+                        let total: i64 = row.try_get("byte_len")?;
+                        ensure!(offset <= total, "asset offset exceeds length");
+                        let bytes: Vec<u8> = row.try_get("page")?;
+                        let valid = match std::str::from_utf8(&bytes) { Ok(text) => text.len(), Err(error) if error.error_len().is_none() => error.valid_up_to(), Err(_) => bail!("asset offset is not UTF-8 text boundary") };
+                        ensure!(valid > 0 || offset == total, "page budget splits UTF-8 character");
+                        let text = std::str::from_utf8(&bytes[..valid])?.to_owned();
+                        let next = offset.checked_add(i64::try_from(valid)?).context("asset offset overflow")?;
+                        return Ok(CommandOutcome::AssetPage { asset_id, offset: offset.to_string(), text, next_offset: (next < total).then(|| next.to_string()) });
+                    }
+                    Command::Approval { approval_id, source_session_id, decision, edited_input, .. } => {
+                        ensure!(Uuid::parse_str(&source_session_id)? == session_id, "approval source differs from scope");
+                        ensure!(edited_input.is_none(), "runtime does not support edited approval input");
+                        HostCommand::Approve { session_id, approval_id, decision: match decision {
+                            borg_view::wire::Decision::Once => crate::ApprovalDecision::AllowOnce,
+                            borg_view::wire::Decision::Session => crate::ApprovalDecision::AllowSession,
+                            borg_view::wire::Decision::Deny => crate::ApprovalDecision::Deny,
+                        } }
+                    }
+                    Command::RespondToQuestion { approval_id, source_session_id, text, .. } => {
+                        ensure!(Uuid::parse_str(&source_session_id)? == session_id, "question source differs from scope");
+                        HostCommand::RespondToProviderInteraction { session_id, interaction_id: approval_id, response: serde_json::json!({"text":text}) }
+                    }
+                    Command::NewSession { cwd } => {
+                        let Some(StoredHostLaunch::Launch(metadata)) = load_launch_metadata(context.session_store.as_ref(), session_id).await? else { bail!("session launch configuration unavailable") };
+                        let mut request = metadata.request;
+                        request.cwd = validate_host_cwd(&context.config.roots, Path::new(&cwd))?;
+                        request.request_id = viewer.command_id;
+                        request.initial_prompt = None;
+                        HostCommand::Launch { session_id: viewer.command_id, request: Box::new(request), attachment: None }
                     }
                     Command::Configure {
                         provider,
@@ -2408,7 +2506,16 @@ async fn viewer_command(
                                 delivery,
                                 output_schema: None,
                             },
-                            _ => bail!("slash intent is not supported by remote command bridge"),
+                            F::RecallQueuedPrompt(message_id) => HostCommand::RecallQueuedPrompt { session_id, message_id },
+                            F::ApplyAgentTodo { target_session_id, action } => HostCommand::AgentTodo { session_id, target_session_id, action },
+                            F::RunExtension { command, arguments } => HostCommand::ExtensionCommand { session_id, invocation_id: viewer.command_id, command, arguments },
+                            F::SetModel { provider, model } => HostCommand::Configure { session_id, action: crate::SessionConfigAction::SetProvider { provider, model: Some(model) } },
+                            F::SetPermission(permission_mode) => HostCommand::Configure { session_id, action: crate::SessionConfigAction::SetPermissionMode { permission_mode } },
+                            F::SetLanguage(language) => HostCommand::Configure { session_id, action: crate::SessionConfigAction::SetResponseLanguage { language } },
+                            F::SetEffort(effort) => HostCommand::Configure { session_id, action: crate::SessionConfigAction::SetEffort { effort } },
+                            F::SetFast(enabled) => HostCommand::Configure { session_id, action: crate::SessionConfigAction::SetFast { enabled } },
+                            F::SetUltrafast(enabled) => HostCommand::Configure { session_id, action: crate::SessionConfigAction::SetUltrafast { enabled } },
+                            _ => bail!("slash intent requires client-local behavior or revision-bound approval; use typed control"),
                         }
                     }
                     _ => bail!("command requires an unsupported canonical operation"),
@@ -2417,11 +2524,11 @@ async fn viewer_command(
                     dispatch(context.clone(), command).await,
                     "command admission interrupted"
                 );
-                Ok::<_, anyhow::Error>(())
+                Ok::<_, anyhow::Error>(CommandOutcome::Applied)
             }
             .await;
             let outcome = match translate {
-                Ok(()) => CommandOutcome::Applied,
+                Ok(outcome) => outcome,
                 Err(error) => CommandOutcome::Rejected {
                     code: "unsupported_or_interrupted".into(),
                     message: error.to_string(),
