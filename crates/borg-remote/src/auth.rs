@@ -1,0 +1,47 @@
+use serde::{Deserialize, Serialize};
+
+/// Ed25519 signature covers the exact UTF-8 claims bytes, base64url without padding.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SignedTicket { pub claims: String, pub signature: String }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TicketClaims {
+    pub version: u32,
+    pub ticket_id: String,
+    pub principal_id: String,
+    pub device_id: String,
+    pub host_id: String,
+    /// Empty means host-wide; otherwise an explicit allowlist including child IDs.
+    pub session_ids: Vec<String>,
+    pub permission: Permission,
+    pub device_public_key: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub revocation_epoch: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission { Read, Control }
+/// First frame only. Proof signs `borg.remote.auth.v2\n{ticket_id}\n{nonce}`.
+/// Ticket IDs are consumed atomically at relay admission. Direct hosts independently
+/// consume ticket IDs, so route switching requires a fresh ticket.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Authentication {
+    Client { ticket: SignedTicket, nonce: String, proof: String },
+    Host { host_id: String, token: String },
+}
+/// One outbound host socket muxes devices; relay never changes the inner view frame.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TunnelFrame {
+    Open { connection_id: String, ticket: SignedTicket },
+    Client { connection_id: String, frame: serde_json::Value },
+    Server { connection_id: String, frame: serde_json::Value },
+    Close { connection_id: String, reason: String },
+    CacheBatch { snapshots: Vec<ColdSnapshot>, headlines: Vec<SessionHeadline> },
+    Revoked { epoch: u64 },
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ColdSnapshot { pub session_id: String, pub frame: serde_json::Value, pub synchronized_at: String }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionHeadline { pub session_id: String, pub parent_session_id: Option<String>, pub name: String, pub status: String, pub updated_at: String }

@@ -8,6 +8,9 @@
 
 mod command;
 mod host;
+pub mod projection;
+pub mod auth;
+pub mod admission;
 
 pub use borg_agent_runtime::*;
 
