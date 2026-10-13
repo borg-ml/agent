@@ -121,6 +121,7 @@ pub(crate) struct Watches {
     session_id: Uuid,
     entries: Arc<Mutex<BTreeMap<Uuid, WatchEntry>>>,
     events: mpsc::Sender<String>,
+    completion_notices: Arc<Mutex<Option<Vec<String>>>>,
     pub cancel: CancellationToken,
     /// Signalled whenever the watch set or a watch's counters change, so
     /// the session can publish a fresh `WatchesChanged` to its frontends.
@@ -142,6 +143,7 @@ impl Watches {
             session_id,
             entries: Default::default(),
             events,
+            completion_notices: Default::default(),
             cancel: CancellationToken::new(),
             changed: Arc::new(tokio::sync::Notify::new()),
             yielded: Arc::new(std::sync::Mutex::new(None)),
@@ -401,7 +403,7 @@ impl Watches {
             }
             stopped.cancel();
             watches.changed.notify_one();
-            let _ = watches.events.send(format!(
+            watches.report_completion(format!(
                 "Watcher event: {label} ({watch_id}) finished. Retrieve its result with list_watchers."
             )).await;
         });
@@ -409,6 +411,31 @@ impl Watches {
             "running": true, "background": true, "watch_id": watch_id,
             "message": "Job continues in the background. Use list_watchers to retrieve its result, await_watchers to wait, or stop_watcher to cancel. Do not repeat the call."
         }))
+    }
+
+    /// Results settle immediately; a burst of completions sends one agent
+    /// wake rather than one interrupting input per finished job.
+    async fn report_completion(&self, notice: String) {
+        let mut pending = self.completion_notices.lock().await;
+        if let Some(notices) = pending.as_mut() {
+            notices.push(notice);
+            return;
+        }
+        *pending = Some(vec![notice]);
+        drop(pending);
+        let watches = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let notices = watches
+                .completion_notices
+                .lock()
+                .await
+                .take()
+                .unwrap_or_default();
+            if !notices.is_empty() {
+                let _ = watches.events.send(notices.join("\n")).await;
+            }
+        });
     }
 
     pub async fn start(
@@ -942,6 +969,19 @@ fn agent_event_text(
 mod tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn simultaneous_completions_wake_the_agent_once() {
+        let (tx, mut notices) = mpsc::channel(8);
+        let watches = Watches::new(ProcessManager::default(), tx, Uuid::new_v4());
+        for label in ["first", "second", "third"] {
+            watches.report_completion(label.to_owned()).await;
+        }
+        assert!(notices.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(notices.recv().await.unwrap(), "first\nsecond\nthird");
+        assert!(notices.try_recv().is_err());
+    }
+
     // A parallel tool batch must detach into independently retrievable jobs,
     // not hit the old four-watcher limit or lose cancellation/completion.
     #[tokio::test]
@@ -981,12 +1021,14 @@ mod tests {
             assert!(!job.running);
             assert_eq!(job.result.unwrap()["ok"], true);
         }
-        for _ in 0..11 {
-            tokio::time::timeout(Duration::from_secs(5), notices.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        }
+        let mut reported = String::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ids.iter().any(|id| !reported.contains(&id.to_string())) {
+                reported.push_str(&notices.recv().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
