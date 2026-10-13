@@ -8803,7 +8803,7 @@ pub fn agent_tool_specs_for_surface(
         ),
         tool(
             "stop_watcher",
-            "Stop a background watcher and its process tree.",
+            "Stop a background watcher. For a command launched by watch, also stop its process tree. For an attached exec session, stop monitoring only: the shell keeps running; use exec with session_id and terminate=true to stop it.",
             json!({
                 "type": "object", "properties": {"watch_id": {"type": "string", "format": "uuid"}},
                 "required": ["watch_id"], "additionalProperties": false
