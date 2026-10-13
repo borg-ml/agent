@@ -6676,12 +6676,10 @@ async fn run_agent_session_store_kernel_inner(
                                         &mut journal, &events, session_id, &mut goal,
                                         &mut goal_active_since,
                                     ).await?;
-                                    let mut terminal = Vec::new();
-
-                                    terminal.push(SessionEventKind::StatusChanged {
+                                    let terminal = vec![SessionEventKind::StatusChanged {
                                         status: SessionStatus::Running,
                                         detail: Some(TurnPhase::Cancelling.detail().to_string()),
-                                    });
+                                    }];
                                     record_all(&mut journal, &events, session_id, terminal).await?;
                                     Ok::<(), anyhow::Error>(())
                                 }
