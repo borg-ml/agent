@@ -6,7 +6,7 @@ use axum::{
         RawQuery, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -131,15 +131,27 @@ async fn descriptor(State(state): State<ListenerState>, RawQuery(query): RawQuer
     if query.is_some() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    Json(serde_json::json!({"protocol":2,"host_id":state.host.to_string(),"route":state.route}))
-        .into_response()
+    public_response(
+        Json(
+            serde_json::json!({"protocol":2,"host_id":state.host.to_string(),"route":state.route}),
+        )
+        .into_response(),
+    )
 }
 
-async fn preflight(RawQuery(query): RawQuery) -> StatusCode {
+fn public_response(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    response
+}
+
+async fn preflight(RawQuery(query): RawQuery) -> Response {
     if query.is_some() {
-        StatusCode::BAD_REQUEST
+        StatusCode::BAD_REQUEST.into_response()
     } else {
-        StatusCode::NO_CONTENT
+        public_response(StatusCode::NO_CONTENT.into_response())
     }
 }
 
