@@ -45,6 +45,8 @@ pub struct HostConfig {
     pub server: String,
     pub host_id: Uuid,
     pub host_token: String,
+    pub relay_public_key: String,
+    pub revocation_epoch: u64,
     pub name: String,
     pub roots: Vec<PathBuf>,
     /// The security boundary this host was enrolled to provide. Older host
@@ -202,6 +204,8 @@ struct EnrollRequest {
 struct EnrollResponse {
     host: RemoteHost,
     host_token: String,
+    relay_public_key: String,
+    revocation_epoch: u64,
 }
 
 #[derive(Deserialize)]
@@ -1115,10 +1119,13 @@ pub async fn enroll_host(
         .json()
         .await
         .context("Borg returned an invalid host enrollment response")?;
+    let _issuer = crate::admission::issuer_key(&enrolled.relay_public_key)?;
     let config = HostConfig {
         server,
         host_id: enrolled.host.id,
         host_token: enrolled.host_token,
+        relay_public_key: enrolled.relay_public_key,
+        revocation_epoch: enrolled.revocation_epoch,
         name,
         roots,
         execution_profile,
@@ -15120,6 +15127,8 @@ connection: close
             server: "http://localhost".to_string(),
             host_id: Uuid::new_v4(),
             host_token: "test".to_string(),
+            relay_public_key: "".into(),
+            revocation_epoch: 0,
             name: "test".to_string(),
             roots: vec![root.to_path_buf()],
             execution_profile: HostExecutionProfile::TrustedUser,

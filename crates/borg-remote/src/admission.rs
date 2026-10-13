@@ -71,3 +71,8 @@ mod tests {
         assert!(verify_ticket(&ticket,&signer.verifying_key(),"h",3,150).is_err());
     }
 }
+
+pub fn issuer_key(encoded: &str) -> Result<VerifyingKey> {
+    let bytes: [u8;32] = URL_SAFE_NO_PAD.decode(encoded)?.try_into().map_err(|_| anyhow::anyhow!("invalid relay public key"))?;
+    Ok(VerifyingKey::from_bytes(&bytes)?)
+}

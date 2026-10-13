@@ -467,6 +467,7 @@ impl PostgresSessionStore {
         .bind(event.session_id)
         .execute(&mut **transaction)
         .await?;
+        super::publication::notify(transaction, event.session_id).await?;
         Ok(compact_event)
     }
 
@@ -643,6 +644,7 @@ impl PostgresSessionStore {
             .bind(event.session_id)
             .execute(&mut *transaction)
             .await?;
+        super::publication::notify(&mut transaction, event.session_id).await?;
         transaction.commit().await?;
         // The COALESCED snapshot, not the frame that was passed in. A
         // continuation keeps the identity and start time of the key it extends,

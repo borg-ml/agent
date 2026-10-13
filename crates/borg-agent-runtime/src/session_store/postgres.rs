@@ -26,6 +26,7 @@ pub mod fork;
 pub mod harness;
 pub mod host;
 pub mod maintenance;
+pub mod publication;
 pub mod recovery;
 pub mod runtime;
 pub mod search;
