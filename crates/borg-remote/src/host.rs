@@ -3484,11 +3484,9 @@ pub(crate) async fn register_child(
         .await
 }
 
-/// Mirror a terminal-owned session through the enrolled host relay.
-///
-/// The terminal remains the process owner and journal authority. This task
-/// only registers the session, uploads its durable suffix, and forwards typed
-/// commands from web/mobile clients.
+/// Register an existing canonical journal with the enrolled host publisher.
+/// Commits metadata and a wakeup on the selected PostgreSQL authority; never
+/// bootstraps a provider or takes ownership of the session's writer.
 pub async fn register_existing_session(
     config_path: &Path,
     store: Arc<dyn SessionStore>,
@@ -3520,6 +3518,8 @@ pub async fn register_existing_session(
     Ok(())
 }
 
+/// Keep the terminal-owned registration handoff alive until shutdown.
+/// Commands continue through the canonical local-control endpoint.
 pub async fn mirror_local_session(
     config_path: &Path,
     store: Arc<dyn crate::SessionStore>,
