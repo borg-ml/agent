@@ -646,6 +646,78 @@ fn process_tree_holds_lock(pid: u32, lock_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Pin the obsolete process identity before signaling. A stale/reused PID or
+/// a replacement owner is never a reason to kill a process.
+#[cfg(target_os = "linux")]
+pub fn force_terminate_obsolete_local_session_owner(
+    sessions_dir: &Path,
+    session_id: Uuid,
+    lock_path: &Path,
+) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let Some(pid) = obsolete_local_session_owner_pid(sessions_dir, session_id, lock_path)? else {
+        bail!("session owner is no longer verified obsolete");
+    };
+    let mut targets = Vec::new();
+    for candidate in process_tree_pids(pid).into_iter().rev() {
+        // Only the recorded owner and descendants actually holding this writer
+        // lock are part of the handoff, not arbitrary subprocesses.
+        if candidate != pid && !process_holds_lock(candidate, lock_path)? {
+            continue;
+        }
+        let start = process_start_time(candidate)?;
+        let identity = process_executable_identity(candidate)?;
+        anyhow::ensure!(
+            start.is_some() && identity.is_some(),
+            "could not verify session process {candidate}"
+        );
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, candidate, 0) };
+        anyhow::ensure!(
+            fd >= 0,
+            "could not pin session process {candidate}: {}",
+            std::io::Error::last_os_error()
+        );
+        let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+        anyhow::ensure!(
+            process_start_time(candidate)? == start
+                && process_executable_identity(candidate)? == identity,
+            "session process {candidate} changed during verification"
+        );
+        targets.push(fd);
+    }
+    anyhow::ensure!(
+        obsolete_local_session_owner_pid(sessions_dir, session_id, lock_path)? == Some(pid),
+        "session owner changed during handoff"
+    );
+    for fd in targets {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).context("failed to terminate verified obsolete owner");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn force_terminate_obsolete_local_session_owner(
+    _sessions_dir: &Path,
+    _session_id: Uuid,
+    _lock_path: &Path,
+) -> Result<()> {
+    bail!("verified obsolete process termination requires Linux")
+}
+
 /// Force-stop a verified obsolete local session owner.
 #[cfg(unix)]
 pub fn force_terminate_local_session_owner(pid: u32) -> Result<()> {
@@ -2257,7 +2329,7 @@ mod tests {
             executable_identity: process_executable_identity(owner.id())
                 .unwrap()
                 .expect("flock child executable identity"),
-            package_version: None,
+            package_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             process_start_time: process_start_time(owner.id()).unwrap(),
         };
         fs::write(
@@ -2270,12 +2342,75 @@ mod tests {
             obsolete_local_session_owner_pid(root.path(), session_id, &lock_path).unwrap(),
             Some(owner.id())
         );
-        force_terminate_local_session_owner(owner.id()).unwrap();
+        // Same package version is not the same installed executable. Conversely,
+        // unknown or mismatched metadata cannot authorize a force handoff.
+        assert!(
+            force_terminate_obsolete_local_session_owner(root.path(), Uuid::new_v4(), &lock_path)
+                .is_err()
+        );
+        assert!(process_is_alive(owner.id()));
+        let mut stale: LocalSessionOwnerMetadata =
+            serde_json::from_slice(&serde_json::to_vec(&metadata).unwrap()).unwrap();
+        stale.process_start_time = Some(metadata.process_start_time.unwrap() + 1);
+        fs::write(
+            session_control_owner_path(root.path(), session_id),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            force_terminate_obsolete_local_session_owner(root.path(), session_id, &lock_path)
+                .is_err()
+        );
+        assert!(process_is_alive(owner.id()));
+        assert!(
+            SessionWriterLease::try_acquire(&lock_path)
+                .unwrap()
+                .is_none()
+        );
+        fs::write(
+            session_control_owner_path(root.path(), session_id),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        force_terminate_obsolete_local_session_owner(root.path(), session_id, &lock_path).unwrap();
         owner.wait().unwrap();
         assert!(
             SessionWriterLease::try_acquire(&lock_path)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    // The force boundary must refuse a live current owner even when its writer
+    // lease is busy; CLI parsing and compiler checks cannot guard this.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn force_handoff_refuses_current_owner_and_unrelated_lock() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let lock_path = root.path().join(format!("{session_id}.lock"));
+        let _writer = SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .unwrap();
+        write_local_session_owner_metadata(root.path(), session_id).unwrap();
+        assert!(
+            obsolete_local_session_owner_pid(root.path(), session_id, &lock_path)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            force_terminate_obsolete_local_session_owner(root.path(), session_id, &lock_path)
+                .is_err()
+        );
+        assert!(
+            SessionWriterLease::try_acquire(&lock_path)
+                .unwrap()
+                .is_none()
+        );
+        let unrelated = root.path().join("unrelated.lock");
+        assert!(
+            force_terminate_obsolete_local_session_owner(root.path(), session_id, &unrelated)
+                .is_err()
         );
     }
 

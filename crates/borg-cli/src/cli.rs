@@ -524,6 +524,11 @@ pub(crate) struct CapabilitiesArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct UpdateArgs {
+    /// Hand off obsolete local session workers, including busy workers.
+    #[arg(long, conflicts_with = "check")]
+    pub(crate) force: bool,
+    #[arg(long, hide = true, conflicts_with = "check")]
+    pub(crate) handoff_only: bool,
     /// Report whether an update is available without installing it.
     #[arg(long)]
     pub(crate) check: bool,
@@ -690,6 +695,21 @@ impl LocalAgentCliArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // This is the public opt-in boundary for interrupting active workers;
+    // compiler checks cannot protect clap's runtime defaults/conflicts.
+    #[test]
+    fn update_requires_explicit_force_to_interrupt_workers() {
+        let parsed = try_parse_direct(["borg", "update"])
+            .unwrap()
+            .command_or_agent();
+        assert!(matches!(parsed, Command::Update(args) if !args.force && !args.handoff_only));
+        let parsed = try_parse_direct(["borg", "update", "--force"])
+            .unwrap()
+            .command_or_agent();
+        assert!(matches!(parsed, Command::Update(args) if args.force && !args.check));
+        assert!(try_parse_direct(["borg", "update", "--check", "--force"]).is_err());
+    }
 
     #[test]
     fn import_is_a_command_with_both_categories_selected_by_default() {

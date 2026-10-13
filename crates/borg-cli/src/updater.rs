@@ -44,6 +44,9 @@ struct UpdateState {
 }
 
 pub(crate) async fn run(args: UpdateArgs) -> Result<()> {
+    if args.handoff_only {
+        return crate::remote_commands::update_local_workers(args.force).await;
+    }
     match update(args.check, false).await? {
         UpdateOutcome::Current(version) => println!("Borg {version} is up to date."),
         UpdateOutcome::Available(version) => {
@@ -55,6 +58,20 @@ pub(crate) async fn run(args: UpdateArgs) -> Result<()> {
             #[cfg(windows)]
             println!("Borg {version} will be installed when this process exits.");
         }
+    }
+    if !args.check {
+        // Run the handoff from the installed image, not the now-unlinked updater.
+        let executable =
+            crate::remote_commands::detached_host_executable(&std::env::current_exe()?)?;
+        let mut command = tokio::process::Command::new(executable);
+        command.args(["update", "--handoff-only"]);
+        if args.force {
+            command.arg("--force");
+        }
+        anyhow::ensure!(
+            command.status().await?.success(),
+            "local worker update failed; saved sessions remain available for resume"
+        );
     }
     Ok(())
 }

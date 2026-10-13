@@ -22,7 +22,7 @@ use borg_remote::{
     SessionConfigAction, SessionEvent, SessionEventKind, SessionGoal, SessionInterrupt,
     SessionState, SessionStatus, SessionStore, SessionWriterLease, SpawnSubagent, SubagentAction,
     SubagentSnapshot, SubagentStatus, TodoAction, default_host_config_path, enroll_host,
-    force_terminate_local_session_owner, local_session_owner_is_active,
+    force_terminate_obsolete_local_session_owner, local_session_owner_is_active,
     local_session_owner_uses_current_binary, login_provider, mirror_local_session,
     obsolete_local_session_owner_pid, probe_capabilities, probe_provider_admission_capabilities,
     provider_credentials_present, run_agent_session_with_priority_commands, run_attached_session,
@@ -1520,7 +1520,61 @@ async fn ensure_detached_session_host(
     result
 }
 
-fn detached_host_executable(current: &Path) -> Result<PathBuf> {
+/// Only explicit force authorizes interrupting a live owner. Unknown identities
+/// are left alone, even when their control socket is present.
+pub(crate) async fn update_local_workers(force: bool) -> Result<()> {
+    let sessions_dir = default_host_config_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("sessions");
+    if !sessions_dir.exists() {
+        return Ok(());
+    }
+    let store = open_local_session_store().await?;
+    for entry in fs::read_dir(&sessions_dir)? {
+        let path = entry?.path();
+        let Some(id) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".control.owner.json"))
+            .and_then(|name| Uuid::parse_str(name).ok())
+        else {
+            continue;
+        };
+        let lock_path = sessions_dir.join(format!("{id}.lock"));
+        if obsolete_local_session_owner_pid(&sessions_dir, id, &lock_path)?.is_none() {
+            continue;
+        }
+        if !force {
+            println!(
+                "Session {id} has an older worker. Idle workers upgrade automatically; run `borg update --force` to interrupt busy work."
+            );
+            continue;
+        }
+        anyhow::ensure!(
+            store.contains_session(id).await?,
+            "session {id} has no durable journal; refusing handoff"
+        );
+        anyhow::ensure!(
+            store.load_host_launch_metadata(id).await?.is_none(),
+            "session {id} belongs to a remote host; refusing local handoff"
+        );
+        let socket = session_control_socket_path(&sessions_dir, id);
+        let writer = stop_stale_local_owner_and_acquire(&lock_path, &socket, id).await?;
+        drop(writer);
+        let args = LocalAgentCliArgs::resume(Some(id));
+        let mut terminal = None;
+        ensure_detached_session_host(&args, id, false, &mut terminal).await?;
+        anyhow::ensure!(
+            local_session_owner_uses_current_binary(&sessions_dir, id)?,
+            "session {id} replacement has not published the installed executable identity"
+        );
+        println!("Updated local worker for session {id}.");
+    }
+    Ok(())
+}
+
+pub(crate) fn detached_host_executable(current: &Path) -> Result<PathBuf> {
     if current.is_file() {
         return Ok(current.to_path_buf());
     }
@@ -2046,6 +2100,10 @@ async fn stop_stale_local_owner_and_acquire(
         return Ok(writer);
     }
     let sessions_dir = lock_path.parent().unwrap_or_else(|| Path::new("."));
+    anyhow::ensure!(
+        obsolete_local_session_owner_pid(sessions_dir, session_id, lock_path)?.is_some(),
+        "session owner is not verified obsolete; refusing to interrupt it"
+    );
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     if let Err(error) = send_local_session_command(
         control_socket_path,
@@ -2095,7 +2153,7 @@ async fn stop_stale_local_owner_and_acquire(
             pid,
             "force-terminating the verified obsolete local session owner"
         );
-        force_terminate_local_session_owner(pid)?;
+        force_terminate_obsolete_local_session_owner(sessions_dir, session_id, lock_path)?;
         let force_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             if let Some(writer) = SessionWriterLease::try_acquire(lock_path)? {
