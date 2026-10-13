@@ -32,6 +32,96 @@ fn subagent_counts_partition_all_lifecycle_states() {
     );
 }
 
+// An exec that returns early must be the same kind of retrievable,
+// cancellable job as runtime/tools; stopping it must kill the owned process.
+#[tokio::test]
+async fn shell_jobs_retrieve_output_and_cancel_the_owned_process() {
+    let directory = tempdir().unwrap();
+    let session = Uuid::new_v4();
+    let processes = crate::native_process::ProcessManager::default();
+    let (tx, _notices) = tokio::sync::mpsc::channel(32);
+    let watches = crate::watch::Watches::new(processes.clone(), tx, session);
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        session,
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        processes.clone(),
+        PermissionMode::FullAccess,
+    )
+    .with_watches(watches.clone());
+    let result = dispatcher
+        .call(
+            "exec",
+            json!({
+                "cmd": "sleep 0.1; printf job-finished", "async": true
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["background"], true);
+    let job = Uuid::parse_str(result["watch_id"].as_str().unwrap()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let info = watches.list_for(&[job]).await.pop().unwrap();
+            if !info.running {
+                assert_eq!(info.result.unwrap()["output"]["stdout"], "job-finished");
+                break;
+            }
+            watches.changed.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    let result = dispatcher
+        .call(
+            "exec",
+            json!({
+                "cmd": "sleep 30", "async": true
+            }),
+        )
+        .await
+        .unwrap();
+    let job = Uuid::parse_str(result["watch_id"].as_str().unwrap()).unwrap();
+    let process = Uuid::parse_str(result["session_id"].as_str().unwrap()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), watches.stop(job))
+        .await
+        .unwrap()
+        .unwrap();
+    let settled = watches.list_for(&[job]).await.pop().unwrap();
+    assert_eq!(settled.result.unwrap()["output"]["running"], false);
+    assert!(
+        processes
+            .write_stdin(session, process, None, false, Some(0), Some(1024))
+            .await
+            .is_err(),
+        "terminated process must be reaped from the live registry"
+    );
+    let result = dispatcher
+        .call(
+            "exec",
+            json!({
+                "cmd": "sleep 0.1; printf synchronous", "async": false, "yield_time_ms": 0
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["running"], false);
+    assert_eq!(result["stdout"], "synchronous");
+    assert!(result.get("watch_id").is_none());
+}
+
 #[tokio::test]
 async fn live_subagent_count_tracks_lifecycle_and_descendant_scope() {
     let directory = tempdir().unwrap();

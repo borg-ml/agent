@@ -1210,9 +1210,25 @@ impl AgentToolDispatcher {
     pub(crate) async fn shell_tool(
         &self,
         name: &str,
-        arguments: Value,
+        mut arguments: Value,
         cancellation: Option<CancellationToken>,
     ) -> Result<Value> {
+        let asynchronous = arguments
+            .as_object_mut()
+            .and_then(|args| args.remove("async"));
+        let asynchronous = match asynchronous {
+            None => None,
+            Some(Value::Bool(value)) => Some(value),
+            Some(_) => bail!("async must be a boolean"),
+        };
+        if asynchronous == Some(true) {
+            arguments["yield_time_ms"] = json!(0);
+        }
+        let label = arguments
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or(name)
+            .to_owned();
         let execution_provider = self.execution_provider();
         if let Some(journal) = self.journal.clone() {
             execution_provider
@@ -1367,6 +1383,72 @@ impl AgentToolDispatcher {
                 "hint".to_string(),
                 json!("Child agents are working. Wait for them with `wait_agent` instead of shell sleeps: one call blocks up to 30 minutes and returns as soon as a child finishes, fails, or messages you."),
             );
+        }
+        if result["running"] == true {
+            let process_id = Uuid::parse_str(
+                result["session_id"]
+                    .as_str()
+                    .context("running shell has no process id")?,
+            )?;
+            let owner = self.actor_session_id;
+            let execution = async move {
+                let mut attachments = Vec::new();
+                let mut attachment_errors = Vec::new();
+                loop {
+                    let snapshot = execution_provider
+                        .write_stdin(crate::ExecutionStdinRequest {
+                            owner_session_id: owner,
+                            process_id,
+                            chars: None,
+                            terminate: false,
+                            yield_time_ms: Some(30_000),
+                            max_output_tokens: None,
+                        })
+                        .await?;
+                    let running = snapshot.running;
+                    let mut outcome = serde_json::to_value(snapshot)?;
+                    if let Some(images) = outcome["attachments"].as_array() {
+                        attachments.extend(images.iter().cloned());
+                    }
+                    if let Some(errors) = outcome["attachment_errors"].as_array() {
+                        attachment_errors.extend(errors.iter().cloned());
+                    }
+                    if !running {
+                        outcome["attachments"] = Value::Array(attachments);
+                        outcome["attachment_errors"] = Value::Array(attachment_errors);
+                        drop_command_echo(&mut outcome);
+                        return Ok(outcome);
+                    }
+                }
+            };
+            if asynchronous == Some(false) {
+                let completed: Value = execution.await?;
+                result
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(completed.as_object().unwrap().clone());
+            } else if let Some(watches) = &self.watches {
+                let cancel = CancellationToken::new();
+                let terminate = cancel.clone();
+                let provider = self.execution_provider();
+                let job = watches.run_job(&label, name, async move {
+                    tokio::select! {
+                        outcome = execution => outcome,
+                        _ = terminate.cancelled() => {
+                            let snapshot = provider.write_stdin(crate::ExecutionStdinRequest {
+                                owner_session_id: owner, process_id, chars: None, terminate: true,
+                                yield_time_ms: Some(0), max_output_tokens: None,
+                            }).await?;
+                            ensure!(!snapshot.running, "shell cancellation has not settled");
+                            Ok(serde_json::to_value(snapshot)?)
+                        }
+                    }
+                }, cancel, Duration::ZERO).await?;
+                result
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(job.as_object().unwrap().clone());
+            }
         }
         Ok(result)
     }
@@ -2031,13 +2113,50 @@ impl AgentToolDispatcher {
                     | "lsp_document_symbols"
                     | "lsp_workspace_symbols"
                     | "get_message_status"
+                    | "get_goal"
+                    | "get_plan"
+                    | "list_agents"
+                    | "inspect_agent"
+                    | "query_history"
+                    | "history_index"
+                    | "get_tool_context"
+                    | "list_shared_work"
+                    | "team_snapshot"
+                    | "list_workspace_participants"
+                    | "get_provider_capabilities"
+                    | "get_agent_settings"
+                    | "get_agent_goal"
+                    | "list_workflows"
+                    | "list_blu_workflows"
+                    | "list_blu_extensions"
+                    | "read_blu_extension"
+                    | "list_plugins"
+                    | "read_plugin"
+                    | "list_retrieval_adapters"
+                    | "read_retrieval_adapter"
+                    | "read_skill"
+                    | "lsp_status"
+                    | "list_watchers"
+                    | "list_runtime_checkpoints"
+                    | "get_runtime_job"
+                    | "get_team_operation"
+                    | "consult_peer"
+                    | "consult_model"
             );
-            if name == "runtime_exec"
-                && let Some(value) = asynchronous
+            if matches!(
+                name,
+                "runtime_exec" | "exec" | "exec_command" | "write_stdin"
+            ) && let Some(value) = asynchronous
             {
                 arguments["async"] = Value::Bool(value);
             }
-            if asynchronous == Some(true) && !detachable && name != "runtime_exec" {
+            if asynchronous == Some(true)
+                && !detachable
+                && !matches!(
+                    name,
+                    "runtime_exec" | "exec" | "exec_command" | "write_stdin"
+                )
+            {
                 bail!("{name} must remain synchronous to preserve ordering or wait semantics");
             }
             if detachable
