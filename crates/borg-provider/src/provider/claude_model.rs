@@ -144,9 +144,13 @@ impl ClaudeModelProvider {
         )
         .await
         .map_err(|error| {
+            let throttled = error
+                .chain()
+                .any(|cause| cause.is::<crate::claude_subscription::Throttled>());
             let kind = error
                 .downcast_ref::<ModelFailure>()
                 .map(|failure| failure.kind)
+                .or(throttled.then_some(ProviderErrorKind::ConnectionLost))
                 .or_else(|| {
                     error.downcast_ref::<reqwest::Error>().map(|error| {
                         if error.status().is_some_and(|status| {

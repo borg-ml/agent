@@ -42,6 +42,9 @@ Git comparison.
   distinct local recipients concurrently without reordering aliases of one agent.
 - Move past Claude subscription quota refusals to the configured fallback
   instead of retrying them as broken connections.
+- Retry throttled Claude account checks (HTTP 429/5xx), honouring Retry-After,
+  and then reconnect instead of failing turns as if the subscription were
+  unavailable.
 
 ### Terminal
 

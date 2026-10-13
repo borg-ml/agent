@@ -574,6 +574,21 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// A Claude account endpoint kept refusing with HTTP 429/5xx after retries.
+/// Temporary: callers reconnect rather than treating the subscription as unusable.
+#[derive(Debug)]
+pub struct Throttled(pub u16);
+impl std::fmt::Display for Throttled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Claude account check temporarily throttled (HTTP {}); retrying, saved credentials kept",
+            self.0
+        )
+    }
+}
+impl std::error::Error for Throttled {}
+
 #[derive(Clone, Copy)]
 enum Operation {
     Refresh,
@@ -612,35 +627,55 @@ async fn fetch(operation: Operation, body: Option<&Value>, bearer: Option<&str>)
         .user_agent("claude-code/2.1.296")
         .build()
         .map_err(|_| anyhow::anyhow!("cannot initialize Claude TLS client"))?;
-    let mut request = match body {
-        Some(value) => client.post(operation.endpoint()).json(value),
-        None => client.get(operation.endpoint()),
-    };
-    request = request
-        .header("Content-Type", "application/json")
-        .header("Cache-Control", "no-cache");
-    if let Some(token) = bearer {
-        request = request.bearer_auth(token);
-    }
-    if matches!(operation, Operation::Usage | Operation::Fast) {
-        request = request.header("anthropic-beta", "oauth-2025-04-20");
-    }
-    let response = request.send().await.map_err(|_| {
-        anyhow::anyhow!("Claude subscription connection failed; saved credentials kept")
-    })?;
-    let status = response.status();
-    if !status.is_success() {
+    // Claude throttles these account endpoints per client. A throttled or
+    // briefly failing check is retried, honouring Retry-After, before the turn
+    // is handed to the reconnection loop; it never means the plan is exhausted.
+    let mut attempt = 0;
+    let response = loop {
+        let mut request = match body {
+            Some(value) => client.post(operation.endpoint()).json(value),
+            None => client.get(operation.endpoint()),
+        };
+        request = request
+            .header("Content-Type", "application/json")
+            .header("Cache-Control", "no-cache");
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
+        }
+        if matches!(operation, Operation::Usage | Operation::Fast) {
+            request = request.header("anthropic-beta", "oauth-2025-04-20");
+        }
+        let response = request.send().await.map_err(|_| {
+            anyhow::anyhow!("Claude subscription connection failed; saved credentials kept")
+        })?;
+        let status = response.status();
+        if status.is_success() {
+            break response;
+        }
         if matches!(status.as_u16(), 400 | 401 | 403) {
             bail!(
                 "Claude subscription rejected (HTTP {}); reconnect or resolve account restrictions. No API-key fallback",
                 status.as_u16()
             );
         }
-        bail!(
-            "Claude subscription unavailable (HTTP {}); saved credentials kept",
-            status.as_u16()
-        );
-    }
+        if !(status.as_u16() == 429 || status.is_server_error()) {
+            bail!(
+                "Claude subscription unavailable (HTTP {}); saved credentials kept",
+                status.as_u16()
+            );
+        }
+        attempt += 1;
+        if attempt > 4 {
+            return Err(Throttled(status.as_u16()).into());
+        }
+        let wait = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()?.trim().parse::<u64>().ok())
+            .unwrap_or(1 << attempt)
+            .min(30);
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+    };
     ensure!(
         response
             .content_length()
