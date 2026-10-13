@@ -3331,6 +3331,38 @@ where
     host_transport::spawn(future)
 }
 
+pub(crate) async fn scope_registration(
+    store: &dyn SessionStore,
+    session: Uuid,
+) -> Result<Option<LaunchSession>> {
+    let root = store.owning_root_session(session).await?.unwrap_or(session);
+    let Some(StoredHostLaunch::Launch(metadata)) = load_launch_metadata(store, root).await? else {
+        return Ok(None);
+    };
+    let mut request = metadata.request;
+    let state = store.state(session).await?;
+    if let Some(configuration) = state.configuration {
+        request.cwd = configuration.cwd;
+        request.provider = configuration.provider;
+        request.model = configuration.model;
+        request.effort = configuration.effort;
+        request.fast = Some(configuration.fast);
+        request.ultrafast = Some(configuration.ultrafast);
+        request.permission_mode = configuration.permission_mode;
+        request.response_language = configuration.response_language;
+    } else if session != root {
+        // A child must have its own committed configuration before registration.
+        return Ok(None);
+    }
+    request.name = state
+        .title
+        .or(state.imported_title)
+        .or_else(|| (session == root).then(|| request.name.clone()).flatten());
+    request.request_id = session;
+    request.initial_prompt = None;
+    Ok(Some(request))
+}
+
 pub(crate) async fn register_child(
     host: Uuid,
     session_id: Uuid,
