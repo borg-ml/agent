@@ -5435,6 +5435,14 @@ async fn run_local_agent_session(
                             );
                         }
                     }
+                    UiAction::ReplaceRecalledPrompt { originals, known_attachment_originals, message_id, text, attachments, delivery } => {
+                        dispatch_ui_command(&ui_interaction_tx, HostCommand::ReplaceRecalledPrompt {
+                            session_id,
+                            replacement: borg_remote::PromptRecallReplacement {
+                                originals, known_attachment_originals, message_id, text, attachments, delivery,
+                            },
+                        });
+                    }
                     UiAction::RecallQueuedPrompts { target } => {
                         if let Some(target) = target {
                             dispatch_ui_command(
@@ -5449,13 +5457,18 @@ async fn run_local_agent_session(
                                 },
                             );
                         } else {
-                            dispatch_ui_command(
-                                &ui_interaction_tx,
-                                HostCommand::RecallQueuedPrompt {
-                                    session_id,
-                                    message_id: None,
-                                },
-                            );
+                            let ids = terminal.as_ref().expect("terminal").provisional_recall_ids();
+                            if ids.is_empty() {
+                                dispatch_ui_command(&ui_interaction_tx, HostCommand::RecallQueuedPrompt {
+                                    session_id, message_id: None,
+                                });
+                            } else {
+                                for message_id in ids {
+                                    dispatch_ui_command(&ui_interaction_tx, HostCommand::RecallQueuedPrompt {
+                                        session_id, message_id: Some(message_id),
+                                    });
+                                }
+                            }
                         }
                     }
                     UiAction::StopWatch(watch_id) => {
@@ -10975,6 +10988,7 @@ fn remote_command_name(command: &HostCommand) -> &'static str {
             }
         }
         HostCommand::RecallQueuedPrompt { .. } => "recall queued prompt",
+        HostCommand::ReplaceRecalledPrompt { .. } => "replace recalled prompt",
         HostCommand::Broadcast { .. } => "team broadcast",
         HostCommand::BroadcastInstances { .. } => "instance broadcast",
         HostCommand::FlushPendingInput { .. } => "flush pending input",

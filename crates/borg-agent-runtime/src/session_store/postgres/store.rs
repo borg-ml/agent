@@ -389,7 +389,10 @@ impl PostgresSessionStore {
         let historical_projection =
             historical_projection_json(event.sequence, inherited_event_count, &projection_json);
         let message_id = match &event.kind {
-            SessionEventKind::Message { message_id, .. } => Some(*message_id),
+            SessionEventKind::Message { message_id, .. }
+            | SessionEventKind::PromptRecalled { message_id, .. }
+            | SessionEventKind::PromptReplacementCommitted { message_id, .. }
+            | SessionEventKind::PromptReplacementResolved { message_id, .. } => Some(*message_id),
             _ => None,
         };
 
@@ -476,7 +479,7 @@ impl PostgresSessionStore {
             _ => return Ok(false),
         };
         let exists: bool = sqlx::query_scalar(
-            "select exists(select 1 from session_events where session_id = $1 and message_id = $2)",
+            "select exists(select 1 from session_events where session_id = $1 and message_id = $2 and event_kind = 'message')",
         )
         .bind(event.session_id)
         .bind(message_id)
@@ -748,7 +751,7 @@ impl PostgresSessionStore {
             let limit = before_or_at.unwrap_or(session.next_sequence.saturating_sub(1));
             let found: bool = sqlx::query_scalar(
                 "select exists(select 1 from session_events \
-                 where session_id = $1 and message_id = $2 and sequence <= $3 \
+                 where session_id = $1 and message_id = $2 and event_kind = 'message' and sequence <= $3 \
                    and (not $4 or fork_inheritable))",
             )
             .bind(session_id)
@@ -964,6 +967,25 @@ impl SessionStore for PostgresSessionStore {
             return self.events_query(session_id, 0, None).await;
         }
         self.composed_events(session_id, None).await
+    }
+
+    async fn prompt_event(
+        &self,
+        session_id: Uuid,
+        message_id: Uuid,
+        kind: &str,
+    ) -> Result<Option<SessionEvent>> {
+        let row = sqlx::query("select event_json, event_body, dict_id from session_events where session_id = $1 and message_id = $2 and event_kind = $3 order by sequence desc limit 1")
+            .bind(session_id).bind(message_id).bind(kind).fetch_optional(self.pool()).await?;
+        let Some(row) = row else { return Ok(None) };
+        let value = self
+            .decode_body(
+                row.try_get("event_json")?,
+                row.try_get("event_body")?,
+                row.try_get("dict_id")?,
+            )
+            .await?;
+        Ok(Some(serde_json::from_value(value)?))
     }
 
     async fn events_after(
@@ -1679,7 +1701,7 @@ impl SessionStore for PostgresSessionStore {
         // index exists for.
         let existing = sqlx::query(
             "select event_json, event_body, dict_id from session_events \
-             where session_id = $1 and message_id = $2 order by sequence asc limit 1",
+             where session_id = $1 and message_id = $2 and event_kind = 'message' order by sequence asc limit 1",
         )
         .bind(event.session_id)
         .bind(message_id)

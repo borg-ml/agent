@@ -1578,6 +1578,14 @@ pub trait SessionStore: Send + Sync {
         action_id: Uuid,
     ) -> Result<Vec<SessionActionTransition>>;
     async fn pending_actions(&self, session_id: Uuid, limit: usize) -> Result<Vec<SessionAction>>;
+    async fn prompt_event(
+        &self,
+        _session_id: Uuid,
+        _message_id: Uuid,
+        _kind: &str,
+    ) -> Result<Option<SessionEvent>> {
+        anyhow::bail!("indexed prompt event lookup is unsupported by this store")
+    }
     async fn read(&self, session_id: Uuid) -> Result<Vec<SessionEvent>>;
     async fn events_after(
         &self,

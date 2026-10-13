@@ -15,6 +15,9 @@ use uuid::Uuid;
 pub struct ComposerDraft {
     pub text: String,
     pub attachments: Vec<PathBuf>,
+    pub recall_originals: Vec<Uuid>,
+    pub recall_acknowledged: Vec<Uuid>,
+    pub recall_submission: Option<(Uuid, String, Vec<PathBuf>)>,
 }
 
 impl ComposerDraft {
@@ -26,6 +29,9 @@ impl ComposerDraft {
         serde_json::json!({
             "text": self.text,
             "attachments": self.attachments,
+            "recall_originals": self.recall_originals,
+            "recall_acknowledged": self.recall_acknowledged,
+            "recall_submission": self.recall_submission,
         })
     }
 
@@ -42,7 +48,28 @@ impl ComposerDraft {
                     .collect()
             })
             .unwrap_or_default();
-        Some(Self { text, attachments })
+        let recall_originals = value
+            .get("recall_originals")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        let recall_acknowledged = value
+            .get("recall_acknowledged")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        let recall_submission = value
+            .get("recall_submission")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        Some(Self {
+            text,
+            attachments,
+            recall_originals,
+            recall_acknowledged,
+            recall_submission,
+        })
     }
 }
 
@@ -165,5 +192,26 @@ impl Drop for DraftWriter {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod recall_tests {
+    use super::*;
+
+    #[test]
+    fn recall_draft_retains_owner_ids_and_retry_identity() {
+        let draft = ComposerDraft {
+            text: "edited".into(),
+            attachments: vec![PathBuf::from("image.png")],
+            recall_originals: vec![Uuid::new_v4()],
+            recall_acknowledged: vec![Uuid::new_v4()],
+            recall_submission: Some((Uuid::new_v4(), "submitted".into(), Vec::new())),
+        };
+        assert_eq!(ComposerDraft::from_value(draft.to_value()), Some(draft));
+        let old =
+            ComposerDraft::from_value(serde_json::json!({"text":"old", "attachments":[]})).unwrap();
+        assert!(old.recall_originals.is_empty());
+        assert!(old.recall_submission.is_none());
     }
 }

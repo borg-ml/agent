@@ -12132,6 +12132,53 @@ async fn escape_flushes_pending_queue_without_latching_a_stop_and_keeps_the_comp
             .unwrap(),
         UiAction::RecallQueuedPrompts { target: None }
     ));
+    // A slow owner must not delay visible restoration or Enter's send intent.
+    assert_eq!(terminal.composer.text, "recall me");
+    assert!(matches!(
+        terminal
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap(),
+        UiAction::ReplaceRecalledPrompt { .. }
+    ));
+    let recalled_id = terminal.queued_prompts[0].message_id;
+    terminal
+        .composer
+        .replace_text("edited while waiting");
+    let attachment = PathBuf::from("/tmp/recalled-image.png");
+    terminal.reconcile_recalled_prompt(None, recalled_id, "recall me", &[attachment.clone()]);
+    assert!(terminal.composer.text.starts_with("edited while waiting"));
+    assert_eq!(
+        terminal
+            .composer
+            .attachments
+            .iter()
+            .map(|item| &item.path)
+            .collect::<Vec<_>>(),
+        vec![&attachment]
+    );
+    assert!(!terminal.provisional_recalls.is_empty());
+    terminal.composer.remove_attachment(0);
+    let action = terminal
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        matches!(action, UiAction::ReplaceRecalledPrompt { known_attachment_originals, attachments, .. }
+        if known_attachment_originals == vec![recalled_id] && attachments.is_empty())
+    );
+    let submitted_id = terminal.recall_submission.as_ref().unwrap().0;
+    terminal.composer.replace_text("newer local draft");
+    terminal.apply_session_event(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::PromptReplacementResolved {
+            message_id: submitted_id,
+            sent: true,
+            originals_consumed: false,
+        },
+    ));
+    assert_eq!(terminal.composer.text, "newer local draft");
+    assert!(terminal.composer.attachments.is_empty());
+    assert!(terminal.provisional_recalls.is_empty());
     terminal.shutdown().await;
 }
 

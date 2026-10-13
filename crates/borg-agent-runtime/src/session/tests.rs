@@ -23590,3 +23590,576 @@ async fn immediate_interrupt_aborts_generation_and_fences_a_replacement_turn() {
     interrupt.settle();
     assert!(!interrupt.requested());
 }
+
+// Protects journal settlement and provider-admission races; a compile check cannot
+// prove that recall/replacement replay never delivers both original and edit.
+#[tokio::test]
+async fn recall_replacement_preserves_attachments_and_replays_only_replacement() {
+    let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let mut journal = RuntimeSessionStore::new(store.clone(), Vec::new(), true);
+    let (events, mut receiver) = mpsc::channel(32);
+    let original = Uuid::new_v4();
+    let replacement_id = Uuid::new_v4();
+    let image = PathBuf::from("original.png");
+    let added = PathBuf::from("added.png");
+    let mut pending = VecDeque::new();
+    queue_pending_prompt(
+        &mut journal,
+        &events,
+        session_id,
+        &mut pending,
+        &mut HashSet::new(),
+        original,
+        "original".into(),
+        vec![image.clone()],
+        Some(json!({"type": "object"})),
+    )
+    .await
+    .unwrap();
+    let replacement = crate::PromptRecallReplacement {
+        originals: vec![original],
+        known_attachment_originals: Vec::new(),
+        message_id: replacement_id,
+        text: "edited".into(),
+        attachments: vec![image.clone(), added.clone(), added.clone()],
+        delivery: PromptDelivery::Queue,
+    };
+    let mut deferred = VecDeque::new();
+    resolve_prompt_replacement(
+        &mut journal,
+        &events,
+        session_id,
+        &mut pending,
+        None,
+        &mut deferred,
+        replacement.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(pending.is_empty());
+    assert!(
+        matches!(deferred.pop_front(), Some(HostCommand::Prompt { message_id, attachments, output_schema, .. })
+        if message_id == replacement_id && attachments == vec![image, added] && output_schema == Some(json!({"type": "object"})))
+    );
+    assert!(
+        matches!(store.prompt_event(session_id, original, "prompt_replacement_committed").await.unwrap().unwrap().kind,
+        SessionEventKind::PromptReplacementCommitted { message_id, .. } if message_id == original)
+    );
+    assert!(matches!(
+        store
+            .prompt_event(session_id, replacement_id, "prompt_replacement_resolved")
+            .await
+            .unwrap()
+            .unwrap()
+            .kind,
+        SessionEventKind::PromptReplacementResolved { sent: true, .. }
+    ));
+    let history = store.read(session_id).await.unwrap();
+    let replay = recover_queued_prompts(&history);
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0].message_id, replacement_id);
+    let count = history.len();
+    resolve_prompt_replacement(
+        &mut journal,
+        &events,
+        session_id,
+        &mut pending,
+        None,
+        &mut deferred,
+        replacement,
+    )
+    .await
+    .unwrap();
+    assert!(deferred.is_empty());
+    assert_eq!(store.read(session_id).await.unwrap().len(), count);
+    let mut outcomes = 0;
+    while let Ok(event) = receiver.try_recv() {
+        if matches!(event.kind, SessionEventKind::PromptReplacementResolved { message_id, sent: true, originals_consumed: false } if message_id == replacement_id)
+        {
+            outcomes += 1;
+        }
+    }
+    assert_eq!(outcomes, 2, "retry must replay its durable resolution");
+}
+
+#[tokio::test]
+async fn recall_replacement_consumed_unchanged_is_noop_but_edit_steers() {
+    let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let original = Uuid::new_v4();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: original,
+                actor: EventActor::User,
+                text: "original".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ))
+        .await
+        .unwrap();
+    let mut journal = RuntimeSessionStore::new(store.clone(), Vec::new(), true);
+    let (events, _receiver) = mpsc::channel(32);
+    let mut pending = VecDeque::new();
+    let mut deferred = VecDeque::new();
+    for (text, sent) in [("original", false), ("edited", true)] {
+        let message_id = Uuid::new_v4();
+        resolve_prompt_replacement(
+            &mut journal,
+            &events,
+            session_id,
+            &mut pending,
+            None,
+            &mut deferred,
+            crate::PromptRecallReplacement {
+                originals: vec![original],
+                known_attachment_originals: Vec::new(),
+                message_id,
+                text: text.into(),
+                attachments: Vec::new(),
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&store.read(session_id).await.unwrap().last().unwrap().kind,
+            SessionEventKind::PromptReplacementResolved { sent: actual, originals_consumed: true, .. } if *actual == sent)
+        );
+        if sent {
+            assert!(matches!(
+                deferred.pop_front(),
+                Some(HostCommand::Prompt {
+                    delivery: PromptDelivery::Steer,
+                    ..
+                })
+            ));
+        } else {
+            assert!(deferred.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn recall_replacement_withdraws_held_steer_before_provider_claim() {
+    let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let original = Uuid::new_v4();
+    let replacement_id = Uuid::new_v4();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: original,
+                actor: EventActor::User,
+                text: "held".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        ))
+        .await
+        .unwrap();
+    let mut journal = RuntimeSessionStore::new(store.clone(), Vec::new(), true);
+    let (events, _receiver) = mpsc::channel(32);
+    let admission = SteerAdmission::pending();
+    let mut steers = VecDeque::from([PendingSteer {
+        prompt: QueuedPrompt {
+            message_id: original,
+            text: "held".into(),
+            actor: EventActor::User,
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+            visible: true,
+            interrupt_batch: true,
+            batch: Vec::new(),
+        },
+        acknowledgement_id: Uuid::new_v4(),
+        admission: admission.clone(),
+        state: PendingSteerState::AwaitingAcknowledgement,
+        attempt_boundary: 0,
+    }]);
+    let mut pending = VecDeque::new();
+    let mut deferred = VecDeque::new();
+    resolve_prompt_replacement(
+        &mut journal,
+        &events,
+        session_id,
+        &mut pending,
+        Some(&mut steers),
+        &mut deferred,
+        crate::PromptRecallReplacement {
+            originals: vec![original],
+            known_attachment_originals: Vec::new(),
+            message_id: replacement_id,
+            text: "held".into(),
+            attachments: Vec::new(),
+            delivery: PromptDelivery::Steer,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(steers.is_empty());
+    assert!(
+        !admission.recall(),
+        "withdrawal admission must already be claimed by recall"
+    );
+    assert!(
+        matches!(deferred.pop_front(), Some(HostCommand::Prompt { message_id, .. }) if message_id == replacement_id)
+    );
+    let history = store.read(session_id).await.unwrap();
+    assert!(history.iter().any(|event| matches!(event.kind, SessionEventKind::PromptRecalled { message_id, .. } if message_id == original)));
+    assert!(matches!(
+        history.last().unwrap().kind,
+        SessionEventKind::PromptReplacementResolved {
+            sent: true,
+            originals_consumed: false,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn recall_replacement_empty_originals_rejects_without_accessing_session() {
+    let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    // Deliberately no create_session: any durable admission would fail.
+    let session_id = Uuid::new_v4();
+    let mut journal = RuntimeSessionStore::new(store, Vec::new(), true);
+    let (events, mut receiver) = mpsc::channel(4);
+    let mut pending = VecDeque::new();
+    let mut deferred = VecDeque::new();
+    resolve_prompt_replacement(
+        &mut journal,
+        &events,
+        session_id,
+        &mut pending,
+        None,
+        &mut deferred,
+        crate::PromptRecallReplacement {
+            originals: Vec::new(),
+            known_attachment_originals: Vec::new(),
+            message_id: Uuid::new_v4(),
+            text: "invalid".into(),
+            attachments: Vec::new(),
+            delivery: PromptDelivery::Queue,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        receiver.recv().await.unwrap().kind,
+        SessionEventKind::PromptReplacementResolved {
+            sent: false,
+            originals_consumed: false,
+            ..
+        }
+    ));
+    assert!(pending.is_empty() && deferred.is_empty());
+}
+
+#[tokio::test]
+async fn replacement_outcome_is_not_message_admission() {
+    let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        SessionEventKind::SessionConfigured {
+            cwd: PathBuf::from("/tmp"),
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+            ultrafast: false,
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::Manual,
+            speed_support: Default::default(),
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::PromptReplacementResolved {
+                message_id,
+                sent: false,
+                originals_consumed: true,
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .contains_message(session_id, message_id)
+            .await
+            .unwrap()
+    );
+    let admitted = store
+        .admit_prompt(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "new".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(admitted.kind, SessionEventKind::Message { .. }));
+    assert!(
+        store
+            .contains_message(session_id, message_id)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn replacement_recovers_legacy_recall_without_decoding_unrelated_history() {
+    let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let session_id = Uuid::new_v4();
+    let original = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: original,
+                actor: EventActor::User,
+                text: "original".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::PromptRecalled {
+                message_id: original,
+                text: "original".into(),
+                attachments: Vec::new(),
+            },
+        ))
+        .await
+        .unwrap();
+    sqlx::query("update session_events set message_id = null where session_id = $1 and event_kind = 'prompt_recalled'")
+        .bind(session_id).execute(store.pool()).await.unwrap();
+    assert!(
+        store
+            .prompt_event(session_id, original, "prompt_recalled")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let unrelated = store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::PromptRecallResolved {
+                message_id: Uuid::new_v4(),
+                recalled: false,
+            },
+        ))
+        .await
+        .unwrap();
+    // A full-read regression fails here even in a tiny fixture.
+    sqlx::query("update session_events set event_json = '{}'::jsonb where session_id = $1 and sequence = $2")
+        .bind(session_id).bind(unrelated.sequence as i64).execute(store.pool()).await.unwrap();
+    assert!(store.read(session_id).await.is_err());
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    let mut journal = RuntimeSessionStore::new(store, Vec::new(), true);
+    let (events, mut receiver) = mpsc::channel(8);
+    let mut pending = VecDeque::new();
+    let mut deferred = VecDeque::new();
+    resolve_prompt_replacement(
+        &mut journal,
+        &events,
+        session_id,
+        &mut pending,
+        None,
+        &mut deferred,
+        crate::PromptRecallReplacement {
+            originals: vec![original],
+            known_attachment_originals: Vec::new(),
+            message_id: Uuid::new_v4(),
+            text: "original".into(),
+            attachments: Vec::new(),
+            delivery: PromptDelivery::Queue,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        deferred.pop_front(),
+        Some(HostCommand::Prompt { .. })
+    ));
+    let mut resolved = false;
+    while let Ok(event) = receiver.try_recv() {
+        resolved |= matches!(
+            event.kind,
+            SessionEventKind::PromptReplacementResolved {
+                sent: true,
+                originals_consumed: false,
+                ..
+            }
+        );
+    }
+    assert!(resolved);
+}
+
+#[tokio::test]
+async fn replacement_restart_with_new_id_does_not_repeat_last_accepted_edit() {
+    let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    let session_id = Uuid::new_v4();
+    let original = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: original,
+                actor: EventActor::User,
+                text: "O".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ))
+        .await
+        .unwrap();
+    let (events, _receiver) = mpsc::channel(32);
+    for (text, sent) in [("A", true), ("A", false), ("B", true), ("B", false)] {
+        // New runtime and submission ID simulate lost asynchronous composer snapshot.
+        let mut journal = RuntimeSessionStore::new(store.clone(), Vec::new(), true);
+        let mut pending = VecDeque::new();
+        let mut deferred = VecDeque::new();
+        let message_id = Uuid::new_v4();
+        resolve_prompt_replacement(
+            &mut journal,
+            &events,
+            session_id,
+            &mut pending,
+            None,
+            &mut deferred,
+            crate::PromptRecallReplacement {
+                originals: vec![original],
+                known_attachment_originals: Vec::new(),
+                message_id,
+                text: text.into(),
+                attachments: vec![PathBuf::from("new.png")],
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(deferred.len(), usize::from(sent));
+        let outcome = store
+            .prompt_event(session_id, message_id, "prompt_replacement_resolved")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(outcome.kind, SessionEventKind::PromptReplacementResolved { sent: actual, originals_consumed: true, .. } if actual == sent)
+        );
+        let claim = store
+            .prompt_event(session_id, original, "prompt_replacement_committed")
+            .await
+            .unwrap()
+            .unwrap();
+        if sent {
+            assert!(
+                matches!(claim.kind, SessionEventKind::PromptReplacementCommitted { replacement_id, .. } if replacement_id == message_id)
+            );
+        } else {
+            assert!(
+                matches!(claim.kind, SessionEventKind::PromptReplacementCommitted { replacement_id, .. } if replacement_id != message_id)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn replacement_acknowledged_attachment_can_be_removed_and_queue_is_preserved() {
+    let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    let session_id = Uuid::new_v4();
+    let original = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: original,
+                actor: EventActor::User,
+                text: "original".into(),
+                attachments: vec![PathBuf::from("removed.png")],
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ))
+        .await
+        .unwrap();
+    let mut journal = RuntimeSessionStore::new(store.clone(), Vec::new(), true);
+    let (events, _receiver) = mpsc::channel(8);
+    let mut pending = VecDeque::new();
+    let mut deferred = VecDeque::new();
+    let message_id = Uuid::new_v4();
+    resolve_prompt_replacement(
+        &mut journal,
+        &events,
+        session_id,
+        &mut pending,
+        None,
+        &mut deferred,
+        crate::PromptRecallReplacement {
+            originals: vec![original],
+            known_attachment_originals: vec![original],
+            message_id,
+            text: "original".into(),
+            attachments: Vec::new(),
+            delivery: PromptDelivery::Queue,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(deferred.pop_front(), Some(HostCommand::Prompt {
+        delivery: PromptDelivery::Queue, attachments, ..
+    }) if attachments.is_empty()));
+    assert!(
+        matches!(store.prompt_event(session_id, message_id, "message").await.unwrap().unwrap().kind,
+        SessionEventKind::Message { delivery: Some(PromptDelivery::Queue), attachments, .. } if attachments.is_empty())
+    );
+}

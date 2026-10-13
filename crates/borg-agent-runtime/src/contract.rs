@@ -1443,6 +1443,18 @@ pub struct RecoveredPendingPrompt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PromptRecallReplacement {
+    pub originals: Vec<Uuid>,
+    #[serde(default)]
+    pub known_attachment_originals: Vec<Uuid>,
+    pub message_id: Uuid,
+    pub text: String,
+    pub attachments: Vec<PathBuf>,
+    pub delivery: PromptDelivery,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
 pub enum HostCommand {
@@ -1469,6 +1481,10 @@ pub enum HostCommand {
         attachments: Vec<PathBuf>,
         output_schema: Option<Value>,
         delivery: PromptDelivery,
+    },
+    ReplaceRecalledPrompt {
+        session_id: Uuid,
+        replacement: PromptRecallReplacement,
     },
     RecallQueuedPrompt {
         session_id: Uuid,
@@ -1603,6 +1619,7 @@ impl HostCommand {
             | Self::Broadcast { session_id, .. }
             | Self::BroadcastInstances { session_id, .. }
             | Self::RecallQueuedPrompt { session_id, .. }
+            | Self::ReplaceRecalledPrompt { session_id, .. }
             | Self::FlushPendingInput { session_id }
             | Self::RecoverPendingInput { session_id, .. }
             | Self::Configure { session_id, .. }
@@ -2798,6 +2815,19 @@ pub enum SessionEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_contract_version: Option<u32>,
     },
+    PromptRecallResolved {
+        message_id: Uuid,
+        recalled: bool,
+    },
+    PromptReplacementCommitted {
+        message_id: Uuid,
+        replacement_id: Uuid,
+    },
+    PromptReplacementResolved {
+        message_id: Uuid,
+        sent: bool,
+        originals_consumed: bool,
+    },
     PromptRecalled {
         message_id: Uuid,
         text: String,
@@ -3454,4 +3484,45 @@ pub struct HostHeartbeat {
     pub active_session_ids: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<RemoteHostIdentity>,
+}
+
+#[cfg(test)]
+mod prompt_replacement_compatibility_tests {
+    use super::*;
+
+    // An old owner must reject replacement, never silently withdraw without sending.
+    #[test]
+    fn replacement_is_not_an_ordinary_recall_on_old_owners() {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldCommand {
+            RecallQueuedPrompt {
+                #[serde(rename = "session_id")]
+                _session_id: Uuid,
+            },
+        }
+        let command = HostCommand::ReplaceRecalledPrompt {
+            session_id: Uuid::new_v4(),
+            replacement: PromptRecallReplacement {
+                originals: vec![Uuid::new_v4()],
+                known_attachment_originals: Vec::new(),
+                message_id: Uuid::new_v4(),
+                text: "edited".into(),
+                attachments: Vec::new(),
+                delivery: PromptDelivery::Steer,
+            },
+        };
+        let ordinary = serde_json::to_value(HostCommand::RecallQueuedPrompt {
+            session_id: Uuid::new_v4(),
+            message_id: None,
+        })
+        .unwrap();
+        assert!(serde_json::from_value::<OldCommand>(ordinary).is_ok());
+        let encoded = serde_json::to_value(command).unwrap();
+        assert!(serde_json::from_value::<OldCommand>(encoded.clone()).is_err());
+        assert!(matches!(
+            serde_json::from_value::<HostCommand>(encoded).unwrap(),
+            HostCommand::ReplaceRecalledPrompt { .. }
+        ));
+    }
 }

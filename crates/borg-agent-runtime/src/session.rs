@@ -483,6 +483,7 @@ impl QueuedPrompt {
     }
 }
 
+#[derive(Clone)]
 struct PendingSteer {
     prompt: QueuedPrompt,
     acknowledgement_id: Uuid,
@@ -491,6 +492,7 @@ struct PendingSteer {
     attempt_boundary: u64,
 }
 
+#[derive(Clone)]
 enum PendingSteerState {
     AwaitingAcknowledgement,
     Accepted,
@@ -3600,7 +3602,23 @@ async fn run_agent_session_store_kernel_inner(
                         )
                         .await?;
                     }
+                    Some(HostCommand::ReplaceRecalledPrompt { replacement, .. }) => {
+                        resolve_prompt_replacement(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            &mut pending,
+                            None,
+                            &mut deferred_commands,
+                            replacement,
+                        )
+                        .await?;
+                    }
                     Some(HostCommand::RecallQueuedPrompt { message_id, .. }) => {
+                        let recalled_any = pending
+                            .iter()
+                            .any(|p| queued_prompt_matches_recall(p, message_id));
+
                         for recalled in recall_visible_queued_prompts(&mut pending, message_id) {
                             if network_retry_message_id == Some(recalled.message_id) {
                                 network_retry_message_id = None;
@@ -3610,6 +3628,18 @@ async fn run_agent_session_store_kernel_inner(
                             }
                             record_recalled_prompt(&mut journal, &events, session_id, &recalled)
                                 .await?;
+                        }
+                        if let Some(message_id) = message_id {
+                            record(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                SessionEventKind::PromptRecallResolved {
+                                    message_id,
+                                    recalled: recalled_any,
+                                },
+                            )
+                            .await?;
                         }
                         if pending.is_empty() {
                             retry_not_before = None;
@@ -6514,6 +6544,9 @@ async fn run_agent_session_store_kernel_inner(
                                 batch: Vec::new(),
                             });
                         }
+                        HostCommand::ReplaceRecalledPrompt { replacement, .. } => {
+                                resolve_prompt_replacement(&mut journal, &events, session_id, &mut pending, Some(&mut pending_steers), &mut deferred_commands, replacement).await?;
+                        }
                         HostCommand::RecallQueuedPrompt { message_id, .. } => {
                             let recalled = recall_visible_queued_prompts(&mut pending, message_id)
                                 .into_iter()
@@ -6521,7 +6554,9 @@ async fn run_agent_session_store_kernel_inner(
                                     &mut pending_steers,
                                     message_id,
                                 ));
-                            for recalled in recalled.collect::<Vec<_>>() {
+                            let recalled = recalled.collect::<Vec<_>>();
+                            let recalled_any = !recalled.is_empty();
+                            for recalled in recalled {
                                 record_recalled_prompt(
                                     &mut journal,
                                     &events,
@@ -6529,6 +6564,9 @@ async fn run_agent_session_store_kernel_inner(
                                     &recalled,
                                 )
                                 .await?;
+                            }
+                            if let Some(message_id) = message_id {
+                                record(&mut journal, &events, session_id, SessionEventKind::PromptRecallResolved { message_id, recalled: recalled_any }).await?;
                             }
                         }
                         HostCommand::FlushPendingInput { .. } => {
@@ -10191,6 +10229,329 @@ fn queued_prompt_matches_recall(prompt: &QueuedPrompt, message_id: Option<Uuid>)
         })
 }
 
+async fn resolve_prompt_replacement(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    pending: &mut VecDeque<QueuedPrompt>,
+    mut steers: Option<&mut VecDeque<PendingSteer>>,
+    deferred: &mut VecDeque<HostCommand>,
+    replacement: crate::PromptRecallReplacement,
+) -> Result<()> {
+    if replacement.originals.is_empty() || replacement.originals.contains(&replacement.message_id) {
+        let event = SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::PromptReplacementResolved {
+                message_id: replacement.message_id,
+                sent: false,
+                originals_consumed: false,
+            },
+        );
+        deliver_recorded_event(
+            events,
+            session_id,
+            event,
+            crate::EventPersistence::Ephemeral,
+        )
+        .await;
+        return Ok(());
+    }
+    if let Some(event) = journal
+        .store
+        .prompt_event(
+            session_id,
+            replacement.message_id,
+            "prompt_replacement_resolved",
+        )
+        .await?
+    {
+        let persistence = event.kind.persistence();
+        deliver_recorded_event(events, session_id, event, persistence).await;
+        return Ok(());
+    }
+    let mut latest_claim: Option<SessionEvent> = None;
+    for id in &replacement.originals {
+        if let Some(claim) = journal
+            .store
+            .prompt_event(session_id, *id, "prompt_replacement_committed")
+            .await?
+        {
+            if latest_claim
+                .as_ref()
+                .is_none_or(|latest| claim.sequence > latest.sequence)
+            {
+                latest_claim = Some(claim);
+            }
+        }
+    }
+    let previously_replaced = latest_claim.is_some();
+    let accepted_baseline = if let Some(SessionEvent {
+        kind: SessionEventKind::PromptReplacementCommitted { replacement_id, .. },
+        ..
+    }) = latest_claim
+    {
+        match journal
+            .store
+            .prompt_event(session_id, replacement_id, "message")
+            .await?
+            .map(|event| event.kind)
+        {
+            Some(SessionEventKind::Message {
+                text, attachments, ..
+            }) => Some((text, attachments)),
+            _ => anyhow::bail!("replacement claim has no admitted message"),
+        }
+    } else {
+        None
+    };
+    let mut originals = Vec::new();
+    let mut consumed = previously_replaced;
+    for id in &replacement.originals {
+        let original = journal
+            .store
+            .prompt_event(session_id, *id, "message")
+            .await?
+            .and_then(|event| match event.kind {
+                SessionEventKind::Message {
+                    actor: EventActor::User,
+                    text,
+                    attachments,
+                    ..
+                } => Some((text, attachments)),
+                _ => None,
+            });
+        let Some(original) = original else {
+            record(
+                journal,
+                events,
+                session_id,
+                SessionEventKind::PromptReplacementResolved {
+                    message_id: replacement.message_id,
+                    sent: false,
+                    originals_consumed: false,
+                },
+            )
+            .await?;
+            return Ok(());
+        };
+        originals.push(original);
+        let mut withdrawn = journal
+            .store
+            .prompt_event(session_id, *id, "prompt_recalled")
+            .await?
+            .is_some();
+        if !withdrawn {
+            withdrawn = journal
+                .store
+                .action(session_id, *id)
+                .await?
+                .is_some_and(|action| {
+                    action.state == crate::SessionActionState::Cancelled
+                        && action.error.as_deref() == Some("recalled before execution")
+                });
+        }
+        let pending_original = pending
+            .iter()
+            .any(|p| queued_prompt_matches_recall(p, Some(*id)));
+        let steer_original = steers.as_ref().is_some_and(|ss| {
+            ss.iter().any(|s| {
+                s.prompt.message_id == *id && s.prompt.visible && s.prompt.actor == EventActor::User
+            })
+        });
+        let deferred_original = deferred.iter().any(|command| {
+            matches!(command,
+            HostCommand::Prompt { message_id, .. } if message_id == id)
+        });
+        consumed |= !withdrawn && !pending_original && !steer_original && !deferred_original;
+    }
+    let mut output_schema = None;
+    for id in &replacement.originals {
+        for prompt in pending
+            .iter()
+            .chain(steers.iter().flat_map(|ss| ss.iter().map(|s| &s.prompt)))
+        {
+            if (prompt.message_id == *id
+                || prompt.batch.iter().any(|entry| entry.message_id == *id))
+                && prompt.output_schema.is_some()
+            {
+                output_schema = prompt.output_schema.clone();
+            }
+        }
+        for command in deferred.iter() {
+            if let HostCommand::Prompt {
+                message_id,
+                output_schema: Some(schema),
+                ..
+            } = command
+            {
+                if message_id == id {
+                    output_schema = Some(schema.clone());
+                }
+            }
+        }
+    }
+    let pending_before = pending.clone();
+    let steers_before = steers.as_ref().map(|ss| (**ss).clone());
+    let deferred_before = deferred.clone();
+    let mut retained = VecDeque::new();
+    while let Some(command) = deferred.pop_front() {
+        match command {
+            HostCommand::Prompt {
+                message_id,
+                text,
+                attachments,
+                output_schema,
+                ..
+            } if replacement.originals.contains(&message_id) => {
+                pending.push_back(QueuedPrompt {
+                    message_id,
+                    text,
+                    attachments,
+                    output_schema,
+                    delivery: PromptDelivery::Queue,
+                    actor: EventActor::User,
+                    visible: true,
+                    interrupt_batch: true,
+                    batch: Vec::new(),
+                });
+            }
+            command => retained.push_back(command),
+        }
+    }
+    *deferred = retained;
+
+    let mut kinds = Vec::new();
+    for id in &replacement.originals {
+        let mut recalled = recall_visible_queued_prompts(pending, Some(*id));
+        if let Some(steers) = steers.as_mut() {
+            let withdrawn = recall_withdrawable_steers(steers, Some(*id));
+            if withdrawn.is_empty() && steers.iter().any(|s| s.prompt.message_id == *id) {
+                consumed = true;
+            }
+            recalled.extend(withdrawn);
+        }
+        for prompt in recalled {
+            for entry in prompt.batch_entries() {
+                kinds.push(SessionEventKind::PromptRecalled {
+                    message_id: entry.message_id,
+                    text: entry.text,
+                    attachments: entry.attachments,
+                });
+            }
+        }
+    }
+    let original_text = originals
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut attachments = Vec::new();
+    for path in originals
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            !replacement
+                .known_attachment_originals
+                .contains(&replacement.originals[*index])
+        })
+        .flat_map(|(_, (_, paths))| paths.iter())
+        .chain(replacement.attachments.iter())
+    {
+        if !attachments.contains(path) {
+            attachments.push(path.clone());
+        }
+    }
+    let original_attachments = originals
+        .iter()
+        .flat_map(|(_, paths)| paths.iter())
+        .collect::<Vec<_>>();
+    let changed = if let Some((text, baseline_attachments)) = accepted_baseline {
+        replacement.text != text
+            || attachments
+                .iter()
+                .any(|p| !baseline_attachments.contains(p))
+            || baseline_attachments
+                .iter()
+                .any(|p| !attachments.contains(p))
+    } else {
+        replacement.text != original_text
+            || attachments
+                .iter()
+                .any(|p| !original_attachments.contains(&p))
+            || original_attachments
+                .iter()
+                .any(|p| !attachments.contains(p))
+    };
+    let sent = !replacement.originals.is_empty() && (!consumed || changed);
+    let delivery = replacement.delivery;
+    if sent {
+        kinds.extend(replacement.originals.iter().map(|id| {
+            SessionEventKind::PromptReplacementCommitted {
+                message_id: *id,
+                replacement_id: replacement.message_id,
+            }
+        }));
+        kinds.push(SessionEventKind::Message {
+            message_id: replacement.message_id,
+            actor: EventActor::User,
+            text: replacement.text.clone(),
+            attachments: attachments.clone(),
+            status: MessageStatus::Queued,
+            delivery: Some(delivery),
+        });
+    }
+    kinds.push(SessionEventKind::PromptReplacementResolved {
+        message_id: replacement.message_id,
+        sent,
+        originals_consumed: consumed,
+    });
+    let appended = journal
+        .append_all(
+            kinds
+                .into_iter()
+                .map(|kind| SessionEvent::new(session_id, 0, kind))
+                .collect(),
+        )
+        .await;
+    let appended = match appended {
+        Ok(appended) => appended,
+        Err(error) => {
+            *pending = pending_before;
+            *deferred = deferred_before;
+            if let (Some(steers), Some(mut before)) = (steers.as_mut(), steers_before) {
+                for steer in &mut before {
+                    if steer.admission.is_recalled() {
+                        steer.admission = SteerAdmission::pending();
+                        steer.acknowledgement_id = Uuid::new_v4();
+                        steer.state = PendingSteerState::RetryAtBoundary {
+                            error: "replacement persistence failed".into(),
+                        };
+                    }
+                }
+                **steers = before;
+            }
+            return Err(error);
+        }
+    };
+
+    for event in appended {
+        let persistence = event.kind.persistence();
+        deliver_recorded_event(events, session_id, event, persistence).await;
+    }
+    if sent {
+        deferred.push_front(HostCommand::Prompt {
+            session_id,
+            message_id: replacement.message_id,
+            text: replacement.text,
+            attachments,
+            output_schema,
+            delivery,
+        });
+    }
+    Ok(())
+}
+
 async fn record_recalled_prompt(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
@@ -10953,6 +11314,30 @@ async fn recall_queued_prompt_before_provider_admission(
     let mut recalled_current = false;
     while let Some(command) = ready.pop_front() {
         match command {
+            HostCommand::ReplaceRecalledPrompt {
+                session_id: command_session_id,
+                replacement,
+            } if command_session_id == session_id => {
+                if replacement
+                    .originals
+                    .iter()
+                    .any(|id| queued_prompt_matches_recall(current, Some(*id)))
+                    && !recalled_current
+                {
+                    pending.push_front(current.clone());
+                    recalled_current = true;
+                }
+                resolve_prompt_replacement(
+                    journal,
+                    events,
+                    session_id,
+                    pending,
+                    None,
+                    deferred,
+                    replacement,
+                )
+                .await?;
+            }
             HostCommand::RecallQueuedPrompt {
                 session_id: command_session_id,
                 message_id,
@@ -11006,6 +11391,18 @@ async fn recall_queued_prompt_before_provider_admission(
                 }
                 for recalled in recalled {
                     record_recalled_prompt(journal, events, session_id, &recalled).await?;
+                }
+                if let Some(message_id) = message_id {
+                    record(
+                        journal,
+                        events,
+                        session_id,
+                        SessionEventKind::PromptRecallResolved {
+                            message_id,
+                            recalled: true,
+                        },
+                    )
+                    .await?;
                 }
             }
             command => deferred.push_back(command),
@@ -11123,12 +11520,43 @@ async fn collect_input_at_turn_boundary(
                 )
                 .await?;
             }
+            HostCommand::ReplaceRecalledPrompt {
+                session_id: command_session_id,
+                replacement,
+            } if command_session_id == session_id => {
+                resolve_prompt_replacement(
+                    journal,
+                    events,
+                    session_id,
+                    pending,
+                    None,
+                    deferred,
+                    replacement,
+                )
+                .await?;
+            }
             HostCommand::RecallQueuedPrompt {
                 session_id: command_session_id,
                 message_id,
             } if command_session_id == session_id => {
+                let recalled_any = pending
+                    .iter()
+                    .any(|p| queued_prompt_matches_recall(p, message_id));
+
                 for recalled in recall_visible_queued_prompts(pending, message_id) {
                     record_recalled_prompt(journal, events, session_id, &recalled).await?;
+                }
+                if let Some(message_id) = message_id {
+                    record(
+                        journal,
+                        events,
+                        session_id,
+                        SessionEventKind::PromptRecallResolved {
+                            message_id,
+                            recalled: recalled_any,
+                        },
+                    )
+                    .await?;
                 }
             }
             HostCommand::RecoverPendingInput {

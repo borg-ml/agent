@@ -908,6 +908,14 @@ pub enum UiAction {
         target: Option<Uuid>,
         decision: ApprovalDecision,
     },
+    ReplaceRecalledPrompt {
+        originals: Vec<Uuid>,
+        known_attachment_originals: Vec<Uuid>,
+        message_id: Uuid,
+        text: String,
+        attachments: Vec<PathBuf>,
+        delivery: PromptDelivery,
+    },
     RecallQueuedPrompts {
         target: Option<Uuid>,
     },
@@ -1784,6 +1792,9 @@ pub struct BorgTerminal {
     last_ctrl_c: Option<Instant>,
     ctrl_c_count: u8,
     queued_prompts: Vec<PendingPromptProjection>,
+    provisional_recalls: Vec<(Option<Uuid>, Uuid)>,
+    acknowledged_recalls: HashSet<Uuid>,
+    recall_submission: Option<(Uuid, String, Vec<PathBuf>)>,
     /// An idle submission this surface already projected as a starting turn.
     ///
     /// The session journals such a prompt as `Message{status: Queued}` a beat
@@ -3206,6 +3217,9 @@ impl BorgTerminal {
             last_ctrl_c: None,
             ctrl_c_count: 0,
             queued_prompts: Vec::new(),
+            provisional_recalls: Vec::new(),
+            acknowledged_recalls: HashSet::new(),
+            recall_submission: None,
             optimistic_idle_prompt: None,
             withheld_queued_prompt: None,
             requeue_cursor: None,
@@ -3670,6 +3684,13 @@ impl BorgTerminal {
         };
         self.composer
             .restore(draft.text.clone(), draft.attachments.clone());
+        self.provisional_recalls = draft
+            .recall_originals
+            .iter()
+            .map(|id| (None, *id))
+            .collect();
+        self.acknowledged_recalls = draft.recall_acknowledged.iter().copied().collect();
+        self.recall_submission = draft.recall_submission.clone();
         self.persisted_draft = Some(draft);
     }
 
@@ -3677,11 +3698,17 @@ impl BorgTerminal {
     /// at any point leaves a resumable prompt. Failures are logged, never
     /// surfaced: a draft that cannot be written must not break typing.
     pub fn persist_composer_draft(&mut self) {
-        let current = self
-            .composer_draft()
-            .map_or_else(ComposerDraft::default, |(text, attachments)| {
-                ComposerDraft { text, attachments }
-            });
+        let current =
+            self.composer_draft()
+                .map_or_else(ComposerDraft::default, |(text, attachments)| {
+                    ComposerDraft {
+                        text,
+                        attachments,
+                        recall_originals: self.provisional_recall_ids(),
+                        recall_acknowledged: self.acknowledged_recalls.iter().copied().collect(),
+                        recall_submission: self.recall_submission.clone(),
+                    }
+                });
         if self
             .persisted_draft
             .as_ref()
@@ -3852,6 +3879,89 @@ impl BorgTerminal {
         self.composer.append_recalled(text, attachments);
         self.composer_selection = None;
         self.notice = Some("Could not send the prompt; it was returned to the composer".into());
+    }
+
+    pub fn provisional_recall_ids(&self) -> Vec<Uuid> {
+        self.provisional_recalls
+            .iter()
+            .filter_map(|(target, id)| target.is_none().then_some(*id))
+            .collect()
+    }
+
+    fn preview_queued_recall(&mut self) {
+        let target = self.focused_child;
+        if target.is_some() || !self.composer.attachments.is_empty() {
+            return;
+        }
+        if self.composer.text.trim().is_empty() {
+            self.composer.clear();
+        }
+        let prompts = self
+            .active_queued_prompts()
+            .iter()
+            .filter(|prompt| prompt.actor == EventActor::User)
+            .cloned()
+            .collect::<Vec<_>>();
+        for prompt in prompts {
+            if !self
+                .provisional_recalls
+                .contains(&(target, prompt.message_id))
+            {
+                self.provisional_recalls.push((target, prompt.message_id));
+                self.composer.append_recalled(prompt.text, Vec::new());
+            }
+        }
+        self.notice = Some("Draft restored".into());
+    }
+
+    fn reconcile_recalled_prompt(
+        &mut self,
+        target: Option<Uuid>,
+        message_id: Uuid,
+        text: &str,
+        attachments: &[PathBuf],
+    ) {
+        if self.provisional_recalls.contains(&(target, message_id)) {
+            if !self.acknowledged_recalls.insert(message_id) {
+                return;
+            }
+            // Text is already editable. Only the durable acknowledgment owns
+            // attachments, and must not overwrite edits made while it travelled.
+            let text = self.composer.expanded_text();
+            let mut paths = self
+                .composer
+                .attachments
+                .iter()
+                .map(|item| item.path.clone())
+                .collect::<Vec<_>>();
+            for attachment in attachments {
+                if !paths.contains(attachment) {
+                    paths.push(attachment.clone());
+                }
+                if let Some((_, _, submitted_attachments)) = &mut self.recall_submission {
+                    if !submitted_attachments.contains(attachment) {
+                        submitted_attachments.push(attachment.clone());
+                    }
+                }
+            }
+            self.composer.restore(text, paths);
+            if let Some((_, submitted_text, submitted_attachments)) = &mut self.recall_submission {
+                let mut submitted = Composer::default();
+                submitted.restore(submitted_text.clone(), submitted_attachments.clone());
+                *submitted_text = submitted.expanded_text();
+            }
+        } else {
+            self.composer
+                .append_recalled(text.to_owned(), attachments.to_vec());
+        }
+        self.notice = Some(
+            if self.provisional_recalls.is_empty() {
+                "Queued prompts returned to composer"
+            } else {
+                "Draft restored"
+            }
+            .into(),
+        );
     }
 
     pub fn is_launch_screen(&self) -> bool {
@@ -4203,12 +4313,64 @@ impl BorgTerminal {
                 self.hovered_message = None;
                 self.pending_tool_copy = None;
             }
-            SessionEventKind::PromptRecalled {
-                text, attachments, ..
+            SessionEventKind::PromptRecallResolved {
+                message_id,
+                recalled: false,
+            } if !self.replaying_history
+                && self.provisional_recalls.contains(&(None, *message_id)) =>
+            {
+                self.notice =
+                    Some("Original prompt already running; edits remain in the composer".into());
+            }
+            SessionEventKind::PromptReplacementResolved {
+                message_id,
+                sent,
+                originals_consumed,
             } if !self.replaying_history => {
-                self.composer
-                    .append_recalled(text.clone(), attachments.clone());
-                self.notice = Some("Queued prompts returned to composer".to_string());
+                if self
+                    .recall_submission
+                    .as_ref()
+                    .is_some_and(|(id, _, _)| id == message_id)
+                {
+                    let (_, text, attachments) =
+                        self.recall_submission.take().expect("matched submission");
+                    if *sent
+                        && self.composer.expanded_text() == text
+                        && self
+                            .composer
+                            .attachments
+                            .iter()
+                            .map(|item| &item.path)
+                            .eq(attachments.iter())
+                    {
+                        self.composer.clear();
+                    }
+                    if *sent {
+                        self.provisional_recalls.clear();
+                        self.acknowledged_recalls.clear();
+                    }
+                }
+                self.notice = Some(
+                    if !sent && !originals_consumed {
+                        "Could not reconcile the original prompt; draft retained"
+                    } else if !sent {
+                        "Prompt already admitted; unchanged draft was not sent again"
+                    } else if *originals_consumed {
+                        "Previous input already admitted; edits sent as new input"
+                    } else {
+                        "Edited prompt sent"
+                    }
+                    .into(),
+                );
+                self.persist_composer_draft();
+            }
+            SessionEventKind::PromptRecalled {
+                message_id,
+                text,
+                attachments,
+            } if !self.replaying_history => {
+                self.reconcile_recalled_prompt(None, *message_id, text, attachments);
+                self.persist_composer_draft();
             }
             _ => {}
         }
@@ -4472,11 +4634,11 @@ impl BorgTerminal {
                 self.child_pending_approvals.remove(&child_id);
             }
             SessionEventKind::PromptRecalled {
-                text, attachments, ..
+                message_id,
+                text,
+                attachments,
             } if self.focused_child == Some(child_id) && !self.replaying_history => {
-                self.composer
-                    .append_recalled(text.clone(), attachments.clone());
-                self.notice = Some("Queued prompts returned to composer".to_string());
+                self.reconcile_recalled_prompt(Some(child_id), *message_id, text, attachments);
             }
             _ => {}
         }
@@ -11351,6 +11513,9 @@ impl BorgTerminal {
         }
         if ctrl_c && (!self.composer.text.is_empty() || !self.composer.attachments.is_empty()) {
             self.composer.clear();
+            self.provisional_recalls.clear();
+            self.acknowledged_recalls.clear();
+            self.recall_submission = None;
             self.composer_selection = None;
             self.notice = Some("Prompt cleared".to_string());
             return Ok(UiAction::None);
@@ -11476,6 +11641,36 @@ impl BorgTerminal {
             self.transcript.select_next();
             self.notice = Some(self.transcript.selection_notice(&self.keymap));
             return Ok(UiAction::None);
+        }
+        if !self.provisional_recalls.is_empty()
+            && (self.keymap.matches(KeyAction::Queue, &key)
+                || self.keymap.matches(KeyAction::Send, &key))
+        {
+            let text = self.composer.expanded_text();
+            let attachments = self
+                .composer
+                .attachments
+                .iter()
+                .map(|item| item.path.clone())
+                .collect::<Vec<_>>();
+            let message_id = self
+                .recall_submission
+                .as_ref()
+                .filter(|(_, sent, images)| sent == &text && images == &attachments)
+                .map_or_else(Uuid::new_v4, |(id, _, _)| *id);
+            self.recall_submission = Some((message_id, text.clone(), attachments.clone()));
+            return Ok(UiAction::ReplaceRecalledPrompt {
+                originals: self.provisional_recall_ids(),
+                known_attachment_originals: self.acknowledged_recalls.iter().copied().collect(),
+                message_id,
+                text,
+                attachments,
+                delivery: if self.keymap.matches(KeyAction::Queue, &key) {
+                    PromptDelivery::Queue
+                } else {
+                    PromptDelivery::Steer
+                },
+            });
         }
         if self.keymap.matches(KeyAction::Queue, &key)
             && slash_matches(&self.composer.text).is_empty()
@@ -11650,6 +11845,7 @@ impl BorgTerminal {
                 }
                 if has_recallable_queued_prompts(&self.composer.text, self.active_queued_prompts())
                 {
+                    self.preview_queued_recall();
                     return Ok(UiAction::RecallQueuedPrompts {
                         target: self.focused_child,
                     });
@@ -11658,6 +11854,7 @@ impl BorgTerminal {
                     // Only the session knows whether the provider has committed
                     // the steer. Transport acceptance is still recallable, so
                     // ask the session to reconcile it at the provider boundary.
+                    self.preview_queued_recall();
                     return Ok(UiAction::RecallQueuedPrompts {
                         target: self.focused_child,
                     });
@@ -14012,6 +14209,9 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::GoalUpdated { .. }
         | SessionEventKind::GoalCleared { .. }
         | SessionEventKind::ContextCleared
+        | SessionEventKind::PromptRecallResolved { .. }
+        | SessionEventKind::PromptReplacementCommitted { .. }
+        | SessionEventKind::PromptReplacementResolved { .. }
         | SessionEventKind::PromptRecalled { .. }
         | SessionEventKind::TurnCompleted { .. }
         | SessionEventKind::Error { .. } => true,
