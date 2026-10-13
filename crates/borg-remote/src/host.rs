@@ -78,18 +78,6 @@ const HOST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HOST_HEARTBEAT_RETRY_MAX: Duration = Duration::from_secs(30);
 const SYSTEMD_NOTIFY_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-struct HostAcknowledgement {
-    sequence: u64,
-    claim_token: Option<Uuid>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct PersistedHostState {
-    host_id: Uuid,
-    acknowledged: HostAcknowledgement,
-}
-
 #[derive(Default)]
 struct RemoteRetryBackoff {
     failures: u32,
@@ -203,12 +191,6 @@ struct EnrollResponse {
 }
 
 #[derive(Deserialize)]
-struct SessionSyncResponse {
-    event_cursor: u64,
-    live_revision: u64,
-}
-
-#[derive(Deserialize)]
 struct RelayWorkspaceRoster {
     participants: Vec<RelayWorkspaceParticipant>,
 }
@@ -302,38 +284,6 @@ struct PersistedLaunchMetadata {
     request: LaunchSession,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     attachment: Option<WorkspaceAttachment>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum EventUploadOutcome {
-    Complete,
-    Retryable,
-    Blocked {
-        session_id: Uuid,
-        sequence: u64,
-        event_kind: String,
-        event_bytes: usize,
-    },
-    /// An event the relay can never store, and replay moved past it.
-    Skipped {
-        sequence: u64,
-    },
-}
-
-async fn upload_event_page(
-    client: &Client,
-    config: &HostConfig,
-    store: &dyn SessionStore,
-    events: &[SessionEvent],
-    uploaded_sequence: &mut u64,
-    timeout: Duration,
-) -> Result<EventUploadOutcome> {
-    // The committed journal is served by sync; no relay event copy exists.
-    let _ = (client, config, store, timeout);
-    if let Some(last) = events.last() {
-        *uploaded_sequence = last.sequence;
-    }
-    Ok(EventUploadOutcome::Complete)
 }
 
 pub async fn enroll_host(
@@ -1593,11 +1543,6 @@ pub(crate) async fn run_host_with_resolved_store(
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(35))
         .build()?;
-    let host_state_path = host_state_path(config_path);
-    let acknowledged = Arc::new(Mutex::new(load_host_acknowledgement(
-        &host_state_path,
-        config.host_id,
-    )));
     let sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let session_root = config_path
@@ -1632,7 +1577,7 @@ pub(crate) async fn run_host_with_resolved_store(
     host_transport::CURRENT.scope(transport.clone(), async move {
     let _shutdown = host_transport::StopOnDrop(transport.clone());
     let _heartbeat = AbortTask(host_transport::spawn(run_host_heartbeat_loop(
-        client.clone(), config.clone(), acknowledged, Arc::clone(&sessions), capabilities,
+        client.clone(), config.clone(), Arc::clone(&sessions), capabilities,
     )));
     let _operations = AbortTask(host_transport::spawn(run_host_operation_loop(
         client.clone(), config.clone(), Arc::clone(&receipts), session_root.clone(),
@@ -2579,98 +2524,6 @@ async fn execute_host_operation(
     }
 }
 
-async fn run_host_journal_recovery_loop(
-    client: Client,
-    config: HostConfig,
-    store: Arc<dyn SessionStore>,
-    sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
-) {
-    let mut after = None;
-    let mut retry_at = HashMap::new();
-    loop {
-        retry_at.retain(|_, retry| *retry > Instant::now());
-        let pending = match store.pending_host_journals(after, 32).await {
-            Ok(pending) => pending,
-            Err(error) => {
-                tracing::warn!(%error, "cannot scan pending host journals; retrying");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-        // Page past failed and active sessions so they cannot starve later journals.
-        after = if pending.len() == 32 {
-            pending.last().copied()
-        } else {
-            None
-        };
-        for session_id in pending {
-            if sessions.lock().await.contains_key(&session_id)
-                || retry_at
-                    .get(&session_id)
-                    .is_some_and(|retry| Instant::now() < *retry)
-            {
-                continue;
-            }
-            let result = tokio::time::timeout(
-                Duration::from_secs(10),
-                recover_host_journal(&client, &config, store.as_ref(), session_id),
-            )
-            .await;
-            match result {
-                Ok(Ok(retry)) => {
-                    if retry > Instant::now() {
-                        retry_at.insert(session_id, retry);
-                    } else {
-                        retry_at.remove(&session_id);
-                    }
-                }
-                error => {
-                    let unavailable = matches!(&error, Ok(Err(error))
-                        if error.downcast_ref::<reqwest::Error>().is_some_and(|error|
-                            matches!(error.status(), Some(StatusCode::NOT_FOUND | StatusCode::GONE))));
-                    tracing::warn!(?error, %session_id, "host journal recovery deferred");
-                    retry_at.insert(
-                        session_id,
-                        Instant::now() + Duration::from_secs(if unavailable { 300 } else { 10 }),
-                    );
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-}
-
-async fn recover_host_journal(
-    client: &Client,
-    config: &HostConfig,
-    store: &dyn SessionStore,
-    session_id: Uuid,
-) -> Result<Instant> {
-    ensure_host_launch_owner(client, config, store, session_id).await?;
-    if !store.contains_session(session_id).await? {
-        return Ok(Instant::now());
-    }
-    // The relay is authoritative after a lost response or a host restart.
-    // This path only publishes journals; it never constructs a session actor.
-    let cursor = load_session_sync(client, config, session_id).await?;
-    store
-        .acknowledge_host_journal(session_id, cursor.event_cursor, cursor.live_revision)
-        .await?;
-    // Event replay only: this sync never relays messages, so it has no
-    // attachment store to read.
-    let mut sync = JournalSync::new(cursor, false, PathBuf::new());
-    let result = flush_pending(client, config, store, session_id, &mut sync).await;
-    store
-        .acknowledge_host_journal(
-            session_id,
-            sync.uploaded_sequence,
-            sync.uploaded_live_revision,
-        )
-        .await?;
-    result?;
-    Ok(sync.retry_at)
-}
-
 async fn run_host_workspace_recovery_loop(
     client: Client,
     config: HostConfig,
@@ -2725,16 +2578,9 @@ async fn run_host_workspace_recovery_loop(
             {
                 continue;
             }
-            let sync = syncs.entry(session_id).or_insert_with(|| {
-                JournalSync::new(
-                    SessionSyncResponse {
-                        event_cursor: 0,
-                        live_revision: 0,
-                    },
-                    false,
-                    journal_root.clone(),
-                )
-            });
+            let sync = syncs
+                .entry(session_id)
+                .or_insert_with(|| JournalSync::new(false, journal_root.clone()));
             let result = tokio::time::timeout(
                 Duration::from_secs(10),
                 recover_host_workspace_messages(
@@ -2875,7 +2721,6 @@ async fn flush_host_workspace_messages(
 async fn run_host_heartbeat_loop(
     client: Client,
     config: HostConfig,
-    acknowledged: Arc<Mutex<HostAcknowledgement>>,
     sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
     mut capabilities: HostCapabilities,
 ) {
@@ -2894,14 +2739,11 @@ async fn run_host_heartbeat_loop(
             capabilities.resource_limits = config.resource_limits.clone();
             capabilities_probed_at = Instant::now();
         }
-        let acknowledgement = *acknowledged.lock().await;
         let active_session_ids = sessions.lock().await.keys().copied().collect();
         match heartbeat(
             &client,
             &config,
             capabilities.clone(),
-            acknowledgement.sequence,
-            acknowledgement.claim_token,
             active_session_ids,
             None,
         )
@@ -3082,8 +2924,6 @@ async fn heartbeat(
     client: &Client,
     config: &HostConfig,
     capabilities: HostCapabilities,
-    acknowledged_command_sequence: u64,
-    acknowledged_command_claim_token: Option<Uuid>,
     active_session_ids: Vec<Uuid>,
     session_id: Option<Uuid>,
 ) -> Result<()> {
@@ -3096,8 +2936,8 @@ async fn heartbeat(
                 platform: platform(),
                 hostname: hostname(),
                 capabilities,
-                acknowledged_command_sequence,
-                acknowledged_command_claim_token,
+                acknowledged_command_sequence: 0,
+                acknowledged_command_claim_token: None,
                 active_session_ids,
                 identity: Some(RemoteHostIdentity {
                     host_id: config.host_id,
@@ -3108,18 +2948,6 @@ async fn heartbeat(
         })
         .await?;
     Ok(())
-}
-
-async fn load_session_sync(
-    client: &Client,
-    config: &HostConfig,
-    session_id: Uuid,
-) -> Result<SessionSyncResponse> {
-    let _ = (client, config, session_id);
-    Ok(SessionSyncResponse {
-        event_cursor: 0,
-        live_revision: 0,
-    })
 }
 
 #[derive(Clone)]
@@ -4994,12 +4822,11 @@ async fn run_session(
             .await?;
     }
     let store: Arc<dyn SessionStore> = durable_store.clone();
-    let cursor = load_session_sync(&client, &config, session_id).await?;
-    let mut sync = JournalSync::new(cursor, attachment.is_some(), session_root.clone());
+    let mut sync = JournalSync::new(attachment.is_some(), session_root.clone());
     sync.uploaded_workspace_sequences = durable_store
         .host_workspace_cursors(config.host_id, session_id)
         .await?;
-    flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
+
     flush_host_workspace_messages(
         &client,
         &config,
@@ -5065,7 +4892,7 @@ async fn run_session(
                 }
             }
             let synchronized: Result<()> = async {
-                flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
+
                 flush_host_workspace_messages(
                     &client,
                     &config,
@@ -5091,7 +4918,7 @@ async fn run_session(
                     return Err(error);
                 }
                 tracing::warn!(%error, %session_id, "session synchronization failed; keeping actor and controls alive for retry");
-                sync.retry_at = Instant::now() + Duration::from_secs(2);
+
             }
         }
         (&mut actor.0).await.context("agent session task failed")?
@@ -5109,7 +4936,7 @@ async fn run_session(
         return Ok(());
     }
     finish_ready_host_bootstrap(durable_store.as_ref(), session_id, initial_prompt_id).await?;
-    flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
+
     flush_host_workspace_messages(
         &client,
         &config,
@@ -5450,8 +5277,6 @@ fn isolated_mcp_command_allowed(command: &str, allowlist: &[String]) -> bool {
 }
 
 struct JournalSync {
-    uploaded_sequence: u64,
-    uploaded_live_revision: u64,
     workspace_retry_at: HashMap<Uuid, Instant>,
     uploaded_workspace_sequences: HashMap<Uuid, u64>,
     workspace_relay_available: bool,
@@ -5459,7 +5284,6 @@ struct JournalSync {
     next_workspace_roster_sync: Instant,
     next_instance_directory_sync: Instant,
     next_inbox_sync: Instant,
-    retry_at: Instant,
     /// The sessions directory whose `attachments/` store holds the images
     /// this host captured or received; the relay reads and fills it.
     journal_root: PathBuf,
@@ -5470,14 +5294,8 @@ struct JournalSync {
 }
 
 impl JournalSync {
-    fn new(
-        cursor: SessionSyncResponse,
-        workspace_relay_available: bool,
-        journal_root: PathBuf,
-    ) -> Self {
+    fn new(workspace_relay_available: bool, journal_root: PathBuf) -> Self {
         Self {
-            uploaded_sequence: cursor.event_cursor,
-            uploaded_live_revision: cursor.live_revision,
             workspace_retry_at: HashMap::new(),
             uploaded_workspace_sequences: HashMap::new(),
             workspace_relay_available,
@@ -5485,7 +5303,6 @@ impl JournalSync {
             next_workspace_roster_sync: Instant::now(),
             next_instance_directory_sync: Instant::now(),
             next_inbox_sync: Instant::now(),
-            retry_at: Instant::now(),
             journal_root,
             inbox_retry_at: HashMap::new(),
         }
@@ -5586,8 +5403,6 @@ pub async fn sync_remote_session(
     if send_pending {
         let next_sync = Instant::now() + Duration::from_secs(30);
         let mut sync = JournalSync {
-            uploaded_sequence: 0,
-            uploaded_live_revision: 0,
             workspace_retry_at: HashMap::new(),
             // The store trait, never a backend-specific entry point, so this
             // path stays independent of which database is underneath.
@@ -5599,7 +5414,6 @@ pub async fn sync_remote_session(
             next_workspace_roster_sync: next_sync,
             next_instance_directory_sync: next_sync,
             next_inbox_sync: next_sync,
-            retry_at: Instant::now(),
             journal_root,
             inbox_retry_at: HashMap::new(),
         };
@@ -6262,23 +6076,6 @@ async fn flush_workspace_messages(
     Ok(caught_up)
 }
 
-async fn flush_pending(
-    client: &Client,
-    config: &HostConfig,
-    store: &dyn SessionStore,
-    session_id: Uuid,
-    sync: &mut JournalSync,
-) -> Result<()> {
-    // Session events are already committed. SyncAuthority owns their ordered
-    // projection/publication; the actor must not rebuild a second live suffix.
-    let _ = (client, config, session_id, sync);
-    ensure!(
-        store.postgres_authority().is_some(),
-        "host publication requires PostgreSQL authority"
-    );
-    Ok(())
-}
-
 fn validate_host_cwd(roots: &[PathBuf], requested: &Path) -> Result<PathBuf> {
     let cwd = requested
         .canonicalize()
@@ -6308,34 +6105,6 @@ fn canonical_roots(roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
                 .with_context(|| format!("host root does not exist: {}", root.display()))
         })
         .collect()
-}
-
-fn host_state_path(config_path: &Path) -> PathBuf {
-    config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("host-state.json")
-}
-
-fn load_host_acknowledgement(path: &Path, host_id: Uuid) -> HostAcknowledgement {
-    let state = match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice::<PersistedHostState>(&bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return HostAcknowledgement::default();
-        }
-        Err(error) => {
-            tracing::warn!(%error, path = %path.display(), "failed to read the durable remote host cursor; relying on relay replay");
-            return HostAcknowledgement::default();
-        }
-    };
-    match state {
-        Ok(state) if state.host_id == host_id => state.acknowledged,
-        Ok(_) => HostAcknowledgement::default(),
-        Err(error) => {
-            tracing::warn!(%error, path = %path.display(), "the durable remote host cursor is invalid; relying on relay replay");
-            HostAcknowledgement::default()
-        }
-    }
 }
 
 fn write_config(path: &Path, config: &HostConfig) -> Result<()> {
@@ -6587,365 +6356,34 @@ mod tests {
         )
     }
 
-    async fn event_server(
-        statuses: Vec<&'static str>,
-    ) -> (String, tokio::task::JoinHandle<Vec<Vec<u64>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = host_transport::spawn(async move {
-            let mut delivered = Vec::new();
-            for status in statuses {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let (_, request) = read_http_request(&mut stream).await;
-                let body: serde_json::Value = serde_json::from_slice(&request).unwrap();
-                delivered.push(
-                    body["events"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|event| {
-                            event["sequence"]
-                                .as_u64()
-                                .or_else(|| event["event"]["sequence"].as_u64())
-                                .unwrap()
-                        })
-                        .collect::<Vec<_>>(),
-                );
-                stream
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                        )
-                        .as_bytes(),
-                    )
-                    .await
-                    .unwrap();
-            }
-            delivered
-        });
-        (format!("http://{address}"), server)
-    }
-
     #[tokio::test]
-    async fn closing_remote_controls_does_not_cancel_the_terminal_journal_flush() {
-        exercise_mirror_streaming(true, true).await;
-    }
-
-    async fn exercise_mirror_streaming(scoped: bool, close_control: bool) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let session_id = Uuid::new_v4();
-        let (first_upload_tx, first_upload_rx) = tokio::sync::oneshot::channel();
-        let (poll_started_tx, poll_started_rx) = tokio::sync::oneshot::channel();
-        let (second_upload_tx, second_upload_rx) = tokio::sync::oneshot::channel();
-        let server = host_transport::spawn(async move {
-            let mut poll_started_tx = Some(poll_started_tx);
-            let mut second_upload_tx = Some(second_upload_tx);
-            let mut held_polls = Vec::new();
-            let mut first_upload_tx = Some(first_upload_tx);
-            let mut uploads = Vec::new();
-            let mut messages = Vec::new();
-            let mut registrations = Vec::new();
-            while uploads.len() < 3 || messages.is_empty() {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let (path, body) = read_http_request(&mut stream).await;
-                if path != "/api/remote/host/sessions" {
-                    assert_eq!(
-                        registrations.len(),
-                        3,
-                        "no mirroring before valid registration"
-                    );
-                }
-                let response = match path.split_once('?').map_or(path.as_str(), |(path, _)| path) {
-                    "/api/remote/host/commands" => {
-                        assert!(
-                            scoped,
-                            "a legacy relay must not be polled for shared commands"
-                        );
-                        let url = Url::parse(&format!("http://localhost{path}")).unwrap();
-                        assert!(
-                            url.query_pairs().any(|(key, value)| key == "session_id"
-                                && value == session_id.to_string())
-                        );
-                        if let Some(started) = poll_started_tx.take() {
-                            started.send(()).unwrap();
-                        }
-                        if close_control {
-                            let body = serde_json::json!({"commands": [HostCommandEnvelope {
-                                id: Uuid::new_v4(), sequence: 1235, created_at: Utc::now(),
-                                claim_token: Some(Uuid::new_v4()), command: HostCommand::Stop { session_id },
-                            }]}).to_string();
-                            stream
-                                .write_all(
-                                    format!(
-                                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                                        body.len()
-                                    )
-                                    .as_bytes(),
-                                )
-                                .await
-                                .unwrap();
-                        } else {
-                            held_polls.push(stream);
-                        }
-                        continue;
-                    }
-                    "/api/remote/host/sessions" => {
-                        let registration: serde_json::Value =
-                            serde_json::from_slice(&body).unwrap();
-                        assert_eq!(registration["command_scope"], "session_v1");
-                        assert_eq!(registration["session_id"], session_id.to_string());
-                        registrations.push(registration);
-                        if registrations.len() == 1 {
-                            stream
-                                .write_all(
-                                    b"HTTP/1.1 503 Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                                )
-                                .await
-                                .unwrap();
-                            continue;
-                        }
-                        let body = if registrations.len() == 2 {
-                            "{"
-                        } else if scoped {
-                            r#"{"command_scope":"session_v1","command_cursor":1234,"event_cursor":0,"live_revision":0}"#
-                        } else {
-                            r#"{"command_cursor":1234,"event_cursor":0,"live_revision":0}"#
-                        };
-                        format!(
-                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                            body.len()
-                        )
-                    }
-                    "/api/remote/host/heartbeat" => {
-                        let heartbeat: HostHeartbeat = serde_json::from_slice(&body).unwrap();
-                        assert_eq!(heartbeat.active_session_ids, vec![session_id]);
-                        let url = Url::parse(&format!("http://localhost{path}")).unwrap();
-                        assert_eq!(
-                            url.query_pairs().any(|(key, value)| key == "session_id"
-                                && value == session_id.to_string()),
-                            scoped
-                        );
-                        assert_eq!(
-                            heartbeat.acknowledged_command_sequence,
-                            if scoped { 1234 } else { 0 }
-                        );
-                        "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                            .to_string()
-                    }
-                    path if path.ends_with("/inbox") => {
-                        "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                            .to_string()
-                    }
-                    path if path.ends_with("/instances") => {
-                        let body = r#"{"participants":[]}"#;
-                        format!(
-                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                            body.len()
-                        )
-                    }
-                    path if path.ends_with("/messages") => {
-                        messages.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
-                        "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                            .to_string()
-                    }
-                    "/api/remote/host/events" => {
-                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                        uploads.push(
-                            body["events"]
-                                .as_array()
-                                .unwrap()
-                                .iter()
-                                .map(|event| {
-                                    event["sequence"]
-                                        .as_u64()
-                                        .or_else(|| event["event"]["sequence"].as_u64())
-                                        .unwrap()
-                                })
-                                .collect::<Vec<_>>(),
-                        );
-                        if uploads.len() == 1
-                            && let Some(first_upload_tx) = first_upload_tx.take()
-                        {
-                            first_upload_tx.send(()).unwrap();
-                        }
-                        if uploads.len() == 2
-                            && let Some(uploaded) = second_upload_tx.take()
-                        {
-                            uploaded.send(()).unwrap();
-                        }
-                        "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                            .to_string()
-                    }
-                    unexpected => panic!("unexpected mirror request: {unexpected}"),
-                };
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-            assert_eq!(registrations.len(), 3);
-            assert!(
-                registrations
-                    .iter()
-                    .all(|request| request == &registrations[0])
-            );
-            (uploads, messages)
-        });
-
+    async fn closing_remote_controls_preserves_terminal_registration_and_journal() {
         let root = tempdir().unwrap();
-        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
-        let store: Arc<dyn SessionStore> = Arc::new(postgres);
-        let remote_recipient = Uuid::new_v4();
-        store.create_session(session_id).await.unwrap();
-        let workspace = store.workspace_store().await.unwrap().unwrap();
-        let binding = store.workspace_binding(session_id).await.unwrap().unwrap();
-        let human = crate::local_human_participant_id("Human");
-        workspace
-            .ensure_execution_workspace(
-                binding.workspace_id,
-                "mirror workspace",
-                human,
-                "Human",
-                session_id,
-                "Mirror sender",
-            )
-            .await
-            .unwrap();
-        workspace
-            .upsert_instance(
-                Participant {
-                    id: remote_recipient,
-                    display_name: "Remote peer".to_string(),
-                    kind: ParticipantKind::Agent,
-                    created_at: Utc::now(),
-                },
-                Some(Uuid::new_v4()),
-                None,
-            )
-            .await
-            .unwrap();
-        let direct_workspace = workspace
-            .ensure_direct_workspace(session_id, remote_recipient)
-            .await
-            .unwrap();
-        workspace
-            .append_message(crate::NewWorkspaceMessage {
-                workspace_id: direct_workspace,
-                author_id: session_id,
-                text: "mirror this private handoff".to_string(),
-                mentions: Vec::new(),
-                attachments: Vec::new(),
-                audience: Audience::Direct {
-                    participant: remote_recipient,
-                },
-                mode: crate::DeliveryMode::NextTurn,
-                thread_id: None,
-                reply_to_message_id: None,
-                idempotency_key: "mirror-private-handoff".to_string(),
-            })
-            .await
-            .unwrap();
-        store
-            .append(SessionEvent::new(
-                session_id,
-                0,
-                crate::SessionEventKind::SessionStarted,
-            ))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let id = Uuid::new_v4();
+        store.create_session(id).await.unwrap();
+        let config = test_config(root.path());
         let config_path = root.path().join("host.json");
-        write_config(
+        write_config(&config_path, &config).unwrap();
+        let (commands, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let (shutdown, stopped) = watch::channel(true);
+        mirror_local_session(
             &config_path,
-            &HostConfig {
-                server: format!("http://{address}"),
-                ..test_config(root.path())
-            },
+            host_store(&scratch).await,
+            id,
+            bootstrap_test_launch(root.path()),
+            commands,
+            stopped,
         )
+        .await
         .unwrap();
-        let launch = LaunchSession {
-            request_id: session_id,
-            cwd: root.path().to_path_buf(),
-            provider: CodingProvider::Codex,
-            model: None,
-            effort: None,
-            fast: Some(false),
-            ultrafast: None,
-            response_language: crate::ResponseLanguage::Auto,
-            permission_mode: crate::PermissionMode::FullAccess,
-            name: None,
-            initial_prompt: None,
-            capabilities: Default::default(),
-            subagent_concurrency_limit: None,
-            extension_skill_roots: Vec::new(),
-            team_policy: None,
-        };
-        let (command_tx, command_rx) = mpsc::channel(1);
-        let _command_rx = if close_control {
-            drop(command_rx);
-            None
-        } else {
-            Some(command_rx)
-        };
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mirror_store: Arc<dyn SessionStore> = store.clone();
-        let mirror = host_transport::spawn(async move {
-            mirror_local_session(
-                &config_path,
-                mirror_store,
-                session_id,
-                launch,
-                command_tx,
-                shutdown_rx,
-            )
-            .await
-        });
-
-        tokio::time::timeout(Duration::from_secs(20), first_upload_rx)
-            .await
-            .expect("mirror should register and upload its initial journal")
-            .unwrap();
-        if scoped {
-            tokio::time::timeout(Duration::from_secs(3), poll_started_rx)
-                .await
-                .unwrap()
-                .unwrap();
-        }
-        store
-            .append(SessionEvent::new(
-                session_id,
-                0,
-                crate::SessionEventKind::Error {
-                    message: "output produced during a pending command poll".to_string(),
-                },
-            ))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(3), second_upload_rx)
-            .await
-            .expect("journal output must not wait for the command long poll")
-            .unwrap();
-        store
-            .append(SessionEvent::new(
-                session_id,
-                0,
-                crate::SessionEventKind::StatusChanged {
-                    status: crate::SessionStatus::Stopped,
-                    detail: None,
-                },
-            ))
-            .await
-            .unwrap();
-        shutdown_tx.send(true).unwrap();
-
-        tokio::time::timeout(Duration::from_secs(3), mirror)
-            .await
-            .expect("mirror should finish after its shutdown flush")
-            .unwrap()
-            .unwrap();
-        let (uploads, messages) = server.await.unwrap();
-        assert_eq!(uploads, vec![vec![1], vec![2], vec![3]]);
-        assert_eq!(messages.len(), 1);
+        drop(shutdown);
+        assert!(store.contains_session(id).await.unwrap());
+        assert!(store.load_host_launch_metadata(id).await.unwrap().is_some());
         assert_eq!(
-            messages[0]["recipient_participant_ids"],
-            serde_json::json!([remote_recipient])
+            store.host_launch_owner(id).await.unwrap(),
+            Some((config.host_id, host_relay_origin(&config).unwrap()))
         );
         scratch.discard().await;
     }
@@ -7245,14 +6683,7 @@ mod tests {
             }
         });
         let later = Instant::now() + Duration::from_secs(60);
-        let mut sync = JournalSync::new(
-            SessionSyncResponse {
-                event_cursor: 0,
-                live_revision: 0,
-            },
-            false,
-            sender_root.path().to_path_buf(),
-        );
+        let mut sync = JournalSync::new(false, sender_root.path().to_path_buf());
         sync.next_inbox_sync = later;
         sync.next_instance_directory_sync = later;
         let client = Client::new();
@@ -7599,8 +7030,6 @@ mod tests {
         });
 
         let mut sync = JournalSync {
-            uploaded_sequence: 0,
-            uploaded_live_revision: 0,
             workspace_retry_at: HashMap::new(),
             uploaded_workspace_sequences: HashMap::new(),
             workspace_relay_available: false,
@@ -7608,7 +7037,6 @@ mod tests {
             next_workspace_roster_sync: Instant::now(),
             next_instance_directory_sync: Instant::now(),
             next_inbox_sync: Instant::now(),
-            retry_at: Instant::now(),
             journal_root: PathBuf::new(),
             inbox_retry_at: HashMap::new(),
         };
@@ -7728,23 +7156,6 @@ mod tests {
         let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let session_id = Uuid::new_v4();
         store.create_session(session_id).await.unwrap();
-        store
-            .append(SessionEvent::new(
-                session_id,
-                0,
-                crate::SessionEventKind::ToolCompleted {
-                    tool_call_id: "large".to_string(),
-                    output: "x".repeat(crate::session_store::INLINE_SESSION_PAYLOAD_BYTES + 1),
-                    output_ref: None,
-                    is_error: false,
-                    input: None,
-                    input_ref: None,
-                    parent_tool_call_id: None,
-                },
-            ))
-            .await
-            .unwrap();
-        let events = store.events_after(session_id, 0, 8).await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = HostConfig {
             server: format!("http://{}", listener.local_addr().unwrap()),
@@ -7752,7 +7163,7 @@ mod tests {
         };
         let server = AbortTask(host_transport::spawn(async move {
             let mut paths = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..2 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let (path, _) = read_http_request(&mut stream).await;
                 paths.push(path);
@@ -7762,29 +7173,6 @@ mod tests {
             paths
         }));
         let client = Client::new();
-        let mut uploaded_sequence = 0;
-        let error = upload_event_page(
-            &client,
-            &config,
-            &store,
-            &events,
-            &mut uploaded_sequence,
-            Duration::from_secs(3),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            error
-                .downcast_ref::<reqwest::Error>()
-                .and_then(|e| e.status()),
-            Some(StatusCode::UNAUTHORIZED)
-        );
-        assert_eq!(uploaded_sequence, 0);
-        assert_eq!(
-            serde_json::to_value(store.events_after(session_id, 0, 8).await.unwrap()).unwrap(),
-            serde_json::to_value(&events).unwrap()
-        );
-
         let workspace = store.workspace_store().await.unwrap().unwrap();
         let binding = store.workspace_binding(session_id).await.unwrap().unwrap();
         let human = crate::local_human_participant_id("Human");
@@ -7855,8 +7243,6 @@ mod tests {
                 .sequence;
             let later = Instant::now() + Duration::from_secs(60);
             let mut sync = JournalSync {
-                uploaded_sequence: 0,
-                uploaded_live_revision: 0,
                 workspace_retry_at: HashMap::new(),
                 uploaded_workspace_sequences: HashMap::new(),
                 workspace_relay_available: shared,
@@ -7864,7 +7250,6 @@ mod tests {
                 next_workspace_roster_sync: later,
                 next_instance_directory_sync: later,
                 next_inbox_sync: later,
-                retry_at: Instant::now(),
                 journal_root: PathBuf::new(),
                 inbox_retry_at: HashMap::new(),
             };
@@ -7905,9 +7290,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(paths[0].contains("/payloads/"));
-        assert!(paths[1].ends_with(&format!("/{session_id}/messages")));
-        assert!(paths[2].ends_with("/workspace/messages"));
+        assert!(paths[0].ends_with(&format!("/{session_id}/messages")));
+        assert!(paths[1].ends_with("/workspace/messages"));
         scratch.discard().await;
     }
 
@@ -8086,8 +7470,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hosted_duration_limit_settles_work_even_during_a_blocked_upload() {
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    async fn hosted_duration_limit_settles_work_without_publication() {
         use tokio::sync::Notify;
         struct PendingExecutor(Arc<Notify>, Arc<Notify>);
         struct NotifyDrop(Arc<Notify>);
@@ -8114,47 +7497,6 @@ mod tests {
         let mut config = test_config(root.path());
         config.server = format!("http://{}", listener.local_addr().unwrap());
         config.resource_limits.max_session_seconds = 8;
-        let block = Arc::new(AtomicBool::new(false));
-        let blocked = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let uploaded = Arc::new(AtomicU64::new(0));
-        let (server_block, server_blocked, server_release, server_uploaded) = (
-            Arc::clone(&block),
-            Arc::clone(&blocked),
-            Arc::clone(&release),
-            Arc::clone(&uploaded),
-        );
-        let _server = AbortTask(host_transport::spawn(async move {
-            loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let (path, body) = read_http_request(&mut socket).await;
-                let path = path.split("?").next().unwrap();
-                let (status, response) = if path.ends_with("/sync") {
-                    (200, "{\"event_cursor\":0,\"live_revision\":0}")
-                } else if path == "/api/remote/host/events" {
-                    if server_block.swap(false, Ordering::SeqCst) {
-                        server_blocked.notify_one();
-                        server_release.notified().await;
-                        (503, "")
-                    } else {
-                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                        for event in body["events"].as_array().unwrap() {
-                            let seq = event["sequence"]
-                                .as_u64()
-                                .or_else(|| event["event"]["sequence"].as_u64())
-                                .unwrap();
-                            server_uploaded.fetch_max(seq, Ordering::SeqCst);
-                        }
-                        (200, "")
-                    }
-                } else if path == "/api/remote/host/live-state" {
-                    (200, "")
-                } else {
-                    (404, "")
-                };
-                let _ = socket.write_all(format!("HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",response.len()).as_bytes()).await;
-            }
-        }));
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -8186,20 +7528,6 @@ mod tests {
             host_store(&scratch).await,
         )));
         tokio::time::timeout(Duration::from_secs(30), started.notified())
-            .await
-            .unwrap();
-        block.store(true, Ordering::SeqCst);
-        store
-            .append(SessionEvent::new(
-                id,
-                0,
-                crate::SessionEventKind::Error {
-                    message: "force a blocked event upload".to_string(),
-                },
-            ))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), blocked.notified())
             .await
             .unwrap();
         assert!(
@@ -8260,18 +7588,6 @@ mod tests {
         .await
         .unwrap();
         assert!(sessions.lock().await.is_empty());
-        release.notify_one();
-        recover_host_journal(&client, &config, &store, id)
-            .await
-            .unwrap();
-        assert!(uploaded.load(Ordering::SeqCst) >= state.latest_sequence);
-        assert!(
-            store
-                .pending_host_journals(None, 8)
-                .await
-                .unwrap()
-                .is_empty()
-        );
         scratch.discard().await;
     }
 
@@ -8824,8 +8140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hosted_actor_survives_sync_faults_but_is_owned_on_rejection_or_cancellation() {
-        use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+    async fn hosted_actor_is_owned_on_stop_or_cancellation() {
         use tokio::sync::Notify;
         struct PendingExecutor {
             started: Arc<Notify>,
@@ -8854,38 +8169,6 @@ mod tests {
         let mut config = test_config(root.path());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         config.server = format!("http://{}", listener.local_addr().unwrap());
-        let rejection = Arc::new(AtomicU16::new(200));
-        let uploaded = Arc::new(AtomicU64::new(0));
-        let server_rejection = Arc::clone(&rejection);
-        let server_uploaded = Arc::clone(&uploaded);
-        let _server = AbortTask(host_transport::spawn(async move {
-            loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let (path, request) = read_http_request(&mut stream).await;
-                let path = path.split("?").next().unwrap();
-                let (status, body) = if path.ends_with("/sync") {
-                    (200, "{\"event_cursor\":0,\"live_revision\":0}")
-                } else if path == "/api/remote/host/events" {
-                    let status = server_rejection.load(Ordering::SeqCst);
-                    if status == 200 {
-                        let body: serde_json::Value = serde_json::from_slice(&request).unwrap();
-                        for event in body["events"].as_array().unwrap() {
-                            let sequence = event["sequence"]
-                                .as_u64()
-                                .or_else(|| event["event"]["sequence"].as_u64())
-                                .unwrap();
-                            server_uploaded.fetch_max(sequence, Ordering::SeqCst);
-                        }
-                    }
-                    (status, "")
-                } else if path == "/api/remote/host/live-state" {
-                    (200, "")
-                } else {
-                    (404, "")
-                };
-                stream.write_all(format!("HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-            }
-        }));
         let client = Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -8950,7 +8233,7 @@ mod tests {
             .execute(store.pool())
             .await
             .unwrap();
-        let marker = store
+        let _marker = store
             .append(SessionEvent::new(
                 session_id,
                 0,
@@ -8960,13 +8243,6 @@ mod tests {
             ))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(8), async {
-            while uploaded.load(Ordering::SeqCst) < marker.sequence {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
         commands
             .send(HostCommand::Stop { session_id })
             .await
@@ -8983,12 +8259,7 @@ mod tests {
             store.state(session_id).await.unwrap().status,
             Some(crate::SessionStatus::Stopped)
         );
-        assert!(
-            uploaded.load(Ordering::SeqCst)
-                >= store.state(session_id).await.unwrap().latest_sequence
-        );
-        for status in [Some(401), Some(409), None] {
-            rejection.store(200, Ordering::SeqCst);
+        {
             let id = Uuid::new_v4();
             let (_commands, rx) = mpsc::channel(8);
             let mut supervisor = AbortTask(host_transport::spawn(run_session(
@@ -9007,36 +8278,8 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(30), started.notified())
                 .await
                 .unwrap();
-            if let Some(status) = status {
-                rejection.store(status, Ordering::SeqCst);
-                store
-                    .append(SessionEvent::new(
-                        id,
-                        0,
-                        crate::SessionEventKind::Error {
-                            message: "rejection marker".to_string(),
-                        },
-                    ))
-                    .await
-                    .unwrap();
-                let error = tokio::time::timeout(Duration::from_secs(8), &mut supervisor.0)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap_err();
-                assert_eq!(
-                    error
-                        .downcast_ref::<reqwest::Error>()
-                        .unwrap()
-                        .status()
-                        .unwrap()
-                        .as_u16(),
-                    status
-                );
-            } else {
-                supervisor.0.abort();
-                assert!((&mut supervisor.0).await.unwrap_err().is_cancelled());
-            }
+            supervisor.0.abort();
+            assert!((&mut supervisor.0).await.unwrap_err().is_cancelled());
             tokio::time::timeout(Duration::from_secs(2), dropped.notified())
                 .await
                 .expect("host supervisor must not detach its actor or provider turn");
@@ -9050,8 +8293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_launch_owner_requires_relay_proof_and_rechecks_binding() {
-        use std::sync::atomic::{AtomicU16, Ordering};
+    async fn legacy_launch_owner_requires_local_ownership_and_rechecks_identity() {
         let root = tempdir().unwrap();
         let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let id = Uuid::new_v4();
@@ -9085,161 +8327,45 @@ mod tests {
             store.host_launch_owner(id).await.unwrap().is_none(),
             "schema upgrade must not invent an owner"
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = test_config(root.path());
-        config.server = format!("http://{}", listener.local_addr().unwrap());
-        let mode = Arc::new(AtomicU16::new(404));
-        let server_mode = Arc::clone(&mode);
-        let release = Arc::new(tokio::sync::Notify::new());
-        let gate = Arc::clone(&release);
-        let (sent, mut requests) = mpsc::channel(8);
-        let _server = AbortTask(host_transport::spawn(async move {
-            loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let (path, _) = read_http_request(&mut socket).await;
-                assert!(
-                    path.ends_with("/sync"),
-                    "legacy authorization must not execute or upload output"
-                );
-                sent.send(path).await.unwrap();
-                let mode = server_mode.load(Ordering::SeqCst);
-                if mode == 0 {
-                    gate.notified().await;
-                }
-                let status = if mode <= 1 { 200 } else { mode };
-                let body = if mode == 0 || mode == 200 {
-                    "{\"event_cursor\":0,\"live_revision\":0}"
-                } else {
-                    ""
-                };
-                socket.write_all(format!("HTTP/1.1 {status} Response\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-            }
-        }));
-        let client = Client::builder()
-            .timeout(Duration::from_secs(3))
-            .build()
-            .unwrap();
-        for rejection in [404, 401, 503, 1] {
-            mode.store(rejection, Ordering::SeqCst);
-            assert!(
-                ensure_host_launch_owner(&client, &config, store.as_ref(), id)
-                    .await
-                    .is_err()
-            );
-            assert_eq!(
-                requests.recv().await.unwrap(),
-                format!("/api/remote/host/sessions/{id}/sync")
-            );
-            assert!(store.host_launch_owner(id).await.unwrap().is_none());
-            assert!(!store.contains_session(id).await.unwrap());
-            assert_eq!(
-                store.load_host_launch_metadata(id).await.unwrap(),
-                Some(metadata.clone())
-            );
-            assert_eq!(
-                store.pending_host_launch_metadata(8).await.unwrap().len(),
-                1
-            );
-        }
-        let sessions = Arc::new(Mutex::new(HashMap::new()));
-        let (active, _active_rx) = mpsc::channel(1);
-        sessions.lock().await.insert(Uuid::new_v4(), active);
-        config.resource_limits.max_concurrent_sessions = 1;
-        let executor: HostExecutorFactory =
-            Arc::new(|_, _| panic!("migration must not construct a provider"));
-        resume_pending_host_sessions(
-            0,
-            &client,
+        let config = test_config(root.path());
+        let client = Client::new();
+        assert!(
+            ensure_host_launch_owner(&client, &config, store.as_ref(), id)
+                .await
+                .is_err()
+        );
+        assert!(store.host_launch_owner(id).await.unwrap().is_none());
+        assert!(!store.contains_session(id).await.unwrap());
+        assert_eq!(
+            store.load_host_launch_metadata(id).await.unwrap(),
+            Some(metadata)
+        );
+        let owned = Uuid::new_v4();
+        persist_launch_metadata(
             &config,
-            root.path(),
-            &sessions,
-            &host_store(&scratch).await,
-            &executor,
+            store.as_ref(),
+            owned,
+            &bootstrap_test_launch(root.path()),
+            None,
         )
         .await
         .unwrap();
-        assert!(
-            requests.try_recv().is_err(),
-            "legacy proof must not block command polling"
-        );
-        mode.store(200, Ordering::SeqCst);
-        let mut recovery = AbortTask(host_transport::spawn(run_host_journal_recovery_loop(
-            client.clone(),
-            config.clone(),
-            Arc::clone(&store),
-            Arc::clone(&sessions),
-        )));
-        tokio::time::timeout(Duration::from_secs(3), requests.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while store.host_launch_owner(id).await.unwrap().is_none() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        recovery.0.abort();
-        let _ = (&mut recovery.0).await;
-        assert!(!store.contains_session(id).await.unwrap());
-        assert_eq!(sessions.lock().await.len(), 1);
-        assert_eq!(
-            store.host_launch_owner(id).await.unwrap(),
-            Some((config.host_id, host_relay_origin(&config).unwrap()))
-        );
-        ensure_host_launch_owner(&client, &config, store.as_ref(), id)
+        ensure_host_launch_owner(&client, &config, store.as_ref(), owned)
             .await
             .unwrap();
         let mut foreign = config.clone();
         foreign.host_id = Uuid::new_v4();
         assert!(
-            ensure_host_launch_owner(&client, &foreign, store.as_ref(), id)
+            ensure_host_launch_owner(&client, &foreign, store.as_ref(), owned)
                 .await
                 .is_err()
         );
         foreign = config.clone();
         foreign.server = "https://other.invalid".to_string();
         assert!(
-            ensure_host_launch_owner(&client, &foreign, store.as_ref(), id)
+            ensure_host_launch_owner(&client, &foreign, store.as_ref(), owned)
                 .await
                 .is_err()
-        );
-        assert!(
-            requests.try_recv().is_err(),
-            "verified or foreign ownership must not re-probe"
-        );
-        let racing = Uuid::new_v4();
-        store
-            .persist_host_launch_metadata(racing, &metadata)
-            .await
-            .unwrap();
-        mode.store(0, Ordering::SeqCst);
-        let task_store = Arc::clone(&store);
-        let task_config = config.clone();
-        let mut authorization = AbortTask(host_transport::spawn(async move {
-            ensure_host_launch_owner(&client, &task_config, task_store.as_ref(), racing).await
-        }));
-        assert_eq!(
-            requests.recv().await.unwrap(),
-            format!("/api/remote/host/sessions/{racing}/sync")
-        );
-        store.create_session(racing).await.unwrap();
-        let binding = store.workspace_binding(racing).await.unwrap().unwrap();
-        let binding = crate::SessionWorkspaceBinding {
-            host_id: Some(Uuid::new_v4()),
-            ..binding
-        };
-        store.attach_workspace(binding.clone()).await.unwrap();
-        release.notify_one();
-        assert!(
-            (&mut authorization.0).await.unwrap().is_err(),
-            "relay proof cannot override a concurrently changed local identity"
-        );
-        assert!(store.host_launch_owner(racing).await.unwrap().is_none());
-        assert_eq!(
-            store.workspace_binding(racing).await.unwrap().unwrap(),
-            binding
         );
         scratch.discard().await;
     }
@@ -9416,7 +8542,7 @@ mod tests {
             1
         );
         assert!(
-            recover_host_journal(&Client::new(), &config, store.as_ref(), session_id)
+            ensure_host_launch_owner(&Client::new(), &config, store.as_ref(), session_id)
                 .await
                 .is_err()
         );
@@ -10890,7 +10016,6 @@ connection: close
 
     #[tokio::test]
     async fn workspace_roster_recovers_without_restarting_or_losing_queued_messages() {
-        use std::sync::atomic::{AtomicU16, Ordering};
         let root = tempdir().unwrap();
         let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let id = Uuid::new_v4();
@@ -10968,14 +10093,7 @@ connection: close
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
-        let mut sync = JournalSync::new(
-            SessionSyncResponse {
-                event_cursor: 0,
-                live_revision: 0,
-            },
-            true,
-            PathBuf::new(),
-        );
+        let mut sync = JournalSync::new(true, PathBuf::new());
         sync.next_inbox_sync = Instant::now() + Duration::from_secs(60);
         sync.next_instance_directory_sync = Instant::now() + Duration::from_secs(60);
         for mode in [404, 503, 1, 200] {
@@ -11062,7 +10180,6 @@ connection: close
 
     #[tokio::test]
     async fn failed_shared_upload_does_not_skip_private_messages_or_advance_its_cursor() {
-        use std::sync::atomic::{AtomicU16, Ordering};
         let root = tempdir().unwrap();
         let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let session_id = Uuid::new_v4();
@@ -11172,20 +10289,13 @@ connection: close
                     .unwrap();
             }
             let later = Instant::now() + Duration::from_secs(60);
-            let mut sync = JournalSync::new(
-                SessionSyncResponse {
-                    event_cursor: 0,
-                    live_revision: 0,
-                },
-                true,
-                PathBuf::new(),
-            );
+            let mut sync = JournalSync::new(true, PathBuf::new());
             sync.uploaded_workspace_sequences = store
                 .host_workspace_cursors(config.host_id, session_id)
                 .await
                 .unwrap();
             // A blocked session journal must not suppress independent messages.
-            sync.retry_at = Instant::now() + Duration::from_secs(300);
+
             sync.next_inbox_sync = later;
             sync.next_instance_directory_sync = later;
             sync.next_workspace_roster_sync = later;
@@ -11250,14 +10360,7 @@ connection: close
         let workspace = store.workspace_store().await.unwrap().unwrap();
         status.store(204, Ordering::SeqCst);
         let later = Instant::now() + Duration::from_secs(60);
-        let mut sync = JournalSync::new(
-            SessionSyncResponse {
-                event_cursor: 0,
-                live_revision: 0,
-            },
-            true,
-            PathBuf::new(),
-        );
+        let mut sync = JournalSync::new(true, PathBuf::new());
         sync.uploaded_workspace_sequences = store
             .host_workspace_cursors(config.host_id, session_id)
             .await
@@ -11295,7 +10398,6 @@ connection: close
 
     #[tokio::test]
     async fn stopped_host_recovers_final_messages_without_an_actor_or_pending_journal() {
-        use std::sync::atomic::{AtomicU16, Ordering};
         let root = tempdir().unwrap();
         let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         // Current-v5 databases acquire the additive table without losing their journal.
@@ -11457,14 +10559,7 @@ connection: close
             .timeout(Duration::from_secs(3))
             .build()
             .unwrap();
-        let mut recovery_sync = JournalSync::new(
-            SessionSyncResponse {
-                event_cursor: 0,
-                live_revision: 0,
-            },
-            false,
-            PathBuf::new(),
-        );
+        let mut recovery_sync = JournalSync::new(false, PathBuf::new());
         recover_host_workspace_messages(
             &client,
             &config,
@@ -11837,7 +10932,7 @@ connection: close
     }
 
     #[tokio::test]
-    async fn expired_bootstrap_settles_offline_before_capacity_and_recovers_publication() {
+    async fn expired_bootstrap_settles_offline_before_capacity() {
         let root = tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = test_config(root.path());
@@ -12009,63 +11104,6 @@ connection: close
             unpublished.contains(&expired) && unpublished.contains(&locked),
             "journal recovery must discover failures after bootstrap markers are removed"
         );
-        let server = host_transport::spawn(async move {
-            let mut uploads = Vec::new();
-            for status in ["503 Service Unavailable", "200 OK"] {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let (path, _) = read_http_request(&mut stream).await;
-                assert_eq!(path, format!("/api/remote/host/sessions/{expired}/sync"));
-                let body = r#"{"event_cursor":0,"live_revision":0}"#;
-                stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let (path, body) = read_http_request(&mut stream).await;
-                assert_eq!(path.split("?").next().unwrap(), "/api/remote/host/events");
-                uploads.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
-                stream
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                        )
-                        .as_bytes(),
-                    )
-                    .await
-                    .unwrap();
-            }
-            uploads
-        });
-        recover_host_journal(&client, &config, &store, expired)
-            .await
-            .unwrap();
-        assert!(
-            store
-                .pending_host_journals(None, 10)
-                .await
-                .unwrap()
-                .contains(&expired)
-        );
-        drop(store);
-        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
-            .await
-            .unwrap();
-        recover_host_journal(&client, &config, &store, expired)
-            .await
-            .unwrap();
-        assert!(
-            !store
-                .pending_host_journals(None, 10)
-                .await
-                .unwrap()
-                .contains(&expired)
-        );
-        let uploads = tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(uploads.len(), 2);
-        assert_eq!(
-            uploads[0], uploads[1],
-            "publication retries preserve the exact failure journal"
-        );
         scratch.discard().await;
     }
 
@@ -12089,54 +11127,6 @@ connection: close
             context_seen_tx.send(()).unwrap();
             release_rx.await.unwrap();
             stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
-            let mut uploads = Vec::new();
-            for status in [
-                "503 Service Unavailable",
-                "503 Service Unavailable",
-                "200 OK",
-            ] {
-                // The host reloads its sync cursor from more than one place --
-                // starting a session, recovering a journal, and the legacy
-                // ownership check each fetch it -- and nothing promises which
-                // of them runs between two uploads. Answering a sync wherever
-                // it arrives keeps this test pinned to what the uploads
-                // contain, which is its subject, instead of to the order the
-                // host happened to ask in, which it never guaranteed.
-                let (mut stream, body) = loop {
-                    let (mut stream, _) = listener.accept().await.unwrap();
-                    let (path, body) = read_http_request(&mut stream).await;
-                    if path == format!("/api/remote/host/sessions/{session_id}/sync") {
-                        let cursor = r#"{"event_cursor":0,"live_revision":0}"#;
-                        stream
-                            .write_all(
-                                format!(
-                                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{cursor}",
-                                    cursor.len()
-                                )
-                                .as_bytes(),
-                            )
-                            .await
-                            .unwrap();
-                        continue;
-                    }
-                    assert!(
-                        path.starts_with("/api/remote/host/events"),
-                        "unexpected host request while awaiting an upload: {path}"
-                    );
-                    break (stream, body);
-                };
-                uploads.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
-                stream
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                        )
-                        .as_bytes(),
-                    )
-                    .await
-                    .unwrap();
-            }
-            uploads
         });
         let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
         let store: Arc<dyn SessionStore> = Arc::new(postgres);
@@ -12250,21 +11240,7 @@ connection: close
                 .unwrap()
                 .contains(&session_id)
         );
-        recover_host_journal(&client, &config, store.as_ref(), session_id)
-            .await
-            .unwrap();
-        let uploads = tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            uploads[0], uploads[1],
-            "recovery must replay identical durable failure"
-        );
-        assert_eq!(
-            uploads[0], uploads[2],
-            "background publication preserves failure identity"
-        );
+        server.await.unwrap();
         scratch.discard().await;
     }
 
@@ -12414,15 +11390,7 @@ connection: close
         for rejection in ["capacity", "oversized", "malformed", "expired"] {
             let oversized = rejection == "oversized";
             let root = tempdir().unwrap();
-            let (server_url, server) = event_server(vec![
-                "503 Service Unavailable",
-                "200 OK",
-                "200 OK",
-                "200 OK",
-            ])
-            .await;
             let mut config = test_config(root.path());
-            config.server = server_url;
             config.resource_limits.max_concurrent_sessions = 1;
             let session_id = Uuid::new_v4();
             let active_id = Uuid::new_v4();
@@ -12813,13 +11781,6 @@ connection: close
             assert_eq!(state.status, Some(crate::SessionStatus::Failed));
             assert!(state.started_at.is_none());
             assert!(sessions.lock().await.is_empty());
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(5), server)
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                vec![vec![1]; 4]
-            );
             scratch.discard().await;
         }
     }
