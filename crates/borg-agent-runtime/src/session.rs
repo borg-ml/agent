@@ -10276,13 +10276,11 @@ async fn resolve_prompt_replacement(
             .store
             .prompt_event(session_id, *id, "prompt_replacement_committed")
             .await?
-        {
-            if latest_claim
+            && latest_claim
                 .as_ref()
                 .is_none_or(|latest| claim.sequence > latest.sequence)
-            {
-                latest_claim = Some(claim);
-            }
+        {
+            latest_claim = Some(claim);
         }
     }
     let previously_replaced = latest_claim.is_some();
@@ -10384,10 +10382,9 @@ async fn resolve_prompt_replacement(
                 output_schema: Some(schema),
                 ..
             } = command
+                && message_id == id
             {
-                if message_id == id {
-                    output_schema = Some(schema.clone());
-                }
+                output_schema = Some(schema.clone());
             }
         }
     }
