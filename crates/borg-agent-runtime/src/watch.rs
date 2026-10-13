@@ -11,6 +11,7 @@ use crate::agent_watch::{AgentSignal, AgentSubjects, Aggregate, SubjectLife, Sub
 use crate::native_process::ProcessManager;
 
 const MAX_WATCHES: usize = 4;
+const MAX_BACKGROUND_JOBS: usize = 64;
 
 /// How long a wait may hear nothing before the session takes it back.
 ///
@@ -308,6 +309,26 @@ impl Watches {
         execution_cancel: CancellationToken,
         foreground: Duration,
     ) -> Result<Value> {
+        self.run_job(
+            &format!("{runtime} runtime"),
+            &format!("runtime_exec ({runtime})"),
+            execution,
+            execution_cancel,
+            foreground,
+        )
+        .await
+    }
+
+    /// All detached tool and runtime executions share the same registry,
+    /// result retrieval, cancellation, frontend summary and completion wake.
+    pub async fn run_job(
+        &self,
+        label: &str,
+        command: &str,
+        execution: impl std::future::Future<Output = Result<Value>> + Send + 'static,
+        execution_cancel: CancellationToken,
+        foreground: Duration,
+    ) -> Result<Value> {
         ensure!(!self.cancel.is_cancelled(), "session watchers have stopped");
         let started_at = chrono::Utc::now();
         let mut execution = Box::pin(execution);
@@ -316,20 +337,22 @@ impl Watches {
         }
         let mut entries = self.entries.lock().await;
         if self.cancel.is_cancelled()
-            || entries.values().filter(|entry| entry.info.running).count() >= MAX_WATCHES
+            || entries
+                .values()
+                .filter(|entry| entry.runtime && entry.info.running)
+                .count()
+                >= MAX_BACKGROUND_JOBS
         {
             execution_cancel.cancel();
             drop(entries);
-            let _ = execution.await;
-            bail!(
-                "runtime could not background: session watchers stopped or watcher limit reached"
-            );
+            let _ = tokio::time::timeout(Duration::from_secs(2), execution).await;
+            bail!("job could not background: session stopped or background job limit reached");
         }
         prune_completed_watches(&mut entries);
         let info = WatchInfo {
             watch_id: Uuid::new_v4(),
-            label: format!("{runtime} runtime"),
-            command: format!("runtime_exec ({runtime})"),
+            label: label.to_owned(),
+            command: command.to_owned(),
             running: true,
             started_at,
             last_event_at: None,
@@ -354,12 +377,16 @@ impl Watches {
         self.changed.notify_one();
         let watches = self.clone();
         let watch_id = info.watch_id;
+        let label = info.label.clone();
         tokio::spawn(async move {
             let outcome = tokio::select! {
                 result = &mut execution => result,
                 _ = cancel.cancelled() => {
                     execution_cancel.cancel();
-                    execution.await
+                    match tokio::time::timeout(Duration::from_secs(2), execution).await {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::anyhow!("background job cancelled; effects already completed may remain")),
+                    }
                 }
             };
             let result = match outcome {
@@ -375,12 +402,12 @@ impl Watches {
             stopped.cancel();
             watches.changed.notify_one();
             let _ = watches.events.send(format!(
-                "Watcher event: runtime ({watch_id}) finished. Retrieve its result with list_watchers."
+                "Watcher event: {label} ({watch_id}) finished. Retrieve its result with list_watchers."
             )).await;
         });
         Ok(json!({
             "running": true, "background": true, "watch_id": watch_id,
-            "message": "Runtime continues in the background. Use list_watchers to retrieve its result, await_watchers to wait, or stop_watcher to cancel. Do not repeat the code."
+            "message": "Job continues in the background. Use list_watchers to retrieve its result, await_watchers to wait, or stop_watcher to cancel. Do not repeat the call."
         }))
     }
 
@@ -426,7 +453,11 @@ impl Watches {
         ensure!(!self.cancel.is_cancelled(), "session watchers have stopped");
         let mut entries = self.entries.lock().await;
         ensure!(
-            entries.values().filter(|entry| entry.info.running).count() < MAX_WATCHES,
+            entries
+                .values()
+                .filter(|entry| !entry.runtime && entry.info.running)
+                .count()
+                < MAX_WATCHES,
             "at most {MAX_WATCHES} watchers can run; stop one first"
         );
         prune_completed_watches(&mut entries);
@@ -548,7 +579,11 @@ impl Watches {
         let subjects = AgentSubjects::new(args.agents, signal, args.aggregate);
         let mut entries = self.entries.lock().await;
         ensure!(
-            entries.values().filter(|entry| entry.info.running).count() < MAX_WATCHES,
+            entries
+                .values()
+                .filter(|entry| !entry.runtime && entry.info.running)
+                .count()
+                < MAX_WATCHES,
             "at most {MAX_WATCHES} watchers can run; stop one first"
         );
         prune_completed_watches(&mut entries);
@@ -819,7 +854,7 @@ fn prune_completed_watches(entries: &mut BTreeMap<Uuid, WatchEntry>) {
     completed.sort_unstable();
     for (_, id) in completed
         .iter()
-        .take(completed.len().saturating_sub(MAX_WATCHES - 1))
+        .take(completed.len().saturating_sub(MAX_BACKGROUND_JOBS - 1))
     {
         entries.remove(id);
     }
@@ -906,6 +941,53 @@ fn agent_event_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A parallel tool batch must detach into independently retrievable jobs,
+    // not hit the old four-watcher limit or lose cancellation/completion.
+    #[tokio::test]
+    async fn parallel_tool_jobs_share_results_and_cancellation() {
+        let (tx, mut notices) = mpsc::channel(32);
+        let watches = Watches::new(ProcessManager::default(), tx, Uuid::new_v4());
+        let mut ids = Vec::new();
+        for index in 0..11 {
+            let cancel = CancellationToken::new();
+            let execution_cancel = cancel.clone();
+            let result = watches
+                .run_job(
+                    &format!("send {index}"),
+                    "send_message",
+                    async move {
+                        execution_cancel.cancelled().await;
+                        Ok(json!({"cancelled": index}))
+                    },
+                    cancel,
+                    Duration::ZERO,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result["background"], true);
+            ids.push(Uuid::parse_str(result["watch_id"].as_str().unwrap()).unwrap());
+        }
+        assert_eq!(watches.summaries().await.len(), 11);
+        for id in &ids {
+            tokio::time::timeout(Duration::from_secs(5), watches.stop(*id))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let jobs = watches.list_for(&ids).await;
+        assert_eq!(jobs.len(), 11);
+        for job in jobs {
+            assert!(!job.running);
+            assert_eq!(job.result.unwrap()["ok"], true);
+        }
+        for _ in 0..11 {
+            tokio::time::timeout(Duration::from_secs(5), notices.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn runtime_background_preserves_result_namespace_and_can_be_stopped() {

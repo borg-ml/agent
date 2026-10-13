@@ -5320,6 +5320,10 @@ fn add_action_metadata(definition: &mut ModelToolDefinition) -> Result<()> {
             "description": "One- or two-word summary for the live UI. Emit this as the first argument field. Presentation metadata only; it does not affect tool execution."
         }),
     );
+    properties.insert("async".into(), json!({
+        "type": "boolean",
+        "description": "Optional execution policy: true detaches immediately, false waits for completion, omitted auto-detaches safe calls after five seconds. Ordering-sensitive actions and explicit waits stay synchronous."
+    }));
     properties.extend(existing);
     let required = schema
         .entry("required")

@@ -1996,7 +1996,97 @@ impl AgentToolDispatcher {
 
     /// Run one capability. A call with the wrong name or arguments fails with
     /// the shape the capability expects, so the caller's next try can be right.
-    pub(crate) async fn call_with_workflow_control(
+    pub(crate) fn call_with_workflow_control<'a>(
+        &'a self,
+        name: &'a str,
+        mut arguments: Value,
+        workflow_approved: bool,
+        workflow_cancel: Option<CancellationToken>,
+    ) -> futures::future::BoxFuture<'a, Result<Value>> {
+        Box::pin(async move {
+            let asynchronous = arguments
+                .as_object_mut()
+                .and_then(|args| args.remove("async"));
+            let asynchronous = match asynchronous {
+                None => None,
+                Some(Value::Bool(value)) => Some(value),
+                Some(_) => bail!("async must be a boolean"),
+            };
+            // Tool-side effects and explicit waits retain their sequencing. Reads
+            // and durable sends can continue independently in the shared registry.
+            let detachable = matches!(
+                name,
+                "read_file"
+                    | "list_files"
+                    | "search_files"
+                    | "web_search"
+                    | "send_message"
+                    | "followup_task"
+                    | "list_instances"
+                    | "lsp_diagnostics"
+                    | "lsp_workspace_diagnostics"
+                    | "lsp_hover"
+                    | "lsp_definition"
+                    | "lsp_references"
+                    | "lsp_document_symbols"
+                    | "lsp_workspace_symbols"
+                    | "get_message_status"
+            );
+            if name == "runtime_exec"
+                && let Some(value) = asynchronous
+            {
+                arguments["async"] = Value::Bool(value);
+            }
+            if asynchronous == Some(true) && !detachable && name != "runtime_exec" {
+                bail!("{name} must remain synchronous to preserve ordering or wait semantics");
+            }
+            if detachable
+                && asynchronous != Some(false)
+                && let Some(watches) = &self.watches
+            {
+                let dispatcher = self.clone();
+                let tool = name.to_owned();
+                let label = arguments
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or(name)
+                    .to_owned();
+                let cancel = workflow_cancel.unwrap_or_default();
+                let execution_cancel = cancel.clone();
+                return watches
+                    .run_job(
+                        &label,
+                        name,
+                        async move {
+                            dispatcher
+                                .call_with_workflow_control_direct(
+                                    &tool,
+                                    arguments,
+                                    workflow_approved,
+                                    Some(execution_cancel),
+                                )
+                                .await
+                        },
+                        cancel,
+                        if asynchronous == Some(true) {
+                            Duration::ZERO
+                        } else {
+                            Duration::from_secs(5)
+                        },
+                    )
+                    .await;
+            }
+            self.call_with_workflow_control_direct(
+                name,
+                arguments,
+                workflow_approved,
+                workflow_cancel,
+            )
+            .await
+        })
+    }
+
+    async fn call_with_workflow_control_direct(
         &self,
         name: &str,
         arguments: Value,
@@ -3180,6 +3270,11 @@ impl AgentToolDispatcher {
             (requested, None) => requested,
         };
         let execution_cancel = cancellation.clone();
+        let foreground = match args.asynchronous {
+            Some(true) => Duration::ZERO,
+            Some(false) => Duration::from_millis(timeout_ms.unwrap_or(30 * 60 * 1000)),
+            None => Duration::from_secs(5),
+        };
         let execution = crate::persistent_runtime::inherit_runtime_host_call_chain(async move {
             Ok(serde_json::to_value(
                 runtime_worker
@@ -3196,17 +3291,12 @@ impl AgentToolDispatcher {
             )?)
         });
         match &self.watches {
-            Some(watches) => {
+            Some(watches) if args.asynchronous != Some(false) => {
                 watches
-                    .run_runtime(
-                        runtime,
-                        execution,
-                        execution_cancel,
-                        Duration::from_secs(60),
-                    )
+                    .run_runtime(runtime, execution, execution_cancel, foreground)
                     .await
             }
-            None => execution.await,
+            _ => execution.await,
         }
     }
 }
@@ -9548,6 +9638,8 @@ struct PersistentRuntimeArgs {
     runtime: Option<String>,
     code: String,
     timeout_ms: Option<u64>,
+    #[serde(rename = "async")]
+    asynchronous: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -10390,7 +10482,7 @@ fn harness_tool_spec() -> Value {
 pub(crate) fn runtime_exec_spec() -> Value {
     tool(
         "runtime_exec",
-        "Run code in the session's persistent Python (or Bun JavaScript/TypeScript) runtime: variables, imports, helpers and parsed data survive across calls and turns. `borg` is preloaded: every Borg capability as a call (`borg.send_message(...)`, `borg.tools(\"query\")` to find one), plus `borg.checkpoint(key, state)` / `borg.restore(key)` for durable state, `borg.exec`, `borg.read`, `borg.rlm` subagents and `borg.harness` for evidence-backed refinements of your own prompts, memory and skills with rollback. Trusted user-authority execution, not a sandbox. After 60 seconds the call returns a background watch_id without cancelling execution. Completion notifies the session; retrieve output/error through list_watchers, wait with await_watchers, or cancel with stop_watcher. Do not repeat backgrounded code.",
+        "Run code in the session's persistent Python (or Bun JavaScript/TypeScript) runtime: variables, imports, helpers and parsed data survive across calls and turns. `borg` is preloaded: every Borg capability as a call (`borg.send_message(...)`, `borg.tools(\"query\")` to find one), plus `borg.checkpoint(key, state)` / `borg.restore(key)` for durable state, `borg.exec`, `borg.read`, `borg.rlm` subagents and `borg.harness` for evidence-backed refinements of your own prompts, memory and skills with rollback. Trusted user-authority execution, not a sandbox. After five seconds the call returns a background watch_id without cancelling execution. Completion notifies the session; retrieve output/error through list_watchers, wait with await_watchers, or cancel with stop_watcher. Do not repeat backgrounded code.",
         json!({
             "type": "object",
             "properties": {
@@ -10601,6 +10693,10 @@ fn add_action_metadata(specs: &mut [Value]) {
                 "description": "One- or two-word summary for the live UI. Emit this as the first argument field. Presentation metadata only; it does not affect tool execution."
             }),
         );
+        properties.insert("async".into(), json!({
+            "type": "boolean",
+            "description": "Optional execution policy: true detaches immediately, false waits for completion, omitted auto-detaches safe calls after five seconds. Ordering-sensitive actions and explicit waits stay synchronous."
+        }));
         properties.extend(existing);
         if let Some(required) = schema
             .entry("required")

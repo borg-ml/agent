@@ -2090,7 +2090,7 @@ console.log(cases.length);"#,
         );
         let program = crate::process_environment::resolve_runtime_program(&bun_command());
         let code = format!(
-            "import subprocess\n_sdk_process = subprocess.run([{program}, '--eval', {script}], capture_output=True, text=True, timeout=15)\nassert _sdk_process.returncode == 0, _sdk_process.stderr\nint(_sdk_process.stdout)",
+            "import subprocess\n_sdk_process = subprocess.run([{program}, 'run', '-'], input={script}, capture_output=True, text=True, timeout=15)\nassert _sdk_process.returncode == 0, _sdk_process.stderr\nint(_sdk_process.stdout)",
             program = serde_json::to_string(&program.to_string_lossy()).unwrap(),
             script = serde_json::to_string(&script).unwrap()
         );
