@@ -467,6 +467,11 @@ pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits> 
 }
 
 /// Read subscription usage directly. No provider process or model turn is started.
+///
+/// Claude throttles its usage endpoint hard, so the newest values per account
+/// are kept: a fresh read is reused briefly, and a refused refresh reports the
+/// last known values (from the endpoint or Claude's response headers) with
+/// their age instead of nothing.
 pub async fn read_claude_account_rate_limits() -> Result<ClaudeAccountRateLimits> {
     #[cfg(not(feature = "claude"))]
     {
@@ -474,9 +479,22 @@ pub async fn read_claude_account_rate_limits() -> Result<ClaudeAccountRateLimits
     }
     #[cfg(feature = "claude")]
     {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        let access = tokio::time::timeout(Duration::from_secs(10), async {
             let authority = crate::claude_subscription::AuthAuthority::resolve(None)?;
-            let access = crate::claude_subscription::discover(authority).await?;
+            crate::claude_subscription::discover(authority).await
+        })
+        .await
+        .context("timed out reading Claude account limits")??;
+        let account = access.profile.identity.subscription_id();
+        let known = known_claude_usage(&account);
+        if let Some(known) = &known
+            && known
+                .fetched_at
+                .is_some_and(|at| Utc::now() - at < chrono::TimeDelta::seconds(60))
+        {
+            return Ok(known.limits.clone());
+        }
+        let fresh = tokio::time::timeout(Duration::from_secs(10), async {
             let usage =
                 crate::claude_subscription::usage(&access, &access.profile.identity).await?;
             // The raw endpoint uses percentages. Do not pass the fraction-valued
@@ -488,8 +506,119 @@ pub async fn read_claude_account_rate_limits() -> Result<ClaudeAccountRateLimits
             }))
         })
         .await
-        .context("timed out reading Claude account limits")?
+        .context("timed out reading Claude account limits")
+        .and_then(|result| result);
+        match (fresh, known) {
+            (Ok(limits), _) => {
+                remember_claude_usage(&account, limits.clone(), true);
+                Ok(limits)
+            }
+            (Err(_), Some(known)) => Ok(ClaudeAccountRateLimits {
+                last_known_at: Some(known.updated_at),
+                ..known.limits
+            }),
+            (Err(error), None) => Err(error),
+        }
     }
+}
+
+#[derive(Clone)]
+struct KnownClaudeUsage {
+    account: String,
+    updated_at: DateTime<Utc>,
+    /// When the usage endpoint last answered; header updates do not count.
+    fetched_at: Option<DateTime<Utc>>,
+    limits: ClaudeAccountRateLimits,
+}
+
+static KNOWN_CLAUDE_USAGE: std::sync::Mutex<Vec<KnownClaudeUsage>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn known_claude_usage(account: &str) -> Option<KnownClaudeUsage> {
+    KNOWN_CLAUDE_USAGE
+        .lock()
+        .ok()?
+        .iter()
+        .find(|known| known.account == account)
+        .cloned()
+}
+
+fn remember_claude_usage(account: &str, limits: ClaudeAccountRateLimits, fetched: bool) {
+    let Ok(mut known) = KNOWN_CLAUDE_USAGE.lock() else {
+        return;
+    };
+    let now = Utc::now();
+    let previous = known.iter().position(|entry| entry.account == account);
+    let fetched_at = if fetched {
+        Some(now)
+    } else {
+        previous.and_then(|index| known[index].fetched_at)
+    };
+    let entry = KnownClaudeUsage {
+        account: account.to_owned(),
+        updated_at: now,
+        fetched_at,
+        limits: ClaudeAccountRateLimits {
+            last_known_at: None,
+            ..limits
+        },
+    };
+    match previous {
+        Some(index) => known[index] = entry,
+        None => known.push(entry),
+    }
+}
+
+/// Update an account's known usage from the unified rate-limit headers Claude
+/// returns on every subscription response, as Claude Code does.
+pub(crate) fn record_claude_usage_headers(account: &str, headers: &reqwest::header::HeaderMap) {
+    let value = |name: &str| {
+        headers
+            .get(format!("anthropic-ratelimit-unified-{name}"))
+            .and_then(|value| value.to_str().ok())
+    };
+    let window = |key: &str, label: &str| {
+        let used = value(&format!("{key}-utilization"))?
+            .parse::<f64>()
+            .ok()
+            .filter(|used| used.is_finite() && *used >= 0.0)?;
+        Some(ClaudeRateLimitWindow {
+            label: label.to_owned(),
+            used_percent: (used * 100.0).clamp(0.0, 100.0).round() as u8,
+            resets_at: value(&format!("{key}-reset"))
+                .and_then(|reset| reset.parse::<i64>().ok())
+                .and_then(|reset| DateTime::from_timestamp(reset, 0)),
+            global: true,
+        })
+    };
+    let observed: Vec<_> = [window("5h", "5-hour"), window("7d", "Weekly")]
+        .into_iter()
+        .flatten()
+        .collect();
+    if observed.is_empty() {
+        return;
+    }
+    let mut limits = known_claude_usage(account).map_or(
+        ClaudeAccountRateLimits {
+            subscription_type: None,
+            rate_limits_available: true,
+            windows: Vec::new(),
+            extra_usage_available: false,
+            last_known_at: None,
+        },
+        |known| known.limits,
+    );
+    for window in observed {
+        match limits
+            .windows
+            .iter_mut()
+            .find(|known| known.label == window.label)
+        {
+            Some(known) => *known = window,
+            None => limits.windows.push(window),
+        }
+    }
+    remember_claude_usage(account, limits, false);
 }
 
 fn parse_claude_account_rate_limits(value: &Value) -> Result<ClaudeAccountRateLimits> {
@@ -787,5 +916,43 @@ mod tests {
         assert!(parsed.windows[0].global);
         assert_eq!(parsed.windows[1].used_percent, 33);
         assert!(!parsed.extra_usage_available);
+    }
+
+    /// Claude throttles its usage endpoint, so the unified rate-limit headers
+    /// on each response must keep `/usage` current without dropping the
+    /// endpoint's per-model windows or plan.
+    #[test]
+    fn claude_response_headers_update_known_usage() {
+        let account = "claude-usage-header-test";
+        let endpoint = parse_claude_account_rate_limits(&serde_json::json!({
+            "subscription_type": "max",
+            "rate_limits_available": true,
+            "rate_limits": {
+                "five_hour": {"utilization": 10, "resets_at": "2026-08-30T23:40:00Z"},
+                "seven_day_opus": {"utilization": 50, "resets_at": "2026-09-01T23:00:00Z"}
+            }
+        }))
+        .unwrap();
+        remember_claude_usage(account, endpoint, true);
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in [
+            ("anthropic-ratelimit-unified-5h-utilization", "0.42"),
+            ("anthropic-ratelimit-unified-5h-reset", "1790000000"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.9"),
+        ] {
+            headers.insert(name, value.parse().unwrap());
+        }
+        record_claude_usage_headers(account, &headers);
+
+        let known = known_claude_usage(account).unwrap().limits;
+        let window = |label: &str| known.windows.iter().find(|w| w.label == label).unwrap();
+        assert_eq!(known.subscription_type.as_deref(), Some("max"));
+        assert_eq!(window("5-hour").used_percent, 42);
+        assert_eq!(
+            window("5-hour").resets_at,
+            DateTime::from_timestamp(1_790_000_000, 0)
+        );
+        assert_eq!(window("Weekly").used_percent, 90);
+        assert_eq!(window("Weekly · Opus").used_percent, 50);
     }
 }

@@ -232,6 +232,7 @@ impl ClaudeModelProvider {
             }
             .into());
         }
+        super::chat_stream::record_claude_usage_headers(&info.account_identity, response.headers());
         if let Some((five_hour, weekly)) = claude_subscription_transport::grace(response.headers())
         {
             publish(

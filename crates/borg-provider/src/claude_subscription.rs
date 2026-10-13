@@ -386,8 +386,8 @@ pub async fn usage(
     access: &SubscriptionAccess,
     expected: &AccountIdentity,
 ) -> Result<SubscriptionUsage> {
+    // `discover` already verified this token's profile.
     expected.check(&access.profile.identity)?;
-    profile(&access.token, expected).await?;
     usage_from(
         fetch(Operation::Usage, None, Some(access.token.bearer())).await?,
         expected,
@@ -607,10 +607,9 @@ async fn fetch(operation: Operation, body: Option<&Value>, bearer: Option<&str>)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
-        .user_agent(match operation {
-            Operation::Usage => "claude-cli/2.1.296 (external, borg)",
-            _ => "claude-code/2.1.296",
-        })
+        // Claude throttles the usage endpoint per client; Claude Code's own
+        // identity is the bucket that answers reliably.
+        .user_agent("claude-code/2.1.296")
         .build()
         .map_err(|_| anyhow::anyhow!("cannot initialize Claude TLS client"))?;
     let mut request = match body {
