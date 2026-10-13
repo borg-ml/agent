@@ -6275,62 +6275,13 @@ async fn flush_pending(
     session_id: Uuid,
     sync: &mut JournalSync,
 ) -> Result<()> {
-    if Instant::now() < sync.retry_at {
-        return Ok(());
-    }
-    const PAGE_SIZE: usize = 1_024;
-    loop {
-        let pending = store
-            .events_after(session_id, sync.uploaded_sequence, PAGE_SIZE)
-            .await?;
-        let caught_up = pending.len() < PAGE_SIZE;
-        match upload_event_page(
-            client,
-            config,
-            store,
-            &pending,
-            &mut sync.uploaded_sequence,
-            Duration::from_secs(3),
-        )
-        .await?
-        {
-            EventUploadOutcome::Complete => {}
-            EventUploadOutcome::Retryable => {
-                sync.retry_at = Instant::now() + Duration::from_secs(2);
-                return Ok(());
-            }
-            EventUploadOutcome::Blocked { .. } => {
-                // Preserve the actor and command receiver. A later binary or
-                // relay limit change can resume from this exact cursor.
-                sync.retry_at = Instant::now() + Duration::from_secs(300);
-                return Ok(());
-            }
-            // The cursor already moved past the one event the relay cannot
-            // store, so the next page carries on from after it.
-            EventUploadOutcome::Skipped { .. } => {
-                if caught_up {
-                    break;
-                }
-                continue;
-            }
-        }
-        if caught_up {
-            break;
-        }
-    }
-    if !upload_live_state(
-        client,
-        config,
-        store,
-        session_id,
-        &mut sync.uploaded_live_revision,
-    )
-    .await?
-    {
-        sync.retry_at = Instant::now() + Duration::from_secs(2);
-        return Ok(());
-    }
-    sync.retry_at = Instant::now();
+    // Session events are already committed. SyncAuthority owns their ordered
+    // projection/publication; the actor must not rebuild a second live suffix.
+    let _ = (client, config, session_id, sync);
+    ensure!(
+        store.postgres_authority().is_some(),
+        "host publication requires PostgreSQL authority"
+    );
     Ok(())
 }
 
