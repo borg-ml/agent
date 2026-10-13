@@ -777,12 +777,15 @@ async fn open_browser(url: &str) -> Result<()> {
     } else {
         ("xdg-open", vec![url])
     };
-    let status = tokio::process::Command::new(program)
+    // The opener can stay alive as long as the browser does, so reap it in the
+    // background rather than blocking approval polling on it.
+    let mut child = tokio::process::Command::new(program)
         .args(args)
-        .status()
-        .await
+        .spawn()
         .with_context(|| format!("failed to start {program}"))?;
-    anyhow::ensure!(status.success(), "{program} exited with {status}");
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
     Ok(())
 }
 
