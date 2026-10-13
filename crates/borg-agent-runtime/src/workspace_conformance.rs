@@ -1791,6 +1791,36 @@ pub async fn work_assignment_permissions_and_parent_cycles_are_enforced_by_store
     );
 }
 
+/// Plan reads run for every agent on every refresh. Queued behind the
+/// workspace write lock they held pool connections until a whole team
+/// session stalled, so a read must never wait for a writer.
+#[tokio::test]
+async fn work_plan_reads_do_not_wait_for_the_workspace_writer() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let scratch = ScratchDatabase::create(&url).await;
+    let session = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+        .await
+        .expect("bootstrap postgres schema");
+    let store = PostgresWorkspaceStore::from_pool(session.pool().clone());
+    let (workspace, actor, _, _) = workspace_with_members(&store).await;
+    let mut writer = session.pool().begin().await.unwrap();
+    sqlx::query("select id from workspaces where id = $1 for update")
+        .bind(workspace.to_string())
+        .fetch_one(&mut *writer)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        store.work_items(workspace, actor, Some(actor)),
+    )
+    .await
+    .expect("plan read waited for the workspace writer")
+    .unwrap();
+    writer.rollback().await.unwrap();
+}
+
 #[tokio::test]
 async fn legacy_work_backfill_preserves_canonical_retries_and_claim_tokens() {
     use crate::workspace::{AtomicWorkClaim, SharedWork};

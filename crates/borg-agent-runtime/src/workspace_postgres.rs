@@ -94,6 +94,7 @@ impl PostgresWorkspaceStore {
     async fn work_snapshot(
         transaction: &mut Transaction<'_, Postgres>,
         workspace_id: Uuid,
+        persist_backfill: bool,
     ) -> Result<WorkSnapshot> {
         let row = sqlx::query(
             "select work_projection_version, work_revision from workspaces where id=$1",
@@ -107,20 +108,27 @@ impl PostgresWorkspaceStore {
                 .bind(workspace_id.to_string()).fetch_all(&mut **transaction).await?;
             for row in rows {
                 let event: WorkspaceEvent = serde_json::from_str(row.try_get("event_json")?)?;
-                Self::apply_work_event(transaction, &mut snapshot, &event).await?;
-                if let WorkspaceEventKind::WorkPlanMigrated {
-                    source_session_id, ..
-                } = &event.kind
+                if persist_backfill {
+                    Self::apply_work_event(transaction, &mut snapshot, &event).await?;
+                } else {
+                    snapshot.apply_with_plan_assignees(&event)?;
+                }
+                if persist_backfill
+                    && let WorkspaceEventKind::WorkPlanMigrated {
+                        source_session_id, ..
+                    } = &event.kind
                 {
                     sqlx::query("insert into workspace_plan_migrations(workspace_id,source_session_id,event_id) values($1,$2,$3) on conflict(workspace_id,source_session_id) do nothing")
                         .bind(workspace_id.to_string()).bind(source_session_id.to_string()).bind(event.id.to_string()).execute(&mut **transaction).await?;
                 }
             }
-            Self::persist_work_snapshot(transaction, workspace_id, &snapshot, 0).await?;
-            sqlx::query("update workspaces set work_projection_version=2 where id=$1")
-                .bind(workspace_id.to_string())
-                .execute(&mut **transaction)
-                .await?;
+            if persist_backfill {
+                Self::persist_work_snapshot(transaction, workspace_id, &snapshot, 0).await?;
+                sqlx::query("update workspaces set work_projection_version=2 where id=$1")
+                    .bind(workspace_id.to_string())
+                    .execute(&mut **transaction)
+                    .await?;
+            }
         } else {
             snapshot.revision = u64::try_from(row.try_get::<i64, _>("work_revision")?)?;
             let rows = sqlx::query("select item_json from workspace_work_items where workspace_id=$1 and item_json is not null order by created_sequence, work_id")
@@ -373,7 +381,7 @@ impl PostgresWorkspaceStore {
                 members.iter().any(|(id, _)| id == assignee_id),
                 "assignee is not a workspace member"
             );
-            Self::work_snapshot(&mut transaction, event.workspace_id).await?;
+            Self::work_snapshot(&mut transaction, event.workspace_id, true).await?;
             let existing: Option<String> = sqlx::query_scalar("select e.event_json from workspace_plan_migrations m join workspace_events e on e.id=m.event_id and e.workspace_id=m.workspace_id where m.workspace_id=$1 and m.source_session_id=$2")
                 .bind(event.workspace_id.to_string()).bind(source_session_id.to_string()).fetch_optional(&mut *transaction).await?;
             if let Some(existing) = existing {
@@ -418,7 +426,8 @@ impl PostgresWorkspaceStore {
         Self::insert_event(&mut transaction, &event, &canonical).await?;
         Self::apply_side_effects(&mut transaction, &event, sequence).await?;
         if event.kind.is_work() {
-            let mut snapshot = Self::work_snapshot(&mut transaction, event.workspace_id).await?;
+            let mut snapshot =
+                Self::work_snapshot(&mut transaction, event.workspace_id, true).await?;
             let previous = snapshot.revision;
             Self::apply_work_event(&mut transaction, &mut snapshot, &event).await?;
             Self::persist_work_snapshot(&mut transaction, event.workspace_id, &snapshot, previous)
@@ -466,7 +475,7 @@ impl PostgresWorkspaceStore {
         if !event.kind.is_work() {
             return Ok(());
         }
-        let snapshot = Self::work_snapshot(transaction, event.workspace_id).await?;
+        let snapshot = Self::work_snapshot(transaction, event.workspace_id, true).await?;
         let plan_revision = match &event.kind {
             WorkspaceEventKind::WorkPlanUpdated { assignee_id, .. } => {
                 Self::plan_revision(transaction, event.workspace_id, *assignee_id).await?
@@ -676,8 +685,14 @@ impl WorkspaceStore for PostgresWorkspaceStore {
         viewer_id: Uuid,
         assignee_id: Option<Uuid>,
     ) -> Result<WorkSnapshot> {
+        // A consistent snapshot, not the workspace write lock: plan reads run
+        // for every agent on every refresh, and queueing them behind writers
+        // held pool connections until whole sessions stalled.
         let mut tx = self.pool.begin().await?;
-        sqlx::query("select id from workspaces where id=$1 for update")
+        sqlx::query("set transaction isolation level repeatable read, read only")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("select id from workspaces where id=$1")
             .bind(workspace_id.to_string())
             .fetch_one(&mut *tx)
             .await?;
@@ -686,9 +701,31 @@ impl WorkspaceStore for PostgresWorkspaceStore {
             members.iter().any(|(id, _)| *id == viewer_id),
             "viewer is not a workspace member"
         );
-        let mut snapshot = Self::work_snapshot(&mut tx, workspace_id).await?;
+        let mut snapshot = Self::work_snapshot(&mut tx, workspace_id, false).await?;
         if let Some(assignee) = assignee_id {
-            snapshot.revision = Self::plan_revision(&mut tx, workspace_id, assignee).await?;
+            let version: i32 =
+                sqlx::query_scalar("select work_projection_version from workspaces where id=$1")
+                    .bind(workspace_id.to_string())
+                    .fetch_one(&mut *tx)
+                    .await?;
+            snapshot.revision = if version >= 2 {
+                Self::plan_revision(&mut tx, workspace_id, assignee).await?
+            } else {
+                let rows: Vec<String> = sqlx::query_scalar("select event_json from workspace_events where workspace_id=$1 order by sequence")
+                    .bind(workspace_id.to_string()).fetch_all(&mut *tx).await?;
+                let mut replay = WorkSnapshot::default();
+                let mut revision = 0;
+                for raw in rows {
+                    let event: WorkspaceEvent = serde_json::from_str(&raw)?;
+                    if replay
+                        .apply_with_plan_assignees(&event)?
+                        .contains(&assignee)
+                    {
+                        revision = event.sequence;
+                    }
+                }
+                revision
+            };
         }
         tx.commit().await?;
         if let Some(assignee) = assignee_id {
