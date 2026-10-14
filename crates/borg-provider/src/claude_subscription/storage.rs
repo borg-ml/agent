@@ -171,22 +171,26 @@ impl AuthAuthority {
     }
     pub(super) async fn write_lock(&self) -> Result<RefreshLock> {
         let paths = [self.config_dir.join(".storage-write.lock")];
-        let start = tokio::time::Instant::now();
         loop {
-            match RefreshLock::acquire(&paths) {
-                Ok(lock) => return Ok(lock),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    ensure!(
-                        start.elapsed() < Duration::from_secs(12),
-                        "Claude storage write lock busy; retry later"
-                    );
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(_) => return Err(anyhow::anyhow!("cannot acquire Claude storage write lock")),
+            if let Some(lock) = RefreshLock::try_acquire(&paths)
+                .map_err(|_| anyhow::anyhow!("cannot acquire Claude storage write lock"))?
+            {
+                return Ok(lock);
             }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
     pub(super) async fn lock(&self) -> Result<RefreshLock> {
+        loop {
+            if let Some(lock) = self.try_lock()? {
+                return Ok(lock);
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+    /// `None` while a live process holds the refresh lock; the caller decides
+    /// whether to wait for its rotation or keep using a still-valid token.
+    pub(super) fn try_lock(&self) -> Result<Option<RefreshLock>> {
         // Existing authorities must not be replaced or have directory permissions changed.
         if !self.config_dir.exists() {
             create_private_dir(&self.config_dir)?;
@@ -199,20 +203,8 @@ impl AuthAuthority {
             directory.join(".oauth_refresh.lock"),
             PathBuf::from(format!("{}.lock", directory.display())),
         ];
-        let start = tokio::time::Instant::now();
-        loop {
-            match RefreshLock::acquire(&paths) {
-                Ok(lock) => return Ok(lock),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    ensure!(
-                        start.elapsed() < Duration::from_secs(12),
-                        "Claude refresh lock busy; retry later (stale locks require explicit recovery)"
-                    );
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(_) => return Err(anyhow::anyhow!("cannot acquire Claude refresh lock")),
-            }
-        }
+        RefreshLock::try_acquire(&paths)
+            .map_err(|_| anyhow::anyhow!("cannot acquire Claude refresh lock"))
     }
 }
 
@@ -258,13 +250,43 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-// Native proper-lockfile uses mkdir, NOT flock. Keep both the current and legacy
-// directories alive; never reclaim somebody else's lock based on age alone.
+// Native proper-lockfile uses mkdir, NOT flock, with `stale: 60000, update: 5000`.
+// Holders refresh the directory mtime every 5s; like native, a lock left
+// unrefreshed for 60s belongs to a dead process and is reclaimed.
+const STALE: Duration = Duration::from_secs(60);
 pub(super) struct RefreshLock {
     entries: Vec<(PathBuf, fs::File)>,
     heartbeat: tokio::task::JoinHandle<()>,
 }
 impl RefreshLock {
+    fn try_acquire(paths: &[PathBuf]) -> std::io::Result<Option<Self>> {
+        match Self::acquire(paths) {
+            Ok(lock) => return Ok(Some(lock)),
+            Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => return Err(error),
+            Err(_) => {}
+        }
+        let mut reclaimed = false;
+        for path in paths {
+            let Ok(meta) = fs::symlink_metadata(path) else {
+                continue;
+            };
+            if meta.is_dir()
+                && meta
+                    .modified()
+                    .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > STALE))
+            {
+                reclaimed |= fs::remove_dir_all(path).is_ok();
+            }
+        }
+        if !reclaimed {
+            return Ok(None);
+        }
+        match Self::acquire(paths) {
+            Ok(lock) => Ok(Some(lock)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
     fn acquire(paths: &[PathBuf]) -> std::io::Result<Self> {
         let mut entries = Vec::new();
         for path in paths {

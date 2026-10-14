@@ -109,7 +109,12 @@ struct State {
     fetched: BTreeMap<String, (Instant, [u8; 32])>,
     // client_data is a per-model slot, unlike the account-level deny/default overlay.
     client_data: BTreeMap<String, Value>,
+    fast: Option<(Instant, [u8; 32], bool)>,
 }
+
+// Turns reuse the account-bound connector so its metadata caches survive
+// between requests instead of being refetched before every first token.
+static CONNECTORS: std::sync::Mutex<Vec<NativeConnector>> = std::sync::Mutex::new(Vec::new());
 
 impl NativeConnector {
     pub async fn connect(selected: Option<&Path>) -> Result<Self> {
@@ -117,10 +122,19 @@ impl NativeConnector {
         let result = auth::discover(authority.clone()).await;
         super::claude_connector::record_account_verification(selected, result.is_ok());
         let access = result?;
+        let cached = CONNECTORS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|c| c.authority == authority && c.bound == access.profile.identity)
+            .cloned();
+        if let Some(connector) = cached {
+            return Ok(connector);
+        }
         let device_id = tokio::task::spawn_blocking(installation_device_id)
             .await
             .context("Claude device metadata task failed")??;
-        Ok(Self {
+        let connector = Self {
             authority,
             bound: access.profile.identity,
             device_id: Arc::new(device_id),
@@ -135,8 +149,13 @@ impl NativeConnector {
                 bootstrap: json!({}),
                 fetched: BTreeMap::new(),
                 client_data: BTreeMap::new(),
+                fast: None,
             })),
-        })
+        };
+        let mut connectors = CONNECTORS.lock().unwrap_or_else(|e| e.into_inner());
+        connectors.retain(|c| c.authority != connector.authority);
+        connectors.push(connector.clone());
+        Ok(connector)
     }
 
     /// Account-owned profile/token access for usage/admission without another agent loop.
@@ -266,7 +285,19 @@ impl NativeConnector {
         drop(state);
         // Do not collapse unknown/account-fetch errors into `fast=false`.
         let enabled = if caps.fast {
-            auth::fast_eligibility(access, &self.bound).await?
+            let cached =
+                self.state.lock().await.fast.filter(|(at, stamp, _)| {
+                    at.elapsed() < CACHE_AGE && *stamp == generation(access)
+                });
+            match cached {
+                Some((_, _, enabled)) => enabled,
+                None => {
+                    let enabled = auth::fast_eligibility(access, &self.bound).await?;
+                    self.state.lock().await.fast =
+                        Some((Instant::now(), generation(access), enabled));
+                    enabled
+                }
+            }
         } else {
             false
         };
@@ -1090,8 +1121,9 @@ mod tests {
             },
         ])));
         let sends = Arc::new(AtomicUsize::new(0));
+        // One profile verification per distinct bearer.
         let result = auth_tests::offline(
-            vec![auth_tests::profile_fixture(); 3],
+            vec![auth_tests::profile_fixture(); 2],
             vec![],
             METADATA.scope(
                 metadata.clone(),
@@ -1124,8 +1156,8 @@ mod tests {
         assert_eq!(state.bootstrap, json!({}));
     }
 
-    // A cache hit can rotate specifically during the final profile check. Re-admit
-    // its new generation, rather than returning Fatal or reusing cached capabilities.
+    // Credentials can rotate after a bootstrap cache hit. Re-admit the new
+    // generation, rather than returning Fatal or reusing cached capabilities.
     #[tokio::test]
     async fn final_generation_change_readmits_same_account() {
         let directory = tempfile::tempdir().unwrap();
@@ -1155,9 +1187,12 @@ mod tests {
             bootstrap: json!({}),
             write: None,
         }])));
+        auth_tests::save_fixture(&authority, &sibling())
+            .await
+            .unwrap();
         let (current, caps) = auth_tests::offline(
-            vec![auth_tests::profile_fixture(); 4],
-            vec![(authority, sibling())],
+            vec![auth_tests::profile_fixture()],
+            vec![],
             METADATA.scope(
                 metadata.clone(),
                 client.admit(access, "haiku", None, false, None),
@@ -1239,6 +1274,7 @@ mod tests {
             bootstrap: json!({}),
             fetched: BTreeMap::new(),
             client_data: BTreeMap::new(),
+            fast: None,
         }
     }
     #[test]

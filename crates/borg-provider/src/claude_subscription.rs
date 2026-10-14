@@ -56,6 +56,9 @@ impl OAuthToken {
     pub fn bearer(&self) -> &str {
         &self.access_token
     }
+    fn expired_at(&self, now_ms: i64) -> bool {
+        self.expires_at_ms.is_some_and(|expiry| now_ms >= expiry)
+    }
     pub fn needs_refresh_at(&self, now_ms: i64) -> bool {
         self.expires_at_ms
             .is_some_and(|expiry| now_ms.saturating_add(REFRESH_SKEW_MS) >= expiry)
@@ -230,13 +233,27 @@ async fn access_inner(
     if !token.needs_refresh_at(now_ms()) && rejected.as_deref() != Some(token.bearer()) {
         return verified_access(&authority, token, expected.as_ref()).await;
     }
-    let lock = authority.lock().await?;
+    let lock = loop {
+        if let Some(lock) = authority.try_lock()? {
+            break lock;
+        }
+        // Another process is refreshing. Like native, keep using a token that has
+        // not actually expired, or adopt the sibling's rotation once it lands.
+        let latest = authority.load().await?;
+        adopt_binding(&latest, &mut expected)?;
+        let current = OAuthToken::from_document(&latest)?;
+        if rejected.as_deref() != Some(current.bearer()) && !current.expired_at(now_ms()) {
+            return verified_access(&authority, current, expected.as_ref()).await;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
     let document = authority.load().await?;
     adopt_binding(&document, &mut expected)?;
     let old = OAuthToken::from_document(&document)?;
     if (old.bearer() != token.bearer() || rejected.as_deref() != Some(old.bearer()))
         && !old.needs_refresh_at(now_ms())
     {
+        drop(lock);
         return verified_access(&authority, old, expected.as_ref()).await;
     }
     let posted = old
@@ -263,7 +280,13 @@ async fn access_inner(
             let latest = authority.load().await?;
             adopt_binding(&latest, &mut expected)?;
             let sibling = OAuthToken::from_document(&latest)?;
+            drop(lock);
             if sibling.bearer() != old.bearer() && !sibling.needs_refresh_at(now_ms()) {
+                return verified_access(&authority, sibling, expected.as_ref()).await;
+            }
+            // A failed proactive refresh is not a failed turn while the
+            // unrejected token is still valid; the next access retries.
+            if rejected.as_deref() != Some(sibling.bearer()) && !sibling.expired_at(now_ms()) {
                 return verified_access(&authority, sibling, expected.as_ref()).await;
             }
             return Err(error);
@@ -285,6 +308,8 @@ async fn access_inner(
         authority.save(&latest).await?;
     }
     drop(write_lock);
+    // Profile verification is network-bound; never make siblings wait on it.
+    drop(lock);
     let result = OAuthToken::from_document(&latest)?;
     verified_access(&authority, result, expected.as_ref()).await
 }
@@ -297,6 +322,14 @@ async fn verified_access(
     let mut token = token;
     let mut expected = expected.cloned();
     for _ in 0..3 {
+        // A bearer belongs to one account; re-fetching its profile on every turn
+        // only spends the throttled account-endpoint budget and delays the turn.
+        if let Some(profile) = verified_profile(authority, &token) {
+            if let Some(expected) = &expected {
+                expected.check(&profile.identity)?;
+            }
+            return Ok(SubscriptionAccess { token, profile });
+        }
         let profile = fetch_profile(&token, expected.as_ref()).await?;
         // Discovery also pins its first verified account across concurrent rotations.
         expected.get_or_insert_with(|| profile.identity.clone());
@@ -316,11 +349,34 @@ async fn verified_access(
         apply_profile(&mut latest, &profile)?;
         lock.check()?;
         authority.save(&latest).await?;
+        remember_profile(authority, &token, &profile);
         return Ok(SubscriptionAccess { token, profile });
     }
     anyhow::bail!(
         "Claude credentials kept changing during profile verification; no model request sent"
     )
+}
+
+type VerifiedKey = (AuthAuthority, [u8; 32]);
+static VERIFIED: std::sync::Mutex<Vec<(VerifiedKey, SubscriptionProfile)>> =
+    std::sync::Mutex::new(Vec::new());
+fn verified_key(authority: &AuthAuthority, token: &OAuthToken) -> VerifiedKey {
+    (authority.clone(), Sha256::digest(token.bearer()).into())
+}
+fn verified_profile(authority: &AuthAuthority, token: &OAuthToken) -> Option<SubscriptionProfile> {
+    let key = verified_key(authority, token);
+    let verified = VERIFIED.lock().unwrap_or_else(|e| e.into_inner());
+    verified
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, profile)| profile.clone())
+}
+fn remember_profile(authority: &AuthAuthority, token: &OAuthToken, profile: &SubscriptionProfile) {
+    let key = verified_key(authority, token);
+    let mut verified = VERIFIED.lock().unwrap_or_else(|e| e.into_inner());
+    // Only the current bearer per authority is worth keeping.
+    verified.retain(|((authority, _), _)| *authority != key.0);
+    verified.push((key, profile.clone()));
 }
 
 fn adopt_binding(document: &Value, expected: &mut Option<AccountIdentity>) -> Result<()> {

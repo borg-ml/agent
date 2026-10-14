@@ -241,6 +241,25 @@ async fn durable_file_write_and_refresh_are_offline() {
     }
 }
 
+// Native-compatible refresh lock: a live holder is never stolen, while a holder
+// that stopped heartbeating (crashed process) must not wedge auth forever.
+#[tokio::test]
+async fn refresh_lock_waits_for_live_holder_and_reclaims_dead_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let authority =
+        AuthAuthority::selected(directory.path().to_owned(), CredentialStore::File).unwrap();
+    let held = authority.try_lock().unwrap().unwrap();
+    assert!(authority.try_lock().unwrap().is_none());
+    drop(held);
+    let dead = directory.path().join(".oauth_refresh.lock");
+    std::fs::create_dir(&dead).unwrap();
+    std::fs::File::open(&dead)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+        .unwrap();
+    assert!(authority.try_lock().unwrap().is_some());
+}
+
 #[tokio::test]
 async fn fresh_auth_fetches_profile_without_rotation() {
     let directory = tempfile::tempdir().unwrap();
