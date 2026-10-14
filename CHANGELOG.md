@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.16.0)
 
+### Remote
+
+- Fix `borg` refusing to start with "this session is still owned by the
+  background Borg remote host" on enrolled machines: sessions a local terminal
+  registers for mirroring are no longer treated as relay-launched.
+- Fix the `borg-remote` service crash-looping on its first TLS connection
+  ("Could not automatically determine the process-level CryptoProvider").
+
 ## 0.16.0 (2026-10-14)
 
 ### Providers
