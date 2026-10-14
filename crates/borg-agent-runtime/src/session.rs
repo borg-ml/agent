@@ -13328,11 +13328,11 @@ async fn forward_child_activity(
                             }
                         }
                         Err(error) => {
-                            tracing::error!(%session_id, %error, "child activity recovery failed; retaining roster cursor");
-                            tokio::select! {
-                                _ = forwarded.closed() => return,
-                                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                            }
+                            // Retrying here starves live activity: every child
+                            // would stay frozen at its last forwarded status.
+                            // Resume live forwarding; the next lag recovers again.
+                            tracing::error!(%session_id, %error, "child activity recovery failed; resuming live activity");
+                            break;
                         }
                     }
                 }

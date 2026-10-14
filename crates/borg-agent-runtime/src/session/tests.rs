@@ -20150,8 +20150,10 @@ async fn forwarding_coordinator(
 ) -> (
     crate::session_store::postgres::testing::ScratchDatabase,
     SubagentCoordinator,
+    Arc<crate::session_store::postgres::PostgresSessionStore>,
 ) {
     let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     let launch = LaunchSession {
         request_id: root,
         cwd: PathBuf::from("/tmp"),
@@ -20175,10 +20177,10 @@ async fn forwarding_coordinator(
         launch,
         1,
         Arc::new(HungProviderExecutor),
-        Arc::new(store),
+        store.clone(),
     )
     .unwrap();
-    (scratch, coordinator)
+    (scratch, coordinator, store)
 }
 
 #[tokio::test]
@@ -20186,7 +20188,7 @@ async fn forwarded_child_activity_keeps_the_coordinator_order() {
     let (activity_tx, activity_rx) = broadcast::channel(8);
     let (forwarded_tx, mut forwarded_rx) = mpsc::channel(8);
     let root = Uuid::new_v4();
-    let (scratch, coordinator) = forwarding_coordinator(root).await;
+    let (scratch, coordinator, _) = forwarding_coordinator(root).await;
     let forwarder = tokio::spawn(forward_child_activity(
         activity_rx,
         forwarded_tx,
@@ -20216,6 +20218,77 @@ async fn forwarded_child_activity_keeps_the_coordinator_order() {
     scratch.discard().await;
 }
 
+// Failure mode (seen live): one broadcast lag sent the forwarder into roster
+// recovery, a descendant the store knew but the coordinator never tracked made
+// every recovery page fail, and the retry loop never returned to live
+// activity. Every child that then finished a resumed turn stayed Running in the
+// parent journal and the TUI team panel.
+#[tokio::test]
+async fn child_activity_after_a_lag_survives_an_untracked_descendant() {
+    let root = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let (scratch, coordinator, store) = forwarding_coordinator(root).await;
+    crate::SessionStore::create_session(store.as_ref(), root)
+        .await
+        .unwrap();
+    store
+        .register_child_session(root, Uuid::new_v4())
+        .await
+        .unwrap();
+    let (activity_tx, activity_rx) = broadcast::channel(1);
+    let (forwarded_tx, mut forwarded_rx) = mpsc::channel(8);
+    for _ in 0..3 {
+        activity_tx
+            .send(SubagentActivity::Started {
+                agent: watched_child(Uuid::new_v4()),
+            })
+            .unwrap();
+    }
+    let forwarder = tokio::spawn(forward_child_activity(
+        activity_rx,
+        forwarded_tx,
+        None,
+        coordinator,
+        root,
+    ));
+    activity_tx
+        .send(SubagentActivity::SessionEvent {
+            parent_session_id: root,
+            task_name: "/root/resumed".to_string(),
+            event: SessionEvent::new(
+                child,
+                7,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Ready,
+                    detail: None,
+                },
+            ),
+        })
+        .unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(activity) = forwarded_rx.recv().await {
+            if let SubagentActivity::SessionEvent { event, .. } = activity
+                && event.session_id == child
+            {
+                return event;
+            }
+        }
+        panic!("forwarder ended before the child's completion arrived");
+    })
+    .await
+    .expect("live child activity resumes after lag recovery");
+    assert!(matches!(
+        ready.kind,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            ..
+        }
+    ));
+    drop(activity_tx);
+    forwarder.await.unwrap();
+    scratch.discard().await;
+}
+
 // A nested actor receives its own child's lifecycle, never sibling or
 // grandchild activity from the shared coordinator's broadcast.
 #[tokio::test]
@@ -20224,7 +20297,7 @@ async fn forwarded_nested_child_activity_preserves_lifecycle_and_parent_boundary
     let child = Uuid::new_v4();
     let (activity_tx, activity_rx) = broadcast::channel(32);
     let (forwarded_tx, mut forwarded_rx) = mpsc::channel(16);
-    let (scratch, coordinator) = forwarding_coordinator(parent).await;
+    let (scratch, coordinator, _) = forwarding_coordinator(parent).await;
     let forwarder = tokio::spawn(forward_child_activity(
         activity_rx,
         forwarded_tx,

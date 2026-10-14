@@ -6169,10 +6169,13 @@ impl SubagentCoordinator {
         };
         let mut activity = Vec::with_capacity(ids.len());
         for id in ids {
-            let agent = self
-                .get(id)
-                .await
-                .with_context(|| format!("canonical child {id} absent from coordinator"))?;
+            // A descendant the store knows but the coordinator never tracked
+            // (a child whose start failed) has no snapshot to project. Failing
+            // the page on it would stall recovery, and with it every live
+            // activity, forever.
+            let Some(agent) = self.get(id).await else {
+                continue;
+            };
             let state = self.store.state(id).await?;
             let events = self
                 .store
