@@ -2183,6 +2183,15 @@ async fn run_agent_session_store_kernel_inner(
         .for_session(session_id, store.as_ref(), launch.model.as_deref())
         .await?
         .unwrap_or(executor);
+    // Verify the subscription and load the model's metadata while the user is
+    // still typing, so the first turn does not wait on account checks. Any
+    // failure resurfaces on the turn itself.
+    {
+        let (executor, launch) = (executor.clone(), launch.clone());
+        tokio::spawn(async move {
+            let _ = probe_speed_support(executor.as_ref(), &launch).await;
+        });
+    }
     let initial_state = store.state(session_id).await?;
     let fresh = initial_state.latest_sequence == 0;
     // A provider process can die after the durable TurnStarted boundary but
