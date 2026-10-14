@@ -361,22 +361,43 @@ impl NativeConnector {
     ) -> Result<(SubscriptionAccess, bool)> {
         let key = normalized(model);
         let mut state = self.state.lock().await;
-        if state
-            .fetched
-            .get(&key)
-            .is_some_and(|(at, stamp)| at.elapsed() < CACHE_AGE && *stamp == generation(&access))
+        if let Some((at, stamp)) = state.fetched.get_mut(&key)
+            && *stamp == generation(&access)
         {
+            // Like native, serve this generation's last verified metadata and
+            // revalidate off the request path instead of delaying the first token.
+            if at.elapsed() >= CACHE_AGE {
+                *at = Instant::now();
+                let connector = self.clone();
+                tokio::spawn(async move {
+                    if let Ok(access) = connector.access().await {
+                        let _ = connector.refresh_metadata(access, key).await;
+                    }
+                });
+            }
             return Ok((access, true));
         }
+        drop(state);
+        self.refresh_metadata(access, key).await
+    }
+
+    async fn refresh_metadata(
+        &self,
+        access: SubscriptionAccess,
+        key: String,
+    ) -> Result<(SubscriptionAccess, bool)> {
         // Optional endpoint failure leaves the last account-bound deny/default state
         // intact. Explicit policy evidence is fetched separately and never guessed.
-        let policy = self.fetch_policy(&access).await;
-        let fetched = self.fetch_bootstrap(&access, &key).await;
+        let (policy, fetched) = tokio::join!(
+            self.fetch_policy(&access),
+            self.fetch_bootstrap(&access, &key)
+        );
         let current = self.access().await?;
         if generation(&access) != generation(&current) {
             // Credential generation changed during fetch: never commit its response.
             return Ok((current, false));
         }
+        let mut state = self.state.lock().await;
         if let Some(policy) = policy? {
             if policy["compliance_taints"]
                 .as_array()
