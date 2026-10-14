@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.16.4)
 
+### Providers
+
+- Fix "Claude subscription account/organization changed; reconnect explicitly"
+  blocking a valid login after switching Claude accounts or organizations.
+  Connecting now adopts the account the current token belongs to instead of
+  failing on a stale saved binding.
+
 ## 0.16.4 (2026-10-14)
 
 ### Subagents
