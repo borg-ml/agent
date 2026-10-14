@@ -5007,6 +5007,46 @@ impl BorgTerminal {
         self.child_unhydrated_events.clear();
     }
 
+    /// The children this view currently tracks, for resyncing their status
+    /// against each child's own journal.
+    pub fn team_roster_snapshots(&self) -> Vec<SubagentSnapshot> {
+        self.director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript)
+            .subagent_snapshots
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Apply resynced child snapshots whose status differs from what this view
+    /// believes. Child status transitions are mirrored to the parent as live
+    /// events only, so a viewer that missed one would otherwise show a stale
+    /// roster until the child's next durable event.
+    pub fn sync_child_statuses(&mut self, agents: &[SubagentSnapshot]) -> bool {
+        let transcript = self
+            .director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript);
+        let changed = agents
+            .iter()
+            .filter(|agent| {
+                transcript
+                    .subagent_snapshots
+                    .get(&agent.session_id)
+                    .is_some_and(|current| {
+                        current.status != agent.status && current.updated_at <= agent.updated_at
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if changed.is_empty() {
+            return false;
+        }
+        self.seed_team_roster(&changed);
+        true
+    }
+
     pub fn seed_team_roster(&mut self, agents: &[SubagentSnapshot]) {
         let transcript = self
             .director_transcript
@@ -8907,11 +8947,7 @@ impl BorgTerminal {
             .as_deref()
             .unwrap_or(&self.transcript);
         let active_subagents = team_transcript.active_subagent_count();
-        let inactive_subagents = team_transcript
-            .subagent_snapshots
-            .values()
-            .filter(|agent| agent.status != SubagentStatus::Running)
-            .count();
+        let inactive_subagents = team_transcript.inactive_subagent_count();
         let agent_roster_entries = team_transcript.agent_roster_entries();
         let focused_agent_name = self.focused_child.and_then(|child| {
             team_transcript

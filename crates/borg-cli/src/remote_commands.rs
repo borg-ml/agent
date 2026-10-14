@@ -3205,6 +3205,9 @@ async fn run_local_agent_session(
     session_host_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut blu_discovery_task: Option<BluDiscoveryTask> = None;
     let mut agent_config_poll_task: Option<tokio::task::JoinHandle<AgentConfigPollResult>> = None;
+    let mut child_status_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+    child_status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut child_status_sync_task: Option<tokio::task::JoinHandle<Vec<SubagentSnapshot>>> = None;
     let mut shutdown_signal_open = true;
     let mut session_event_stream_open = true;
     let mut queued_session_events = LiveEventQueue::default();
@@ -3421,6 +3424,33 @@ async fn run_local_agent_session(
                     Err(error) => {
                         return Err(anyhow::anyhow!("session projection repair task failed: {error}"));
                     }
+                }
+            }
+            result = async {
+                child_status_sync_task
+                    .as_mut()
+                    .expect("child status sync branch is guarded")
+                    .await
+            }, if child_status_sync_task.is_some() => {
+                child_status_sync_task = None;
+                if let (Ok(agents), Some(terminal)) = (result, terminal.as_mut())
+                    && terminal.sync_child_statuses(&agents)
+                {
+                    terminal_dirty = true;
+                }
+            }
+            _ = child_status_tick.tick(), if interactive && child_status_sync_task.is_none() => {
+                let mut agents = terminal
+                    .as_ref()
+                    .map(|terminal| terminal.team_roster_snapshots())
+                    .unwrap_or_default();
+                if !agents.is_empty() {
+                    let store = Arc::clone(&store);
+                    let sessions_dir = sessions_dir.clone();
+                    child_status_sync_task = Some(tokio::spawn(async move {
+                        reconcile_subagent_snapshots(store.as_ref(), &sessions_dir, &mut agents).await;
+                        agents
+                    }));
                 }
             }
             result = async {
@@ -8155,6 +8185,9 @@ async fn run_local_agent_session(
         task.abort();
     }
     if let Some(task) = agent_config_poll_task.take() {
+        task.abort();
+    }
+    if let Some(task) = child_status_sync_task.take() {
         task.abort();
     }
     if let Some(task) = projection_gap_repair_task.take() {

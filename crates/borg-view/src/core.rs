@@ -274,6 +274,10 @@ pub struct TranscriptCore {
     pub waiting_on_watchers: bool,
     pub subagents: HashMap<Uuid, SubagentStatus>,
     pub subagent_snapshots: HashMap<Uuid, SubagentSnapshot>,
+    /// Settled children dropped from `subagent_snapshots` to bound memory.
+    /// Remembered by id so the team's inactive count stays the real total.
+    #[serde(default)]
+    pub pruned_settled_children: HashSet<Uuid>,
     pub agent_names: HashMap<Uuid, String>,
     pub watches: Vec<WatchSummary>,
     pub watch_messages: HashSet<Uuid>,
@@ -348,6 +352,7 @@ impl Default for TranscriptCore {
             waiting_on_watchers: false,
             subagents: HashMap::new(),
             subagent_snapshots: HashMap::new(),
+            pruned_settled_children: HashSet::new(),
             agent_names: HashMap::new(),
             watches: Vec::new(),
             watch_messages: HashSet::new(),
@@ -3611,6 +3616,7 @@ impl TranscriptCore {
         if self.agent_names.get(&agent.session_id) != Some(&name) {
             self.agent_names.insert(agent.session_id, name);
         }
+        self.pruned_settled_children.remove(&agent.session_id);
         self.subagents.insert(agent.session_id, status);
         let mut snapshot = agent.clone();
         snapshot.status = status;
@@ -3910,22 +3916,21 @@ impl TranscriptCore {
             _ => TranscriptActionState::Complete,
         };
         let time = child.updated_at.to_rfc3339();
-        if let Some(index) = self.subagent_entries.get(&child_id).copied() {
-            if let Some(TranscriptEntry::Action {
+        // Metadata only refreshes a card the transcript already has. Creating
+        // one here would append a card for every settled child at the tail
+        // whenever metadata hydrates after a stall.
+        if let Some(index) = self.subagent_entries.get(&child_id).copied()
+            && let Some(TranscriptEntry::Action {
                 detail: row_detail,
                 body,
                 state: row_state,
                 ..
             }) = self.order.get_mut(index)
-            {
-                *row_detail = format!("{} · {detail}", child.task_name);
-                *body = None;
-                *row_state = state;
-            }
+        {
+            *row_detail = format!("{} · {detail}", child.task_name);
+            *body = None;
+            *row_state = state;
         }
-        // Metadata only refreshes a card the transcript already has. Creating
-        // one here would append a card for every settled child at the tail
-        // whenever metadata hydrates after a stall.
         self.child_meta_refs.insert(
             child_id,
             ChildMetaReference {
@@ -3945,6 +3950,16 @@ impl TranscriptCore {
         );
         self.prune_child_metadata();
         Ok(true)
+    }
+
+    /// Children that are not running, including settled ones pruned from the
+    /// bounded snapshot map.
+    pub fn inactive_subagent_count(&self) -> usize {
+        self.subagent_snapshots
+            .values()
+            .filter(|agent| agent.status != SubagentStatus::Running)
+            .count()
+            + self.pruned_settled_children.len()
     }
 
     pub fn prune_child_metadata(&mut self) {
@@ -3976,6 +3991,7 @@ impl TranscriptCore {
         let remove = settled.len().saturating_sub(64);
         for (_, id) in settled.into_iter().take(remove) {
             self.subagent_snapshots.remove(&id);
+            self.pruned_settled_children.insert(id);
             self.subagents.remove(&id);
             self.agent_names.remove(&id);
             self.child_meta_refs.remove(&id);

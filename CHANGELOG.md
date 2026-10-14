@@ -11,6 +11,10 @@ Git comparison.
   the transcript after resuming a large team or recovering from a UI stall:
   child metadata now refreshes existing cards instead of adding one per
   settled child.
+- Fix the status bar's team counts: the inactive count no longer stops at 64
+  for larger teams, and a child blocked in a long tool call now shows as
+  running. Child status is resynced from each child's journal every few
+  seconds because status transitions are mirrored to the parent live only.
 
 ## 0.16.1 (2026-10-14)
 
