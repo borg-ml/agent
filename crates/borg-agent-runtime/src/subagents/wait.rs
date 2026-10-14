@@ -63,7 +63,8 @@ impl Unseen {
 
 fn settled(agent: &SubagentSnapshot) -> bool {
     match agent.status {
-        SubagentStatus::Ready => agent.final_text.is_some(),
+        // A child parked on watchers has only said something intermediate.
+        SubagentStatus::Ready => agent.final_text.is_some() && !parked_on_watchers(agent),
         SubagentStatus::Stopped | SubagentStatus::Failed | SubagentStatus::WaitingForApproval => {
             true
         }
@@ -84,6 +85,19 @@ fn fingerprint(agent: &SubagentSnapshot) -> u64 {
         agent.detail.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// A `Ready` child that is parked on live watchers (a long build or scan it
+/// started) is not idle: it wakes itself when the watcher fires. It is not
+/// counted as `working` (the wait must not block on a watcher that may never
+/// fire), but the parent is told, so "working_children: 0" is not read as
+/// "nothing is running".
+pub(super) fn parked_on_watchers(agent: &SubagentSnapshot) -> bool {
+    agent.status == SubagentStatus::Ready
+        && agent
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.starts_with("Waiting on ") && d.ends_with(" watcher(s)"))
 }
 
 fn working(agent: &SubagentSnapshot) -> bool {
@@ -419,6 +433,7 @@ impl SubagentCoordinator {
             "agents_mode": "delta",
             "total_children": children.len(),
             "working_children": children.iter().filter(|agent| working(agent)).count(),
+            "parked_on_watchers": children.iter().filter(|agent| parked_on_watchers(agent)).count(),
         });
         if more_agents > 0 {
             result["more_agents"] = json!(more_agents);

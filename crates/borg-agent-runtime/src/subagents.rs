@@ -1840,6 +1840,7 @@ impl AgentToolDispatcher {
     pub(crate) async fn subagent_count_prompt(&self) -> String {
         let mut direct = SubagentCounts::default();
         let mut descendants = SubagentCounts::default();
+        let (mut direct_parked, mut descendants_parked) = (0usize, 0usize);
         if let Some(subagents) = &self.subagents {
             let table = subagents.table.lock().await;
             if let Ok(path) = table.task_name(self.actor_session_id) {
@@ -1852,19 +1853,30 @@ impl AgentToolDispatcher {
                         } else {
                             agent.status
                         };
+                        let parked = !entry.dormant && wait::parked_on_watchers(agent);
                         descendants.add(status);
+                        descendants_parked += usize::from(parked);
                         if agent.parent_session_id == self.actor_session_id {
                             direct.add(status);
+                            direct_parked += usize::from(parked);
                         }
                     }
                 }
             }
         }
+        let parked = if descendants_parked > 0 {
+            format!(
+                " Of the inactive, parked on live watchers (still running work, they wake \
+                 themselves): direct={direct_parked}, descendants={descendants_parked}."
+            )
+        } else {
+            String::new()
+        };
         format!(
             "Live subagent counts — direct children: running={}, starting={}, inactive={}; \
              all descendants: running={}, starting={}, inactive={}. \
              Refreshed before this model request; excludes yourself. Inactive includes ready, \
-             approval-waiting, stopped, failed and dormant agents.",
+             approval-waiting, stopped, failed and dormant agents.{parked}",
             direct.running,
             direct.starting,
             direct.inactive,

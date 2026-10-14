@@ -204,6 +204,30 @@ async fn live_subagent_count_tracks_lifecycle_and_descendant_scope() {
     assert!(dispatcher.subagent_count_prompt().await.starts_with(
         "Live subagent counts — direct children: running=0, starting=0, inactive=2; all descendants: running=0, starting=0, inactive=3."
     ));
+    // A Ready child parked on a watcher is inactive, but the line says it is
+    // still running work, and a wait neither blocks on it nor reports it settled.
+    {
+        let mut table = coordinator.table.lock().await;
+        let parked = &mut table.entries.get_mut(&sibling).unwrap().snapshot;
+        parked.status = SubagentStatus::Ready;
+        parked.detail = Some("Waiting on 1 watcher(s)".into());
+        parked.final_text = Some("build started".into());
+        table.entries.get_mut(&grandchild).unwrap().snapshot.status = SubagentStatus::Stopped;
+    }
+    let prompt = dispatcher.subagent_count_prompt().await;
+    assert!(prompt.contains("inactive=2; all descendants"));
+    assert!(prompt.contains("parked on live watchers"));
+    assert!(prompt.contains("direct=1, descendants=1"));
+    let started = std::time::Instant::now();
+    let result = coordinator
+        .wait_for(root, Duration::from_secs(30), WaitSignals::default())
+        .await
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(result["reason"], "no_active_children");
+    assert_eq!(result["changes"], json!([]));
+    assert_eq!(result["working_children"], 0);
+    assert_eq!(result["parked_on_watchers"], 1);
 }
 
 // Context correction remains available without exposing a context-budget signal.
