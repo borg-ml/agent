@@ -188,12 +188,14 @@ impl ModelCapabilities {
 
 struct CachedModels {
     account: String,
-    client_version: String,
     fetched: Instant,
     models: Vec<ModelCapabilities>,
 }
 
+static MODELS: tokio::sync::Mutex<Option<CachedModels>> = tokio::sync::Mutex::const_new(None);
+
 // Never serialize or debug credentials. Native auth owns refresh-token persistence.
+#[derive(Clone)]
 struct SubscriptionAccess {
     token: String,
     account_id: String,
@@ -360,62 +362,75 @@ impl SubscriptionAccess {
         client: &reqwest::Client,
         model: &str,
     ) -> Result<ModelCapabilities> {
-        let version = catalog_client_version(client).await;
-        static CACHE: OnceLock<tokio::sync::Mutex<Option<CachedModels>>> = OnceLock::new();
-        let mut cache = CACHE
-            .get_or_init(|| tokio::sync::Mutex::new(None))
-            .lock()
-            .await;
         let account = self.identity();
-        if !cache.as_ref().is_some_and(|entry| {
-            entry.account == account
-                && entry.client_version == version
-                && entry.fetched.elapsed() < CATALOG_CACHE_TTL
-        }) {
-            // The catalog gates model visibility on its client protocol version, not Borg releases.
-            // Keep Borg identified by originator; no installed executable is needed.
-            let rejected_token = self.token.clone();
-            let auth_file = self.auth_file.clone();
-            let response = self
-                .send_with_recovery(
-                    client
-                        .get(MODELS_ENDPOINT)
-                        .query(&[("client_version", version.as_str())])
-                        .header("originator", "borg")
-                        .timeout(Duration::from_secs(30)),
-                    &account,
-                    Self::read_with(auth_file, Some(rejected_token)),
-                )
-                .await?;
-            let response = check_subscription_response(response).await?;
-            let mut stream = response.bytes_stream();
-            let mut bytes = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.context("Codex model catalog disconnected")?;
-                ensure!(
-                    bytes.len().saturating_add(chunk.len()) <= MAX_EVENT_BYTES,
-                    "Codex model catalog exceeds size limit"
-                );
-                bytes.extend_from_slice(&chunk);
+        if let Some(entry) = MODELS.lock().await.as_mut()
+            && entry.account == account
+            && let Some(found) = entry.models.iter().find(|entry| entry.slug == model)
+        {
+            // Serve this account's last catalog and revalidate it off the
+            // request path rather than delaying the first token.
+            if entry.fetched.elapsed() >= CATALOG_CACHE_TTL {
+                entry.fetched = Instant::now();
+                let (mut access, client) = (self.clone(), client.clone());
+                tokio::spawn(async move {
+                    if let Err(error) = access.fetch_catalog(&client).await {
+                        tracing::warn!(%error, "Codex model catalog revalidation failed");
+                    }
+                });
             }
-            #[derive(Deserialize)]
-            struct Catalog {
-                models: Vec<ModelCapabilities>,
-            }
-            let catalog: Catalog =
-                serde_json::from_slice(&bytes).context("invalid Codex model catalog")?;
-            *cache = Some(CachedModels {
-                account,
-                client_version: version,
-                fetched: Instant::now(),
-                models: catalog.models,
-            });
+            return Ok(found.clone());
         }
-        cache
+        self.fetch_catalog(client).await?;
+        MODELS
+            .lock()
+            .await
             .as_ref()
             .and_then(|entry| entry.models.iter().find(|entry| entry.slug == model))
             .cloned()
             .context("selected model is not available in this Codex account's catalog")
+    }
+
+    async fn fetch_catalog(&mut self, client: &reqwest::Client) -> Result<()> {
+        let version = catalog_client_version(client).await;
+        let account = self.identity();
+        // The catalog gates model visibility on its client protocol version, not Borg releases.
+        // Keep Borg identified by originator; no installed executable is needed.
+        let rejected_token = self.token.clone();
+        let auth_file = self.auth_file.clone();
+        let response = self
+            .send_with_recovery(
+                client
+                    .get(MODELS_ENDPOINT)
+                    .query(&[("client_version", version.as_str())])
+                    .header("originator", "borg")
+                    .timeout(Duration::from_secs(30)),
+                &account,
+                Self::read_with(auth_file, Some(rejected_token)),
+            )
+            .await?;
+        let response = check_subscription_response(response).await?;
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("Codex model catalog disconnected")?;
+            ensure!(
+                bytes.len().saturating_add(chunk.len()) <= MAX_EVENT_BYTES,
+                "Codex model catalog exceeds size limit"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        #[derive(Deserialize)]
+        struct Catalog {
+            models: Vec<ModelCapabilities>,
+        }
+        let catalog: Catalog =
+            serde_json::from_slice(&bytes).context("invalid Codex model catalog")?;
+        *MODELS.lock().await = Some(CachedModels {
+            account,
+            fetched: Instant::now(),
+            models: catalog.models,
+        });
+        Ok(())
     }
 
     async fn read_with(
