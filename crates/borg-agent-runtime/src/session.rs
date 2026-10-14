@@ -2194,6 +2194,11 @@ async fn run_agent_session_store_kernel_inner(
     }
     let initial_state = store.state(session_id).await?;
     let fresh = initial_state.latest_sequence == 0;
+    // A revert fork inherits its parent's goal but none of its own history.
+    // Goal work there waits for the user's next message instead of starting
+    // a turn the moment the reverted session opens.
+    let mut goal_waits_for_input =
+        !fresh && store.inherited_event_count(session_id).await? == initial_state.latest_sequence;
     // A provider process can die after the durable TurnStarted boundary but
     // before its worker lease is installed. Requeue both unleased and expired
     // in-flight actions before rebuilding the actor's prompt queue. Recovery
@@ -3058,6 +3063,7 @@ async fn run_agent_session_store_kernel_inner(
             // for one pass costs a Ready and hands the command its boundary.
             && deferred_commands.is_empty()
             && watches.yielded().is_none()
+            && !goal_waits_for_input
             && let Some(active_goal) = goal
                 .as_ref()
                 .filter(|goal| goal_allows_automatic_continuation(goal))
@@ -4492,6 +4498,9 @@ async fn run_agent_session_store_kernel_inner(
                 },
             )
             .await?;
+        }
+        if next.is_some() {
+            goal_waits_for_input = false;
         }
         if let Some(prompt) = next.as_ref() {
             reconcile_usage_limit_continuation(

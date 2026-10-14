@@ -30,6 +30,11 @@ Git comparison.
 - Scroll back through a subagent's earlier history, as in the main
   transcript.
 
+### Sessions
+
+- Fix reverting a session with an active `/goal` immediately starting a turn
+  on the goal. The reverted session now waits for your next message.
+
 ## 0.16.2 (2026-10-14)
 
 ### Terminal UI

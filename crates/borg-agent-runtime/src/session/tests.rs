@@ -24062,3 +24062,125 @@ async fn approval_actor_receipt_completes_once_across_clones() {
     assert!(!ack.is_waiting());
     assert_eq!(receiver.await.unwrap(), Err("stale request".into()));
 }
+
+// Reverting forks the session with its active goal. Opening the reverted
+// session must not spend a provider turn on goal work by itself; the user's
+// next message starts the next turn.
+#[tokio::test]
+async fn reverted_session_waits_for_a_message_before_continuing_its_goal() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = Uuid::new_v4();
+    let (scratch, store, mut journal) = runtime_store(parent).await;
+    for event in [
+        SessionEvent::new(parent, 0, SessionEventKind::SessionStarted),
+        SessionEvent::new(
+            parent,
+            0,
+            SessionEventKind::SessionConfigured {
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+                ultrafast: false,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                speed_support: Default::default(),
+            },
+        ),
+        SessionEvent::new(
+            parent,
+            0,
+            SessionEventKind::GoalUpdated {
+                goal: SessionGoal::new("Keep going".to_string(), None),
+            },
+        ),
+    ] {
+        journal.append(event).await.unwrap();
+    }
+    drop(journal);
+    let latest = store.state(parent).await.unwrap().latest_sequence;
+    let fork = Uuid::new_v4();
+    store.fork_before(parent, fork, latest + 1).await.unwrap();
+
+    let seen = RecordedTurns::default();
+    let called = Arc::new(Notify::new());
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        let executor = Arc::new(RecordingExecutor {
+            seen: Arc::clone(&seen),
+            called: Arc::clone(&called),
+        });
+        let store = Arc::clone(&store);
+        async move {
+            run_session_actor(
+                &journal_path,
+                fork,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    ultrafast: None,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                store,
+            )
+            .await
+        }
+    });
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("the reverted session settles");
+        let Some(event) = event else {
+            panic!("actor exited: {:?}", actor.await);
+        };
+        assert!(
+            !matches!(event.kind, SessionEventKind::TurnStarted { .. }),
+            "reverting must not start goal work on its own"
+        );
+        if matches!(
+            event.kind,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    assert!(seen.lock().unwrap().is_empty());
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id: fork,
+            message_id: Uuid::new_v4(),
+            text: "carry on from here".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
+        .await
+        .expect("the user's message starts the next turn");
+    actor.abort();
+    scratch.discard().await;
+}
