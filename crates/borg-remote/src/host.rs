@@ -3001,7 +3001,8 @@ pub async fn register_existing_session(
         "local mirror session does not exist"
     );
     let rejection =
-        persist_launch_metadata_as(&config, store.as_ref(), session_id, &request, None, true).await?;
+        persist_launch_metadata_as(&config, store.as_ref(), session_id, &request, None, true)
+            .await?;
     ensure!(
         rejection.is_none(),
         "local session registration rejected: {}",
