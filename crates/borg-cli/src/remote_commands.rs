@@ -3090,6 +3090,8 @@ async fn run_local_agent_session(
     // Warm one bounded older page immediately after first paint. Upward
     // navigation then reveals already-loaded rows instead of waiting behind
     // unrelated session/team hydration work.
+    let mut child_history_tasks: tokio::task::JoinSet<(Uuid, Result<Vec<SessionEvent>>)> =
+        tokio::task::JoinSet::new();
     let mut history_page_task: Option<tokio::task::JoinHandle<Result<Vec<SessionEvent>>>> =
         (resuming && terminal.is_some() && !history_start_reached).then(|| {
             let before = history_page_before_sequence;
@@ -3891,6 +3893,21 @@ async fn run_local_agent_session(
                     }
                 }
             }
+            Some(child_history) = child_history_tasks.join_next(), if !child_history_tasks.is_empty() => {
+                let Ok((child_id, result)) = child_history else {
+                    continue;
+                };
+                if let Some(terminal) = terminal.as_mut() {
+                    match result {
+                        Ok(events) => terminal.seed_child_history(child_id, &events),
+                        Err(error) => {
+                            tracing::warn!(%child_id, %error, "could not load subagent transcript history");
+                            terminal.defer_child_history(child_id);
+                        }
+                    }
+                    terminal_dirty = true;
+                }
+            }
             history_page_result = async {
                 history_page_task
                     .as_mut()
@@ -3989,6 +4006,12 @@ async fn run_local_agent_session(
                 let terminal = terminal.as_mut().expect("terminal");
                 let interaction_frame = terminal.has_pending_scroll_frame();
                 terminal.advance_scroll_frame();
+                if let Some(child_id) = terminal.take_child_history_request() {
+                    let child_store = Arc::clone(&store);
+                    child_history_tasks.spawn(async move {
+                        (child_id, child_authored_history(child_store.as_ref(), child_id).await)
+                    });
+                }
                 let history_requested = terminal.take_history_page_request();
                 if history_requested && !history_start_reached {
                     terminal.set_history_page_loading(true);
@@ -9461,6 +9484,12 @@ fn seed_terminal_subagent_threads(
     terminal.finish_child_history_hydration();
 }
 
+/// Children seeded at resume, and the event tail each child view loads. A
+/// subagent can author tens of thousands of events; replaying whole journals
+/// for a large team froze resume for minutes.
+const EAGER_CHILD_HISTORY_LIMIT: usize = 8;
+const CHILD_HISTORY_TAIL_EVENTS: usize = 1024;
+
 async fn load_subagent_thread_state(
     store: &dyn SessionStore,
     sessions_dir: &Path,
@@ -9477,9 +9506,17 @@ async fn load_subagent_thread_state(
     // bounded concurrency instead of one round trip at a time: a session with
     // two dozen subagents otherwise serialises dozens of store queries behind
     // each other before the team panel can leave its hydrating state.
+    // Resume work must not grow with the team: only the most recently active
+    // working children are seeded. Every other child loads its tail on focus.
+    let mut working: Vec<_> = team_snapshots
+        .iter()
+        .filter(|agent| subagent_is_working(agent.status))
+        .collect();
+    working.sort_by_key(|agent| std::cmp::Reverse(agent.updated_at));
     let child_histories = futures_util::stream::iter(
-        team_snapshots
+        working
             .iter()
+            .take(EAGER_CHILD_HISTORY_LIMIT)
             .map(|agent| agent.session_id)
             .collect::<Vec<_>>(),
     )
@@ -9601,9 +9638,10 @@ async fn child_authored_history(
 ) -> Result<Vec<SessionEvent>> {
     let inherited = store.inherited_event_count(child_id).await?;
     let latest = store.state(child_id).await?.latest_sequence;
-    let limit = usize::try_from(latest.saturating_sub(inherited))
-        .context("child history exceeds addressable event count")?;
-    store.events_after(child_id, inherited, limit).await
+    let after = inherited.max(latest.saturating_sub(CHILD_HISTORY_TAIL_EVENTS as u64));
+    store
+        .events_after(child_id, after, CHILD_HISTORY_TAIL_EVENTS)
+        .await
 }
 
 async fn recent_sessions_summary(

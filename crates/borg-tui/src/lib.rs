@@ -1639,6 +1639,9 @@ pub struct BorgTerminal {
     child_transcripts: HashMap<Uuid, Transcript>,
     child_unhydrated_events: HashMap<Uuid, Vec<SessionEvent>>,
     hydrated_children: HashSet<Uuid>,
+    /// Roster children whose history loads only when first focused, so
+    /// resume work does not grow with the number of subagents.
+    deferred_child_histories: HashSet<Uuid>,
     child_history_hydration_complete: bool,
     child_queued_prompts: HashMap<Uuid, Vec<PendingPromptProjection>>,
     child_requeue_cursors: HashMap<Uuid, Option<usize>>,
@@ -3080,6 +3083,7 @@ impl BorgTerminal {
             child_transcripts: HashMap::new(),
             child_unhydrated_events: HashMap::new(),
             hydrated_children: HashSet::new(),
+            deferred_child_histories: HashSet::new(),
             child_history_hydration_complete: false,
             child_queued_prompts: HashMap::new(),
             child_requeue_cursors: HashMap::new(),
@@ -3298,6 +3302,7 @@ impl BorgTerminal {
         self.child_transcripts.clear();
         self.child_unhydrated_events.clear();
         self.hydrated_children.clear();
+        self.deferred_child_histories.clear();
         self.child_history_hydration_complete = false;
         self.child_queued_prompts.clear();
         self.child_statuses.clear();
@@ -4595,7 +4600,10 @@ impl BorgTerminal {
             status,
             observed_at,
         );
-        if !self.hydrated_children.contains(&child_id) && self.child_history_hydration_complete {
+        if !self.hydrated_children.contains(&child_id)
+            && self.child_history_hydration_complete
+            && !self.deferred_child_histories.contains(&child_id)
+        {
             self.hydrated_children.insert(child_id);
         }
         let Some(child_event) = child_event else {
@@ -5000,11 +5008,41 @@ impl BorgTerminal {
     /// Finish the one-time resumed-team hydration pass. Children discovered
     /// after this point are live-only and do not need an authoritative history
     /// query before their nested events can be projected directly.
+    /// Roster children that were not seeded keep buffering live events until
+    /// their history is requested on focus.
     pub fn finish_child_history_hydration(&mut self) {
         self.child_history_hydration_complete = true;
-        self.hydrated_children
-            .extend(self.child_unhydrated_events.keys().copied());
-        self.child_unhydrated_events.clear();
+        let roster = &self
+            .director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript)
+            .subagent_snapshots;
+        self.deferred_child_histories = roster
+            .keys()
+            .filter(|child_id| !self.hydrated_children.contains(child_id))
+            .copied()
+            .collect();
+        let deferred = &self.deferred_child_histories;
+        self.hydrated_children.extend(
+            self.child_unhydrated_events
+                .keys()
+                .filter(|child_id| !deferred.contains(child_id)),
+        );
+        self.child_unhydrated_events
+            .retain(|child_id, _| deferred.contains(child_id));
+    }
+
+    /// The focused child whose deferred history should load now, at most once.
+    pub fn take_child_history_request(&mut self) -> Option<Uuid> {
+        self.focused_child
+            .filter(|child_id| self.deferred_child_histories.remove(child_id))
+    }
+
+    /// Retry a failed deferred load the next time this child is focused.
+    pub fn defer_child_history(&mut self, child_id: Uuid) {
+        if !self.hydrated_children.contains(&child_id) {
+            self.deferred_child_histories.insert(child_id);
+        }
     }
 
     /// The children this view currently tracks, for resyncing their status

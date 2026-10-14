@@ -21228,3 +21228,76 @@ async fn interrupted_outcomes_render_identically_after_journal_replay() {
     );
     assert_eq!(render(&replay), rendered);
 }
+
+// Resume seeds only a bounded set of children. Every other roster child must
+// load its history exactly once on focus, keeping live output that arrived
+// before that load.
+#[tokio::test]
+#[ignore = "requires a PTY; run under script"]
+async fn deferred_child_history_loads_once_on_focus_and_keeps_live_events() {
+    let root = Uuid::new_v4();
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        root,
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    let now = Utc::now();
+    let child = SubagentSnapshot {
+        session_id: Uuid::new_v4(),
+        parent_session_id: root,
+        task_name: "/root/scout".into(),
+        status: SubagentStatus::Running,
+        provider: CodingProvider::Claude,
+        model: None,
+        effort: None,
+        fast: false,
+        ultrafast: false,
+        cwd: directory.path().to_path_buf(),
+        created_at: now,
+        updated_at: now,
+        detail: None,
+        final_text: None,
+        usage: Default::default(),
+        interrupted_by: None,
+    };
+    let message = |sequence, message_id, text: &str| {
+        SessionEvent::new(
+            child.session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::Assistant,
+                text: text.into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        )
+    };
+    terminal.seed_team_roster(std::slice::from_ref(&child));
+    terminal.finish_child_history_hydration();
+    let (older_id, live_id) = (Uuid::new_v4(), Uuid::new_v4());
+    let live = message(2, live_id, "live after resume");
+    terminal.apply_session_event(&SessionEvent::new(
+        root,
+        1,
+        SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Updated,
+            agent: child.clone(),
+            event: Some(Box::new(live)),
+        },
+    ));
+    assert_eq!(terminal.take_child_history_request(), None);
+    terminal.focus_child_transcript(child.session_id);
+    assert_eq!(
+        terminal.take_child_history_request(),
+        Some(child.session_id)
+    );
+    assert_eq!(terminal.take_child_history_request(), None);
+    terminal.seed_child_history(child.session_id, &[message(1, older_id, "older history")]);
+    assert!(terminal.transcript.messages.contains_key(&older_id));
+    assert!(terminal.transcript.messages.contains_key(&live_id));
+}
