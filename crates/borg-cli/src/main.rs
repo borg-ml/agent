@@ -50,6 +50,8 @@ fn main() -> Result<()> {
     {
         return borg_remote::run_linux_helper();
     }
+    // ring and aws-lc-rs are both linked, so rustls cannot pick a provider itself.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     configure_allocator();
     spawn_allocator_trim();
     tokio::runtime::Builder::new_multi_thread()

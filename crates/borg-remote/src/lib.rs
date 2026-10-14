@@ -23,7 +23,7 @@ pub use command::{
     execute_workspace_command_with_limits,
 };
 pub use host::{
-    DirectListenerConfig, HostConfig, HostExecutorFactory, enroll_host, login_provider,
+    DirectListenerConfig, HostConfig, HostExecutorFactory, enroll_host, host_launch_is_local_mirror, login_provider,
     login_provider_with_output, mirror_local_session, probe_capabilities,
     probe_provider_admission_capabilities, probe_provider_capabilities,
     provider_credentials_present, provider_subscription_credentials_present,

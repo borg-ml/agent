@@ -286,6 +286,15 @@ struct PersistedLaunchMetadata {
     attachment: Option<WorkspaceAttachment>,
 }
 
+/// True when the stored launch was registered by a local terminal owner, so
+/// the session is still locally owned and may be resumed or attached.
+pub fn host_launch_is_local_mirror(metadata: &serde_json::Value) -> bool {
+    metadata
+        .get("local_mirror")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 pub async fn enroll_host(
     server: &str,
     token: &str,
@@ -2992,7 +3001,7 @@ pub async fn register_existing_session(
         "local mirror session does not exist"
     );
     let rejection =
-        persist_launch_metadata(&config, store.as_ref(), session_id, &request, None).await?;
+        persist_launch_metadata_as(&config, store.as_ref(), session_id, &request, None, true).await?;
     ensure!(
         rejection.is_none(),
         "local session registration rejected: {}",
@@ -4437,6 +4446,17 @@ async fn persist_launch_metadata(
     request: &LaunchSession,
     attachment: Option<&WorkspaceAttachment>,
 ) -> Result<Option<String>> {
+    persist_launch_metadata_as(config, store, session_id, request, attachment, false).await
+}
+
+async fn persist_launch_metadata_as(
+    config: &HostConfig,
+    store: &dyn SessionStore,
+    session_id: Uuid,
+    request: &LaunchSession,
+    attachment: Option<&WorkspaceAttachment>,
+    local_mirror: bool,
+) -> Result<Option<String>> {
     if let Some(identity) = attachment.and_then(|attachment| attachment.host_identity.as_ref()) {
         ensure!(
             identity.host_id == config.host_id,
@@ -4460,6 +4480,14 @@ async fn persist_launch_metadata(
             .map(|error| error.to_string())
     };
     let existing = store.load_host_launch_metadata(session_id).await?;
+    // Admitted metadata is immutable, so rows written before the marker existed
+    // keep their original shape.
+    if local_mirror && existing.as_ref().is_none_or(host_launch_is_local_mirror) {
+        // A local terminal owner registered its own session; the relay host
+        // only mirrors it and never takes the writer.
+        metadata["local_mirror"] = true.into();
+    }
+    let bytes = serde_json::to_vec(&metadata)?;
     if let Some(existing) = existing.as_ref()
         && let StoredHostLaunch::Rejected { rejected_launch } =
             serde_json::from_value::<StoredHostLaunch>(existing.clone())?

@@ -22,11 +22,12 @@ use borg_remote::{
     SessionConfigAction, SessionEvent, SessionEventKind, SessionGoal, SessionInterrupt,
     SessionState, SessionStatus, SessionStore, SessionWriterLease, SpawnSubagent, SubagentAction,
     SubagentSnapshot, SubagentStatus, TodoAction, default_host_config_path, enroll_host,
-    force_terminate_obsolete_local_session_owner, local_session_owner_is_active,
-    local_session_owner_uses_current_binary, login_provider, mirror_local_session,
-    obsolete_local_session_owner_pid, probe_capabilities, probe_provider_admission_capabilities,
-    provider_credentials_present, run_agent_session_with_priority_commands, run_attached_session,
-    run_host_with_executor_factory, send_local_session_command, session_control_socket_path,
+    force_terminate_obsolete_local_session_owner, host_launch_is_local_mirror,
+    local_session_owner_is_active, local_session_owner_uses_current_binary, login_provider,
+    mirror_local_session, obsolete_local_session_owner_pid, probe_capabilities,
+    probe_provider_admission_capabilities, provider_credentials_present,
+    run_agent_session_with_priority_commands, run_attached_session, run_host_with_executor_factory,
+    send_local_session_command, session_control_socket_path,
 };
 use chrono::{DateTime, Local, TimeZone, Utc};
 use futures_util::{FutureExt, StreamExt};
@@ -1380,6 +1381,15 @@ fn should_use_detached_session_host(args: &LocalAgentCliArgs) -> bool {
         && args.session_host.is_none()
 }
 
+/// A relay-launched session belongs to the background host; a launch that a
+/// local terminal owner registered for mirroring does not.
+async fn owned_by_remote_host(store: &dyn SessionStore, session_id: Uuid) -> Result<bool> {
+    Ok(store
+        .load_host_launch_metadata(session_id)
+        .await?
+        .is_some_and(|metadata| !host_launch_is_local_mirror(&metadata)))
+}
+
 // Every caller runs on the interactive launch path before the first frame, so
 // this must not re-verify a schema that is already current: the extra work
 // would stall the menu before it can draw.
@@ -1452,7 +1462,7 @@ async fn ensure_detached_session_host(
 
     let store = open_local_session_store().await?;
     anyhow::ensure!(
-        store.load_host_launch_metadata(session_id).await?.is_none(),
+        !owned_by_remote_host(store.as_ref(), session_id).await?,
         "this session is owned by the background Borg remote host"
     );
 
@@ -1551,7 +1561,7 @@ pub(crate) async fn update_local_workers(force: bool) -> Result<()> {
             "session {id} has no durable journal; refusing handoff"
         );
         anyhow::ensure!(
-            store.load_host_launch_metadata(id).await?.is_none(),
+            !owned_by_remote_host(store.as_ref(), id).await?,
             "session {id} belongs to a remote host; refusing local handoff"
         );
         let socket = session_control_socket_path(&sessions_dir, id);
@@ -2237,10 +2247,7 @@ async fn run_local_agent_session(
     crash_context.set_session_id(session_id);
     let lock_path = sessions_dir.join(format!("{session_id}.lock"));
     let control_socket_path = session_control_socket_path(&sessions_dir, session_id);
-    let remote_launch_present = durable_store
-        .load_host_launch_metadata(session_id)
-        .await?
-        .is_some();
+    let remote_launch_present = owned_by_remote_host(durable_store.as_ref(), session_id).await?;
     let writer = SessionWriterLease::try_acquire(&lock_path)?;
     let session_access = if writer.is_some() {
         LocalSessionAccess::Owned
@@ -7605,11 +7612,7 @@ async fn run_local_agent_session(
                                                 &target,
                                             )
                                             .await?;
-                                            if lookup_store
-                                                .load_host_launch_metadata(target)
-                                                .await?
-                                                .is_some()
-                                            {
+                                            if owned_by_remote_host(lookup_store.as_ref(), target).await? {
                                                 anyhow::bail!(
                                                     "this session is still owned by the background Borg remote host; reopen it from the connected remote chat instead of starting a second local writer"
                                                 );
@@ -8933,7 +8936,7 @@ async fn resolve_resume_switch(
     status: SessionStatus,
 ) -> Result<(Uuid, SessionSwitch)> {
     let target = resolve_resume_target(sessions_dir, store, current, value).await?;
-    if store.load_host_launch_metadata(target).await?.is_some() {
+    if owned_by_remote_host(store, target).await? {
         anyhow::bail!(
             "this session is still owned by the background Borg remote host; reopen it from the connected remote chat instead of starting a second local writer"
         );
