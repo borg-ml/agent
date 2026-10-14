@@ -5,6 +5,31 @@ Git comparison.
 
 ## Unreleased (since 0.16.2)
 
+### Providers
+
+- Fix "Claude refresh lock busy" and "Claude account check temporarily
+  throttled (HTTP 429)" errors interrupting turns. Each Claude token's account
+  is now verified once per process instead of five to seven times per turn,
+  and the refresh lock is no longer held during that check.
+- Keep using a still-valid Claude token while another process refreshes it or
+  a proactive refresh fails, and recover refresh locks left by a crashed
+  process after 60 seconds instead of requiring manual recovery. This matches
+  Claude Code.
+- Restore fast time to first token on Claude subscriptions: request
+  preparation dropped from about 2.5 s per turn to under 1 ms once the session
+  is warm. Claude bootstrap and policy data and the Codex model catalog now
+  refresh in the background instead of delaying a turn.
+- Verify the subscription and load model metadata when a session starts, so
+  the first turn does not wait on account checks either.
+
+### Terminal UI
+
+- Fix resume freezing for minutes, and using gigabytes of memory, in sessions
+  with many subagents. Resume now loads only a few active subagents. Other
+  subagents load their recent history when you first open them.
+- Scroll back through a subagent's earlier history, as in the main
+  transcript.
+
 ## 0.16.2 (2026-10-14)
 
 ### Terminal UI
