@@ -321,6 +321,7 @@ async fn verified_access(
 ) -> Result<SubscriptionAccess> {
     let mut token = token;
     let mut expected = expected.cloned();
+    let enforce_saved = expected.is_some();
     for _ in 0..3 {
         // A bearer belongs to one account; re-fetching its profile on every turn
         // only spends the throttled account-endpoint budget and delays the turn.
@@ -335,7 +336,9 @@ async fn verified_access(
         expected.get_or_insert_with(|| profile.identity.clone());
         let lock = authority.write_lock().await?;
         let mut latest = authority.load().await?;
-        check_saved_identity(&latest, &profile.identity)?;
+        if enforce_saved {
+            check_saved_identity(&latest, &profile.identity)?;
+        }
         let current = OAuthToken::from_document(&latest)?;
         if current.bearer() != token.bearer() {
             drop(lock);
@@ -385,10 +388,11 @@ fn adopt_binding(document: &Value, expected: &mut Option<AccountIdentity>) -> Re
             account_uuid: secret(&saved["accountUuid"], "invalid saved Claude identity")?,
             organization_uuid: secret(&saved["organizationUuid"], "invalid saved Claude identity")?,
         };
+        // A stored binding only constrains callers that already carry an identity
+        // (a live session). Discovery adopts whatever account the token belongs to.
         if let Some(expected) = expected {
             expected.check(&identity)?;
         }
-        *expected = Some(identity);
     }
     Ok(())
 }
