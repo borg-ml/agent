@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.16.1)
 
+### Terminal UI
+
+- Fix a wall of "done · waiting for input" agent cards appearing at the end of
+  the transcript after resuming a large team or recovering from a UI stall:
+  child metadata now refreshes existing cards instead of adding one per
+  settled child.
+
 ## 0.16.1 (2026-10-14)
 
 ### Remote

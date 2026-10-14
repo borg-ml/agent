@@ -3922,19 +3922,10 @@ impl TranscriptCore {
                 *body = None;
                 *row_state = state;
             }
-        } else {
-            let index = self.order.len();
-            self.subagent_entries.insert(child_id, index);
-            self.order.push(TranscriptEntry::Action {
-                kind: TranscriptActionKind::Agent,
-                label: "Agent".into(),
-                detail: format!("{} · {detail}", child.task_name),
-                body: None,
-                time: time.clone(),
-                state,
-                expanded: false,
-            });
         }
+        // Metadata only refreshes a card the transcript already has. Creating
+        // one here would append a card for every settled child at the tail
+        // whenever metadata hydrates after a stall.
         self.child_meta_refs.insert(
             child_id,
             ChildMetaReference {
