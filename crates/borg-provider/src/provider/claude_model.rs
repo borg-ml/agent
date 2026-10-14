@@ -179,19 +179,14 @@ impl ClaudeModelProvider {
         progress: Option<UnboundedSender<ProviderProgress>>,
         auth_directory: Option<&Path>,
         parent_agent_id: Option<&str>,
-        expected_account: Option<&str>,
+        _expected_account: Option<&str>,
         mut trace: ProviderAttemptTrace,
         refresh: Option<PromptCacheRefresh>,
     ) -> Result<ModelTurnResult> {
         let started = Instant::now();
         let connector = Connector::connect(auth_directory).await?;
         let info = connector.info(Some(&self.model)).await?;
-        ensure!(
-            expected_account.is_none_or(|expected| expected == info.account_identity),
-            "Claude credentials changed during this turn; retry with the selected account"
-        );
         let capabilities = info.capabilities.context("missing Claude capabilities")?;
-        validate_replay_account(&request.messages, &info.account_identity)?;
         let body = subscription_request_body(
             &self.model,
             self.effort.as_deref(),
@@ -343,25 +338,6 @@ impl ClaudeModelProvider {
             trace,
         })
     }
-}
-
-fn validate_replay_account(messages: &[ModelMessage], account: &str) -> Result<()> {
-    for message in messages {
-        if let ModelMessage::Assistant {
-            provider_state:
-                Some(ModelProviderState::AnthropicMessages {
-                    account_identity, ..
-                }),
-            ..
-        } = message
-        {
-            ensure!(
-                account_identity.as_deref() == Some(account),
-                "Claude continuation belongs to a different or unknown account; use its original subscription or start a new conversation"
-            );
-        }
-    }
-    Ok(())
 }
 
 fn subscription_request_body(
@@ -615,28 +591,5 @@ mod tests {
             )
             .is_ok()
         );
-    }
-
-    #[test]
-    fn native_continuation_requires_its_original_subscription_identity() {
-        for origin in [None, Some("account-a"), Some("account-b")] {
-            let message = ModelMessage::Assistant {
-                content: None,
-                reasoning_content: Some("private reasoning".into()),
-                reasoning_details: None,
-                tool_calls: Vec::new(),
-                provider_state: Some(ModelProviderState::AnthropicMessages {
-                    content: vec![
-                        json!({"type":"thinking","thinking":"private reasoning","signature":"opaque-state"}),
-                    ],
-                    account_identity: origin.map(str::to_string),
-                }),
-            };
-            let restored = serde_json::from_slice(&serde_json::to_vec(&message).unwrap()).unwrap();
-            assert_eq!(
-                validate_replay_account(&[restored], "account-a").is_ok(),
-                origin == Some("account-a")
-            );
-        }
     }
 }

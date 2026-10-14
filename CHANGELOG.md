@@ -11,6 +11,9 @@ Git comparison.
   blocking a valid login after switching Claude accounts or organizations.
   Connecting now adopts the account the current token belongs to instead of
   failing on a stale saved binding.
+- Allow continuing Claude conversations on a different account or organization
+  than they started on, for example after hitting a usage limit. Borg no
+  longer refuses to replay provider state across accounts.
 
 ## 0.16.4 (2026-10-14)
 
