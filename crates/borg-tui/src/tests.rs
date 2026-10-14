@@ -21230,11 +21230,11 @@ async fn interrupted_outcomes_render_identically_after_journal_replay() {
 }
 
 // Resume seeds only a bounded set of children. Every other roster child must
-// load its history exactly once on focus, keeping live output that arrived
-// before that load.
+// load its history exactly once on focus, and paging back must keep live
+// output that arrived before and after that load.
 #[tokio::test]
 #[ignore = "requires a PTY; run under script"]
-async fn deferred_child_history_loads_once_on_focus_and_keeps_live_events() {
+async fn deferred_child_history_loads_on_focus_pages_back_and_keeps_live_events() {
     let root = Uuid::new_v4();
     let directory = tempfile::tempdir().unwrap();
     let mut terminal = BorgTerminal::enter(
@@ -21280,7 +21280,7 @@ async fn deferred_child_history_loads_once_on_focus_and_keeps_live_events() {
     terminal.seed_team_roster(std::slice::from_ref(&child));
     terminal.finish_child_history_hydration();
     let (older_id, live_id) = (Uuid::new_v4(), Uuid::new_v4());
-    let live = message(2, live_id, "live after resume");
+    let live = message(3, live_id, "live after resume");
     terminal.apply_session_event(&SessionEvent::new(
         root,
         1,
@@ -21297,7 +21297,22 @@ async fn deferred_child_history_loads_once_on_focus_and_keeps_live_events() {
         Some(child.session_id)
     );
     assert_eq!(terminal.take_child_history_request(), None);
-    terminal.seed_child_history(child.session_id, &[message(1, older_id, "older history")]);
+    terminal.seed_child_history(child.session_id, &[message(2, older_id, "older history")]);
     assert!(terminal.transcript.messages.contains_key(&older_id));
     assert!(terminal.transcript.messages.contains_key(&live_id));
+    // Scrolling back prepends an older page without dropping live rows.
+    let (oldest_id, later_id) = (Uuid::new_v4(), Uuid::new_v4());
+    terminal.apply_session_event(&SessionEvent::new(
+        root,
+        2,
+        SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Updated,
+            agent: child.clone(),
+            event: Some(Box::new(message(4, later_id, "live after load"))),
+        },
+    ));
+    terminal.prepend_child_history(child.session_id, vec![message(1, oldest_id, "oldest page")]);
+    for id in [oldest_id, older_id, live_id, later_id] {
+        assert!(terminal.transcript.messages.contains_key(&id));
+    }
 }

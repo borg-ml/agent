@@ -3092,6 +3092,8 @@ async fn run_local_agent_session(
     // unrelated session/team hydration work.
     let mut child_history_tasks: tokio::task::JoinSet<(Uuid, Result<Vec<SessionEvent>>)> =
         tokio::task::JoinSet::new();
+    let mut child_page_task: Option<tokio::task::JoinHandle<(Uuid, Result<Vec<SessionEvent>>)>> =
+        None;
     let mut history_page_task: Option<tokio::task::JoinHandle<Result<Vec<SessionEvent>>>> =
         (resuming && terminal.is_some() && !history_start_reached).then(|| {
             let before = history_page_before_sequence;
@@ -3893,6 +3895,26 @@ async fn run_local_agent_session(
                     }
                 }
             }
+            child_page = async {
+                child_page_task
+                    .as_mut()
+                    .expect("child-page task branch is guarded")
+                    .await
+            }, if child_page_task.is_some()
+                && terminal.as_ref().is_none_or(|terminal| !terminal.is_inspecting_action()) => {
+                child_page_task = None;
+                if let Some(terminal) = terminal.as_mut() {
+                    terminal.set_history_page_loading(false);
+                    match child_page {
+                        Ok((child_id, Ok(older))) => terminal.prepend_child_history(child_id, older),
+                        Ok((child_id, Err(error))) => {
+                            tracing::warn!(%child_id, %error, "could not load an older subagent page");
+                        }
+                        Err(error) => tracing::warn!(%error, "older subagent page task failed"),
+                    }
+                    terminal_dirty = true;
+                }
+            }
             Some(child_history) = child_history_tasks.join_next(), if !child_history_tasks.is_empty() => {
                 let Ok((child_id, result)) = child_history else {
                     continue;
@@ -4011,6 +4033,18 @@ async fn run_local_agent_session(
                     child_history_tasks.spawn(async move {
                         (child_id, child_authored_history(child_store.as_ref(), child_id).await)
                     });
+                }
+                if child_page_task.is_none()
+                    && let Some((child_id, before)) = terminal.take_child_history_page_request()
+                {
+                    terminal.set_history_page_loading(true);
+                    let page_store = Arc::clone(&store);
+                    child_page_task = Some(tokio::spawn(async move {
+                        (
+                            child_id,
+                            older_child_history(page_store.as_ref(), child_id, before).await,
+                        )
+                    }));
                 }
                 let history_requested = terminal.take_history_page_request();
                 if history_requested && !history_start_reached {
@@ -9387,6 +9421,29 @@ async fn older_tui_history(
     let limit = older_tui_history_limit(before_sequence, after_sequence);
     Ok(store
         .events_after(session_id, after_sequence, limit)
+        .await?
+        .into_iter()
+        .filter(|event| event.sequence < before_sequence)
+        .collect())
+}
+
+/// One older page of a child's own events; inherited parent events are the
+/// director's history, not the child's.
+async fn older_child_history(
+    store: &dyn SessionStore,
+    child_id: Uuid,
+    before_sequence: u64,
+) -> Result<Vec<SessionEvent>> {
+    let inherited = store.inherited_event_count(child_id).await?;
+    let after = inherited.max(before_sequence.saturating_sub(CHILD_HISTORY_TAIL_EVENTS as u64 + 1));
+    let limit = usize::try_from(before_sequence.saturating_sub(after.saturating_add(1)))
+        .unwrap_or(CHILD_HISTORY_TAIL_EVENTS)
+        .min(CHILD_HISTORY_TAIL_EVENTS);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(store
+        .events_after(child_id, after, limit)
         .await?
         .into_iter()
         .filter(|event| event.sequence < before_sequence)

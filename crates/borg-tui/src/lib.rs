@@ -1642,6 +1642,10 @@ pub struct BorgTerminal {
     /// Roster children whose history loads only when first focused, so
     /// resume work does not grow with the number of subagents.
     deferred_child_histories: HashSet<Uuid>,
+    /// Events behind each loaded child transcript, and the oldest sequence
+    /// loaded, so older pages can be prepended and the view rebuilt.
+    child_history_events: HashMap<Uuid, (u64, Vec<SessionEvent>)>,
+    child_history_start_reached: HashSet<Uuid>,
     child_history_hydration_complete: bool,
     child_queued_prompts: HashMap<Uuid, Vec<PendingPromptProjection>>,
     child_requeue_cursors: HashMap<Uuid, Option<usize>>,
@@ -3084,6 +3088,8 @@ impl BorgTerminal {
             child_unhydrated_events: HashMap::new(),
             hydrated_children: HashSet::new(),
             deferred_child_histories: HashSet::new(),
+            child_history_events: HashMap::new(),
+            child_history_start_reached: HashSet::new(),
             child_history_hydration_complete: false,
             child_queued_prompts: HashMap::new(),
             child_requeue_cursors: HashMap::new(),
@@ -3303,6 +3309,8 @@ impl BorgTerminal {
         self.child_unhydrated_events.clear();
         self.hydrated_children.clear();
         self.deferred_child_histories.clear();
+        self.child_history_events.clear();
+        self.child_history_start_reached.clear();
         self.child_history_hydration_complete = false;
         self.child_queued_prompts.clear();
         self.child_statuses.clear();
@@ -4620,16 +4628,18 @@ impl BorgTerminal {
         {
             return false;
         }
-        if !self.hydrated_children.contains(&child_id)
-            && !matches!(
-                child_event.kind,
-                SessionEventKind::MessageDelta { .. } | SessionEventKind::ReasoningTextDelta { .. }
-            )
-        {
-            self.child_unhydrated_events
-                .entry(child_id)
-                .or_default()
-                .push(child_event.as_ref().clone());
+        if !matches!(
+            child_event.kind,
+            SessionEventKind::MessageDelta { .. } | SessionEventKind::ReasoningTextDelta { .. }
+        ) {
+            if !self.hydrated_children.contains(&child_id) {
+                self.child_unhydrated_events
+                    .entry(child_id)
+                    .or_default()
+                    .push(child_event.as_ref().clone());
+            } else if let Some((_, events)) = self.child_history_events.get_mut(&child_id) {
+                events.push(child_event.as_ref().clone());
+            }
         }
         if matches!(
             &child_event.kind,
@@ -4867,6 +4877,20 @@ impl BorgTerminal {
             .remove(&child_id)
             .unwrap_or_default();
         let events = merge_child_history(events, buffered);
+        match events
+            .iter()
+            .map(|event| event.sequence)
+            .filter(|sequence| *sequence > 0)
+            .min()
+        {
+            Some(start) => {
+                self.child_history_events
+                    .insert(child_id, (start, events.clone()));
+            }
+            None => {
+                self.child_history_start_reached.insert(child_id);
+            }
+        }
         let previous_plan = if self.focused_child == Some(child_id) {
             Some(&self.transcript)
         } else {
@@ -5036,6 +5060,49 @@ impl BorgTerminal {
     pub fn take_child_history_request(&mut self) -> Option<Uuid> {
         self.focused_child
             .filter(|child_id| self.deferred_child_histories.remove(child_id))
+    }
+
+    /// The focused child and the oldest sequence it has loaded, once the user
+    /// scrolls to the top of its transcript and older events may exist.
+    pub fn take_child_history_page_request(&mut self) -> Option<(Uuid, u64)> {
+        let child_id = self.focused_child?;
+        // Rebuilding renumbers entries; never do it under an open inspector.
+        if self.focused_tool.is_some()
+            || self.history_page_loading
+            || self.child_history_start_reached.contains(&child_id)
+        {
+            return None;
+        }
+        let start = self.child_history_events.get(&child_id)?.0;
+        let viewport_height = self.transcript_viewport_area.map_or(12, |area| area.height);
+        if !should_load_history_page(
+            self.history_page_requested,
+            self.scroll_from_bottom,
+            self.transcript_scroll_max,
+            usize::from(viewport_height),
+        ) {
+            return None;
+        }
+        self.history_page_requested = false;
+        Some((child_id, start))
+    }
+
+    /// Prepend an older page to a child transcript, keeping the reader's place.
+    pub fn prepend_child_history(&mut self, child_id: Uuid, older: Vec<SessionEvent>) {
+        if older.is_empty() {
+            self.child_history_start_reached.insert(child_id);
+            return;
+        }
+        let Some((_, current)) = self.child_history_events.remove(&child_id) else {
+            return;
+        };
+        let previous_height = self.rendered_transcript_height;
+        let mut events = older;
+        events.extend(current);
+        self.seed_child_history(child_id, &events);
+        if self.focused_child == Some(child_id) {
+            self.pending_scroll_anchor_height = Some(previous_height);
+        }
     }
 
     /// Retry a failed deferred load the next time this child is focused.
