@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.16.3)
 
+### Subagents
+
+- Fix `wait_agent` and subagent counts treating ready children that are parked
+  on a watcher as idle. They now count as running work.
+
+### Security
+
+- Update rustls to 0.23.46 for RUSTSEC-2026-0346 through RUSTSEC-2026-0349.
+
 ## 0.16.3 (2026-10-14)
 
 ### Providers
