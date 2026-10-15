@@ -601,7 +601,11 @@ impl LaneStore {
     /// Release every service lease and restart barrier whose owning service
     /// supervisor is provably gone (see `claim_owner_gone`): a Granted one
     /// whose lock is free ends Finished, and one that recovery quarantined
-    /// (it could not prove the owner gone then) is un-quarantined. A claim
+    /// (it could not prove the owner gone then) is un-quarantined. An
+    /// ordinary job that recovery quarantined is un-quarantined once its
+    /// workload is provably gone (see `job_workload_gone`); before this, such
+    /// a job kept every key it requested (including shared host slots)
+    /// quarantined forever, blocking every later build on the host. A claim
     /// whose owner may still run is left as it is (fail closed). With
     /// `dry_run` only the report is returned. Runs under the journal lock.
     fn release_dead_service_claims(
@@ -610,12 +614,13 @@ impl LaneStore {
         dry_run: bool,
     ) -> Result<Vec<(Uuid, String)>> {
         let mut actions = Vec::new();
-        for row in state
-            .records
-            .iter_mut()
-            .filter(|r| r.restart_barrier || r.service_lease)
-        {
-            let granted = matches!(row.state, TicketState::Granted(_));
+        for row in state.records.iter_mut().filter(|r| {
+            r.restart_barrier
+                || r.service_lease
+                || (r.quarantined && matches!(r.state, TicketState::Finished))
+        }) {
+            let job = !row.restart_barrier && !row.service_lease;
+            let granted = !job && matches!(row.state, TicketState::Granted(_));
             let quarantined = row.quarantined && matches!(row.state, TicketState::Finished);
             if !granted && !quarantined {
                 continue;
@@ -630,10 +635,17 @@ impl LaneStore {
                     Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
                 }
             }
-            let Some(proof) = claim_owner_gone(row) else {
+            let proof = if job {
+                job_workload_gone(row)
+            } else {
+                claim_owner_gone(row)
+            };
+            let Some(proof) = proof else {
                 continue;
             };
-            let kind = if row.restart_barrier {
+            let kind = if job {
+                "job quarantine"
+            } else if row.restart_barrier {
                 "restart barrier"
             } else {
                 "service lease"
@@ -1739,6 +1751,32 @@ pub(crate) fn key_label(key: &ResourceKey) -> String {
 /// the supervisor pid must be gone or name another process: a different
 /// start time, or, for a claim recorded without one (an older binary), a
 /// process that is not a supervisor of the claim's service.
+/// Proof that a quarantined ordinary job's workload is gone: its recorded
+/// scope cgroup (when it had one) is empty or no longer exists, and its
+/// recorded workload process (when known) has exited or its PID now names
+/// another process. With neither recorded nothing proves it gone (fail
+/// closed).
+fn job_workload_gone(row: &LaneRecord) -> Option<String> {
+    let cgroup = row.scope_cgroup.as_deref().filter(|c| !c.is_empty());
+    let workload = row.workload_pid.zip(row.workload_start_ticks);
+    if cgroup.is_none() && workload.is_none() {
+        return None;
+    }
+    if cgroup.is_some_and(cgroup_populated) {
+        return None;
+    }
+    if let Some((pid, ticks)) = workload {
+        if proc_start_ticks(pid) == Some(ticks) {
+            return None;
+        }
+    }
+    Some(format!(
+        "job scope {} is empty and workload pid {} is gone",
+        cgroup.unwrap_or("-"),
+        workload.map_or_else(|| "-".to_owned(), |(pid, _)| pid.to_string())
+    ))
+}
+
 fn claim_owner_gone(row: &LaneRecord) -> Option<String> {
     if let Some(cgroup) = &row.owner_cgroup {
         return (!cgroup_populated(cgroup)).then(|| format!("unit cgroup {cgroup} is empty"));
@@ -3791,6 +3829,50 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn recovery_releases_a_quarantined_job_whose_workload_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        // An orphan whose scope unit is gone and whose workload PID is free.
+        let mut orphan = record(
+            1,
+            TicketState::Finished,
+            vec![resource("a", Access::Exclusive)],
+        );
+        orphan.quarantined = true;
+        orphan.scope_cgroup = Some("/borg-lane-test-no-such-scope.scope".into());
+        orphan.workload_pid = Some(u32::MAX - 7);
+        orphan.workload_start_ticks = Some(1);
+        // One whose workload still runs (this test process) stays quarantined.
+        let mut live = record(
+            2,
+            TicketState::Finished,
+            vec![resource("b", Access::Exclusive)],
+        );
+        live.quarantined = true;
+        live.workload_pid = Some(std::process::id());
+        live.workload_start_ticks = proc_start_ticks(std::process::id());
+        // One with no evidence at all stays quarantined (fail closed).
+        let mut unknown = record(
+            3,
+            TicketState::Finished,
+            vec![resource("c", Access::Exclusive)],
+        );
+        unknown.quarantined = true;
+        let mut state = Journal {
+            records: vec![orphan, live, unknown],
+            ..Default::default()
+        };
+        let dry = store.release_dead_service_claims(&mut state.clone(), true).unwrap();
+        assert_eq!(dry.len(), 1);
+        let actions = store.release_dead_service_claims(&mut state, false).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].1.contains("job quarantine"));
+        assert!(!state.records[0].quarantined);
+        assert!(state.records[1].quarantined && state.records[2].quarantined);
+        assert!(quarantined_by(&state, &resource("a", Access::Exclusive)).is_none());
     }
 
     /// Failure mode: a journal that grows forever, or retention that drops a
