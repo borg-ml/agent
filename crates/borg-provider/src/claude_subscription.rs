@@ -683,9 +683,6 @@ async fn fetch(operation: Operation, body: Option<&Value>, bearer: Option<&str>)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
-        // Claude throttles the usage endpoint per client; Claude Code's own
-        // identity is the bucket that answers reliably.
-        .user_agent("claude-code/2.1.296")
         .build()
         .map_err(|_| anyhow::anyhow!("cannot initialize Claude TLS client"))?;
     // Claude throttles these account endpoints per client. A throttled or
@@ -697,9 +694,18 @@ async fn fetch(operation: Operation, body: Option<&Value>, bearer: Option<&str>)
             Some(value) => client.post(operation.endpoint()).json(value),
             None => client.get(operation.endpoint()),
         };
-        request = request
-            .header("Content-Type", "application/json")
-            .header("Cache-Control", "no-cache");
+        request = request.header("Content-Type", "application/json");
+        // Native posts token grants through bare axios; the token endpoint
+        // answers a `claude-code/*` agent with HTTP 429, so a login code is
+        // wasted and the grant can never rotate. Account reads use its own UA.
+        request = match operation {
+            Operation::Refresh | Operation::Exchange => request
+                .header("User-Agent", "axios/1.15.2")
+                .header("Accept", "application/json, text/plain, */*"),
+            _ => request
+                .header("User-Agent", "claude-code/2.1.296")
+                .header("Cache-Control", "no-cache"),
+        };
         if let Some(token) = bearer {
             request = request.bearer_auth(token);
         }

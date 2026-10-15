@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.16.6)
 
+### Claude subscription
+
+- Fix Claude login failing with "temporarily throttled (HTTP 429)" and the
+  subscription dropping out after a few hours. Anthropic's token endpoint
+  rate-limits requests that identify as Claude Code, so Borg could neither
+  finish a browser login nor refresh an expiring token on its own, and only
+  stayed signed in while Claude Code itself was refreshing the shared login.
+  Token requests now carry the same headers Claude Code sends.
+
 ## 0.16.6 (2026-10-15)
 
 ### Claude subscription
