@@ -81,9 +81,7 @@ jobs:
           fi
           "$binary" --version
           "$binary" --help >/dev/null
-      - name: Install the pinned native Claude payload
-        shell: bash
-        run: npm --prefix packages/claude-native-runtime ci --omit=dev --ignore-scripts
+      - uses: ./.github/actions/install-claude-native
       - name: Package and extract-smoke the Unix archive
         if: matrix.archive == 'tar'
         shell: bash

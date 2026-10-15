@@ -109,10 +109,7 @@ jobs:
           if [[ "${{ runner.os }}" == "Linux" ]]; then
             "target/${{ matrix.target }}/release/borg-display" --version
           fi
-      - name: Install pinned native Claude payload
-        shell: bash
-        run: |
-          npm --prefix packages/claude-native-runtime ci --omit=dev --ignore-scripts
+      - uses: ./.github/actions/install-claude-native
       - name: Package Unix archive
         if: matrix.archive == 'tar'
         shell: bash

@@ -1,0 +1,17 @@
+name: Install pinned native Claude payload
+description: Install the locked SDK and require its optional native payload to work.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      working-directory: packages/claude-native-runtime
+      run: |
+        native="$(node -p "'node_modules/@anthropic-ai/claude-agent-sdk-' + process.platform + '-' + process.arch + '/claude' + (process.platform === 'win32' ? '.exe' : '')")"
+        for attempt in 1 2 3; do
+          if npm ci --omit=dev --include=optional --ignore-scripts && "$native" --version; then
+            exit 0
+          fi
+          echo "::warning::Claude native payload install or smoke test failed (attempt $attempt/3)"
+        done
+        echo "::error::Failed to install a working pinned Claude native payload: $native"
+        exit 1
