@@ -633,10 +633,12 @@ pub(crate) fn is_between_states(error: &anyhow::Error) -> bool {
         if error
             .as_database_error()
             .and_then(|error| error.code())
-            .is_some_and(|code| matches!(
+            .is_some_and(|code| {
+                matches!(
                     code.as_ref(),
                     "57P01" | "57P02" | "57P03" | "53100" | "53300"
-                ))
+                )
+            })
         {
             return true;
         }
