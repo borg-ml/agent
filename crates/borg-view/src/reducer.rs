@@ -73,20 +73,19 @@ impl ViewReducer {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("view revision exhausted"))?;
         self.cursor.revision = revision.to_string();
-        let index = *self
-            .core
-            .subagent_entries
-            .get(&child_id)
-            .ok_or_else(|| anyhow::anyhow!("missing child summary row"))?;
-        let id = self.semantic_row_id(index).expect("child row identity");
-        self.row_revisions.insert(id.clone(), revision);
-        self.history_positions
-            .entry(id)
-            .or_insert_with(|| format!("child:{child_id}"));
         self.sync_meta();
         let mut ops = Vec::new();
-        if let Some(row) = self.row(index) {
-            ops.push(ViewOp::RowUpsert { row });
+        // Settled child rows can leave the active window while their metadata
+        // remains authoritative; do not resurrect them at the transcript tail.
+        if let Some(index) = self.core.subagent_entries.get(&child_id).copied() {
+            let id = self.semantic_row_id(index).expect("child row identity");
+            self.row_revisions.insert(id.clone(), revision);
+            self.history_positions
+                .entry(id)
+                .or_insert_with(|| format!("child:{child_id}"));
+            if let Some(row) = self.row(index) {
+                ops.push(ViewOp::RowUpsert { row });
+            }
         }
         ops.push(ViewOp::MetaPatch {
             meta: self.core.meta.clone(),

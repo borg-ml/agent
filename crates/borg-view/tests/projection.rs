@@ -223,6 +223,61 @@ fn parent_has_one_child_summary_and_source_scoped_approval_without_child_bodies(
             .unwrap()
             .contains("PRIVATE CHILD BODY")
     );
+
+    // Old child rows leave the active window; their metadata must still advance
+    // without resurrecting a historical row or poisoning the parent cursor.
+    reducer
+        .apply_child_meta(
+            child,
+            borg_view::wire::Cursor {
+                epoch: "child-epoch".into(),
+                revision: "0".into(),
+            },
+            &borg_view::wire::Meta {
+                status: Some(borg_agent_runtime::SessionStatus::Ready),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    for sequence in 3..=132 {
+        reducer.apply(message(
+            parent,
+            sequence,
+            Uuid::new_v4(),
+            EventActor::User,
+            "",
+            MessageStatus::Complete,
+        ));
+    }
+    assert!(!reducer.core.subagent_entries.contains_key(&child));
+    let checkpoint = reducer.checkpoint().unwrap();
+    let mut reducer = ViewReducer::restore(&checkpoint, |_| Ok(String::new())).unwrap();
+    let previous: u64 = reducer.cursor().revision.parse().unwrap();
+    let meta = borg_view::wire::Meta {
+        status: Some(borg_agent_runtime::SessionStatus::Failed),
+        ..Default::default()
+    };
+    let cursor = borg_view::wire::Cursor {
+        epoch: "child-epoch".into(),
+        revision: "1".into(),
+    };
+    let ops = reducer
+        .apply_child_meta(child, cursor.clone(), &meta)
+        .unwrap();
+    assert_eq!(reducer.cursor().revision, (previous + 1).to_string());
+    assert!(ops.iter().all(|op| !matches!(op, ViewOp::RowUpsert { .. })));
+    let snapshot = reducer.snapshot();
+    assert_eq!(snapshot.meta.children.len(), 1);
+    assert!(matches!(
+        snapshot.meta.children[0].status,
+        borg_view::wire::Lifecycle::Failed
+    ));
+    assert!(
+        reducer
+            .apply_child_meta(child, cursor, &meta)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// A child report must stay private even when the reducer no longer holds

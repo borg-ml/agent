@@ -691,6 +691,15 @@ impl SyncAuthority {
         }
         Ok(())
     }
+    async fn recover_scope(&self, session: Uuid) {
+        if let Err(error) = self.catch_up(session).await {
+            // Both this scope and lifted parent metadata may have advanced in
+            // memory before persistence failed. Reload only committed state.
+            self.projectors.lock().await.clear();
+            self.catalog_recovery.store(true, Ordering::Release);
+            tracing::error!(%session, %error, "projection commit failed; durable cursor retained");
+        }
+    }
     async fn reconcile_catalog(&self) -> Result<()> {
         let mut root_after = Uuid::nil();
         loop {
@@ -702,7 +711,7 @@ impl SyncAuthority {
             root_after = *roots.last().expect("nonempty page");
             let count = roots.len();
             for root in roots {
-                self.catch_up(root).await?;
+                self.recover_scope(root).await;
                 let mut after = None;
                 loop {
                     let ids = self.store.descendant_sessions(root, after, 64).await?;
@@ -712,7 +721,7 @@ impl SyncAuthority {
                     after = ids.last().copied();
                     let count = ids.len();
                     for child in ids {
-                        self.catch_up(child).await?;
+                        self.recover_scope(child).await;
                     }
                     if count < 64 {
                         break;
@@ -795,6 +804,7 @@ pub(super) async fn run_publisher(
         let session = tokio::select! {
             session=inbox.recv()=>match session {Some(session)=>session,None=>return},
             _=wake=>continue,
+            _=tokio::time::sleep(std::time::Duration::from_secs(1)), if recovery.load(Ordering::Acquire)=>continue,
         };
         drop(authority);
         if session.is_nil() {
@@ -803,11 +813,7 @@ pub(super) async fn run_publisher(
         let Some(authority) = weak.upgrade() else {
             return;
         };
-        if let Err(error) = authority.catch_up(session).await {
-            tracing::error!(%session,%error,"projection commit failed; durable cursor retained");
-            authority.projectors.lock().await.remove(&session);
-            recovery.store(true, Ordering::Release);
-        }
+        authority.recover_scope(session).await;
     }
 }
 
@@ -995,6 +1001,69 @@ impl SyncAuthority {
 #[cfg(test)]
 mod attention_recovery_tests {
     use super::*;
+
+    // A failing scope must not starve later sessions or leave a mutated reducer
+    // ahead of its durable checkpoint when storage becomes writable again.
+    #[tokio::test]
+    async fn catalog_failure_is_isolated_and_retries_from_committed_state() {
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let host = Uuid::new_v4();
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        let (outbound, _receiver) = mpsc::channel(128);
+        let (commands, _) = mpsc::channel(1);
+        let authority = SyncAuthority::open(host, 1, store.clone(), outbound, commands)
+            .await
+            .unwrap();
+        authority.shutdown().await;
+        let sessions = [Uuid::from_u128(1), Uuid::from_u128(2)];
+        for session in sessions {
+            store.create_session(session).await.unwrap();
+            store.persist_owned_host_launch_metadata(session, &serde_json::json!({
+                "request": { "request_id":session, "cwd":"/tmp", "provider":"codex", "permission_mode":"manual" },
+                "attachment":null
+            }), host, "https://fixture.invalid").await.unwrap();
+            store
+                .append(crate::SessionEvent::new(
+                    session,
+                    0,
+                    crate::SessionEventKind::SessionStarted,
+                ))
+                .await
+                .unwrap();
+        }
+        let bad_key = scope_key(host, Some(sessions[0]));
+        sqlx::query("alter table remote_view_replay add constraint injected_failure check(scope not like '%/session:00000000-0000-0000-0000-000000000001') not valid")
+            .execute(&authority.pg.pool).await.unwrap();
+        authority.reconcile_catalog().await.unwrap();
+        let good = authority
+            .projection
+            .load(&scope_key(host, Some(sessions[1])))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(good.source_sequence, 1);
+        assert_eq!(
+            authority
+                .projection
+                .load(&bad_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .source_sequence,
+            0
+        );
+        sqlx::query("alter table remote_view_replay drop constraint injected_failure")
+            .execute(&authority.pg.pool)
+            .await
+            .unwrap();
+        authority.reconcile_catalog().await.unwrap();
+        let recovered = authority.projection.load(&bad_key).await.unwrap().unwrap();
+        assert_eq!(recovered.source_sequence, 1);
+        assert_eq!(recovered.revision, 1);
+        drop(authority);
+        drop(store);
+        scratch.discard().await;
+    }
 
     #[tokio::test]
     async fn retained_attention_survives_uplink_failure_and_authority_reopen() {
