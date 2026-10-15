@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.16.5)
+## Unreleased (since 0.16.6)
+
+## 0.16.6 (2026-10-15)
 
 ### Claude subscription
 
