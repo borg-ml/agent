@@ -561,7 +561,7 @@ impl SyncAuthority {
         } else {
             return Ok(());
         }
-        loop {
+        {
             let mut projectors = self.projectors.lock().await;
             if let std::collections::hash_map::Entry::Vacant(e) = projectors.entry(session) {
                 e.insert(self.projector(session).await?);
@@ -576,12 +576,12 @@ impl SyncAuthority {
                 self.project(projector, event, None).await?;
             }
             drop(projectors);
-            if count < 128 {
-                break;
+            if count == 128 {
+                self.catalog_recovery.store(true, Ordering::Release);
+                return Ok(());
             }
-            tokio::task::yield_now().await;
         }
-        loop {
+        {
             let mut projectors = self.projectors.lock().await;
             let projector = projectors
                 .get_mut(&session)
@@ -594,8 +594,9 @@ impl SyncAuthority {
             for (revision, event) in deltas {
                 self.project(projector, event, Some(revision)).await?;
             }
-            if count < 128 {
-                break;
+            if count == 128 {
+                self.catalog_recovery.store(true, Ordering::Release);
+                return Ok(());
             }
         }
         if self.relay_online.load(Ordering::Acquire) {
@@ -609,20 +610,6 @@ impl SyncAuthority {
         }
         self.lift_child_metadata(session).await?;
         self.publish_headline(session).await?;
-        // Bound idle reducer memory independently from roster/thread count.
-        let mut projectors = self.projectors.lock().await;
-        if projectors.len() > 128 {
-            let connections = self.connections.lock().await;
-            let idle = projectors.keys().copied().find(|id| {
-                let key = scope_key(self.host, Some(*id));
-                !connections
-                    .values()
-                    .any(|connection| connection.subscriptions.contains_key(&key))
-            });
-            if let Some(id) = idle {
-                projectors.remove(&id);
-            }
-        }
         Ok(())
     }
     async fn lift_child_metadata(&self, child: Uuid) -> Result<()> {
@@ -699,6 +686,20 @@ impl SyncAuthority {
             self.catalog_recovery.store(true, Ordering::Release);
             tracing::error!(%session, %error, "projection commit failed; durable cursor retained");
         }
+        // Bound idle reducer memory independently from roster/thread count.
+        let mut projectors = self.projectors.lock().await;
+        if projectors.len() > 128 {
+            let connections = self.connections.lock().await;
+            let idle = projectors.keys().copied().find(|id| {
+                let key = scope_key(self.host, Some(*id));
+                !connections
+                    .values()
+                    .any(|connection| connection.subscriptions.contains_key(&key))
+            });
+            if let Some(id) = idle {
+                projectors.remove(&id);
+            }
+        }
     }
     async fn reconcile_catalog(&self) -> Result<()> {
         let mut root_after = Uuid::nil();
@@ -710,8 +711,11 @@ impl SyncAuthority {
             }
             root_after = *roots.last().expect("nonempty page");
             let count = roots.len();
+            // Root admission must not wait behind archived descendant bodies.
+            for root in &roots {
+                self.recover_scope(*root).await;
+            }
             for root in roots {
-                self.recover_scope(root).await;
                 let mut after = None;
                 loop {
                     let ids = self.store.descendant_sessions(root, after, 64).await?;
@@ -1060,6 +1064,60 @@ mod attention_recovery_tests {
         let recovered = authority.projection.load(&bad_key).await.unwrap().unwrap();
         assert_eq!(recovered.source_sequence, 1);
         assert_eq!(recovered.revision, 1);
+
+        // An older healthy history must yield before a new root waits for its
+        // entire backlog; resume the old source without skipping any events.
+        for session in std::iter::repeat_n(sessions[0], 256).chain(std::iter::once(sessions[1])) {
+            store
+                .append(crate::SessionEvent::new(
+                    session,
+                    0,
+                    crate::SessionEventKind::Message {
+                        message_id: Uuid::new_v4(),
+                        actor: crate::EventActor::User,
+                        text: "backlog".into(),
+                        status: crate::MessageStatus::Complete,
+                        attachments: Vec::new(),
+                        delivery: None,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        authority.catalog_recovery.store(false, Ordering::Release);
+        authority.reconcile_catalog().await.unwrap();
+        assert_eq!(
+            authority
+                .projection
+                .load(&scope_key(host, Some(sessions[1])))
+                .await
+                .unwrap()
+                .unwrap()
+                .source_sequence,
+            2
+        );
+        assert_eq!(
+            authority
+                .projection
+                .load(&bad_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .source_sequence,
+            129
+        );
+        assert!(authority.catalog_recovery.load(Ordering::Acquire));
+        authority.reconcile_catalog().await.unwrap();
+        assert_eq!(
+            authority
+                .projection
+                .load(&bad_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .source_sequence,
+            257
+        );
         drop(authority);
         drop(store);
         scratch.discard().await;
