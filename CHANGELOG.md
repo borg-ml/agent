@@ -28,6 +28,16 @@ Git comparison.
   Both are dry runs without `--apply`.
 - Add `borg session drop-test-databases` for leftover `borg_test_*` databases,
   and drop test scratch databases even when a test fails.
+- Fix "sorry, too many clients already" and "opening the Borg session cluster
+  timed out" when many sessions run at once or `borg update --force` overlaps
+  old and new workers. The managed session cluster now starts with
+  `max_connections=1000`, and a full server is waited out like a restart
+  instead of failing startup. An already running cluster picks up the new
+  limit the next time Borg starts it.
+- Fix `borg update --force` reporting "replacement has not published the
+  installed executable identity" after Ctrl-C while a new worker was still
+  starting. It now says the session keeps starting in the background and to
+  rerun the command for the remaining sessions.
 
 ## 0.16.5 (2026-10-14)
 
