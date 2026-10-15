@@ -213,9 +213,10 @@ pub async fn discover(authority: AuthAuthority) -> Result<SubscriptionAccess> {
         .map_err(|_| anyhow::anyhow!("Claude auth task failed"))?
 }
 
-fn spawn_auth<F>(future: F) -> tokio::task::JoinHandle<Result<SubscriptionAccess>>
+fn spawn_auth<F, T>(future: F) -> tokio::task::JoinHandle<Result<T>>
 where
-    F: std::future::Future<Output = Result<SubscriptionAccess>> + Send + 'static,
+    F: std::future::Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
 {
     #[cfg(test)]
     let future = tests::inherit_fetch_context(future);

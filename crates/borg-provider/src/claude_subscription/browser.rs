@@ -1,6 +1,6 @@
 //! Native browser login collection; opening the URL belongs to the frontend.
 
-use super::{AuthAuthority, PendingLogin, SubscriptionAccess};
+use super::{AuthAuthority, PendingLogin};
 use anyhow::{Context, Result, bail, ensure};
 use std::{net::Ipv4Addr, time::Duration};
 use tokio::{
@@ -48,7 +48,7 @@ impl BrowserLogin {
 
     /// Explicit new login may select a different account. Session/account guards
     /// remain the controller's responsibility; exchange/save belong to auth.
-    pub async fn complete(self) -> Result<SubscriptionAccess> {
+    pub async fn complete(self) -> Result<()> {
         let Self {
             listener,
             pending,

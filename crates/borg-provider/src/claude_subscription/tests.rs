@@ -355,6 +355,47 @@ async fn pkce_login_rejects_wrong_state_offline() {
     assert!(!authority.credential_file().exists());
 }
 
+// The authorization code is single-use: a completed exchange must be durable
+// without any profile request, so a throttled account check cannot lose the login.
+#[tokio::test]
+async fn completed_login_persists_without_profile_verification() {
+    let pending = PendingLogin::new().unwrap();
+    let state = reqwest::Url::parse(&pending.authorize_url().unwrap())
+        .unwrap()
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    let directory = tempfile::tempdir().unwrap();
+    let authority =
+        AuthAuthority::selected(directory.path().to_owned(), CredentialStore::File).unwrap();
+    let mut stale = document(now_ms() + 3_600_000);
+    stale["borgClaudeSubscription"] = json!({"accountUuid":"old","organizationUuid":"old"});
+    authority.save(&stale).await.unwrap();
+    let mut exchange = rotation();
+    exchange["account"] = json!({"uuid":"account-a"});
+    exchange["organization"] = json!({"uuid":"org-a"});
+    offline(
+        vec![exchange],
+        vec![],
+        pending.complete("fixture-code".into(), state, authority.clone(), None),
+    )
+    .await
+    .unwrap();
+    let saved = authority.load().await.unwrap();
+    assert_eq!(saved["foreign"], json!({"device":"keep"}));
+    assert_eq!(
+        saved["borgClaudeSubscription"],
+        json!({"accountUuid":"account-a","organizationUuid":"org-a"})
+    );
+    let access = offline(vec![profile_fixture()], vec![], discover(authority))
+        .await
+        .unwrap();
+    assert_eq!(access.token.bearer(), "rotated-access");
+    assert_eq!(access.profile.identity, identity());
+}
+
 // Concurrent durable refresh during the profile await must adopt the new bearer,
 // but never a new account/org. Ordinary CAS tests and compilation cannot hit this race.
 #[tokio::test]

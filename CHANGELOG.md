@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.16.5)
 
+### Claude subscription
+
+- Fix Claude browser login sometimes not staying signed in. Borg now saves the
+  new credentials as soon as the browser callback's code is exchanged, before
+  checking the account, so a rate-limited or failed account check (or another
+  process touching the credential file) can no longer throw away a completed
+  login. The account is verified on first use instead.
+
 ### Web search
 
 - Fix keyless web search returning no results when Exa's free route is rate

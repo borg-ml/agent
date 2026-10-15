@@ -56,13 +56,16 @@ impl PendingLogin {
     }
     /// Caller supplies the returned code and state separately. Re-login may select
     /// a new identity explicitly; `expected` prevents unintended account switching.
+    /// The authorization code is single-use, so the exchanged grant is persisted
+    /// before any profile request: a throttled or failed account check must never
+    /// discard a completed login. Discovery verifies the profile on first use.
     pub async fn complete(
         self,
         code: String,
         returned_state: String,
         authority: AuthAuthority,
         expected: Option<AccountIdentity>,
-    ) -> Result<SubscriptionAccess> {
+    ) -> Result<()> {
         ensure!(
             self.created.elapsed() <= Duration::from_secs(600),
             "Claude login expired; restart login"
@@ -75,15 +78,10 @@ impl PendingLogin {
             !code.is_empty() && code.len() <= 8192,
             "invalid Claude authorization code"
         );
+        // Detached so a dropped caller cannot lose a grant between exchange and save.
         spawn_auth(async move {
-            let lock = authority.lock().await?;
-            let previous = match authority.load().await {
-                Ok(document) => document,
-                Err(error) if error.is::<storage::MissingAuthority>() => {
-                    json!({})
-                }
-                Err(error) => return Err(error),
-            };
+            // Held to keep sibling refreshes off the old grant while it is replaced.
+            let _refresh = authority.lock().await?;
             let response = fetch(
                 Operation::Exchange,
                 Some(&json!({
@@ -98,64 +96,57 @@ impl PendingLogin {
                 &response["refresh_token"],
                 "Claude login omitted refresh token; not persisted",
             )?;
-            let mut candidate = previous.clone();
-            if !candidate["claudeAiOauth"].is_object() {
-                candidate["claudeAiOauth"] = json!({});
-            }
-            candidate["claudeAiOauth"]
-                .as_object_mut()
-                .unwrap()
-                .remove("refreshTokenExpiresAt");
-            candidate = rotated_document(candidate, &response, now_ms())?;
-            let token = OAuthToken::from_document(&candidate)?;
-            ensure!(
-                token.refresh_token.is_some(),
-                "Claude login omitted refresh token; not persisted"
-            );
-            let profile = SubscriptionProfile::parse(
-                fetch(Operation::Profile, None, Some(token.bearer())).await?,
-            )?;
-            if let Some(expected) = expected {
-                expected.check(&profile.identity)?;
-            }
-            check_token_account(&response, &profile.identity)?;
-            lock.check()?;
-            // Protect against non-cooperating writers during a browser login.
-            let write_lock = authority.write_lock().await?;
-            let latest = match authority.load().await {
-                Ok(document) => document,
-                Err(error) if error.is::<storage::MissingAuthority>() => {
-                    json!({})
+            let mut identity = exchanged_identity(&response);
+            if let Some(expected) = &expected {
+                if identity.is_none() {
+                    let token = OAuthToken::from_document(&rotated_document(
+                        json!({"claudeAiOauth":{}}),
+                        &response,
+                        now_ms(),
+                    )?)?;
+                    identity = Some(fetch_profile(&token, Some(expected)).await?.identity);
                 }
+                expected.check(identity.as_ref().unwrap())?;
+            }
+            let write_lock = authority.write_lock().await?;
+            let mut document = match authority.load().await {
+                Ok(document) => document,
+                Err(error) if error.is::<storage::MissingAuthority>() => json!({}),
                 Err(error) => return Err(error),
             };
-            ensure!(
-                latest.get("claudeAiOauth") == previous.get("claudeAiOauth"),
-                "Claude authority changed during login; restart login"
-            );
-            candidate = merge_login(latest, candidate, &profile)?;
+            // A new grant replaces the previous one; its plan and tier are
+            // filled in by profile verification on first use.
+            document["claudeAiOauth"] = json!({"clientId":CLIENT_ID});
+            document = rotated_document(document, &response, now_ms())?;
+            let object = document.as_object_mut().unwrap();
+            match &identity {
+                Some(identity) => {
+                    object.insert(
+                        "borgClaudeSubscription".into(),
+                        json!({"accountUuid":identity.account_uuid,"organizationUuid":identity.organization_uuid}),
+                    );
+                }
+                None => {
+                    object.remove("borgClaudeSubscription");
+                }
+            }
             write_lock.check()?;
-            authority.save(&candidate).await?;
-            Ok(SubscriptionAccess {
-                token: OAuthToken::from_document(&candidate)?,
-                profile,
-            })
+            authority.save(&document).await
         })
         .await
         .map_err(|_| anyhow::anyhow!("Claude login task failed"))?
     }
 }
-fn merge_login(
-    mut latest: Value,
-    candidate: Value,
-    profile: &SubscriptionProfile,
-) -> Result<Value> {
-    latest["claudeAiOauth"] = candidate["claudeAiOauth"].clone();
-    latest["claudeAiOauth"]["clientId"] = json!(CLIENT_ID);
-    latest["claudeAiOauth"]["subscriptionType"] = json!(profile.subscription_type);
-    latest["claudeAiOauth"]["rateLimitTier"] = json!(profile.rate_limit_tier);
-    latest["borgClaudeSubscription"] = json!({"accountUuid":profile.identity.account_uuid,"organizationUuid":profile.identity.organization_uuid});
-    Ok(latest)
+/// Token exchange names its account and organization; native Claude Code
+/// relies on the same fields. Both are required to bind an identity.
+fn exchanged_identity(response: &Value) -> Option<AccountIdentity> {
+    Some(AccountIdentity {
+        account_uuid: optional_string(&response["account"]["uuid"])?,
+        organization_uuid: optional_string(&response["organization"]["uuid"])?,
+    })
+    .filter(|identity| {
+        !identity.account_uuid.contains('\0') && !identity.organization_uuid.contains('\0')
+    })
 }
 fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
