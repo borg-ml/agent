@@ -1569,7 +1569,14 @@ pub(crate) async fn update_local_workers(force: bool) -> Result<()> {
         drop(writer);
         let args = LocalAgentCliArgs::resume(Some(id));
         let mut terminal = None;
-        ensure_detached_session_host(&args, id, false, &mut terminal).await?;
+        if let DetachedHostWait::Detach =
+            ensure_detached_session_host(&args, id, false, &mut terminal).await?
+        {
+            println!(
+                "Session {id} is still starting its new worker; it keeps recovering in the background. Skipped the remaining sessions; rerun `borg update --force` to continue."
+            );
+            return Ok(());
+        }
         anyhow::ensure!(
             local_session_owner_uses_current_binary(&sessions_dir, id)?,
             "session {id} replacement has not published the installed executable identity"

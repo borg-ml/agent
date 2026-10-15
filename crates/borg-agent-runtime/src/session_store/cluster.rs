@@ -82,6 +82,13 @@ pub(crate) const TRANSITION_BUDGET: Duration = Duration::from_secs(30);
 /// takes well under a second. A child blocked on a full disk can hold it open
 /// indefinitely, and the postmaster never retries once space returns. Short
 /// enough that the restart still fits inside [`TRANSITION_BUDGET`].
+/// Every Borg process keeps its own pool (up to 64 connections, see
+/// `POSTGRES_MAX_CONNECTIONS`), and an update briefly runs old and new workers
+/// side by side. PostgreSQL's default of 100 made a dozen busy sessions refuse
+/// new ones with "too many clients". A connection slot costs roughly 20 KB of
+/// shared memory, so this is cheap headroom rather than a tuning knob.
+const MAX_CONNECTIONS: u32 = 1000;
+
 const WEDGE_GRACE: Duration = Duration::from_secs(10);
 
 /// Where `initdb` and `pg_ctl` live when they are not on `PATH`.
@@ -468,7 +475,7 @@ impl ManagedCluster {
             .arg(&self.log_path)
             .arg("-o")
             .arg(format!(
-                "-p {} -k {} -h 127.0.0.1",
+                "-p {} -k {} -h 127.0.0.1 -c max_connections={MAX_CONNECTIONS}",
                 self.port,
                 self.socket_dir.display()
             ))
@@ -608,6 +615,8 @@ impl ManagedCluster {
 ///   surfaces as an unexpected end of file rather than a refusal.
 ///
 /// Disk-full errors (53100 or StorageFull) can recover after space is reclaimed.
+/// `53300` (`too_many_connections`) clears as soon as other processes release
+/// pooled connections, typically while an update overlaps old and new workers.
 /// These conditions permit another bounded startup attempt, not replay of writes.
 /// A rejected role, missing database or corrupt data directory must stay loud.
 pub(crate) fn is_between_states(error: &anyhow::Error) -> bool {
@@ -624,7 +633,10 @@ pub(crate) fn is_between_states(error: &anyhow::Error) -> bool {
         if error
             .as_database_error()
             .and_then(|error| error.code())
-            .is_some_and(|code| matches!(code.as_ref(), "57P01" | "57P02" | "57P03" | "53100"))
+            .is_some_and(|code| matches!(
+                    code.as_ref(),
+                    "57P01" | "57P02" | "57P03" | "53100" | "53300"
+                ))
         {
             return true;
         }

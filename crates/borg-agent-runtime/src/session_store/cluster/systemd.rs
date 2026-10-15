@@ -143,6 +143,8 @@ pub(super) fn run_args(launch: &Launch<'_>, unit: &str) -> Vec<OsString> {
     args.push(launch.socket_dir.into());
     args.push("-h".into());
     args.push("127.0.0.1".into());
+    args.push("-c".into());
+    args.push(format!("max_connections={}", super::MAX_CONNECTIONS).into());
     args
 }
 
@@ -369,6 +371,7 @@ mod tests {
         );
         assert!(rendered.contains(&"/borg/pgdata".to_string()));
         assert!(rendered.contains(&"5433".to_string()));
+        assert!(rendered.contains(&"max_connections=1000".to_string()));
         // SIGINT is a fast shutdown; systemd's default SIGTERM is a smart one
         // that waits for every client to leave and would hold the stop open.
         // `mixed` leaves the postmaster to shut its own backends down.
