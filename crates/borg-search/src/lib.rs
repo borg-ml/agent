@@ -50,6 +50,17 @@ impl SearchBackend {
             Self::Federated => "federated",
         }
     }
+
+    /// The environment variable that supplies this backend's credential.
+    pub const fn credential_env(self) -> Option<&'static str> {
+        match self {
+            Self::Exa => Some("EXA_API_KEY"),
+            Self::Firecrawl => Some("FIRECRAWL_API_KEY"),
+            Self::Parallel => Some("PARALLEL_API_KEY"),
+            Self::Brave => Some("BRAVE_SEARCH_API_KEY"),
+            Self::ExaMcp | Self::Federated => None,
+        }
+    }
 }
 
 impl fmt::Display for SearchBackend {
@@ -58,8 +69,11 @@ impl fmt::Display for SearchBackend {
     }
 }
 
-/// The configured backend selection. Auto queries every configured backend in
-/// parallel, then merges the normalized results in stable provider order.
+/// A backend selection. Auto queries every configured backend in parallel,
+/// then merges the normalized results in stable provider order.
+///
+/// The effective choice for a call is, in order: the per-call `backend`
+/// argument, the user's `[search] backend` setting, BORG_SEARCH_BACKEND, Auto.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchBackendChoice {
     #[default]
@@ -81,7 +95,7 @@ impl SearchBackendChoice {
             "brave" => Ok(Self::Brave),
             "exa-mcp" | "exa_mcp" | "keyless" => Ok(Self::ExaMcp),
             other => bail!(
-                "unsupported BORG_SEARCH_BACKEND {other}; expected auto, exa, firecrawl, parallel, brave, or exa-mcp"
+                "unsupported search backend `{other}`; expected auto, exa, firecrawl, parallel, brave, or exa-mcp"
             ),
         }
     }
@@ -141,7 +155,8 @@ impl SearchConfig {
     pub fn from_env() -> Result<Self> {
         let backend = SearchBackendChoice::parse(
             &std::env::var("BORG_SEARCH_BACKEND").unwrap_or_else(|_| "auto".to_string()),
-        )?;
+        )
+        .context("invalid BORG_SEARCH_BACKEND")?;
         let timeout = match std::env::var("BORG_SEARCH_TIMEOUT_SECS") {
             Ok(value) => Duration::from_secs(
                 value
@@ -197,6 +212,8 @@ pub struct SearchRequest {
     pub max_results: usize,
     pub include_domains: Vec<String>,
     pub exclude_domains: Vec<String>,
+    /// Overrides the service's configured backend for this request only.
+    pub backend: Option<SearchBackendChoice>,
 }
 
 impl SearchRequest {
@@ -206,6 +223,7 @@ impl SearchRequest {
             max_results: max_results.unwrap_or(DEFAULT_RESULTS),
             include_domains: Vec::new(),
             exclude_domains: Vec::new(),
+            backend: None,
         };
         request.validate()?;
         Ok(request)
@@ -349,10 +367,13 @@ impl SearchService {
         if backend == SearchBackend::ExaMcp {
             return self.search_exa_mcp(request).await;
         }
-        let key = self
-            .config
-            .key_for(backend)
-            .with_context(|| format!("the selected {backend} backend has no configured API key"))?;
+        let key = self.config.key_for(backend).with_context(|| {
+            format!(
+                "the {backend} search backend is selected but {} is not set on this host; \
+                 choose another backend or configure it",
+                backend.credential_env().unwrap_or("its API key")
+            )
+        })?;
         match backend {
             SearchBackend::Exa => self.search_exa(key, request).await,
             SearchBackend::Firecrawl => self.search_firecrawl(key, request).await,
@@ -438,7 +459,7 @@ impl SearchService {
             status.as_u16()
         );
         let payload = parse_mcp_sse_payload(&text).context("decode Exa MCP web search response")?;
-        let blocks = mcp_result_text(&payload)?;
+        let blocks = mcp_result_text(&payload, &keyed_backends(&self.config))?;
         Ok(SearchResponse {
             backend: SearchBackend::ExaMcp,
             query: request.query.trim().to_string(),
@@ -558,7 +579,7 @@ impl SearchService {
 impl WebSearchProvider for SearchService {
     async fn search(&self, request: SearchRequest) -> Result<SearchResponse> {
         request.validate()?;
-        match self.config.backend {
+        match request.backend.unwrap_or(self.config.backend) {
             SearchBackendChoice::Auto => {
                 let backends = configured_backends(&self.config);
                 ensure!(
@@ -608,8 +629,8 @@ impl SearchService {
     }
 }
 
-fn configured_backends(config: &SearchConfig) -> Vec<SearchBackend> {
-    let keyed = [
+fn keyed_backends(config: &SearchConfig) -> Vec<SearchBackend> {
+    [
         SearchBackend::Exa,
         SearchBackend::Firecrawl,
         SearchBackend::Parallel,
@@ -617,7 +638,11 @@ fn configured_backends(config: &SearchConfig) -> Vec<SearchBackend> {
     ]
     .into_iter()
     .filter(|backend| config.key_for(*backend).is_some())
-    .collect::<Vec<_>>();
+    .collect()
+}
+
+fn configured_backends(config: &SearchConfig) -> Vec<SearchBackend> {
+    let keyed = keyed_backends(config);
     if keyed.is_empty() {
         // With nothing keyed, the keyless route is the only backend there is,
         // so Auto selects it instead of reporting search as unavailable. A host
@@ -763,7 +788,9 @@ fn parse_mcp_sse_payload(text: &str) -> Result<Value> {
 }
 
 /// The readable text blocks carried by a JSON-RPC tool result.
-fn mcp_result_text(payload: &Value) -> Result<String> {
+/// `keyed` lists the backends with a configured credential, so a rate-limit
+/// error can name a retry target. It names backends only, never credentials.
+fn mcp_result_text(payload: &Value, keyed: &[SearchBackend]) -> Result<String> {
     if let Some(error) = payload.get("error") {
         bail!(
             "Exa MCP web search failed: {}",
@@ -782,6 +809,40 @@ fn mcp_result_text(payload: &Value) -> Result<String> {
         .filter_map(|item| item.get("text").and_then(Value::as_str))
         .collect::<Vec<_>>()
         .join("\n");
+    // The keyless endpoint reports throttling and tool failures as an ordinary
+    // result whose text is a notice, not search results. Parsing that notice
+    // would yield zero results, so it must surface as an error instead.
+    let rate_limited = payload
+        .pointer("/result/_meta/ai.exa~1rateLimited")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let is_error = payload
+        .pointer("/result/isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if rate_limited {
+        let retry = if keyed.is_empty() {
+            "no keyed backend is configured on this host; configure EXA_API_KEY, \
+             FIRECRAWL_API_KEY, PARALLEL_API_KEY or BRAVE_SEARCH_API_KEY for keyed search"
+                .to_string()
+        } else {
+            format!(
+                "keyed backends configured on this host: {}; retry with backend set to one of them",
+                keyed
+                    .iter()
+                    .map(|backend| backend.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        bail!(
+            "Exa MCP web search is rate limited on the keyless route; {retry}. Provider notice: {}",
+            text.trim()
+        );
+    }
+    if is_error {
+        bail!("Exa MCP web search failed: {}", text.trim());
+    }
     ensure!(
         !text.trim().is_empty(),
         "Exa MCP web search returned empty content"
@@ -1083,6 +1144,7 @@ mod tests {
             max_results: 2,
             include_domains: vec!["example.com".to_string()],
             exclude_domains: Vec::new(),
+            backend: None,
         };
         let results = vec![
             SearchResult {
@@ -1179,6 +1241,7 @@ mod tests {
             max_results: 3,
             include_domains: Vec::new(),
             exclude_domains: Vec::new(),
+            backend: None,
         };
         let response = merge_search_outcomes(
             &request,
@@ -1311,6 +1374,47 @@ mod tests {
     }
 
     #[test]
+    fn keyless_mcp_rate_limit_notice_is_an_error_not_empty_results() {
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "_meta": {"ai.exa/rateLimited": true},
+                "content": [{
+                    "type": "text",
+                    "text": "You've hit Exa's free MCP rate limit. To continue using without limits, create your own Exa API key."
+                }]
+            }
+        });
+        let framed = format!("event: message\ndata: {reply}\n\n");
+        let payload = parse_mcp_sse_payload(&framed).expect("json-rpc payload");
+        let error = mcp_result_text(&payload, &[]).expect_err("rate limit must be an error");
+        let message = error.to_string();
+        assert!(message.contains("rate limited"), "{message}");
+        assert!(message.contains("EXA_API_KEY"), "{message}");
+        // With keyed backends configured, the error names them as retry
+        // targets so the agent can pass backend=... on the next call.
+        let message = mcp_result_text(&payload, &[SearchBackend::Exa, SearchBackend::Brave])
+            .expect_err("rate limit must be an error")
+            .to_string();
+        assert!(
+            message.contains("configured on this host: exa, brave"),
+            "{message}"
+        );
+
+        let failed = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "isError": true,
+                "content": [{"type": "text", "text": "upstream timeout"}]
+            }
+        });
+        let error = mcp_result_text(&failed, &[]).expect_err("isError must be an error");
+        assert!(error.to_string().contains("upstream timeout"));
+    }
+
+    #[test]
     fn keyless_mcp_reply_parses_into_normalized_results() {
         let reply = json!({
             "jsonrpc": "2.0",
@@ -1324,7 +1428,7 @@ mod tests {
         });
         let framed = format!("event: message\ndata: {reply}\n\n");
         let payload = parse_mcp_sse_payload(&framed).expect("json-rpc payload");
-        let blocks = mcp_result_text(&payload).expect("text blocks");
+        let blocks = mcp_result_text(&payload, &[]).expect("text blocks");
         let mut request = SearchRequest::bounded("rust async", Some(5)).expect("request");
         request.exclude_domains = vec!["example.com".to_string()];
         let results = normalize_results(&request, parse_exa_mcp_results(&blocks));
@@ -1349,7 +1453,7 @@ mod tests {
         });
         let framed = format!("event: message\ndata: {reply}\n\n");
         let payload = parse_mcp_sse_payload(&framed).expect("json-rpc payload");
-        let error = mcp_result_text(&payload).expect_err("an error reply is a failure");
+        let error = mcp_result_text(&payload, &[]).expect_err("an error reply is a failure");
         assert!(error.to_string().contains("rate limited"), "{error}");
     }
 
@@ -1360,6 +1464,7 @@ mod tests {
             max_results: 1,
             include_domains: Vec::new(),
             exclude_domains: Vec::new(),
+            backend: None,
         };
         assert!(request.validate().is_err());
     }
@@ -1382,5 +1487,29 @@ mod tests {
             SearchBackendChoice::parse("brave").unwrap(),
             SearchBackendChoice::Brave
         );
+        for alias in ["exa-mcp", "exa_mcp", "keyless", " Keyless "] {
+            assert_eq!(
+                SearchBackendChoice::parse(alias).unwrap(),
+                SearchBackendChoice::ExaMcp
+            );
+        }
+        assert!(SearchBackendChoice::parse("google").is_err());
+    }
+
+    #[test]
+    fn per_call_keyed_backend_without_credential_names_the_missing_variable() {
+        // The host default is the keyless route; a per-call override to a
+        // keyed backend with no key must fail loudly, never fall back.
+        let service = SearchService::new(SearchConfig {
+            backend: SearchBackendChoice::ExaMcp,
+            ..SearchConfig::default()
+        })
+        .expect("service");
+        let mut request = SearchRequest::bounded("borg", None).expect("request");
+        request.backend = Some(SearchBackendChoice::Brave);
+        let message = futures::executor::block_on(service.search(request))
+            .expect_err("brave without a key must fail")
+            .to_string();
+        assert!(message.contains("BRAVE_SEARCH_API_KEY"), "{message}");
     }
 }

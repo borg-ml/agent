@@ -61,6 +61,7 @@ const SETTINGS_SECTIONS: &[&str] = &[
     "approvals",
     "updates",
     "providers",
+    "search",
 ];
 
 #[derive(Debug, Clone)]
@@ -182,6 +183,22 @@ impl SelfServiceContext {
         Ok(settings)
     }
 
+    /// The user's live `[search] backend` choice, read on every search call so
+    /// a change takes effect without a restart. None when unset.
+    pub(crate) fn search_backend(&self) -> Result<Option<borg_search::SearchBackendChoice>> {
+        let path = self.settings_path("user")?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let root: toml::Value = toml::from_str(&fs::read_to_string(path)?)?;
+        root.get("search")
+            .and_then(|search| search.get("backend"))
+            .and_then(toml::Value::as_str)
+            .map(borg_search::SearchBackendChoice::parse)
+            .transpose()
+            .context("invalid [search] backend in the user agent settings")
+    }
+
     fn get_settings(&self, scope: &str) -> Result<Value> {
         let path = self.settings_path(scope)?;
         let exists = path.is_file();
@@ -206,7 +223,7 @@ impl SelfServiceContext {
             "path": path,
             "exists": exists,
             "settings": serde_json::to_value(settings)?,
-            "hot_reload": ["commands.aliases", "keybindings", "scout"],
+            "hot_reload": ["commands.aliases", "keybindings", "scout", "search"],
             "next_turn_reload": ["extensions", "mcp"],
             "restart_required": [
                 "capabilities", "team", "approvals", "updates", "providers", "prompt"
@@ -1657,7 +1674,7 @@ pub(crate) fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "update_agent_settings",
-            "description": "Safely merge typed Borg settings into the user agent.toml. Aliases/keybindings hot-reload in the TUI; Blu and MCP catalogs reload at the next turn boundary; capability and policy changes require a new session.",
+            "description": "Safely merge typed Borg settings into the user agent.toml. Aliases/keybindings hot-reload in the TUI; Blu and MCP catalogs reload at the next turn boundary; {search:{backend:\"brave\"}} switches the web_search default provider for the next call; capability and policy changes require a new session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2180,6 +2197,16 @@ fn validate_settings_shape(root: &toml::Value) -> Result<()> {
     if let Some(scout) = root.get("scout") {
         let settings: crate::subagents::ScoutSettings = scout.clone().try_into()?;
         settings.routes()?;
+    }
+    if let Some(search) = root.get("search") {
+        check_keys(search, &["backend"], "search")?;
+        if let Some(backend) = search.get("backend") {
+            borg_search::SearchBackendChoice::parse(
+                backend
+                    .as_str()
+                    .context("search.backend must be a string")?,
+            )?;
+        }
     }
     if let Some(prompt) = root.get("prompt") {
         check_keys(prompt, &["append"], "prompt")?;
@@ -2784,6 +2811,47 @@ sibling_flag = "theirs"
                 .unwrap_or_else(|| panic!("{section}.{key} was dropped: {written}"));
             assert_eq!(value.to_string().trim_matches('"'), expected);
         }
+    }
+
+    /// The search backend setting is the user's runtime switch: a write must
+    /// be seen by the very next search call, and a bad name must be refused
+    /// before it reaches the file every later call reads.
+    #[test]
+    fn search_backend_setting_applies_on_the_next_read_and_rejects_bad_names() {
+        let _lock = SETTINGS_ENV_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir().expect("config home");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: serialized by SETTINGS_ENV_TEST_LOCK.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", root.path()) };
+        let context = SelfServiceContext::new(root.path().to_path_buf());
+        let unset = context.search_backend();
+        let write = |backend: &str| {
+            context.update_settings(
+                "user",
+                serde_json::from_value(json!({"search": {"backend": backend}})).unwrap(),
+            )
+        };
+        let saved = write("keyless");
+        let selected = context.search_backend();
+        let rejected = write("google");
+        let after_rejection = context.search_backend();
+        // SAFETY: as above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert_eq!(unset.expect("readable"), None);
+        saved.expect("a valid backend is saved");
+        let exa_mcp = Some(borg_search::SearchBackendChoice::ExaMcp);
+        assert_eq!(selected.expect("readable"), exa_mcp);
+        assert!(rejected.is_err());
+        assert_eq!(after_rejection.expect("readable"), exa_mcp);
     }
 
     #[test]

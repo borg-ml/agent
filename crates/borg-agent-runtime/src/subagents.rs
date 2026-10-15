@@ -3068,11 +3068,18 @@ impl AgentToolDispatcher {
                     .web_search
                     .as_ref()
                     .context("web search is unavailable for this session")?;
+                // Per-call choice, then the user's live `[search] backend`
+                // setting; with neither, the service keeps its host default.
+                let backend = match args.backend.as_deref() {
+                    Some(backend) => Some(borg_search::SearchBackendChoice::parse(backend)?),
+                    None => self.self_service.search_backend()?,
+                };
                 let request = borg_search::SearchRequest {
                     query: args.query,
                     max_results: args.max_results.unwrap_or(borg_search::DEFAULT_RESULTS),
                     include_domains: args.include_domains.unwrap_or_default(),
                     exclude_domains: args.exclude_domains.unwrap_or_default(),
+                    backend,
                 };
                 Ok(serde_json::to_value(provider.search(request).await?)?)
             }
@@ -9562,7 +9569,7 @@ pub fn agent_tool_specs_for_surface(
 fn web_search_tool_spec() -> Value {
     tool(
         "web_search",
-        "Search the public web through Borg's host-configured providers. Auto mode may query Exa, Firecrawl, Parallel, and Brave concurrently and return a deduplicated federated result; credentials never belong in tool input. Results include source URLs, snippets, and publication metadata; use URLs as provenance and do not treat snippets as authoritative page contents.",
+        "Search the public web through Borg's host-configured providers. Auto mode may query Exa, Firecrawl, Parallel, and Brave concurrently and return a deduplicated federated result; credentials never belong in tool input. Optional backend picks one provider for this call (auto, exa, firecrawl, parallel, brave, or exa-mcp, the keyless route); a keyed backend whose key is not configured on the host fails rather than falling back. Omit it to use the user's [search] backend setting or the host default. Results include source URLs, snippets, and publication metadata; use URLs as provenance and do not treat snippets as authoritative page contents.",
         json!({
             "type": "object",
             "properties": {
@@ -9586,6 +9593,10 @@ fn web_search_tool_spec() -> Value {
                     "type": "array",
                     "maxItems": borg_search::MAX_DOMAIN_FILTERS,
                     "items": { "type": "string", "minLength": 1, "maxLength": borg_search::MAX_DOMAIN_CHARS }
+                },
+                "backend": {
+                    "type": "string",
+                    "enum": ["auto", "exa", "firecrawl", "parallel", "brave", "exa-mcp", "exa_mcp", "keyless"]
                 }
             },
             "required": ["query"],
@@ -10173,6 +10184,7 @@ struct WebSearchArgs {
     max_results: Option<usize>,
     include_domains: Option<Vec<String>>,
     exclude_domains: Option<Vec<String>>,
+    backend: Option<String>,
 }
 
 #[derive(Deserialize)]

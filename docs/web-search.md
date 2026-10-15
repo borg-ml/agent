@@ -47,8 +47,43 @@ auto is the default and resolves in this order:
 
 exa-mcp (aliases exa_mcp and keyless) pins the keyless route even when
 credentials exist. Naming a keyed backend explicitly stays single-provider and
-does not silently switch to another provider; if that backend has no credential,
-Borg omits the tool rather than advertising a capability that cannot run.
+does not silently switch to another provider. If BORG_SEARCH_BACKEND names a
+keyed backend with no credential, Borg omits the tool rather than advertising a
+capability that cannot run.
+
+## Switching provider at runtime
+
+The backend can change without restarting Borg. Each search uses the first of
+these that is set:
+
+1. the per-call `backend` argument of web_search
+   (auto|exa|firecrawl|parallel|brave|exa-mcp, plus the keyless/exa_mcp
+   aliases);
+2. the user setting `[search] backend` in `~/.config/borg/agent.toml`
+   (`$XDG_CONFIG_HOME/borg/agent.toml`), read again on every call;
+3. BORG_SEARCH_BACKEND in the host environment;
+4. auto.
+
+To change the default for every session, ask the agent to call
+`update_agent_settings` with `{"search": {"backend": "brave"}}`, or edit the
+file directly:
+
+    [search]
+    backend = "brave"
+
+Set `"backend": "auto"` to return to automatic selection. The setting holds a
+backend name only; it never holds credentials, and the tool never accepts or
+echoes them.
+
+Choosing a keyed backend per call or in the setting when its credential is not
+configured fails with an error naming the missing variable (for example
+BRAVE_SEARCH_API_KEY); Borg does not fall back to another provider.
+
+When the keyless route is rate limited, the endpoint answers with a normal
+JSON-RPC result flagged `ai.exa/rateLimited`. Borg reports that as an error
+rather than as zero results. The error lists the keyed backends configured on
+the host by name, so the agent can retry with `backend` set to one of them, or
+it names the credential variables when none is configured.
 
 Two consequences are worth knowing. Adding a credential replaces the keyless
 route under auto rather than supplementing it, so there is no automatic fallback

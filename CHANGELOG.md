@@ -5,6 +5,17 @@ Git comparison.
 
 ## Unreleased (since 0.16.5)
 
+### Web search
+
+- Fix keyless web search returning no results when Exa's free route is rate
+  limited. The rate-limit notice is now an error that names the keyed backends
+  configured on the host so the agent can retry with one of them.
+- Switch the search provider without restarting. `web_search` takes an optional
+  `backend` (auto, exa, firecrawl, parallel, brave, exa-mcp), and the
+  `[search] backend` user setting changes the default from the next call; ask
+  the agent or edit `agent.toml`. A keyed backend without its key fails with
+  the missing variable named instead of switching providers.
+
 ## 0.16.5 (2026-10-14)
 
 ### Providers
