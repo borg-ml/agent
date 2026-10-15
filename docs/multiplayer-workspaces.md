@@ -129,6 +129,17 @@ admitted, acknowledged, or terminal failure. Admission is exactly once even
 across process restart. A message may be recalled only while that recipient's
 delivery remains pending. Read cursors are per participant and thread.
 
+Only messages store per-recipient delivery rows. Every other event (session
+projections, shared work, decisions, artifacts) is addressed to the whole
+workspace and has no per-recipient state, so its audience is recorded once,
+through membership: each member has a `joined_sequence`, the workspace sequence
+at which they were added, and sees workspace-wide events at or after it. A
+viewer therefore replays what they authored, workspace-wide events since they
+joined, and messages with a delivery row for them; a private audience never
+leaks. Releases up to 0.16.5 wrote a pending delivery row per member for every
+workspace-wide event instead, which on a busy machine reached hundreds of
+millions of rows; see [Reclaiming legacy delivery rows](#reclaiming-legacy-delivery-rows).
+
 ## Shared work
 
 Plans and shared todos use one underlying work record. The shared backlog contains
@@ -320,6 +331,42 @@ Migration is additive and restart-safe:
 
 Existing event IDs, message IDs, workspace IDs, ordering, encrypted bodies,
 session journals, and access grants must remain unchanged.
+
+### Reclaiming legacy delivery rows
+
+Opening the store with this release adds `workspace_members.joined_sequence`
+and backfills it from each member's first legacy delivery row, so visibility is
+unchanged and the old rows carry no information. Nothing deletes them
+automatically. Upgrade and restart every Borg process on the machine first: an
+older binary still writes the rows and still reads visibility from them.
+
+Each command is a dry run unless `--apply` is given:
+
+```sh
+borg session prune-deliveries                 # report rows, size, estimated reclaim
+borg session prune-deliveries --apply         # online, batched, resumable
+borg session reclaim-deliveries               # same report
+borg session reclaim-deliveries --apply       # return the space; sessions idle
+borg session drop-test-databases [--apply]    # leftover borg_test_* databases
+```
+
+- `prune-deliveries --apply` deletes legacy rows online, at most
+  `--batch-events` (default 1000) events of one workspace per transaction, and
+  records its position in `workspace_delivery_prune_progress`, so an
+  interrupted run resumes where it stopped. Postgres reuses the freed space
+  but the table files do not shrink.
+- `reclaim-deliveries --apply` returns the space to the filesystem. In one
+  transaction it takes an `ACCESS EXCLUSIVE` lock on `workspace_deliveries`,
+  copies the message deliveries aside (found through the message index, so
+  this does not scan the old table), truncates the table and restores them.
+  Workspace appends and replays wait for its duration, typically seconds. If
+  the lock is not granted within `--lock-timeout-secs` (default 5) it fails
+  instead of queueing all traffic behind a long transaction. It needs no free
+  disk beyond the kept rows and makes the prune step optional; `VACUUM FULL`
+  would instead hold the lock while reading the whole old heap.
+- `drop-test-databases --apply` drops idle `borg_test_<32 hex>` databases on the
+  session server, skipping any with open connections. Test scratch databases
+  now drop themselves even when a test fails.
 
 ## Extension surface
 

@@ -22,6 +22,7 @@ use super::{SESSION_SCHEMA_VERSION, SessionStoreHealth};
 pub mod actions;
 pub mod body;
 pub mod cold;
+pub mod delivery_maintenance;
 pub mod fork;
 pub mod harness;
 pub mod host;

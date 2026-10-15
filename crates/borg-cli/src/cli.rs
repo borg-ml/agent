@@ -361,6 +361,41 @@ pub(crate) enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Report, or with --apply delete online, the workspace delivery rows
+    /// releases up to 0.16.5 wrote for every workspace-wide event. Deletes
+    /// run in bounded per-workspace batches and resume where they stopped.
+    /// Postgres reuses the space but the files do not shrink; see
+    /// reclaim-deliveries.
+    PruneDeliveries {
+        #[arg(long)]
+        apply: bool,
+        /// Events per delete transaction.
+        #[arg(long, default_value_t = 1000)]
+        batch_events: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report, or with --apply return to the filesystem, the space of those
+    /// rows: truncate the delivery table and restore only message deliveries.
+    /// Holds an exclusive lock on the table while it runs (seconds), blocking
+    /// workspace traffic; run it while sessions are idle.
+    ReclaimDeliveries {
+        #[arg(long)]
+        apply: bool,
+        /// Give up if the table lock is not granted within this many seconds.
+        #[arg(long, default_value_t = 5)]
+        lock_timeout_secs: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List, or with --apply drop, borg_test_* scratch databases that test
+    /// runs left on the session server. Databases with connections are kept.
+    DropTestDatabases {
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

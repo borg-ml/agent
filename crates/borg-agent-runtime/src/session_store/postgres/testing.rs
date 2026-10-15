@@ -70,10 +70,15 @@ pub async fn session_store() -> (ScratchDatabase, PostgresSessionStore) {
 /// Per-test isolation is required rather than tidy: tests run in parallel, and
 /// a shared database let one test's ageing pass compress another test's
 /// fixtures out from under it.
+///
+/// Dropped when this value is: explicitly through [`ScratchDatabase::discard`],
+/// or from `Drop` when a test fails or returns early. Leaving them behind
+/// accumulated hundreds of databases on shared servers.
 pub struct ScratchDatabase {
     pub url: String,
     name: String,
-    admin: PgPool,
+    admin_url: String,
+    discarded: bool,
 }
 
 impl ScratchDatabase {
@@ -87,20 +92,52 @@ impl ScratchDatabase {
             .execute(&admin)
             .await
             .expect("create scratch database");
+        admin.close().await;
         let options: PgConnectOptions = url.parse().expect("parse url");
-        let url = options.database(&name).to_url_lossy().to_string();
-        Self { url, name, admin }
+        let scratch_url = options.database(&name).to_url_lossy().to_string();
+        Self {
+            url: scratch_url,
+            name,
+            admin_url: url.to_string(),
+            discarded: false,
+        }
     }
 
-    /// Drop the scratch database. Called explicitly rather than on `Drop`
-    /// because dropping a database is async; a test that fails early simply
-    /// leaves it behind, which is harmless on a test server.
-    pub async fn discard(self) {
-        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "drop database if exists {} with (force)",
-            self.name
-        )))
-        .execute(&self.admin)
-        .await;
+    /// Drop the scratch database now, disconnecting anything still using it.
+    pub async fn discard(mut self) {
+        drop_database(&self.admin_url, &self.name).await;
+        self.discarded = true;
     }
+}
+
+impl Drop for ScratchDatabase {
+    fn drop(&mut self) {
+        if self.discarded {
+            return;
+        }
+        // `Drop` cannot await, and the test's runtime may be the one
+        // unwinding, so the drop runs on its own thread and runtime.
+        let (admin_url, name) = (self.admin_url.clone(), self.name.clone());
+        let _ = std::thread::spawn(move || {
+            if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                runtime.block_on(drop_database(&admin_url, &name));
+            }
+        })
+        .join();
+    }
+}
+
+async fn drop_database(admin_url: &str, name: &str) {
+    let Ok(admin) = PgPool::connect(admin_url).await else {
+        return;
+    };
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "drop database if exists {name} with (force)"
+    )))
+    .execute(&admin)
+    .await;
+    admin.close().await;
 }

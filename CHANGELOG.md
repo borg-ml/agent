@@ -16,6 +16,19 @@ Git comparison.
   the agent or edit `agent.toml`. A keyed backend without its key fails with
   the missing variable named instead of switching providers.
 
+### Storage
+
+- Fix the Postgres session database growing without bound: every session
+  projection and shared-work event wrote a never-read delivery row per
+  workspace member (565 million rows, 283 GB on one machine). Only messages
+  write delivery rows now; workspace-wide visibility comes from each member's
+  join point. After upgrading every Borg process, remove the old rows with
+  `borg session prune-deliveries --apply` (online, resumable) and/or return the
+  space with `borg session reclaim-deliveries --apply` while sessions are idle.
+  Both are dry runs without `--apply`.
+- Add `borg session drop-test-databases` for leftover `borg_test_*` databases,
+  and drop test scratch databases even when a test fails.
+
 ## 0.16.5 (2026-10-14)
 
 ### Providers

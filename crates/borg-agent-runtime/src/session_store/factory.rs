@@ -238,7 +238,19 @@ pub async fn open(config: &SessionStoreConfig) -> Result<OpenSessionStore> {
         .workspace_override
         .as_ref()
         .map(|override_store| std::sync::Arc::clone(&override_store.0));
-    let store: PostgresSessionStore = match &config.selection {
+    let store = open_postgres(config).await?;
+    let store = match workspace_override {
+        Some(workspace) => store.with_workspace_store(workspace),
+        None => store,
+    };
+    let session: Arc<dyn SessionStore> = Arc::new(store);
+    Ok(OpenSessionStore { session })
+}
+
+/// Open the configured journal as the concrete Postgres store, for operator
+/// maintenance that works below the store traits.
+pub async fn open_postgres(config: &SessionStoreConfig) -> Result<PostgresSessionStore> {
+    Ok(match &config.selection {
         Selection::Url(url) => {
             let store = PostgresSessionStore::connect(url).await.with_context(|| {
                 format!("{SESSIONS_URL_ENV} is set, so Borg requires PostgreSQL")
@@ -258,13 +270,7 @@ pub async fn open(config: &SessionStoreConfig) -> Result<OpenSessionStore> {
             let cluster = config.cluster();
             open_managed(&cluster).await?
         }
-    };
-    let store = match workspace_override {
-        Some(workspace) => store.with_workspace_store(workspace),
-        None => store,
-    };
-    let session: Arc<dyn SessionStore> = Arc::new(store);
-    Ok(OpenSessionStore { session })
+    })
 }
 
 /// Open the configured backend and prove every tier in one step.

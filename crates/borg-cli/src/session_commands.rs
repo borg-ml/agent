@@ -63,6 +63,17 @@ pub(crate) async fn run(command: SessionCommand) -> Result<()> {
             json,
         } => restore_snapshot(input, cwd, prune, json).await,
         SessionCommand::Import { input, cwd, json } => import_session(input, cwd, json).await,
+        SessionCommand::PruneDeliveries {
+            apply,
+            batch_events,
+            json,
+        } => prune_deliveries(apply, batch_events, json).await,
+        SessionCommand::ReclaimDeliveries {
+            apply,
+            lock_timeout_secs,
+            json,
+        } => reclaim_deliveries(apply, lock_timeout_secs, json).await,
+        SessionCommand::DropTestDatabases { apply, json } => drop_test_databases(apply, json).await,
         command => {
             let store = open_store().await?;
             match command {
@@ -92,7 +103,10 @@ pub(crate) async fn run(command: SessionCommand) -> Result<()> {
                 }
                 SessionCommand::Import { .. }
                 | SessionCommand::Snapshot { .. }
-                | SessionCommand::Restore { .. } => unreachable!("handled above"),
+                | SessionCommand::Restore { .. }
+                | SessionCommand::PruneDeliveries { .. }
+                | SessionCommand::ReclaimDeliveries { .. }
+                | SessionCommand::DropTestDatabases { .. } => unreachable!("handled above"),
             }
         }
     }
@@ -118,6 +132,135 @@ async fn compact_store(store: &dyn SessionStore, vacuum: bool, json: bool) -> Re
         println!(
             "Session store stays at {}; freed pages are reused. Run without --no-vacuum to shrink the file.",
             human_bytes(outcome.bytes_before)
+        );
+    }
+    Ok(())
+}
+
+async fn open_postgres() -> Result<borg_remote::session_store::postgres::PostgresSessionStore> {
+    borg_remote::session_store::factory::open_postgres(
+        &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
+    )
+    .await
+}
+
+fn print_delivery_report(
+    report: &borg_remote::session_store::postgres::delivery_maintenance::DeliveryStorageReport,
+) {
+    println!(
+        "workspace_deliveries: {} on disk, ~{} rows; {} message deliveries are kept.",
+        human_bytes(report.table_bytes),
+        report.estimated_rows,
+        report.message_deliveries
+    );
+    println!(
+        "Legacy workspace-wide rows: ~{}; reclaim-deliveries would free ~{}.",
+        report.estimated_legacy_rows,
+        human_bytes(report.estimated_reclaimable_bytes)
+    );
+    if report.members_missing_joined_sequence > 0 {
+        println!(
+            "{} members still lack joined_sequence; nothing can be removed until the schema backfill runs.",
+            report.members_missing_joined_sequence
+        );
+    }
+}
+
+async fn prune_deliveries(apply: bool, batch_events: i64, json: bool) -> Result<()> {
+    let store = open_postgres().await?;
+    let report = store.delivery_storage_report().await?;
+    if !apply {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print_delivery_report(&report);
+            println!("Dry run. Re-run with --apply to delete them online in batches.");
+        }
+        return Ok(());
+    }
+    let outcome = store
+        .prune_legacy_deliveries(batch_events, |progress| {
+            if !json {
+                eprintln!(
+                    "workspace {}/{}: {} rows deleted",
+                    progress.workspaces_done, progress.workspaces_total, progress.deleted_rows
+                );
+            }
+        })
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&outcome)?);
+    } else {
+        println!(
+            "Deleted {} legacy delivery rows in {} batches. Run reclaim-deliveries while \
+             sessions are idle to return the space to the filesystem.",
+            outcome.deleted_rows, outcome.batches
+        );
+    }
+    Ok(())
+}
+
+async fn reclaim_deliveries(apply: bool, lock_timeout_secs: u64, json: bool) -> Result<()> {
+    let store = open_postgres().await?;
+    if !apply {
+        let report = store.delivery_storage_report().await?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print_delivery_report(&report);
+            println!(
+                "Dry run. --apply locks workspace_deliveries exclusively while it truncates \
+                 the table and restores the message deliveries; stop or idle sessions first."
+            );
+        }
+        return Ok(());
+    }
+    let outcome = store.reclaim_delivery_storage(lock_timeout_secs).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&outcome)?);
+    } else {
+        println!(
+            "Kept {} message deliveries. workspace_deliveries: {} -> {}.",
+            outcome.kept_rows,
+            human_bytes(outcome.bytes_before),
+            human_bytes(outcome.bytes_after)
+        );
+    }
+    Ok(())
+}
+
+async fn drop_test_databases(apply: bool, json: bool) -> Result<()> {
+    let store = open_postgres().await?;
+    let databases = store.stale_test_databases(apply).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&databases)?);
+        return Ok(());
+    }
+    let idle: Vec<_> = databases
+        .iter()
+        .filter(|database| !database.in_use)
+        .collect();
+    let bytes: i64 = idle.iter().map(|database| database.bytes).sum();
+    for database in databases.iter().filter(|database| database.error.is_some()) {
+        println!(
+            "{}: not dropped: {}",
+            database.name,
+            database.error.as_deref().unwrap_or_default()
+        );
+    }
+    let in_use = databases.len() - idle.len();
+    if apply {
+        let dropped = databases.iter().filter(|database| database.dropped).count();
+        println!(
+            "Dropped {dropped} of {} idle borg_test_* databases ({}); {in_use} in use were kept.",
+            idle.len(),
+            human_bytes(bytes)
+        );
+    } else {
+        println!(
+            "{} idle borg_test_* databases ({}); {in_use} in use. Dry run; re-run with --apply to drop the idle ones.",
+            idle.len(),
+            human_bytes(bytes)
         );
     }
     Ok(())

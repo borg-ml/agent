@@ -316,3 +316,29 @@ create table if not exists workspace_work_plan_revisions (
     revision bigint not null,
     primary key(workspace_id, assignee_id)
 );
+
+-- Non-message events (session projections, shared work, decisions...) always
+-- go to the whole workspace, so their audience is "every member who had joined
+-- by then", not a row per recipient: those rows reached hundreds of millions
+-- and were never read for state. A member sees such an event when its
+-- sequence is at or after `joined_sequence`, the workspace's next sequence when
+-- the member was added. Delivery rows remain only for messages, whose
+-- per-recipient state is tracked.
+alter table workspace_members add column if not exists joined_sequence bigint;
+
+-- Members added before this column existed join at their first delivery: every
+-- non-message event fanned out to every member, so that is where their
+-- visibility began. Runs once per member while the old rows still exist; a
+-- member with no delivery has only seen what they authored.
+update workspace_members m set joined_sequence = coalesce(
+    (select min(d.sequence) from workspace_deliveries d
+      where d.workspace_id = m.workspace_id and d.recipient_id = m.participant_id),
+    (select w.next_sequence from workspaces w where w.id = m.workspace_id))
+where m.joined_sequence is null;
+
+-- Resume point of `borg session prune-deliveries`, which deletes the rows above
+-- in bounded batches: the highest sequence per workspace already processed.
+create table if not exists workspace_delivery_prune_progress (
+    workspace_id     text   primary key references workspaces (id) on delete cascade,
+    through_sequence bigint not null
+);

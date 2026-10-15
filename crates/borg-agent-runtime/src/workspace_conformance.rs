@@ -2060,3 +2060,299 @@ async fn large_team_concurrent_fanout_preserves_every_delivery() {
     session.pool().close().await;
     scratch.discard().await;
 }
+
+#[cfg(test)]
+fn session_projection(workspace_id: Uuid, author_id: Uuid) -> WorkspaceEvent {
+    let session_event_id = Uuid::new_v4();
+    WorkspaceEvent {
+        id: Uuid::new_v4(),
+        workspace_id,
+        sequence: 0,
+        author_id,
+        idempotency_key: format!("session-{session_event_id}"),
+        created_at: Utc::now(),
+        kind: WorkspaceEventKind::SessionEvent {
+            session_id: author_id,
+            session_event_id,
+            session_sequence: 1,
+            mode: DeliveryMode::Notify,
+        },
+    }
+}
+
+#[cfg(test)]
+async fn replayed_sequences(store: &dyn WorkspaceStore, workspace: Uuid, viewer: Uuid) -> Vec<u64> {
+    store
+        .replay(workspace, viewer, 0, 100)
+        .await
+        .expect("replay")
+        .into_iter()
+        .map(|event| event.sequence)
+        .collect()
+}
+
+#[cfg(test)]
+async fn delivery_count(pool: &sqlx::PgPool, workspace: Uuid) -> i64 {
+    sqlx::query_scalar("select count(*) from workspace_deliveries where workspace_id = $1")
+        .bind(workspace.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("count deliveries")
+}
+
+#[cfg(test)]
+async fn join_late(store: &dyn WorkspaceStore, workspace: Uuid) -> Uuid {
+    let late = Uuid::new_v4();
+    store
+        .create_participant(participant(late, "late"))
+        .await
+        .unwrap();
+    store
+        .add_member(WorkspaceMembership {
+            workspace_id: workspace,
+            participant_id: late,
+            role: WorkspaceRole::Editor,
+            joined_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    late
+}
+
+/// Workspace-wide events once wrote a delivery row per member that nothing
+/// ever read for state; the table reached hundreds of millions of rows. They
+/// must write none, while replay still shows them exactly to the members who
+/// had joined, and messages keep their per-recipient rows and private
+/// audience.
+#[cfg(test)]
+#[tokio::test]
+async fn workspace_wide_events_write_no_deliveries_and_keep_their_audience() {
+    let url = crate::session_store::postgres::testing::required_test_url();
+    let scratch = ScratchDatabase::create(&url).await;
+    let session = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+        .await
+        .expect("bootstrap scratch schema");
+    let store = PostgresWorkspaceStore::from_pool(session.pool().clone());
+    let (workspace, author, second, third) = workspace_with_members(&store).await;
+
+    store
+        .append_session_event_batch(&[session_projection(workspace, author)])
+        .await
+        .expect("project session event");
+    let direct = message_event(
+        workspace,
+        author,
+        "for second only",
+        Audience::Direct {
+            participant: second,
+        },
+        "direct",
+    );
+    // Message reads are keyed by the event id.
+    let message_id = direct.id;
+    store.append(direct).await.expect("direct message");
+    assert_eq!(
+        delivery_count(session.pool(), workspace).await,
+        1,
+        "only the message has a delivery row"
+    );
+    assert_eq!(replayed_sequences(&store, workspace, author).await, [1, 2]);
+    assert_eq!(replayed_sequences(&store, workspace, second).await, [1, 2]);
+    assert_eq!(
+        replayed_sequences(&store, workspace, third).await,
+        [1],
+        "a private audience must not leak through replay"
+    );
+
+    // A member who joins later sees workspace-wide events from then on only.
+    let late = join_late(&store, workspace).await;
+    assert!(replayed_sequences(&store, workspace, late).await.is_empty());
+    store
+        .append_session_event_batch(&[session_projection(workspace, second)])
+        .await
+        .expect("project session event");
+    assert_eq!(replayed_sequences(&store, workspace, late).await, [3]);
+    assert_eq!(replayed_sequences(&store, workspace, third).await, [1, 3]);
+    assert_eq!(delivery_count(session.pool(), workspace).await, 1);
+
+    // Message delivery state is still tracked per recipient.
+    let admitted = store
+        .transition_message_delivery(workspace, message_id, second, DeliveryState::Admitted, None)
+        .await
+        .unwrap()
+        .expect("second was addressed");
+    assert_eq!(admitted.state, DeliveryState::Admitted);
+    assert!(
+        store
+            .transition_message_delivery(
+                workspace,
+                message_id,
+                third,
+                DeliveryState::Admitted,
+                None
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "an unaddressed member has no delivery to transition"
+    );
+    assert!(
+        store
+            .pending_message_events(workspace, second, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(store);
+    session.pool().close().await;
+    scratch.discard().await;
+}
+
+/// Older releases left a delivery row per member per workspace-wide event.
+/// The schema must derive each member's `joined_sequence` from them before
+/// they go, and both removal paths must delete exactly those rows -- the
+/// online prune resuming from its recorded progress -- without changing what
+/// anyone can replay or touching message delivery state.
+#[cfg(test)]
+#[tokio::test]
+async fn legacy_delivery_rows_convert_then_prune_resumably_or_reclaim() {
+    let url = crate::session_store::postgres::testing::required_test_url();
+    let scratch = ScratchDatabase::create(&url).await;
+    let session = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+        .await
+        .expect("bootstrap scratch schema");
+    let pool = session.pool().clone();
+    let store = PostgresWorkspaceStore::from_pool(pool.clone());
+    let (workspace, author, second, third) = workspace_with_members(&store).await;
+    store
+        .append_session_event_batch(&[session_projection(workspace, author)])
+        .await
+        .unwrap();
+    let broadcast = message_event(workspace, author, "hello", Audience::Workspace, "hello");
+    let message_id = broadcast.id;
+    store.append(broadcast).await.unwrap();
+    let late = join_late(&store, workspace).await;
+    store
+        .append_session_event_batch(&[session_projection(workspace, second)])
+        .await
+        .unwrap();
+
+    // What an older release stored: a pending row for every non-author member
+    // of a workspace-wide event, and no joined_sequence at all.
+    let legacy_rows = [
+        (1_i64, second),
+        (1, third),
+        (3, author),
+        (3, third),
+        (3, late),
+    ];
+    let insert_legacy_rows = || async {
+        for (sequence, recipient) in legacy_rows {
+            sqlx::query(
+                "insert into workspace_deliveries \
+                 (workspace_id, sequence, recipient_id, mode, state) \
+                 values ($1, $2, $3, '\"notify\"', '\"pending\"')",
+            )
+            .bind(workspace.to_string())
+            .bind(sequence)
+            .bind(recipient.to_string())
+            .execute(&pool)
+            .await
+            .expect("insert legacy row");
+        }
+    };
+    insert_legacy_rows().await;
+    sqlx::query("update workspace_members set joined_sequence = null")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("update borg_session_schema set definition_hash = null")
+        .execute(&pool)
+        .await
+        .unwrap();
+    session.ensure_schema().await.expect("schema backfill");
+
+    let expected = [
+        (author, vec![1, 2, 3]),
+        (second, vec![1, 2, 3]),
+        (third, vec![1, 2, 3]),
+        (late, vec![3]),
+    ];
+    let assert_visibility = |stage: &'static str| {
+        let store = &store;
+        let expected = &expected;
+        async move {
+            for (viewer, sequences) in expected {
+                assert_eq!(
+                    &replayed_sequences(store, workspace, *viewer).await,
+                    sequences,
+                    "{stage}: visibility changed"
+                );
+            }
+        }
+    };
+    assert_visibility("after backfill").await;
+
+    let report = session.delivery_storage_report().await.unwrap();
+    assert_eq!(report.message_deliveries, 2);
+    assert_eq!(report.members_missing_joined_sequence, 0);
+    assert_eq!(delivery_count(&pool, workspace).await, 7);
+
+    // An interrupted prune that committed its first one-event batch.
+    sqlx::query("delete from workspace_deliveries where workspace_id = $1 and sequence = 1")
+        .bind(workspace.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "insert into workspace_delivery_prune_progress (workspace_id, through_sequence) \
+         values ($1, 1)",
+    )
+    .bind(workspace.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let resumed = session.prune_legacy_deliveries(1, |_| {}).await.unwrap();
+    assert_eq!(resumed.batches, 2, "resumes after the committed batch");
+    assert_eq!(resumed.deleted_rows, 3);
+    assert_eq!(delivery_count(&pool, workspace).await, 2);
+    assert_visibility("after prune").await;
+    let again = session.prune_legacy_deliveries(1, |_| {}).await.unwrap();
+    assert_eq!((again.batches, again.deleted_rows), (0, 0));
+
+    // The offline path reaches the same end state in one truncation and
+    // keeps message delivery state.
+    insert_legacy_rows().await;
+    store
+        .transition_message_delivery(workspace, message_id, third, DeliveryState::Admitted, None)
+        .await
+        .unwrap()
+        .expect("third was addressed");
+    let reclaimed = session.reclaim_delivery_storage(5).await.unwrap();
+    assert_eq!(reclaimed.kept_rows, 2);
+    assert_eq!(delivery_count(&pool, workspace).await, 2);
+    let states: Vec<(Uuid, DeliveryState)> = store
+        .message_deliveries(message_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|delivery| (delivery.recipient_id, delivery.state))
+        .collect();
+    assert!(states.contains(&(third, DeliveryState::Admitted)));
+    assert!(states.contains(&(second, DeliveryState::Pending)));
+    assert_visibility("after reclaim").await;
+
+    // A leftover scratch database is listed, but a dry run drops nothing.
+    let leftover = ScratchDatabase::create(&url).await;
+    let listed = session.stale_test_databases(false).await.unwrap();
+    let entry = listed
+        .iter()
+        .find(|database| leftover.url.contains(&database.name))
+        .expect("leftover scratch database is listed");
+    assert!(!entry.in_use && !entry.dropped);
+    leftover.discard().await;
+
+    drop(store);
+    pool.close().await;
+    scratch.discard().await;
+}

@@ -8,7 +8,7 @@
 //! are shared with the `workspace` module, because a store that disagreed on
 //! either would accept a message twice or deliver it to the wrong people.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPool;
 use sqlx::{Postgres, Row, Transaction};
@@ -305,7 +305,6 @@ impl PostgresWorkspaceStore {
         sequence: i64,
         recipients: &[Uuid],
         mode: &DeliveryMode,
-        is_message: bool,
     ) -> Result<()> {
         if recipients.is_empty() {
             return Ok(());
@@ -319,14 +318,13 @@ impl PostgresWorkspaceStore {
         sqlx::query(
             "insert into workspace_deliveries \
              (workspace_id, sequence, recipient_id, mode, state, is_message) \
-             select $1::text, $2::bigint, recipient, $4::text, $5::text, $6::boolean from unnest($3::text[]) as recipient",
+             select $1::text, $2::bigint, recipient, $4::text, $5::text, true from unnest($3::text[]) as recipient",
         )
         .bind(workspace_id.to_string())
         .bind(sequence)
         .bind(&recipient_ids)
         .bind(&mode_json)
         .bind(&pending)
-        .bind(is_message)
         .execute(&mut **transaction)
         .await?;
         Ok(())
@@ -441,21 +439,24 @@ impl PostgresWorkspaceStore {
             }
         }
         let is_message = matches!(&event.kind, WorkspaceEventKind::Message { .. });
-        // The author is a member but not a recipient of their own event.
-        let recipients: Vec<Uuid> = recipients
-            .into_iter()
-            .filter(|id| *id != event.author_id)
-            .collect();
-        Self::fan_out(
-            &mut transaction,
-            event.workspace_id,
-            sequence,
-            &recipients,
-            &mode,
-            is_message,
-        )
-        .await?;
         if is_message {
+            // Only messages carry per-recipient delivery state. Every other
+            // event goes to the whole workspace, and replay derives that
+            // audience from `workspace_members.joined_sequence`; a row per
+            // member per event grew without bound and was never updated.
+            // The author is a member but not a recipient of their own event.
+            let recipients: Vec<Uuid> = recipients
+                .into_iter()
+                .filter(|id| *id != event.author_id)
+                .collect();
+            Self::fan_out(
+                &mut transaction,
+                event.workspace_id,
+                sequence,
+                &recipients,
+                &mode,
+            )
+            .await?;
             // Commit-coupled outbox wake: hosts upload undelivered messages
             // when one commits, from whichever process authored it.
             sqlx::query("select pg_notify('borg_workspace_outbox', $1)")
@@ -881,9 +882,14 @@ impl WorkspaceStore for PostgresWorkspaceStore {
     }
 
     async fn add_member(&self, membership: WorkspaceMembership) -> Result<()> {
+        // `joined_sequence` is where this member's view of workspace-wide
+        // events begins. `for share` waits for an in-flight append, which holds
+        // the workspace row `for update`, so the member never sees an event
+        // whose audience was resolved before they joined.
         sqlx::query(
-            "insert into workspace_members (workspace_id, participant_id, role, joined_at) \
-             values ($1, $2, $3, $4)",
+            "insert into workspace_members \
+             (workspace_id, participant_id, role, joined_at, joined_sequence) \
+             values ($1, $2, $3, $4, (select next_sequence from workspaces where id = $1 for share))",
         )
         .bind(membership.workspace_id.to_string())
         .bind(membership.participant_id.to_string())
@@ -935,10 +941,9 @@ impl WorkspaceStore for PostgresWorkspaceStore {
         let members = self.members(&mut transaction, workspace_id).await?;
         let member_ids: Vec<Uuid> = members.into_iter().map(|(id, _)| id).collect();
 
+        // Session projections go to the whole workspace, so they write no
+        // delivery rows: replay derives the audience from membership.
         for source in events {
-            let WorkspaceEventKind::SessionEvent { mode, .. } = &source.kind else {
-                bail!("session projection batch was validated above");
-            };
             ensure!(
                 member_ids.contains(&source.author_id),
                 "author is not a workspace member"
@@ -954,20 +959,6 @@ impl WorkspaceStore for PostgresWorkspaceStore {
             let mut event = source.clone();
             event.sequence = u64::try_from(sequence)?;
             Self::insert_event(&mut transaction, &event, &canonical).await?;
-            let recipients: Vec<Uuid> = member_ids
-                .iter()
-                .copied()
-                .filter(|id| *id != event.author_id)
-                .collect();
-            Self::fan_out(
-                &mut transaction,
-                workspace_id,
-                sequence,
-                &recipients,
-                mode,
-                false,
-            )
-            .await?;
         }
         transaction.commit().await?;
         Ok(())
@@ -981,15 +972,21 @@ impl WorkspaceStore for PostgresWorkspaceStore {
         limit: usize,
     ) -> Result<Vec<WorkspaceEvent>> {
         self.require_member(workspace_id, viewer_id).await?;
-        // A viewer sees what they authored plus what was delivered to them --
-        // never another participant's private audience.
+        // A viewer sees what they authored, every workspace-wide event since
+        // they joined, and the messages delivered to them -- never another
+        // participant's private audience. Only messages have an audience
+        // narrower than the workspace, so only they are checked per recipient.
         let rows = sqlx::query(
             "select e.event_json from workspace_events e \
              where e.workspace_id = $1 and e.sequence > $2 \
-               and (e.author_id = $3 or exists( \
-                    select 1 from workspace_deliveries d \
-                    where d.workspace_id = e.workspace_id and d.sequence = e.sequence \
-                      and d.recipient_id = $3)) \
+               and (e.author_id = $3 \
+                 or (not e.is_message and e.sequence >= ( \
+                      select m.joined_sequence from workspace_members m \
+                      where m.workspace_id = $1 and m.participant_id = $3)) \
+                 or (e.is_message and exists( \
+                      select 1 from workspace_deliveries d \
+                      where d.workspace_id = e.workspace_id and d.sequence = e.sequence \
+                        and d.recipient_id = $3))) \
              order by e.sequence limit $4",
         )
         .bind(workspace_id.to_string())
@@ -1247,8 +1244,9 @@ impl WorkspaceStore for PostgresWorkspaceStore {
             (agent_participant_id, WorkspaceRole::Editor),
         ] {
             sqlx::query(
-                "insert into workspace_members (workspace_id, participant_id, role, joined_at) \
-                 values ($1, $2, $3, $4) \
+                "insert into workspace_members \
+                 (workspace_id, participant_id, role, joined_at, joined_sequence) \
+                 values ($1, $2, $3, $4, (select next_sequence from workspaces where id = $1 for share)) \
                  on conflict (workspace_id, participant_id) do nothing",
             )
             .bind(workspace_id.to_string())
@@ -1307,8 +1305,9 @@ impl WorkspaceStore for PostgresWorkspaceStore {
         .await?;
         for participant_id in participant_ids {
             sqlx::query(
-                "insert into workspace_members (workspace_id, participant_id, role, joined_at) \
-                 values ($1, $2, $3, $4) \
+                "insert into workspace_members \
+                 (workspace_id, participant_id, role, joined_at, joined_sequence) \
+                 values ($1, $2, $3, $4, (select next_sequence from workspaces where id = $1 for share)) \
                  on conflict (workspace_id, participant_id) do nothing",
             )
             .bind(workspace_id.to_string())
@@ -1359,9 +1358,10 @@ impl WorkspaceStore for PostgresWorkspaceStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        // Session projections also create deliveries and stay pending forever,
-        // so the message bit is what lets this poll seek to the pending-message
-        // intersection instead of scanning every delivery for the recipient.
+        // Releases before workspace-wide events stopped writing deliveries
+        // left rows that stay pending forever until `borg session
+        // prune-deliveries` removes them, so the message bit keeps this poll
+        // on the pending-message index instead of scanning those rows.
         let rows = sqlx::query(
             "select d.sequence, d.recipient_id, d.mode, d.state, d.attempts, \
                     d.last_attempt_json, e.event_json \
@@ -1455,8 +1455,9 @@ impl WorkspaceStore for PostgresWorkspaceStore {
         );
         for participant_id in [message.author_id, recipient_id] {
             sqlx::query(
-                "insert into workspace_members (workspace_id, participant_id, role, joined_at) \
-                 values ($1, $2, $3, $4) \
+                "insert into workspace_members \
+                 (workspace_id, participant_id, role, joined_at, joined_sequence) \
+                 values ($1, $2, $3, $4, (select next_sequence from workspaces where id = $1 for share)) \
                  on conflict (workspace_id, participant_id) do nothing",
             )
             .bind(message.workspace_id.to_string())
@@ -1512,8 +1513,9 @@ impl WorkspaceStore for PostgresWorkspaceStore {
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
-            "insert into workspace_members (workspace_id, participant_id, role, joined_at) \
-             values ($1, $2, $3, $4) \
+            "insert into workspace_members \
+             (workspace_id, participant_id, role, joined_at, joined_sequence) \
+             values ($1, $2, $3, $4, (select next_sequence from workspaces where id = $1 for share)) \
              on conflict (workspace_id, participant_id) do update set role = excluded.role",
         )
         .bind(workspace_id.to_string())
