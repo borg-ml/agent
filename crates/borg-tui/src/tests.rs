@@ -8396,6 +8396,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
 fn team_roster_mode_cells_render_requested_speed_with_ultrafast_precedence() {
     let now = Utc::now();
     let mut agent = SubagentSnapshot {
+        desktop: false,
         session_id: Uuid::new_v4(),
         parent_session_id: Uuid::new_v4(),
         task_name: "/root/worker".to_string(),
