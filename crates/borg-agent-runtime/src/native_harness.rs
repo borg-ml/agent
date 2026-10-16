@@ -774,8 +774,9 @@ impl NativeHarness {
         let mut length_continuations = 0_usize;
         let mut context_length_recoveries = 0_usize;
         let mut truncated_text = String::new();
-        // Background steers wait for a safe boundary; human steers preempt
-        // generation without cancelling tools that have already started.
+        // Claude subscription follow-ups must let a replacement response finish
+        // before preempting again, or they can continually discard its thinking.
+        let mut allow_preemption = true;
         let mut queued_steer: Vec<CapturedSteer> = Vec::new();
         // A person who wrote to this turn is owed a visible reply. A turn that
         // parks on watchers ends without asking the model again, so a model
@@ -863,13 +864,18 @@ impl NativeHarness {
                         events: &events,
                         controls: &mut controls,
                         queued_steer: &mut queued_steer,
+                        allow_preemption,
                         grace_wrapup: Some(&grace_wrapup),
                     },
                 )
                 .await
             {
-                Ok(NativeModelOutcome::Completed(result)) => *result,
+                Ok(NativeModelOutcome::Completed(result)) => {
+                    allow_preemption = true;
+                    *result
+                }
                 Ok(NativeModelOutcome::Steered { captured, partial_text }) => {
+                    allow_preemption = turn.provider != crate::CodingProvider::Claude;
                     if !partial_text.trim().is_empty() {
                         let partial = ModelMessage::assistant(Some(partial_text.clone()), None, None, vec![]);
                         record_native_message(&events, turn.provider, &partial).await?;
@@ -3169,9 +3175,10 @@ struct ModelStreamContext<'a> {
     events: &'a mpsc::Sender<SessionEventKind>,
     controls: &'a mut Option<mpsc::Receiver<AgentTurnControl>>,
     /// Where a steer that arrives mid-stream is parked, unadmitted. Queuing it
-    /// here keeps the request alive so the tool call the model is still writing
-    /// reaches execution; the caller admits and folds it at a safe boundary.
+    /// here keeps the request alive so its complete response is preserved;
+    /// the caller admits and folds it at a safe boundary.
     queued_steer: &'a mut Vec<CapturedSteer>,
+    allow_preemption: bool,
     grace_wrapup: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
@@ -3428,9 +3435,9 @@ async fn call_model_streaming_with_timeout(
                         }
                         continue;
                     }
-                    if !preempt {
-                        // Background input waits for the current response; it
-                        // must not repeatedly cancel useful foreground work.
+                    if !preempt || !context.allow_preemption {
+                        // Background input and follow-ups to an instant steer
+                        // wait for a completed response instead of restarting it.
                         context.queued_steer.push(captured);
                         continue;
                     }
@@ -7346,6 +7353,7 @@ mod tests {
                     events: &events_tx,
                     controls: &mut controls,
                     queued_steer: &mut queued_steer,
+                    allow_preemption: true,
                     grace_wrapup: None,
                 },
             );
@@ -7480,6 +7488,7 @@ mod tests {
                 events: &events_tx,
                 controls: &mut controls,
                 queued_steer: &mut queued_steer,
+                allow_preemption: true,
                 grace_wrapup: None,
             },
         );
@@ -7523,6 +7532,7 @@ mod tests {
                 events: &events_tx,
                 controls: &mut controls,
                 queued_steer: &mut queued_steer,
+                allow_preemption: true,
                 grace_wrapup: None,
             },
         );
@@ -7667,6 +7677,7 @@ mod tests {
                 events: &events_tx,
                 controls: &mut controls,
                 queued_steer: &mut queued_steer,
+                allow_preemption: true,
                 grace_wrapup: None,
             },
         );
@@ -7761,6 +7772,7 @@ mod tests {
                 events: &events_tx,
                 controls: &mut controls,
                 queued_steer: &mut queued_steer,
+                allow_preemption: true,
                 grace_wrapup: None,
             },
         );
@@ -7825,6 +7837,7 @@ mod tests {
                 events: &events,
                 controls: &mut controls,
                 queued_steer: &mut queued_steer,
+                allow_preemption: true,
                 grace_wrapup: Some(&grace),
             },
         );
@@ -7895,6 +7908,7 @@ mod tests {
                         events: &events,
                         controls: &mut controls,
                         queued_steer: &mut queued,
+                        allow_preemption: true,
                         grace_wrapup: None,
                     },
                     Duration::from_millis(100),
@@ -8083,6 +8097,7 @@ mod tests {
                     events: &events_tx,
                     controls: &mut controls,
                     queued_steer: &mut queued_steer,
+                    allow_preemption: true,
                     grace_wrapup: None,
                 },
                 Duration::from_millis(1),
@@ -11309,6 +11324,7 @@ mod tests {
                     events: &events_tx,
                     controls: &mut controls,
                     queued_steer: &mut queued_steer,
+                    allow_preemption: true,
                     grace_wrapup: None,
                 },
             )
@@ -11433,6 +11449,7 @@ mod tests {
                 events: &events_tx,
                 controls: &mut controls,
                 queued_steer: &mut queued_steer,
+                allow_preemption: true,
                 grace_wrapup: None,
             },
         );
@@ -11542,6 +11559,7 @@ mod tests {
                 events: &events_tx,
                 controls: &mut controls,
                 queued_steer: &mut queued_steer,
+                allow_preemption: true,
                 grace_wrapup: None,
             },
         );
@@ -11632,6 +11650,7 @@ mod tests {
                 events: &events_tx,
                 controls: &mut controls,
                 queued_steer: &mut queued_steer,
+                allow_preemption: false,
                 grace_wrapup: None,
             },
         );
@@ -11732,6 +11751,7 @@ mod tests {
         /// that dies between capture and fold.
         abort: bool,
         human: bool,
+        followups: bool,
         /// The durable message the marker must name.
         steer_message_id: Uuid,
         /// Shared so the test can assert admission timing from outside.
@@ -11743,7 +11763,7 @@ mod tests {
     impl NativeModelClient for SteerDuringGenerationHarnessClient {
         async fn model_turn(
             &self,
-            _provider: crate::CodingProvider,
+            provider: crate::CodingProvider,
             _model: &str,
             _effort: Option<&str>,
             request: ModelTurnRequest,
@@ -11753,7 +11773,7 @@ mod tests {
                 .rounds
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if round > 0 {
-                if self.human {
+                if self.human && round == 1 {
                     let partial = request.messages.iter().position(|message| matches!(message,
                         ModelMessage::Assistant { content: Some(content), tool_calls, .. }
                             if content == "I checked the first result." && tool_calls.is_empty()
@@ -11769,6 +11789,149 @@ mod tests {
                         })
                         .expect("earlier background input stays ahead of the human steer");
                     assert!(partial < steer);
+                }
+                if self.followups && provider != crate::CodingProvider::Claude {
+                    if round < 3 {
+                        progress
+                            .unwrap()
+                            .send(reasoning_progress("in-flight work"))
+                            .unwrap();
+                        let (ack, _) = tokio::sync::oneshot::channel();
+                        self.controls
+                            .send(AgentTurnControl::Steer {
+                                message_id: Uuid::new_v4(),
+                                text: if round == 1 {
+                                    "follow-up one"
+                                } else {
+                                    "follow-up two"
+                                }
+                                .into(),
+                                attachments: Vec::new(),
+                                admission: borg_provider::provider::SteerAdmission::pending(),
+                                preempt: false,
+                                human: true,
+                                ack,
+                            })
+                            .await
+                            .unwrap();
+                        // OpenAI follow-ups must each preempt, without waiting
+                        // for any model response to complete between them.
+                        return std::future::pending().await;
+                    }
+                    assert!(
+                        request.messages.iter().any(|message| matches!(message,
+                            ModelMessage::User { content, .. }
+                                if content.contains("follow-up one\nfollow-up two")
+                        )),
+                        "both instant OpenAI follow-ups must reach the model"
+                    );
+                }
+                if self.followups && provider == crate::CodingProvider::Claude && round == 1 {
+                    progress
+                        .unwrap()
+                        .send(reasoning_progress("retained work"))
+                        .unwrap();
+                    for text in ["follow-up one", "follow-up two"] {
+                        let (ack, _) = tokio::sync::oneshot::channel();
+                        self.controls
+                            .send(AgentTurnControl::Steer {
+                                message_id: Uuid::new_v4(),
+                                text: text.into(),
+                                attachments: Vec::new(),
+                                admission: borg_provider::provider::SteerAdmission::pending(),
+                                preempt: true,
+                                human: true,
+                                ack,
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    // Capacity one: completing this send proves both follow-ups
+                    // were captured before the replacement response finishes.
+                    self.controls
+                        .send(AgentTurnControl::Approval {
+                            approval_id: "capture-followups".into(),
+                            resolution: ApprovalResolution {
+                                decision: ApprovalDecision::Deny,
+                                edited_input: None,
+                            },
+                        })
+                        .await
+                        .unwrap();
+                    let input = json!({"cmd": format!("echo stale >> {}", self.marker.display())});
+                    return Ok(ModelTurnResult {
+                        message: ModelMessage::Assistant {
+                            content: None,
+                            reasoning_content: Some("retained work".into()),
+                            reasoning_details: None,
+                            provider_state: Some(
+                                borg_core::ModelProviderState::AnthropicMessages {
+                                    content: vec![
+                                        json!({"type":"thinking", "thinking":"retained work", "signature":"opaque-test-signature"}),
+                                        json!({"type":"tool_use", "id":"after-steer", "name":"exec", "input": input}),
+                                    ],
+                                    narration_block_indexes: None,
+                                    account_identity: None,
+                                },
+                            ),
+                            tool_calls: vec![ModelToolCall::function(
+                                "after-steer".into(),
+                                "exec".into(),
+                                input.to_string(),
+                            )],
+                        },
+                        finish_reason: "tool_calls".into(),
+                        usage: ProviderCallUsage::default(),
+                        raw_response: Value::Null,
+                        trace: ProviderAttemptTrace::default(),
+                    });
+                }
+                if self.followups && provider == crate::CodingProvider::Claude {
+                    let retained = request.messages.iter().position(|message| matches!(message,
+                        ModelMessage::Assistant {
+                            provider_state: Some(borg_core::ModelProviderState::AnthropicMessages { content, .. }), ..
+                        } if content[0]["signature"] == "opaque-test-signature"
+                    )).expect("follow-ups must not discard the replacement response's signed thinking");
+                    let followups = request.messages.iter().position(|message| matches!(message,
+                        ModelMessage::User { content, .. } if content == "follow-up one\nfollow-up two"
+                    )).expect("follow-ups reach the next request once, in order");
+                    assert!(retained < followups);
+                    assert!(
+                        request.messages.iter().any(|message| matches!(message,
+                            ModelMessage::Tool { tool_call_id, content, .. }
+                                if tool_call_id == "after-steer" && content.contains("cancelled")
+                        )),
+                        "superseded tools must not run before the follow-ups are folded"
+                    );
+                    if round == 2 {
+                        let progress = progress.unwrap();
+                        progress
+                            .send(ProviderProgress::Bytes {
+                                stream: ProviderProgressStream::Stdout,
+                                chunk: b"Progress boundary reached.".to_vec(),
+                            })
+                            .unwrap();
+                        let (ack, _) = tokio::sync::oneshot::channel();
+                        self.controls
+                            .send(AgentTurnControl::Steer {
+                                message_id: Uuid::new_v4(),
+                                text: "after progress".into(),
+                                attachments: Vec::new(),
+                                admission: borg_provider::provider::SteerAdmission::pending(),
+                                preempt: false,
+                                human: true,
+                                ack,
+                            })
+                            .await
+                            .unwrap();
+                        return std::future::pending().await;
+                    }
+                    assert!(
+                        request.messages.iter().any(|message| matches!(message,
+                            ModelMessage::User { content, .. } if content == "after progress"
+                        )),
+                        "instant steering must rearm after a completed response"
+                    );
                 }
                 return Ok(ModelTurnResult {
                     message: ModelMessage::assistant(Some("done".to_string()), None, None, vec![]),
@@ -11878,7 +12041,14 @@ mod tests {
     /// background message folded in.
     #[tokio::test]
     async fn steering_during_generation_preserves_context_and_tool_delivery() {
-        for (abort, human) in [(false, false), (true, false), (false, true)] {
+        use crate::CodingProvider::{Claude, Codex, OpenRouter};
+        for (abort, human, followups, provider) in [
+            (false, false, false, OpenRouter),
+            (true, false, false, OpenRouter),
+            (false, true, false, OpenRouter),
+            (false, true, true, Claude),
+            (false, true, true, Codex),
+        ] {
             let root = tempfile::tempdir().unwrap();
             let cwd = root.path().to_path_buf();
             let marker = cwd.join("ran.txt");
@@ -11897,6 +12067,7 @@ mod tests {
                 marker: marker.clone(),
                 abort,
                 human,
+                followups,
                 steer_message_id,
                 admission: admission.clone(),
                 acked: std::sync::Arc::clone(&acked),
@@ -11914,7 +12085,7 @@ mod tests {
                 message_id: Uuid::new_v4(),
                 context_generation: 0,
                 prior_native_context_tokens: None,
-                provider: crate::CodingProvider::OpenRouter,
+                provider,
                 provider_session_id: None,
                 provider_fork_turn_id: None,
                 cwd: cwd.clone(),
@@ -11941,7 +12112,7 @@ mod tests {
                     crate::session::SessionTodoTools::disconnected(),
                     None,
                     crate::LspService::new(&cwd),
-                    crate::CodingProvider::OpenRouter,
+                    provider,
                     session_id,
                     false,
                     None,
@@ -11973,7 +12144,9 @@ mod tests {
             let (events_tx, mut events_rx) = mpsc::channel(512);
             let outcome = tokio::time::timeout(
                 Duration::from_secs(30),
-                harness.run(turn, events_tx, Some(controls_rx)),
+                // The fake client is already bound; subscription account admission
+                // is independent of this model-loop regression.
+                harness.run_bound(turn, events_tx, Some(controls_rx), Vec::new()),
             )
             .await
             .expect("a queued steer must not stall the turn");
@@ -12016,16 +12189,16 @@ mod tests {
             assert_eq!(result.final_text, "done");
             assert_eq!(
                 rounds.load(std::sync::atomic::Ordering::SeqCst),
-                2,
-                "the steer is answered in a second round, not by replacing the first"
+                if followups { 4 } else { 2 },
+                "Claude follow-ups coalesce; OpenAI follow-ups keep preempting immediately"
             );
 
             // Externally visible: the command really ran, and exactly once. A
             // skipped or cancelled call would leave this empty.
             let ran = std::fs::read_to_string(&marker).unwrap_or_default();
             assert_eq!(
-                ran.lines().filter(|line| line.trim() == "ran").count(),
-                usize::from(!human),
+                ran,
+                if human { "" } else { "ran\n" },
                 "only background steering lets the generated tool execute"
             );
 
@@ -12050,6 +12223,21 @@ mod tests {
                 })
             };
             let steer = recorded("check the log first").expect("the steer has to be journaled");
+            if followups && provider == Claude {
+                for needle in ["opaque-test-signature", "follow-up one", "follow-up two"] {
+                    assert_eq!(
+                        journal
+                            .iter()
+                            .filter(|(kind, payload)| {
+                                kind == "native_model_message"
+                                    && payload.to_string().contains(needle)
+                            })
+                            .count(),
+                        1,
+                        "completed thinking and each follow-up are journaled once"
+                    );
+                }
+            }
             if human {
                 let partial = recorded("I checked the first result.")
                     .expect("preempted commentary is durable");

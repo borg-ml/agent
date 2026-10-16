@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.16.8)
 
+- Prevent repeated human follow-ups from continually restarting Claude
+  subscription thinking. The first steer remains instant; further input coalesces
+  until a response completes, before unstarted tools run. Stop remains immediate,
+  and OpenAI/Codex steering is unchanged.
+
 - Let the director opt a child into user-desktop `computer_use` access with
   `spawn_agent {desktop: true, ...}`. Children remain private-display-only by
   default; grants persist across resume, are not inherited, and do not bypass
