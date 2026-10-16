@@ -15,12 +15,22 @@ use support::{BORG, CANCELLED, Lane, describe, lines, position, traced};
 fn fifo_order_and_pending_identical_jobs_coalesce() {
     let lane = Lane::new();
     let trace = lane.root.join("trace");
-    let first = lane.submit(&lane.spec("a", &traced(&trace, "a", 0.3)));
+    let gate = tempfile::NamedTempFile::new_in(&lane.root).unwrap();
+    let first = lane.submit(&lane.spec(
+        "a",
+        &format!(
+            "echo 'start a' >> '{}'; while [ -e '{}' ]; do sleep 0.01; done; echo 'end a' >> '{}'",
+            trace.display(),
+            gate.path().display(),
+            trace.display()
+        ),
+    ));
     lane.until(|| lines(&trace).contains(&"start a".to_string()).then_some(()));
     let second = lane.submit(&lane.spec("b", &traced(&trace, "b", 0.12)));
     let joined = lane.submit(&lane.spec("b", &traced(&trace, "b", 0.12)));
     assert_eq!(second, joined, "a pending identical job must be joined");
     let third = lane.submit(&lane.spec("c", &traced(&trace, "c", 0.05)));
+    drop(gate);
     for id in [&first, &second, &third] {
         lane.wait(id, 0);
     }
@@ -49,17 +59,37 @@ fn shared_slots_overlap_and_exclusive_waits_for_them() {
     );
     assert!(out.status.success(), "{}", describe(&out));
     let trace = lane.root.join("overlap");
-    let job = |name: &str, access: Access| {
-        let mut spec = lane.spec(name, &traced(&trace, name, 0.24));
-        spec.lease.resources[0].access = access;
+    // Hold both shared slots explicitly; CLI startup can exceed a short sleep.
+    // Removing the guards releases the fake workloads even if an assertion fails.
+    let gate_a = tempfile::NamedTempFile::new_in(&lane.root).unwrap();
+    let gate_b = tempfile::NamedTempFile::new_in(&lane.root).unwrap();
+    let shared = |name: &str, gate: &std::path::Path| {
+        let script = format!(
+            "echo 'start {name}' >> '{}'; while [ -e '{}' ]; do sleep 0.01; done; echo 'end {name}' >> '{}'",
+            trace.display(),
+            gate.display(),
+            trace.display()
+        );
+        let mut spec = lane.spec(name, &script);
+        spec.lease.resources[0].access = Access::Shared { slots: 1 };
         lane.submit(&spec)
     };
-    let a = job("a", Access::Shared { slots: 1 });
-    let b = job("b", Access::Shared { slots: 1 });
-    let x = job("x", Access::Exclusive);
-    for id in [&a, &b, &x] {
-        lane.wait(id, 0);
-    }
+    let a = shared("a", gate_a.path());
+    let b = shared("b", gate_b.path());
+    let x = lane.submit(&lane.spec("x", &traced(&trace, "x", 0.01)));
+    lane.until(|| {
+        let events = lines(&trace);
+        (events.iter().any(|event| event == "start a")
+            && events.iter().any(|event| event == "start b"))
+        .then_some(())
+    });
+    assert!(!lines(&trace).iter().any(|event| event == "start x"));
+    drop(gate_a);
+    lane.wait(&a, 0);
+    assert!(!lines(&trace).iter().any(|event| event == "start x"));
+    drop(gate_b);
+    lane.wait(&b, 0);
+    lane.wait(&x, 0);
     let lines = lines(&trace);
     assert!(position(&lines, "start b") < position(&lines, "end a"));
     assert!(position(&lines, "start x") > position(&lines, "end a"));
