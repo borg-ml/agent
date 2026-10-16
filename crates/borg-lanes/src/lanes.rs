@@ -1765,10 +1765,10 @@ fn job_workload_gone(row: &LaneRecord) -> Option<String> {
     if cgroup.is_some_and(cgroup_populated) {
         return None;
     }
-    if let Some((pid, ticks)) = workload {
-        if proc_start_ticks(pid) == Some(ticks) {
-            return None;
-        }
+    if let Some((pid, ticks)) = workload
+        && proc_start_ticks(pid) == Some(ticks)
+    {
+        return None;
     }
     Some(format!(
         "job scope {} is empty and workload pid {} is gone",
@@ -3865,9 +3865,13 @@ mod tests {
             records: vec![orphan, live, unknown],
             ..Default::default()
         };
-        let dry = store.release_dead_service_claims(&mut state.clone(), true).unwrap();
+        let dry = store
+            .release_dead_service_claims(&mut state.clone(), true)
+            .unwrap();
         assert_eq!(dry.len(), 1);
-        let actions = store.release_dead_service_claims(&mut state, false).unwrap();
+        let actions = store
+            .release_dead_service_claims(&mut state, false)
+            .unwrap();
         assert_eq!(actions.len(), 1);
         assert!(actions[0].1.contains("job quarantine"));
         assert!(!state.records[0].quarantined);

@@ -5,6 +5,26 @@ Git comparison.
 
 ## Unreleased (since 0.16.7)
 
+### Actions
+
+- All tool actions now start synchronously and automatically continue in the
+  background after ten seconds, without cancellation or restart. Use
+  `async: true` to background immediately or `blocking: true` to wait until
+  completion; the two opt-ins cannot be combined.
+- Left-click a running foreground action to send it to the background
+  immediately, including a blocking action. Hover shows the shortcut;
+  background actions remain visible as running and subsequent clicks inspect
+  details rather than toggling them back. Completed watcher actions no longer
+  remain stuck showing “Running in background”.
+
+### Build reliability
+
+- Unblock queued lane work after recovery proves a quarantined job's workload
+  is gone. Jobs with insufficient evidence remain quarantined rather than
+  risking a second workload using the same resources.
+- Verify and retry native Claude payload installation in CI so incomplete
+  downloads do not leave release and platform builds without a working binary.
+
 ## 0.16.7 (2026-10-15)
 
 ### Claude subscription
