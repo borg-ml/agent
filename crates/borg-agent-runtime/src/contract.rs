@@ -1041,6 +1041,9 @@ pub struct ModelRoute {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct SessionCapabilities {
+    /// Restricted roles (for example scouts) cannot acquire team authority.
+    #[serde(default = "default_true")]
+    pub director_eligible: bool,
     pub multiplayer: bool,
     pub subagents: bool,
     pub autonomous_team: bool,
@@ -1119,6 +1122,7 @@ pub struct SessionCapabilities {
 impl Default for SessionCapabilities {
     fn default() -> Self {
         Self {
+            director_eligible: true,
             multiplayer: true,
             subagents: true,
             autonomous_team: true,
@@ -1333,6 +1337,8 @@ pub struct InactiveCapability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct EffectiveCapabilities {
+    #[serde(default = "default_true")]
+    pub director_eligible: bool,
     pub active: Vec<SessionCapability>,
     pub inactive: Vec<InactiveCapability>,
 }
@@ -1400,7 +1406,11 @@ impl SessionCapabilities {
                 });
             }
         }
-        EffectiveCapabilities { active, inactive }
+        EffectiveCapabilities {
+            director_eligible: self.director_eligible,
+            active,
+            inactive,
+        }
     }
 }
 
@@ -1700,6 +1710,12 @@ pub enum SessionConfigAction {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
 pub enum SubagentAction {
+    /// Human-only logical handoff, serialized by the physical host journal.
+    Promote {
+        request_id: Uuid,
+        target: String,
+        expected_epoch: u64,
+    },
     /// Ensure one deterministic, provider-pinned child exists. This is used
     /// by client-side persistent lanes such as `/claude` and `/gpt`; unlike
     /// `spawn_agent`, it creates an idle child without spending a turn on an
@@ -1791,7 +1807,8 @@ pub enum SubagentAction {
 impl SubagentAction {
     pub fn request_id(&self) -> Uuid {
         match self {
-            Self::Ensure { request_id, .. }
+            Self::Promote { request_id, .. }
+            | Self::Ensure { request_id, .. }
             | Self::Rotate { request_id, .. }
             | Self::List { request_id, .. }
             | Self::Message { request_id, .. }
@@ -1805,6 +1822,15 @@ impl SubagentAction {
             | Self::Approve { request_id, .. } => *request_id,
         }
     }
+}
+
+/// Logical team authority. Session ownership and stable team paths do not move.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TeamDirector {
+    pub session_id: Uuid,
+    pub path: String,
+    pub epoch: u64,
 }
 
 /// A watch armed by the agent (`watch` tool): a long-running command whose
@@ -1827,6 +1853,9 @@ pub struct WatchSummary {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
 pub enum SubagentControlOutcome {
+    Director {
+        director: TeamDirector,
+    },
     Listed {
         agents: Vec<crate::SubagentSnapshot>,
     },
@@ -2847,6 +2876,9 @@ pub enum SessionEventKind {
         activity: crate::SubagentActivityKind,
         agent: crate::SubagentSnapshot,
         event: Option<Box<SessionEvent>>,
+    },
+    TeamDirectorChanged {
+        director: TeamDirector,
     },
     SubagentControl {
         request_id: Uuid,

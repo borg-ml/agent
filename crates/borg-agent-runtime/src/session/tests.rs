@@ -24184,3 +24184,538 @@ async fn reverted_session_waits_for_a_message_before_continuing_its_goal() {
     actor.abort();
     scratch.discard().await;
 }
+
+// A stale tool catalog/physical ancestor must not retain control after a human
+// handoff, and replay must not quietly crown the physical host again. Exercise
+// the real journaled slash action and existing child actors, not a role label.
+#[tokio::test]
+async fn promote_moves_live_authority_and_restores_without_moving_session_state() {
+    for stopped_target in [false, true] {
+        let directory = tempdir().unwrap();
+        let root = Uuid::new_v4();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        store.create_session(root).await.unwrap();
+        let launch = LaunchSession {
+            request_id: Uuid::new_v4(),
+            cwd: directory.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-6.1-sol".into()),
+            effort: Some("high".into()),
+            fast: Some(false),
+            ultrafast: None,
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::Manual,
+            name: None,
+            initial_prompt: None,
+            capabilities: crate::SessionCapabilities {
+                multiplayer: false,
+                provider_capabilities: test_provider_capabilities(),
+                ..Default::default()
+            },
+            subagent_concurrency_limit: None,
+            extension_skill_roots: Vec::new(),
+            team_policy: None,
+        };
+        store
+            .append(SessionEvent::new(
+                root,
+                0,
+                SessionEventKind::EffectiveCapabilitiesUpdated {
+                    capabilities: launch.capabilities.effective(),
+                },
+            ))
+            .await
+            .unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let executor: Arc<dyn AgentTurnExecutor> = Arc::new(RecordingExecutor {
+            seen: seen.clone(),
+            called: Arc::new(Notify::new()),
+        });
+        let team = SubagentCoordinator::new_with_store_and_executor(
+            directory.path(),
+            root,
+            launch.clone(),
+            4,
+            executor.clone(),
+            store.clone(),
+        )
+        .unwrap();
+        let mut activity = team.subscribe();
+        let sibling = team
+            .ensure_sidecar("sibling", CodingProvider::Codex, launch.model.clone(), None)
+            .await
+            .unwrap();
+        let successor: crate::SubagentSnapshot = serde_json::from_value(
+            team.call_tool_as(
+                sibling.session_id,
+                "spawn_agent",
+                json!({"task_name":"successor", "message":"Remember this existing conversation."}),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if team.get(successor.session_id).await.unwrap().status
+                    == crate::SubagentStatus::Ready
+                    && team.get(sibling.session_id).await.unwrap().status
+                        == crate::SubagentStatus::Ready
+                {
+                    break;
+                }
+                activity.recv().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        if stopped_target {
+            let mut goal = SessionGoal::new("Keep this existing goal paused".into(), None);
+            goal.status = GoalStatus::Paused;
+            store
+                .append(SessionEvent::new(
+                    successor.session_id,
+                    0,
+                    SessionEventKind::GoalUpdated { goal },
+                ))
+                .await
+                .unwrap();
+            team.stop(&successor.task_name).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while team.get(successor.session_id).await.unwrap().status
+                    != crate::SubagentStatus::Stopped
+                {
+                    activity.recv().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let executions_before_promotion = seen.lock().unwrap().len();
+        for id in [successor.session_id, sibling.session_id] {
+            store
+                .append(SessionEvent::new(
+                    root,
+                    0,
+                    SessionEventKind::SubagentActivity {
+                        activity: SubagentActivityKind::Updated,
+                        agent: team.get(id).await.unwrap(),
+                        event: None,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        let before = store.state(successor.session_id).await.unwrap();
+        let sibling_before = store.state(sibling.session_id).await.unwrap();
+        let mut journal = RuntimeSessionStore::new(store.clone(), Vec::new(), true);
+        let (events, mut received) = mpsc::channel(32);
+        apply_subagent_action(
+            &mut journal,
+            &events,
+            root,
+            None,
+            SubagentAction::Promote {
+                request_id: Uuid::new_v4(),
+                target: successor.task_name.clone(),
+                expected_epoch: 0,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                received.recv().await.unwrap().kind,
+                SessionEventKind::SubagentControl {
+                    outcome: crate::SubagentControlOutcome::Failed { .. },
+                    ..
+                }
+            ),
+            "unavailable team controls must refuse, not panic the host"
+        );
+        // Epoch zero clients retain the original physical-root default.
+        assert_eq!(team.director().session_id, root);
+        for target in ["/root/missing".to_string(), Uuid::new_v4().to_string()] {
+            apply_subagent_action(
+                &mut journal,
+                &events,
+                root,
+                Some(&team),
+                SubagentAction::Promote {
+                    request_id: Uuid::new_v4(),
+                    target,
+                    expected_epoch: 0,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(team.director().epoch, 0);
+            assert!(matches!(
+                received.recv().await.unwrap().kind,
+                SessionEventKind::SubagentControl {
+                    outcome: crate::SubagentControlOutcome::Failed { .. },
+                    ..
+                }
+            ));
+        }
+        // Restricted eligibility is persisted, not inferred from model or permission mode.
+        let mut restricted = launch.capabilities.effective();
+        restricted.director_eligible = false;
+        store
+            .append(SessionEvent::new(
+                sibling.session_id,
+                0,
+                SessionEventKind::EffectiveCapabilitiesUpdated {
+                    capabilities: restricted,
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(team.prepare_promotion(&sibling.task_name, 0).await.is_err());
+        store
+            .append(SessionEvent::new(
+                sibling.session_id,
+                0,
+                SessionEventKind::EffectiveCapabilitiesUpdated {
+                    capabilities: launch.capabilities.effective(),
+                },
+            ))
+            .await
+            .unwrap();
+        let dispatcher = |actor| {
+            crate::AgentToolDispatcher::new(
+                SessionGoalTools::disconnected(),
+                SessionTodoTools::disconnected(),
+                Some(team.clone()),
+                crate::LspService::new(directory.path()),
+                launch.provider,
+                actor,
+                true,
+                None,
+                None,
+                directory.path().to_path_buf(),
+                None,
+                None,
+                Some(store.clone()),
+                Vec::new(),
+                None,
+                crate::native_process::ProcessManager::default(),
+                PermissionMode::Manual,
+            )
+        };
+        let old_dispatcher = dispatcher(root);
+        let promoted_dispatcher = dispatcher(successor.session_id);
+        let has_consult = |dispatcher: &crate::AgentToolDispatcher| {
+            dispatcher
+                .specs()
+                .iter()
+                .any(|spec| spec["name"] == "consult_model")
+        };
+        assert!(has_consult(&old_dispatcher));
+        assert!(!has_consult(&promoted_dispatcher));
+        assert!(
+            promoted_dispatcher
+                .subscription_mcp_specs(false)
+                .iter()
+                .any(|spec| spec["name"] == "consult_model"),
+            "the actual cached MCP tools/list must already include the future director's tools"
+        );
+        apply_subagent_action(
+            &mut journal,
+            &events,
+            root,
+            Some(&team),
+            SubagentAction::Promote {
+                request_id: Uuid::new_v4(),
+                target: successor.task_name.clone(),
+                expected_epoch: 0,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!has_consult(&old_dispatcher));
+        assert!(has_consult(&promoted_dispatcher));
+        assert_eq!(
+            promoted_dispatcher.parent_session_id().await,
+            Some(sibling.session_id),
+            "provider/access physical-parent attribution must not move with authority"
+        );
+        assert_eq!(old_dispatcher.parent_session_id().await, None);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            executions_before_promotion,
+            "promotion must not start a model request"
+        );
+        let denied = old_dispatcher
+            .call("consult_peer", json!({"prompt":"old catalog call"}))
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("authority"));
+        assert!(team.require_director(root).is_err());
+        team.require_director(successor.session_id).unwrap();
+        assert_eq!(team.director().epoch, 1);
+        loop {
+            match received.recv().await.unwrap().kind {
+                SessionEventKind::TeamDirectorChanged { .. } => break,
+                SessionEventKind::SubagentActivity { .. } => (),
+                event => panic!("unexpected handoff event: {event:?}"),
+            }
+        }
+        assert!(matches!(
+            received.recv().await.unwrap().kind,
+            SessionEventKind::SubagentControl {
+                outcome: crate::SubagentControlOutcome::Director { .. },
+                ..
+            }
+        ));
+        assert!(
+            team.prepare_promotion(&sibling.task_name, 0).await.is_err(),
+            "stale epoch must not replace a newer handoff"
+        );
+        assert_eq!(
+            team.prepare_promotion(&successor.task_name, 1)
+                .await
+                .unwrap(),
+            team.director(),
+            "already-director is a no-op"
+        );
+        // Real execution as the old ancestor fails, while the new director controls a sibling.
+        let forbidden = team
+            .call_tool_as(
+                root,
+                "interrupt_agent",
+                json!({"target": successor.task_name}),
+            )
+            .await
+            .unwrap_err();
+        assert!(forbidden.to_string().contains("director"));
+        let forbidden = team
+            .call_tool_as(
+                root,
+                "configure_agent",
+                json!({"target": successor.task_name, "effort": "medium"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(forbidden.to_string().contains("director"));
+        let forbidden = team
+            .call_tool_as(
+                root,
+                "control_agent_goal",
+                json!({"target": successor.task_name, "goal_action": {"type":"clear"}}),
+            )
+            .await
+            .unwrap_err();
+        assert!(forbidden.to_string().contains("director"));
+        assert!(
+            team.call_tool_as(
+                sibling.session_id,
+                "interrupt_agent",
+                json!({"target": successor.task_name})
+            )
+            .await
+            .is_err(),
+            "an ordinary physical parent cannot interrupt the new director"
+        );
+        assert!(
+            team.call_tool_as(
+                sibling.session_id,
+                "control_agent_goal",
+                json!({"target": successor.task_name, "goal_action":{"type":"clear"}})
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            team.call_tool_as(
+                root,
+                "interrupt_agent",
+                json!({"target": sibling.task_name})
+            )
+            .await
+            .is_err(),
+            "the demoted physical root must not retain umbrella team authority"
+        );
+        let owned: crate::SubagentSnapshot = serde_json::from_value(
+            team.call_tool_as(
+                sibling.session_id,
+                "spawn_agent",
+                json!({"task_name":"owned", "message":"Ordinary worker-owned child."}),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        team.call_tool_as(
+            sibling.session_id,
+            "control_agent_goal",
+            json!({"target": owned.task_name, "goal_action":{"type":"clear"}}),
+        )
+        .await
+        .unwrap();
+        team.call_tool_as(
+            sibling.session_id,
+            "interrupt_agent",
+            json!({"target": owned.task_name}),
+        )
+        .await
+        .unwrap();
+        let observed = team
+            .call_tool_as(successor.session_id, "wait_agent", json!({"timeout_ms": 1}))
+            .await
+            .unwrap();
+        assert!(
+            observed["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|agent| agent["session_id"] == sibling.session_id.to_string()),
+            "a promoted director must observe the existing team, not only physical children"
+        );
+        team.call_tool_as(
+            successor.session_id,
+            "configure_agent",
+            json!({"target": sibling.task_name, "effort": "medium"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .state(sibling.session_id)
+                .await
+                .unwrap()
+                .configuration
+                .unwrap()
+                .effort
+                .as_deref(),
+            Some("medium")
+        );
+        team.stop(&sibling.task_name).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while team.get(sibling.session_id).await.unwrap().status
+                != crate::SubagentStatus::Stopped
+            {
+                activity.recv().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            team.prepare_promotion(&sibling.task_name, 1).await.is_ok(),
+            "regular stopped agents remain eligible"
+        );
+        store
+            .append(SessionEvent::new(
+                sibling.session_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Failed,
+                    detail: Some("failed eligibility fixture".into()),
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(
+            team.prepare_promotion(&sibling.task_name, 1).await.is_err(),
+            "failed agents remain ineligible"
+        );
+        let (host_commands, mut host_rx) = mpsc::channel(4);
+        team.attach_root_commands(host_commands);
+        apply_subagent_action(
+            &mut journal,
+            &events,
+            root,
+            Some(&team),
+            SubagentAction::Stop {
+                request_id: Uuid::new_v4(),
+                target: "/root".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            received.recv().await.unwrap().kind,
+            SessionEventKind::SubagentControl {
+                outcome: crate::SubagentControlOutcome::Accepted { .. },
+                ..
+            }
+        ));
+        assert!(
+            matches!(host_rx.recv().await, Some(HostCommand::Interrupt { session_id }) if session_id == root),
+            "ordinary host-member stop must not send team exit"
+        );
+        assert_eq!(
+            team.get(successor.session_id).await.unwrap().status,
+            if stopped_target {
+                crate::SubagentStatus::Stopped
+            } else {
+                crate::SubagentStatus::Ready
+            }
+        );
+        let after = store.state(successor.session_id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&before.configuration).unwrap(),
+            serde_json::to_value(&after.configuration).unwrap()
+        );
+        assert_eq!(before.provider_session_id, after.provider_session_id);
+        assert_eq!(before.context_generation, after.context_generation);
+        assert_eq!(
+            serde_json::to_value(&before.goal).unwrap(),
+            serde_json::to_value(&after.goal).unwrap()
+        );
+        assert_eq!(before.todos, after.todos);
+        assert_eq!(
+            before.latest_sequence, after.latest_sequence,
+            "promotion must not rewrite the successor journal"
+        );
+        assert_eq!(
+            sibling_before
+                .configuration
+                .as_ref()
+                .unwrap()
+                .permission_mode,
+            after.configuration.as_ref().unwrap().permission_mode
+        );
+        assert!(team.role_prompt(root).contains("ordinary team member"));
+        assert!(
+            team.role_prompt(successor.session_id)
+                .contains("user-facing voice")
+        );
+        // Rebuild from canonical recovery: pointer and authority survive an owner restart.
+        let recovery = store.recovery(root).await.unwrap();
+        assert!(
+            recovery
+                .subagent_events
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::TeamDirectorChanged { .. }))
+        );
+        team.stop_all().await;
+        let restored = SubagentCoordinator::new_with_store_and_executor(
+            directory.path(),
+            root,
+            launch,
+            4,
+            executor,
+            store.clone(),
+        )
+        .unwrap();
+        restored
+            .restore_from_events(&recovery.subagent_events)
+            .await
+            .unwrap();
+        assert_eq!(restored.director(), team.director());
+        restored.require_director(successor.session_id).unwrap();
+        assert!(restored.require_director(root).is_err());
+        assert_eq!(
+            restored
+                .prepare_promotion("/root", 1)
+                .await
+                .unwrap()
+                .session_id,
+            root,
+            "the physical host remains eligible for a later human promotion"
+        );
+        scratch.discard().await;
+    }
+}

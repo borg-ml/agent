@@ -258,8 +258,25 @@ pub struct ViewConfiguration {
     pub permission_mode: borg_agent_runtime::PermissionMode,
     pub response_language: borg_agent_runtime::ResponseLanguage,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ViewDirector {
+    pub session_id: String,
+    pub path: String,
+    pub epoch: String,
+}
+impl From<&borg_agent_runtime::TeamDirector> for ViewDirector {
+    fn from(director: &borg_agent_runtime::TeamDirector) -> Self {
+        Self {
+            session_id: director.session_id.to_string(),
+            path: director.path.clone(),
+            epoch: director.epoch.to_string(),
+        }
+    }
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize, TS)]
 pub struct Meta {
+    #[serde(default)]
+    pub director: Option<ViewDirector>,
     pub configuration: Option<ViewConfiguration>,
     pub status_detail: Option<String>,
     pub waiting_on_watchers: bool,

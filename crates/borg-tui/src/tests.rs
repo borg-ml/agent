@@ -21758,3 +21758,129 @@ fn retained_live_history_compacts_text_without_changing_replay() {
         retained.len()
     );
 }
+
+// A promotion must change the human's default stream, not just the roster badge.
+// Exercise input and live child delivery: type checking cannot catch a prompt
+// accidentally sent to the former director or a detached child transcript.
+#[tokio::test]
+#[ignore = "requires a PTY; run under script"]
+async fn promote_focused_agent_rebinds_default_without_replacing_the_host() {
+    let root = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        root,
+        directory.path().into(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    let now = Utc::now();
+    let agent = SubagentSnapshot {
+        session_id: child,
+        parent_session_id: root,
+        task_name: "/root/worker".into(),
+        status: SubagentStatus::Stopped,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        fast: false,
+        ultrafast: false,
+        cwd: directory.path().into(),
+        created_at: now,
+        updated_at: now,
+        detail: None,
+        final_text: None,
+        usage: Default::default(),
+        interrupted_by: None,
+    };
+    terminal.seed_team_roster(&[agent.clone()]);
+    terminal.focus_child_transcript(child);
+    terminal.composer.replace_text("/promote");
+    assert!(
+        matches!(terminal.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap(),
+        UiAction::PromoteAgent { target, expected_epoch: 0 } if target == child.to_string())
+    );
+
+    terminal.apply_session_event(&SessionEvent::new(
+        root,
+        1,
+        SessionEventKind::TeamDirectorChanged {
+            director: borg_remote::TeamDirector {
+                session_id: child,
+                path: agent.task_name.clone(),
+                epoch: 1,
+            },
+        },
+    ));
+    assert_eq!(terminal.session_id, root);
+    assert_eq!(terminal.focused_child(), Some(child));
+    let message_id = Uuid::new_v4();
+    terminal.apply_session_event(&SessionEvent::new(
+        root,
+        2,
+        SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Updated,
+            agent,
+            event: Some(Box::new(SessionEvent::new(
+                child,
+                1,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::Assistant,
+                    text: "same child stream".into(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ))),
+        },
+    ));
+    assert!(terminal.transcript.messages.contains_key(&message_id));
+    terminal.focus_host_transcript();
+    assert_eq!(terminal.focused_child(), None);
+    assert!(!terminal.transcript.messages.contains_key(&message_id));
+    terminal.composer.replace_text("/main");
+    assert!(matches!(
+        terminal
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap(),
+        UiAction::None
+    ));
+    assert!(terminal.transcript.messages.contains_key(&message_id));
+    terminal.composer.replace_text("next human message");
+    assert!(
+        matches!(terminal.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap(),
+        UiAction::Submit { target: Some(target), .. } if target == child)
+    );
+    terminal.composer.replace_text("/promote");
+    assert!(
+        matches!(terminal.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap(),
+        UiAction::PromoteAgent { target, expected_epoch: 1 } if target == child.to_string())
+    );
+    assert!(matches!(terminal.team_command_action("/promote missing"),
+        Some(UiAction::PromoteAgent { target, expected_epoch: 1 }) if target == "missing"));
+    terminal.apply_session_event(&SessionEvent::new(
+        root,
+        3,
+        SessionEventKind::SubagentControl {
+            request_id: Uuid::new_v4(),
+            outcome: borg_remote::SubagentControlOutcome::Failed {
+                message: "unknown target".into(),
+            },
+        },
+    ));
+    assert_eq!(terminal.focused_child(), Some(child));
+    assert_eq!(terminal.director_target(), Some(child));
+    assert!(
+        terminal
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("unknown target"))
+    );
+    terminal.focus_host_transcript();
+    assert!(matches!(
+        terminal.team_command_action("/promote"),
+        Some(UiAction::PromoteAgent { target, expected_epoch: 1 }) if target == root.to_string()
+    ));
+}

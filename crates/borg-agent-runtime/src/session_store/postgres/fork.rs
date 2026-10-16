@@ -61,7 +61,7 @@ impl PostgresSessionStore {
                        sequence, event_json, event_body, dict_id \
                        from session_events \
                        where session_id = $1 and sequence <= $2 \
-                         and event_kind = 'subagent_activity' \
+                         and event_kind in ('subagent_activity', 'team_director_changed') \
                        order by subagent_session_id, sequence desc) latest \
                  order by latest.sequence",
             )

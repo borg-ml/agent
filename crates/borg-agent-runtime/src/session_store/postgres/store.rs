@@ -2088,6 +2088,11 @@ impl SessionStore for PostgresSessionStore {
             if let SessionEventKind::SubagentActivity { agent, .. } = &mut event.kind {
                 agent.parent_session_id = session_id;
             }
+            if let SessionEventKind::TeamDirectorChanged { director } = &mut event.kind {
+                if director.path == "/root" {
+                    director.session_id = session_id;
+                }
+            }
         }
         Ok(events)
     }

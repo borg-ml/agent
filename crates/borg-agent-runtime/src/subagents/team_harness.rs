@@ -206,6 +206,10 @@ fn validate_goal_action(
 
 impl SubagentCoordinator {
     async fn authorize_inspection(&self, actor: Uuid, target: Uuid) -> Result<()> {
+        if self.is_director(actor) {
+            self.table.lock().await.task_name(target)?;
+            return Ok(());
+        }
         ensure!(
             self.store.is_descendant(actor, target).await?,
             "session is not an owned descendant of the caller"
@@ -221,7 +225,11 @@ impl SubagentCoordinator {
     ) -> Result<Value> {
         let args: AgentGoalArgs = serde_json::from_value(arguments)?;
         let id = self.table.lock().await.resolve(&args.target)?;
-        self.authorize_inspection(actor, id).await?;
+        if change {
+            self.authorize_control(actor, id).await?;
+        } else {
+            self.authorize_inspection(actor, id).await?;
+        }
         if !change {
             ensure!(
                 args.goal_action.is_none(),
@@ -256,7 +264,15 @@ impl SubagentCoordinator {
         let limit = args.limit.unwrap_or(50).clamp(1, 100);
         let mut ids = self
             .store
-            .descendant_sessions(actor, args.after, limit + 1)
+            .descendant_sessions(
+                if self.is_director(actor) {
+                    self.root_session_id
+                } else {
+                    actor
+                },
+                args.after,
+                limit + 1,
+            )
             .await?;
         let more = ids.len() > limit;
         ids.truncate(limit);
@@ -513,7 +529,7 @@ impl SubagentCoordinator {
                 }
                 "configure_agent" => {
                     ensure!(
-                        actor == self.root_session_id,
+                        self.is_director(actor),
                         "only the director may configure child agents"
                     );
                     ensure!(

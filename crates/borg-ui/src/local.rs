@@ -67,7 +67,7 @@ impl LocalSessionWorker {
                         Ok(Some(client)) => {
                             let owner = match ensure_session_owner(
                                 &client.sessions_dir,
-                                client.view().session_id,
+                                client.root_session_id,
                             )
                             .await
                             {
@@ -100,7 +100,6 @@ impl LocalSessionWorker {
                     if ready_tx.send(Ok(true)).is_err() {
                         return;
                     }
-                    let mut root_session_id = client.view().session_id;
                     if let Ok(sessions) = client.list_sessions().await {
                         let _ = update_tx.send_blocking(LocalSessionUpdate::Sessions(sessions));
                     }
@@ -128,7 +127,6 @@ impl LocalSessionWorker {
                                         match launch_new_session_owner().await {
                                             Ok((next, next_owner)) => {
                                                 _owner = next_owner;
-                                                root_session_id = next.view().session_id;
                                                 client = next;
                                                 if let Ok(sessions) = client.list_sessions().await {
                                                     let _ = update_tx.send_blocking(
@@ -160,7 +158,6 @@ impl LocalSessionWorker {
                                                     }
                                                 }
                                                 client = next;
-                                                root_session_id = session_id;
                                                 if let Ok(sessions) = client.list_sessions().await {
                                                     let _ = update_tx.send_blocking(
                                                         LocalSessionUpdate::Sessions(sessions),
@@ -173,19 +170,7 @@ impl LocalSessionWorker {
                                         }
                                     }
                                     FrontendCommand::FocusAgent(target) => {
-                                        match LocalSessionClient::open_for_root(
-                                            target.unwrap_or(root_session_id),
-                                            root_session_id,
-                                        )
-                                        .await
-                                        {
-                                            Ok(Some(next)) => {
-                                                client = next;
-                                                Ok(true)
-                                            }
-                                            Ok(None) => Ok(false),
-                                            Err(error) => Err(error),
-                                        }
+                                        client.focus_session(target).await
                                     }
                                     FrontendCommand::LoadOlderHistory => {
                                         client.load_older_history().await
@@ -296,6 +281,11 @@ impl LocalSessionWorker {
                                 {
                                     return;
                                 }
+                            }
+                        }
+                        for notice in std::mem::take(&mut client.notices) {
+                            if update_tx.send_blocking(LocalSessionUpdate::Error(notice)).is_err() {
+                                return;
                             }
                         }
                     }
@@ -470,6 +460,7 @@ pub struct LocalSessionClient {
     presence: Option<tokio::net::UnixStream>,
     timeline: TimelineProjector,
     recalled_prompts: Vec<(String, Vec<PathBuf>)>,
+    notices: Vec<String>,
     composer_history: Arc<Vec<String>>,
 }
 
@@ -493,22 +484,11 @@ impl LocalSessionClient {
                 None => return Ok(None),
             },
         };
-        Self::open_from_store(store, sessions_dir, session_id, session_id).await
-    }
-
-    async fn open_for_root(session_id: Uuid, root_session_id: Uuid) -> Result<Option<Self>> {
-        let sessions_dir = default_host_config_path()
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("sessions");
-        let store = Arc::clone(
-            borg_remote::session_store::factory::open(
-                &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
-            )
-            .await?
-            .session(),
-        );
-        Self::open_from_store(store, sessions_dir, session_id, root_session_id).await
+        let mut client = Self::open_from_store(store, sessions_dir, session_id, session_id).await?;
+        if let Some(client) = client.as_mut() {
+            client.focus_session(None).await?;
+        }
+        Ok(client)
     }
 
     async fn open_from_store(
@@ -544,6 +524,7 @@ impl LocalSessionClient {
             view.overlay_agent_plan(&root_state);
             root_state
         };
+        view.state.team_director = root_state.team_director.clone();
         let fork_team = store.fork_team_events(root_session_id).await?;
         let mut team = store
             .recovery_parts(root_session_id, RecoveryParts::SUBAGENTS)
@@ -582,12 +563,76 @@ impl LocalSessionClient {
             presence: None,
             timeline,
             recalled_prompts: Vec::new(),
+            notices: Vec::new(),
             composer_history: Arc::new(composer_history),
         };
         client.maintain_presence().await;
         client.refresh_live().await?;
         client.rebuild_history();
         Ok(Some(client))
+    }
+
+    async fn focus_session(&mut self, target: Option<Uuid>) -> Result<bool> {
+        let target = target.unwrap_or_else(|| {
+            self.view
+                .state
+                .team_director
+                .as_ref()
+                .map_or(self.root_session_id, |director| director.session_id)
+        });
+        if target == self.view.session_id {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            target == self.root_session_id
+                || self
+                    .view
+                    .agents
+                    .iter()
+                    .any(|agent| agent.session_id == target),
+            "no team member matches {target}"
+        );
+        let mut state = self.store.state(target).await?;
+        state.team_director = self.view.state.team_director.clone();
+        self.view.session_id = target;
+        self.view.state = state;
+        if target != self.root_session_id {
+            self.view
+                .overlay_agent_plan(&self.store.state(self.root_session_id).await?);
+        }
+        self.view.goal = self.view.state.goal.clone();
+        self.view.cwd = self
+            .view
+            .state
+            .configuration
+            .as_ref()
+            .map(|config| config.cwd.clone())
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.durable_history = self
+            .store
+            .events_after(
+                target,
+                self.view.state.latest_sequence.saturating_sub(2_000),
+                2_000,
+            )
+            .await?;
+        self.timeline = TimelineProjector::from_events(&self.durable_history);
+        self.composer_history = Arc::new(
+            self.store
+                .recent_user_messages(target, 100)
+                .await?
+                .into_iter()
+                .filter_map(|event| match event.kind {
+                    SessionEventKind::Message { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect(),
+        );
+        self.live_events.clear();
+        self.live_revision = 0;
+        self.refresh_live().await?;
+        self.rebuild_history();
+        Ok(true)
     }
 
     pub fn view(&self) -> &SessionView {
@@ -614,16 +659,35 @@ impl LocalSessionClient {
             .events_after(self.view.session_id, self.view.state.latest_sequence, 1_024)
             .await?;
         let mut changed = !events.is_empty();
-        if self.view.session_id == self.root_session_id {
-            merge_team_events(&mut self.view.agents, &mut self.team_sequence, &events);
+        let root_events = if self.view.session_id == self.root_session_id {
+            events.clone()
         } else {
-            let root_events = self
-                .store
+            self.store
                 .events_after(self.root_session_id, self.team_sequence, 1_024)
-                .await?;
-            changed |=
-                merge_team_events(&mut self.view.agents, &mut self.team_sequence, &root_events);
-        }
+                .await?
+        };
+        changed |= merge_team_events(&mut self.view.agents, &mut self.team_sequence, &root_events);
+        let director = root_events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::TeamDirectorChanged { director } => Some(director.clone()),
+                _ => None,
+            })
+            .max_by_key(|director| director.epoch)
+            .filter(|director| {
+                self.view
+                    .state
+                    .team_director
+                    .as_ref()
+                    .is_none_or(|current| current.epoch < director.epoch)
+            });
+        let control_error = root_events.iter().find_map(|event| match &event.kind {
+            SessionEventKind::SubagentControl {
+                outcome: borg_remote::SubagentControlOutcome::Failed { message },
+                ..
+            } => Some(message.clone()),
+            _ => None,
+        });
         for event in events {
             if event.kind.is_recallable_user_message()
                 && let SessionEventKind::Message { text, .. } = &event.kind
@@ -660,6 +724,15 @@ impl LocalSessionClient {
             changed |= self
                 .view
                 .overlay_agent_plan(&self.store.state(self.root_session_id).await?);
+        }
+        if let Some(director) = director {
+            self.view.state.team_director = Some(director.clone());
+            self.focus_session(Some(director.session_id)).await?;
+            changed = true;
+        }
+        if let Some(message) = control_error {
+            self.notices
+                .push(format!("Agent action failed · {message}"));
         }
         if !changed {
             return Ok(false);
@@ -782,6 +855,25 @@ impl LocalSessionClient {
     }
 
     pub async fn dispatch(&self, command: FrontendCommand) -> Result<()> {
+        let (command, target) = match command {
+            FrontendCommand::SubmitDirectorPrompt {
+                text,
+                attachments,
+                delivery,
+            } => (
+                FrontendCommand::SubmitPrompt {
+                    text,
+                    attachments,
+                    delivery,
+                },
+                self.view
+                    .state
+                    .team_director
+                    .as_ref()
+                    .map_or(self.root_session_id, |director| director.session_id),
+            ),
+            command => (command, self.view.session_id),
+        };
         let command = match command {
             FrontendCommand::ApplyTodo(action) if self.view.session_id != self.root_session_id => {
                 FrontendCommand::ApplyAgentTodo {
@@ -791,10 +883,13 @@ impl LocalSessionClient {
             }
             command => command,
         };
-        if self.view.session_id != self.root_session_id
-            && !matches!(&command, FrontendCommand::ApplyAgentTodo { .. })
+        if target != self.root_session_id
+            && !matches!(
+                &command,
+                FrontendCommand::ApplyAgentTodo { .. } | FrontendCommand::PromoteAgent(_)
+            )
         {
-            return self.dispatch_to_child(command).await;
+            return self.dispatch_to_child(command, target).await;
         }
         let session_id = self.root_session_id;
         let command = match command {
@@ -898,7 +993,22 @@ impl LocalSessionClient {
                 command,
                 arguments,
             },
-            FrontendCommand::ControlPeer { .. } => unreachable!(),
+            FrontendCommand::ControlPeer { .. } | FrontendCommand::SubmitDirectorPrompt { .. } => {
+                unreachable!()
+            }
+            FrontendCommand::PromoteAgent(target) => HostCommand::Subagent {
+                session_id,
+                action: SubagentAction::Promote {
+                    request_id: Uuid::new_v4(),
+                    target: target.unwrap_or_else(|| self.view.session_id.to_string()),
+                    expected_epoch: self
+                        .view
+                        .state
+                        .team_director
+                        .as_ref()
+                        .map_or(0, |director| director.epoch),
+                },
+            },
             FrontendCommand::SetModel { provider, model } => HostCommand::Configure {
                 session_id,
                 action: SessionConfigAction::SetProvider {
@@ -948,9 +1058,13 @@ impl LocalSessionClient {
         .await
     }
 
-    async fn dispatch_to_child(&self, command: FrontendCommand) -> Result<()> {
+    async fn dispatch_to_child(
+        &self,
+        command: FrontendCommand,
+        target_session_id: Uuid,
+    ) -> Result<()> {
         let session_id = self.root_session_id;
-        let target = self.view.session_id.to_string();
+        let target = target_session_id.to_string();
         let request_id = Uuid::new_v4();
         let action = match command {
             FrontendCommand::SubmitPrompt {
@@ -961,7 +1075,7 @@ impl LocalSessionClient {
                 let message_id = Uuid::new_v4();
                 self.store
                     .admit_prompt(SessionEvent::new(
-                        self.view.session_id,
+                        target_session_id,
                         0,
                         SessionEventKind::Message {
                             message_id,

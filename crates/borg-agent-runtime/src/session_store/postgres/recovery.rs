@@ -62,14 +62,21 @@ fn recovery_scan_predicate(parts: RecoveryParts, alias: &str) -> String {
     }
     if parts.subagents {
         kinds.push("'subagent_activity'");
+        kinds.push("'team_director_changed'");
         kinds.push("'agent_message_received'");
     }
     match kinds.as_slice() {
         [] => "false".to_string(),
         // Older receipt rows lack the recovery flag; kind selection also lets
         // roster-only callers avoid walking the whole context index.
-        ["'subagent_activity'", "'agent_message_received'"] => {
-            format!("{alias}event_kind in ('subagent_activity', 'agent_message_received')")
+        [
+            "'subagent_activity'",
+            "'team_director_changed'",
+            "'agent_message_received'",
+        ] => {
+            format!(
+                "{alias}event_kind in ('subagent_activity', 'team_director_changed', 'agent_message_received')"
+            )
         }
         kinds => format!(
             "({alias}recovery_relevant or {alias}event_kind = 'agent_message_received') and {alias}event_kind in ({})",
@@ -303,7 +310,7 @@ impl PostgresSessionStore {
                 "select e.event_json, e.event_body, e.dict_id from session_events e \
                  where e.session_id = $1 and e.sequence < $2 \
                    and ((e.event_kind = 'subagent_activity' and {LATEST_SUBAGENT_ROWS}) \
-                     or e.event_kind = 'agent_message_received') \
+                     or e.event_kind in ('agent_message_received', 'team_director_changed')) \
                  order by e.sequence"
             );
             let rows = sqlx::query(sqlx::AssertSqlSafe(sql))

@@ -718,6 +718,37 @@ mod tests {
 
     #[test]
     fn submission_parser_keeps_commands_out_of_prompts() {
+        assert!(
+            matches!(parse_submission("/director report", CodingProvider::Codex, PromptDelivery::Queue, &[]),
+            Ok(FrontendCommand::SubmitDirectorPrompt { text, delivery: PromptDelivery::Queue, .. }) if text == "report")
+        );
+        for (command, target) in [
+            ("/promote", None),
+            ("/promote /root/worker", Some("/root/worker")),
+        ] {
+            assert!(
+                matches!(parse_submission(command, CodingProvider::Codex, PromptDelivery::Steer, &[]),
+                Ok(FrontendCommand::PromoteAgent(actual)) if actual.as_deref() == target)
+            );
+        }
+        assert!(
+            parse_submission(
+                "/promote one two",
+                CodingProvider::Codex,
+                PromptDelivery::Steer,
+                &[]
+            )
+            .is_err()
+        );
+        assert!(
+            parse_submission(
+                "/promoted",
+                CodingProvider::Codex,
+                PromptDelivery::Steer,
+                &[]
+            )
+            .is_err()
+        );
         assert!(matches!(
             parse_submission(
                 "/permission manual",

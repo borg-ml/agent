@@ -3726,6 +3726,13 @@ impl TranscriptCore {
                 self.team_report_sources
                     .insert(event.id, (*message_id, *sender_id, sender_name.clone()));
             }
+            SessionEventKind::TeamDirectorChanged { director } => {
+                if self.meta.director.as_ref().is_none_or(|current| {
+                    current.epoch.parse::<u64>().unwrap_or(0) < director.epoch
+                }) {
+                    self.meta.director = Some(director.into());
+                }
+            }
             SessionEventKind::StatusChanged { status, detail } => {
                 self.meta.status = Some(*status);
                 self.meta.status_detail = detail.clone();

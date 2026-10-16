@@ -261,12 +261,16 @@ impl SubagentCoordinator {
     }
 
     async fn children(&self, actor: Uuid) -> Vec<SubagentSnapshot> {
+        let director = self.director();
+        let team_scope = director.epoch > 0 && director.session_id == actor;
         self.table
             .lock()
             .await
             .snapshots()
             .into_iter()
-            .filter(|agent| agent.parent_session_id == actor)
+            .filter(|agent| {
+                agent.session_id != actor && (team_scope || agent.parent_session_id == actor)
+            })
             .collect()
     }
 

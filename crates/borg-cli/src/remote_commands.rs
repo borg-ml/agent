@@ -5279,6 +5279,24 @@ async fn run_local_agent_session(
                     }
                     continue;
                 }
+                if line == "/promote" || line.starts_with("/promote ") {
+                    match borg_ui::parse_submission(line, provider, PromptDelivery::Steer, &[]) {
+                        Ok(borg_ui::FrontendCommand::PromoteAgent(target)) => {
+                            let target = target.unwrap_or_else(|| delivered_projection.state().team_director.as_ref()
+                                .map_or(session_id, |director| director.session_id).to_string());
+                            let _ = session_command_tx.send(HostCommand::Subagent {
+                                session_id,
+                                action: SubagentAction::Promote {
+                                    request_id: Uuid::new_v4(), target,
+                                    expected_epoch: delivered_projection.state().team_director.as_ref().map_or(0, |director| director.epoch),
+                                },
+                            }).await;
+                        }
+                        Err(error) => eprintln!("\n  {error}\n"),
+                        _ => unreachable!(),
+                    }
+                    continue;
+                }
                 if let Some(prompt) = director_prompt_command(line) {
                     match prompt {
                         Ok(prompt) => {
@@ -5298,6 +5316,8 @@ async fn run_local_agent_session(
                             if session_command_tx
                                 .send(director_prompt_host_command(
                                     session_id,
+                                    delivered_projection.state().team_director.as_ref()
+                                        .map(|director| director.session_id).filter(|id| *id != session_id),
                                     message_id,
                                     prompt,
                                     Vec::new(),
@@ -5352,6 +5372,10 @@ async fn run_local_agent_session(
                 }
                 match line {
                     "/help" => print_agent_help(),
+                    "/main" | "/focus" => {
+                        println!("  director {}", delivered_projection.state().team_director.as_ref()
+                            .map_or("/root", |director| director.path.as_str()));
+                    }
                     "/compact" => {
                         session_command_tx
                             .send(HostCommand::Compact { session_id })
@@ -5389,7 +5413,15 @@ async fn run_local_agent_session(
                         }
                     }
                     "/interrupt" | "/stop" => {
-                        session_command_tx.send(HostCommand::Interrupt { session_id }).await.ok();
+                        let command = delivered_projection.state().team_director.as_ref()
+                            .filter(|director| director.session_id != session_id)
+                            .map_or(HostCommand::Interrupt { session_id }, |director| HostCommand::Subagent {
+                                session_id,
+                                action: SubagentAction::Interrupt {
+                                    request_id: Uuid::new_v4(), target: director.session_id.to_string(),
+                                },
+                            });
+                        session_command_tx.send(command).await.ok();
                     }
                     _ => {
                         let active = matches!(
@@ -5410,9 +5442,11 @@ async fn run_local_agent_session(
                         };
                         if !text.is_empty() {
                             let message_id = Uuid::new_v4();
+                            let target = delivered_projection.state().team_director.as_ref()
+                                .map(|director| director.session_id).filter(|id| *id != session_id);
                             persist_prompt_admission(
                                 store.as_ref(),
-                                session_id,
+                                target.unwrap_or(session_id),
                                 message_id,
                                 &text,
                                 &[],
@@ -5420,14 +5454,9 @@ async fn run_local_agent_session(
                             )
                             .await?;
                             pending_prompt_ids.insert(message_id);
-                            if session_command_tx.send(HostCommand::Prompt {
-                                session_id,
-                                message_id,
-                                text,
-                                attachments: Vec::new(),
-                                output_schema: None,
-                                delivery,
-                            }).await.is_err() {
+                            if session_command_tx.send(director_prompt_host_command(
+                                session_id, target, message_id, text, Vec::new(), delivery,
+                            )).await.is_err() {
                                 tracing::warn!(
                                     %message_id,
                                     "durably admitted prompt is waiting for the session actor to reconnect"
@@ -5549,6 +5578,19 @@ async fn run_local_agent_session(
                 }
                 match action {
                     UiAction::None => {}
+                    UiAction::PromoteAgent { target, expected_epoch } => {
+                        dispatch_ui_command(
+                            &ui_interaction_tx,
+                            HostCommand::Subagent {
+                                session_id,
+                                action: SubagentAction::Promote {
+                                    request_id: Uuid::new_v4(),
+                                    target,
+                                    expected_epoch,
+                                },
+                            },
+                        );
+                    }
                     UiAction::ToggleGoal { action } => {
                         let terminal = terminal.as_mut().expect("terminal");
                         let changed = terminal.optimistically_apply_goal_action(&action);
@@ -6487,8 +6529,9 @@ async fn run_local_agent_session(
                             match prompt {
                                 Ok(prompt) => {
                                     terminal.focus_director();
+                                    let director_target = terminal.director_target();
                                     terminal.project_pending_prompt(
-                                        None,
+                                        director_target,
                                         message_id,
                                         prompt.clone(),
                                         PromptDelivery::Queue,
@@ -6496,14 +6539,15 @@ async fn run_local_agent_session(
                                     terminal.set_notice("Queued message for director".to_string());
                                     let command = director_prompt_host_command(
                                         session_id,
+                                        director_target,
                                         message_id,
                                         prompt.clone(),
                                         attachments.clone(),
                                         PromptDelivery::Queue,
                                     );
                                     let submission = UiPromptSubmission {
-                                        journal_session_id: session_id,
-                                        target: None,
+                                        journal_session_id: director_target.unwrap_or(session_id),
+                                        target: director_target,
                                         message_id,
                                         rejected_text: format!("/director {prompt}"),
                                         text: prompt,
@@ -6519,7 +6563,7 @@ async fn run_local_agent_session(
                                         submission,
                                     ) {
                                         terminal.reject_optimistic_prompt(
-                                            None,
+                                            director_target,
                                             submission.message_id,
                                             submission.rejected_text,
                                             submission.attachments,
@@ -6631,7 +6675,8 @@ async fn run_local_agent_session(
                             match prompt {
                                 Ok(prompt) => {
                                     terminal.focus_director();
-                                    let active = matches!(
+                                    let director_target = terminal.director_target();
+                                    let active = director_target.is_some() || matches!(
                                         status,
                                         SessionStatus::Starting
                                             | SessionStatus::Running
@@ -6646,7 +6691,7 @@ async fn run_local_agent_session(
                                     let message_id = Uuid::new_v4();
                                     if active {
                                         terminal.project_pending_prompt(
-                                            None,
+                                            director_target,
                                             message_id,
                                             prompt.clone(),
                                             delivery,
@@ -6664,14 +6709,15 @@ async fn run_local_agent_session(
                                     terminal.set_notice("Sending to director".to_string());
                                     let command = director_prompt_host_command(
                                         session_id,
+                                        director_target,
                                         message_id,
                                         prompt.clone(),
                                         attachments.clone(),
                                         delivery,
                                     );
                                     let submission = UiPromptSubmission {
-                                        journal_session_id: session_id,
-                                        target: None,
+                                        journal_session_id: director_target.unwrap_or(session_id),
+                                        target: director_target,
                                         message_id,
                                         rejected_text: format!("/director {prompt}"),
                                         text: prompt,
@@ -6687,7 +6733,7 @@ async fn run_local_agent_session(
                                         submission,
                                     ) {
                                         terminal.reject_optimistic_prompt(
-                                            None,
+                                            director_target,
                                             submission.message_id,
                                             submission.rejected_text,
                                             submission.attachments,
@@ -10318,18 +10364,33 @@ fn director_prompt_delivery(
 
 fn director_prompt_host_command(
     session_id: Uuid,
+    target: Option<Uuid>,
     message_id: Uuid,
     text: String,
     attachments: Vec<PathBuf>,
     delivery: PromptDelivery,
 ) -> HostCommand {
-    HostCommand::Prompt {
-        session_id,
-        message_id,
-        text,
-        attachments,
-        output_schema: None,
-        delivery,
+    if let Some(target) = target {
+        HostCommand::Subagent {
+            session_id,
+            action: SubagentAction::Prompt {
+                request_id: Uuid::new_v4(),
+                target: target.to_string(),
+                message_id,
+                text,
+                attachments,
+                delivery,
+            },
+        }
+    } else {
+        HostCommand::Prompt {
+            session_id,
+            message_id,
+            text,
+            attachments,
+            output_schema: None,
+            delivery,
+        }
     }
 }
 
@@ -10440,7 +10501,9 @@ fn print_agent_help() {
   /import           copy threads and memory from another assistant
   /customize        inspect effective settings and extension authority
   /ask PROFILE TEXT ask another model through its persistent peer thread
-  /director TEXT    send a message to the persistent director thread
+  /director TEXT    send a message to the current director thread
+  /promote [TARGET] make the focused/default agent the team director
+  /main             return to the current director thread
   /claude TEXT      ask the active model to consult its persistent Claude peer
   /gpt TEXT         ask the active model to consult its persistent GPT peer
   /peer PROVIDER    direct peer control; add TEXT, clear, or new MODEL@EFFORT

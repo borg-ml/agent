@@ -642,7 +642,12 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/ask",
         "ask another model through its persistent peer thread",
     ),
-    ("/director", "send text to the persistent director thread"),
+    ("/director", "send text to the current director thread"),
+    (
+        "/promote",
+        "make the focused agent (or TARGET) team director",
+    ),
+    ("/main", "return to the current director thread"),
     ("/claude", "ask the active model to consult its Claude peer"),
     ("/gpt", "ask the active model to consult its GPT peer"),
     ("/peer", "message, clear, or replace a persistent peer"),
@@ -915,6 +920,10 @@ pub enum UiAction {
     },
     /// Stop a watch from the watches panel.
     StopWatch(Uuid),
+    PromoteAgent {
+        target: String,
+        expected_epoch: u64,
+    },
     ToggleGoal {
         action: GoalAction,
     },
@@ -1671,6 +1680,7 @@ pub struct BorgTerminal {
     /// and child projections, but do not turn them into root transcript cards.
     suppress_bootstrap_subagent_activity: bool,
     focused_child: Option<Uuid>,
+    team_director: Option<borg_remote::TeamDirector>,
     focused_tool: Option<usize>,
     focused_tool_anchor: Option<ActionInspectorAnchor>,
     tool_return_scroll_from_bottom: usize,
@@ -3115,6 +3125,7 @@ impl BorgTerminal {
             child_pending_approvals: HashSet::new(),
             suppress_bootstrap_subagent_activity: true,
             focused_child: None,
+            team_director: None,
             focused_tool: None,
             focused_tool_anchor: None,
             tool_return_scroll_from_bottom: 0,
@@ -3337,6 +3348,7 @@ impl BorgTerminal {
         self.child_pending_approvals.clear();
         self.suppress_bootstrap_subagent_activity = true;
         self.focused_child = None;
+        self.team_director = None;
         self.focused_tool = None;
         self.focused_tool_anchor = None;
         self.tool_return_scroll_from_bottom = 0;
@@ -3688,6 +3700,9 @@ impl BorgTerminal {
             .pending_provider_interaction_payload
             .as_ref()
             .is_some_and(provider_interaction_contains_secret);
+        if let Some(director) = &state.team_director {
+            self.apply_team_director(director);
+        }
         self.invalidate_transcript_render_cache();
     }
 
@@ -4613,6 +4628,9 @@ impl BorgTerminal {
             self.scroll_from_bottom = 0;
             self.pending_scroll_anchor_height = None;
         }
+        if let SessionEventKind::TeamDirectorChanged { director } = &event.kind {
+            self.apply_team_director(director);
+        }
         projection_changed
     }
 
@@ -4897,7 +4915,7 @@ impl BorgTerminal {
         ));
     }
 
-    fn focus_director_transcript(&mut self) {
+    fn focus_host_transcript(&mut self) {
         let Some(child_id) = self.focused_child.take() else {
             self.notice = None;
             return;
@@ -4912,10 +4930,71 @@ impl BorgTerminal {
         self.team_switcher_open = false;
         self.refresh_configuration_picker();
         self.reset_transcript_focus();
-        // The director transcript is the default view. A persistent banner
-        // saying that we are viewing it is both redundant and obscures the
-        // statusline's useful state.
         self.notice = None;
+    }
+
+    fn apply_team_director(&mut self, director: &borg_remote::TeamDirector) {
+        if self
+            .team_director
+            .as_ref()
+            .is_some_and(|current| current.epoch >= director.epoch)
+        {
+            return;
+        }
+        self.team_director = Some(director.clone());
+        self.focus_director_transcript();
+    }
+
+    fn focus_director_transcript(&mut self) {
+        if let Some(child) = self.director_target() {
+            self.focus_child_transcript(child);
+        } else {
+            self.focus_host_transcript();
+        }
+        self.notice = None;
+    }
+
+    pub fn director_target(&self) -> Option<Uuid> {
+        self.team_director
+            .as_ref()
+            .map(|director| director.session_id)
+            .filter(|id| *id != self.session_id)
+    }
+
+    fn team_command_action(&mut self, text: &str) -> Option<UiAction> {
+        let text = text.trim();
+        if text == "/main" || text == "/focus" {
+            self.focus_director_transcript();
+            return Some(UiAction::None);
+        }
+        let rest = text.strip_prefix("/promote")?;
+        if rest.chars().next().is_some_and(|ch| !ch.is_whitespace()) {
+            return None;
+        }
+        let parsed = borg_view::intent::parse_submission(
+            text,
+            self.session_provider().unwrap_or(CodingProvider::Codex),
+            PromptDelivery::Steer,
+            &[],
+        );
+        let target = match parsed {
+            Ok(borg_view::intent::FrontendCommand::PromoteAgent(target)) => target,
+            Err(error) => {
+                self.set_notice(error.to_string());
+                return Some(UiAction::None);
+            }
+            _ => unreachable!("promote command parsed as promote intent"),
+        };
+        let target =
+            target.unwrap_or_else(|| self.focused_child.unwrap_or(self.session_id).to_string());
+        self.set_notice(format!("Promoting {target}"));
+        Some(UiAction::PromoteAgent {
+            target,
+            expected_epoch: self
+                .team_director
+                .as_ref()
+                .map_or(0, |director| director.epoch),
+        })
     }
 
     #[must_use]
@@ -7256,7 +7335,7 @@ impl BorgTerminal {
                             TeamRosterTarget::Child(child_id) => {
                                 self.focus_child_transcript(child_id)
                             }
-                            TeamRosterTarget::Director => self.focus_director_transcript(),
+                            TeamRosterTarget::Director => self.focus_host_transcript(),
                             TeamRosterTarget::Inactive => {
                                 self.inactive_team_expanded = !self.inactive_team_expanded;
                                 self.team_roster_scroll = 0;
@@ -8036,7 +8115,7 @@ impl BorgTerminal {
         };
         match target {
             TeamRosterTarget::Child(child_id) => self.focus_child_transcript(child_id),
-            TeamRosterTarget::Director => self.focus_director_transcript(),
+            TeamRosterTarget::Director => self.focus_host_transcript(),
             TeamRosterTarget::Inactive => unreachable!(),
         }
         true
@@ -8549,6 +8628,9 @@ impl BorgTerminal {
                 self.composer.restore(format!("{command} "), Vec::new());
                 self.notice = Some(format!("{command} · add the message, then send"));
                 return Ok(UiAction::None);
+            }
+            if let Some(action) = self.team_command_action(&command) {
+                return Ok(action);
             }
             return Ok(UiAction::Submit {
                 target: self.focused_child,
@@ -9139,6 +9221,11 @@ impl BorgTerminal {
         let active_subagents = team_transcript.active_subagent_count();
         let inactive_subagents = team_transcript.inactive_subagent_count();
         let agent_roster_entries = team_transcript.agent_roster_entries();
+        let director_target = self.director_target();
+        let director_status = self
+            .team_director
+            .as_ref()
+            .map(|director| format!("director {}", director.path));
         let focused_agent_name = self.focused_child.and_then(|child| {
             team_transcript
                 .subagent_snapshots
@@ -10165,7 +10252,7 @@ impl BorgTerminal {
             let jump_to_bottom_label = (!is_launch_screen && self.scroll_from_bottom > 0)
                 .then(|| format!(" ↓ {} ", ui_text(ui_language, "Jump to bottom")));
             let back_to_thread_label =
-                (self.focused_child.is_some() || self.focused_tool.is_some()).then(|| {
+                (self.focused_child != director_target || self.focused_tool.is_some()).then(|| {
                     if self.focused_tool.is_some() {
                         " ← Back to thread "
                     } else {
@@ -10497,6 +10584,14 @@ impl BorgTerminal {
                         Color::Gray
                     },
                 );
+            }
+            if let Some(director) = director_status.as_deref() {
+                status_spans.push(Span::styled(
+                    format!("{STATUS_SEPARATOR}{director}"),
+                    Style::default()
+                        .fg(SUBAGENT_PURPLE)
+                        .add_modifier(Modifier::BOLD),
+                ));
             }
             if let Some(name) = focused_agent_name.as_deref() {
                 status_spans.push(Span::styled(
@@ -11578,7 +11673,7 @@ impl BorgTerminal {
                 if let Some(child_id) = entry.child_id {
                     self.focus_child_transcript(child_id);
                 } else {
-                    self.focus_director_transcript();
+                    self.focus_host_transcript();
                 }
             }
             return Ok(UiAction::None);
@@ -12024,6 +12119,11 @@ impl BorgTerminal {
             if text.trim().is_empty() && attachments.is_empty() {
                 return Ok(UiAction::None);
             }
+            if attachments.is_empty()
+                && let Some(action) = self.team_command_action(&text)
+            {
+                return Ok(action);
+            }
             self.notice = None;
             return Ok(
                 if matches!(
@@ -12116,6 +12216,11 @@ impl BorgTerminal {
             let (text, attachments) = self.composer.take();
             if text.trim().is_empty() && attachments.is_empty() {
                 return Ok(UiAction::None);
+            }
+            if attachments.is_empty()
+                && let Some(action) = self.team_command_action(&text)
+            {
+                return Ok(action);
             }
             self.notice = None;
             return Ok(UiAction::Submit {
@@ -14443,6 +14548,7 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::ContextWindowUpdated { .. }
         | SessionEventKind::UserStopChanged { .. }
         | SessionEventKind::SubagentControl { .. }
+        | SessionEventKind::TeamDirectorChanged { .. }
         | SessionEventKind::WatchesChanged { .. }
         | SessionEventKind::ProviderSessionLinked { .. }
         | SessionEventKind::RuntimeProcessStarted { .. }

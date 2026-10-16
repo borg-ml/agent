@@ -402,6 +402,7 @@ impl Default for CapabilityConfig {
 impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
     fn from(value: &CapabilityConfig) -> Self {
         Self {
+            director_eligible: true,
             multiplayer: value.multiplayer,
             subagents: value.subagents,
             autonomous_team: value.autonomous_team,

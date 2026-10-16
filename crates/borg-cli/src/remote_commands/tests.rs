@@ -752,6 +752,7 @@ fn director_command_extracts_text_without_matching_longer_commands() {
     let message_id = Uuid::new_v4();
     let command = director_prompt_host_command(
         session_id,
+        None,
         message_id,
         "send this to the root".to_string(),
         vec![PathBuf::from("brief.png")],
@@ -3164,6 +3165,7 @@ async fn resume_discovery_ignores_launch_only_probe_sessions() {
             },
             SessionEventKind::EffectiveCapabilitiesUpdated {
                 capabilities: borg_remote::EffectiveCapabilities {
+                    director_eligible: true,
                     active: Vec::new(),
                     inactive: Vec::new(),
                 },

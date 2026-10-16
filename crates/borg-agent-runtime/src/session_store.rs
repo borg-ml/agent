@@ -434,6 +434,7 @@ impl SessionEventKind {
                 | Self::StatusChanged { .. }
                 | Self::UserStopChanged { .. }
                 | Self::SubagentActivity { .. }
+                | Self::TeamDirectorChanged { .. }
                 | Self::SubagentControl { .. }
                 | Self::RuntimeProcessStarted { .. }
                 | Self::RuntimeProcessOutput { .. }
@@ -546,6 +547,7 @@ impl SessionEventKind {
         matches!(
             self,
             Self::SubagentActivity { .. }
+                | Self::TeamDirectorChanged { .. }
                 | Self::TeamBroadcastUpdated { .. }
                 | Self::AgentMessageReceived { .. }
         )
@@ -812,6 +814,8 @@ pub struct PendingUsageLimitRetry {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionState {
+    #[serde(default)]
+    pub team_director: Option<crate::TeamDirector>,
     pub latest_sequence: u64,
     /// Monotonic identity for the canonical provider-context prefix. A
     /// compaction, explicit context clear, or provider/model change starts a
@@ -908,6 +912,9 @@ impl SessionState {
             self.activity_at = Some(event.created_at);
         }
         match &event.kind {
+            SessionEventKind::TeamDirectorChanged { director } => {
+                self.team_director = Some(director.clone());
+            }
             SessionEventKind::SessionStarted => self.started_at = Some(event.created_at),
             SessionEventKind::SessionTitled {
                 title,

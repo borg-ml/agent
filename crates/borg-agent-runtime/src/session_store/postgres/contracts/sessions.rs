@@ -47,6 +47,7 @@ async fn empty_sessions_are_discarded_but_real_sessions_are_kept() {
         },
         SessionEventKind::EffectiveCapabilitiesUpdated {
             capabilities: crate::EffectiveCapabilities {
+                director_eligible: true,
                 active: Vec::new(),
                 inactive: Vec::new(),
             },

@@ -40,6 +40,16 @@ Git comparison.
   a second text copy. Preserve genuine text repetitions, edited context,
   signatures, tool repairs, and subscription continuation.
 
+### Team control
+
+- Use `/promote` in the focused child chat to hand over durable logical director
+  authority and default input/stream routing. The physical host and stable
+  paths stay fixed; context, model settings, permissions, goals, and plans stay
+  with each session. Stale or ineligible targets fail without stopping work.
+- Refresh authority at execution and preserve subscription tool discovery across
+  promotion without restarting providers. Ordinary workers retain control of
+  their own children but cannot control the director's protected subtree.
+
 ### Planning
 
 - Allow multiple in-progress todos for the same assignee in both session and

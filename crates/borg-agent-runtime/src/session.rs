@@ -1792,6 +1792,7 @@ impl SessionConsultationTools {
 struct HostCommandInbox {
     commands: mpsc::Receiver<HostCommand>,
     priority: Option<mpsc::Receiver<HostCommand>>,
+    team_control: Option<mpsc::Receiver<HostCommand>>,
     interrupt: Option<SessionInterrupt>,
     session_id: Uuid,
     interrupt_delivered: bool,
@@ -1810,6 +1811,7 @@ impl HostCommandInbox {
         Self {
             commands,
             priority,
+            team_control: None,
             interrupt,
             session_id,
             interrupt_delivered: false,
@@ -1840,6 +1842,11 @@ impl HostCommandInbox {
     }
 
     fn try_recv(&mut self) -> std::result::Result<HostCommand, mpsc::error::TryRecvError> {
+        if let Some(control) = self.team_control.as_mut() {
+            if let Ok(command) = control.try_recv() {
+                return Ok(command);
+            }
+        }
         self.try_recv_priority()
             .map(Ok)
             .unwrap_or_else(|| self.commands.try_recv())
@@ -1857,6 +1864,15 @@ impl HostCommandInbox {
                 } => match command {
                     Some(command) => return Some(command),
                     None => self.priority = None,
+                },
+                command = async {
+                    match self.team_control.as_mut() {
+                        Some(control) => control.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => match command {
+                    Some(command) => return Some(command),
+                    None => self.team_control = None,
                 },
                 command = self.commands.recv() => return command,
             }
@@ -2695,6 +2711,9 @@ async fn run_agent_session_store_kernel_inner(
         .as_ref()
         .map(SubagentCoordinator::subscribe)
         .unwrap_or_else(|| disabled_activity_tx.subscribe());
+    let mut director_changes = subagents
+        .as_ref()
+        .map(SubagentCoordinator::subscribe_director);
     // Child activity reaches the actor on one channel of its own, so no loop has
     // to know where it came from. See `forward_child_activity`.
     let (child_activity_tx, mut child_activity_rx) = mpsc::channel(CHILD_ACTIVITY_BUFFER);
@@ -2743,6 +2762,9 @@ async fn run_agent_session_store_kernel_inner(
     let _watch_shutdown = SessionAutonomyShutdown(watches.cancel.clone());
     if owns_team {
         let team = subagents.as_ref().expect("enabled team");
+        let (control_tx, control_rx) = mpsc::channel(32);
+        team.attach_root_commands(control_tx);
+        commands.team_control = Some(control_rx);
         // A fork (a revert continues on one) keeps the parent's team; its own
         // later activity comes after and wins.
         let mut team_events = store.fork_team_events(session_id).await?;
@@ -2750,6 +2772,17 @@ async fn run_agent_session_store_kernel_inner(
         for activity in team.restore_from_events(&team_events).await? {
             record_subagent_activity(&mut journal, &events, session_id, team, &watches, activity)
                 .await?;
+        }
+        if team.director().epoch > 0 && store.state(session_id).await?.team_director.is_none() {
+            record(
+                &mut journal,
+                &events,
+                session_id,
+                SessionEventKind::TeamDirectorChanged {
+                    director: team.director(),
+                },
+            )
+            .await?;
         }
         // A child the last owner parked mid-task continues on its own; the
         // wake runs before the watcher sees it, so it is never read as idle.
@@ -3966,9 +3999,7 @@ async fn run_agent_session_store_kernel_inner(
                             &mut journal,
                             &events,
                             session_id,
-                            subagents
-                                .as_ref()
-                                .expect("team activity requires coordinator"),
+                            subagents.as_ref(),
                             action,
                         )
                         .await?;
@@ -5401,6 +5432,7 @@ async fn run_agent_session_store_kernel_inner(
         // interrupt path settles them before the terminal events.
         let mut provider_carry: VecDeque<SessionEventKind> = VecDeque::new();
         let mut interrupted = false;
+        let mut role_notice_pending = false;
         let mut network_recovery_pending = network_retry_message_id.is_some();
         let mut turn_had_side_effects = false;
         let mut retryable_provider_errors = Vec::new();
@@ -6748,7 +6780,7 @@ async fn run_agent_session_store_kernel_inner(
                                 &mut journal,
                                 &events,
                                 session_id,
-                                subagents.as_ref().expect("team activity requires coordinator"),
+                                subagents.as_ref(),
                                 action,
                             )
                             .await?;
@@ -6946,6 +6978,27 @@ async fn run_agent_session_store_kernel_inner(
                         | HostCommand::ShellCommand { .. }
                         | HostCommand::OpenTerminal { .. } => {}
                     }
+                }
+                changed = async {
+                    match director_changes.as_mut() {
+                        Some(changes) => changes.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    role_notice_pending |= changed.is_ok() && !executor.uses_native_harness(launch.provider);
+                }
+                permit = control_tx.reserve(), if role_notice_pending => {
+                    if let Ok(permit) = permit {
+                        if let Some(team) = &subagents {
+                            let (ack, _result) = oneshot::channel();
+                            permit.send(AgentTurnControl::Steer {
+                                message_id: Uuid::new_v4(), text: team.role_prompt(session_id),
+                                attachments: Vec::new(), admission: SteerAdmission::pending(),
+                                preempt: false, human: false, ack,
+                            });
+                        }
+                    }
+                    role_notice_pending = false;
                 }
                 message = root_message_rx.recv(), if owns_team => {
                     let _trace = SessionBranchTrace::begin(trace_loop, session_id, "root_message", provider_events.len() + provider_carry.len());
@@ -13513,12 +13566,67 @@ async fn apply_subagent_action(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
-    subagents: &SubagentCoordinator,
+    subagents: Option<&SubagentCoordinator>,
     action: SubagentAction,
 ) -> Result<()> {
     let request_id = action.request_id();
     let result: Result<SubagentControlOutcome> = async {
+        let subagents = subagents.context("subagent controls are disabled for this session")?;
         match action {
+            SubagentAction::Promote {
+                target,
+                expected_epoch,
+                ..
+            } => {
+                anyhow::ensure!(
+                    subagents.is_root_session(session_id),
+                    "promotion must be routed through the physical host"
+                );
+                let director = subagents.prepare_promotion(&target, expected_epoch).await?;
+                if director.epoch != subagents.director().epoch {
+                    // One physical writer serializes validation, durable pointer and publication.
+                    // Apply authority before publishing so live viewers cannot race the old role.
+                    let mut change = subagents
+                        .list(None)
+                        .await
+                        .into_iter()
+                        .filter(|agent| {
+                            director.path == agent.task_name
+                                || director.path.starts_with(&format!("{}/", agent.task_name))
+                        })
+                        .map(|agent| {
+                            SessionEvent::new(
+                                session_id,
+                                0,
+                                SessionEventKind::SubagentActivity {
+                                    activity: SubagentActivityKind::Updated,
+                                    agent,
+                                    event: None,
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    change.push(SessionEvent::new(
+                        session_id,
+                        0,
+                        SessionEventKind::TeamDirectorChanged {
+                            director: director.clone(),
+                        },
+                    ));
+                    let changed = journal.append_all(change).await?;
+                    subagents.apply_director(director.clone());
+                    for event in changed {
+                        deliver_recorded_event(
+                            events,
+                            session_id,
+                            event,
+                            crate::EventPersistence::Durable,
+                        )
+                        .await;
+                    }
+                }
+                Ok(SubagentControlOutcome::Director { director })
+            }
             SubagentAction::Ensure {
                 task_name,
                 provider,

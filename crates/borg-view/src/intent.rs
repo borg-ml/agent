@@ -13,6 +13,11 @@ pub enum FrontendCommand {
         attachments: Vec<PathBuf>,
         delivery: PromptDelivery,
     },
+    SubmitDirectorPrompt {
+        text: String,
+        attachments: Vec<PathBuf>,
+        delivery: PromptDelivery,
+    },
     RecallQueuedPrompt(Option<Uuid>),
     FlushPendingInput,
     Interrupt,
@@ -50,6 +55,7 @@ pub enum FrontendCommand {
     /// Stop a watch the agent armed (from the watches panel).
     StopWatch(Uuid),
     FocusAgent(Option<Uuid>),
+    PromoteAgent(Option<String>),
     NewSession,
     OpenSession(Uuid),
     LoadOlderHistory,
@@ -165,11 +171,22 @@ pub fn parse_submission(
     }
     if let Some(text) = text.strip_prefix("/director ").map(str::trim) {
         anyhow::ensure!(!text.is_empty(), "usage: /director TEXT");
-        return Ok(FrontendCommand::SubmitPrompt {
+        return Ok(FrontendCommand::SubmitDirectorPrompt {
             text: text.to_string(),
             attachments: Vec::new(),
             delivery,
         });
+    }
+    if let Some(target) = text.strip_prefix("/promote")
+        && target.chars().next().is_none_or(char::is_whitespace)
+    {
+        let mut words = target.split_whitespace();
+        let target = words.next().map(str::to_string);
+        anyhow::ensure!(words.next().is_none(), "usage: /promote [TARGET]");
+        return Ok(FrontendCommand::PromoteAgent(target));
+    }
+    if text == "/main" || text == "/focus" {
+        return Ok(FrontendCommand::FocusAgent(None));
     }
     if text == "/interrupt" || text == "/stop" {
         return Ok(FrontendCommand::Interrupt);

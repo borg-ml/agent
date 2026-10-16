@@ -262,6 +262,14 @@ impl BorgGui {
                         delivery,
                     });
                 }
+                Ok(FrontendCommand::SubmitDirectorPrompt { text, delivery, .. }) => {
+                    let attachments = std::mem::take(&mut this.attachments);
+                    this.send(FrontendCommand::SubmitDirectorPrompt {
+                        text,
+                        attachments,
+                        delivery,
+                    });
+                }
                 Ok(FrontendCommand::ControlPeer {
                     target,
                     intent,

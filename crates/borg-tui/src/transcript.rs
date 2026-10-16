@@ -810,6 +810,7 @@ impl Transcript {
     }
 
     fn seed_session_state(&mut self, state: &SessionState) {
+        self.meta.director = state.team_director.as_ref().map(Into::into);
         self.goal = state.goal.clone();
         if let (Some(participant_id), Some(revision)) =
             (state.plan_participant_id, state.plan_workspace_revision)
@@ -1579,16 +1580,27 @@ impl Transcript {
 
     fn agent_roster_entries(&self) -> Vec<AgentRosterEntry> {
         let mut rows = Vec::new();
+        let host_is_director = self
+            .meta
+            .director
+            .as_ref()
+            .is_none_or(|director| director.path == "/root");
+        let host_name = if host_is_director { "director" } else { "/root" };
+        let host_role = if host_is_director {
+            "main thread"
+        } else {
+            "member"
+        };
         if let Some(config) = self.config.as_ref() {
             let model = config
                 .model
                 .as_deref()
                 .unwrap_or_else(|| config.provider.catalog_backend());
             rows.push(AgentRosterEntry {
-                name: "director".to_string(),
+                name: host_name.to_string(),
                 model: model.to_string(),
                 effort: config.effort.as_deref().unwrap_or("—").to_string(),
-                state: "main thread".to_string(),
+                state: host_role.to_string(),
                 usage: format_subagent_usage(&self.session_usage)
                     .trim_start()
                     .to_string(),
@@ -1596,10 +1608,10 @@ impl Transcript {
             });
         } else {
             rows.push(AgentRosterEntry {
-                name: "director".to_string(),
+                name: host_name.to_string(),
                 model: "model pending".to_string(),
                 effort: "—".to_string(),
-                state: "main thread".to_string(),
+                state: host_role.to_string(),
                 usage: "—".to_string(),
                 child_id: None,
             });
@@ -1610,7 +1622,16 @@ impl Transcript {
                 .cmp(&(right.status != SubagentStatus::Running, &right.task_name))
         });
         rows.extend(agents.into_iter().map(|agent| {
-            let name = display_agent_name(&agent.task_name);
+            let name = if self
+                .meta
+                .director
+                .as_ref()
+                .is_some_and(|director| director.session_id == agent.session_id.to_string())
+            {
+                format!("{} · director", agent.task_name)
+            } else {
+                display_agent_name(&agent.task_name)
+            };
             let model = display_subagent_model(agent);
             let effort = agent.effort.as_deref().unwrap_or("—");
             let usage = format_subagent_usage(&agent.usage);
