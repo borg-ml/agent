@@ -322,6 +322,56 @@ fn focused_entry(backend: &str) -> Result<Option<CompositorWindow>> {
         .find(|c| c.focused))
 }
 
+/// US-layout evdev key for one ASCII character: (key name, needs shift).
+/// Used to type into windows that ignore wtype's temporary keymap.
+fn us_key(c: char) -> Option<(String, bool)> {
+    if c.is_ascii_lowercase() || c.is_ascii_digit() {
+        return Some((format!("KEY_{}", c.to_ascii_uppercase()), false));
+    }
+    if c.is_ascii_uppercase() {
+        return Some((format!("KEY_{c}"), true));
+    }
+    let (name, shift) = match c {
+        ' ' => ("KEY_SPACE", false),
+        '\n' => ("KEY_ENTER", false),
+        '\t' => ("KEY_TAB", false),
+        '-' => ("KEY_MINUS", false),
+        '_' => ("KEY_MINUS", true),
+        '=' => ("KEY_EQUAL", false),
+        '+' => ("KEY_EQUAL", true),
+        '[' => ("KEY_LEFTBRACE", false),
+        '{' => ("KEY_LEFTBRACE", true),
+        ']' => ("KEY_RIGHTBRACE", false),
+        '}' => ("KEY_RIGHTBRACE", true),
+        ';' => ("KEY_SEMICOLON", false),
+        ':' => ("KEY_SEMICOLON", true),
+        '\'' => ("KEY_APOSTROPHE", false),
+        '"' => ("KEY_APOSTROPHE", true),
+        '`' => ("KEY_GRAVE", false),
+        '~' => ("KEY_GRAVE", true),
+        '\\' => ("KEY_BACKSLASH", false),
+        '|' => ("KEY_BACKSLASH", true),
+        ',' => ("KEY_COMMA", false),
+        '<' => ("KEY_COMMA", true),
+        '.' => ("KEY_DOT", false),
+        '>' => ("KEY_DOT", true),
+        '/' => ("KEY_SLASH", false),
+        '?' => ("KEY_SLASH", true),
+        '!' => ("KEY_1", true),
+        '@' => ("KEY_2", true),
+        '#' => ("KEY_3", true),
+        '$' => ("KEY_4", true),
+        '%' => ("KEY_5", true),
+        '^' => ("KEY_6", true),
+        '&' => ("KEY_7", true),
+        '*' => ("KEY_8", true),
+        '(' => ("KEY_9", true),
+        ')' => ("KEY_0", true),
+        _ => return None,
+    };
+    Some((name.to_string(), shift))
+}
+
 fn type_text(text: &str) -> Result<()> {
     let tool = typing_tool();
     let argv: Vec<&str> = if tool == Some("wtype") {
@@ -877,8 +927,33 @@ impl Helper {
                 self.input_device()?; // surface missing prerequisites before touching focus
                 self.observations.remove(&wid);
                 self.ensure_active(&win, &wid)?;
-                type_text(text)?;
-                return self.finish(&win, &wid, op, args, json!({}));
+                // Windows without an accessibility tree (Unreal, SDL and game
+                // clients) read raw keycodes through their own layout and
+                // ignore wtype's per-character temporary keymap, so wtype
+                // text arrives as digits there. Type ASCII text on the
+                // virtual keyboard instead (US layout, like the key op).
+                let keys: Option<Vec<(u16, bool)>> = matches!(win, Win::Compositor(_))
+                    .then(|| {
+                        text.chars()
+                            .map(|c| us_key(c).and_then(|(n, s)| code(&n).map(|k| (k, s))))
+                            .collect()
+                    })
+                    .flatten();
+                let route = if let Some(keys) = keys {
+                    let shift = code("KEY_LEFTSHIFT").expect("shift code");
+                    for (key, shifted) in keys {
+                        let mods: &[u16] = if shifted { &[shift] } else { &[] };
+                        self.press(mods, key)?;
+                        std::thread::sleep(Duration::from_millis(8));
+                        self.release(mods, key)?;
+                        std::thread::sleep(Duration::from_millis(8));
+                    }
+                    "virtual keyboard (US layout)"
+                } else {
+                    type_text(text)?;
+                    "wtype/xdotool"
+                };
+                return self.finish(&win, &wid, op, args, json!({"typed_via": route}));
             }
             "key" => {
                 let (modifiers, key) = parse_keys(args.get("keys"))?;
