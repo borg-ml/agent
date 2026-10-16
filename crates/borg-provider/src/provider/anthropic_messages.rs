@@ -272,6 +272,7 @@ pub(crate) fn messages_request_body(
             } => {
                 if let Some(ModelProviderState::AnthropicMessages {
                     content: native_content,
+                    narration_block_indexes,
                     ..
                 }) = provider_state
                 {
@@ -296,14 +297,39 @@ pub(crate) fn messages_request_body(
                             .filter_map(|block| block["text"].as_str())
                             .collect::<String>();
                         if text != native_text {
-                            // Public narration may originate in signed thinking.
-                            // Keep those blocks intact, but replay visible text too.
-                            blocks.retain(|block| block["type"] != "text");
-                            let before_tools = blocks
+                            let narration_indexes = match narration_block_indexes {
+                                Some(indexes) => indexes.clone(),
+                                #[cfg(feature = "claude")]
+                                None => {
+                                    super::claude_subscription_protocol::narration_block_indexes(
+                                        native_content,
+                                    )
+                                }
+                                #[cfg(not(feature = "claude"))]
+                                None => Vec::new(),
+                            };
+                            let native_visible = native_content
                                 .iter()
-                                .position(|block| block["type"] == "tool_use")
-                                .unwrap_or(blocks.len());
-                            blocks.insert(before_tools, json!({ "type": "text", "text": text }));
+                                .enumerate()
+                                .filter_map(|(index, block)| match block["type"].as_str() {
+                                    Some("text") => block["text"].as_str(),
+                                    Some("thinking") if narration_indexes.contains(&index) => {
+                                        block["thinking"].as_str()
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<String>();
+                            // Narration is already present in signed thinking.
+                            // Only an actual visible edit needs replacement text.
+                            if text != native_visible {
+                                blocks.retain(|block| block["type"] != "text");
+                                let before_tools = blocks
+                                    .iter()
+                                    .position(|block| block["type"] == "tool_use")
+                                    .unwrap_or(blocks.len());
+                                blocks
+                                    .insert(before_tools, json!({ "type": "text", "text": text }));
+                            }
                         }
                     }
                     push_turn(&mut messages, "assistant", blocks);
@@ -808,12 +834,15 @@ impl AnthropicStreamState {
                 ))
             })
             .collect();
+        let mut narration_block_indexes: Vec<_> = self.narration_blocks.iter().copied().collect();
+        narration_block_indexes.sort_unstable();
         ModelMessage::Assistant {
             content: (!text.is_empty()).then_some(text),
             reasoning_content: (!thinking.is_empty()).then_some(thinking),
             reasoning_details: None,
             provider_state: Some(ModelProviderState::AnthropicMessages {
                 content: self.blocks.clone(),
+                narration_block_indexes: Some(narration_block_indexes),
                 account_identity: None,
             }),
             tool_calls,
@@ -994,9 +1023,10 @@ pub(crate) fn apply_stream_event(
                         state.protocol_error("non-string content delta");
                         return;
                     };
-                    let mut value = block[field].as_str().unwrap_or_default().to_string();
-                    value.push_str(text);
-                    block[field] = json!(value);
+                    match &mut block[field] {
+                        Value::String(value) => value.push_str(text),
+                        value => *value = Value::String(text.to_string()),
+                    }
                     match field {
                         "text" => send_text(progress, text),
                         "thinking" if !state.defer_thinking => send_reasoning(progress, text),
@@ -1353,16 +1383,17 @@ mod tests {
 
     #[test]
     fn native_replay_keeps_public_narration_and_signed_thinking() {
-        for suffix in ["", " Ordinary text."] {
-            let narration = "I'll run `just dev` now.\n\n";
+        let narration = "I'll run `just dev` now.\n\n";
+        for suffix in ["", " Ordinary text.", narration] {
             let visible = format!("{narration}{suffix}");
             let signed = vec![
                 json!({"type":"thinking", "thinking":"private reasoning", "signature":"private-signature"}),
                 json!({"type":"thinking", "thinking":narration, "signature":"narration-signature"}),
             ];
-            let mut native = signed.clone();
+            let mut native = signed;
+            native.push(json!({"type":"redacted_thinking", "data":"opaque-redacted"}));
             if !suffix.is_empty() {
-                native.push(json!({"type":"text", "text":suffix}));
+                native.push(json!({"type":"text", "text":suffix, "citations":[], "cache_control":{"type":"ephemeral","ttl":"1h"}}));
             }
             native.push(
                 json!({"type":"tool_use", "id":"handoff", "name":"followup_task", "input":{}}),
@@ -1378,8 +1409,9 @@ mod tests {
                             reasoning_content: Some("private reasoning".into()),
                             reasoning_details: None,
                             provider_state: Some(ModelProviderState::AnthropicMessages {
-                                content: native,
-                                account_identity: None,
+                                content: native.clone(),
+                                narration_block_indexes: Some(vec![1]),
+                                account_identity: Some("test-account".into()),
                             }),
                             tool_calls: vec![ModelToolCall::function(
                                 "handoff".into(),
@@ -1393,14 +1425,83 @@ mod tests {
                 ),
             );
             let blocks = body["messages"][1]["content"].as_array().unwrap();
-            assert_eq!(&blocks[..2], signed.as_slice());
-            let replayed_text = blocks
-                .iter()
-                .filter(|block| block["type"] == "text")
-                .filter_map(|block| block["text"].as_str())
-                .collect::<String>();
-            assert_eq!(replayed_text, visible);
-            assert_eq!(blocks.last().unwrap()["id"], "handoff");
+            assert_eq!(
+                blocks, &native,
+                "including legitimate repeated ordinary text"
+            );
+            assert!(
+                blocks
+                    .iter()
+                    .all(|block| block.get("narration_block_indexes").is_none())
+            );
+        }
+    }
+
+    #[test]
+    fn native_replay_preserves_edits_and_legacy_states() {
+        let narration = "Checking now.\n";
+        // The pinned native classifier reads the signature marker, never prose.
+        let signature = "Eg0KC0IJbmFycmF0aW9u";
+        for indexes in [None, Some(vec![]), Some(vec![0])] {
+            for signature in [signature, "opaque-unknown"] {
+                let native = vec![
+                    json!({"type":"thinking", "thinking":narration, "signature":signature}),
+                    json!({"type":"text", "text":"Ordinary text.", "citations":[]}),
+                ];
+                let original = format!("{narration}Ordinary text.");
+                for visible in [
+                    original.clone(),
+                    format!("{original}!"),
+                    "Ordinary text.".into(),
+                ] {
+                    let state = ModelProviderState::AnthropicMessages {
+                        content: native.clone(),
+                        narration_block_indexes: indexes.clone(),
+                        account_identity: Some("test-account".into()),
+                    };
+                    let persisted = serde_json::to_value(&state).unwrap();
+                    assert_eq!(
+                        persisted.get("narration_block_indexes").is_none(),
+                        indexes.is_none()
+                    );
+                    let restored = serde_json::from_value(persisted).unwrap();
+                    assert_eq!(
+                        state, restored,
+                        "including account identity and absent legacy metadata"
+                    );
+                    let body = messages_request_body(
+                        "claude-test",
+                        None,
+                        &request(
+                            vec![
+                                ModelMessage::user("question"),
+                                ModelMessage::Assistant {
+                                    content: Some(visible.clone()),
+                                    reasoning_content: None,
+                                    reasoning_details: None,
+                                    provider_state: Some(restored),
+                                    tool_calls: vec![],
+                                },
+                                ModelMessage::user("continue"),
+                            ],
+                            vec![],
+                        ),
+                    );
+                    let blocks = body["messages"][1]["content"].as_array().unwrap();
+                    let known_narration = indexes.as_ref().is_some_and(|indexes| indexes == &[0])
+                        || (indexes.is_none()
+                            && cfg!(feature = "claude")
+                            && signature != "opaque-unknown");
+                    if visible == "Ordinary text." || (known_narration && visible == original) {
+                        assert_eq!(blocks, &native);
+                    } else {
+                        assert_eq!(
+                            blocks,
+                            &vec![native[0].clone(), json!({"type":"text", "text":visible})]
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1412,6 +1513,7 @@ mod tests {
         let native = vec![
             json!({ "type": "thinking", "thinking": "poll twice", "signature": "sig" }),
             json!({ "type": "tool_use", "id": "toolu_lost", "name": "exec", "input": {} }),
+            json!({ "type": "thinking", "thinking": "Checking again.", "signature": "narration-signature" }),
             json!({ "type": "tool_use", "id": "toolu_kept", "name": "exec", "input": {} }),
         ];
         let body = messages_request_body(
@@ -1421,11 +1523,12 @@ mod tests {
                 vec![
                     ModelMessage::user("hello"),
                     ModelMessage::Assistant {
-                        content: None,
+                        content: Some("Checking again.".into()),
                         reasoning_content: None,
                         reasoning_details: None,
                         provider_state: Some(ModelProviderState::AnthropicMessages {
-                            content: native,
+                            content: native.clone(),
+                            narration_block_indexes: Some(vec![2]),
                             account_identity: None,
                         }),
                         tool_calls: vec![ModelToolCall::function(
@@ -1447,7 +1550,10 @@ mod tests {
             .map(|block| block["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["toolu_kept"]);
-        assert_eq!(replayed[0]["type"], json!("thinking"));
+        assert_eq!(
+            replayed,
+            &vec![native[0].clone(), native[2].clone(), native[3].clone()]
+        );
     }
 
     #[test]
@@ -1675,6 +1781,99 @@ mod tests {
             &request(vec![ModelMessage::user("think")], Vec::new()),
         );
         assert!(off.get("thinking").is_none());
+    }
+
+    #[test]
+    fn content_deltas_preserve_bytes_progress_and_protocol_errors() {
+        for deferred in [false, true] {
+            for (field, kind) in [
+                ("text", "text_delta"),
+                ("thinking", "thinking_delta"),
+                ("signature", "signature_delta"),
+            ] {
+                for initial in [None, Some(json!("pré")), Some(Value::Null), Some(json!(4))] {
+                    let mut state = if deferred {
+                        AnthropicStreamState::claude_summaries()
+                    } else {
+                        AnthropicStreamState::default()
+                    };
+                    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+                    apply_stream_event(&mut state, "message_start", &json!({"message":{}}), None);
+                    let mut block =
+                        json!({"type": if field == "text" { "text" } else { "thinking" }});
+                    let mut expected = initial
+                        .as_ref()
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if let Some(initial) = initial {
+                        block[field] = initial;
+                    }
+                    apply_stream_event(
+                        &mut state,
+                        "content_block_start",
+                        &json!({"index":0,"content_block":block}),
+                        None,
+                    );
+                    for text in ["", "é", "🦀", ""] {
+                        apply_sse_frame(
+                            &mut state,
+                            &frame(
+                                "content_block_delta",
+                                json!({"index":0,"delta":{"type":kind,field:text}}),
+                            ),
+                            Some(&sender),
+                        );
+                        expected.push_str(text);
+                        assert_eq!(state.blocks[0][field], expected);
+                        if !text.is_empty() {
+                            match receiver.try_recv().expect("one delta progress event") {
+                                ProviderProgress::Bytes { stream, chunk } if field == "text" => {
+                                    assert_eq!(stream, ProviderProgressStream::Stdout);
+                                    assert_eq!(chunk, text.as_bytes());
+                                }
+                                ProviderProgress::ProviderEvent {
+                                    kind,
+                                    payload,
+                                    content_text,
+                                    stream_channel,
+                                    ..
+                                } if field == "thinking" && !deferred => {
+                                    assert_eq!(kind, "reasoning_delta");
+                                    assert_eq!(payload, json!({"text":text}));
+                                    assert_eq!(content_text.as_deref(), Some(text));
+                                    assert_eq!(stream_channel.as_deref(), Some("reasoning"));
+                                }
+                                ProviderProgress::Phase { name, input } => {
+                                    assert!(
+                                        field == "signature" || (field == "thinking" && deferred)
+                                    );
+                                    assert_eq!(name, "transport_activity");
+                                    assert!(input.is_null());
+                                }
+                                event => panic!("unexpected {field} progress: {event:?}"),
+                            }
+                        }
+                        assert!(
+                            receiver.try_recv().is_err(),
+                            "empty delta or extra progress"
+                        );
+                        assert!(state.provider_error.is_none());
+                    }
+                    apply_stream_event(
+                        &mut state,
+                        "content_block_delta",
+                        &json!({"index":0,"delta":{"type":kind,field:42}}),
+                        Some(&sender),
+                    );
+                    let (error, kind) = state.take_error().expect("non-string delta rejected");
+                    assert_eq!(kind, ProviderErrorKind::ConnectionLost);
+                    assert!(error.contains("non-string content delta"));
+                    assert_eq!(state.blocks[0][field], expected);
+                    assert!(receiver.try_recv().is_err());
+                }
+            }
+        }
     }
 
     #[test]
@@ -1942,7 +2141,12 @@ mod tests {
             );
             apply_stream_event(&mut state, "message_stop", &json!({}), None);
             state.validate_complete().expect("complete native response");
-            let message = state.assistant_message();
+            let persisted = serde_json::to_value(state.assistant_message()).unwrap();
+            assert_eq!(
+                persisted["provider_state"]["narration_block_indexes"],
+                if classified { json!([1]) } else { json!([]) }
+            );
+            let message = serde_json::from_value(persisted).unwrap();
             let ModelMessage::Assistant {
                 content,
                 reasoning_content,
@@ -1975,25 +2179,10 @@ mod tests {
                     vec![],
                 ),
             );
-            let blocks = replay["messages"][1]["content"].as_array().unwrap();
-            let signed: Vec<_> = blocks
-                .iter()
-                .filter(|block| block["type"] != "text")
-                .cloned()
-                .collect();
-            assert_eq!(Value::Array(signed), state.raw_response()["content"]);
-            let public_text: String = blocks
-                .iter()
-                .filter(|block| block["type"] == "text")
-                .filter_map(|block| block["text"].as_str())
-                .collect();
             assert_eq!(
-                public_text,
-                if classified {
-                    "Off keeps the old lighting."
-                } else {
-                    ""
-                }
+                replay["messages"][1]["content"],
+                state.raw_response()["content"],
+                "displayed narration must replay only as its original signed block"
             );
             assert!(
                 replay["messages"][1]["content"][1]

@@ -9043,6 +9043,7 @@ mod tests {
         };
         let anthropic = |content| ModelProviderState::AnthropicMessages {
             content,
+            narration_block_indexes: None,
             account_identity: Some("test-account".into()),
         };
         let encrypted = responses(vec![json!({

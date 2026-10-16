@@ -7,6 +7,10 @@ Git comparison.
 
 ### Actions
 
+- Preserve standalone MCP shell yield behavior and queue immediate stdin until
+  an explicitly asynchronous shell has started. Its watcher/session identity,
+  working directory, cancellation, and result retrieval stay intact.
+
 - All tool actions now start synchronously and automatically continue in the
   background after ten seconds, without cancellation or restart. Use
   `async: true` to background immediately or `blocking: true` to wait until
@@ -16,6 +20,15 @@ Git comparison.
   background actions remain visible as running and subsequent clicks inspect
   details rather than toggling them back. Completed watcher actions no longer
   remain stuck showing “Running in background”.
+
+### Streaming
+
+- Append Claude text, thinking, and signature fragments in place instead of
+  rebuilding the entire buffer on every delta. The same 1 MiB/16,384-fragment
+  decoder fixture is 13–15× faster; provider output and progress are unchanged.
+- Replay native signed Claude narration exactly once instead of synthesizing
+  a second text copy. Preserve genuine text repetitions, edited context,
+  signatures, tool repairs, and subscription continuation.
 
 ### Build reliability
 

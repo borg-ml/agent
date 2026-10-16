@@ -61,6 +61,9 @@ pub enum ModelProviderState {
     },
     AnthropicMessages {
         content: Vec<Value>,
+        /// Display-only indexes into `content`; absent in older saved states.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        narration_block_indexes: Option<Vec<usize>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account_identity: Option<String>,
     },
