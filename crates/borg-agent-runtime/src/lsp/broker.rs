@@ -19,11 +19,11 @@ use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant, timeout};
 use uuid::Uuid;
 
-use super::{LspPathPolicy, LspService};
+use super::{LspPathPolicy, LspService, REQUEST_CANCELLED};
 
 const MAX_WIRE_BYTES: u64 = 64 * 1024 * 1024;
-// A workspace pass can initialize a server for 120 s and then spend up to
-// 90 s collecting diagnostics. Keep the IPC budget above both, but bounded.
+// IPC is a final safety net; local operations have their own budgets, including
+// slot acquisition and workspace bootstrap.
 const BROKER_TIMEOUT: Duration = Duration::from_secs(4 * 60);
 const SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
 
@@ -135,8 +135,10 @@ async fn request_on(request: Request, (socket, lock_path): (PathBuf, PathBuf)) -
             bytes.len() as u64 <= MAX_WIRE_BYTES,
             "LSP request exceeds broker limit"
         );
+        stream.write_u32(bytes.len() as u32).await?;
         stream.write_all(&bytes).await?;
-        stream.shutdown().await?;
+        // Keep the write half open: EOF now means the caller abandoned work,
+        // not simply that its request body ended.
         let mut response = Vec::new();
         stream
             .take(MAX_WIRE_BYTES + 1)
@@ -185,12 +187,14 @@ fn socket_paths_in(base: PathBuf) -> Result<(PathBuf, PathBuf)> {
         meta.file_type().is_dir() && meta.uid() == uid && meta.permissions().mode() & 0o077 == 0,
         "LSP broker directory is not private to this OS user"
     );
-    let socket = dir.join("pool.sock");
+    // V1 used EOF to frame requests, so it cannot detect client abandonment.
+    // Never silently attach a fixed client to an old broker implementation.
+    let socket = dir.join("pool-v2.sock");
     ensure!(
         socket.as_os_str().len() < 104,
         "LSP broker socket path is too long"
     );
-    Ok((socket, dir.join("election.lock")))
+    Ok((socket, dir.join("election-v2.lock")))
 }
 
 async fn serve(listener: UnixListener) {
@@ -220,17 +224,34 @@ async fn serve(listener: UnixListener) {
 }
 
 async fn serve_request(mut stream: UnixStream, sessions: Sessions) -> Result<()> {
-    let mut bytes = Vec::new();
-    (&mut stream)
-        .take(MAX_WIRE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .await?;
-    ensure!(
-        bytes.len() as u64 <= MAX_WIRE_BYTES,
-        "LSP request exceeds broker limit"
-    );
-    let request: Request = serde_json::from_slice(&bytes)?;
-    let result = dispatch(request, sessions).await;
+    let request = timeout(BROKER_TIMEOUT, async {
+        let length = stream.read_u32().await? as u64;
+        ensure!(length <= MAX_WIRE_BYTES, "LSP request exceeds broker limit");
+        let mut bytes = vec![0; length as usize];
+        stream.read_exact(&mut bytes).await?;
+        serde_json::from_slice::<Request>(&bytes).context("invalid LSP broker request")
+    })
+    .await
+    .context("timed out reading LSP broker request")??;
+    let (cancel, cancelled) = tokio::sync::watch::channel(false);
+    let dispatch = REQUEST_CANCELLED.scope(cancelled, dispatch(request, sessions));
+    tokio::pin!(dispatch);
+    let mut unexpected = [0];
+    let result = tokio::select! {
+        result = &mut dispatch => result,
+        _ = stream.read(&mut unexpected) => {
+            let _ = cancel.send(true);
+            // Let in-flight requests send $/cancelRequest; slot waiters leave
+            // immediately. Bounded cleanup also covers stuck filesystem I/O.
+            let _ = timeout(super::CANCEL_TIMEOUT, &mut dispatch).await;
+            return Ok(());
+        }
+        _ = tokio::time::sleep(BROKER_TIMEOUT) => {
+            let _ = cancel.send(true);
+            let _ = timeout(super::CANCEL_TIMEOUT, &mut dispatch).await;
+            bail!("LSP broker dispatch exceeded its deadline");
+        }
+    };
     let reply = match result {
         Ok(value) => Reply {
             result: Some(value),
@@ -271,6 +292,7 @@ async fn dispatch(request: Request, sessions: Sessions) -> Result<Value> {
         Operation::Status => {
             let mut status = service.status_local().await;
             status["broker_pid"] = Value::from(std::process::id());
+            status["broker_protocol"] = Value::from(2);
             Ok(status)
         }
         Operation::Diagnostics { path } => service.diagnostics_local(&path).await,
@@ -424,6 +446,9 @@ mod tests {
     async fn second_process_uses_the_same_broker() {
         let base = tempfile::tempdir().unwrap();
         let paths = socket_paths_in(base.path().to_path_buf()).unwrap();
+        // Leave a V1 broker socket present. A V2 client must not connect to it
+        // and silently regain the old non-cancellable dispatch semantics.
+        let _old = UnixListener::bind(paths.0.with_file_name("pool.sock")).unwrap();
         let status = request_on(
             status_request(
                 Uuid::new_v4(),
@@ -435,6 +460,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status["broker_pid"], json!(std::process::id()));
+        assert_eq!(status["broker_protocol"], json!(2));
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("lsp::broker::tests::broker_subprocess_client")
@@ -450,6 +476,64 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&child.stdout)
                 .contains(&format!("BROKER_PID={}", std::process::id()))
+        );
+    }
+
+    // A dropped client used to leave dispatch queued behind the slot even
+    // after its four-minute IPC deadline. Check the actual socket lifecycle,
+    // not only a cancellation helper or a shortened timeout.
+    #[tokio::test]
+    async fn disconnected_broker_clients_do_not_leave_queued_work() {
+        let base = tempfile::tempdir().unwrap();
+        let paths = socket_paths_in(base.path().to_path_buf()).unwrap();
+        let listener = UnixListener::bind(&paths.0).unwrap();
+        let service = LspService::new(base.path());
+        let shared = service
+            .lease_client(spec_for_id("rust-analyzer").unwrap(), base.path())
+            .await;
+        let busy = shared.lock().await;
+        let count = Arc::strong_count(&shared);
+        let id = Uuid::new_v4();
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::from([(
+            id,
+            Session {
+                root: base.path().to_path_buf(),
+                policy: LspPathPolicy::Unrestricted,
+                service,
+                last_used: Instant::now(),
+            },
+        )])));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_request(stream, sessions).await
+        });
+        let root = base.path().to_path_buf();
+        let client = tokio::spawn(request_on(
+            Request {
+                id,
+                root,
+                policy: LspPathPolicy::Unrestricted,
+                operation: Operation::WorkspaceSymbols {
+                    query: "obsolete".into(),
+                },
+            },
+            paths,
+        ));
+        timeout(Duration::from_secs(2), async {
+            // active_clients retains a snapshot while waiting for the slot.
+            while Arc::strong_count(&shared) == count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request reached the busy slot");
+        client.abort();
+        let _ = client.await;
+        let completed = timeout(Duration::from_secs(2), server).await;
+        drop(busy);
+        assert!(
+            completed.is_ok(),
+            "abandoned dispatch must exit while the slot is still occupied"
         );
     }
 }

@@ -33,6 +33,17 @@ Git comparison.
   a second text copy. Preserve genuine text repetitions, edited context,
   signatures, tool repairs, and subscription continuation.
 
+### Language tools
+
+- Bound LSP queue waits and count startup and queueing against the workspace
+  diagnostic budget. Abandoned requests cancel instead of blocking later work;
+  incomplete analysis remains explicitly partial, never a false clean result.
+- Preserve partial protocol reads and writes across cancellation, and use warm
+  diagnostic waits after closing a document rather than repeatedly waiting for
+  cold analysis.
+- Updated processes use a versioned LSP broker without restarting existing
+  agent hosts or changing analyzer features.
+
 ### Build reliability
 
 - Restore release manifests and changelog on interruption instead of leaving

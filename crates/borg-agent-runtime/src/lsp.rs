@@ -7,13 +7,42 @@ use serde_json::{Value, json};
 
 #[cfg(unix)]
 mod broker;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
-use tokio::time::{Duration, Instant, timeout};
+use tokio::sync::{Mutex, MutexGuard, watch};
+use tokio::time::{Duration, Instant, timeout, timeout_at};
 use url::Url;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
+
+tokio::task_local! {
+    // Scoped to one broker dispatch, never to a pooled client or session.
+    static REQUEST_CANCELLED: watch::Receiver<bool>;
+}
+
+async fn request_cancelled() {
+    if let Ok(mut receiver) = REQUEST_CANCELLED.try_with(Clone::clone) {
+        let _ = receiver.wait_for(|cancelled| *cancelled).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+async fn lock_client(
+    shared: &SharedLspClient,
+    deadline: Option<Instant>,
+) -> Result<MutexGuard<'_, LspClientState>> {
+    let end = Instant::now() + REQUEST_TIMEOUT;
+    let end = deadline.map_or(end, |deadline| deadline.min(end));
+    tokio::select! {
+        biased;
+        _ = request_cancelled() => bail!("LSP request cancelled while waiting for server slot"),
+        result = timeout_at(end, shared.lock()) => {
+            result.context("language server slot is busy; timed out waiting for another LSP request")
+        }
+    }
+}
 /// `initialize` is the one request that legitimately takes long: jdtls, gopls
 /// and rust-analyzer index the workspace before answering. Every other
 /// request keeps the short timeout so a wedged server is noticed quickly.
@@ -29,10 +58,9 @@ const LSP_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const LSP_REAPER_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_LSP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WORKSPACE_DIAGNOSTIC_FILES: usize = 4096;
-/// Whole-call wall clock for a workspace diagnostics pass. Without it, the
-/// per-document fallback multiplies its own timeout by the file count, which
-/// on a large C++ workspace is hours; callers get a bounded partial report
-/// instead of a hang.
+/// Whole-pass budget including startup and slot waits. Without it, document
+/// fallback multiplies its timeout by the file count. At expiry, allow at most
+/// CANCEL_TIMEOUT more for best-effort cancellation, then return a partial report.
 const WORKSPACE_DIAGNOSTICS_BUDGET: Duration = Duration::from_secs(90);
 /// Remembered reaps, so a later "nothing is active" answer can say a server
 /// *was* active rather than implying one never started.
@@ -160,6 +188,12 @@ struct LspClient {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    // Reads and writes may be interrupted by tool cancellation, including in
+    // the middle of a frame. Keep all consumed/emitted bytes on the client.
+    incoming: Vec<u8>,
+    outgoing: Vec<u8>,
+    outgoing_written: usize,
+    pending_request: Option<u64>,
     supports_pull_diagnostics: bool,
     compilation_configuration: Vec<(PathBuf, u64, std::time::SystemTime)>,
     opened_versions: HashMap<PathBuf, i32>,
@@ -434,8 +468,8 @@ impl LspService {
     async fn diagnostics_local(&self, path: &Path) -> Result<Value> {
         let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
         let shared = self.lease_client(spec, &workspace_root).await;
-        let mut slot = shared.lock().await;
-        let client = ready_client(&mut slot, spec, &workspace_root, &path).await?;
+        let mut slot = lock_client(&shared, None).await?;
+        let client = ready_client(&mut slot, spec, &workspace_root, &path, None).await?;
         let mut report = client
             .document_diagnostics(&path, &uri, spec.language_id, None)
             .await?;
@@ -622,7 +656,7 @@ impl LspService {
         let mut results = serde_json::Map::new();
         for (key, shared) in &clients {
             let label = workspace_label(key, server_counts[key.server_id]);
-            let mut slot = shared.lock().await;
+            let mut slot = lock_client(&shared, None).await?;
             let Some(client) = slot.ready_mut() else {
                 results.insert(label, slot.unavailable_report());
                 continue;
@@ -663,49 +697,91 @@ impl LspService {
     }
 
     async fn workspace_diagnostics_local(&self, path: Option<&Path>) -> Result<Value> {
-        if let Some(path) = path {
-            let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
-            let shared = self.lease_client(spec, &workspace_root).await;
-            let mut slot = shared.lock().await;
-            let client = ready_client(&mut slot, spec, &workspace_root, &path).await?;
-            client.open_document(&path, &uri, spec.language_id).await?;
-        }
+        // Include path discovery, bootstrap and slot contention in the SAME
+        // budget as analysis, not another 120 seconds before the clock starts.
+        let deadline = Instant::now() + WORKSPACE_DIAGNOSTICS_BUDGET;
+        let bootstrap = if let Some(path) = path {
+            match timeout_at(deadline, async {
+                let resolved = self.resolve_document(path).await?;
+                self.lease_client(resolved.2, &resolved.3).await;
+                Ok::<_, anyhow::Error>(resolved)
+            })
+            .await
+            {
+                Ok(result) => Some(result?),
+                Err(_) => return Ok(json!({ "bootstrap": skipped_for_budget_report() })),
+            }
+        } else {
+            None
+        };
 
         let clients = self.active_clients().await;
         if clients.is_empty() {
             return Err(self.no_active_server_error().await);
         }
         let server_counts = server_counts(&clients);
-        let deadline = Instant::now() + WORKSPACE_DIAGNOSTICS_BUDGET;
         let mut results = serde_json::Map::new();
         for (key, shared) in &clients {
             let label = workspace_label(key, server_counts[key.server_id]);
-            let mut slot = shared.lock().await;
-            let Some(client) = slot.ready_mut() else {
-                results.insert(label, slot.unavailable_report());
-                continue;
-            };
-            // The budget is shared across workspaces, so one slow server
-            // cannot consume the whole call and leave the rest unreported.
             if Instant::now() >= deadline {
                 results.insert(label, skipped_for_budget_report());
                 continue;
             }
-            let value = workspace_diagnostic_result(match client.workspace_diagnostics().await {
-                Ok(value) => Ok(value),
-                Err(error) if is_unknown_workspace_diagnostics_request(&error) => {
-                    let spec = spec_for_id(key.server_id)
-                        .with_context(|| format!("unknown language server `{}`", key.server_id))?;
-                    client
-                        .document_workspace_diagnostics(&key.workspace_root, spec, deadline)
-                        .await
-                        .with_context(|| {
-                            format!("{label} document diagnostics fallback failed ({error:#})")
-                        })
+            let mut slot = match lock_client(shared, Some(deadline)).await {
+                Ok(slot) => slot,
+                Err(error) => {
+                    results.insert(label, workspace_diagnostic_result(Err(error)));
+                    continue;
                 }
-                Err(error) => Err(error)
-                    .with_context(|| format!("{label} workspace diagnostics request failed")),
-            });
+            };
+            if let Some((path, uri, spec, root)) = &bootstrap
+                && spec.id == key.server_id
+                && root == &key.workspace_root
+            {
+                let started = timeout_at(deadline, async {
+                    let client = ready_client(&mut slot, spec, root, path, Some(deadline)).await?;
+                    client.open_document(path, uri, spec.language_id).await?;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+                .context("workspace diagnostic time budget exhausted during bootstrap")
+                .and_then(|result| result);
+                if let Err(error) = started {
+                    results.insert(label, workspace_diagnostic_result(Err(error)));
+                    continue;
+                }
+            }
+            let Some(client) = slot.ready_mut() else {
+                results.insert(label, slot.unavailable_report());
+                continue;
+            };
+            let report = timeout_at(deadline, client.workspace_diagnostics(deadline)).await;
+            if report.is_err() {
+                // The outer timer may drop the nested request before its own
+                // cancellation cleanup runs. Do not leave it running until reuse.
+                let _ = timeout(CANCEL_TIMEOUT, client.cancel_pending_request()).await;
+            }
+            let value = workspace_diagnostic_result(
+                match report
+                    .context("workspace diagnostic time budget exhausted")
+                    .and_then(|result| result)
+                {
+                    Ok(value) => Ok(value),
+                    Err(error) if is_unknown_workspace_diagnostics_request(&error) => {
+                        let spec = spec_for_id(key.server_id).with_context(|| {
+                            format!("unknown language server `{}`", key.server_id)
+                        })?;
+                        client
+                            .document_workspace_diagnostics(&key.workspace_root, spec, deadline)
+                            .await
+                            .with_context(|| {
+                                format!("{label} document diagnostics fallback failed ({error:#})")
+                            })
+                    }
+                    Err(error) => Err(error)
+                        .with_context(|| format!("{label} workspace diagnostics request failed")),
+                },
+            );
             results.insert(label, value);
         }
         Ok(Value::Object(results))
@@ -714,8 +790,8 @@ impl LspService {
     async fn document_request(&self, path: &Path, method: &str, extra: Value) -> Result<Value> {
         let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
         let shared = self.lease_client(spec, &workspace_root).await;
-        let mut slot = shared.lock().await;
-        let client = ready_client(&mut slot, spec, &workspace_root, &path).await?;
+        let mut slot = lock_client(&shared, None).await?;
+        let client = ready_client(&mut slot, spec, &workspace_root, &path, None).await?;
         client.open_document(&path, &uri, spec.language_id).await?;
         let mut params = extra.as_object().cloned().unwrap_or_default();
         params.insert("textDocument".to_string(), json!({ "uri": uri }));
@@ -732,8 +808,8 @@ impl LspService {
     ) -> Result<Value> {
         let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
         let shared = self.lease_client(spec, &workspace_root).await;
-        let mut slot = shared.lock().await;
-        let client = ready_client(&mut slot, spec, &workspace_root, &path).await?;
+        let mut slot = lock_client(&shared, None).await?;
+        let client = ready_client(&mut slot, spec, &workspace_root, &path, None).await?;
         let text = client.open_document(&path, &uri, spec.language_id).await?;
         // Callers count columns in characters; the wire position is UTF-16
         // code units (the encoding negotiated in `initialize`).
@@ -815,7 +891,7 @@ fn configure_private_preamble_storage(
 }
 
 impl LspClient {
-    async fn start(spec: &ServerSpec, root: &Path) -> Result<Self> {
+    async fn start(spec: &ServerSpec, root: &Path, deadline: Option<Instant>) -> Result<Self> {
         let mut command = Command::new(spec.command);
         let private_preamble_storage = configure_private_preamble_storage(spec, &mut command)?;
         let mut child = command
@@ -845,6 +921,10 @@ impl LspClient {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
+            incoming: Vec::new(),
+            outgoing: Vec::new(),
+            outgoing_written: 0,
+            pending_request: None,
             supports_pull_diagnostics: false,
             compilation_configuration: compilation_configuration_stamp(spec, root).await,
             opened_versions: HashMap::new(),
@@ -875,7 +955,13 @@ impl LspClient {
             initialize["initializationOptions"] = options;
         }
         let initialized = client
-            .request_with_timeout("initialize", initialize, INITIALIZE_TIMEOUT)
+            .request_with_timeout(
+                "initialize",
+                initialize,
+                deadline.map_or(INITIALIZE_TIMEOUT, |end| {
+                    INITIALIZE_TIMEOUT.min(end.saturating_duration_since(Instant::now()))
+                }),
+            )
             .await?;
         client.supports_pull_diagnostics = initialized
             .pointer("/capabilities/diagnosticProvider")
@@ -953,7 +1039,7 @@ impl LspClient {
         // budget even after initialize has answered. Bound BOTH the pull and
         // push fallback by the workspace's remaining budget: checking only
         // between files allowed one cold file to add another 120 seconds.
-        let publish_timeout = if self.opened_versions.contains_key(path) {
+        let publish_timeout = if self.last_versions.contains_key(path) {
             PUBLISHED_DIAGNOSTICS_TIMEOUT
         } else {
             INITIALIZE_TIMEOUT
@@ -1008,7 +1094,15 @@ impl LspClient {
         spec: &ServerSpec,
         deadline: Instant,
     ) -> Result<Value> {
-        let scan = discover_workspace_documents(workspace_root, spec.extensions).await;
+        let scan = match timeout_at(
+            deadline,
+            discover_workspace_documents(workspace_root, spec.extensions),
+        )
+        .await
+        {
+            Ok(scan) => scan,
+            Err(_) => return Ok(skipped_for_budget_report()),
+        };
         let total = scan.paths.len();
         let mut items = Vec::new();
         let mut failed = 0usize;
@@ -1022,17 +1116,22 @@ impl LspClient {
             let uri = Url::from_file_path(&path)
                 .map_err(|_| anyhow::anyhow!("cannot convert {} to a file URI", path.display()))?
                 .to_string();
-            if let Err(error) = self.close_document(&path, &uri).await {
-                let error = format!("failed to reset {}: {error:#}", path.display());
-                failed += 1;
-                items.push(json!({ "uri": uri, "kind": "full", "items": [], "error": error }));
-                interrupted = Some(error);
-                break;
+            let report = timeout_at(
+                deadline,
+                self.document_diagnostics(&path, &uri, spec.language_id, Some(deadline)),
+            )
+            .await;
+            if report.is_err() {
+                let _ = timeout(CANCEL_TIMEOUT, self.cancel_pending_request()).await;
             }
-            let report = self
-                .document_diagnostics(&path, &uri, spec.language_id, Some(deadline))
-                .await;
-            let close_error = self.close_document(&path, &uri).await.err();
+            let report = report
+                .context("workspace diagnostic time budget exhausted")
+                .and_then(|result| result);
+            let close_error = timeout_at(deadline, self.close_document(&path, &uri))
+                .await
+                .context("workspace diagnostic time budget exhausted during document cleanup")
+                .and_then(|result| result)
+                .err();
             let diagnostic_failed = report.is_err();
             // One unreadable or slow document used to abort the whole pass
             // and discard every diagnostic already collected.
@@ -1090,15 +1189,24 @@ impl LspClient {
             result["documentsScanned"] = json!(scanned);
             result["documentsDiscovered"] = json!(total);
         }
-        if let Some(context) = compilation_context_status(workspace_root, spec, None).await {
+        if let Ok(Some(context)) = timeout_at(
+            deadline,
+            compilation_context_status(workspace_root, spec, None),
+        )
+        .await
+        {
             result["compilationContext"] = context;
         }
         Ok(result)
     }
 
-    async fn workspace_diagnostics(&mut self) -> Result<Value> {
-        self.request("workspace/diagnostic", json!({ "previousResultIds": [] }))
-            .await
+    async fn workspace_diagnostics(&mut self, deadline: Instant) -> Result<Value> {
+        self.request_with_timeout(
+            "workspace/diagnostic",
+            json!({ "previousResultIds": [] }),
+            REQUEST_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .await
     }
 
     async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
@@ -1121,41 +1229,59 @@ impl LspClient {
         params: Value,
         deadline: Duration,
     ) -> Result<Value> {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.write_message(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params
-        }))
-        .await?;
-        timeout(deadline, async {
-            loop {
-                let message = self.read_message().await?;
-                self.capture_diagnostics(&message);
-                if message.get("method").is_some()
-                    && let Some(server_request_id) = message.get("id").cloned()
-                {
-                    self.write_message(&json!({
-                        "jsonrpc": "2.0",
-                        "id": server_request_id,
-                        "result": Value::Null
-                    }))
-                    .await?;
-                    continue;
+        let result = tokio::select! {
+            biased;
+            _ = request_cancelled() => Err(anyhow::anyhow!("LSP request cancelled")),
+            result = timeout(deadline, async {
+                self.cancel_pending_request().await?;
+                let id = self.next_id;
+                self.next_id += 1;
+                self.pending_request = Some(id);
+                self.write_message(&json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method,
+                    "params": params
+                })).await?;
+                loop {
+                    let message = self.read_message().await?;
+                    self.capture_diagnostics(&message);
+                    if message.get("method").is_some()
+                        && let Some(server_request_id) = message.get("id").cloned()
+                    {
+                        self.write_message(&json!({
+                            "jsonrpc": "2.0",
+                            "id": server_request_id,
+                            "result": Value::Null
+                        })).await?;
+                        continue;
+                    }
+                    if message.get("id").and_then(Value::as_u64) != Some(id) {
+                        continue;
+                    }
+                    self.pending_request = None;
+                    if let Some(error) = message.get("error") {
+                        bail!("{method} failed: {error}");
+                    }
+                    return Ok(message.get("result").cloned().unwrap_or(Value::Null));
                 }
-                if message.get("id").and_then(Value::as_u64) != Some(id) {
-                    continue;
-                }
-                if let Some(error) = message.get("error") {
-                    bail!("{method} failed: {error}");
-                }
-                return Ok(message.get("result").cloned().unwrap_or(Value::Null));
-            }
-        })
-        .await
-        .with_context(|| format!("{method} timed out"))?
+            }) => result.with_context(|| format!("{method} timed out")).and_then(|result| result),
+        };
+        if result.is_err() {
+            // Best effort now; an interrupted write/cancel stays queued and
+            // MUST finish before any later request is emitted on this client.
+            let _ = timeout(CANCEL_TIMEOUT, self.cancel_pending_request()).await;
+        }
+        result
+    }
+
+    async fn cancel_pending_request(&mut self) -> Result<()> {
+        if let Some(id) = self.pending_request.take() {
+            // write_message queues the complete frame before its first await.
+            // Retrying an interrupted cancel must flush it, not enqueue it twice.
+            self.notify("$/cancelRequest", json!({ "id": id })).await?;
+        }
+        self.flush_outgoing().await
     }
 
     fn capture_diagnostics(&mut self, message: &Value) {
@@ -1201,7 +1327,10 @@ impl LspClient {
         if let Some(items) = self.published_diagnostics.remove(uri) {
             return Ok(json!({ "kind": "full", "items": items }));
         }
-        timeout(publish_timeout, async {
+        tokio::select! {
+            biased;
+            _ = request_cancelled() => bail!("LSP diagnostic wait cancelled"),
+            result = timeout(publish_timeout, async {
             loop {
                 let message = self.read_message().await?;
                 self.capture_diagnostics(&message);
@@ -1219,47 +1348,87 @@ impl LspClient {
                     return Ok(json!({ "kind": "full", "items": items }));
                 }
             }
-        })
-        .await
-        .context("language server did not publish diagnostics")?
+        }) => result.context("language server did not publish diagnostics")?,
+        }
     }
 
     async fn write_message(&mut self, message: &Value) -> Result<()> {
         let body = serde_json::to_vec(message)?;
-        self.stdin
-            .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
-            .await?;
-        self.stdin.write_all(&body).await?;
+        // Queue the complete frame before awaiting: didOpen/didClose have
+        // already updated document state, even if an older write was paused.
+        self.outgoing
+            .extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        self.outgoing.extend_from_slice(&body);
+        timeout(REQUEST_TIMEOUT, self.flush_outgoing())
+            .await
+            .context("timed out writing to language server")?
+    }
+
+    async fn flush_outgoing(&mut self) -> Result<()> {
+        while self.outgoing_written < self.outgoing.len() {
+            // write (unlike write_all) is cancellation safe. Commit each
+            // successful offset before the next await, even if a tool drops us.
+            let written = self
+                .stdin
+                .write(&self.outgoing[self.outgoing_written..])
+                .await?;
+            if written == 0 {
+                bail!("language server closed stdin");
+            }
+            self.outgoing_written += written;
+        }
         self.stdin.flush().await?;
+        self.outgoing.clear();
+        self.outgoing_written = 0;
         Ok(())
     }
 
     async fn read_message(&mut self) -> Result<Value> {
-        let mut content_length = None;
+        const MAX_HEADER_BYTES: usize = 8192;
         loop {
-            let mut header = String::new();
-            let bytes = self.stdout.read_line(&mut header).await?;
-            if bytes == 0 {
+            // Search only the bounded header prefix, not the growing body.
+            let header = &self.incoming[..self.incoming.len().min(MAX_HEADER_BYTES)];
+            let header_end = header
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .map(|end| end + 4)
+                .into_iter()
+                .chain(
+                    header
+                        .windows(2)
+                        .position(|bytes| bytes == b"\n\n")
+                        .map(|end| end + 2),
+                )
+                .min();
+            if let Some(end) = header_end.filter(|end| *end <= MAX_HEADER_BYTES) {
+                let header = std::str::from_utf8(&self.incoming[..end])?;
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .context("LSP response omitted Content-Length")?;
+                if length > MAX_LSP_MESSAGE_BYTES {
+                    bail!("LSP response exceeds {} bytes", MAX_LSP_MESSAGE_BYTES);
+                }
+                if self.incoming.len() >= end + length {
+                    let message = serde_json::from_slice(&self.incoming[end..end + length])
+                        .context("language server returned invalid JSON");
+                    self.incoming.drain(..end + length);
+                    return message;
+                }
+            } else if self.incoming.len() >= MAX_HEADER_BYTES {
+                bail!("LSP response header exceeds {MAX_HEADER_BYTES} bytes");
+            }
+            let mut bytes = [0; 8192];
+            let read = self.stdout.read(&mut bytes).await?;
+            if read == 0 {
                 let status = self.child.try_wait()?;
                 bail!("language server closed stdout (status: {status:?})");
             }
-            if header == "\r\n" || header == "\n" {
-                break;
-            }
-            if let Some(value) = header
-                .strip_prefix("Content-Length:")
-                .and_then(|value| value.trim().parse::<usize>().ok())
-            {
-                content_length = Some(value);
-            }
+            self.incoming.extend_from_slice(&bytes[..read]);
         }
-        let length = content_length.context("LSP response omitted Content-Length")?;
-        if length > MAX_LSP_MESSAGE_BYTES {
-            bail!("LSP response exceeds {} bytes", MAX_LSP_MESSAGE_BYTES);
-        }
-        let mut body = vec![0; length];
-        self.stdout.read_exact(&mut body).await?;
-        serde_json::from_slice(&body).context("language server returned invalid JSON")
     }
 }
 
@@ -1341,6 +1510,7 @@ async fn ready_client<'a>(
     spec: &'static ServerSpec,
     root: &Path,
     document: &Path,
+    deadline: Option<Instant>,
 ) -> Result<&'a mut LspClient> {
     let mut configuration = compilation_configuration_stamp(spec, root).await;
     // A document may use a nearer .clangd/compile_flags.txt than the workspace
@@ -1379,7 +1549,7 @@ async fn ready_client<'a>(
         *slot = LspClientState::NotStarted;
     }
     if !matches!(slot, LspClientState::Ready(_)) {
-        match LspClient::start(spec, root).await {
+        match LspClient::start(spec, root, deadline).await {
             Ok(mut client) => {
                 client.compilation_configuration = configuration;
                 *slot = LspClientState::Ready(Box::new(client));
@@ -1390,7 +1560,11 @@ async fn ready_client<'a>(
             }
         }
     }
-    Ok(slot.ready_mut().expect("started LSP client"))
+    let client = slot.ready_mut().expect("started LSP client");
+    timeout(REQUEST_TIMEOUT, client.cancel_pending_request())
+        .await
+        .context("timed out cancelling an abandoned LSP request")??;
+    Ok(client)
 }
 
 /// The UTF-16 code-unit column for a character (code point) column on `line`.
@@ -1481,7 +1655,7 @@ fn skipped_for_budget_report() -> Value {
         "items": [],
         "partial": true,
         "partialReason": format!(
-            "time budget of {}s was consumed by earlier workspaces; query this one directly",
+            "time budget of {}s exhausted during workspace diagnostics; query this workspace directly",
             WORKSPACE_DIAGNOSTICS_BUDGET.as_secs()
         )
     })
@@ -2504,6 +2678,10 @@ mod tests {
                 stdin,
                 stdout: BufReader::new(stdout),
                 next_id: 1,
+                incoming: Vec::new(),
+                outgoing: Vec::new(),
+                outgoing_written: 0,
+                pending_request: None,
                 supports_pull_diagnostics: false,
                 compilation_configuration: Vec::new(),
                 opened_versions: HashMap::new(),
@@ -3014,6 +3192,10 @@ mod tests {
             stdout: BufReader::new(child.stdout.take().expect("stdout")),
             child,
             next_id: 1,
+            incoming: Vec::new(),
+            outgoing: Vec::new(),
+            outgoing_written: 0,
+            pending_request: None,
             supports_pull_diagnostics: false,
             compilation_configuration: Vec::new(),
             opened_versions: HashMap::new(),
@@ -3089,6 +3271,10 @@ mod tests {
             stdout: BufReader::new(child.stdout.take().expect("stdout")),
             child,
             next_id: 1,
+            incoming: Vec::new(),
+            outgoing: Vec::new(),
+            outgoing_written: 0,
+            pending_request: None,
             supports_pull_diagnostics: false,
             compilation_configuration: Vec::new(),
             opened_versions: HashMap::new(),
@@ -3106,6 +3292,34 @@ mod tests {
             ),
         )
         .await;
+        // Closing a sweep's document must not turn the next explicit check
+        // back into a cold 120-second publication wait.
+        assert!(
+            client
+                .last_versions
+                .contains_key(&root.path().join("unit.cpp")),
+            "the sweep checked this document"
+        );
+        tokio::time::pause();
+        let warm_started = Instant::now();
+        let path = root.path().join("unit.cpp");
+        let uri = Url::from_file_path(&path).unwrap().to_string();
+        assert!(
+            client
+                .document_diagnostics(&path, &uri, "cpp", None)
+                .await
+                .is_err()
+        );
+        assert!(
+            warm_started.elapsed() < PUBLISHED_DIAGNOSTICS_TIMEOUT + Duration::from_secs(1),
+            "a previously checked, closed document is still warm: {:?}",
+            warm_started.elapsed()
+        );
+        client
+            .close_document(&path, &uri)
+            .await
+            .expect("close warm check");
+        tokio::time::resume();
         client.child.kill().await.expect("stop owned mock server");
         let report = result
             .expect("the scan must not wait for the ordinary request/publish timeout")
@@ -3150,6 +3364,10 @@ mod tests {
             stdin,
             stdout,
             next_id: 1,
+            incoming: Vec::new(),
+            outgoing: Vec::new(),
+            outgoing_written: 0,
+            pending_request: None,
             supports_pull_diagnostics: false,
             compilation_configuration: Vec::new(),
             opened_versions: HashMap::new(),
@@ -3240,5 +3458,288 @@ mod tests {
                 .is_some_and(|reason| reason.contains("time budget")),
             "the caller must learn the result was cut short by time"
         );
+    }
+
+    // A timeout can land in either a header or body. Losing those bytes used
+    // to corrupt the next request, and dropping a request did not cancel the
+    // server's obsolete work. A compiler check cannot exercise this wire order.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_requests_preserve_frames_and_cancel_before_reuse() {
+        for split_header in [true, false] {
+            for mode in ["timeout", "drop", "broker_cancel"] {
+                let script = r#"
+import sys,json
+r,w=sys.stdin.buffer,sys.stdout.buffer
+def read():
+    n=0
+    while True:
+        h=r.readline()
+        if not h: raise EOFError()
+        if h==b'\r\n': break
+        if h.startswith(b'Content-Length:'): n=int(h.split(b':')[1])
+    return json.loads(r.read(n))
+def frame(v):
+    b=json.dumps(v).encode()
+    return b'Content-Length: '+str(len(b)).encode()+b'\r\n\r\n'+b
+first=read()
+body=json.dumps({'jsonrpc':'2.0','id':first['id'],'result':'obsolete'}).encode()
+b=b'Content-Length: '+str(len(body)).encode()+b'\n\n'+body
+cut=9 if sys.argv[1]=='header' else len(b)-5
+w.write(b[:cut]);w.flush()
+cancel=read()
+assert cancel['method']=='$/cancelRequest' and cancel['params']['id']==first['id'],cancel
+# Coalesce an LF-framed response with a CRLF-framed successor. Choosing a
+# later CRLF boundary instead of the earlier LF boundary corrupts both frames.
+w.write(b[cut:]+frame({'jsonrpc':'2.0','method':'fixture/late'}));w.flush()
+second=read()
+w.write(frame({'jsonrpc':'2.0','id':second['id'],'result':'fresh'}));w.flush()
+"#;
+                let mut child = Command::new("python3")
+                    .args([
+                        "-u",
+                        "-c",
+                        script,
+                        if split_header { "header" } else { "body" },
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .expect("owned stdio server");
+                let mut client = LspClient {
+                    stdin: child.stdin.take().unwrap(),
+                    stdout: BufReader::new(child.stdout.take().unwrap()),
+                    child,
+                    next_id: 1,
+                    incoming: Vec::new(),
+                    outgoing: Vec::new(),
+                    outgoing_written: 0,
+                    pending_request: None,
+                    supports_pull_diagnostics: false,
+                    compilation_configuration: Vec::new(),
+                    opened_versions: HashMap::new(),
+                    last_versions: HashMap::new(),
+                    published_diagnostics: HashMap::new(),
+                    _private_preamble_storage: None,
+                };
+                if mode == "broker_cancel" {
+                    let (cancel, cancelled) = watch::channel(false);
+                    let trigger = async move {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        cancel.send(true).unwrap();
+                    };
+                    let (result, ()) = tokio::join!(
+                        REQUEST_CANCELLED
+                            .scope(cancelled, client.request("fixture/first", json!({}))),
+                        trigger,
+                    );
+                    assert!(result.is_err());
+                    assert!(
+                        client.pending_request.is_none(),
+                        "send cancellation without waiting for reuse"
+                    );
+                } else if mode == "drop" {
+                    assert!(
+                        timeout(
+                            Duration::from_millis(500),
+                            client.request("fixture/first", json!({}))
+                        )
+                        .await
+                        .is_err()
+                    );
+                } else {
+                    assert!(
+                        client
+                            .request_with_timeout(
+                                "fixture/first",
+                                json!({}),
+                                Duration::from_millis(500)
+                            )
+                            .await
+                            .is_err()
+                    );
+                }
+                assert!(
+                    !client.incoming.is_empty(),
+                    "fixture must interrupt a consumed frame"
+                );
+                let result = client.request("fixture/second", json!({})).await;
+                let _ = client.child.kill().await;
+                assert_eq!(
+                    result.unwrap(),
+                    json!("fresh"),
+                    "header={split_header}, mode={mode}"
+                );
+            }
+        }
+    }
+
+    // Waiting behind another session's scan must not hang unrelated callers
+    // forever, or turn an unexamined workspace into an empty clean report.
+    #[tokio::test(start_paused = true)]
+    async fn busy_workspace_slots_have_bounded_explicit_results() {
+        let root = tempfile::tempdir().unwrap();
+        let service = LspService::new(root.path());
+        let shared = service
+            .lease_client(spec_for_id("rust-analyzer").unwrap(), root.path())
+            .await;
+        let _busy = shared.lock().await;
+        let started = Instant::now();
+        let (symbols, diagnostics) = timeout(REQUEST_TIMEOUT + Duration::from_secs(1), async {
+            tokio::join!(
+                service.workspace_symbols_local("value"),
+                service.workspace_diagnostics_local(None)
+            )
+        })
+        .await
+        .expect("slot waits must be bounded, not wait for a broker deadline");
+        assert!(symbols.is_err());
+        let report = diagnostics.unwrap();
+        assert_eq!(report["rust-analyzer"]["partial"], json!(true));
+        assert!(
+            report["rust-analyzer"]["partialReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("slot"))
+        );
+        assert!(started.elapsed() <= REQUEST_TIMEOUT + Duration::from_secs(1));
+    }
+    // Initialization is allowed to be slow, but not to start a second clock
+    // after the caller has spent its workspace budget. No real analyzer runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_bootstrap_respects_the_callers_remaining_budget() {
+        static SILENT: ServerSpec = ServerSpec {
+            id: "fixture",
+            command: "sh",
+            args: &["-c", "cat >/dev/null"],
+            language_id: "fixture",
+            extensions: &[],
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut state = LspClientState::NotStarted;
+        let result = timeout(
+            Duration::from_secs(2),
+            ready_client(
+                &mut state,
+                &SILENT,
+                root.path(),
+                root.path(),
+                Some(Instant::now() + Duration::from_millis(100)),
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "do not wait for the ordinary 120-second initialize timeout"
+        );
+        assert!(result.unwrap().is_err());
+        assert!(matches!(state, LspClientState::Failed(_)));
+    }
+    // The OS pipe can stop a request/cancel partway through writing. Retrying
+    // cleanup must neither lose bytes nor enqueue another cancel. The control
+    // socket makes backpressure deterministic without a real language server.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupted_writes_resume_without_duplicate_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let control_path = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&control_path).unwrap();
+        let script = r#"
+import sys,json,socket
+c=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+c.connect(sys.argv[1]);c.sendall(b'R');assert c.recv(1)==b'R'
+r,w=sys.stdin.buffer,sys.stdout.buffer
+def read():
+    n=0
+    while True:
+        h=r.readline()
+        if not h: raise EOFError()
+        if h==b'\r\n': break
+        if h.startswith(b'Content-Length:'): n=int(h.split(b':')[1])
+    return json.loads(r.read(n))
+first=read()
+assert len(first['params']['text'])==2*1024*1024
+cancel=read()
+assert cancel['method']=='$/cancelRequest' and cancel['params']['id']==first['id'],cancel
+second=read()
+assert second['method']=='fixture/second',second
+body=json.dumps({'jsonrpc':'2.0','id':second['id'],'result':'fresh'}).encode()
+w.write(b'Content-Length: '+str(len(body)).encode()+b'\r\n\r\n'+body);w.flush()
+# A workspace pass must cancel its expired pull WITHOUT another reuse call.
+while True:
+    third=read()
+    if 'id' in third: break
+assert third['method']=='textDocument/diagnostic',third
+cancel=read()
+assert cancel['method']=='$/cancelRequest' and cancel['params']['id']==third['id'],cancel
+c.sendall(b'C')
+read() # didClose cleanup
+"#;
+        let mut child = Command::new("python3")
+            .args(["-u", "-c", script])
+            .arg(&control_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("owned blocked server");
+        let mut client = LspClient {
+            stdin: child.stdin.take().unwrap(),
+            stdout: BufReader::new(child.stdout.take().unwrap()),
+            child,
+            next_id: 1,
+            incoming: Vec::new(),
+            outgoing: Vec::new(),
+            outgoing_written: 0,
+            pending_request: None,
+            supports_pull_diagnostics: false,
+            compilation_configuration: Vec::new(),
+            opened_versions: HashMap::new(),
+            last_versions: HashMap::new(),
+            published_diagnostics: HashMap::new(),
+            _private_preamble_storage: None,
+        };
+        let (mut control, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(control.read_u8().await.unwrap(), b'R');
+        let result = client
+            .request_with_timeout(
+                "fixture/first",
+                json!({ "text": "x".repeat(2*1024*1024) }),
+                Duration::from_millis(100),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(
+            timeout(Duration::from_millis(100), client.cancel_pending_request())
+                .await
+                .is_err()
+        );
+        control.write_all(b"R").await.unwrap();
+        let result = client.request("fixture/second", json!({})).await;
+        assert_eq!(result.unwrap(), json!("fresh"));
+        std::fs::write(root.path().join("unit.cpp"), "int value;\n").unwrap();
+        client.supports_pull_diagnostics = true;
+        let report = client
+            .document_workspace_diagnostics(
+                root.path(),
+                spec_for_id("clangd").unwrap(),
+                Instant::now() + Duration::from_millis(100),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report["partial"], json!(true));
+        assert_eq!(
+            timeout(Duration::from_secs(2), control.read_u8())
+                .await
+                .unwrap()
+                .unwrap(),
+            b'C',
+            "the workspace deadline must cancel immediately, not wait for reuse"
+        );
+        let _ = client.child.kill().await;
     }
 }
