@@ -9380,7 +9380,7 @@ pub fn agent_tool_specs_for_surface(
         ),
         tool(
             "update_plan",
-            "Replace your ordered assigned todo projection with revision checking. Omitted items become unassigned, not deleted. Refresh with get_plan after a conflict. Exact call: {\"explanation\":\"optional\",\"plan\":[{\"id\":\"UUID from get_plan\",\"content\":\"concise step\",\"status\":\"pending\"}]}. Call get_plan first, reuse exact UUIDs for existing items, and omit id for new items. Use at most 100 items, 500 characters per content, and one in_progress item.",
+            "Replace your ordered assigned todo projection with revision checking. Omitted items become unassigned, not deleted. Refresh with get_plan after a conflict. Exact call: {\"explanation\":\"optional\",\"plan\":[{\"id\":\"UUID from get_plan\",\"content\":\"concise step\",\"status\":\"pending\"}]}. Call get_plan first, reuse exact UUIDs for existing items, and omit id for new items. Use at most 100 items and 500 characters per content. Multiple items may be in_progress.",
             update_plan_schema,
         ),
         tool(

@@ -9183,7 +9183,7 @@ async fn usage_limit_failure_stops_an_active_goal() {
 }
 
 #[test]
-fn todo_list_rejects_multiple_in_progress_items() {
+fn todo_list_accepts_multiple_in_progress_items() {
     let items = vec![
         PlanItem {
             id: Uuid::new_v4(),
@@ -9197,8 +9197,8 @@ fn todo_list_rejects_multiple_in_progress_items() {
         },
     ];
 
-    let error = validate_todos(items).unwrap_err();
-    assert!(error.to_string().contains("at most one in-progress item"));
+    let validated = validate_todos(items.clone()).unwrap();
+    assert_eq!(validated, items);
 }
 
 #[test]

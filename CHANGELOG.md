@@ -33,6 +33,18 @@ Git comparison.
   a second text copy. Preserve genuine text repetitions, edited context,
   signatures, tool repairs, and subscription continuation.
 
+### Planning
+
+- Allow multiple in-progress todos for the same assignee in both session and
+  shared-work plans. Keep revision, assignment, identity, and size validation.
+
+### Composer
+
+- Preserve drafts rejected before send or before any agent output, including
+  attached images, and validate image limits before taking the draft.
+- Add configurable Ctrl+Z undo and Ctrl+Y / Ctrl+Shift+Z redo for the composer;
+  save asynchronous pastes, dictation, and returned drafts to the sidecar too.
+
 ### Language tools
 
 - Bound LSP queue waits and count startup and queueing against the workspace

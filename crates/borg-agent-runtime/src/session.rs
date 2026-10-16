@@ -13129,7 +13129,6 @@ fn validate_todos(mut items: Vec<PlanItem>) -> Result<Vec<PlanItem>> {
         "todo list may contain at most {MAX_PLAN_ITEMS} items"
     );
     let mut ids = std::collections::HashSet::with_capacity(items.len());
-    let mut in_progress = 0;
     for item in &mut items {
         item.content = item.content.trim().to_string();
         anyhow::ensure!(!item.content.is_empty(), "todo content must not be empty");
@@ -13138,14 +13137,7 @@ fn validate_todos(mut items: Vec<PlanItem>) -> Result<Vec<PlanItem>> {
             "todo content may contain at most {MAX_PLAN_ITEM_CONTENT_CHARS} characters"
         );
         anyhow::ensure!(ids.insert(item.id), "todo item IDs must be unique");
-        if item.status == PlanItemStatus::InProgress {
-            in_progress += 1;
-        }
     }
-    anyhow::ensure!(
-        in_progress <= 1,
-        "todo list may contain at most one in-progress item"
-    );
     Ok(items)
 }
 

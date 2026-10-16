@@ -1169,20 +1169,15 @@ impl WorkSnapshot {
         }
         let mut candidate = self.clone();
         candidate.apply(event)?;
-        let mut active = std::collections::HashSet::new();
         for item in &candidate.items {
             ensure!(
                 !item.work.title.trim().is_empty(),
                 "work title must not be empty"
             );
             if item.work.status == WorkStatus::InProgress {
-                let assignee = item
-                    .work
-                    .assignee_id
-                    .context("in-progress work requires an assignee")?;
                 ensure!(
-                    active.insert(assignee),
-                    "only one in-progress item per assignee"
+                    item.work.assignee_id.is_some(),
+                    "in-progress work requires an assignee"
                 );
             }
             let mut seen = std::collections::HashSet::from([item.work.id]);

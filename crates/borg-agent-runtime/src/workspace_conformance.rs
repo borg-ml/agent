@@ -1561,6 +1561,46 @@ pub async fn work_plan_is_a_revision_checked_assignment_projection(
             .status,
         WorkStatus::Pending
     );
+    let current = store
+        .work_items(workspace, actor, Some(actor))
+        .await
+        .unwrap();
+    let parallel = store
+        .update_work_plan(
+            workspace,
+            actor,
+            actor,
+            "parallel-work".into(),
+            current.revision,
+            vec![
+                WorkPlanUpdate {
+                    id: None,
+                    content: "build".into(),
+                    status: WorkStatus::InProgress,
+                },
+                WorkPlanUpdate {
+                    id: None,
+                    content: "review".into(),
+                    status: WorkStatus::InProgress,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(parallel.items.len(), 2);
+    assert!(
+        parallel
+            .items
+            .iter()
+            .all(|item| item.work.status == WorkStatus::InProgress)
+    );
+    assert_eq!(
+        store
+            .work_items(workspace, actor, Some(actor))
+            .await
+            .unwrap(),
+        parallel
+    );
 }
 
 // Import is once-only even for an empty plan, and a restart cannot resurrect
