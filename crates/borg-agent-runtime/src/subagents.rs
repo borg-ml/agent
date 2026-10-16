@@ -46,6 +46,24 @@ struct NestedToolCompletion {
     cancelled: Option<SessionEventKind>,
 }
 
+struct PendingShellStartup {
+    id: Uuid,
+    startups: Arc<RwLock<HashMap<Uuid, CancellationToken>>>,
+}
+
+impl Drop for PendingShellStartup {
+    fn drop(&mut self) {
+        if let Some(ready) = self
+            .startups
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id)
+        {
+            ready.cancel();
+        }
+    }
+}
+
 impl Drop for NestedToolCompletion {
     fn drop(&mut self) {
         if let Some(event) = self.cancelled.take() {
@@ -305,6 +323,7 @@ pub struct AgentToolDispatcher {
     /// Where the last `cd` left the shell, so commands carry on there like in
     /// one terminal instead of every command repeating `cd DIR &&`.
     shell_directory: Arc<RwLock<Option<PathBuf>>>,
+    shell_startups: Arc<RwLock<HashMap<Uuid, CancellationToken>>>,
     /// Nested AGENTS.md/CLAUDE.md files already handed to the model.
     announced_guidance: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
     persistent_runtimes: PersistentRuntimeRegistry,
@@ -980,6 +999,7 @@ impl AgentToolDispatcher {
             command_environment: Arc::new(RwLock::new(BTreeMap::new())),
             turn_events: Arc::new(RwLock::new(None)),
             shell_directory: Arc::new(RwLock::new(None)),
+            shell_startups: Default::default(),
             announced_guidance: Arc::new(std::sync::Mutex::new(HashSet::new())),
             persistent_runtimes: PersistentRuntimeRegistry::default(),
             #[cfg(unix)]
@@ -1282,6 +1302,20 @@ impl AgentToolDispatcher {
             other => bail!("{other} is not a shell tool"),
         };
         if let Some(args) = stdin {
+            let startup = self
+                .shell_startups
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&args.session_id)
+                .cloned();
+            if let Some(startup) = startup {
+                let cancel = cancellation.clone().unwrap_or_default();
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => bail!("shell interaction was cancelled during process startup"),
+                    _ = startup.cancelled() => {}
+                }
+            }
             let mut result = serde_json::to_value(
                 execution_provider
                     .write_stdin(crate::ExecutionStdinRequest {
@@ -1342,15 +1376,22 @@ impl AgentToolDispatcher {
         } else {
             self.in_shell_directory(args.cmd)
         };
+        let action_job_id = crate::watch::action_job_id();
         let mut result = serde_json::to_value(
             execution_provider
                 .command(crate::ExecutionCommandRequest {
-                    process_id: crate::watch::action_job_id(),
+                    process_id: action_job_id,
                     owner_session_id: self.actor_session_id,
                     root: execution_root,
                     command,
                     workdir: args.workdir,
-                    yield_time_ms: args.yield_time_ms,
+                    // The action watcher owns foreground timing; expose the
+                    // registered process before waiting for its completion.
+                    yield_time_ms: if self.watches.is_some() {
+                        Some(0)
+                    } else {
+                        args.yield_time_ms
+                    },
                     max_output_tokens: args
                         .max_output_tokens
                         .map(|tokens| {
@@ -1370,6 +1411,15 @@ impl AgentToolDispatcher {
                 })
                 .await?,
         )?;
+        if let Some(job_id) = action_job_id
+            && let Some(startup) = self
+                .shell_startups
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&job_id)
+        {
+            startup.cancel();
+        }
         drop_command_echo(&mut result);
         let guidance = self.newly_reached_guidance(&command_text, shell_directory.as_deref());
         if let Some(result) = result.as_object_mut() {
@@ -1392,7 +1442,9 @@ impl AgentToolDispatcher {
                 json!("Child agents are working. Wait for them with `wait_agent` instead of shell sleeps: one call blocks up to 30 minutes and returns as soon as a child finishes, fails, or messages you."),
             );
         }
-        if result["running"] == true {
+        // Without an action watcher, callers need the yielded process snapshot
+        // so they can send stdin or continue running code before the shell exits.
+        if result["running"] == true && self.watches.is_some() {
             let process_id = Uuid::parse_str(
                 result["session_id"]
                     .as_str()
@@ -1429,7 +1481,8 @@ impl AgentToolDispatcher {
                     }
                 }
             };
-            let completed: Value = execution.await?;
+            let mut completed: Value = execution.await?;
+            completed["cwd"] = result["cwd"].clone();
             result
                 .as_object_mut()
                 .unwrap()
@@ -2139,6 +2192,20 @@ impl AgentToolDispatcher {
                         &label,
                         name,
                         async move {
+                            // A detached shell's identity is public before
+                            // startup can finish. Queue stdin until it settles.
+                            let _startup = shell_start.then(|| {
+                                let id = crate::watch::action_job_id().unwrap();
+                                dispatcher
+                                    .shell_startups
+                                    .write()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .insert(id, CancellationToken::new());
+                                PendingShellStartup {
+                                    id,
+                                    startups: dispatcher.shell_startups.clone(),
+                                }
+                            });
                             dispatcher
                                 .call_with_workflow_control_direct(
                                     &tool,

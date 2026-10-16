@@ -37,6 +37,8 @@ fn subagent_counts_partition_all_lifecycle_states() {
 #[tokio::test]
 async fn shell_jobs_retrieve_output_and_cancel_the_owned_process() {
     let directory = tempdir().unwrap();
+    let nested = directory.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
     let session = Uuid::new_v4();
     let processes = crate::native_process::ProcessManager::default();
     let (tx, _notices) = tokio::sync::mpsc::channel(32);
@@ -65,7 +67,7 @@ async fn shell_jobs_retrieve_output_and_cancel_the_owned_process() {
         .call(
             "exec",
             json!({
-                "cmd": "sleep 0.1; printf job-finished", "async": true
+                "cmd": "cd nested; read -r line; printf '%s' \"$line\"", "async": true
             }),
         )
         .await
@@ -76,12 +78,23 @@ async fn shell_jobs_retrieve_output_and_cancel_the_owned_process() {
         "one command has one identity"
     );
     assert_eq!(watches.list().await.len(), 1, "one command has one watcher");
+    // An immediate background handle must already accept stdin, without
+    // waiting for a process output event to prove startup has completed.
+    dispatcher
+        .call(
+            "exec",
+            json!({"session_id": result["session_id"], "chars": "job-finished\n", "yield_time_ms": 0}),
+        )
+        .await
+        .unwrap();
     let job = Uuid::parse_str(result["watch_id"].as_str().unwrap()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let info = watches.list_for(&[job]).await.pop().unwrap();
             if !info.running {
-                assert_eq!(info.result.unwrap()["output"]["stdout"], "job-finished");
+                let output = &info.result.unwrap()["output"];
+                assert_eq!(output["stdout"], "job-finished");
+                assert_eq!(output["cwd"], nested.to_string_lossy().as_ref());
                 break;
             }
             watches.changed.notified().await;
@@ -89,6 +102,24 @@ async fn shell_jobs_retrieve_output_and_cancel_the_owned_process() {
     })
     .await
     .unwrap();
+    let pending = dispatcher
+        .call("exec", json!({"cmd": "read -r line", "async": true}))
+        .await
+        .unwrap();
+    let pending_job = Uuid::parse_str(pending["watch_id"].as_str().unwrap()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), watches.stop(pending_job))
+        .await
+        .unwrap()
+        .unwrap();
+    let expired = tokio::time::timeout(
+        Duration::from_secs(5),
+        dispatcher.call("exec", json!({"session_id": pending["session_id"]})),
+    )
+    .await
+    .expect("a cancelled startup must not leave process interactions waiting")
+    .unwrap_err();
+    assert!(expired.to_string().contains("unknown or expired process"));
+
     let mut output_events = processes.subscribe_output();
     let result = dispatcher
         .call(
