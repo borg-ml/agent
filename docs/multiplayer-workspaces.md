@@ -156,7 +156,7 @@ parent/subtask relationships remain attached to the same work IDs.
 `get_plan` reads the assigned view; `update_plan` edits those shared work records
 and their order. Removing an item from the plan unassigns it without deleting its
 history or dependencies. Updates check the observed revision so a stale plan cannot
-silently discard a newer assignment. Only one item per assignee may be in progress.
+silently discard a newer assignment. Multiple items per assignee may be in progress.
 Session plan events and UI state are rebuildable read projections, not independent
 sources of task ownership or status.
 
