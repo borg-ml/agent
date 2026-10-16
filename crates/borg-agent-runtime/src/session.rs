@@ -3973,6 +3973,20 @@ async fn run_agent_session_store_kernel_inner(
                         )
                         .await?;
                     }
+                    Some(HostCommand::BackgroundAction {
+                        session_id: command_session_id,
+                        target,
+                        tool_call_id,
+                    }) if command_session_id == session_id => {
+                        if let Some(target) = target {
+                            if let Some(team) = &subagents {
+                                team.background_action(target, tool_call_id).await;
+                            }
+                        } else {
+                            watches.background_action(&tool_call_id);
+                        }
+                        continue;
+                    }
                     Some(HostCommand::StopWatch {
                         session_id: command_session_id,
                         watch_id,
@@ -6791,6 +6805,13 @@ async fn run_agent_session_store_kernel_inner(
                                     &mut journal, &events, session_id,
                                     SessionEventKind::Error { message: error },
                                 ).await?;
+                            }
+                        }
+                        HostCommand::BackgroundAction { target, tool_call_id, .. } => {
+                            if let Some(target) = target {
+                                if let Some(team) = &subagents { team.background_action(target, tool_call_id).await; }
+                            } else {
+                                watches.background_action(&tool_call_id);
                             }
                         }
                         HostCommand::StopWatch { watch_id, .. } => {

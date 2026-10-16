@@ -5643,6 +5643,9 @@ async fn run_local_agent_session(
                             }
                         }
                     }
+                    UiAction::BackgroundAction { target, tool_call_id } => {
+                        dispatch_ui_command(&ui_interaction_tx, HostCommand::BackgroundAction { session_id, target: (target != session_id).then_some(target), tool_call_id });
+                    }
                     UiAction::StopWatch(watch_id) => {
                         dispatch_ui_command(
                             &ui_interaction_tx,
@@ -11213,6 +11216,7 @@ fn remote_command_name(command: &HostCommand) -> &'static str {
         HostCommand::ExtensionCommand { .. } => "extension command",
         HostCommand::Subagent { .. } => "subagent",
         HostCommand::Interrupt { .. } => "interrupt",
+        HostCommand::BackgroundAction { .. } => "background action",
         HostCommand::StopWatch { .. } => "stop watch",
         HostCommand::Compact { .. } => "compact",
         HostCommand::ClearContext { .. } => "clear context",

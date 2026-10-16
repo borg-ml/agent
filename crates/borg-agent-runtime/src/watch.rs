@@ -10,6 +10,12 @@ use uuid::Uuid;
 use crate::agent_watch::{AgentSignal, AgentSubjects, Aggregate, SubjectLife, SubjectRecord};
 use crate::native_process::ProcessManager;
 
+tokio::task_local! { static ACTION_JOB_ID: Uuid; }
+
+pub(crate) fn action_job_id() -> Option<Uuid> {
+    ACTION_JOB_ID.try_with(|id| *id).ok()
+}
+
 const MAX_WATCHES: usize = 4;
 const MAX_BACKGROUND_JOBS: usize = 64;
 
@@ -117,6 +123,7 @@ struct WatchEntry {
 
 #[derive(Clone)]
 pub(crate) struct Watches {
+    foreground: Arc<std::sync::Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::Notify>>>>,
     processes: ProcessManager,
     session_id: Uuid,
     entries: Arc<Mutex<BTreeMap<Uuid, WatchEntry>>>,
@@ -139,6 +146,7 @@ pub(crate) struct Watches {
 impl Watches {
     pub fn new(processes: ProcessManager, events: mpsc::Sender<String>, session_id: Uuid) -> Self {
         Self {
+            foreground: Default::default(),
             processes,
             session_id,
             entries: Default::default(),
@@ -301,9 +309,58 @@ impl Watches {
 
     /// Frontend-facing view of every watch this session has armed.
     pub async fn summaries(&self) -> Vec<crate::WatchSummary> {
-        self.list().await.into_iter().map(Into::into).collect()
+        self.entries
+            .lock()
+            .await
+            .values()
+            .map(|entry| entry.info.clone().into())
+            .collect()
     }
 
+    pub fn background_action(&self, tool_call_id: &str) {
+        if let Some(signal) = self
+            .foreground
+            .lock()
+            .unwrap()
+            .get(tool_call_id)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            signal.notify_one();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_action(
+        &self,
+        tool_call_id: &str,
+        label: &str,
+        command: &str,
+        execution: impl std::future::Future<Output = Result<Value>> + Send + 'static,
+        execution_cancel: CancellationToken,
+        foreground: Option<Duration>,
+    ) -> Result<Value> {
+        let signal = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut actions = self.foreground.lock().unwrap();
+            actions.retain(|_, signal| signal.strong_count() > 0);
+            actions.insert(tool_call_id.to_owned(), Arc::downgrade(&signal));
+        }
+        let result = self
+            .run_job_controlled(
+                Uuid::new_v4(),
+                label,
+                command,
+                execution,
+                execution_cancel,
+                foreground,
+                Some(signal),
+            )
+            .await;
+        self.foreground.lock().unwrap().remove(tool_call_id);
+        result
+    }
+
+    #[cfg(test)]
     pub async fn run_runtime(
         &self,
         runtime: &str,
@@ -323,6 +380,7 @@ impl Watches {
 
     /// All detached tool and runtime executions share the same registry,
     /// result retrieval, cancellation, frontend summary and completion wake.
+    #[cfg(test)]
     pub async fn run_job(
         &self,
         label: &str,
@@ -331,44 +389,59 @@ impl Watches {
         execution_cancel: CancellationToken,
         foreground: Duration,
     ) -> Result<Value> {
-        self.run_job_with_id(
+        self.run_job_controlled(
             Uuid::new_v4(),
             label,
             command,
             execution,
             execution_cancel,
-            foreground,
+            Some(foreground),
+            None,
         )
         .await
     }
 
-    pub(crate) async fn run_job_with_id(
+    #[allow(clippy::too_many_arguments)]
+    async fn run_job_controlled(
         &self,
         job_id: Uuid,
         label: &str,
         command: &str,
         execution: impl std::future::Future<Output = Result<Value>> + Send + 'static,
         execution_cancel: CancellationToken,
-        foreground: Duration,
+        foreground: Option<Duration>,
+        background: Option<Arc<tokio::sync::Notify>>,
     ) -> Result<Value> {
+        let cancel_on_drop = execution_cancel.clone().drop_guard();
         ensure!(!self.cancel.is_cancelled(), "session watchers have stopped");
         let started_at = chrono::Utc::now();
-        let mut execution = Box::pin(execution);
-        if let Ok(result) = tokio::time::timeout(foreground, &mut execution).await {
-            return result;
+        let mut execution = Box::pin(ACTION_JOB_ID.scope(job_id, execution));
+        tokio::select! {
+            biased;
+            result = &mut execution => {
+                cancel_on_drop.disarm();
+                return result;
+            },
+            _ = async { match foreground { Some(duration) => tokio::time::sleep(duration).await, None => std::future::pending().await } } => {},
+            _ = async { match background { Some(signal) => signal.notified().await, None => std::future::pending().await } } => {},
         }
         let mut entries = self.entries.lock().await;
-        if self.cancel.is_cancelled()
-            || entries
-                .values()
-                .filter(|entry| entry.runtime && entry.info.running)
-                .count()
-                >= MAX_BACKGROUND_JOBS
-        {
+        if self.cancel.is_cancelled() {
             execution_cancel.cancel();
             drop(entries);
             let _ = tokio::time::timeout(Duration::from_secs(2), execution).await;
-            bail!("job could not background: session stopped or background job limit reached");
+            bail!("job could not background: session stopped");
+        }
+        if entries
+            .values()
+            .filter(|entry| entry.runtime && entry.info.running)
+            .count()
+            >= MAX_BACKGROUND_JOBS
+        {
+            drop(entries);
+            let result = execution.await;
+            cancel_on_drop.disarm();
+            return result;
         }
         prune_completed_watches(&mut entries);
         let info = WatchInfo {
@@ -418,6 +491,7 @@ impl Watches {
             if let Some(entry) = watches.entries.lock().await.get_mut(&watch_id) {
                 entry.info.running = false;
                 entry.info.result = Some(result);
+                entry.pending_report = true;
                 entry.info.last_event_at = Some(chrono::Utc::now());
                 entry.info.event_count += 1;
             }
@@ -427,6 +501,7 @@ impl Watches {
                 "Watcher event: {label} ({watch_id}) finished. Retrieve its result with list_watchers."
             )).await;
         });
+        cancel_on_drop.disarm();
         Ok(json!({
             "running": true, "background": true, "watch_id": watch_id,
             "message": "Job continues in the background. Use list_watchers to retrieve its result, await_watchers to wait, or stop_watcher to cancel. Do not repeat the call."
@@ -541,6 +616,7 @@ impl Watches {
                         environment,
                         // Monitoring reports progress, not edits made by other work while it waits.
                         false,
+                        None,
                     )
                     .await?
             }
@@ -741,8 +817,13 @@ impl Watches {
         self.entries
             .lock()
             .await
-            .values()
-            .map(|entry| entry.info.clone())
+            .values_mut()
+            .map(|entry| {
+                if entry.runtime {
+                    entry.pending_report = false;
+                }
+                entry.info.clone()
+            })
             .collect()
     }
 
@@ -750,9 +831,14 @@ impl Watches {
         self.entries
             .lock()
             .await
-            .values()
+            .values_mut()
             .filter(|entry| watch_ids.contains(&entry.info.watch_id))
-            .map(|entry| entry.info.clone())
+            .map(|entry| {
+                if entry.runtime {
+                    entry.pending_report = false;
+                }
+                entry.info.clone()
+            })
             .collect()
     }
 
@@ -988,6 +1074,50 @@ fn agent_event_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn action_deadline_and_manual_background_preserve_execution() {
+        let (tx, _notices) = mpsc::channel(32);
+        let watches = Watches::new(ProcessManager::default(), tx, Uuid::new_v4());
+        for (id, duration) in [("auto", Some(Duration::from_secs(10))), ("blocking", None)] {
+            let (finish, finished) = tokio::sync::oneshot::channel();
+            let cancel = CancellationToken::new();
+            let mut action = Box::pin(watches.run_action(
+                id,
+                id,
+                "wait_agent",
+                async move {
+                    finished.await.unwrap();
+                    Ok(json!({"finished": true}))
+                },
+                cancel.clone(),
+                duration,
+            ));
+            assert!(futures::poll!(&mut action).is_pending());
+            tokio::time::advance(Duration::from_secs(9)).await;
+            assert!(futures::poll!(&mut action).is_pending());
+            if id == "auto" {
+                tokio::time::advance(Duration::from_secs(1)).await;
+            } else {
+                tokio::time::advance(Duration::from_secs(60)).await;
+                assert!(futures::poll!(&mut action).is_pending());
+                watches.background_action(id);
+            }
+            let result = action.await.unwrap();
+            let job = Uuid::parse_str(result["watch_id"].as_str().unwrap()).unwrap();
+            assert!(!cancel.is_cancelled());
+            watches.background_action(id); // A second click cannot reattach or cancel.
+            assert!(watches.list_for(&[job]).await[0].running);
+            finish.send(()).unwrap();
+            while watches.list_for(&[job]).await[0].running {
+                watches.changed.notified().await;
+            }
+            assert_eq!(
+                watches.list_for(&[job]).await[0].result.as_ref().unwrap()["output"]["finished"],
+                true
+            );
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn simultaneous_completions_wake_the_agent_once() {

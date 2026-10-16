@@ -26,6 +26,23 @@ See `LocalAgentTurnExecutor::uses_native_harness` / `for_session` in
 evidence below records earlier stages; its historical descriptions do not
 supersede this current routing summary.
 
+## Tool execution policy
+
+Every tool action starts synchronously and yields a background `watch_id` after
+10 seconds if it is still running. `async: true` opts into immediate background
+execution; `blocking: true` opts out of the automatic deadline. Setting both to
+true is an error. `async: false` is equivalent to the default, not an unbounded
+wait. These controls are shared across tools, including explicit waits, shell
+commands, persistent runtimes, and external MCP calls; there is no eligibility
+allowlist. Approval still gates execution.
+
+Left-clicking a running foreground action yields it immediately, even when
+`blocking: true`. This changes only where it is awaited: the same execution
+continues without cancellation or restart. Background rows retain their running
+state until their watcher completes, and later clicks inspect details instead
+of toggling the execution back. Retrieve background results with `list_watchers`
+and cancel only with `stop_watcher`.
+
 ## Target boundary
 
 | Responsibility | Owner |

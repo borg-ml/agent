@@ -1121,6 +1121,20 @@ impl Transcript {
         }
     }
 
+    fn foreground_action_id(&self, index: usize) -> Option<String> {
+        let TranscriptEntry::Tool { complete: false, backgrounded: false, code_view, .. } = self.order.get(index)? else {
+            return None;
+        };
+        if code_view.as_ref().is_some_and(|(language, _)| language == "reasoning") {
+            return None;
+        }
+        let id = self.tools.iter().find_map(|(id, row)| (*row == index).then_some(id))?;
+        if self.preparing_tools.values().chain(&self.unkeyed_preparing_tools).any(|preparing| preparing == id) {
+            return None;
+        }
+        Some(id.clone())
+    }
+
     fn tool_copy_hint(&self, index: usize) -> Option<&'static str> {
         let TranscriptEntry::Tool {
             code_view,

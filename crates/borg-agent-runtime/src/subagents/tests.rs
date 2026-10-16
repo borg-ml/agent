@@ -73,8 +73,9 @@ async fn shell_jobs_retrieve_output_and_cancel_the_owned_process() {
     assert_eq!(result["background"], true);
     assert_eq!(
         result["watch_id"], result["session_id"],
-        "one command must have one job identity"
+        "one command has one identity"
     );
+    assert_eq!(watches.list().await.len(), 1, "one command has one watcher");
     let job = Uuid::parse_str(result["watch_id"].as_str().unwrap()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -88,29 +89,59 @@ async fn shell_jobs_retrieve_output_and_cancel_the_owned_process() {
     })
     .await
     .unwrap();
+    let mut output_events = processes.subscribe_output();
     let result = dispatcher
         .call(
             "exec",
             json!({
-                "cmd": "sleep 30", "async": true
+                "cmd": "printf started; sleep 30", "async": true
             }),
         )
         .await
         .unwrap();
     let job = Uuid::parse_str(result["watch_id"].as_str().unwrap()).unwrap();
-    let process = Uuid::parse_str(result["session_id"].as_str().unwrap()).unwrap();
+
+    let process = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (process, bytes) = output_events.recv().await.unwrap();
+            if bytes.is_some_and(|bytes| bytes.windows(7).any(|word| word == b"started")) {
+                break process;
+            }
+        }
+    })
+    .await
+    .unwrap();
     tokio::time::timeout(Duration::from_secs(5), watches.stop(job))
         .await
         .unwrap()
         .unwrap();
     let settled = watches.list_for(&[job]).await.pop().unwrap();
-    assert_eq!(settled.result.unwrap()["output"]["running"], false);
+    let outcome = settled.result.unwrap();
+    assert!(
+        outcome["output"]["running"] == false
+            || outcome["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("cancelled")),
+        "{outcome}"
+    );
+    assert_eq!(result["session_id"], process.to_string());
     assert!(
         processes
             .write_stdin(session, process, None, false, Some(0), Some(1024))
             .await
             .is_err(),
         "terminated process must be reaped from the live registry"
+    );
+    assert!(
+        dispatcher
+            .call(
+                "exec",
+                json!({"cmd": "printf should-not-run", "async": true, "blocking": true})
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cannot both be true")
     );
     let result = dispatcher
         .call(
@@ -124,6 +155,48 @@ async fn shell_jobs_retrieve_output_and_cancel_the_owned_process() {
     assert_eq!(result["running"], false);
     assert_eq!(result["stdout"], "synchronous");
     assert!(result.get("watch_id").is_none());
+}
+
+#[tokio::test]
+async fn background_click_routes_to_live_child_without_waking_dormant_child() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        8,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        Arc::new(store),
+    )
+    .unwrap();
+    let child = coordinator
+        .table
+        .lock()
+        .await
+        .reserve("child", &launch())
+        .unwrap()
+        .session_id;
+    coordinator.background_action(child, "action".into()).await;
+    assert!(
+        coordinator.table.lock().await.entries[&child]
+            .commands
+            .is_none()
+    );
+    let (tx, mut rx) = mpsc::channel(8);
+    coordinator
+        .table
+        .lock()
+        .await
+        .entries
+        .get_mut(&child)
+        .unwrap()
+        .commands = Some(tx);
+    coordinator.background_action(child, "action".into()).await;
+    assert!(
+        matches!(rx.recv().await, Some(HostCommand::BackgroundAction { session_id, target: None, tool_call_id }) if session_id == child && tool_call_id == "action")
+    );
 }
 
 #[tokio::test]
@@ -9746,6 +9819,7 @@ async fn code_client_managed_command(
     let result = dispatcher
         .execution_provider()
         .command(crate::ExecutionCommandRequest {
+            process_id: None,
             owner_session_id: owner,
             root: dispatcher.runtime_root.clone(),
             command: command.to_string(),
@@ -9917,6 +9991,7 @@ async fn command_sdk_socket_approval_comes_only_from_host_command_context() {
     let approved_parent = environment["BORG_TOOL_CALL_ID"].clone();
     let approved = provider
         .command(crate::ExecutionCommandRequest {
+            process_id: None,
             owner_session_id: owner,
             root: root.path().to_path_buf(),
             command: "read gate".to_string(),

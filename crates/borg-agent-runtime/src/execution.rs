@@ -12,6 +12,8 @@ use crate::{HostResourceLimits, WorkspaceFilesystemRequest, WorkspaceFilesystemR
 /// One command executed in an agent's execution world.
 #[derive(Clone)]
 pub struct ExecutionCommandRequest {
+    /// When supplied, keep the action's public watcher and shell identity the same.
+    pub process_id: Option<Uuid>,
     pub owner_session_id: Uuid,
     pub root: PathBuf,
     pub command: String,
@@ -195,6 +197,7 @@ impl ExecutionProvider for LocalExecutionProvider {
                 request.cancellation.unwrap_or_default(),
                 &request.environment,
                 true,
+                request.process_id,
             )
             .await
     }

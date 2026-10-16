@@ -128,9 +128,7 @@ pub fn project_tool_presentation(
             .and_then(|output| command_outcome(input, output)),
         cwd: command_cwd(input, output),
         body_rows: tool_detail_rows(name, input),
-        backgrounded: (tool_can_start_background_process(name)
-            || matches!(tool_leaf_name(name).as_str(), "wait" | "write_stdin"))
-            && output.is_some_and(|output| !is_error && tool_output_is_backgrounded(output)),
+        backgrounded: output.is_some_and(|output| !is_error && tool_output_is_backgrounded(output)),
         hidden: is_internal_tool(name),
         label,
         detail,
@@ -1011,7 +1009,7 @@ pub fn tool_can_start_background_process(name: &str) -> bool {
 }
 
 fn process_handle_value(value: &Value) -> Option<String> {
-    ["session_id", "cell_id"]
+    ["watch_id", "session_id", "cell_id"]
         .into_iter()
         .find_map(|key| value.get(key))
         .and_then(|value| match value {
@@ -1023,7 +1021,7 @@ fn process_handle_value(value: &Value) -> Option<String> {
 
 fn process_result_is_running(value: &Value) -> bool {
     if value.get("running").and_then(Value::as_bool) == Some(false)
-        || value.get("exit_code").is_some()
+        || value.get("exit_code").is_some_and(|code| !code.is_null())
         || value.get("timed_out").and_then(Value::as_bool) == Some(true)
     {
         return false;
@@ -1040,6 +1038,8 @@ pub fn tool_output_background_handle(output: &str) -> Option<String> {
             .get("structuredContent")
             .filter(|process| process.is_object())
             .or_else(|| value.is_object().then_some(&value))
+        && (process.get("running").and_then(Value::as_bool) == Some(true)
+            || process.get("background").and_then(Value::as_bool) == Some(true))
         && process_result_is_running(process)
         && let Some(handle) = process_handle_value(process)
     {
@@ -3919,7 +3919,29 @@ all green"
             )
             .backgrounded
         );
-        let process_result = json!({"session_id": "process-1", "running": true}).to_string();
+        assert!(
+            !project_tool_presentation(
+                "get_tool_context",
+                &json!({}),
+                Some(
+                    &json!({"session_id":"ordinary-session", "assigned_directory":"/tmp"})
+                        .to_string()
+                ),
+                false
+            )
+            .backgrounded
+        );
+        assert!(
+            project_tool_presentation(
+                "wait_agent",
+                &json!({}),
+                Some(&json!({"watch_id":"job-1", "background":true, "running":true}).to_string()),
+                false
+            )
+            .backgrounded
+        );
+        let process_result =
+            json!({"session_id": "process-1", "running": true, "exit_code": null}).to_string();
         for tool in ["functions.exec", "functions.wait", "functions.write_stdin"] {
             assert!(
                 project_tool_presentation(tool, &json!({}), Some(&process_result), false)

@@ -253,6 +253,7 @@ impl ProcessManager {
             CancellationToken::new(),
             environment,
             true,
+            None,
         )
         .await
     }
@@ -282,6 +283,7 @@ impl ProcessManager {
             cancel,
             &BTreeMap::new(),
             true,
+            None,
         )
         .await
     }
@@ -300,6 +302,7 @@ impl ProcessManager {
         cancel: CancellationToken,
         environment: &BTreeMap<String, String>,
         capture_changes: bool,
+        process_id: Option<Uuid>,
     ) -> Result<ProcessSnapshot> {
         let cancel = cancel.child_token();
         ensure!(!cancel.is_cancelled(), "process execution was cancelled");
@@ -335,7 +338,7 @@ impl ProcessManager {
             None
         };
 
-        let process_id = Uuid::new_v4();
+        let process_id = process_id.unwrap_or_else(Uuid::new_v4);
         let (attachment_spool, attachment_channel_error) = match create_attachment_spool(process_id)
         {
             Ok(spool) => (Some(spool), None),

@@ -1568,6 +1568,11 @@ pub enum HostCommand {
     Interrupt {
         session_id: Uuid,
     },
+    BackgroundAction {
+        session_id: Uuid,
+        target: Option<Uuid>,
+        tool_call_id: String,
+    },
     /// Stop a watch the agent armed with the `watch` tool.
     StopWatch {
         session_id: Uuid,
@@ -1630,6 +1635,7 @@ impl HostCommand {
             | Self::ExtensionCommand { session_id, .. }
             | Self::Subagent { session_id, .. }
             | Self::Interrupt { session_id }
+            | Self::BackgroundAction { session_id, .. }
             | Self::StopWatch { session_id, .. }
             | Self::Compact { session_id }
             | Self::ClearContext { session_id }

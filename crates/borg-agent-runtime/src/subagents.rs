@@ -1194,7 +1194,13 @@ impl AgentToolDispatcher {
             }),
         });
         let result = self
-            .call_with_workflow_control(name, arguments, workflow_approved, cancellation)
+            .call_action(
+                &tool_call_id,
+                name,
+                arguments,
+                workflow_approved,
+                cancellation,
+            )
             .await;
         if let Some(events) = &events {
             let (output, is_error) = match &result {
@@ -1227,25 +1233,9 @@ impl AgentToolDispatcher {
     pub(crate) async fn shell_tool(
         &self,
         name: &str,
-        mut arguments: Value,
+        arguments: Value,
         cancellation: Option<CancellationToken>,
     ) -> Result<Value> {
-        let asynchronous = arguments
-            .as_object_mut()
-            .and_then(|args| args.remove("async"));
-        let asynchronous = match asynchronous {
-            None => None,
-            Some(Value::Bool(value)) => Some(value),
-            Some(_) => bail!("async must be a boolean"),
-        };
-        if asynchronous == Some(true) {
-            arguments["yield_time_ms"] = json!(0);
-        }
-        let label = arguments
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or(name)
-            .to_owned();
         let execution_provider = self.execution_provider();
         if let Some(journal) = self.journal.clone() {
             execution_provider
@@ -1355,6 +1345,7 @@ impl AgentToolDispatcher {
         let mut result = serde_json::to_value(
             execution_provider
                 .command(crate::ExecutionCommandRequest {
+                    process_id: crate::watch::action_job_id(),
                     owner_session_id: self.actor_session_id,
                     root: execution_root,
                     command,
@@ -1434,39 +1425,15 @@ impl AgentToolDispatcher {
                         outcome["attachments"] = Value::Array(attachments);
                         outcome["attachment_errors"] = Value::Array(attachment_errors);
                         drop_command_echo(&mut outcome);
-                        return Ok(outcome);
+                        return Ok::<Value, anyhow::Error>(outcome);
                     }
                 }
             };
-            if asynchronous == Some(false) {
-                let completed: Value = execution.await?;
-                result
-                    .as_object_mut()
-                    .unwrap()
-                    .extend(completed.as_object().unwrap().clone());
-            } else if let Some(watches) = &self.watches {
-                let cancel = CancellationToken::new();
-                let terminate = cancel.clone();
-                let provider = self.execution_provider();
-                let job = watches.run_job_with_id(
-                        process_id,&label, name, async move {
-                    tokio::select! {
-                        outcome = execution => outcome,
-                        _ = terminate.cancelled() => {
-                            let snapshot = provider.write_stdin(crate::ExecutionStdinRequest {
-                                owner_session_id: owner, process_id, chars: None, terminate: true,
-                                yield_time_ms: Some(0), max_output_tokens: None,
-                            }).await?;
-                            ensure!(!snapshot.running, "shell cancellation has not settled");
-                            Ok(serde_json::to_value(snapshot)?)
-                        }
-                    }
-                }, cancel, Duration::ZERO).await?;
-                result
-                    .as_object_mut()
-                    .unwrap()
-                    .extend(job.as_object().unwrap().clone());
-            }
+            let completed: Value = execution.await?;
+            result
+                .as_object_mut()
+                .unwrap()
+                .extend(completed.as_object().unwrap().clone());
         }
         Ok(result)
     }
@@ -2111,88 +2078,52 @@ impl AgentToolDispatcher {
     pub(crate) fn call_with_workflow_control<'a>(
         &'a self,
         name: &'a str,
+        arguments: Value,
+        workflow_approved: bool,
+        workflow_cancel: Option<CancellationToken>,
+    ) -> futures::future::BoxFuture<'a, Result<Value>> {
+        self.call_action(
+            &Uuid::new_v4().to_string(),
+            name,
+            arguments,
+            workflow_approved,
+            workflow_cancel,
+        )
+    }
+
+    pub(crate) fn call_action<'a>(
+        &'a self,
+        tool_call_id: &str,
+        name: &'a str,
         mut arguments: Value,
         workflow_approved: bool,
         workflow_cancel: Option<CancellationToken>,
     ) -> futures::future::BoxFuture<'a, Result<Value>> {
+        let tool_call_id = tool_call_id.to_owned();
         Box::pin(async move {
             let asynchronous = arguments
                 .as_object_mut()
                 .and_then(|args| args.remove("async"));
-            let asynchronous = match asynchronous {
-                None => None,
-                Some(Value::Bool(value)) => Some(value),
+            let immediate = match asynchronous {
+                None | Some(Value::Bool(false)) => false,
+                Some(Value::Bool(true)) => true,
                 Some(_) => bail!("async must be a boolean"),
             };
-            // Tool-side effects and explicit waits retain their sequencing. Reads
-            // and durable sends can continue independently in the shared registry.
-            let detachable = matches!(
-                name,
-                "read_file"
-                    | "list_files"
-                    | "search_files"
-                    | "web_search"
-                    | "send_message"
-                    | "followup_task"
-                    | "list_instances"
-                    | "lsp_diagnostics"
-                    | "lsp_workspace_diagnostics"
-                    | "lsp_hover"
-                    | "lsp_definition"
-                    | "lsp_references"
-                    | "lsp_document_symbols"
-                    | "lsp_workspace_symbols"
-                    | "get_message_status"
-                    | "get_goal"
-                    | "get_plan"
-                    | "list_agents"
-                    | "inspect_agent"
-                    | "query_history"
-                    | "history_index"
-                    | "get_tool_context"
-                    | "list_shared_work"
-                    | "team_snapshot"
-                    | "list_workspace_participants"
-                    | "get_provider_capabilities"
-                    | "get_agent_settings"
-                    | "get_agent_goal"
-                    | "list_workflows"
-                    | "list_blu_workflows"
-                    | "list_blu_extensions"
-                    | "read_blu_extension"
-                    | "list_plugins"
-                    | "read_plugin"
-                    | "list_retrieval_adapters"
-                    | "read_retrieval_adapter"
-                    | "read_skill"
-                    | "lsp_status"
-                    | "list_watchers"
-                    | "list_runtime_checkpoints"
-                    | "get_runtime_job"
-                    | "get_team_operation"
-                    | "consult_peer"
-                    | "consult_model"
+            let blocking = match arguments
+                .as_object_mut()
+                .and_then(|args| args.remove("blocking"))
+            {
+                None | Some(Value::Bool(false)) => false,
+                Some(Value::Bool(true)) => true,
+                Some(_) => bail!("blocking must be a boolean"),
+            };
+            ensure!(
+                !(immediate && blocking),
+                "async and blocking cannot both be true"
             );
-            if matches!(
-                name,
-                "runtime_exec" | "exec" | "exec_command" | "write_stdin"
-            ) && let Some(value) = asynchronous
-            {
-                arguments["async"] = Value::Bool(value);
-            }
-            if asynchronous == Some(true)
-                && !detachable
-                && !matches!(
-                    name,
-                    "runtime_exec" | "exec" | "exec_command" | "write_stdin"
-                )
-            {
-                bail!("{name} must remain synchronous to preserve ordering or wait semantics");
-            }
-            if detachable
-                && asynchronous != Some(false)
-                && let Some(watches) = &self.watches
-            {
+            if let Some(watches) = &self.watches {
+                let shell_start =
+                    matches!(name, "exec" | "exec_command") && arguments.get("cmd").is_some();
                 let dispatcher = self.clone();
                 let tool = name.to_owned();
                 let label = arguments
@@ -2200,10 +2131,11 @@ impl AgentToolDispatcher {
                     .and_then(Value::as_str)
                     .unwrap_or(name)
                     .to_owned();
-                let cancel = workflow_cancel.unwrap_or_default();
+                let cancel = workflow_cancel.unwrap_or_default().child_token();
                 let execution_cancel = cancel.clone();
-                return watches
-                    .run_job(
+                let mut result = watches
+                    .run_action(
+                        &tool_call_id,
                         &label,
                         name,
                         async move {
@@ -2217,13 +2149,19 @@ impl AgentToolDispatcher {
                                 .await
                         },
                         cancel,
-                        if asynchronous == Some(true) {
-                            Duration::ZERO
+                        if immediate {
+                            Some(Duration::ZERO)
+                        } else if blocking {
+                            None
                         } else {
-                            Duration::from_secs(5)
+                            Some(Duration::from_secs(10))
                         },
                     )
-                    .await;
+                    .await?;
+                if shell_start && result["background"] == true {
+                    result["session_id"] = result["watch_id"].clone();
+                }
+                return Ok(result);
             }
             self.call_with_workflow_control_direct(
                 name,
@@ -2319,7 +2257,12 @@ impl AgentToolDispatcher {
                 )
             )),
             CapabilityInvocation::Forward { name, arguments } => {
-                self.call_with_workflow_control(name, arguments, true, workflow_cancel)
+                let mut arguments = arguments;
+                if let Some(args) = arguments.as_object_mut() {
+                    args.remove("async");
+                    args.remove("blocking");
+                }
+                self.call_with_workflow_control_direct(name, arguments, true, workflow_cancel)
                     .await
             }
         }
@@ -3425,12 +3368,6 @@ impl AgentToolDispatcher {
             (None, Some(limits)) => Some(limits.max_runtime_execution_ms),
             (requested, None) => requested,
         };
-        let execution_cancel = cancellation.clone();
-        let foreground = match args.asynchronous {
-            Some(true) => Duration::ZERO,
-            Some(false) => Duration::from_millis(timeout_ms.unwrap_or(30 * 60 * 1000)),
-            None => Duration::from_secs(5),
-        };
         let execution = crate::persistent_runtime::inherit_runtime_host_call_chain(async move {
             Ok(serde_json::to_value(
                 runtime_worker
@@ -3446,14 +3383,7 @@ impl AgentToolDispatcher {
                     ))?,
             )?)
         });
-        match &self.watches {
-            Some(watches) if args.asynchronous != Some(false) => {
-                watches
-                    .run_runtime(runtime, execution, execution_cancel, foreground)
-                    .await
-            }
-            _ => execution.await,
-        }
+        execution.await
     }
 }
 
@@ -7497,6 +7427,25 @@ impl SubagentCoordinator {
         Ok(value)
     }
 
+    pub(crate) async fn background_action(&self, target: Uuid, tool_call_id: String) {
+        let sender = self
+            .table
+            .lock()
+            .await
+            .entries
+            .get(&target)
+            .and_then(|entry| entry.commands.clone());
+        if let Some(sender) = sender
+            && let Err(error) = sender.try_send(HostCommand::BackgroundAction {
+                session_id: target,
+                target: None,
+                tool_call_id,
+            })
+        {
+            tracing::warn!(%target, %error, "could not background child action");
+        }
+    }
+
     /// Interrupt the current turn through the UI path.
     pub async fn interrupt(&self, target: &str) -> Result<()> {
         self.set_interrupter(target, None).await;
@@ -9801,8 +9750,6 @@ struct PersistentRuntimeArgs {
     runtime: Option<String>,
     code: String,
     timeout_ms: Option<u64>,
-    #[serde(rename = "async")]
-    asynchronous: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -10646,7 +10593,7 @@ fn harness_tool_spec() -> Value {
 pub(crate) fn runtime_exec_spec() -> Value {
     tool(
         "runtime_exec",
-        "Run code in the session's persistent Python (or Bun JavaScript/TypeScript) runtime: variables, imports, helpers and parsed data survive across calls and turns. `borg` is preloaded: every Borg capability as a call (`borg.send_message(...)`, `borg.tools(\"query\")` to find one), plus `borg.checkpoint(key, state)` / `borg.restore(key)` for durable state, `borg.exec`, `borg.read`, `borg.rlm` subagents and `borg.harness` for evidence-backed refinements of your own prompts, memory and skills with rollback. Trusted user-authority execution, not a sandbox. After five seconds the call returns a background watch_id without cancelling execution. Completion notifies the session; retrieve output/error through list_watchers, wait with await_watchers, or cancel with stop_watcher. Do not repeat backgrounded code.",
+        "Run code in the session's persistent Python (or Bun JavaScript/TypeScript) runtime: variables, imports, helpers and parsed data survive across calls and turns. `borg` is preloaded: every Borg capability as a call (`borg.send_message(...)`, `borg.tools(\"query\")` to find one), plus `borg.checkpoint(key, state)` / `borg.restore(key)` for durable state, `borg.exec`, `borg.read`, `borg.rlm` subagents and `borg.harness` for evidence-backed refinements of your own prompts, memory and skills with rollback. Trusted user-authority execution, not a sandbox. By default, after ten seconds the call returns a background watch_id without cancelling execution; async: true backgrounds immediately, blocking: true waits until completion. Completion notifies the session; retrieve output/error through list_watchers, wait with await_watchers, or cancel with stop_watcher. Do not repeat backgrounded code.",
         json!({
             "type": "object",
             "properties": {
@@ -10857,9 +10804,13 @@ fn add_action_metadata(specs: &mut [Value]) {
                 "description": "One- or two-word summary for the live UI. Emit this as the first argument field. Presentation metadata only; it does not affect tool execution."
             }),
         );
+        properties.insert("blocking".into(), json!({
+            "type": "boolean",
+            "description": "Wait until completion instead of auto-backgrounding after ten seconds. Cannot be combined with async: true. The user can still manually background the action."
+        }));
         properties.insert("async".into(), json!({
             "type": "boolean",
-            "description": "Optional execution policy: true detaches immediately, false waits for completion, omitted auto-detaches safe calls after five seconds. Ordering-sensitive actions and explicit waits stay synchronous."
+            "description": "Optional execution policy: true detaches immediately; otherwise actions start synchronously and background after ten seconds without cancelling execution (unless blocking: true). Retrieve background results with list_watchers; do not repeat the action."
         }));
         properties.extend(existing);
         if let Some(required) = schema

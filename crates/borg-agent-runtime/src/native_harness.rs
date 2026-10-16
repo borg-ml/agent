@@ -1341,7 +1341,8 @@ impl NativeHarness {
                         let reads = futures::future::join_all(chunk.iter().map(
                             |(tool_call, input)| async {
                                 match runtime
-                                    .call(
+                                    .call_action(
+                                        &tool_call.id,
                                         &tool_call.function.name,
                                         input.as_ref().expect("validated input").clone(),
                                         false,
@@ -3099,6 +3100,26 @@ impl NativeToolRuntime {
         tool_execution_class(name)
     }
 
+    async fn call_action(
+        &self,
+        tool_call_id: &str,
+        name: &str,
+        arguments: Value,
+        workflow_approved: bool,
+        cancellation: Option<CancellationToken>,
+    ) -> Result<Value> {
+        self.agent_tools
+            .call_action(
+                tool_call_id,
+                name,
+                arguments,
+                workflow_approved,
+                cancellation,
+            )
+            .await
+    }
+
+    #[cfg(test)]
     async fn call(
         &self,
         name: &str,
@@ -4033,7 +4054,8 @@ async fn execute_tool(
                 | "watch"
         ))
     .then(CancellationToken::new);
-    let call = runtime.call(
+    let call = runtime.call_action(
+        &tool_call.id,
         &tool_call.function.name,
         input,
         workflow_approved,
@@ -5360,9 +5382,13 @@ fn add_action_metadata(definition: &mut ModelToolDefinition) -> Result<()> {
             "description": "One- or two-word summary for the live UI. Emit this as the first argument field. Presentation metadata only; it does not affect tool execution."
         }),
     );
+    properties.insert("blocking".into(), json!({
+        "type": "boolean",
+        "description": "Wait until completion instead of auto-backgrounding after ten seconds. Cannot be combined with async: true. The user can still manually background the action."
+    }));
     properties.insert("async".into(), json!({
         "type": "boolean",
-        "description": "Optional execution policy: true detaches immediately, false waits for completion, omitted auto-detaches safe calls after five seconds. Ordering-sensitive actions and explicit waits stay synchronous."
+        "description": "Optional execution policy: true detaches immediately; otherwise actions start synchronously and background after ten seconds without cancelling execution (unless blocking: true). Retrieve background results with list_watchers; do not repeat the action."
     }));
     properties.extend(existing);
     let required = schema

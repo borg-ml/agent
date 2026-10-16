@@ -899,6 +899,10 @@ pub enum LidSleepAuthorizationChoice {
 #[derive(Debug)]
 pub enum UiAction {
     None,
+    BackgroundAction {
+        target: Uuid,
+        tool_call_id: String,
+    },
     /// Stop a watch from the watches panel.
     StopWatch(Uuid),
     ToggleGoal {
@@ -7992,6 +7996,12 @@ impl BorgTerminal {
                 self.invalidate_transcript_render_cache();
             }
             PendingTranscriptClick::Tool { index, run } => {
+                if let Some(tool_call_id) = self.transcript.foreground_action_id(index) {
+                    return UiAction::BackgroundAction {
+                        target: self.focused_child.unwrap_or(self.session_id),
+                        tool_call_id,
+                    };
+                }
                 if self.open_message_thread(index) {
                     return UiAction::None;
                 }
@@ -9107,7 +9117,9 @@ impl BorgTerminal {
                         .director_transcript
                         .as_deref()
                         .unwrap_or(&self.transcript);
-                    if message_thread_target(
+                    if self.transcript.foreground_action_id(index).is_some() {
+                        Some("click send to background")
+                    } else if message_thread_target(
                         &self.transcript,
                         index,
                         self.session_id,

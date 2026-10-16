@@ -19024,10 +19024,7 @@ async fn action_inspector_keeps_identity_across_history_reprojection() {
         terminal.apply_session_event(&event);
         history.push(event);
     }
-    terminal.run_pending_transcript_click(PendingTranscriptClick::Tool {
-        index: terminal.transcript.tools["selected-tool"],
-        run: None,
-    });
+    terminal.open_tool_inspector(terminal.transcript.tools["selected-tool"]);
     assert!(terminal.is_inspecting_action());
     let late_prompt = SessionEvent::new(
         session_id,
@@ -19108,10 +19105,7 @@ async fn action_inspector_keeps_identity_across_history_reprojection() {
     let child_id = Uuid::new_v4();
     terminal.seed_child_history(child_id, &history);
     terminal.focus_child_transcript(child_id);
-    terminal.run_pending_transcript_click(PendingTranscriptClick::Tool {
-        index: terminal.transcript.tools["other-tool"],
-        run: None,
-    });
+    terminal.open_tool_inspector(terminal.transcript.tools["other-tool"]);
     history.insert(
         0,
         SessionEvent::new(
@@ -21315,4 +21309,96 @@ async fn deferred_child_history_loads_on_focus_pages_back_and_keeps_live_events(
     for id in [oldest_id, older_id, live_id, later_id] {
         assert!(terminal.transcript.messages.contains_key(&id));
     }
+}
+
+#[tokio::test]
+#[ignore = "requires a PTY"]
+async fn running_action_click_backgrounds_once_and_completed_click_inspects() {
+    let session = Uuid::new_v4();
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        session,
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    terminal.set_tool_click_behavior(ToolClickBehavior::Fullscreen);
+    terminal.apply_session_event(&SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "action".into(),
+            name: "wait_agent".into(),
+            input: serde_json::json!({}),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    let index = terminal.transcript.tools["action"];
+    assert!(
+        matches!(terminal.run_pending_transcript_click(PendingTranscriptClick::Tool { index, run: None }), UiAction::BackgroundAction { target, tool_call_id } if target == session && tool_call_id == "action")
+    );
+    let job = Uuid::new_v4();
+    let completion = SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "action".into(),
+            output: serde_json::json!({"running":true,"background":true,"watch_id":job})
+                .to_string(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    );
+    terminal.apply_session_event(&completion);
+    assert!(matches!(
+        &terminal.transcript.order[index],
+        TranscriptEntry::Tool {
+            backgrounded: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        terminal.run_pending_transcript_click(PendingTranscriptClick::Tool { index, run: None }),
+        UiAction::None
+    ));
+    assert!(terminal.is_inspecting_action());
+    let watch = WatchSummary {
+        watch_id: job,
+        label: "wait".into(),
+        command: "wait_agent".into(),
+        running: false,
+        started_at: Utc::now(),
+        last_event_at: Some(Utc::now()),
+        event_count: 1,
+    };
+    terminal.apply_session_event(&SessionEvent::new(
+        session,
+        3,
+        SessionEventKind::WatchesChanged {
+            watches: vec![watch],
+        },
+    ));
+    assert!(matches!(
+        &terminal.transcript.order[index],
+        TranscriptEntry::Tool {
+            complete: true,
+            backgrounded: false,
+            ..
+        }
+    ));
+    // Late delivery of the initial background receipt must not resurrect a finished job.
+    terminal.apply_session_event(&completion);
+    assert!(matches!(
+        &terminal.transcript.order[index],
+        TranscriptEntry::Tool {
+            complete: true,
+            backgrounded: false,
+            ..
+        }
+    ));
 }

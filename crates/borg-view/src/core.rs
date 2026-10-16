@@ -1437,9 +1437,7 @@ impl TranscriptCore {
                 let reported_background_handle = (!*is_error)
                     .then(|| tool_output_background_handle(output))
                     .flatten();
-                let output_handle = (tool_can_start_background_process(&source_name_for_process))
-                    .then(|| reported_background_handle.clone())
-                    .flatten();
+                let output_handle = reported_background_handle.clone();
                 if let Some(index) = tool_index
                     && let TranscriptEntry::Tool {
                         source_name,
@@ -1630,7 +1628,21 @@ impl TranscriptCore {
                     let is_native_process = Uuid::parse_str(handle)
                         .ok()
                         .is_some_and(|process_id| self.runtime_processes.contains_key(&process_id));
-                    if !is_native_process {
+                    let finished = self
+                        .watches
+                        .iter()
+                        .find(|watch| watch.watch_id.to_string() == *handle && !watch.running);
+                    if let Some(watch) = finished {
+                        if let TranscriptEntry::Tool {
+                            backgrounded,
+                            completed_at,
+                            ..
+                        } = &mut self.order[index]
+                        {
+                            *backgrounded = false;
+                            *completed_at = watch.last_event_at;
+                        }
+                    } else if !is_native_process {
                         self.provider_backgrounds
                             .entry(handle.clone())
                             .or_insert_with(|| ProviderBackgroundProjection {
@@ -1743,6 +1755,22 @@ impl TranscriptCore {
             }
             SessionEventKind::WatchesChanged { watches } => {
                 self.watches = watches.clone();
+                for watch in watches.iter().filter(|watch| !watch.running) {
+                    if let Some(process) = self
+                        .provider_backgrounds
+                        .remove(&watch.watch_id.to_string())
+                        && let Some(TranscriptEntry::Tool {
+                            complete,
+                            backgrounded,
+                            completed_at,
+                            ..
+                        }) = self.order.get_mut(process.tool_index)
+                    {
+                        *complete = true;
+                        *backgrounded = false;
+                        *completed_at = watch.last_event_at;
+                    }
+                }
             }
             SessionEventKind::GoalUpdated { goal } => {
                 self.goal = Some(goal.clone());
