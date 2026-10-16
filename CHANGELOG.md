@@ -50,6 +50,11 @@ Git comparison.
   promotion without restarting providers. Ordinary workers retain control of
   their own children but cannot control the director's protected subtree.
 
+- Retry explicitly queued human prompts across transient owner IPC/ACK loss
+  with the original IDs and FIFO order. Cancellation and settled-input guards
+  prevent duplicate turns or reviving stopped work; controls retain priority.
+  Notifications, promotion, and other controls are not automatically retried.
+
 ### Planning
 
 - Allow multiple in-progress todos for the same assignee in both session and

@@ -11056,3 +11056,149 @@ async fn acknowledged_team_message_body_is_paged_private_and_read_only() {
     );
     scratch.discard().await;
 }
+
+// A durably queued HUMAN message is a turn request even for an idle/stopped
+// worker, not a wake:false agent notification. Exercise actor recovery and
+// duplicate admission; a dispatcher-only test cannot guard this lifecycle.
+#[tokio::test]
+async fn queued_human_prompt_wakes_idle_and_stopped_child_without_resuming_paused_goal() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let executor = RecordingPeerExecutor::default();
+    let prompts = executor.prompts.clone();
+    let mut request = launch();
+    request.cwd = directory.path().to_path_buf();
+    request.model = Some("gpt-6.1-sol".into());
+    request.capabilities.multiplayer = false;
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        request.clone(),
+        2,
+        Arc::new(executor),
+        store.clone(),
+    )
+    .unwrap();
+    let mut activity = coordinator.subscribe();
+    let child = coordinator
+        .ensure_sidecar("worker", request.provider, request.model, None)
+        .await
+        .unwrap();
+    let mut last_message_id = None;
+    for expected_calls in 0..=2 {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if coordinator.get(child.session_id).await.unwrap().status == SubagentStatus::Ready
+                    && prompts.lock().unwrap().len() == expected_calls
+                {
+                    break;
+                }
+                activity.recv().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        if expected_calls == 2 {
+            break;
+        }
+        if expected_calls == 1 {
+            let mut goal = crate::SessionGoal::new("Leave this goal paused".into(), None);
+            goal.status = crate::GoalStatus::Paused;
+            store
+                .append(SessionEvent::new(
+                    child.session_id,
+                    0,
+                    SessionEventKind::GoalUpdated { goal },
+                ))
+                .await
+                .unwrap();
+            coordinator.stop(&child.task_name).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while coordinator.get(child.session_id).await.unwrap().status
+                    != SubagentStatus::Stopped
+                {
+                    activity.recv().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let message_id = Uuid::new_v4();
+        last_message_id = Some(message_id);
+        let text = format!(
+            "Human turn {}: coordinate with root on this.",
+            expected_calls + 1
+        );
+        // The frontend commits this before forwarding its child-directed command.
+        store
+            .admit_prompt(SessionEvent::new(
+                child.session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::User,
+                    text: text.clone(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Queued,
+                    delivery: Some(PromptDelivery::Queue),
+                },
+            ))
+            .await
+            .unwrap();
+        coordinator
+            .prompt_child(
+                &child.task_name,
+                message_id,
+                text,
+                Vec::new(),
+                PromptDelivery::Queue,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        prompts.lock().unwrap().len(),
+        2,
+        "one turn per human admission, without another message or Escape"
+    );
+    assert_eq!(
+        store
+            .state(child.session_id)
+            .await
+            .unwrap()
+            .goal
+            .unwrap()
+            .status,
+        crate::GoalStatus::Paused
+    );
+    assert!(store.state(root).await.unwrap().goal.is_none());
+    coordinator.stop(&child.task_name).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while coordinator.get(child.session_id).await.unwrap().status != SubagentStatus::Stopped {
+            activity.recv().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    coordinator
+        .prompt_child(
+            &child.task_name,
+            last_message_id.unwrap(),
+            "retry an acknowledged human turn".into(),
+            Vec::new(),
+            PromptDelivery::Queue,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        coordinator.get(child.session_id).await.unwrap().status,
+        SubagentStatus::Stopped,
+        "retrying settled input must not revive a deliberately stopped actor"
+    );
+    assert_eq!(prompts.lock().unwrap().len(), 2);
+    coordinator.stop_all().await;
+    scratch.discard().await;
+}

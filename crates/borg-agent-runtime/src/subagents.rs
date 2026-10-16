@@ -6511,6 +6511,14 @@ impl SubagentCoordinator {
             );
             id
         };
+        if self
+            .store
+            .action(id, message_id)
+            .await?
+            .is_some_and(|action| action.state.is_terminal())
+        {
+            return Ok(());
+        }
         self.ensure_child_actor(id).await?;
         self.store
             .admit_prompt(SessionEvent::new(

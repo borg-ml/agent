@@ -873,6 +873,11 @@ pub async fn send_local_session_command(
         let mut response = Vec::new();
         stream.take(4096).read_to_end(&mut response).await?;
         let response: serde_json::Value = serde_json::from_slice(&response)
+            .map_err(|error| {
+                if error.is_eof() {
+                    anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, error))
+                } else { error.into() }
+            })
             .context("session owner returned invalid control JSON")?;
         if let Some(error) = response.get("error").and_then(serde_json::Value::as_str) {
             bail!("session owner rejected command: {error}");
@@ -1511,52 +1516,115 @@ pub async fn run_attached_session(
         last_sequence,
         events,
     ));
+    let mut retry_prompts = std::collections::VecDeque::<HostCommand>::new();
+    let mut human_forward: Option<tokio::task::JoinHandle<Result<bool>>> = None;
+    let mut unavailable_reported = false;
+    let mut retry_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             result = &mut event_forwarder => {
+                if let Some(task) = human_forward.take() { task.abort(); }
                 return result.context("attached session event forwarder failed")?;
+            }
+            result = async {
+                match human_forward.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                human_forward = None;
+                let result = result.context("human prompt forwarding task failed").and_then(|result| result);
+                match result {
+                    Ok(true) => {
+                        event_forwarder.abort();
+                        return Ok(());
+                    }
+                    Ok(false) => {
+                        retry_prompts.pop_front();
+                        unavailable_reported = false;
+                        retry_tick.reset_immediately();
+                    }
+                    Err(error) => {
+                        if !writer_is_active(&lock_path)? {
+                            event_forwarder.abort();
+                            return Ok(());
+                        }
+                        // Missing acknowledgement is not rejection. Only human
+                        // prompts retry, retaining identity and FIFO ordering.
+                        let retry = error.chain().any(|cause|
+                            cause.is::<std::io::Error>() || cause.is::<tokio::time::error::Elapsed>() || cause.is::<sqlx::Error>());
+                        if !retry {
+                            retry_prompts.pop_front();
+                            retry_tick.reset_immediately();
+                        } else { retry_tick.reset(); }
+                        if !unavailable_reported || !retry {
+                            let message = if retry {
+                                format!("The active owner is temporarily unavailable; your admitted prompt will retry automatically: {error:#}")
+                            } else {
+                                format!("The active session owner is not accepting commands yet: {error:#}")
+                            };
+                            let _ = command_events.send(SessionEvent::new(session_id, 0,
+                                SessionEventKind::Error { message })).await;
+                        }
+                        unavailable_reported = retry;
+                    }
+                }
+            }
+            _ = retry_tick.tick(), if human_forward.is_none() && !retry_prompts.is_empty() => {
+                let command = retry_prompts.front().expect("pending human input").clone();
+                let (store, lock, socket) = (store.clone(), lock_path.clone(), socket_path.clone());
+                human_forward = Some(tokio::spawn(async move {
+                    let identity = match &command {
+                        HostCommand::Prompt { session_id, message_id, .. } => Some((*session_id, *message_id)),
+                        HostCommand::Subagent { action: crate::SubagentAction::Prompt { target, message_id, .. }, .. } =>
+                            Uuid::parse_str(target.strip_prefix("session:").or_else(|| target.strip_prefix("participant:")).unwrap_or(target)).ok()
+                                .map(|id| (id, *message_id)),
+                        _ => None,
+                    };
+                    if let Some((target, message)) = identity {
+                        if store.action(target, message).await?.is_some_and(|action| action.state.is_terminal()) {
+                            return Ok(false);
+                        }
+                    }
+                    forward_attached_command(&lock, &socket, command).await
+                }));
             }
             command = commands.recv() => {
                 let Some(command) = command else {
+                    if let Some(task) = human_forward.take() { task.abort(); }
                     event_forwarder.abort();
-                    return Ok(())
+                    return Ok(());
                 };
                 if matches!(command, HostCommand::Stop { .. }) {
+                    if let Some(task) = human_forward.take() { task.abort(); }
                     event_forwarder.abort();
                     return Ok(());
                 }
+                if matches!(&command, HostCommand::Prompt { .. }
+                    | HostCommand::Subagent { action: crate::SubagentAction::Prompt { .. }, .. }) {
+                    let empty = retry_prompts.is_empty();
+                    retry_prompts.push_back(command);
+                    if empty { retry_tick.reset_immediately(); }
+                    continue;
+                }
+                // Controls and notifications never wait behind a human retry
+                // and are never automatically replayed after an uncertain effect.
                 match forward_attached_command(&lock_path, &socket_path, command).await {
                     Ok(true) => {
+                        if let Some(task) = human_forward.take() { task.abort(); }
                         event_forwarder.abort();
-                        tracing::info!(
-                            lock_path = %lock_path.display(),
-                            "local session owner released its writer lease; detaching terminal"
-                        );
                         return Ok(());
                     }
                     Ok(false) => {}
                     Err(error) => {
-                        if writer_is_active(&lock_path)? {
-                            tracing::warn!(
-                                %error,
-                                %session_id,
-                                "local session owner command channel is unavailable; keeping the attached transcript open"
-                            );
-                            let _ = command_events
-                                .send(SessionEvent::new(
-                                    session_id,
-                                    0,
-                                    SessionEventKind::Error {
-                                        message: format!(
-                                            "The active session owner is not accepting commands yet: {error:#}"
-                                        ),
-                                    },
-                                ))
-                                .await;
-                        } else {
+                        if !writer_is_active(&lock_path)? {
+                            if let Some(task) = human_forward.take() { task.abort(); }
                             event_forwarder.abort();
                             return Ok(());
                         }
+                        let _ = command_events.send(SessionEvent::new(session_id, 0,
+                            SessionEventKind::Error { message: format!("The active session owner is not accepting commands yet: {error:#}") })).await;
                     }
                 }
             }
@@ -1570,38 +1638,17 @@ async fn forward_attached_command(
     socket_path: &Path,
     command: HostCommand,
 ) -> Result<bool> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixStream;
-
     if !writer_is_active(lock_path)? {
         return Ok(true);
     }
-    let mut stream = match UnixStream::connect(socket_path).await {
-        Ok(stream) => stream,
-        Err(_) if !writer_is_active(lock_path)? => return Ok(true),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "session writer is active but its local control channel is unavailable ({})",
-                    socket_path.display()
-                )
-            });
-        }
-    };
-    stream.write_all(&serde_json::to_vec(&command)?).await?;
-    stream.shutdown().await?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await?;
-    let response: serde_json::Value = serde_json::from_slice(&response)
-        .context("session owner returned an invalid control response")?;
-    if let Some(error) = response.get("error").and_then(serde_json::Value::as_str) {
-        bail!("session owner rejected command: {error}");
+    let session_id = command
+        .session_id()
+        .context("attached command has no session target")?;
+    match send_local_session_command(socket_path, session_id, command).await {
+        Ok(()) => Ok(false),
+        Err(_) if !writer_is_active(lock_path)? => Ok(true),
+        Err(error) => Err(error),
     }
-    anyhow::ensure!(
-        response.get("ok").and_then(serde_json::Value::as_bool) == Some(true),
-        "session owner did not acknowledge command"
-    );
-    Ok(false)
 }
 
 #[cfg(unix)]
@@ -2458,6 +2505,458 @@ mod tests {
             force_terminate_obsolete_local_session_owner(root.path(), session_id, &unrelated)
                 .is_err()
         );
+    }
+
+    // The UI commits a child human admission before forwarding its command.
+    // A briefly unavailable owner socket must not strand that durable input.
+    #[tokio::test]
+    async fn attached_child_human_prompt_retries_after_owner_socket_recovers() {
+        for cancel_first in [false, true] {
+            let root = short_socket_tempdir();
+            let session_id = Uuid::new_v4();
+            let child = Uuid::new_v4();
+            let socket_path = session_control_socket_path(root.path(), session_id);
+            let lock_path = root.path().join(format!("{session_id}.lock"));
+            let writer = SessionWriterLease::try_acquire(&lock_path)
+                .unwrap()
+                .unwrap();
+            let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+            let store: Arc<dyn SessionStore> = Arc::new(store);
+            store.create_session(session_id).await.unwrap();
+            store
+                .register_child_session(session_id, child)
+                .await
+                .unwrap();
+            store
+                .append(SessionEvent::new(
+                    child,
+                    0,
+                    SessionEventKind::SessionStarted,
+                ))
+                .await
+                .unwrap();
+            store
+                .append(SessionEvent::new(
+                    child,
+                    0,
+                    SessionEventKind::SessionConfigured {
+                        cwd: root.path().to_path_buf(),
+                        provider: crate::CodingProvider::Codex,
+                        model: Some("gpt-6.1-sol".into()),
+                        effort: None,
+                        fast: false,
+                        ultrafast: false,
+                        response_language: crate::ResponseLanguage::Auto,
+                        permission_mode: crate::PermissionMode::Manual,
+                        speed_support: Default::default(),
+                    },
+                ))
+                .await
+                .unwrap();
+            let message_id = Uuid::new_v4();
+            store
+                .admit_prompt(SessionEvent::new(
+                    child,
+                    0,
+                    SessionEventKind::Message {
+                        message_id,
+                        actor: EventActor::User,
+                        text: "Coordinate with root on this".into(),
+                        attachments: Vec::new(),
+                        status: MessageStatus::Queued,
+                        delivery: Some(crate::PromptDelivery::Queue),
+                    },
+                ))
+                .await
+                .unwrap();
+            let (commands, receiver) = mpsc::channel(4);
+            let (events, mut received_events) = mpsc::channel(8);
+            let attachment = tokio::spawn(run_attached_session(
+                store.clone(),
+                session_id,
+                lock_path,
+                socket_path.clone(),
+                0,
+                receiver,
+                events,
+            ));
+            commands
+                .send(HostCommand::Subagent {
+                    session_id,
+                    action: crate::SubagentAction::Prompt {
+                        request_id: Uuid::new_v4(),
+                        target: child.to_string(),
+                        message_id,
+                        text: "Coordinate with root on this".into(),
+                        attachments: Vec::new(),
+                        delivery: crate::PromptDelivery::Queue,
+                    },
+                })
+                .await
+                .unwrap();
+            // Prove the first delivery failed before making the owner available.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if matches!(
+                        received_events.recv().await.unwrap().kind,
+                        SessionEventKind::Error { .. }
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let next_id = Uuid::new_v4();
+            store
+                .admit_prompt(SessionEvent::new(
+                    child,
+                    0,
+                    SessionEventKind::Message {
+                        message_id: next_id,
+                        actor: EventActor::User,
+                        text: "Second human input".into(),
+                        attachments: Vec::new(),
+                        status: MessageStatus::Queued,
+                        delivery: Some(PromptDelivery::Queue),
+                    },
+                ))
+                .await
+                .unwrap();
+            if cancel_first {
+                store
+                    .append(SessionEvent::new(
+                        child,
+                        0,
+                        SessionEventKind::PromptRecalled {
+                            message_id,
+                            text: "Coordinate with root on this".into(),
+                            attachments: Vec::new(),
+                        },
+                    ))
+                    .await
+                    .unwrap();
+            }
+            commands
+                .send(HostCommand::Subagent {
+                    session_id,
+                    action: crate::SubagentAction::Prompt {
+                        request_id: Uuid::new_v4(),
+                        target: child.to_string(),
+                        message_id: next_id,
+                        text: "Second human input".into(),
+                        attachments: Vec::new(),
+                        delivery: PromptDelivery::Queue,
+                    },
+                })
+                .await
+                .unwrap();
+            let (owner_tx, mut owner_rx) = mpsc::channel(4);
+            let server =
+                LocalSessionControlServer::start(socket_path, session_id, &writer, owner_tx)
+                    .unwrap();
+            let expected = if cancel_first {
+                vec![next_id]
+            } else {
+                vec![message_id, next_id]
+            };
+            for expected_id in expected {
+                let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), owner_rx.recv()).await
+                .expect("admitted human input must reach the recovered owner in order without another message").unwrap();
+                assert!(matches!(delivered, HostCommand::Subagent {
+                action: crate::SubagentAction::Prompt { message_id: delivered_id, target, .. }, ..
+            } if delivered_id == expected_id && target == child.to_string()));
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), owner_rx.recv())
+                    .await
+                    .is_err(),
+                "canceled input must not be resurrected or successful input replayed"
+            );
+            commands
+                .send(HostCommand::Stop { session_id })
+                .await
+                .unwrap();
+            attachment.await.unwrap().unwrap();
+            drop(server);
+            scratch.discard().await;
+        }
+    }
+
+    // An uncertain human RPC cannot hold a later user interrupt behind its ACK.
+    #[tokio::test]
+    async fn attached_human_ack_wait_does_not_block_later_interrupt() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let socket = session_control_socket_path(root.path(), session_id);
+        let lock = root.path().join(format!("{session_id}.lock"));
+        let writer = SessionWriterLease::try_acquire(&lock).unwrap().unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        store.create_session(session_id).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionConfigured {
+                    cwd: root.path().to_path_buf(),
+                    provider: crate::CodingProvider::Codex,
+                    model: Some("gpt-6.1-sol".into()),
+                    effort: None,
+                    fast: false,
+                    ultrafast: false,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: crate::PermissionMode::Manual,
+                    speed_support: Default::default(),
+                },
+            ))
+            .await
+            .unwrap();
+        let (normal, normal_rx) = mpsc::channel(1);
+        normal.send(HostCommand::Stop { session_id }).await.unwrap();
+        let (urgent, _urgent_rx) = mpsc::channel(1);
+        let interrupt = SessionInterrupt::default();
+        let mut stopped = interrupt.subscribe();
+        let admitted = Arc::new(Mutex::new(HashSet::new()));
+        let server = LocalSessionControlServer::start_with_priority_commands(
+            socket.clone(),
+            session_id,
+            &writer,
+            normal,
+            urgent,
+            interrupt,
+            Some(admitted.clone()),
+            store.clone(),
+        )
+        .unwrap();
+        let (commands, receiver) = mpsc::channel(4);
+        let (events, _events_rx) = mpsc::channel(8);
+        let attachment = tokio::spawn(run_attached_session(
+            store.clone(),
+            session_id,
+            lock,
+            socket,
+            0,
+            receiver,
+            events,
+        ));
+        let message_id = Uuid::new_v4();
+        commands
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id,
+                text: "human turn".into(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Queue,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !admitted.lock().unwrap().contains(&message_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        commands
+            .send(HostCommand::Interrupt { session_id })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stopped.changed())
+            .await
+            .expect("interrupt must not wait for the blocked human acknowledgement")
+            .unwrap();
+        commands
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        attachment.await.unwrap().unwrap();
+        drop(server);
+        drop(normal_rx);
+        scratch.discard().await;
+    }
+
+    // The effect can commit before the socket closes without its ACK. A retry
+    // must observe the terminal action instead of replaying/reviving the turn.
+    #[tokio::test]
+    async fn attached_lost_ack_after_completed_effect_is_not_replayed() {
+        use tokio::io::AsyncReadExt;
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let socket = session_control_socket_path(root.path(), session_id);
+        let lock = root.path().join(format!("{session_id}.lock"));
+        let _writer = SessionWriterLease::try_acquire(&lock).unwrap().unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        store.create_session(session_id).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionConfigured {
+                    cwd: root.path().to_path_buf(),
+                    provider: crate::CodingProvider::Codex,
+                    model: Some("gpt-6.1-sol".into()),
+                    effort: None,
+                    fast: false,
+                    ultrafast: false,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: crate::PermissionMode::Manual,
+                    speed_support: Default::default(),
+                },
+            ))
+            .await
+            .unwrap();
+        let message_id = Uuid::new_v4();
+        store
+            .admit_prompt(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::User,
+                    text: "human turn".into(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Queued,
+                    delivery: Some(PromptDelivery::Queue),
+                },
+            ))
+            .await
+            .unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (effects, mut observed) = tokio::sync::watch::channel(0_u32);
+        let owner_store = store.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let effects = effects.clone();
+                let store = owner_store.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    if stream.read_to_end(&mut bytes).await.is_err() {
+                        return;
+                    }
+                    if let Ok(HostCommand::Prompt {
+                        session_id,
+                        message_id,
+                        ..
+                    }) = serde_json::from_slice(&bytes)
+                    {
+                        store
+                            .append(SessionEvent::new(
+                                session_id,
+                                0,
+                                SessionEventKind::TurnCompleted {
+                                    message_id,
+                                    provider_session_id: None,
+                                    final_text: "effect committed".into(),
+                                    error: None,
+                                },
+                            ))
+                            .await
+                            .unwrap();
+                        effects.send_modify(|count| *count += 1);
+                        // Deliberately lose the ACK after committing the effect.
+                    }
+                });
+            }
+        });
+        let (commands, receiver) = mpsc::channel(4);
+        let (events, mut event_rx) = mpsc::channel(16);
+        let attachment = tokio::spawn(run_attached_session(
+            store.clone(),
+            session_id,
+            lock,
+            socket,
+            0,
+            receiver,
+            events,
+        ));
+        commands
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id,
+                text: "human turn".into(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Queue,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), observed.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(
+                event_rx.recv().await.unwrap().kind,
+                SessionEventKind::Error { .. }
+            ) {}
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), observed.changed())
+                .await
+                .is_err()
+        );
+        assert_eq!(*observed.borrow(), 1);
+        commands
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        attachment.await.unwrap().unwrap();
+        server.abort();
+        let _ = server.await;
+        scratch.discard().await;
+    }
+
+    // Empty/truncated ACK is transport uncertainty, not an explicit rejection.
+    #[tokio::test]
+    async fn missing_owner_ack_is_unexpected_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for reply in [b"".as_slice(), b"{".as_slice()] {
+            let root = short_socket_tempdir();
+            let session_id = Uuid::new_v4();
+            let socket = session_control_socket_path(root.path(), session_id);
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).await.unwrap();
+                stream.write_all(reply).await.unwrap();
+            });
+            let error = send_local_session_command(
+                &socket,
+                session_id,
+                HostCommand::Interrupt { session_id },
+            )
+            .await
+            .unwrap_err();
+            assert!(error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof)
+            }));
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
