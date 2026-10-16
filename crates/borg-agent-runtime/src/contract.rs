@@ -2367,6 +2367,11 @@ pub enum EventActor {
     System,
 }
 
+/// Most images one user message may carry. Native providers reject more, so
+/// every frontend checks this before taking the composer: a refused send must
+/// leave the draft where the user can fix it, not fail after admission.
+pub const MAX_PROMPT_IMAGES: usize = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]

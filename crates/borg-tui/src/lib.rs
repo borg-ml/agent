@@ -15,6 +15,7 @@ mod attachments;
 mod cache_diagnostics;
 mod clipboard;
 mod composer_draft;
+mod composer_undo;
 mod key_hints;
 mod markdown;
 mod rendering;
@@ -45,10 +46,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use attachments::{AttachmentStore, PasteOutcome};
 use borg_remote::{
-    ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus, MessageStatus,
-    PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage, SessionEvent,
-    SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef, SessionState,
-    SessionStatus, SubagentActivityKind, SubagentSnapshot, SubagentStatus,
+    ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus, MAX_PROMPT_IMAGES,
+    MessageStatus, PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage,
+    SessionEvent, SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef,
+    SessionState, SessionStatus, SubagentActivityKind, SubagentSnapshot, SubagentStatus,
     ToolPresentationCategory, WatchSummary, command_edit_presentation, compact_text,
     is_command_tool, is_diff_language, is_edit_tool, is_mcp_resource_probe, is_subagent_tool,
     project_tool_presentation, tool_action_is_instant, tool_can_start_background_process,
@@ -64,6 +65,7 @@ use borg_ui::preferences::{
 use borg_ui::timeline::tool_lifecycle_label;
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use composer_draft::{ComposerDraft, ComposerDraftStore};
+use composer_undo::{EditKind, UndoHistory};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -302,6 +304,8 @@ enum KeyAction {
     SelectNext,
     Approve,
     Deny,
+    Undo,
+    Redo,
 }
 
 #[derive(Clone)]
@@ -330,6 +334,8 @@ struct KeyMap {
     select_next: Vec<KeyChord>,
     approve: Vec<KeyChord>,
     deny: Vec<KeyChord>,
+    undo: Vec<KeyChord>,
+    redo: Vec<KeyChord>,
 }
 
 impl KeyMap {
@@ -352,6 +358,8 @@ impl KeyMap {
             select_next: parse_key_chords(&config.select_next)?,
             approve: parse_key_chords(&config.approve)?,
             deny: parse_key_chords(&config.deny)?,
+            undo: parse_key_chords(&config.undo)?,
+            redo: parse_key_chords(&config.redo)?,
         })
     }
 
@@ -374,6 +382,8 @@ impl KeyMap {
             KeyAction::SelectNext => &self.select_next,
             KeyAction::Approve => &self.approve,
             KeyAction::Deny => &self.deny,
+            KeyAction::Undo => &self.undo,
+            KeyAction::Redo => &self.redo,
         }
     }
 
@@ -1679,6 +1689,9 @@ pub struct BorgTerminal {
     /// Last composer state written to the sidecar, so a save only touches the
     /// disk when the draft actually changed.
     persisted_draft: Option<ComposerDraft>,
+    /// The live prompt whose turn has not produced output yet; see
+    /// [`Self::return_prompt_failed_before_output`].
+    prompt_awaiting_output: Option<Uuid>,
     keymap: KeyMap,
     ui_language: UiLanguage,
     cwd: PathBuf,
@@ -3118,6 +3131,7 @@ impl BorgTerminal {
             attachment_store,
             composer_draft_store: ComposerDraftStore::for_session(sessions_dir, session_id),
             persisted_draft: None,
+            prompt_awaiting_output: None,
             keymap,
             ui_language: UiLanguage::Auto,
             cwd,
@@ -3304,6 +3318,7 @@ impl BorgTerminal {
         self.attachment_store = AttachmentStore::for_session(sessions_dir, session_id)?;
         self.composer_draft_store = ComposerDraftStore::for_session(sessions_dir, session_id);
         self.persisted_draft = None;
+        self.prompt_awaiting_output = None;
         self.keymap = KeyMap::from_config(keybindings)?;
         self.transcript = root_transcript_from_environment();
         self.transcript
@@ -3684,6 +3699,7 @@ impl BorgTerminal {
         // because submission takes it.
         self.composer.append_recalled(text, attachments);
         self.composer_selection = None;
+        self.persist_composer_draft();
     }
 
     pub fn insert_dictation(&mut self, text: &str) {
@@ -3702,6 +3718,7 @@ impl BorgTerminal {
         self.composer.insert(text);
         self.slash_selection = 0;
         self.notice = Some("Dictation added to composer".to_string());
+        self.persist_composer_draft();
     }
 
     pub fn set_dictation_state(&mut self, state: DictationState) {
@@ -3735,6 +3752,7 @@ impl BorgTerminal {
     /// at any point leaves a resumable prompt. Failures are logged, never
     /// surfaced: a draft that cannot be written must not break typing.
     pub fn persist_composer_draft(&mut self) {
+        self.composer.checkpoint(EditKind::Discrete);
         let current =
             self.composer_draft()
                 .map_or_else(ComposerDraft::default, |(text, attachments)| {
@@ -3928,6 +3946,7 @@ impl BorgTerminal {
         self.composer.append_recalled(text, attachments);
         self.composer_selection = None;
         self.notice = Some("Could not send the prompt; it was returned to the composer".into());
+        self.persist_composer_draft();
     }
 
     pub fn provisional_recall_ids(&self) -> Vec<Uuid> {
@@ -4074,6 +4093,48 @@ impl BorgTerminal {
         Ok(changed)
     }
 
+    /// A prompt that fails before the agent produced any output (a provider
+    /// refused its images, the provider never started) goes back to the
+    /// composer, so the user can fix and resend it instead of digging it out
+    /// of the journal. A turn that already produced output stays failed in
+    /// the transcript only: resending it could repeat work.
+    fn return_prompt_failed_before_output(&mut self, event: &SessionEvent) {
+        match &event.kind {
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                status: MessageStatus::InProgress,
+                ..
+            } => {
+                self.prompt_awaiting_output = Some(*message_id);
+            }
+            SessionEventKind::Message {
+                actor: EventActor::Assistant,
+                ..
+            }
+            | SessionEventKind::ReasoningDelta { .. }
+            | SessionEventKind::ToolStarted { .. } => self.prompt_awaiting_output = None,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                status: MessageStatus::Failed,
+                text,
+                attachments,
+                ..
+            } if self.prompt_awaiting_output == Some(*message_id) => {
+                self.prompt_awaiting_output = None;
+                if event.kind.is_recallable_user_message() {
+                    self.restore_composer(text.clone(), attachments.clone());
+                    self.notice = Some(
+                        "The prompt failed before the agent replied; it was returned to the composer"
+                            .into(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn apply_session_event(&mut self, event: &SessionEvent) -> bool {
         let inspector_anchor = self.action_inspector_anchor();
         if !self.replaying_history {
@@ -4091,6 +4152,7 @@ impl BorgTerminal {
                 self.connection_retry_attempt = None;
                 self.notice = None;
             }
+            self.return_prompt_failed_before_output(event);
             match &event.kind {
                 SessionEventKind::ProviderEvent { kind, payload, .. }
                     if kind == "usage_limit_retry" =>
@@ -5697,6 +5759,8 @@ impl BorgTerminal {
     }
 
     fn begin_user_interrupt(&mut self) -> bool {
+        // A turn the user stopped is not a failure to hand back.
+        self.prompt_awaiting_output = None;
         let status = self.active_status();
         let interrupt_status = if self.usage_retry_at.is_some() {
             SessionStatus::Starting
@@ -5799,6 +5863,12 @@ impl BorgTerminal {
                     .attachments
                     .last()
                     .map(|attachment| format!("Attached {}", attachment.label));
+                if let Some(notice) = prompt_image_limit_notice(self.composer.attachments.len()) {
+                    self.notice = Some(notice);
+                }
+                // Attachments arrive outside input handling; keep the
+                // durable draft in step so a crash cannot lose them.
+                self.persist_composer_draft();
             }
             TerminalIoCompletionKind::Pasted(Err(error)) => {
                 self.notice = Some(format!("Paste failed: {error}"));
@@ -6961,7 +7031,12 @@ impl BorgTerminal {
     /// The draft has to survive a quit at any moment, so it is persisted here
     /// rather than only at shutdown.
     pub fn handle_event(&mut self, input: TerminalInputEvent) -> Result<UiAction> {
+        // Commit changes made outside input (a returned prompt, a resolved
+        // paste, dictation) as their own undo step before this input.
+        self.composer.checkpoint(EditKind::Discrete);
+        let kind = composer_edit_kind(&input.event);
         let action = self.handle_event_inner(input);
+        self.composer.checkpoint(kind);
         self.persist_composer_draft();
         action
     }
@@ -11833,6 +11908,24 @@ impl BorgTerminal {
             self.update_slash_notice();
             return Ok(UiAction::None);
         }
+        if self.keymap.matches(KeyAction::Undo, &key) {
+            self.composer_selection = None;
+            let changed = self.composer.undo();
+            self.update_slash_notice();
+            if !changed {
+                self.notice = Some("Nothing to undo".to_string());
+            }
+            return Ok(UiAction::None);
+        }
+        if self.keymap.matches(KeyAction::Redo, &key) {
+            self.composer_selection = None;
+            let changed = self.composer.redo();
+            self.update_slash_notice();
+            if !changed {
+                self.notice = Some("Nothing to redo".to_string());
+            }
+            return Ok(UiAction::None);
+        }
         if self.keymap.matches(KeyAction::Exit, &key) {
             return Ok(UiAction::Quit);
         }
@@ -11897,6 +11990,10 @@ impl BorgTerminal {
             if text.trim().is_empty() && attachments.is_empty() {
                 return Ok(UiAction::None);
             }
+            if let Some(notice) = prompt_image_limit_notice(attachments.len()) {
+                self.notice = Some(notice);
+                return Ok(UiAction::None);
+            }
             let delivery = if self.keymap.matches(KeyAction::Queue, &key) {
                 PromptDelivery::Queue
             } else {
@@ -11904,6 +12001,7 @@ impl BorgTerminal {
             };
             self.recall_submission = Some((message_id, text.clone(), attachments.clone()));
             self.composer.clear();
+            self.composer.reset_undo();
             self.project_pending_prompt(self.focused_child, message_id, text.clone(), delivery);
             self.persist_composer_draft();
             return Ok(UiAction::ReplaceRecalledPrompt {
@@ -11918,6 +12016,10 @@ impl BorgTerminal {
         if self.keymap.matches(KeyAction::Queue, &key)
             && slash_matches(&self.composer.text).is_empty()
         {
+            if let Some(notice) = prompt_image_limit_notice(self.composer.attachments.len()) {
+                self.notice = Some(notice);
+                return Ok(UiAction::None);
+            }
             let (text, attachments) = self.composer.take();
             if text.trim().is_empty() && attachments.is_empty() {
                 return Ok(UiAction::None);
@@ -12006,6 +12108,10 @@ impl BorgTerminal {
                 self.composer.clear();
                 self.notice = Some("Broadcasting to every instance on this machine".to_string());
                 return Ok(UiAction::BroadcastInstances { text: message });
+            }
+            if let Some(notice) = prompt_image_limit_notice(self.composer.attachments.len()) {
+                self.notice = Some(notice);
+                return Ok(UiAction::None);
             }
             let (text, attachments) = self.composer.take();
             if text.trim().is_empty() && attachments.is_empty() {
@@ -13339,6 +13445,34 @@ fn visible_team_roster(
     (visible, Some(header_index))
 }
 
+/// Classify an input event for undo coalescing: plain typing and plain
+/// deletion merge into runs, everything else is its own step.
+fn composer_edit_kind(event: &Event) -> EditKind {
+    let Event::Key(key) = event else {
+        return EditKind::Discrete;
+    };
+    let plain = !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+    match key.code {
+        KeyCode::Char(character) if plain && character.is_whitespace() => EditKind::WordBreak,
+        KeyCode::Char(_) if plain => EditKind::Typing,
+        KeyCode::Backspace | KeyCode::Delete if plain => EditKind::Deleting,
+        _ => EditKind::Discrete,
+    }
+}
+
+/// Refuse a send the providers would reject, before the composer is taken,
+/// so the draft stays editable instead of failing after admission.
+fn prompt_image_limit_notice(attachments: usize) -> Option<String> {
+    (attachments > MAX_PROMPT_IMAGES).then(|| {
+        format!(
+            "A message can carry at most {MAX_PROMPT_IMAGES} images ({attachments} attached); \
+             remove some and send them in a follow-up"
+        )
+    })
+}
+
 fn team_roster_target_at(
     hit_areas: &[(Rect, TeamRosterTarget)],
     pointer: Position,
@@ -13363,8 +13497,28 @@ struct Composer {
     history_message_ids: HashSet<Uuid>,
     history_index: Option<usize>,
     history_draft: String,
+    undo: UndoHistory<ComposerSnapshot>,
 }
 
+/// Editable composer content as one undo step. The cursor is restored with the
+/// content but does not make two snapshots differ.
+#[derive(Clone, Debug, Default)]
+struct ComposerSnapshot {
+    text: String,
+    cursor: usize,
+    attachments: Vec<ComposerAttachment>,
+    pasted_texts: Vec<ComposerPastedText>,
+}
+
+impl PartialEq for ComposerSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+            && self.attachments == other.attachments
+            && self.pasted_texts == other.pasted_texts
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ComposerAttachment {
     path: PathBuf,
     label: String,
@@ -13372,6 +13526,7 @@ struct ComposerAttachment {
     end: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ComposerPastedText {
     content: String,
     start: usize,
@@ -13379,6 +13534,64 @@ struct ComposerPastedText {
 }
 
 impl Composer {
+    fn snapshot(&self) -> ComposerSnapshot {
+        ComposerSnapshot {
+            text: self.text.clone(),
+            cursor: self.cursor,
+            attachments: self.attachments.clone(),
+            pasted_texts: self.pasted_texts.clone(),
+        }
+    }
+
+    /// Commit the current content as an undo step if it changed since the
+    /// last checkpoint. Cheap when nothing changed: no snapshot is cloned.
+    fn checkpoint(&mut self, kind: EditKind) {
+        let baseline = self.undo.baseline();
+        if baseline.text == self.text
+            && baseline.attachments == self.attachments
+            && baseline.pasted_texts == self.pasted_texts
+        {
+            return;
+        }
+        let snapshot = self.snapshot();
+        self.undo.checkpoint(&snapshot, kind, Instant::now());
+    }
+
+    fn undo(&mut self) -> bool {
+        let current = self.snapshot();
+        self.undo
+            .undo(&current, Instant::now())
+            .map(|previous| self.apply_snapshot(previous))
+            .is_some()
+    }
+
+    fn redo(&mut self) -> bool {
+        let current = self.snapshot();
+        self.undo
+            .redo(&current, Instant::now())
+            .map(|next| self.apply_snapshot(next))
+            .is_some()
+    }
+
+    fn apply_snapshot(&mut self, snapshot: ComposerSnapshot) {
+        self.text = snapshot.text;
+        self.cursor = snapshot.cursor.min(self.text.len());
+        while !self.text.is_char_boundary(self.cursor) {
+            self.cursor -= 1;
+        }
+        self.attachments = snapshot.attachments;
+        self.pasted_texts = snapshot.pasted_texts;
+        self.preferred_column = None;
+        self.history_index = None;
+    }
+
+    /// Forget undo steps once the content has been sent: undoing past a
+    /// submission would resurrect a prompt that is already in the transcript.
+    fn reset_undo(&mut self) {
+        let snapshot = self.snapshot();
+        self.undo.reset(snapshot);
+    }
+
     fn seed_session_events(&mut self, events: &[SessionEvent]) {
         let mut seen = HashSet::new();
         for event in events {
@@ -13775,13 +13988,12 @@ impl Composer {
         self.preferred_column = None;
         self.history_index = None;
         self.history_draft.clear();
-        (
-            text,
-            std::mem::take(&mut self.attachments)
-                .into_iter()
-                .map(|attachment| attachment.path)
-                .collect(),
-        )
+        let attachments = std::mem::take(&mut self.attachments)
+            .into_iter()
+            .map(|attachment| attachment.path)
+            .collect();
+        self.reset_undo();
+        (text, attachments)
     }
 
     fn draft(&self) -> Option<(String, Vec<PathBuf>)> {
@@ -16291,6 +16503,8 @@ fn keybinding_reference(keymap: &KeyMap) -> Vec<(&'static str, String)> {
         ("interrupt or close", keymap.label(KeyAction::Interrupt)),
         ("clear · twice exits", keymap.label(KeyAction::ClearOrExit)),
         ("exit", keymap.label(KeyAction::Exit)),
+        ("undo composer edit", keymap.label(KeyAction::Undo)),
+        ("redo composer edit", keymap.label(KeyAction::Redo)),
         ("paste clipboard", keymap.label(KeyAction::AttachImage)),
         ("start/stop dictation", keymap.label(KeyAction::Dictate)),
         ("copy selection/response", keymap.label(KeyAction::Copy)),

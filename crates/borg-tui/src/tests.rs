@@ -21402,3 +21402,154 @@ async fn running_action_click_backgrounds_once_and_completed_click_inspects() {
         }
     ));
 }
+
+fn composer_input(code: KeyCode, modifiers: KeyModifiers) -> TerminalInputEvent {
+    TerminalInputEvent {
+        event: Event::Key(KeyEvent::new(code, modifiers)),
+        scroll_repetitions: 1,
+    }
+}
+
+fn type_into(terminal: &mut BorgTerminal, text: &str) {
+    for character in text.chars() {
+        terminal
+            .handle_event(composer_input(KeyCode::Char(character), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+fn composer_test_terminal(directory: &tempfile::TempDir) -> BorgTerminal {
+    BorgTerminal::enter(
+        directory.path(),
+        Uuid::new_v4(),
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires a PTY; run under script with a sized terminal"]
+async fn composer_undo_redo_steps_by_word_and_restores_a_cleared_draft() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = composer_test_terminal(&directory);
+    let undo = || composer_input(KeyCode::Char('z'), KeyModifiers::CONTROL);
+    type_into(&mut terminal, "hello world");
+    terminal.handle_event(undo()).unwrap();
+    assert_eq!(terminal.composer.text, "hello ");
+    terminal.handle_event(undo()).unwrap();
+    assert_eq!(terminal.composer.text, "");
+    terminal
+        .handle_event(composer_input(KeyCode::Char('y'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(terminal.composer.text, "hello ");
+    terminal
+        .handle_event(composer_input(
+            KeyCode::Char('Z'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+    assert_eq!(terminal.composer.text, "hello world");
+    assert_eq!(terminal.composer.cursor, "hello world".len());
+
+    // Clearing with Ctrl+C is an ordinary step and comes back with undo.
+    terminal
+        .handle_event(composer_input(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(terminal.composer.text, "");
+    terminal.handle_event(undo()).unwrap();
+    assert_eq!(terminal.composer.text, "hello world");
+
+    // A submission forgets the history: undo must not resurrect a sent prompt.
+    let sent = terminal
+        .handle_event(composer_input(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(matches!(sent, UiAction::Submit { .. }));
+    terminal.handle_event(undo()).unwrap();
+    assert_eq!(terminal.composer.text, "");
+    assert_eq!(terminal.notice.as_deref(), Some("Nothing to undo"));
+    terminal.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a PTY; run under script with a sized terminal"]
+async fn too_many_images_keep_the_durable_draft_instead_of_sending() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = composer_test_terminal(&directory);
+    type_into(&mut terminal, "look ");
+    for index in 0..=MAX_PROMPT_IMAGES {
+        terminal
+            .composer
+            .insert_attachment(PathBuf::from(format!("/tmp/{index}.png")));
+    }
+    let before = terminal.composer.draft();
+    for code in [KeyCode::Enter, KeyCode::Tab] {
+        let action = terminal
+            .handle_event(composer_input(code, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(action, UiAction::None));
+        assert_eq!(terminal.composer.draft(), before);
+        assert!(
+            terminal
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("at most 4 images"))
+        );
+    }
+    // The refused draft, images included, is on disk for a restart. Dropping
+    // the store joins its writer, so the reopened store reads the last save.
+    let session_id = terminal.session_id;
+    drop(std::mem::replace(
+        &mut terminal.composer_draft_store,
+        ComposerDraftStore::for_session(directory.path(), Uuid::new_v4()),
+    ));
+    let stored = ComposerDraftStore::for_session(directory.path(), session_id)
+        .load()
+        .unwrap();
+    assert_eq!(stored.attachments.len(), MAX_PROMPT_IMAGES + 1);
+    assert!(stored.text.starts_with("look [Image 1]"));
+    terminal.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a PTY; run under script with a sized terminal"]
+async fn a_prompt_failing_before_any_output_returns_to_the_composer() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = composer_test_terminal(&directory);
+    let message_id = Uuid::new_v4();
+    let image = PathBuf::from("/tmp/one.png");
+    let user = |status| {
+        SessionEvent::new(
+            Uuid::nil(),
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "fix [Image 1]".to_string(),
+                attachments: vec![image.clone()],
+                status,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        )
+    };
+    terminal.apply_session_event(&user(MessageStatus::InProgress));
+    terminal.apply_session_event(&user(MessageStatus::Failed));
+    assert_eq!(
+        terminal.composer.draft(),
+        Some(("fix [Image 1]".to_string(), vec![image.clone()]))
+    );
+
+    // Once the agent produced output, a failed turn stays in the transcript.
+    terminal.composer.clear();
+    terminal.apply_session_event(&user(MessageStatus::InProgress));
+    terminal.apply_session_event(&SessionEvent::new(
+        Uuid::nil(),
+        0,
+        SessionEventKind::ReasoningDelta {
+            text: "thinking".to_string(),
+        },
+    ));
+    terminal.apply_session_event(&user(MessageStatus::Failed));
+    assert_eq!(terminal.composer.draft(), None);
+    terminal.shutdown().await;
+}

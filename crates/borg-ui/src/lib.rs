@@ -41,6 +41,8 @@ pub struct KeybindingConfig {
     pub select_next: Vec<String>,
     pub approve: Vec<String>,
     pub deny: Vec<String>,
+    pub undo: Vec<String>,
+    pub redo: Vec<String>,
 }
 
 impl Default for KeybindingConfig {
@@ -75,6 +77,8 @@ impl Default for KeybindingConfig {
             select_next: vec!["alt+down".into()],
             approve: vec!["y".into()],
             deny: vec!["n".into(), "esc".into()],
+            undo: vec!["ctrl+z".into()],
+            redo: vec!["ctrl+y".into(), "ctrl+shift+z".into()],
         }
     }
 }
@@ -99,6 +103,8 @@ impl KeybindingConfig {
             "select_next" => &mut self.select_next,
             "approve" => &mut self.approve,
             "deny" => &mut self.deny,
+            "undo" => &mut self.undo,
+            "redo" => &mut self.redo,
             _ => anyhow::bail!("unknown keybinding action `{action}`"),
         };
         anyhow::ensure!(
@@ -112,7 +118,7 @@ impl KeybindingConfig {
         Ok(())
     }
 
-    pub fn entries(&self) -> [(&'static str, &[String]); 17] {
+    pub fn entries(&self) -> [(&'static str, &[String]); 19] {
         [
             ("send", &self.send),
             ("queue", &self.queue),
@@ -131,6 +137,8 @@ impl KeybindingConfig {
             ("select_next", &self.select_next),
             ("approve", &self.approve),
             ("deny", &self.deny),
+            ("undo", &self.undo),
+            ("redo", &self.redo),
         ]
     }
 }

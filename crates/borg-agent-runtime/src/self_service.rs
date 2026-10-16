@@ -2404,6 +2404,8 @@ fn validate_settings_shape(root: &toml::Value) -> Result<()> {
                 "select_next",
                 "approve",
                 "deny",
+                "undo",
+                "redo",
             ],
             "keybindings",
         )?;

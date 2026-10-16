@@ -5189,7 +5189,7 @@ pub(crate) fn bounded_text(mut output: String, max_bytes: usize) -> String {
     output
 }
 
-pub(crate) const MAX_NATIVE_USER_IMAGES: usize = 4;
+pub(crate) const MAX_NATIVE_USER_IMAGES: usize = crate::MAX_PROMPT_IMAGES;
 pub(crate) const MAX_NATIVE_USER_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 
 pub(crate) async fn native_user_message(

@@ -123,6 +123,8 @@ select_previous = ["alt+up"]
 select_next = ["alt+down"]
 approve = ["y"]
 deny = ["n", "esc"]
+undo = ["ctrl+z"] # composer edits
+redo = ["ctrl+y", "ctrl+shift+z"]
 
 # Add any local stdio MCP server as a provider-neutral tool extension. Borg
 # starts enabled servers for the active session and exposes them to Codex,
