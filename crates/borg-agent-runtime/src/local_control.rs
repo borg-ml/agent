@@ -83,6 +83,13 @@ impl LocalLivePublisher {
                 let start = self.reasoning_bytes.entry(session_id).or_default();
                 let previous = *start;
                 *start += delta.len();
+                if let Some(snapshot) = self.reasoning_snapshots.get_mut(&session_id)
+                    && snapshot.sequence == 0
+                    && let (_, SessionEventKind::ReasoningDelta { text }) =
+                        preview_event_kind_mut(snapshot)
+                {
+                    text.push_str(delta);
+                }
                 Some(previous)
             }
             SessionEventKind::MessageDelta { message_id, delta } => {
@@ -92,6 +99,13 @@ impl LocalLivePublisher {
                     .or_default();
                 let previous = *start;
                 *start += delta.len();
+                if let Some(snapshot) = self.message_snapshots.get_mut(&(session_id, *message_id))
+                    && snapshot.sequence == 0
+                    && let (_, SessionEventKind::Message { text, .. }) =
+                        preview_event_kind_mut(snapshot)
+                {
+                    text.push_str(delta);
+                }
                 Some(previous)
             }
             SessionEventKind::ReasoningDelta { text } => {
@@ -2924,6 +2938,125 @@ mod tests {
         assert!(matches!(seen[2], SessionEventKind::ReasoningDelta { ref text } if text == "abc"));
         assert_eq!(preview.reasoning[&session_id].text, "abc");
         assert_eq!(preview.messages[&(session_id, message_id)], "xyz");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_reconnect_baseline_keeps_deltas_after_receiver_lag() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let writer = SessionWriterLease::try_acquire(root.path().join("session.lock"))
+            .unwrap()
+            .unwrap();
+        let (commands, _rx) = mpsc::channel(1);
+        let server = LocalSessionControlServer::start(
+            session_control_socket_path(root.path(), session_id),
+            session_id,
+            &writer,
+            commands,
+        )
+        .unwrap();
+        let snapshot = SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::Assistant,
+                text: "pré".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: None,
+            },
+        );
+        let delta = |text: &str| {
+            SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::MessageDelta {
+                    message_id,
+                    delta: text.into(),
+                },
+            )
+        };
+        server.publish_live_event(&snapshot);
+        server.publish_live_event(&delta("fix")); // No receiver yet.
+        let mut slow = server.live.lock().unwrap().events.subscribe();
+        let mut expected = "préfix".to_string();
+        for _ in 0..=LOCAL_LIVE_EVENT_BUFFER {
+            server.publish_live_event(&delta("x"));
+            expected.push('x');
+            tokio::time::advance(LOCAL_LIVE_DELTA_BATCH_DELAY).await;
+        }
+        let backlog = slow.len();
+        let Err(broadcast::error::TryRecvError::Lagged(skipped)) = slow.try_recv() else {
+            panic!("the actual broadcast receiver must lag before reconnecting");
+        };
+        assert!(backlog > LOCAL_LIVE_EVENT_BUFFER);
+        server.publish_live_event(&delta("🙂"));
+        server.publish_live_event(&delta("尾"));
+        expected.push_str("🙂尾");
+        assert!(server.live.lock().unwrap().pending_delta.is_some());
+
+        let LocalLiveConnect::Connected(mut connection) = connect_local_live_stream(
+            &session_control_presence_socket_path(root.path(), session_id),
+        )
+        .await
+        else {
+            panic!("viewer should reconnect to the live owner");
+        };
+        let mut preview = AttachedPreviewCursor::default();
+        preview.require_snapshot_for_existing_streams();
+        assert_eq!(connection.snapshots.len(), 1);
+        assert_eq!(connection.snapshots[0].created_at, snapshot.created_at);
+        for snapshot in connection.snapshots {
+            preview.accept(snapshot, None).unwrap();
+        }
+        let baseline = &preview.messages[&(session_id, message_id)];
+        eprintln!(
+            "receiver_backlog={backlog} lagged_frames={skipped} baseline_bytes={} published_bytes={}",
+            baseline.len(),
+            expected.len()
+        );
+        assert_eq!(
+            baseline, &expected,
+            "Hello must include every published fragment"
+        );
+
+        server.publish_live_event(&delta("!"));
+        expected.push('!');
+        let mut complete = snapshot.clone();
+        complete.sequence = 1;
+        let SessionEventKind::Message { text, status, .. } = &mut complete.kind else {
+            unreachable!();
+        };
+        *text = expected.clone();
+        *status = MessageStatus::Complete;
+        server.publish_live_event(&complete);
+        let Some(LocalLiveFrame::Event {
+            event, text_start, ..
+        }) = read_live_frame(&mut connection.reader).await.unwrap()
+        else {
+            panic!("the post-Hello delta must precede completion");
+        };
+        let accepted = preview.accept(*event, text_start).unwrap();
+        assert!(
+            matches!(accepted.kind, SessionEventKind::MessageDelta { ref delta, .. } if delta == "!")
+        );
+        assert_eq!(preview.messages[&(session_id, message_id)], expected);
+        let Some(LocalLiveFrame::Event { event, .. }) =
+            read_live_frame(&mut connection.reader).await.unwrap()
+        else {
+            panic!("completion must follow the delta exactly once");
+        };
+        assert_eq!(event.sequence, 1);
+        assert!(matches!(
+            event.kind,
+            SessionEventKind::Message {
+                status: MessageStatus::Complete,
+                ..
+            }
+        ));
+        assert!(server.live.lock().unwrap().snapshots().is_empty());
     }
 
     #[tokio::test]

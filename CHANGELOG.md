@@ -23,6 +23,9 @@ Git comparison.
 
 ### Streaming
 
+- Keep reconnect preview snapshots current with raw text fragments so receiver
+  lag no longer drops text or delays it until a later full snapshot.
+
 - Append Claude text, thinking, and signature fragments in place instead of
   rebuilding the entire buffer on every delta. The same 1 MiB/16,384-fragment
   decoder fixture is 13–15× faster; provider output and progress are unchanged.
