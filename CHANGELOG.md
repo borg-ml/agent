@@ -55,6 +55,9 @@ Git comparison.
   prevent duplicate turns or reviving stopped work; controls retain priority.
   Notifications, promotion, and other controls are not automatically retried.
 
+- Keep canonical team inspection scoped to persisted membership, including
+  dormant sessions after a director handoff, without requiring a live roster.
+
 ### Performance verification
 
 - Add an opt-in owned-PTY gate measuring emission-to-visible age of the latest

@@ -9481,6 +9481,24 @@ async fn team_harness_inspection_is_scoped_paginated_and_non_mutating() {
         first["agents"][0]["session_id"],
         second["agents"][0]["session_id"]
     );
+    // Handoff must not make canonical members depend on a live roster cache.
+    coordinator.director.send_replace(crate::TeamDirector {
+        session_id: child,
+        path: "/root/promoted".into(),
+        epoch: 1,
+    });
+    for target in [root, grandchild] {
+        coordinator
+            .call_tool_as(child, "inspect_agent", json!({"session_id": target}))
+            .await
+            .unwrap();
+    }
+    assert!(
+        coordinator
+            .call_tool_as(child, "inspect_agent", json!({"session_id": unrelated}))
+            .await
+            .is_err()
+    );
     assert_eq!(
         store.state(child).await.unwrap().latest_sequence,
         revision,

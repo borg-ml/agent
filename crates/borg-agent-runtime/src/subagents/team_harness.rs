@@ -206,12 +206,16 @@ fn validate_goal_action(
 
 impl SubagentCoordinator {
     async fn authorize_inspection(&self, actor: Uuid, target: Uuid) -> Result<()> {
-        if self.is_director(actor) {
-            self.table.lock().await.task_name(target)?;
-            return Ok(());
-        }
+        let owner = if self.is_director(actor) {
+            if target == self.root_session_id {
+                return Ok(());
+            }
+            self.root_session_id
+        } else {
+            actor
+        };
         ensure!(
-            self.store.is_descendant(actor, target).await?,
+            self.store.is_descendant(owner, target).await?,
             "session is not an owned descendant of the caller"
         );
         Ok(())
