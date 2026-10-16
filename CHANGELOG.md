@@ -55,6 +55,12 @@ Git comparison.
   prevent duplicate turns or reviving stopped work; controls retain priority.
   Notifications, promotion, and other controls are not automatically retried.
 
+### Performance verification
+
+- Add an opt-in owned-PTY gate measuring emission-to-visible age of the latest
+  assistant tokens during sustained streaming, including before/after binary
+  comparison. Retained-history replay remains covered by rendering parity.
+
 ### Planning
 
 - Allow multiple in-progress todos for the same assignee in both session and

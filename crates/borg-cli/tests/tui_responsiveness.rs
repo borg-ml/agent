@@ -46,7 +46,7 @@ fn live_tui_input_latency_under_storage_pressure() {
     )
     .expect("configure the isolated editor fixture");
 
-    let (endpoint, stream_started, server) = spawn_streaming_provider();
+    let (endpoint, stream_started, server, _) = spawn_streaming_provider(true);
     let executable = std::env::var("BORG_TUI_STRESS_EXE")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_borg").to_string());
     let mut terminal = PtyChild::spawn(
@@ -213,7 +213,7 @@ fn run_esc_probe(queued_prompts: usize) {
         "[updates]\nauto_install = false\n",
     )
     .expect("disable updates");
-    let (endpoint, stream_started, server) = spawn_streaming_provider();
+    let (endpoint, stream_started, server, _emitted) = spawn_streaming_provider(true);
     let executable = std::env::var("BORG_TUI_STRESS_EXE")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_borg").to_string());
     let mut terminal = PtyChild::spawn(
@@ -286,7 +286,7 @@ fn session_host_restart_keeps_the_viewer_on_the_alternate_screen() {
         "[updates]\nauto_install = false\n",
     )
     .expect("disable updates");
-    let (endpoint, stream_started, _server) = spawn_streaming_provider();
+    let (endpoint, stream_started, _server, _emitted) = spawn_streaming_provider(true);
     let executable = std::env::var("BORG_TUI_STRESS_EXE")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_borg").to_string());
     // Declared before the viewer so it drops after it: a live viewer would
@@ -635,10 +635,108 @@ fn mouse_wheel_sequence(button: u8, repetitions: usize, column: usize, row: usiz
         .into_bytes()
 }
 
-fn spawn_streaming_provider() -> (String, mpsc::Receiver<()>, thread::JoinHandle<()>) {
+#[test]
+#[ignore = "explicit owned PTY gate for latest assistant tokens under continuous streaming"]
+fn live_tui_latest_tokens_do_not_accumulate_backlog() {
+    let runtime = tempfile::tempdir().expect("create isolated stream fixture");
+    let home = runtime.path().join("home");
+    let config = runtime.path().join("config");
+    fs::create_dir_all(config.join("borg")).unwrap();
+    fs::write(
+        config.join("borg/agent.toml"),
+        "[updates]\nauto_install = false\n",
+    )
+    .unwrap();
+    fs::write(
+        config.join("borg/editor.toml"),
+        r#"[presentation]
+response_streaming = "token"
+refresh_rate_fps = 165
+"#,
+    )
+    .unwrap();
+    let (endpoint, started, server, emitted) = spawn_streaming_provider(false);
+    let executable =
+        std::env::var("BORG_TUI_STRESS_EXE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_borg").into());
+    let mut terminal =
+        PtyChild::spawn(&executable, runtime.path(), &home, &config, &endpoint).unwrap();
+    terminal.wait_for_output(Duration::from_secs(10)).unwrap();
+    started.recv_timeout(Duration::from_secs(10)).unwrap();
+    terminal
+        .wait_for_screen_text("live-", Duration::from_secs(5))
+        .unwrap();
+    let mut ages = Vec::new();
+    let mut max_behind = 0;
+    let mut greatest_visible = 0;
+    let cpu_before = terminal.cpu_time().unwrap();
+    let sample_start = Instant::now();
+    while sample_start.elapsed() < Duration::from_secs(3) {
+        terminal.read_available(None).unwrap();
+        let visible = terminal
+            .screen
+            .text()
+            .split("live-")
+            .skip(1)
+            .filter_map(|tail| tail.get(..5)?.parse::<usize>().ok())
+            .max();
+        if let Some(visible) = visible {
+            greatest_visible = greatest_visible.max(visible);
+            let published = emitted.lock().unwrap();
+            if let Some(at) = published.get(visible) {
+                ages.push(at.elapsed());
+                max_behind = max_behind.max(published.len().saturating_sub(visible + 1));
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    let cpu_ratio = terminal
+        .cpu_time()
+        .unwrap()
+        .saturating_sub(cpu_before)
+        .as_secs_f64()
+        / sample_start.elapsed().as_secs_f64();
+    assert!(
+        greatest_visible >= 100,
+        "stream must visibly advance, not just paint its first token"
+    );
+    assert!(ages.len() >= 100, "need sustained paint samples");
+    ages.sort_unstable();
+    let p50 = percentile(&ages, 50);
+    let p95 = percentile(&ages, 95);
+    let max = *ages.last().unwrap();
+    eprintln!(
+        "live assistant-token profile: samples={} latest={} behind_max={} age_p50={p50:?} age_p95={p95:?} age_max={max:?} cpu={:.1}%",
+        ages.len(),
+        greatest_visible,
+        max_behind,
+        cpu_ratio * 100.0
+    );
+    assert!(
+        p95 <= INPUT_P95_SLO,
+        "latest-token p95 exceeded {INPUT_P95_SLO:?}: {p95:?}"
+    );
+    assert!(
+        max <= INPUT_MAX_SLO,
+        "latest-token maximum exceeded {INPUT_MAX_SLO:?}: {max:?}"
+    );
+    server.join().unwrap();
+}
+
+type EmissionTimes = Arc<std::sync::Mutex<Vec<Instant>>>;
+
+fn spawn_streaming_provider(
+    reasoning: bool,
+) -> (
+    String,
+    mpsc::Receiver<()>,
+    thread::JoinHandle<()>,
+    EmissionTimes,
+) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
     let address = listener.local_addr().expect("mock provider address");
     let (started_tx, started_rx) = mpsc::channel();
+    let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let emitted_by_server = Arc::clone(&emitted);
     let server = thread::spawn(move || {
         let (mut socket, _) = listener.accept().expect("accept provider request");
         read_http_request(&mut socket).expect("read provider request");
@@ -647,8 +745,16 @@ fn spawn_streaming_provider() -> (String, mpsc::Receiver<()>, thread::JoinHandle
         const DELTAS: usize = 5_000;
         let mut frames = Vec::with_capacity(DELTAS + 2);
         for index in 0..DELTAS {
+            let (field, text) = if reasoning {
+                ("reasoning_content", format!("live-{index} "))
+            } else {
+                ("content", format!("live-{index:05}\n"))
+            };
             frames.push(format!(
-                "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"live-{index} \"}},\"finish_reason\":null}}]}}\n\n"
+                "data: {}\n\n",
+                serde_json::json!({
+                    "choices": [{"delta": {field: text}, "finish_reason": null}]
+                })
             ));
         }
         frames.push(
@@ -663,14 +769,17 @@ fn spawn_streaming_provider() -> (String, mpsc::Receiver<()>, thread::JoinHandle
         )
         .expect("write provider response headers");
         socket.flush().expect("flush provider response headers");
-        for frame in frames {
+        for (index, frame) in frames.into_iter().enumerate() {
+            if index < DELTAS {
+                emitted_by_server.lock().unwrap().push(Instant::now());
+            }
             if socket.write_all(frame.as_bytes()).is_err() || socket.flush().is_err() {
                 return;
             }
             thread::sleep(Duration::from_millis(2));
         }
     });
-    (format!("http://{address}/v1"), started_rx, server)
+    (format!("http://{address}/v1"), started_rx, server, emitted)
 }
 
 fn read_http_request(socket: &mut std::net::TcpStream) -> io::Result<()> {
