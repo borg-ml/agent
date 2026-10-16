@@ -19,6 +19,9 @@ Git comparison.
 
 ### Build reliability
 
+- Restore release manifests and changelog on interruption instead of leaving
+  a half-applied version bump after a cancelled or resource-limited build.
+
 - Unblock queued lane work after recovery proves a quarantined job's workload
   is gone. Jobs with insufficient evidence remain quarantined rather than
   risking a second workload using the same resources.

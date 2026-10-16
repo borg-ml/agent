@@ -322,6 +322,11 @@ FAKE_CARGO
   echo '  fmt|clippy)'
   echo '    ;;'
   echo '  test)'
+  echo '    if [[ "${FAKE_CARGO_FAIL:-}" == signal ]]; then'
+  echo '      parent=$(ps -o ppid= -p "$PPID")'
+  echo '      kill -TERM "${parent//[[:space:]]/}"'
+  echo '      exit 143'
+  echo '    fi'
   echo '    [[ "${FAKE_CARGO_FAIL:-}" != "test" ]] || exit 42'
   echo '    if [[ -n "${REAL_PG_CTL:-}" && -n "${FAKE_PG_LOG:-}" ]]; then'
   echo '      psql "$BORG_TEST_SESSIONS_URL" -X -v ON_ERROR_STOP=1 -c "CREATE DATABASE release_smoke" -c "DROP DATABASE release_smoke" >/dev/null'
@@ -523,29 +528,31 @@ rollback_changelog="$(sha256sum "$rollback_fixture/CHANGELOG.md")"
 rollback_head="$(git -C "$rollback_fixture" rev-parse HEAD)"
 rollback_log="$test_root/rollback-fake-cargo.log"
 : >"$rollback_log"
-if (
-  cd "$rollback_fixture"
-  PATH="$fake_bin:$PATH" FAKE_CARGO_LOG="$rollback_log" FAKE_CARGO_FAIL=test \
-    BORG_TEST_SESSIONS_URL="$FIXTURE_SESSIONS_URL" \
-    BORG_SESSIONS_URL="postgres://must-not-use-production.invalid/journal" \
-    ./scripts/release.sh
-) >/dev/null 2>&1; then
-  fail "a failing release unexpectedly succeeded"
-fi
-assert_equal "$rollback_manifest" "$(sha256sum "$rollback_fixture/Cargo.toml")" \
-  "Cargo.toml rollback"
-assert_equal "$rollback_lock" "$(sha256sum "$rollback_fixture/Cargo.lock")" \
-  "Cargo.lock rollback"
-assert_equal "$rollback_changelog" "$(sha256sum "$rollback_fixture/CHANGELOG.md")" \
-  "CHANGELOG.md rollback"
-assert_equal "$rollback_head" "$(git -C "$rollback_fixture" rev-parse HEAD)" \
-  "failed release HEAD"
-[[ -z "$(git -C "$rollback_fixture" status --porcelain)" ]] ||
-  fail "failed release left a dirty fixture"
-if git -C "$rollback_fixture" rev-parse --verify 'refs/tags/v1.2.4^{commit}' \
-  >/dev/null 2>&1; then
-  fail "failed release created a tag"
-fi
+for failure in test signal; do
+  if (
+    cd "$rollback_fixture"
+    PATH="$fake_bin:$PATH" FAKE_CARGO_LOG="$rollback_log" FAKE_CARGO_FAIL="$failure" \
+      BORG_TEST_SESSIONS_URL="$FIXTURE_SESSIONS_URL" \
+      BORG_SESSIONS_URL="postgres://must-not-use-production.invalid/journal" \
+      ./scripts/release.sh
+  ) >/dev/null 2>&1; then
+    fail "a failing release unexpectedly succeeded"
+  fi
+  assert_equal "$rollback_manifest" "$(sha256sum "$rollback_fixture/Cargo.toml")" \
+    "Cargo.toml rollback"
+  assert_equal "$rollback_lock" "$(sha256sum "$rollback_fixture/Cargo.lock")" \
+    "Cargo.lock rollback"
+  assert_equal "$rollback_changelog" "$(sha256sum "$rollback_fixture/CHANGELOG.md")" \
+    "CHANGELOG.md rollback"
+  assert_equal "$rollback_head" "$(git -C "$rollback_fixture" rev-parse HEAD)" \
+    "failed release HEAD"
+  [[ -z "$(git -C "$rollback_fixture" status --porcelain)" ]] ||
+    fail "failed release left a dirty fixture"
+  if git -C "$rollback_fixture" rev-parse --verify 'refs/tags/v1.2.4^{commit}' \
+    >/dev/null 2>&1; then
+    fail "failed release created a tag"
+  fi
+done
 
 # Refuse low headroom before mutation, and stop compiler descendants when the
 # disk crosses the runtime reserve. Both paths must leave manifests intact.

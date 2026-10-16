@@ -500,6 +500,8 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+trap "exit 130" INT
+trap "exit 143" TERM
 
 replace_workspace_version "$current_version" "$target_version"
 python3 "$script_dir/release-notes.py" stamp "$current_version" "$target_version" CHANGELOG.md
