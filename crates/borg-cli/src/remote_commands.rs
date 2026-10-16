@@ -2607,6 +2607,7 @@ async fn run_local_agent_session(
              participants' work."
         ));
         vec![SpawnSubagent {
+            desktop: false,
             task_name: task_name.clone(),
             message: format!(
                 "{topic}\n\nYou are `{task_name}`, a peer participant in a mixed-provider \

@@ -75,6 +75,7 @@ pub(super) fn subagent_activity(
     SessionEventKind::SubagentActivity {
         activity: crate::SubagentActivityKind::Updated,
         agent: crate::SubagentSnapshot {
+            desktop: false,
             session_id: child_id,
             parent_session_id: parent_id,
             task_name: task.to_string(),

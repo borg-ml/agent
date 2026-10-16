@@ -205,6 +205,8 @@ pub struct SubagentSnapshot {
     pub fast: bool,
     #[serde(default)]
     pub ultrafast: bool,
+    #[serde(default)]
+    pub desktop: bool,
     pub cwd: PathBuf,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -263,6 +265,7 @@ pub struct SpawnSubagent {
     pub effort: Option<String>,
     pub fast: Option<bool>,
     pub ultrafast: Option<bool>,
+    pub desktop: bool,
 }
 
 #[derive(Clone)]
@@ -282,6 +285,7 @@ struct BluWorkflowToolContext {
 #[derive(Clone)]
 pub struct AgentToolDispatcher {
     watches: Option<crate::watch::Watches>,
+    desktop_granted: bool,
     watcher_yield_enabled: bool,
     goals: SessionGoalTools,
     todos: SessionTodoTools,
@@ -961,6 +965,7 @@ impl AgentToolDispatcher {
             });
         Self {
             watches: None,
+            desktop_granted: false,
             watcher_yield_enabled: false,
             journal,
             goals,
@@ -1043,6 +1048,11 @@ impl AgentToolDispatcher {
 
     pub(crate) fn with_watches(mut self, watches: crate::watch::Watches) -> Self {
         self.watches = Some(watches);
+        self
+    }
+
+    pub(crate) fn with_desktop(mut self, granted: bool) -> Self {
+        self.desktop_granted = granted;
         self
     }
 
@@ -1754,7 +1764,7 @@ impl AgentToolDispatcher {
             self.shared_work.is_some(),
             self.team_policy.as_ref(),
             director,
-            director,
+            director || self.desktop_granted,
             self.watcher_yield_enabled,
         );
         if self.web_search.is_some() {
@@ -2880,7 +2890,7 @@ impl AgentToolDispatcher {
                         || workflow_approved,
                     "computer use requires Full Access or explicit approval, including observation"
                 );
-                if !self.is_director() {
+                if !self.is_director() && !self.desktop_granted {
                     crate::computer_use::ensure_private_display_only(&arguments)?;
                 }
                 let cancel = workflow_cancel.unwrap_or_default();
@@ -4088,6 +4098,7 @@ impl SubagentTable {
             effort: launch.effort.clone(),
             fast: launch.fast.unwrap_or(false),
             ultrafast: launch.ultrafast.unwrap_or(false),
+            desktop: launch.capabilities.desktop,
             cwd: launch.cwd.clone(),
             created_at: now,
             updated_at: now,
@@ -5261,9 +5272,14 @@ impl SubagentCoordinator {
         parent_session_id: Uuid,
         request: &SpawnSubagent,
     ) -> Result<LaunchSession> {
+        ensure!(
+            !request.desktop || self.is_director(parent_session_id),
+            "only the director may grant desktop access"
+        );
         let message = required_message(&request.message)?;
         let mut launch = self.root_launch.clone();
         launch.capabilities.model_fallback.clear();
+        launch.capabilities.desktop = request.desktop;
         if parent_session_id != self.root_session_id {
             let parent = self
                 .get(parent_session_id)
@@ -5528,6 +5544,7 @@ impl SubagentCoordinator {
                 launch.effort = snapshot.effort.clone();
                 launch.fast = Some(snapshot.fast);
                 launch.ultrafast = Some(snapshot.ultrafast);
+                launch.capabilities.desktop = snapshot.desktop;
                 launch.cwd = snapshot.cwd.clone();
                 launch.name = Some(snapshot.task_name.clone());
                 {
@@ -6175,6 +6192,7 @@ impl SubagentCoordinator {
                 launch.effort = snapshot.effort.clone();
                 launch.fast = Some(snapshot.fast);
                 launch.ultrafast = Some(snapshot.ultrafast);
+                launch.capabilities.desktop = snapshot.desktop;
                 launch.cwd = snapshot.cwd.clone();
                 launch.name = Some(snapshot.task_name.clone());
                 if let Err(error) = self.start_reserved(snapshot.clone(), launch, false).await {
@@ -6465,6 +6483,7 @@ impl SubagentCoordinator {
                 effort: self.root_launch.effort.clone(),
                 fast: self.root_launch.fast.unwrap_or(false),
                 ultrafast: self.root_launch.ultrafast.unwrap_or(false),
+                desktop: self.root_launch.capabilities.desktop,
                 cwd: self.root_launch.cwd.clone(),
                 created_at: now,
                 updated_at: now,
@@ -7983,6 +8002,7 @@ impl SubagentCoordinator {
                     effort: route.effort.clone(),
                     fast: Some(false),
                     ultrafast: Some(false),
+                    desktop: false,
                 };
                 let mut launch = self.subagent_launch(actor_session_id, &request).await?;
                 launch.capabilities.model_fallback = routes.clone();
@@ -8006,6 +8026,7 @@ impl SubagentCoordinator {
                         effort: args.reasoning_effort,
                         fast: args.fast,
                         ultrafast: args.ultrafast,
+                        desktop: args.desktop,
                     },
                     args.fresh,
                     args.cwd,
@@ -8816,6 +8837,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
                     "reasoning_effort": { "type": "string" },
                     "fast": { "type": "boolean", "description": "Select fast mode for this child. Omit speed fields to inherit the live parent's tier on the same provider; explicit false selects standard mode. Only supported models/accounts can enable it." },
                     "ultrafast": { "type": "boolean", "description": "Select the Codex/OpenAI premium tier when supported. Mutually exclusive with fast; explicit speed settings override inheritance." },
+                    "desktop": {"type":"boolean", "default":false, "description":"Director-only opt-in granting this child access to the user desktop through computer_use. Default false confines it to a private display. Never inherited by grandchildren; non-directors cannot grant it. Full Access/approval and human confirmation for consequential actions still apply."},
                     "cwd": {"type":"string", "description":"Explicit existing worktree/default tool directory for a NEW child. Relative to the author workspace. Never takes over or rewrites existing sessions. Exec/runtime/read/search/LSP start here; later explicit shell cd or path overrides remain deliberate. Outside-workspace assignment requires Full Access."},
                     "fresh": {
                         "type": "boolean",
@@ -9125,7 +9147,7 @@ pub struct ToolSurface {
     pub human_prompt: bool,
     /// The user's desktop seat through computer_use (desktop windows and
     /// screenshots, input that reaches the user's focus). A child's
-    /// computer_use is confined to its own private display instead.
+    /// computer_use is confined to its own private display unless explicitly granted.
     pub desktop: bool,
     /// Parent steering and watcher lifecycle. A child managing the parent
     /// watcher set or yield on its behalf is a deadlock.
@@ -10745,6 +10767,8 @@ struct SpawnAgentArgs {
     reasoning_effort: Option<String>,
     fast: Option<bool>,
     ultrafast: Option<bool>,
+    #[serde(default)]
+    desktop: bool,
     #[serde(default)]
     fresh: bool,
     cwd: Option<PathBuf>,

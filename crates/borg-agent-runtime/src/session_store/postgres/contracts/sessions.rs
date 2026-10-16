@@ -641,6 +641,7 @@ fn persistence_and_fork_rules_are_typed_rust_contracts() {
     // the parent replays something from it. See is_parent_replayable.
     let child_id = Uuid::new_v4();
     let snapshot = || crate::SubagentSnapshot {
+        desktop: false,
         session_id: child_id,
         parent_session_id: Uuid::new_v4(),
         task_name: "worker".to_string(),

@@ -414,6 +414,7 @@ mod tests {
                 SessionEventKind::SubagentActivity {
                     activity: crate::SubagentActivityKind::Started,
                     agent: crate::SubagentSnapshot {
+                        desktop: false,
                         session_id: id,
                         parent_session_id: parent,
                         task_name: task.to_string(),
@@ -501,6 +502,7 @@ mod tests {
         let child_id = Uuid::new_v4();
         let before = Utc::now() - chrono::Duration::minutes(1);
         let mut agent = crate::SubagentSnapshot {
+            desktop: false,
             session_id: child_id,
             parent_session_id: parent,
             task_name: "/root/worker".to_string(),

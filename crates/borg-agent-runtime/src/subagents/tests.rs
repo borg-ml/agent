@@ -2172,6 +2172,7 @@ async fn a_child_without_a_lane_inherits_the_parent_live_lane() {
         .subagent_launch(
             coordinator.root_session_id,
             &SpawnSubagent {
+                desktop: false,
                 task_name: "defaulted".to_string(),
                 message: "Complete the bounded task.".to_string(),
                 provider: None,
@@ -2204,6 +2205,7 @@ async fn a_child_without_a_lane_inherits_the_parent_live_lane() {
         .subagent_launch(
             coordinator.root_session_id,
             &SpawnSubagent {
+                desktop: false,
                 task_name: "named_provider".to_string(),
                 message: "Complete the bounded task.".to_string(),
                 provider: Some(CodingProvider::OpenCode),
@@ -2521,6 +2523,7 @@ async fn subagent_speed_overrides_live_inheritance_without_reusing_workers() {
         .subagent_launch(
             coordinator.root_session_id,
             &SpawnSubagent {
+                desktop: false,
                 task_name: "cross_provider".into(),
                 message: "Complete this task.".into(),
                 provider: Some(CodingProvider::Claude),
@@ -2769,6 +2772,7 @@ async fn director_configures_live_child_speed_and_reuses_its_new_lane_after_wake
     .unwrap();
     let child = coordinator
         .spawn(SpawnSubagent {
+            desktop: false,
             task_name: "worker".into(),
             message: "Remember this original prompt.".into(),
             provider: Some(CodingProvider::Claude),
@@ -5507,6 +5511,7 @@ async fn durable_parent_activity_restores_child_topology() {
     let child_id = Uuid::new_v4();
     let now = Utc::now();
     let mut snapshot = SubagentSnapshot {
+        desktop: false,
         session_id: child_id,
         parent_session_id: root,
         task_name: "/root/review_api".into(),
@@ -5765,6 +5770,7 @@ async fn a_new_assignment_does_not_take_over_a_child_with_missing_membership() {
         .assign_task_in_directory_as(
             root,
             SpawnSubagent {
+                desktop: false,
                 task_name: "materials".to_string(),
                 message: "describe the material set".to_string(),
                 provider: None,
@@ -5913,6 +5919,7 @@ async fn a_child_restored_after_a_host_crash_is_still_addressable_in_the_team_wo
         SessionEventKind::SubagentActivity {
             activity: SubagentActivityKind::Started,
             agent: SubagentSnapshot {
+                desktop: false,
                 session_id: child_id,
                 parent_session_id: root,
                 task_name: "/root/worker".into(),
@@ -5998,6 +6005,7 @@ async fn restore_mirrors_a_child_stop_journaled_before_the_parent_crashed() {
         SessionEventKind::SubagentActivity {
             activity: SubagentActivityKind::Updated,
             agent: SubagentSnapshot {
+                desktop: false,
                 session_id: child_id,
                 parent_session_id: root,
                 task_name: "/root/review_api".into(),
@@ -6090,6 +6098,7 @@ async fn restored_live_child_stays_dormant_and_parks_with_its_root() {
     let child_id = Uuid::new_v4();
     let now = Utc::now();
     let snapshot = SubagentSnapshot {
+        desktop: false,
         session_id: child_id,
         parent_session_id: root,
         task_name: "/root/review_api".into(),
@@ -6304,6 +6313,7 @@ async fn restore_wakes_a_child_cut_off_mid_turn_but_never_a_stopped_one() {
         let child_id = Uuid::new_v4();
         let now = Utc::now();
         let snapshot = SubagentSnapshot {
+            desktop: false,
             session_id: child_id,
             parent_session_id: root,
             task_name: name.into(),
@@ -6675,6 +6685,99 @@ async fn a_sub_agent_computer_use_is_confined_to_a_private_display() {
         .persistent_runtimes
         .stop_session(child.actor_session_id)
         .await;
+
+    // Failure mode: dropping a persisted grant on resume, or silently handing
+    // it to grandchildren. These authorization boundaries need runtime tests;
+    // type checking cannot distinguish an authorized caller from a worker.
+    let mut request: SpawnAgentArgs = serde_json::from_value(json!({
+        "task_name": "desktop_worker", "message": "Inspect the desktop"
+    }))
+    .unwrap();
+    assert!(!request.desktop);
+    request.desktop = true;
+    let mut spawn = SpawnSubagent {
+        task_name: request.task_name,
+        message: request.message,
+        provider: None,
+        model: None,
+        effort: None,
+        fast: None,
+        ultrafast: None,
+        desktop: request.desktop,
+    };
+    let granted_launch = coordinator.subagent_launch(root, &spawn).await.unwrap();
+    let snapshot = coordinator
+        .table
+        .lock()
+        .await
+        .reserve_as(root, &spawn.task_name, &granted_launch)
+        .unwrap();
+    let restored: SubagentSnapshot =
+        serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
+    assert!(restored.desktop);
+    let mut legacy = serde_json::to_value(&snapshot).unwrap();
+    legacy.as_object_mut().unwrap().remove("desktop");
+    assert!(
+        !serde_json::from_value::<SubagentSnapshot>(legacy)
+            .unwrap()
+            .desktop
+    );
+    let restored_launch: LaunchSession =
+        serde_json::from_value(serde_json::to_value(&granted_launch).unwrap()).unwrap();
+    assert!(restored_launch.capabilities.desktop);
+    let granted =
+        dispatcher_for(snapshot.session_id).with_desktop(restored_launch.capabilities.desktop);
+    let mut unapproved = granted.clone();
+    unapproved.runtime_permission = PermissionMode::Manual;
+    assert!(
+        unapproved
+            .call("computer_use", json!({"op": "capabilities"}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("requires Full Access or explicit approval")
+    );
+    assert_eq!(display_enum(&granted), json!(["desktop", "private"]));
+    assert!(
+        granted
+            .specs()
+            .into_iter()
+            .find(|spec| spec["name"] == "computer_use")
+            .unwrap()["inputSchema"]["properties"]
+            .get("restore_focus")
+            .is_some()
+    );
+    if let Err(error) = granted
+        .call(
+            "computer_use",
+            json!({"op":"screenshot", "scope":"desktop"}),
+        )
+        .await
+    {
+        assert!(!error.to_string().contains(REFUSAL), "{error}");
+    }
+    granted
+        .persistent_runtimes
+        .stop_session(granted.actor_session_id)
+        .await;
+    let error = coordinator
+        .subagent_launch(snapshot.session_id, &spawn)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("only the director may grant desktop access")
+    );
+    spawn.desktop = false;
+    assert!(
+        !coordinator
+            .subagent_launch(snapshot.session_id, &spawn)
+            .await
+            .unwrap()
+            .capabilities
+            .desktop
+    );
 
     let director = dispatcher_for(root);
     assert_eq!(display_enum(&director), json!(["desktop", "private"]));

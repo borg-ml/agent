@@ -55,6 +55,7 @@ async fn mirrored_child_provider_audit_events_are_live_only() {
     let (scratch, store) = support::store().await;
     let child_id = Uuid::new_v4();
     let snapshot = || crate::SubagentSnapshot {
+        desktop: false,
         session_id: child_id,
         parent_session_id: Uuid::new_v4(),
         task_name: "worker".to_string(),
@@ -341,6 +342,7 @@ async fn dropping_live_only_child_rows_does_not_change_the_reconstructed_roster(
     let parent_id = started(&store).await;
     let child_id = Uuid::new_v4();
     let snapshot = |detail: &str, total_tokens: u64| crate::SubagentSnapshot {
+        desktop: false,
         session_id: child_id,
         parent_session_id: parent_id,
         task_name: "worker".to_string(),

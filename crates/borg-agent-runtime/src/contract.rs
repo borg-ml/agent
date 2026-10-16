@@ -1041,6 +1041,9 @@ pub struct ModelRoute {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct SessionCapabilities {
+    /// Explicit director grant for a child to use the user desktop. Not inherited.
+    #[serde(default)]
+    pub desktop: bool,
     /// Restricted roles (for example scouts) cannot acquire team authority.
     #[serde(default = "default_true")]
     pub director_eligible: bool,
@@ -1122,6 +1125,7 @@ pub struct SessionCapabilities {
 impl Default for SessionCapabilities {
     fn default() -> Self {
         Self {
+            desktop: false,
             director_eligible: true,
             multiplayer: true,
             subagents: true,

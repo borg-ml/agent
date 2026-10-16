@@ -8028,6 +8028,7 @@ async fn crash_reconciled_child_stop_is_durable_before_resumed_ready() {
         SessionEventKind::SubagentActivity {
             activity: SubagentActivityKind::Updated,
             agent: crate::SubagentSnapshot {
+                desktop: false,
                 session_id: child_id,
                 parent_session_id: session_id,
                 task_name: "/root/worker".to_string(),
@@ -8230,6 +8231,7 @@ async fn initial_mixed_provider_peer_starts_with_isolated_provider_configuration
             actor_store,
             writer,
             vec![crate::SpawnSubagent {
+                desktop: false,
                 task_name: "peer_claude".to_string(),
                 message: "peer topic".to_string(),
                 provider: Some(CodingProvider::Claude),
@@ -14597,6 +14599,7 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
         SessionEventKind::SubagentActivity {
             activity: SubagentActivityKind::Stopped,
             agent: crate::SubagentSnapshot {
+                desktop: false,
                 session_id: child_id,
                 parent_session_id: session_id,
                 task_name: "/root/historical_agent".to_string(),
@@ -15286,6 +15289,7 @@ async fn team_steer_admits_a_distinct_prompt_for_each_active_child() {
         children.push(
             coordinator
                 .spawn(crate::SpawnSubagent {
+                    desktop: false,
                     task_name: name.to_string(),
                     message: "hold this task".to_string(),
                     provider: None,
@@ -15382,6 +15386,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
     )
     .unwrap();
     let snapshot = crate::SubagentSnapshot {
+        desktop: false,
         session_id: child_id,
         parent_session_id: parent_id,
         task_name: "/root/worker".to_string(),
@@ -20372,6 +20377,7 @@ async fn forwarded_nested_child_activity_preserves_lifecycle_and_parent_boundary
 
 fn watched_child(session_id: Uuid) -> crate::SubagentSnapshot {
     crate::SubagentSnapshot {
+        desktop: false,
         session_id,
         parent_session_id: Uuid::new_v4(),
         task_name: "/root/worker".to_string(),

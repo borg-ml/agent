@@ -157,6 +157,7 @@ fn parent_has_one_child_summary_and_source_scoped_approval_without_child_bodies(
     let mut reducer = ViewReducer::new(parent, "epoch".into());
     let now = chrono::Utc::now();
     let agent = SubagentSnapshot {
+        desktop: false,
         session_id: child,
         parent_session_id: parent,
         task_name: "worker".into(),

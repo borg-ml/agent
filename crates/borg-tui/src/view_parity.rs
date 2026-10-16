@@ -116,6 +116,7 @@ fn child_metadata_refs_lift_pending_approval_in_terminal_and_host_without_nested
     let child = Uuid::new_v4();
     let now = Utc::now();
     let snapshot = SubagentSnapshot {
+        desktop: false,
         session_id: child,
         parent_session_id: parent,
         task_name: "worker".into(),

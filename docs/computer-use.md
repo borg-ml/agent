@@ -143,10 +143,14 @@ loss, including descendants left behind when a launcher shell exits.
   the layout go through a temporary keymap). Apps can lock or confine the
   pointer (`zwp_pointer_constraints_v1`); `pointer_move` dx/dy then arrive as
   exact relative motion while the pointer stays put.
-- Sub-agents may use only a private display: desktop windows, desktop
-  screenshots and seat input are refused for them. Each child gets its own
-  display; `attach_display {display_id}` shares a parent's instead, and
-  detaching kills only the child's apps.
+- Sub-agents default to private-display-only access. The director can explicitly
+  grant a child the user's desktop with `spawn_agent {desktop: true, ...}`.
+  The grant persists across resume and exposes the full `computer_use` schema;
+  Full Access or approval and human confirmation (`confirmed: true`) for each
+  consequential action still apply. Only the director may grant this permission:
+  workers cannot grant it to grandchildren, and it is never inherited.
+  Each child still gets its own private display; `attach_display {display_id}`
+  shares a parent's instead, and detaching kills only the child's apps.
 - Without `borg-display` (for example an older install), the private display is
   reported unavailable with how to get it: update or reinstall Borg, or set
   `BORG_DISPLAY_BIN`.

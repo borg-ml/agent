@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.16.8)
 
+- Let the director opt a child into user-desktop `computer_use` access with
+  `spawn_agent {desktop: true, ...}`. Children remain private-display-only by
+  default; grants persist across resume, are not inherited, and do not bypass
+  approval or consequential-action confirmation.
+
 ## 0.16.8 (2026-10-16)
 
 ### Actions

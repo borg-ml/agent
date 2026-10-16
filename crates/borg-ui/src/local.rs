@@ -1274,6 +1274,7 @@ mod tests {
             SessionEventKind::SubagentActivity {
                 activity: SubagentActivityKind::Updated,
                 agent: SubagentSnapshot {
+                    desktop: false,
                     session_id: child,
                     parent_session_id: root,
                     task_name: "worker".into(),

@@ -1552,6 +1552,7 @@ fn initial_subagent_state_uses_only_the_loaded_root_tail() {
     let child = Uuid::new_v4();
     let now = Utc::now();
     let snapshot = SubagentSnapshot {
+        desktop: false,
         session_id: child,
         parent_session_id: root,
         task_name: "/root/worker".to_string(),
@@ -1596,6 +1597,7 @@ fn resumed_roster_never_claims_an_unowned_child_is_running() {
     let child = Uuid::new_v4();
     let now = Utc::now();
     let mut snapshot = SubagentSnapshot {
+        desktop: false,
         session_id: child,
         parent_session_id: root,
         task_name: "/root/worker".to_string(),
@@ -1657,6 +1659,7 @@ async fn resumed_roster_prefers_the_child_terminal_ledger_over_a_stale_parent_mi
         .await
         .unwrap();
     let mut snapshots = vec![SubagentSnapshot {
+        desktop: false,
         session_id: child,
         parent_session_id: root,
         task_name: "/root/worker".to_string(),
@@ -1894,6 +1897,7 @@ fn team_history_restores_every_agent_and_child_approval() {
     let child = Uuid::new_v4();
     let now = Utc::now();
     let mut agent = SubagentSnapshot {
+        desktop: false,
         session_id: child,
         parent_session_id: root,
         task_name: "/root/worker".to_string(),
@@ -3967,6 +3971,7 @@ async fn owner_upgrade_waits_for_child_work_and_background_processes() {
     store.create_session(root).await.unwrap();
     store.create_session(child).await.unwrap();
     let snapshot = SubagentSnapshot {
+        desktop: false,
         session_id: child,
         parent_session_id: root,
         task_name: "/root/worker".into(),

@@ -2849,6 +2849,7 @@ async fn run_agent_session_store_kernel_inner(
     )
     .with_resource_limits(launch.capabilities.resource_limits.clone())
     .with_watches(watches.clone())
+    .with_desktop(launch.capabilities.desktop)
     .with_watcher_yield(launch.capabilities.watcher_yield);
     if let Some(extension_api) = executor.extension_api_snapshot() {
         dispatcher.configure_extension_api(extension_api)?;

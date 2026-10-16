@@ -332,6 +332,7 @@ fn older_root_history_hides_agent_cards_and_preserves_authoritative_roster_state
     let child = Uuid::new_v4();
     let now = Utc::now();
     let stale_running = SubagentSnapshot {
+        desktop: false,
         session_id: child,
         parent_session_id: root,
         task_name: "/root/worker".to_string(),
@@ -395,6 +396,7 @@ fn resumed_history_with_roster_hides_child_reports_and_keeps_peers_in_order() {
     let peer = Uuid::new_v4();
     let now = Utc::now();
     let child_snapshot = SubagentSnapshot {
+        desktop: false,
         session_id: child,
         parent_session_id: root,
         task_name: "/root/worker".to_string(),
@@ -478,6 +480,7 @@ fn resumed_history_with_roster_hides_child_reports_and_keeps_peers_in_order() {
 #[test]
 fn bootstrap_subagent_recovery_updates_do_not_become_root_cards() {
     let agent = SubagentSnapshot {
+        desktop: false,
         session_id: Uuid::new_v4(),
         parent_session_id: Uuid::new_v4(),
         task_name: "/root/recovered_worker".to_string(),
@@ -5466,6 +5469,7 @@ fn large_resume_ingest_and_transcript_scroll_profile() {
     for report in 0..CHILD_REPORTS {
         let child_id = child_ids[report % CHILD_COUNT];
         let agent = SubagentSnapshot {
+            desktop: false,
             session_id: child_id,
             parent_session_id: session_id,
             task_name: format!("/root/profile_worker_{}", report % CHILD_COUNT),
@@ -5630,6 +5634,7 @@ fn projection_only_events_keep_the_transcript_layout_cache() {
 
     let child_id = Uuid::new_v4();
     let agent = SubagentSnapshot {
+        desktop: false,
         session_id: child_id,
         parent_session_id: Uuid::new_v4(),
         task_name: "/root/inspect_ui".to_string(),
@@ -8510,6 +8515,7 @@ fn subagent_selector_shows_cumulative_usage_without_a_redundant_unit_suffix() {
 fn subagent_roster_shows_full_model_ids() {
     let now = Utc::now();
     let mut peer = SubagentSnapshot {
+        desktop: false,
         session_id: Uuid::new_v4(),
         parent_session_id: Uuid::new_v4(),
         task_name: "/root/claude".to_string(),
@@ -8651,6 +8657,7 @@ fn director_roster_preserves_historical_cost_basis_across_model_switches() {
 fn persistent_peers_follow_ordinary_agent_visibility() {
     let now = chrono::Utc::now();
     let mut peer = SubagentSnapshot {
+        desktop: false,
         session_id: Uuid::new_v4(),
         parent_session_id: Uuid::new_v4(),
         task_name: "/root/claude".to_string(),
@@ -8713,6 +8720,7 @@ fn agent_roster_lists_running_children_then_all_inactive_states() {
     let parent_id = Uuid::new_v4();
     let now = chrono::Utc::now();
     let snapshot = |name: &str, status, age_minutes| SubagentSnapshot {
+        desktop: false,
         session_id: Uuid::new_v4(),
         parent_session_id: parent_id,
         task_name: format!("/root/{name}"),
@@ -8896,6 +8904,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
     let child_id = Uuid::new_v4();
     let now = chrono::Utc::now();
     let mut agent = SubagentSnapshot {
+        desktop: false,
         session_id: child_id,
         parent_session_id: parent_id,
         task_name: "inspect_ui".to_string(),
@@ -9078,6 +9087,7 @@ fn subagent_activity_keeps_one_summary_without_embedded_child_bodies() {
     let child_id = Uuid::new_v4();
     let now = chrono::Utc::now();
     let agent = SubagentSnapshot {
+        desktop: false,
         session_id: child_id,
         parent_session_id: parent_id,
         task_name: "inspect_ui".to_string(),
@@ -9216,6 +9226,7 @@ fn ready_subagent_status_is_a_single_body_free_summary() {
     let child_id = Uuid::new_v4();
     let now = Utc::now();
     let mut agent = SubagentSnapshot {
+        desktop: false,
         session_id: child_id,
         parent_session_id: parent_id,
         task_name: "/root/peer".to_string(),
@@ -9300,6 +9311,7 @@ fn ready_subagent_with_provider_isolation_is_shown_as_a_failed_turn() {
     let detail = "Borg blocked a provider-native delegation attempt. The turn was not retried because doing so could repeat work.";
     let now = Utc::now();
     let agent = SubagentSnapshot {
+        desktop: false,
         session_id: child_id,
         parent_session_id: parent_id,
         task_name: "/root/audit".to_string(),
@@ -18959,6 +18971,7 @@ fn subagent_actions_render_names_without_changing_routing_targets() {
     let child_id = Uuid::new_v4();
     let now = Utc::now();
     let agent = SubagentSnapshot {
+        desktop: false,
         session_id: child_id,
         parent_session_id: parent_id,
         task_name: "/root/inspect_ui".to_string(),
@@ -20921,6 +20934,7 @@ fn message_cards_resolve_team_threads_after_replay() {
     let child = Uuid::new_v4();
     let now = Utc::now();
     let agent = SubagentSnapshot {
+        desktop: false,
         session_id: child,
         parent_session_id: director,
         task_name: "/root/worker".into(),
@@ -21017,6 +21031,7 @@ async fn focused_child_configuration_keeps_pickers_and_status_synced() {
     ));
     let now = Utc::now();
     let mut child = SubagentSnapshot {
+        desktop: false,
         session_id: Uuid::new_v4(),
         parent_session_id: root,
         task_name: "/root/scout".into(),
@@ -21350,6 +21365,7 @@ async fn deferred_child_history_loads_on_focus_pages_back_and_keeps_live_events(
     .unwrap();
     let now = Utc::now();
     let child = SubagentSnapshot {
+        desktop: false,
         session_id: Uuid::new_v4(),
         parent_session_id: root,
         task_name: "/root/scout".into(),
@@ -21777,6 +21793,7 @@ async fn promote_focused_agent_rebinds_default_without_replacing_the_host() {
     .unwrap();
     let now = Utc::now();
     let agent = SubagentSnapshot {
+        desktop: false,
         session_id: child,
         parent_session_id: root,
         task_name: "/root/worker".into(),
