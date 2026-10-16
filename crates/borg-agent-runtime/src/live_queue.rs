@@ -37,7 +37,16 @@ pub(crate) fn snapshot_key(kind: &SessionEventKind) -> Option<SnapshotKey> {
 }
 
 /// Fold `next` into `previous`; both must have the same [`snapshot_key`].
-pub(crate) fn merge_snapshot(previous: &mut SessionEventKind, next: SessionEventKind) {
+pub(crate) fn merge_snapshot(previous: &mut SessionEventKind, mut next: SessionEventKind) {
+    if let (
+        SessionEventKind::Message { text: previous, .. },
+        SessionEventKind::Message { text: next, .. },
+    ) = (&*previous, &mut next)
+        && previous.len() > next.len()
+        && previous.starts_with(next.as_str())
+    {
+        next.clone_from(previous);
+    }
     match (previous, next) {
         (
             SessionEventKind::ReasoningDelta { text: previous },
@@ -96,6 +105,69 @@ fn merge_event(pending: &mut SessionEvent, next: SessionEvent) {
     }
 }
 
+fn append_adjacent_delta(previous: &mut SessionEventKind, next: &SessionEventKind) -> bool {
+    match (previous, next) {
+        (
+            SessionEventKind::MessageDelta { message_id, delta },
+            SessionEventKind::MessageDelta {
+                message_id: next_id,
+                delta: next,
+            },
+        ) if message_id == next_id => {
+            delta.push_str(next);
+        }
+        (
+            SessionEventKind::Message {
+                message_id,
+                status: MessageStatus::InProgress,
+                text,
+                ..
+            },
+            SessionEventKind::MessageDelta {
+                message_id: next_id,
+                delta,
+            },
+        ) if message_id == next_id => {
+            text.push_str(delta);
+        }
+        (
+            SessionEventKind::ReasoningTextDelta { delta },
+            SessionEventKind::ReasoningTextDelta { delta: next },
+        ) => {
+            delta.push_str(next);
+        }
+        (
+            SessionEventKind::ReasoningDelta { text },
+            SessionEventKind::ReasoningTextDelta { delta },
+        ) => {
+            text.push_str(delta);
+        }
+        (
+            SessionEventKind::SubagentActivity {
+                activity,
+                agent,
+                event: Some(previous),
+            },
+            SessionEventKind::SubagentActivity {
+                activity: next_activity,
+                agent: next_agent,
+                event: Some(next),
+            },
+        ) if agent.session_id == next_agent.session_id
+            && previous.sequence == 0
+            && next.sequence == 0 =>
+        {
+            if !append_adjacent_delta(&mut previous.kind, &next.kind) {
+                return false;
+            }
+            *activity = *next_activity;
+            agent.clone_from(next_agent);
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// Ordered queue of live session events that keeps only the newest state of
 /// each pending snapshot.
 #[derive(Debug, Default)]
@@ -111,6 +183,22 @@ impl LiveEventQueue {
     /// Append an event, merging it into a queued snapshot of the same state
     /// when no ordered event of its stream has been queued since.
     pub fn push_back(&mut self, event: SessionEvent) {
+        let merged = self.events.back_mut().and_then(|previous| {
+            (previous.sequence == 0
+                && event.sequence == 0
+                && previous.session_id == event.session_id
+                && append_adjacent_delta(&mut previous.kind, &event.kind))
+            .then(|| live_key(previous))
+        });
+        if let Some((stream, key)) = merged {
+            self.pending
+                .retain(|(pending_stream, _), _| *pending_stream != stream);
+            if let Some(key) = key {
+                self.pending
+                    .insert((stream, key), self.front + self.events.len() as u64 - 1);
+            }
+            return;
+        }
         let (stream, key) = live_key(&event);
         let Some(key) = key else {
             self.pending
@@ -152,12 +240,26 @@ impl LiveEventQueue {
         Some(event)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &SessionEvent> {
+        self.events.iter()
+    }
+
     pub fn len(&self) -> usize {
         self.events.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
+    }
+}
+
+impl FromIterator<SessionEvent> for LiveEventQueue {
+    fn from_iter<T: IntoIterator<Item = SessionEvent>>(events: T) -> Self {
+        let mut queue = Self::default();
+        for event in events {
+            queue.push_back(event);
+        }
+        queue
     }
 }
 

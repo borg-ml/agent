@@ -18693,6 +18693,98 @@ fn paragraph_streaming_holds_the_unfinished_block_across_snapshots() {
 }
 
 #[test]
+fn reply_start_anchor_preserves_commentary_before_preparing_tool() {
+    let session = Uuid::new_v4();
+    let message = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    let reply = |text: &str, status| {
+        SessionEvent::new(
+            session,
+            1,
+            SessionEventKind::Message {
+                message_id: message,
+                actor: EventActor::Assistant,
+                text: text.into(),
+                attachments: Vec::new(),
+                status,
+                delivery: None,
+            },
+        )
+    };
+    transcript.apply(&reply("", MessageStatus::InProgress));
+    assert!(
+        !transcript
+            .lines(100)
+            .iter()
+            .any(|line| line.to_string().contains("borg"))
+    );
+    transcript.apply(&SessionEvent::new(
+        session,
+        0,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Claude,
+            kind: "action/preparing".into(),
+            payload: serde_json::json!({"label":"stop stuck build","tool_call_id":"stop-build"}),
+        },
+    ));
+    transcript.apply(&reply("Stopping the stuck build.", MessageStatus::Complete));
+    transcript.apply(&SessionEvent::new(session, 2, SessionEventKind::ToolStarted {
+        tool_call_id: "stop-build".into(), name: "exec".into(),
+        input: serde_json::json!({"action":"stop stuck build","cmd":"systemctl --user stop build.scope"}),
+        input_ref: None, parent_tool_call_id: None,
+    }));
+    let rendered = transcript
+        .lines(120)
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.find("Stopping the stuck build.").unwrap() < rendered.find("systemctl").unwrap(),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn late_empty_reply_anchor_never_erases_visible_tokens() {
+    let session = Uuid::new_v4();
+    let message = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session,
+        0,
+        SessionEventKind::MessageDelta {
+            message_id: message,
+            delta: "This reply must stay visible".into(),
+        },
+    ));
+    for text in ["", "\n\n"] {
+        transcript.apply(&SessionEvent::new(
+            session,
+            1,
+            SessionEventKind::Message {
+                message_id: message,
+                actor: EventActor::Assistant,
+                text: text.into(),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: None,
+            },
+        ));
+        let rendered = transcript
+            .lines(100)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("This reply must stay visible"),
+            "{rendered}"
+        );
+    }
+}
+
+#[test]
 fn live_message_preview_reconciles_snapshots_and_stops_at_completion() {
     let session_id = Uuid::new_v4();
     let prompt_id = Uuid::new_v4();
@@ -18749,6 +18841,7 @@ fn live_message_preview_reconciles_snapshots_and_stops_at_completion() {
     transcript.apply(&preview("!"));
     transcript.apply(&snapshot("Hello.", MessageStatus::Complete));
     transcript.apply(&preview("?"));
+    transcript.apply(&snapshot("Hello", MessageStatus::InProgress));
     assert_eq!(message_text(&transcript), "Hello.");
     assert_eq!(transcript.order.len(), 1);
 
@@ -19819,12 +19912,28 @@ fn copied_image_message_round_trips_text_and_ordered_images_into_another_session
             .unwrap();
     }
     let store = AttachmentStore::for_session(temp.path(), Uuid::new_v4()).unwrap();
-    for caption in ["Inspect these pictures\n\nKeep this paragraph.", ""] {
+    for (caption, expected) in [
+        (
+            "Inspect these pictures\n\nKeep this paragraph.",
+            "Inspect these pictures\n\nKeep this paragraph.",
+        ),
+        (
+            "[Image 37] Inspect these pictures\n\nKeep this paragraph. [Image 38]",
+            "Inspect these pictures\n\nKeep this paragraph.",
+        ),
+        ("Literal [Image 99] stays", "Literal [Image 99] stays"),
+        ("", ""),
+    ] {
         let mut transcript = Transcript::default();
         transcript.order.push(TranscriptEntry::Message {
             actor: EventActor::Assistant,
             text: caption.into(),
-            attachments: sources.iter().cloned().enumerate().collect(),
+            attachments: sources
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, path)| (index + 37, path))
+                .collect(),
             model: None,
             effort: None,
             time: "12:00".into(),
@@ -19836,7 +19945,8 @@ fn copied_image_message_round_trips_text_and_ordered_images_into_another_session
         let copied = transcript.order[0].copy_text_owned().unwrap();
         assert_eq!(transcript.last_assistant_message_text().unwrap(), copied);
         let pasted = store.stage_paste(&copied, temp.path()).unwrap();
-        assert_eq!(pasted.text, caption);
+        assert_eq!(pasted.text, expected);
+        assert!(!copied.contains("[Image 37]") && !copied.contains("[Image 38]"));
         assert_eq!(pasted.attachments.len(), sources.len());
         for (source, staged) in sources.iter().zip(&pasted.attachments) {
             assert_ne!(source, staged);
@@ -21552,4 +21662,99 @@ async fn a_prompt_failing_before_any_output_returns_to_the_composer() {
     terminal.apply_session_event(&user(MessageStatus::Failed));
     assert_eq!(terminal.composer.draft(), None);
     terminal.shutdown().await;
+}
+
+#[test]
+fn retained_live_history_compacts_text_without_changing_replay() {
+    let session = Uuid::new_v4();
+    let message = Uuid::new_v4();
+    let mut original = Transcript::default();
+    let mut retained = borg_remote::LiveEventQueue::default();
+    let mut text = String::new();
+    let mut raw_bytes = 0;
+    for index in 0..1_024 {
+        let delta = "same words 🦀 ";
+        text.push_str(delta);
+        let event = SessionEvent::new(
+            session,
+            0,
+            SessionEventKind::MessageDelta {
+                message_id: message,
+                delta: delta.into(),
+            },
+        );
+        original.apply(&event);
+        retained.push_back(event);
+        raw_bytes += text.len() + delta.len();
+        let event = SessionEvent::new(
+            session,
+            0,
+            SessionEventKind::Message {
+                message_id: message,
+                actor: EventActor::Assistant,
+                text: text.clone(),
+                status: MessageStatus::InProgress,
+                attachments: Vec::new(),
+                delivery: None,
+            },
+        );
+        original.apply(&event);
+        retained.push_back(event);
+        if index == 511 {
+            let boundary = SessionEvent::new(
+                session,
+                3,
+                SessionEventKind::ToolStarted {
+                    tool_call_id: "boundary".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path":"source.rs"}),
+                    input_ref: None,
+                    parent_tool_call_id: None,
+                },
+            );
+            original.apply(&boundary);
+            retained.push_back(boundary);
+        }
+    }
+    let stale = SessionEvent::new(
+        session,
+        0,
+        SessionEventKind::Message {
+            message_id: message,
+            actor: EventActor::Assistant,
+            text: "same words 🦀 ".into(),
+            status: MessageStatus::InProgress,
+            attachments: Vec::new(),
+            delivery: None,
+        },
+    );
+    original.apply(&stale);
+    retained.push_back(stale);
+    let mut rebuilt = Transcript::default();
+    let mut retained_bytes = 0;
+    for event in retained.iter() {
+        rebuilt.apply(event);
+        retained_bytes += match &event.kind {
+            SessionEventKind::Message { text, .. } => text.len(),
+            SessionEventKind::MessageDelta { delta, .. } => delta.len(),
+            _ => 0,
+        };
+    }
+    let rows = |transcript: &Transcript| {
+        transcript
+            .lines(120)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows(&rebuilt), rows(&original));
+    assert!(retained.len() <= 5, "retained {} events", retained.len());
+    assert!(
+        retained_bytes * 100 < raw_bytes,
+        "{raw_bytes} bytes became {retained_bytes}"
+    );
+    eprintln!(
+        "retained live text: {raw_bytes} bytes -> {retained_bytes} bytes in {} events",
+        retained.len()
+    );
 }

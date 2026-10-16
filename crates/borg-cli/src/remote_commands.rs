@@ -1903,15 +1903,20 @@ impl DeliveredSessionProjection {
 /// applies again, so a stalled loop still slows a flooding producer.
 const LIVE_EVENT_QUEUE_LIMIT: usize = 4_096;
 
-// Pull every ready event before applying any, so superseded streaming
-// snapshots are merged away instead of each being applied in turn.
+// Conflate the ready window without chasing a continuously refilled receiver.
 fn pull_ready_session_events(
     queued: &mut LiveEventQueue,
     events: &mut mpsc::Receiver<SessionEvent>,
 ) {
-    while queued.len() < LIVE_EVENT_QUEUE_LIMIT
-        && let Ok(event) = events.try_recv()
-    {
+    let ready = events
+        .len()
+        .min(LIVE_EVENT_QUEUE_LIMIT.saturating_sub(queued.len()));
+    let started = std::time::Instant::now();
+    for _ in 0..ready {
+        if started.elapsed() >= std::time::Duration::from_millis(2) {
+            break;
+        }
+        let Ok(event) = events.try_recv() else { break };
         queued.push_back(event);
     }
 }
@@ -3155,7 +3160,7 @@ async fn run_local_agent_session(
     let mut live_transcript_events = history
         .iter()
         .any(|event| event.sequence == 0 && coalesced_transcript_event(&event.kind))
-        .then(|| history.clone());
+        .then(|| history.iter().cloned().collect::<LiveEventQueue>());
     let mut interaction_dirty = false;
     let mut streaming_frame_pending = false;
     let mut last_stream_text_at: Option<tokio::time::Instant> = None;
@@ -3963,16 +3968,13 @@ async fn run_local_agent_session(
                             history_page_before_sequence = before;
                         }
                         if let Some(live) = live_transcript_events.as_mut() {
-                            let mut rebuilt = older.clone();
-                            rebuilt.append(live);
-                            *live = rebuilt;
+                            live.extend_front(older.clone());
                         }
                         merge_tui_history_page(&mut history, older);
                         history_start_reached = history_page_before_sequence <= 1;
                         if let Some(terminal) = terminal.as_mut() {
-                            terminal.replace_history(
-                                live_transcript_events.as_deref().unwrap_or(&history),
-                            );
+                            let retained = live_transcript_events.as_ref().map(|live| live.iter().cloned().collect::<Vec<_>>());
+                            terminal.replace_history(retained.as_deref().unwrap_or(&history));
                             terminal.seed_session_state(delivered_projection.state());
                             terminal_dirty = true;
                         }
@@ -4620,10 +4622,10 @@ async fn run_local_agent_session(
                             render_tick = tui_render_interval(render_frame_interval);
                         }
                         if event.sequence == 0 && coalesced_transcript_event(&event.kind) {
-                            live_transcript_events.get_or_insert_with(|| history.clone());
+                            live_transcript_events.get_or_insert_with(|| history.iter().cloned().collect::<LiveEventQueue>());
                         }
                         if let Some(live) = live_transcript_events.as_mut() {
-                            live.push(event.clone());
+                            live.push_back(event.clone());
                         }
                         if event.sequence > 0
                             && history
@@ -5873,7 +5875,7 @@ async fn run_local_agent_session(
                                 restored.seed_team_roster(&agents);
                                 restored.seed_history(&latest.events);
                                 if let Some(live) = live_transcript_events.as_mut() {
-                                    live.clone_from(&latest.events);
+                                    *live = latest.events.iter().cloned().collect();
                                 }
                                 seed_terminal_subagent_threads(&mut restored, &agents, &histories);
                                 restored.seed_session_state(&latest_state);
@@ -7868,7 +7870,7 @@ async fn run_local_agent_session(
                                         restored.seed_team_roster(&agents);
                                         restored.seed_history(&latest.events);
                                         if let Some(live) = live_transcript_events.as_mut() {
-                                            live.clone_from(&latest.events);
+                                            *live = latest.events.iter().cloned().collect();
                                         }
                                         seed_terminal_subagent_threads(
                                             &mut restored,

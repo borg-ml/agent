@@ -544,7 +544,7 @@ fn message_row_hidden(entry: &TranscriptEntry) -> bool {
             status: MessageStatus::InProgress,
             text,
             ..
-        } if text.is_empty())
+        } if text.trim().is_empty())
 }
 
 impl Transcript {

@@ -1031,6 +1031,17 @@ impl TranscriptCore {
                 attachments,
                 delivery: _,
             } => {
+                if *actor == EventActor::Assistant
+                    && *status == MessageStatus::InProgress
+                    && let Some(index) = self.messages.get(message_id)
+                    && let Some(TranscriptEntry::Message {
+                        status: stored_status,
+                        ..
+                    }) = self.order.get(*index)
+                    && (text.trim().is_empty() || *stored_status != MessageStatus::InProgress)
+                {
+                    return removed_entry;
+                }
                 // A snapshot carries the whole reply so far: it is compared
                 // with what is shown plus what paragraph streaming holds back.
                 let held_tail = self.streaming_tails.remove(message_id).unwrap_or_default();
@@ -1087,7 +1098,8 @@ impl TranscriptCore {
                     return removed_entry;
                 }
                 if *actor == EventActor::Assistant
-                    && (text.trim().is_empty() || assistant_message_is_retired_action_leak(text))
+                    && ((text.trim().is_empty() && *status != MessageStatus::InProgress)
+                        || assistant_message_is_retired_action_leak(text))
                 {
                     removed_entry = self.remove_message(*message_id);
                     return removed_entry;

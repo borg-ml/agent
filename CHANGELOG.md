@@ -23,6 +23,13 @@ Git comparison.
 
 ### Streaming
 
+- Preserve hidden reply anchors so tool rows cannot reorder the surrounding
+  answer, and ignore stale snapshots without hiding real text repetitions.
+- Bound receiver draining and compact retained live text across resize/replay
+  without changing ordered events or rendered output.
+- Show provider refusals as nonfatal error cards instead of invented assistant
+  prose; preserve native replay and the existing continuation behavior.
+
 - Keep reconnect preview snapshots current with raw text fragments so receiver
   lag no longer drops text or delays it until a later full snapshot.
 
@@ -44,6 +51,9 @@ Git comparison.
   attached images, and validate image limits before taking the draft.
 - Add configurable Ctrl+Z undo and Ctrl+Y / Ctrl+Shift+Z redo for the composer;
   save asynchronous pastes, dictation, and returned drafts to the sidecar too.
+
+- Copy image attachments as image links without also copying their composer
+  placeholder labels.
 
 ### Language tools
 

@@ -383,7 +383,7 @@ impl ViewReducer {
             } => {
                 if *actor == EventActor::System
                     || *status == MessageStatus::Queued
-                    || (*actor == EventActor::Assistant && text.is_empty())
+                    || (*actor == EventActor::Assistant && text.trim().is_empty())
                 {
                     return None;
                 }

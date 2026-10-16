@@ -15087,7 +15087,11 @@ impl TranscriptEntryRenderer for TranscriptEntry {
                             .map(|url| format!("![Borg image]({url})"))
                     })
                     .collect::<Option<Vec<_>>>()?;
-                Some(format!("{}\n\n{}", text, images.join("\n")))
+                let mut caption = text.clone();
+                for (number, _) in attachments {
+                    caption = caption.replace(&format!("[Image {number}]"), "");
+                }
+                Some(format!("{}\n\n{}", caption.trim(), images.join("\n")))
             }
             Self::Message { text, .. } | Self::Activity { text, .. } | Self::Info { text, .. } => {
                 Some(markdown_plain_text(text))

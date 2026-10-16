@@ -3668,6 +3668,44 @@ fn explicit_provider_model_choice_preserves_unlisted_model_ids() {
 }
 
 #[tokio::test]
+async fn coalesced_snapshot_flood_still_bounds_receiver_work() {
+    let session = Uuid::new_v4();
+    let count = LIVE_EVENT_QUEUE_LIMIT * 2;
+    let (tx, mut rx) = mpsc::channel(count);
+    for tokens in 0..count {
+        tx.try_send(SessionEvent::new(
+            session,
+            0,
+            SessionEventKind::ContextWindowUpdated {
+                context_tokens: tokens as u64,
+                context_window_tokens: count as u64,
+            },
+        ))
+        .unwrap();
+    }
+    let mut queued = LiveEventQueue::default();
+    pull_ready_session_events(&mut queued, &mut rx);
+    assert!(
+        rx.len() >= LIVE_EVENT_QUEUE_LIMIT,
+        "coalescing must not defeat the receiver work budget"
+    );
+    let mut last = 0;
+    while !rx.is_empty() || !queued.is_empty() {
+        pull_ready_session_events(&mut queued, &mut rx);
+        while let Some(event) = queued.pop_front() {
+            if let SessionEventKind::ContextWindowUpdated { context_tokens, .. } = event.kind {
+                last = context_tokens;
+            }
+        }
+    }
+    assert_eq!(
+        last,
+        (count - 1) as u64,
+        "latest state must still reach the view"
+    );
+}
+
+#[tokio::test]
 async fn stream_drain_preserves_burst_order_and_yields_without_losing_events() {
     let session_id = Uuid::new_v4();
     let (tx, mut rx) = mpsc::channel(4_096);

@@ -1125,11 +1125,17 @@ impl NativeHarness {
                         result.finish_reason
                     );
                 }
+                let refused = result.finish_reason == "refusal";
                 let mut final_text = content.clone().unwrap_or_default();
-                if result.finish_reason == "refusal" && final_text.trim().is_empty() {
-                    final_text = "The model declined to respond to this request.".into();
-                }
-                if final_text.trim().is_empty() {
+                if refused {
+                    let message = if final_text.trim().is_empty() {
+                        "The provider declined to respond to this request.".to_string()
+                    } else {
+                        format!("Model refusal: {final_text}")
+                    };
+                    send(&events, SessionEventKind::Error { message }).await;
+                    final_text.clear();
+                } else if final_text.trim().is_empty() {
                     if replying_while_parked {
                         // Nothing more to say is a fine answer to "reply if
                         // you meant to"; the turn stays parked.
@@ -9528,9 +9534,26 @@ mod tests {
             .await;
             assert!(completed, "refusal must complete without a fatal error");
             assert_eq!(*client.calls.lock().unwrap(), 1, "refusal must not retry");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, SessionEventKind::Error { .. }))
+                    .count(),
+                1
+            );
             assert!(events.iter().any(|event| matches!(event,
+                SessionEventKind::Error { message }
+                if content.as_ref().map_or(message.contains("declined"), |original| message.contains(original)))));
+            assert!(!events.iter().any(|event| matches!(event,
                 SessionEventKind::Message { actor: EventActor::Assistant, text, status: MessageStatus::Complete, .. }
-                if content.as_ref().map_or(!text.trim().is_empty(), |original| text == original))));
+                if !text.is_empty())));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Ready,
+                    ..
+                }
+            )));
             assert!(events.iter().any(|event| matches!(event,
                 SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "native_model_message" && *payload == serde_json::to_value(&message).unwrap())));
