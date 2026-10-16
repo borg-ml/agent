@@ -24307,8 +24307,6 @@ async fn promote_moves_live_authority_and_restores_without_moving_session_state(
                 .await
                 .unwrap();
         }
-        let before = store.state(successor.session_id).await.unwrap();
-        let sibling_before = store.state(sibling.session_id).await.unwrap();
         let mut journal = RuntimeSessionStore::new(store.clone(), Vec::new(), true);
         let (events, mut received) = mpsc::channel(32);
         apply_subagent_action(
@@ -24421,6 +24419,9 @@ async fn promote_moves_live_authority_and_restores_without_moving_session_state(
                 .any(|spec| spec["name"] == "consult_model"),
             "the actual cached MCP tools/list must already include the future director's tools"
         );
+        // Measure only the handoff, before later tests deliberately change the roster.
+        let before = store.state(successor.session_id).await.unwrap();
+        let sibling_before = store.state(sibling.session_id).await.unwrap();
         apply_subagent_action(
             &mut journal,
             &events,
@@ -24434,6 +24435,15 @@ async fn promote_moves_live_authority_and_restores_without_moving_session_state(
         )
         .await
         .unwrap();
+        assert_eq!(
+            before.latest_sequence,
+            store
+                .state(successor.session_id)
+                .await
+                .unwrap()
+                .latest_sequence,
+            "promotion must not rewrite the successor journal"
+        );
         assert!(!has_consult(&old_dispatcher));
         assert!(has_consult(&promoted_dispatcher));
         assert_eq!(
@@ -24665,10 +24675,7 @@ async fn promote_moves_live_authority_and_restores_without_moving_session_state(
             serde_json::to_value(&after.goal).unwrap()
         );
         assert_eq!(before.todos, after.todos);
-        assert_eq!(
-            before.latest_sequence, after.latest_sequence,
-            "promotion must not rewrite the successor journal"
-        );
+
         assert_eq!(
             sibling_before
                 .configuration
