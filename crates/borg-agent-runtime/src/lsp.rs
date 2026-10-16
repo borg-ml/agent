@@ -656,7 +656,7 @@ impl LspService {
         let mut results = serde_json::Map::new();
         for (key, shared) in &clients {
             let label = workspace_label(key, server_counts[key.server_id]);
-            let mut slot = lock_client(&shared, None).await?;
+            let mut slot = lock_client(shared, None).await?;
             let Some(client) = slot.ready_mut() else {
                 results.insert(label, slot.unavailable_report());
                 continue;

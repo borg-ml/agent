@@ -2361,10 +2361,9 @@ impl AgentToolDispatcher {
         if matches!(
             name,
             "consult_model" | "consult_peer" | "rotate_peer" | "update_agent_settings"
-        ) {
-            if let Some(team) = &self.subagents {
-                team.require_director(self.actor_session_id)?;
-            }
+        ) && let Some(team) = &self.subagents
+        {
+            team.require_director(self.actor_session_id)?;
         }
         let mut workflow_approved = workflow_approved;
         let trusted_settings = crate::self_service::trusted_settings_sections(name, &arguments);
@@ -2569,10 +2568,9 @@ impl AgentToolDispatcher {
         if matches!(
             name,
             "consult_model" | "consult_peer" | "rotate_peer" | "update_agent_settings"
-        ) {
-            if let Some(team) = &self.subagents {
-                team.require_director(self.actor_session_id)?;
-            }
+        ) && let Some(team) = &self.subagents
+        {
+            team.require_director(self.actor_session_id)?;
         }
         if let Some(tool) = self.extension_api_snapshot().tool(name).cloned() {
             let context = self

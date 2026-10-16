@@ -21794,7 +21794,7 @@ async fn promote_focused_agent_rebinds_default_without_replacing_the_host() {
         usage: Default::default(),
         interrupted_by: None,
     };
-    terminal.seed_team_roster(&[agent.clone()]);
+    terminal.seed_team_roster(std::slice::from_ref(&agent));
     terminal.focus_child_transcript(child);
     terminal.composer.replace_text("/promote");
     assert!(

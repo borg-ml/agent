@@ -1582,10 +1582,10 @@ pub async fn run_attached_session(
                                 .map(|id| (id, *message_id)),
                         _ => None,
                     };
-                    if let Some((target, message)) = identity {
-                        if store.action(target, message).await?.is_some_and(|action| action.state.is_terminal()) {
-                            return Ok(false);
-                        }
+                    if let Some((target, message)) = identity
+                        && store.action(target, message).await?.is_some_and(|action| action.state.is_terminal())
+                    {
+                        return Ok(false);
                     }
                     forward_attached_command(&lock, &socket, command).await
                 }));

@@ -1842,10 +1842,10 @@ impl HostCommandInbox {
     }
 
     fn try_recv(&mut self) -> std::result::Result<HostCommand, mpsc::error::TryRecvError> {
-        if let Some(control) = self.team_control.as_mut() {
-            if let Ok(command) = control.try_recv() {
-                return Ok(command);
-            }
+        if let Some(control) = self.team_control.as_mut()
+            && let Ok(command) = control.try_recv()
+        {
+            return Ok(command);
         }
         self.try_recv_priority()
             .map(Ok)
@@ -6988,15 +6988,15 @@ async fn run_agent_session_store_kernel_inner(
                     role_notice_pending |= changed.is_ok() && !executor.uses_native_harness(launch.provider);
                 }
                 permit = control_tx.reserve(), if role_notice_pending => {
-                    if let Ok(permit) = permit {
-                        if let Some(team) = &subagents {
-                            let (ack, _result) = oneshot::channel();
-                            permit.send(AgentTurnControl::Steer {
-                                message_id: Uuid::new_v4(), text: team.role_prompt(session_id),
-                                attachments: Vec::new(), admission: SteerAdmission::pending(),
-                                preempt: false, human: false, ack,
-                            });
-                        }
+                    if let Ok(permit) = permit
+                        && let Some(team) = &subagents
+                    {
+                        let (ack, _result) = oneshot::channel();
+                        permit.send(AgentTurnControl::Steer {
+                            message_id: Uuid::new_v4(), text: team.role_prompt(session_id),
+                            attachments: Vec::new(), admission: SteerAdmission::pending(),
+                            preempt: false, human: false, ack,
+                        });
                     }
                     role_notice_pending = false;
                 }
