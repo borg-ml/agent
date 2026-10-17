@@ -3081,8 +3081,10 @@ async fn run_agent_session_store_kernel_inner(
             && let Some(prompt) = pop_next_pending_prompt(&mut pending, true)
         {
             Some(prompt)
-        } else if !usage_limit_retry_waiting && let Ok(text) = watch_events_rx.try_recv() {
-            Some(watch_prompt(text, &mut watch_events_rx))
+        } else if !usage_limit_retry_waiting
+            && let Some(prompt) = watch_prompt(None, &mut watch_events_rx, &watches).await
+        {
+            Some(prompt)
         } else if !usage_limit_retry_waiting
 
             // A host command is already waiting. Automatic goal work is the
@@ -3248,7 +3250,10 @@ async fn run_agent_session_store_kernel_inner(
                                         continue;
                                     }
                 Some(text) = watch_events_rx.recv(), if retry_not_before.is_none() => {
-                                        break Some(watch_prompt(text, &mut watch_events_rx));
+                                        if let Some(prompt) = watch_prompt(Some(text), &mut watch_events_rx, &watches).await {
+                                            break Some(prompt);
+                                        }
+                                        continue;
                                     }
                                     message = root_message_rx.recv(), if owns_team => {
                                         match message {
@@ -10867,15 +10872,33 @@ async fn stop_watch_for_frontend(
     .await
 }
 
-fn watch_prompt(mut text: String, receiver: &mut mpsc::Receiver<String>) -> QueuedPrompt {
+/// Merge queued watcher events into one prompt, leaving out completion notices
+/// for results the model already collected. `None` when nothing is left.
+async fn watch_prompt(
+    first: Option<String>,
+    receiver: &mut mpsc::Receiver<String>,
+    watches: &crate::watch::Watches,
+) -> Option<QueuedPrompt> {
+    let mut text = match first {
+        Some(first) => watches.deliverable(first).await.unwrap_or_default(),
+        None => String::new(),
+    };
     while text.len() < 48 * 1024 {
         let Ok(next) = receiver.try_recv() else {
             break;
         };
-        text.push_str("\n\n");
+        let Some(next) = watches.deliverable(next).await else {
+            continue;
+        };
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
         text.push_str(&next);
     }
-    QueuedPrompt {
+    if text.is_empty() {
+        return None;
+    }
+    Some(QueuedPrompt {
         message_id: Uuid::new_v4(),
         text,
         actor: EventActor::System,
@@ -10885,7 +10908,7 @@ fn watch_prompt(mut text: String, receiver: &mut mpsc::Receiver<String>) -> Queu
         visible: true,
         interrupt_batch: false,
         batch: Vec::new(),
-    }
+    })
 }
 
 /// How many team notifications one turn may absorb, and how much text they may

@@ -119,7 +119,13 @@ struct WatchEntry {
     /// so stopping the watch leaves the shell running.
     attached: bool,
     pending_report: bool,
+    /// The model already read this job's result another way (an `exec` poll
+    /// of the same shell), so its completion is not news.
+    collected: bool,
 }
+
+/// A background job and the notice announcing its completion.
+type JobNotice = (Uuid, String);
 
 #[derive(Clone)]
 pub(crate) struct Watches {
@@ -128,7 +134,11 @@ pub(crate) struct Watches {
     session_id: Uuid,
     entries: Arc<Mutex<BTreeMap<Uuid, WatchEntry>>>,
     events: mpsc::Sender<String>,
-    completion_notices: Arc<Mutex<Option<Vec<String>>>>,
+    completion_notices: Arc<Mutex<Option<Vec<JobNotice>>>>,
+    /// Completion batches waiting in the event channel, by their exact text.
+    /// The session drains the channel only between turns, so a result the
+    /// model collected meanwhile must not open another turn when it arrives.
+    queued_completions: Arc<std::sync::Mutex<BTreeMap<String, Vec<JobNotice>>>>,
     pub cancel: CancellationToken,
     /// Signalled whenever the watch set or a watch's counters change, so
     /// the session can publish a fresh `WatchesChanged` to its frontends.
@@ -152,6 +162,7 @@ impl Watches {
             entries: Default::default(),
             events,
             completion_notices: Default::default(),
+            queued_completions: Default::default(),
             cancel: CancellationToken::new(),
             changed: Arc::new(tokio::sync::Notify::new()),
             yielded: Arc::new(std::sync::Mutex::new(None)),
@@ -466,6 +477,7 @@ impl Watches {
                 runtime: true,
                 attached: false,
                 pending_report: false,
+                collected: false,
             },
         );
         drop(entries);
@@ -473,6 +485,7 @@ impl Watches {
         let watches = self.clone();
         let watch_id = info.watch_id;
         let label = info.label.clone();
+        let tool = info.command.clone();
         tokio::spawn(async move {
             let outcome = tokio::select! {
                 result = &mut execution => result,
@@ -488,18 +501,22 @@ impl Watches {
                 Ok(value) => json!({"ok": true, "output": value}),
                 Err(error) => json!({"ok": false, "error": error.to_string()}),
             };
+            let mut collected = false;
             if let Some(entry) = watches.entries.lock().await.get_mut(&watch_id) {
                 entry.info.running = false;
                 entry.info.result = Some(result);
-                entry.pending_report = true;
+                entry.pending_report = !entry.collected;
+                collected = entry.collected;
                 entry.info.last_event_at = Some(chrono::Utc::now());
                 entry.info.event_count += 1;
             }
             stopped.cancel();
             watches.changed.notify_one();
-            watches.report_completion(format!(
-                "Watcher event: {label} ({watch_id}) finished. Retrieve its result with list_watchers."
-            )).await;
+            if !collected {
+                watches
+                    .report_completion(watch_id, completion_notice(&label, &tool, watch_id))
+                    .await;
+            }
         });
         cancel_on_drop.disarm();
         Ok(json!({
@@ -510,13 +527,13 @@ impl Watches {
 
     /// Results settle immediately; a burst of completions sends one agent
     /// wake rather than one interrupting input per finished job.
-    async fn report_completion(&self, notice: String) {
+    async fn report_completion(&self, job: Uuid, notice: String) {
         let mut pending = self.completion_notices.lock().await;
         if let Some(notices) = pending.as_mut() {
-            notices.push(notice);
+            notices.push((job, notice));
             return;
         }
-        *pending = Some(vec![notice]);
+        *pending = Some(vec![(job, notice)]);
         drop(pending);
         let watches = self.clone();
         tokio::spawn(async move {
@@ -528,9 +545,44 @@ impl Watches {
                 .take()
                 .unwrap_or_default();
             if !notices.is_empty() {
-                let _ = watches.events.send(notices.join("\n")).await;
+                let text = join_notices(&notices);
+                watches
+                    .queued_completions
+                    .lock()
+                    .unwrap()
+                    .insert(text.clone(), notices);
+                if watches.events.send(text.clone()).await.is_err() {
+                    watches.queued_completions.lock().unwrap().remove(&text);
+                }
             }
         });
+    }
+
+    /// What a queued watcher event still has to say when the session takes
+    /// it. Completion notices whose result the model already collected are
+    /// dropped, so a finished agent is not woken to acknowledge its own
+    /// housekeeping (a turn that would also replace its final report).
+    pub(crate) async fn deliverable(&self, text: String) -> Option<String> {
+        let Some(notices) = self.queued_completions.lock().unwrap().remove(&text) else {
+            return Some(text);
+        };
+        let entries = self.entries.lock().await;
+        let live: Vec<_> = notices
+            .into_iter()
+            .filter(|(job, _)| entries.get(job).is_some_and(|entry| entry.pending_report))
+            .collect();
+        (!live.is_empty()).then(|| join_notices(&live))
+    }
+
+    /// An `exec` poll that saw a backgrounded shell end has handed the model
+    /// that job's result; its completion notice would only repeat it.
+    pub(crate) async fn collected(&self, job: Uuid) {
+        if let Some(entry) = self.entries.lock().await.get_mut(&job)
+            && entry.runtime
+        {
+            entry.collected = true;
+            entry.pending_report = false;
+        }
     }
 
     pub async fn start(
@@ -645,6 +697,7 @@ impl Watches {
                 runtime: false,
                 attached: attached.is_some(),
                 pending_report: false,
+                collected: false,
             },
         );
         let terminal_snapshot = (!snapshot.running).then_some(snapshot);
@@ -734,6 +787,7 @@ impl Watches {
                 runtime: false,
                 attached: false,
                 pending_report: false,
+                collected: false,
             },
         );
         drop(entries);
@@ -973,6 +1027,26 @@ impl Watches {
     }
 }
 
+fn join_notices(notices: &[JobNotice]) -> String {
+    notices
+        .iter()
+        .map(|(_, notice)| notice.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn completion_notice(label: &str, tool: &str, job: Uuid) -> String {
+    if matches!(tool, "spawn_agent" | "scout") {
+        // The tool returns once the child starts; the child's own outcome
+        // arrives through wait_agent, never through this notice.
+        format!(
+            "Watcher event: {label} ({job}) returned: the child agent was started and keeps working. Its identity is in list_watchers; wait for its result with wait_agent."
+        )
+    } else {
+        format!("Watcher event: {label} ({job}) finished. Retrieve its result with list_watchers.")
+    }
+}
+
 // Reading a terminal process retires it. Keep recent results retrievable even
 // while the session is still busy and has not consumed the report notification.
 fn prune_completed_watches(entries: &mut BTreeMap<Uuid, WatchEntry>) {
@@ -1124,12 +1198,68 @@ mod tests {
         let (tx, mut notices) = mpsc::channel(8);
         let watches = Watches::new(ProcessManager::default(), tx, Uuid::new_v4());
         for label in ["first", "second", "third"] {
-            watches.report_completion(label.to_owned()).await;
+            watches
+                .report_completion(Uuid::new_v4(), label.to_owned())
+                .await;
         }
         assert!(notices.try_recv().is_err());
         tokio::time::advance(Duration::from_millis(100)).await;
         assert_eq!(notices.recv().await.unwrap(), "first\nsecond\nthird");
         assert!(notices.try_recv().is_err());
+    }
+
+    // The session drains watcher events only between turns. A finished child
+    // woken by notices for results it already read answers with a housekeeping
+    // turn that replaces its real report as the parent's `final_text`.
+    #[tokio::test(start_paused = true)]
+    async fn collected_results_do_not_wake_the_session() {
+        let (tx, mut notices) = mpsc::channel(8);
+        let watches = Watches::new(ProcessManager::default(), tx, Uuid::new_v4());
+        let mut ids = Vec::new();
+        for label in ["listed", "polled", "unread"] {
+            let release = CancellationToken::new();
+            let finished = release.clone();
+            let result = watches
+                .run_job(
+                    label,
+                    "exec",
+                    async move {
+                        finished.cancelled().await;
+                        Ok(json!({"running": false}))
+                    },
+                    CancellationToken::new(),
+                    Duration::ZERO,
+                )
+                .await
+                .unwrap();
+            let id = Uuid::parse_str(result["watch_id"].as_str().unwrap()).unwrap();
+            ids.push((id, release));
+        }
+        // An exec poll read the shell's end before its own job settled.
+        watches.collected(ids[1].0).await;
+        for (_, release) in &ids {
+            release.cancel();
+        }
+        let text = tokio::time::timeout(Duration::from_secs(5), notices.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !text.contains(&ids[1].0.to_string()),
+            "polled shell is not news"
+        );
+        watches.list_for(&[ids[0].0]).await;
+        let delivered = watches.deliverable(text).await.unwrap();
+        assert!(!delivered.contains(&ids[0].0.to_string()));
+        assert!(delivered.contains(&ids[2].0.to_string()));
+        watches.list().await;
+        watches.report_completion(ids[2].0, "unread".into()).await;
+        let text = notices.recv().await.unwrap();
+        assert_eq!(
+            watches.deliverable(text).await,
+            None,
+            "all collected: no turn"
+        );
     }
 
     // A parallel tool batch must detach into independently retrievable jobs,
@@ -2307,6 +2437,7 @@ mod tests {
                     runtime: true,
                     attached: false,
                     pending_report: false,
+                    collected: false,
                 },
             );
         }

@@ -2203,6 +2203,12 @@ impl AgentToolDispatcher {
             if let Some(watches) = &self.watches {
                 let shell_start =
                     matches!(name, "exec" | "exec_command") && arguments.get("cmd").is_some();
+                // A backgrounded shell's watch id is its exec session id.
+                let polled_shell = matches!(name, "exec" | "exec_command" | "write_stdin")
+                    .then(|| arguments.get("session_id").and_then(Value::as_str))
+                    .flatten()
+                    .and_then(|id| Uuid::parse_str(id).ok());
+                let polled_watches = watches.clone();
                 let dispatcher = self.clone();
                 let tool = name.to_owned();
                 let label = arguments
@@ -2232,14 +2238,22 @@ impl AgentToolDispatcher {
                                     startups: dispatcher.shell_startups.clone(),
                                 }
                             });
-                            dispatcher
+                            let result = dispatcher
                                 .call_with_workflow_control_direct(
                                     &tool,
                                     arguments,
                                     workflow_approved,
                                     Some(execution_cancel),
                                 )
-                                .await
+                                .await;
+                            // A poll that saw the shell end carries its result,
+                            // so the shell's own completion notice is redundant.
+                            if let Some(shell) = polled_shell
+                                && result.as_ref().is_ok_and(|value| value["running"] == false)
+                            {
+                                polled_watches.collected(shell).await;
+                            }
+                            result
                         },
                         cancel,
                         if immediate {
