@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.16.8)
 
+- Fix OpenCode children spawned without a model failing their first turn with
+  "Model not found: opencode-go/beam-free". The default is now `BORG_OPENCODE_MODEL`
+  or a preferred stable model validated against the live OpenCode Go catalog,
+  never a free/preview id, and it is resolved at spawn time so an unresolvable
+  model fails the spawn with a clear error.
+
 - Prevent repeated human follow-ups from continually restarting Claude
   subscription thinking. The first steer remains instant; further input coalesces
   until a response completes, before unstarted tools run. Stop remains immediate,
