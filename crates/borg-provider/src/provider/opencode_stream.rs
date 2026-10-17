@@ -76,6 +76,7 @@ async fn run(
         Some(model) if !model.is_empty() => model.to_string(),
         _ => default_model().await?,
     };
+    let model = resolve_model(Some(&model)).await?;
     let cwd = match request.working_directory {
         Some(cwd) => cwd,
         None => std::env::current_dir().context("failed to resolve OpenCode working directory")?,
@@ -745,14 +746,77 @@ impl EventStream {
     }
 }
 
+/// Models tried, in order, when no default is configured. The live catalog is
+/// sorted alphabetically by label, so "first entry" is arbitrary and used to
+/// land on retired or free-tier ids (`opencode-go/beam-free`) that the
+/// OpenCode server then rejects on the first turn.
+const PREFERRED_GO_MODELS: &[&str] = &[
+    "opencode-go/kimi-k2.7-code",
+    "opencode-go/glm-5.3",
+    "opencode-go/deepseek-v4-pro",
+];
+
+fn is_unstable_go_model(id: &str) -> bool {
+    id.ends_with("-free") || id.contains("preview") || id.contains("alpha")
+}
+
+/// Choose the Go default from the live catalog: an explicitly configured
+/// `BORG_OPENCODE_MODEL` (must be in the catalog), else the first preferred
+/// model present, else the first stable catalog entry. Never a free/preview id.
+fn pick_go_default(catalog: &[String], configured: Option<&str>) -> Result<String> {
+    if let Some(configured) = configured.map(str::trim).filter(|m| !m.is_empty()) {
+        ensure_in_go_catalog(catalog, configured)?;
+        return Ok(configured.to_string());
+    }
+    PREFERRED_GO_MODELS
+        .iter()
+        .find(|preferred| catalog.iter().any(|id| id == *preferred))
+        .map(|id| (*id).to_string())
+        .or_else(|| catalog.iter().find(|id| !is_unstable_go_model(id)).cloned())
+        .context(
+            "OpenCode Go has no stable default model; pass model=<id> or set BORG_OPENCODE_MODEL",
+        )
+}
+
+fn ensure_in_go_catalog(catalog: &[String], model: &str) -> Result<()> {
+    if catalog.iter().any(|id| id == model) {
+        return Ok(());
+    }
+    let sample = catalog
+        .iter()
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!("OpenCode model {model} is not in the live OpenCode Go catalog (available: {sample})")
+}
+
+async fn go_catalog_ids() -> Result<Vec<String>> {
+    Ok(crate::refresh_opencode_go_model_catalog()
+        .await?
+        .into_iter()
+        .map(|model| model.id)
+        .collect())
+}
+
+/// Resolve the model an OpenCode session will run, validating against the live
+/// Go catalog when the Go route is in use. Callable at spawn time so an
+/// unresolvable model fails there, not on the first turn.
+pub async fn resolve_model(requested: Option<&str>) -> Result<String> {
+    match requested.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(model) if model.starts_with("opencode-go/") => {
+            ensure_in_go_catalog(&go_catalog_ids().await?, model)?;
+            Ok(model.to_string())
+        }
+        Some(model) => Ok(model.to_string()),
+        None => default_model().await,
+    }
+}
+
 async fn default_model() -> Result<String> {
     if crate::credentials::opencode_go_api_key().is_some() {
-        let models = crate::refresh_opencode_go_model_catalog().await?;
-        return models
-            .into_iter()
-            .next()
-            .map(|model| model.id)
-            .context("OpenCode Go returned no available models; choose one with /model");
+        let configured = std::env::var("BORG_OPENCODE_MODEL").ok();
+        return pick_go_default(&go_catalog_ids().await?, configured.as_deref());
     }
     let output = crate::provider_bin::command(crate::provider_bin::Runtime::OpenCode)
         .await?
@@ -1062,6 +1126,28 @@ mod tests {
                 )
                 .await;
         }
+    }
+
+    #[test]
+    fn go_default_never_picks_free_or_unlisted_models() {
+        use super::pick_go_default;
+        let catalog = [
+            "opencode-go/beam-free",
+            "opencode-go/glm-5.3",
+            "opencode-go/zzz",
+        ]
+        .map(String::from);
+        assert_eq!(
+            pick_go_default(&catalog, None).unwrap(),
+            "opencode-go/glm-5.3"
+        );
+        let only_free = ["opencode-go/beam-free".to_string()];
+        assert!(pick_go_default(&only_free, None).is_err());
+        assert!(pick_go_default(&catalog, Some("opencode-go/retired")).is_err());
+        assert_eq!(
+            pick_go_default(&catalog, Some("opencode-go/zzz")).unwrap(),
+            "opencode-go/zzz"
+        );
     }
 
     #[tokio::test]

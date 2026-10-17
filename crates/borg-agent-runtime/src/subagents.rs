@@ -5354,6 +5354,16 @@ impl SubagentCoordinator {
                     .flatten()
                     .map(|catalog| catalog.default_model.to_string())
             });
+        // OpenCode resolves/validates its model against the live catalog now,
+        // so an unresolvable or retired model fails the spawn, not turn one.
+        #[cfg(not(test))]
+        if launch.provider == CodingProvider::OpenCode {
+            launch.model = Some(
+                borg_provider::provider::resolve_opencode_model(launch.model.as_deref())
+                    .await
+                    .context("resolve OpenCode model for spawn")?,
+            );
+        }
         if inherits_parent {
             // The parent's live effort is what a worker inherits; the team
             // policy preset still comes first, because it deliberately assigns

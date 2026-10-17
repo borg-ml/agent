@@ -23,7 +23,9 @@ use tokio::sync::mpsc;
 #[path = "opencode_stream.rs"]
 mod opencode_stream;
 
-pub use opencode_stream::run_opencode_local_chat_stream;
+pub use opencode_stream::{
+    resolve_model as resolve_opencode_model, run_opencode_local_chat_stream,
+};
 
 #[path = "grok_stream.rs"]
 mod grok_stream;
