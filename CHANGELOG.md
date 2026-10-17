@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.16.8)
 
+- Make Escape in the TUI stop a running turn exactly like clicking the Running
+  button. With queued follow-ups it used a separate soft "flush pending input"
+  path; it now sends the same immediate interrupt. Menus and overlays still
+  consume Escape first.
+
 - Show an idle subagent that is parked on live watchers it started (a build,
   render or test it wakes itself for) as "waiting on 1 job: <watch label>"
   instead of "inactive", in the TUI roster and status line, the GUI team panel

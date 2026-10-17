@@ -12191,7 +12191,7 @@ fn recovered_idle_session_stops_orphaned_tool_spinner() {
 
 #[tokio::test]
 #[ignore = "requires a PTY; exercises Esc and Up with a queued prompt and a typed draft"]
-async fn escape_flushes_pending_queue_without_latching_a_stop_and_keeps_the_composer_draft() {
+async fn escape_interrupts_with_pending_queue_and_keeps_the_composer_draft() {
     let session_id = Uuid::new_v4();
     let directory = tempfile::tempdir().unwrap();
     let mut terminal = BorgTerminal::enter(
@@ -12210,15 +12210,15 @@ async fn escape_flushes_pending_queue_without_latching_a_stop_and_keeps_the_comp
     });
     terminal.composer.insert("unsent draft");
 
-    // Esc ends the turn at once and starts the queued input; it does not
-    // latch a stop the way a plain interrupt does.
+    // Esc is the Running button: with queued input it is the same plain
+    // interrupt, not a separate flush path.
     assert!(matches!(
         terminal
             .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap(),
-        UiAction::FlushPendingInput { target: None }
+        UiAction::Interrupt { target: None }
     ));
-    assert!(!terminal.interrupt_requested);
+    assert!(terminal.interrupt_requested);
     assert!(terminal.transcript.order.iter().any(|entry| matches!(entry,
         TranscriptEntry::Activity { text, .. } if text == USER_INTERRUPT_ACTIVITY
     )));
@@ -21956,4 +21956,51 @@ async fn promote_focused_agent_rebinds_default_without_replacing_the_host() {
         terminal.team_command_action("/promote"),
         Some(UiAction::PromoteAgent { target, expected_epoch: 1 }) if target == root.to_string()
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires a PTY; exercises Esc and the Running button"]
+async fn escape_and_running_button_reach_the_same_interrupt() {
+    let directory = tempfile::tempdir().unwrap();
+    let build = |queued: bool| {
+        let mut terminal = BorgTerminal::enter(
+            directory.path(),
+            Uuid::new_v4(),
+            directory.path().to_path_buf(),
+            &KeybindingConfig::default(),
+        )
+        .unwrap();
+        terminal.status = SessionStatus::Running;
+        if queued {
+            terminal.queued_prompts.push(PendingPromptProjection {
+                message_id: Uuid::new_v4(),
+                text: "queued follow-up".to_string(),
+                delivery: PromptDelivery::Queue,
+                actor: EventActor::User,
+            });
+        }
+        terminal.status_area = Some(Rect::new(0, 0, 10, 1));
+        terminal
+    };
+    for queued in [false, true] {
+        let mut by_key = build(queued);
+        let mut by_click = build(queued);
+        let key = by_key
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        let click = by_click
+            .handle_event(TerminalInputEvent {
+                event: Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 1,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                scroll_repetitions: 1,
+            })
+            .unwrap();
+        assert!(matches!(key, UiAction::Interrupt { target: None }));
+        assert!(matches!(click, UiAction::Interrupt { target: None }));
+        assert_eq!(by_key.interrupt_requested, by_click.interrupt_requested);
+    }
 }

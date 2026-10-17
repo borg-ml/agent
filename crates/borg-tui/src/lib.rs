@@ -5879,30 +5879,6 @@ impl BorgTerminal {
         self.event_redraw_needed = true;
     }
 
-    fn has_pending_input_for_escape(&self) -> bool {
-        self.visible_queued_prompts()
-            .iter()
-            .any(|prompt| prompt.actor == EventActor::User)
-    }
-
-    fn flush_pending_input(&mut self) -> UiAction {
-        let target = self.focused_child;
-        let root_retrying = target.is_none()
-            && (self.connection_retry_at.is_some() || self.usage_retry_at.is_some());
-        if self.active_status() != SessionStatus::Running || root_retrying {
-            self.notice = Some("Pending input stays queued until the session resumes".to_string());
-            return UiAction::None;
-        }
-        if let Some(child) = target {
-            self.child_active_turn_followups.remove(&child);
-        } else {
-            self.active_turn_followup = false;
-            self.show_user_interrupt();
-        }
-        self.notice = Some("Sending pending input".to_string());
-        UiAction::FlushPendingInput { target }
-    }
-
     pub fn hydrate_payload(
         &mut self,
         payload: &SessionPayloadRef,
@@ -9196,7 +9172,6 @@ impl BorgTerminal {
             billing: billing_status,
             cwd: mut cwd_status,
         } = self.transcript.config_statuses();
-        let waiting_subagents = team_transcript.waiting_subagent_count();
         let active_cwd = self
             .transcript
             .config
@@ -9221,6 +9196,7 @@ impl BorgTerminal {
             .as_deref()
             .unwrap_or(&self.transcript);
         let active_subagents = team_transcript.active_subagent_count();
+        let waiting_subagents = team_transcript.waiting_subagent_count();
         let inactive_subagents = team_transcript.inactive_subagent_count();
         let agent_roster_entries = team_transcript.agent_roster_entries();
         let director_target = self.director_target();
@@ -11915,9 +11891,6 @@ impl BorgTerminal {
         }
         if let Some(target) = focused_child_interrupt_target(&self.keymap, &key, self.focused_child)
         {
-            if !ctrl_c && self.has_pending_input_for_escape() {
-                return Ok(self.flush_pending_input());
-            }
             return Ok(if self.begin_user_interrupt() {
                 UiAction::Interrupt {
                     target: Some(target),
@@ -11947,12 +11920,6 @@ impl BorgTerminal {
             self.rewind_primed = false;
             self.notice = Some("Press Ctrl-C again to exit".to_string());
             return Ok(UiAction::None);
-        }
-        if !ctrl_c
-            && self.keymap.matches(KeyAction::Interrupt, &key)
-            && self.has_pending_input_for_escape()
-        {
-            return Ok(self.flush_pending_input());
         }
         if self.keymap.matches(KeyAction::Interrupt, &key)
             && self.composer.text.is_empty()
@@ -13503,14 +13470,6 @@ fn roster_table_row(
     }
     if let Some(width) = columns.usage {
         cells.push(roster_table_cell(usage, width));
-fn roster_entry_is_active(entry: &AgentRosterEntry) -> bool {
-    entry.state == "running" || roster_entry_is_waiting(entry)
-}
-
-fn roster_entry_is_waiting(entry: &AgentRosterEntry) -> bool {
-    entry.child_id.is_some() && entry.state.starts_with("waiting on ")
-}
-
     }
     format!("{marker}{}", cells.join("  "))
 }
@@ -13542,6 +13501,14 @@ enum TeamRosterTarget {
     Director,
     Child(Uuid),
     Inactive,
+}
+
+fn roster_entry_is_active(entry: &AgentRosterEntry) -> bool {
+    entry.state == "running" || roster_entry_is_waiting(entry)
+}
+
+fn roster_entry_is_waiting(entry: &AgentRosterEntry) -> bool {
+    entry.child_id.is_some() && entry.state.starts_with("waiting on ")
 }
 
 fn visible_team_roster(
