@@ -329,11 +329,14 @@ impl ProcessManager {
         }
 
         let baseline_cwd = cwd.clone();
+        let baseline_command = command.clone();
         let change_baseline = if capture_changes {
-            tokio::task::spawn_blocking(move || CommandChangeBaseline::capture(&baseline_cwd))
-                .await
-                .ok()
-                .flatten()
+            tokio::task::spawn_blocking(move || {
+                CommandChangeBaseline::capture_command(&baseline_cwd, &baseline_command)
+            })
+            .await
+            .ok()
+            .flatten()
         } else {
             None
         };

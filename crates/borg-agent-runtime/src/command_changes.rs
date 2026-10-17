@@ -38,6 +38,36 @@ pub(crate) struct CommandChangeBaseline {
 }
 
 impl CommandChangeBaseline {
+    /// A remembered shell cwd is implemented as a leading `cd`, not the native process cwd.
+    /// Follow literal leading directories so changes from another worktree are not attributed
+    /// to this command. Never execute shell expansion just to observe a diff.
+    pub(crate) fn capture_command(cwd: &Path, command: &str) -> Option<Self> {
+        let mut directory = cwd.to_path_buf();
+        let mut remaining = command;
+        while let Some((target, rest)) = crate::tool_presentation::split_leading_cd(remaining) {
+            if target.contains(['$', '`']) {
+                return None;
+            }
+            let unquoted_home = remaining
+                .trim_start()
+                .strip_prefix("cd")?
+                .trim_start()
+                .starts_with('~');
+            let target = if unquoted_home && (target == "~" || target.starts_with("~/")) {
+                PathBuf::from(std::env::var_os("HOME")?)
+                    .join(target.trim_start_matches('~').trim_start_matches('/'))
+            } else {
+                PathBuf::from(target)
+            };
+            directory = directory.join(target).canonicalize().ok()?;
+            if !directory.is_dir() {
+                return None;
+            }
+            remaining = rest;
+        }
+        Self::capture(&directory)
+    }
+
     pub(crate) fn capture(cwd: &Path) -> Option<Self> {
         let root = git_output(cwd, &["rev-parse", "--show-toplevel"])?;
         let root = PathBuf::from(String::from_utf8(root.stdout).ok()?.trim());
@@ -421,6 +451,28 @@ fn truncate_patch(mut patch: String, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A compiler cannot detect cross-worktree edit misattribution. This protects the shell
+    // tool's reported patch provenance when other agents edit the launch tree concurrently.
+    #[test]
+    fn leading_shell_directory_captures_only_the_executed_worktree() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let launcher = workspace.path().join("launcher");
+        let target = workspace.path().join("target worktree");
+        fs::create_dir_all(&launcher).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        git_output(&launcher, &["init", "--quiet"]).expect("launcher repository");
+        git_output(&target, &["init", "--quiet"]).expect("target repository");
+        let command = "cd .\ncd '../target worktree' && printf done";
+        let baseline =
+            CommandChangeBaseline::capture_command(&launcher, command).expect("target baseline");
+        fs::write(launcher.join("foreign.txt"), "someone else's work\n").unwrap();
+        fs::write(target.join("owned.txt"), "command change\n").unwrap();
+        let changes = baseline.finish();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "owned.txt");
+        assert!(changes[0].diff.contains("+command change"));
+    }
 
     #[test]
     fn capture_excludes_only_untracked_top_level_scratch_outputs() {
