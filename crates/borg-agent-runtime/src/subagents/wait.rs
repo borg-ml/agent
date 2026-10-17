@@ -93,11 +93,7 @@ fn fingerprint(agent: &SubagentSnapshot) -> u64 {
 /// fire), but the parent is told, so "working_children: 0" is not read as
 /// "nothing is running".
 pub(super) fn parked_on_watchers(agent: &SubagentSnapshot) -> bool {
-    agent.status == SubagentStatus::Ready
-        && agent
-            .detail
-            .as_deref()
-            .is_some_and(|d| d.starts_with("Waiting on ") && d.ends_with(" watcher(s)"))
+    agent.waiting_on_watchers().is_some()
 }
 
 fn working(agent: &SubagentSnapshot) -> bool {

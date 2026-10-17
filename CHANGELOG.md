@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.16.8)
 
+- Show an idle subagent that is parked on live watchers it started (a build,
+  render or test it wakes itself for) as "waiting on 1 job: <watch label>"
+  instead of "inactive", in the TUI roster and status line, the GUI team panel
+  and the remote/web child summaries. Waiting agents count as active, are
+  coloured apart from running ones, and the live subagent count line now reports
+  `waiting=` separately. Ready-with-nothing-pending, failed, stopped and dormant
+  agents stay inactive; `list_agents` status values are unchanged.
+
 - Fix OpenCode children spawned without a model failing their first turn with
   "Model not found: opencode-go/beam-free". The default is now `BORG_OPENCODE_MODEL`
   or a preferred stable model validated against the live OpenCode Go catalog,

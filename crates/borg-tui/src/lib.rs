@@ -115,6 +115,7 @@ const BORG_ORANGE: Color = Color::Rgb(255, 142, 36);
 const BORG_ORANGE_HOVER: Color = Color::Rgb(255, 184, 92);
 const RUNNING_STATUS_PEACH: Color = Color::Rgb(255, 132, 112);
 const SUBAGENT_PURPLE: Color = Color::Rgb(213, 126, 177);
+const SUBAGENT_WAITING: Color = Color::Rgb(110, 190, 210);
 const WATCH_PURPLE: Color = Color::Rgb(213, 126, 177);
 const TODO_ORANGE: Color = Color::Rgb(255, 177, 76);
 const USER_LABEL_BLUE: Color = Color::Rgb(74, 163, 255);
@@ -9195,6 +9196,7 @@ impl BorgTerminal {
             billing: billing_status,
             cwd: mut cwd_status,
         } = self.transcript.config_statuses();
+        let waiting_subagents = team_transcript.waiting_subagent_count();
         let active_cwd = self
             .transcript
             .config
@@ -10451,7 +10453,7 @@ impl BorgTerminal {
                 apply_running_status_shimmer(&mut status_spans, running_status_shimmer_phase());
             }
             let status_width = status_spans.iter().map(|span| span.width()).sum::<usize>();
-            let agents_status = agents_status_label(active_subagents).or_else(|| {
+            let agents_status = agents_status_label(active_subagents, waiting_subagents).or_else(|| {
                 (inactive_subagents > 0).then(|| format!("{inactive_subagents} inactive"))
             });
             let agents_status_width = agents_status
@@ -10469,11 +10471,13 @@ impl BorgTerminal {
                 status_spans.push(Span::styled(
                     format!(
                         "{} ",
-                        activity_glyph(if active_subagents > 0 {
-                            SessionStatus::Running
+                        if active_subagents > 0 {
+                            activity_glyph(SessionStatus::Running)
+                        } else if waiting_subagents > 0 {
+                            "◔"
                         } else {
-                            SessionStatus::Stopped
-                        })
+                            activity_glyph(SessionStatus::Stopped)
+                        }
                     ),
                     agents_status_spinner_style(hovered),
                 ));
@@ -10703,7 +10707,13 @@ impl BorgTerminal {
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(Color::DarkGray))
                                 .title(Span::styled(
-                                    format!(" Team · {active_subagents} working "),
+                                    if waiting_subagents > 0 {
+                                        format!(
+                                            " Team · {active_subagents} working · {waiting_subagents} waiting "
+                                        )
+                                    } else {
+                                        format!(" Team · {active_subagents} working ")
+                                    },
                                     Style::default()
                                         .fg(SUBAGENT_PURPLE)
                                         .add_modifier(Modifier::BOLD),
@@ -13386,7 +13396,13 @@ fn team_roster_table_lines(
             &entry.usage,
             columns,
         );
-        Line::from(row).style(team_roster_row_style(focused, hovered_row == Some(index)))
+        let style = team_roster_row_style(focused, hovered_row == Some(index));
+        let style = if roster_entry_is_waiting(entry) && !focused && hovered_row != Some(index) {
+            style.fg(SUBAGENT_WAITING)
+        } else {
+            style
+        };
+        Line::from(row).style(style)
     }))
     .collect()
 }
@@ -13487,6 +13503,14 @@ fn roster_table_row(
     }
     if let Some(width) = columns.usage {
         cells.push(roster_table_cell(usage, width));
+fn roster_entry_is_active(entry: &AgentRosterEntry) -> bool {
+    entry.state == "running" || roster_entry_is_waiting(entry)
+}
+
+fn roster_entry_is_waiting(entry: &AgentRosterEntry) -> bool {
+    entry.child_id.is_some() && entry.state.starts_with("waiting on ")
+}
+
     }
     format!("{marker}{}", cells.join("  "))
 }
@@ -13526,7 +13550,7 @@ fn visible_team_roster(
 ) -> (Vec<AgentRosterEntry>, Option<usize>) {
     let inactive_start = entries
         .iter()
-        .position(|entry| entry.child_id.is_some() && entry.state != "running");
+        .position(|entry| entry.child_id.is_some() && !roster_entry_is_active(entry));
     let Some(inactive_start) = inactive_start else {
         return (entries.to_vec(), None);
     };
@@ -18493,13 +18517,18 @@ fn history_loading_line() -> Line<'static> {
     ])
 }
 
-fn agents_status_label(active_agents: usize) -> Option<String> {
-    (active_agents > 0).then(|| {
+fn agents_status_label(active_agents: usize, waiting_agents: usize) -> Option<String> {
+    let running = (active_agents > 0).then(|| {
         format!(
             "{active_agents} subagent{}",
             if active_agents == 1 { "" } else { "s" }
         )
-    })
+    });
+    let waiting = (waiting_agents > 0).then(|| format!("{waiting_agents} waiting"));
+    match (running, waiting) {
+        (Some(running), Some(waiting)) => Some(format!("{running} · {waiting}")),
+        (running, waiting) => running.or(waiting),
+    }
 }
 
 fn agents_status_spinner_style(hovered: bool) -> Style {

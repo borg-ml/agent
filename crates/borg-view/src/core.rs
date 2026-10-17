@@ -4004,36 +4004,46 @@ impl TranscriptCore {
     pub fn inactive_subagent_count(&self) -> usize {
         self.subagent_snapshots
             .values()
-            .filter(|agent| agent.status != SubagentStatus::Running)
+            .filter(|agent| {
+                agent.status != SubagentStatus::Running && agent.waiting_on_watchers().is_none()
+            })
             .count()
             + self.pruned_settled_children.len()
     }
 
-    pub fn prune_child_metadata(&mut self) {
-        let mut settled = self
-            .subagent_snapshots
+    /// Idle children parked on live watchers they started: active, not inactive.
+    pub fn waiting_subagent_count(&self) -> usize {
+        self.subagent_snapshots
             .values()
-            .filter(|child| {
-                matches!(
-                    child.status,
-                    SubagentStatus::Ready | SubagentStatus::Stopped | SubagentStatus::Failed
-                ) && !self
-                    .meta
-                    .approvals
-                    .iter()
-                    .any(|approval| approval.source_session_id == child.session_id.to_string())
-                    && !self
-                        .child_meta_refs
-                        .get(&child.session_id)
-                        .is_some_and(|reference| {
-                            matches!(
-                                reference.summary.status,
-                                crate::wire::Lifecycle::Running | crate::wire::Lifecycle::Waiting
-                            )
+            .filter(|agent| agent.waiting_on_watchers().is_some())
+            .count()
+    }
+
+    pub fn prune_child_metadata(&mut self) {
+        let mut settled =
+            self.subagent_snapshots
+                .values()
+                .filter(|child| {
+                    matches!(
+                        child.status,
+                        SubagentStatus::Ready | SubagentStatus::Stopped | SubagentStatus::Failed
+                    ) && child.waiting_on_watchers().is_none()
+                        && !self.meta.approvals.iter().any(|approval| {
+                            approval.source_session_id == child.session_id.to_string()
                         })
-            })
-            .map(|child| (child.updated_at, child.session_id))
-            .collect::<Vec<_>>();
+                        && !self
+                            .child_meta_refs
+                            .get(&child.session_id)
+                            .is_some_and(|reference| {
+                                matches!(
+                                    reference.summary.status,
+                                    crate::wire::Lifecycle::Running
+                                        | crate::wire::Lifecycle::Waiting
+                                )
+                            })
+                })
+                .map(|child| (child.updated_at, child.session_id))
+                .collect::<Vec<_>>();
         settled.sort_unstable();
         let remove = settled.len().saturating_sub(64);
         for (_, id) in settled.into_iter().take(remove) {

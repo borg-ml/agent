@@ -148,10 +148,20 @@ impl SubagentStatus {
 pub struct SubagentCounts {
     pub running: usize,
     pub starting: usize,
+    /// Ready but parked on live watchers it started: still running work.
+    pub waiting: usize,
     pub inactive: usize,
 }
 
 impl SubagentCounts {
+    fn add_snapshot(&mut self, agent: &SubagentSnapshot, status: SubagentStatus) {
+        if status == SubagentStatus::Ready && agent.waiting_on_watchers().is_some() {
+            self.waiting += 1;
+        } else {
+            self.add(status);
+        }
+    }
+
     fn add(&mut self, status: SubagentStatus) {
         match status {
             SubagentStatus::Running => self.running += 1,
@@ -221,6 +231,31 @@ pub struct SubagentSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(skip)]
     pub interrupted_by: Option<Uuid>,
+}
+
+impl SubagentSnapshot {
+    /// What a `Ready` child parked on live watchers waits on, e.g.
+    /// `waiting on 1 job: cargo build`. `status` stays `Ready` for API
+    /// compatibility; this is the distinct "waiting" state every UI shows.
+    pub fn waiting_on_watchers(&self) -> Option<String> {
+        if self.status != SubagentStatus::Ready {
+            return None;
+        }
+        watcher_wait_label(self.detail.as_deref()?)
+    }
+}
+
+/// Parse the ready detail `Waiting on N watcher(s)[: label, label]` written
+/// when a session yields to its watchers.
+pub fn watcher_wait_label(detail: &str) -> Option<String> {
+    let rest = detail.strip_prefix("Waiting on ")?;
+    let (count, rest) = rest.split_once(" watcher(s)")?;
+    let count: usize = count.parse().ok()?;
+    let jobs = if count == 1 { "job" } else { "jobs" };
+    Some(match rest.strip_prefix(": ").filter(|l| !l.is_empty()) {
+        Some(labels) => format!("waiting on {count} {jobs}: {labels}"),
+        None => format!("waiting on {count} {jobs}"),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -1877,7 +1912,6 @@ impl AgentToolDispatcher {
             .unwrap_or_default();
         let mut direct = SubagentCounts::default();
         let mut descendants = SubagentCounts::default();
-        let (mut direct_parked, mut descendants_parked) = (0usize, 0usize);
         if let Some(subagents) = &self.subagents {
             let table = subagents.table.lock().await;
             if let Ok(path) = table.task_name(self.actor_session_id) {
@@ -1893,35 +1927,28 @@ impl AgentToolDispatcher {
                         } else {
                             agent.status
                         };
-                        let parked = !entry.dormant && wait::parked_on_watchers(agent);
-                        descendants.add(status);
-                        descendants_parked += usize::from(parked);
+                        descendants.add_snapshot(agent, status);
                         if agent.parent_session_id == self.actor_session_id {
-                            direct.add(status);
-                            direct_parked += usize::from(parked);
+                            direct.add_snapshot(agent, status);
                         }
                     }
                 }
             }
         }
-        let parked = if descendants_parked > 0 {
-            format!(
-                " Of the inactive, parked on live watchers (still running work, they wake \
-                 themselves): direct={direct_parked}, descendants={descendants_parked}."
-            )
-        } else {
-            String::new()
-        };
         format!(
-            "Live subagent counts — direct children: running={}, starting={}, inactive={}; \
-             all descendants: running={}, starting={}, inactive={}. \
-             Refreshed before this model request; excludes yourself. Inactive includes ready, \
-             approval-waiting, stopped, failed and dormant agents.{parked}{role}",
+            "Live subagent counts — direct children: running={}, starting={}, waiting={}, \
+             inactive={}; all descendants: running={}, starting={}, waiting={}, inactive={}. \
+             Refreshed before this model request; excludes yourself. Waiting agents are idle \
+             but parked on live watchers (still running work, they wake themselves) and count \
+             as active. Inactive includes ready-with-nothing-pending, approval-waiting, \
+             stopped, failed and dormant agents.{role}",
             direct.running,
             direct.starting,
+            direct.waiting,
             direct.inactive,
             descendants.running,
             descendants.starting,
+            descendants.waiting,
             descendants.inactive,
         )
     }

@@ -1617,9 +1617,13 @@ impl Transcript {
             });
         }
         let mut agents = self.subagent_snapshots.values().collect::<Vec<_>>();
+        let rank = |agent: &SubagentSnapshot| match agent.status {
+            SubagentStatus::Running => 0,
+            _ if agent.waiting_on_watchers().is_some() => 1,
+            _ => 2,
+        };
         agents.sort_by(|left, right| {
-            (left.status != SubagentStatus::Running, &left.task_name)
-                .cmp(&(right.status != SubagentStatus::Running, &right.task_name))
+            (rank(left), &left.task_name).cmp(&(rank(right), &right.task_name))
         });
         rows.extend(agents.into_iter().map(|agent| {
             let name = if self
@@ -1644,6 +1648,9 @@ impl Transcript {
                 model,
                 effort: effort.to_string(),
                 state: match agent.status {
+                    SubagentStatus::Ready if agent.waiting_on_watchers().is_some() => {
+                        agent.waiting_on_watchers().unwrap_or_default()
+                    }
                     // Clicking the row focuses the child; a message there wakes it.
                     SubagentStatus::Stopped | SubagentStatus::Failed => {
                         format!("{} · click to resume", subagent_status_label(agent.status))

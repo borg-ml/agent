@@ -254,9 +254,9 @@ fn completion_alert_waits_for_work_to_stop_rather_than_each_turn_boundary() {
 
 #[test]
 fn statusline_names_active_workers_as_subagents() {
-    assert_eq!(agents_status_label(0), None);
-    assert_eq!(agents_status_label(1).as_deref(), Some("1 subagent"));
-    assert_eq!(agents_status_label(2).as_deref(), Some("2 subagents"));
+    assert_eq!(agents_status_label(0, 0), None);
+    assert_eq!(agents_status_label(1, 0).as_deref(), Some("1 subagent"));
+    assert_eq!(agents_status_label(2, 0).as_deref(), Some("2 subagents"));
 }
 
 #[test]
@@ -8312,9 +8312,9 @@ fn completed_child_turn_is_not_reported_as_running() {
 
 #[test]
 fn agents_status_label_counts_only_working_children() {
-    let working = agents_status_label(1).expect("one agent is working");
-    let larger_team = agents_status_label(2).expect("two agents are working");
-    let idle = agents_status_label(0);
+    let working = agents_status_label(1, 0).expect("one agent is working");
+    let larger_team = agents_status_label(2, 0).expect("two agents are working");
+    let idle = agents_status_label(0, 0);
 
     assert_eq!(working, "1 subagent");
     assert_eq!(larger_team, "2 subagents");
@@ -8684,7 +8684,7 @@ fn persistent_peers_follow_ordinary_agent_visibility() {
     assert_eq!(ready_rows.len(), 2);
     assert_eq!(transcript.active_subagent_count(), 0);
     assert_eq!(
-        agents_status_label(transcript.active_subagent_count()),
+        agents_status_label(transcript.active_subagent_count(), 0),
         None
     );
 
@@ -8711,9 +8711,64 @@ fn persistent_peers_follow_ordinary_agent_visibility() {
     assert_eq!(stopped_rows[1].state, "stopped · click to resume");
     transcript.upsert_subagent_snapshot(&peer);
     assert_eq!(
-        agents_status_label(transcript.active_subagent_count()).as_deref(),
+        agents_status_label(transcript.active_subagent_count(), 0).as_deref(),
         Some("1 subagent")
     );
+}
+
+#[test]
+fn parked_children_show_as_waiting_and_count_as_active() {
+    let parent_id = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let snapshot = |name: &str, status, detail: Option<&str>| SubagentSnapshot {
+        desktop: false,
+        session_id: Uuid::new_v4(),
+        parent_session_id: parent_id,
+        task_name: format!("/root/{name}"),
+        status,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        fast: false,
+        ultrafast: false,
+        cwd: PathBuf::from("/workspace"),
+        created_at: now,
+        updated_at: now,
+        detail: detail.map(str::to_string),
+        final_text: None,
+        usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
+    };
+    let mut transcript = Transcript::default();
+    for agent in [
+        snapshot(
+            "builder",
+            SubagentStatus::Ready,
+            Some("Waiting on 1 watcher(s): cargo build"),
+        ),
+        snapshot("done", SubagentStatus::Ready, None),
+        snapshot("broken", SubagentStatus::Failed, None),
+        snapshot("live", SubagentStatus::Running, None),
+    ] {
+        transcript.upsert_subagent_snapshot(&agent);
+    }
+
+    assert_eq!(transcript.active_subagent_count(), 1);
+    assert_eq!(transcript.waiting_subagent_count(), 1);
+    assert_eq!(transcript.inactive_subagent_count(), 2);
+    assert_eq!(
+        agents_status_label(1, 1).as_deref(),
+        Some("1 subagent · 1 waiting")
+    );
+    assert_eq!(agents_status_label(0, 2).as_deref(), Some("2 waiting"));
+
+    let rows = transcript.agent_roster_entries();
+    assert_eq!(rows[1].name, "live");
+    assert_eq!(rows[2].name, "builder");
+    assert_eq!(rows[2].state, "waiting on 1 job: cargo build");
+    let (collapsed, header) = visible_team_roster(&rows, false);
+    assert_eq!(header, Some(3));
+    assert_eq!(collapsed[3].name, "▸ Inactive · 2");
 }
 
 #[test]

@@ -894,12 +894,16 @@ fn child_summary(
         name: child.task_name.clone(),
         status: match child.status {
             SubagentStatus::Starting | SubagentStatus::Running => Lifecycle::Running,
+            SubagentStatus::Ready if child.waiting_on_watchers().is_some() => Lifecycle::Waiting,
             SubagentStatus::Ready => Lifecycle::Complete,
             SubagentStatus::WaitingForApproval => Lifecycle::Waiting,
             SubagentStatus::Stopped => Lifecycle::Stopped,
             SubagentStatus::Failed => Lifecycle::Failed,
         },
-        last_activity: child.detail.as_ref().map(|s| preview(s)),
+        last_activity: child
+            .waiting_on_watchers()
+            .or_else(|| child.detail.clone())
+            .map(|s| preview(&s)),
         updated_at: child.updated_at.to_rfc3339(),
         approvals: approvals
             .iter()

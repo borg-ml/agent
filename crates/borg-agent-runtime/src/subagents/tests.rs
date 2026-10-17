@@ -23,6 +23,7 @@ fn subagent_counts_partition_all_lifecycle_states() {
         SubagentCounts {
             running: 1,
             starting: 1,
+            waiting: 0,
             inactive: 4
         }
     );
@@ -30,6 +31,23 @@ fn subagent_counts_partition_all_lifecycle_states() {
         std::iter::empty().collect::<SubagentCounts>(),
         SubagentCounts::default()
     );
+}
+
+#[test]
+fn watcher_wait_detail_names_what_a_parked_child_waits_on() {
+    assert_eq!(
+        watcher_wait_label("Waiting on 1 watcher(s): cargo build").as_deref(),
+        Some("waiting on 1 job: cargo build")
+    );
+    assert_eq!(
+        watcher_wait_label("Waiting on 2 watcher(s): a, b").as_deref(),
+        Some("waiting on 2 jobs: a, b")
+    );
+    assert_eq!(
+        watcher_wait_label("Waiting on 1 watcher(s)").as_deref(),
+        Some("waiting on 1 job")
+    );
+    assert_eq!(watcher_wait_label("Resumed"), None);
 }
 
 // An exec that returns early must be the same kind of retrievable,
@@ -291,11 +309,11 @@ async fn live_subagent_count_tracks_lifecycle_and_descendant_scope() {
     );
     assert!(!dispatcher.independent_message_targets(&["unknown"]).await);
     assert!(dispatcher.subagent_count_prompt().await.starts_with(
-        "Live subagent counts — direct children: running=0, starting=1, inactive=1; all descendants: running=1, starting=1, inactive=1."
+        "Live subagent counts — direct children: running=0, starting=1, waiting=0, inactive=1; all descendants: running=1, starting=1, waiting=0, inactive=1."
     ));
     dispatcher.actor_session_id = child;
     assert!(dispatcher.subagent_count_prompt().await.starts_with(
-        "Live subagent counts — direct children: running=1, starting=0, inactive=0; all descendants: running=1, starting=0, inactive=0."
+        "Live subagent counts — direct children: running=1, starting=0, waiting=0, inactive=0; all descendants: running=1, starting=0, waiting=0, inactive=0."
     ));
     {
         let mut table = coordinator.table.lock().await;
@@ -306,7 +324,7 @@ async fn live_subagent_count_tracks_lifecycle_and_descendant_scope() {
     }
     dispatcher.actor_session_id = root;
     assert!(dispatcher.subagent_count_prompt().await.starts_with(
-        "Live subagent counts — direct children: running=0, starting=0, inactive=2; all descendants: running=0, starting=0, inactive=3."
+        "Live subagent counts — direct children: running=0, starting=0, waiting=0, inactive=2; all descendants: running=0, starting=0, waiting=0, inactive=3."
     ));
     // A Ready child parked on a watcher is inactive, but the line says it is
     // still running work, and a wait neither blocks on it nor reports it settled.
@@ -319,9 +337,9 @@ async fn live_subagent_count_tracks_lifecycle_and_descendant_scope() {
         table.entries.get_mut(&grandchild).unwrap().snapshot.status = SubagentStatus::Stopped;
     }
     let prompt = dispatcher.subagent_count_prompt().await;
-    assert!(prompt.contains("inactive=2; all descendants"));
+    assert!(prompt.contains("waiting=1, inactive=1; all descendants"));
+    assert!(prompt.contains("waiting=1, inactive=2."));
     assert!(prompt.contains("parked on live watchers"));
-    assert!(prompt.contains("direct=1, descendants=1"));
     let started = std::time::Instant::now();
     let result = coordinator
         .wait_for(root, Duration::from_secs(30), WaitSignals::default())

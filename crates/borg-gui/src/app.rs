@@ -1512,7 +1512,15 @@ impl Render for BorgGui {
                                     )
                                     .children(agents.into_iter().map(|agent| {
                                         let session_id = agent.session_id;
-                                        let status = format!("{:?}", agent.status).to_lowercase();
+                                        let waiting = agent.waiting_on_watchers();
+                                        let status_color = if waiting.is_some() {
+                                            palette::BLUE
+                                        } else {
+                                            palette::TEXT_MUTED
+                                        };
+                                        let status = waiting.unwrap_or_else(|| {
+                                            format!("{:?}", agent.status).to_lowercase()
+                                        });
                                         div()
                                             .id(SharedString::from(format!("agent-{session_id}")))
                                             .border_1()
@@ -1537,7 +1545,7 @@ impl Render for BorgGui {
                                             .child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(rgb(palette::TEXT_MUTED))
+                                                    .text_color(rgb(status_color))
                                                     .child(status),
                                             )
                                     }))

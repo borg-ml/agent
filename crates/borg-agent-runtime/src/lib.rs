@@ -149,6 +149,7 @@ pub use subagents::{
     agent_tool_specs_with_capabilities, agent_tool_specs_with_capabilities_and_consultation,
     agent_tool_specs_with_subagents, agent_tool_specs_with_team_policy, load_message_attachment,
     store_relayed_message_attachment, subagent_tool_specs, validate_message_attachment,
+    watcher_wait_label,
 };
 pub use tool_presentation::{
     ToolPresentation, ToolPresentationBody, ToolPresentationCategory, canonical_action_descriptor,

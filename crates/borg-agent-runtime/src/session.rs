@@ -3121,9 +3121,20 @@ async fn run_agent_session_store_kernel_inner(
             {
                 // Visible, never silent: the goal stays active and the session
                 // is plainly waiting rather than appearing stalled.
-                next_ready_detail.get_or_insert_with(|| {
-                    format!("Waiting on {} watcher(s)", waiting.watch_ids.len())
-                });
+                if next_ready_detail.is_none() {
+                    let labels = watches
+                        .list_for(&waiting.watch_ids)
+                        .await
+                        .into_iter()
+                        .map(|watch| watch.label)
+                        .collect::<Vec<_>>();
+                    let mut detail = format!("Waiting on {} watcher(s)", waiting.watch_ids.len());
+                    if !labels.is_empty() {
+                        detail.push_str(": ");
+                        detail.push_str(&labels.join(", "));
+                    }
+                    next_ready_detail = Some(detail);
+                }
                 record(
                     &mut journal,
                     &events,
