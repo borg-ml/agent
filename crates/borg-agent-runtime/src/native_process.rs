@@ -11,7 +11,7 @@ use borg_provider::provider::ModelInputAttachment;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -452,24 +452,37 @@ impl ProcessManager {
             return Err(error.context("failed to journal native process start"));
         }
 
+        // Pipe draining must not wait on database publication: otherwise a
+        // journal backlog is mistaken for an escaped descendant holding a pipe.
+        // The stream byte caps below also bound this publication queue.
+        let (output_sender, output_receiver) = mpsc::unbounded_channel();
+        let output_journal_task = journal.clone().map(|store| {
+            tokio::spawn(journal_process_output(
+                output_receiver,
+                Arc::clone(&entry),
+                store,
+            ))
+        });
+        let sender = journal.as_ref().map(|_| output_sender);
         let stdout_task = tokio::spawn(read_pipe(
             stdout,
             Arc::clone(&entry),
             OutputStream::Stdout,
-            journal.clone(),
+            sender.clone(),
         ));
         let stderr_task = tokio::spawn(read_pipe(
             stderr,
             Arc::clone(&entry),
             OutputStream::Stderr,
-            journal.clone(),
+            sender.clone(),
         ));
+        drop(sender);
         tokio::spawn(supervise_process(
             child,
             Arc::clone(&entry),
             Duration::from_millis(timeout_ms),
-            stdout_task,
-            stderr_task,
+            (stdout_task, stderr_task),
+            output_journal_task,
             journal,
             change_baseline,
         ));
@@ -1224,7 +1237,7 @@ async fn read_pipe<R>(
     mut reader: R,
     entry: Arc<ProcessEntry>,
     stream: OutputStream,
-    journal: Option<std::sync::Arc<dyn crate::SessionStore>>,
+    journal: Option<mpsc::UnboundedSender<(RuntimeProcessStream, String)>>,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -1272,30 +1285,8 @@ async fn read_pipe<R>(
                         )
                     })
                 };
-                if let (Some(store), Some((stream, chunk))) = (journal.as_ref(), journal_chunk)
-                    && let Err(error) = append_runtime_event(
-                        store.as_ref(),
-                        entry.session_id,
-                        SessionEventKind::RuntimeProcessOutput {
-                            process_id: entry.process_id,
-                            stream,
-                            chunk,
-                        },
-                    )
-                    .await
-                {
-                    {
-                        let mut status = entry
-                            .status
-                            .lock()
-                            .expect("native process status lock poisoned");
-                        if status.error.is_none() {
-                            status.error =
-                                Some(format!("failed to journal process output: {error}"));
-                        }
-                    }
-                    terminate_process_tree(entry.pid).await;
-                    break;
+                if let (Some(sender), Some(chunk)) = (journal.as_ref(), journal_chunk) {
+                    let _ = sender.send(chunk);
                 }
                 entry.changed.notify_waiters();
             }
@@ -1312,15 +1303,45 @@ async fn read_pipe<R>(
     }
 }
 
+async fn journal_process_output(
+    mut receiver: mpsc::UnboundedReceiver<(RuntimeProcessStream, String)>,
+    entry: Arc<ProcessEntry>,
+    store: Arc<dyn crate::SessionStore>,
+) {
+    while let Some((stream, chunk)) = receiver.recv().await {
+        if let Err(error) = append_runtime_event(
+            store.as_ref(),
+            entry.session_id,
+            SessionEventKind::RuntimeProcessOutput {
+                process_id: entry.process_id,
+                stream,
+                chunk,
+            },
+        )
+        .await
+        {
+            {
+                let mut status = entry.status.lock().expect("native process status lock poisoned");
+                if status.error.is_none() {
+                    status.error = Some(format!("failed to journal process output: {error}"));
+                }
+            }
+            terminate_process_tree(entry.pid).await;
+            break;
+        }
+    }
+}
+
 async fn supervise_process(
     mut child: tokio::process::Child,
     entry: Arc<ProcessEntry>,
     timeout: Duration,
-    stdout_task: tokio::task::JoinHandle<()>,
-    stderr_task: tokio::task::JoinHandle<()>,
+    pipe_tasks: (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>),
+    output_journal_task: Option<tokio::task::JoinHandle<()>>,
     journal: Option<std::sync::Arc<dyn crate::SessionStore>>,
     change_baseline: Option<CommandChangeBaseline>,
 ) {
+    let (stdout_task, stderr_task) = pipe_tasks;
     let stdout_abort = stdout_task.abort_handle();
     let stderr_abort = stderr_task.abort_handle();
     let complete = async {
@@ -1343,6 +1364,11 @@ async fn supervise_process(
                 .error = Some(
                 "output collection stopped: inherited pipes remained open after child exit".into(),
             );
+        }
+        // Preserve durable output-before-completion ordering, outside the
+        // inherited-pipe deadline. A slow journal is not an open OS pipe.
+        if let Some(task) = output_journal_task {
+            let _ = task.await;
         }
         result
     };
