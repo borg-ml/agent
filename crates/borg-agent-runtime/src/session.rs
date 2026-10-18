@@ -5524,6 +5524,13 @@ async fn run_agent_session_store_kernel_inner(
                         None => (&mut running.0).await,
                     }
                 } => {
+                    // Escape can arrive after the result future checked the latch
+                    // but before its JoinHandle wakes. Settle it through the
+                    // interrupt command, retaining the already-consumed result.
+                    if !interrupted && interrupt.as_ref().is_some_and(SessionInterrupt::requested) {
+                        interrupted_result = Some(result);
+                        continue;
+                    }
                     let cancelled = result.as_ref().err().is_some_and(|error| error.is_cancelled());
                     let result = match result {
                         Ok(result) => result,
@@ -6586,7 +6593,9 @@ async fn run_agent_session_store_kernel_inner(
                             if !pending.iter().any(|queued| queued.actor == EventActor::User) {
                                 continue;
                             }
-                            let cooperative = if control_tx.try_send(AgentTurnControl::Interrupt).is_ok() {
+                            let cooperative = if let Some(result) = interrupted_result.take() {
+                                Some(result)
+                            } else if control_tx.try_send(AgentTurnControl::Interrupt).is_ok() {
                                 tokio::time::timeout(Duration::from_millis(10), &mut running.0).await.ok()
                             } else {
                                 None
@@ -6830,7 +6839,9 @@ async fn run_agent_session_store_kernel_inner(
                             retry_not_before = None;
                             // Let a responsive turn flush its tail and continuation within
                             // one frame, never behind journal I/O or a full control queue.
-                            let cooperative = if control_tx.try_send(AgentTurnControl::Interrupt).is_ok() {
+                            let cooperative = if let Some(result) = interrupted_result.take() {
+                                Some(result)
+                            } else if control_tx.try_send(AgentTurnControl::Interrupt).is_ok() {
                                 tokio::time::timeout(Duration::from_millis(10), &mut running.0).await.ok()
                             } else {
                                 None
@@ -11603,6 +11614,10 @@ async fn collect_input_at_turn_boundary(
                 session_id: command_session_id,
             } if command_session_id == session_id => {
                 tracing::info!(%session_id, "session interrupt received (pending commands)");
+                if let Some(interrupt) = &commands.interrupt {
+                    interrupt.settle();
+                    commands.interrupt_delivered = false;
+                }
                 interrupted = true;
             }
             command => {

@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.16.8)
 
+- Settle Escape at turn boundaries so its stop flag cannot cancel the next
+  message or leave it waiting for a provider that never starts. An Escape racing
+  task completion now follows interrupt cleanup instead of reporting a cancelled
+  task as a provider failure.
+
 - Keep a provider/model switch made during a running turn from inheriting the old
   route's later usage-limit cooldown. Preserved work and fresh director tasks
   proceed on the selected route without waiting for the old provider to reset;

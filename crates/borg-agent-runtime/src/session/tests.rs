@@ -10246,6 +10246,8 @@ async fn turn_boundary_collects_all_emitted_prompts_before_escape() {
     let (scratch, _store, mut journal) = runtime_store(session_id).await;
     let (event_tx, _event_rx) = mpsc::channel(8);
     let (command_tx, command_rx) = mpsc::channel(8);
+    let (priority_tx, priority_rx) = mpsc::channel(8);
+    let interrupt = SessionInterrupt::default();
     let last_id = Uuid::new_v4();
     for (message_id, text) in [
         (Uuid::new_v4(), "first follow-up"),
@@ -10263,13 +10265,18 @@ async fn turn_boundary_collects_all_emitted_prompts_before_escape() {
             .await
             .unwrap();
     }
-    command_tx
+    interrupt.request();
+    priority_tx
         .send(HostCommand::Interrupt { session_id })
         .await
         .unwrap();
 
     let mut pending = VecDeque::new();
-    let mut command_rx = HostCommandInbox::new(command_rx, None, session_id);
+    let mut command_rx = HostCommandInbox::new(
+        command_rx,
+        Some((priority_rx, interrupt.clone())),
+        session_id,
+    );
     let mut deferred = VecDeque::new();
     let mut team_message_ids = HashSet::new();
     let interrupted = collect_input_at_turn_boundary(
@@ -10285,6 +10292,28 @@ async fn turn_boundary_collects_all_emitted_prompts_before_escape() {
     .unwrap();
 
     assert!(interrupted);
+    let next_turn = tokio::spawn(async {});
+    interrupt.install(next_turn.abort_handle());
+    assert!(
+        next_turn.await.is_ok(),
+        "the settled Escape must not cancel the next turn"
+    );
+    interrupt.request();
+    assert!(
+        collect_input_at_turn_boundary(
+            &mut journal,
+            &event_tx,
+            session_id,
+            &mut pending,
+            &mut command_rx,
+            &mut deferred,
+            &mut team_message_ids,
+        )
+        .await
+        .unwrap(),
+        "a later Escape must still be delivered"
+    );
+    assert!(!interrupt.requested());
     assert!(deferred.is_empty());
     assert_eq!(pending.len(), 2);
     coalesce_queued_prompts(&mut pending);
@@ -23557,6 +23586,134 @@ fn native_goal_rounds_do_not_charge_the_final_goal_twice() {
         *turn_id = None;
     }
     assert_eq!(goal_token_usage(&aggregate, &mut ledger), Some(300));
+}
+
+// Escape may abort generation after the actor has already begun awaiting its
+// result. It must still use the interrupt lifecycle, not report a task failure.
+#[tokio::test(flavor = "current_thread")]
+async fn interrupt_during_completion_wait_preserves_the_next_turn() {
+    struct InterruptingExecutor {
+        interrupt: SessionInterrupt,
+        starts: mpsc::Sender<Uuid>,
+        first: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for InterruptingExecutor {
+        async fn execute(
+            &self,
+            turn: AgentTurn,
+            _events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            self.starts.send(turn.message_id).await.unwrap();
+            if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.interrupt.request();
+                std::future::pending::<()>().await;
+            }
+            Ok(AgentTurnResult {
+                provider_session_id: None,
+                final_text: "finished".into(),
+            })
+        }
+    }
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let original = Uuid::new_v4();
+    let fresh = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (_priority_tx, priority_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let (starts, mut started) = mpsc::channel(8);
+    let interrupt = SessionInterrupt::default();
+    let actor = tokio::spawn({
+        let root = root.path().to_path_buf();
+        let store = Arc::clone(&store);
+        let interrupt = interrupt.clone();
+        async move {
+            let writer = SessionWriterLease::acquire(root.join("session.lock")).unwrap();
+            run_agent_session_with_priority_commands(
+                &root,
+                session_id,
+                LaunchSession {
+                    request_id: original,
+                    cwd: root.clone(),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    ultrafast: None,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: Some("original task".into()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                priority_rx,
+                interrupt.clone(),
+                event_tx,
+                Arc::new(InterruptingExecutor {
+                    interrupt,
+                    starts,
+                    first: std::sync::atomic::AtomicBool::new(true),
+                }),
+                store,
+                writer,
+                Vec::new(),
+            )
+            .await
+        }
+    });
+    next_turn_completion(&mut event_rx, "Escape settles the cancelled task").await;
+    let completion = store.read(session_id).await.unwrap().into_iter().find(|event| matches!(event.kind, SessionEventKind::TurnCompleted { message_id, .. } if message_id == original)).unwrap().kind;
+    assert!(matches!(completion, SessionEventKind::TurnCompleted {
+        message_id, error: Some(ref error), ..
+    } if message_id == original && error == "turn interrupted"));
+    assert_eq!(started.recv().await, Some(original));
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: fresh,
+            text: "fresh task".into(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), started.recv())
+            .await
+            .unwrap(),
+        Some(fresh)
+    );
+    next_turn_completion(&mut event_rx, "new task completes after Escape").await;
+    let completion = store.read(session_id).await.unwrap().into_iter().find(|event| matches!(event.kind, SessionEventKind::TurnCompleted { message_id, .. } if message_id == fresh)).unwrap().kind;
+    assert!(matches!(completion, SessionEventKind::TurnCompleted {
+        message_id, error: None, ..
+    } if message_id == fresh));
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+    assert!(!interrupt.requested());
+    assert!(
+        !store
+            .read(session_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.kind, SessionEventKind::Error { .. })),
+        "Escape must not be journaled as a provider failure"
+    );
+    scratch.discard().await;
 }
 
 #[tokio::test]
