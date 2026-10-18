@@ -1388,6 +1388,7 @@ struct TurnWatchdog {
     last_output_mono: tokio::time::Instant,
     last_output_wall: std::time::SystemTime,
     active_tools: HashSet<String>,
+    compaction_completed_passes: u64,
     warned: bool,
     suspected: bool,
     last_poll_mono: tokio::time::Instant,
@@ -1414,6 +1415,7 @@ impl TurnWatchdog {
             last_output_mono: tokio::time::Instant::now(),
             last_output_wall: std::time::SystemTime::now(),
             active_tools: HashSet::new(),
+            compaction_completed_passes: 0,
             warned: false,
             suspected: false,
             last_poll_mono: tokio::time::Instant::now(),
@@ -1456,7 +1458,21 @@ impl TurnWatchdog {
     /// Track in-flight tool calls so a long-running tool is not mistaken for a
     /// silent model. `progress` is classified from the raw provider event, so
     /// bookkeeping traffic cannot refresh liveness.
-    fn observe(&mut self, kind: &SessionEventKind, progress: bool) -> bool {
+    fn observe(&mut self, kind: &SessionEventKind, mut progress: bool) -> bool {
+        match context_compaction_status(kind) {
+            Some("started") => self.compaction_completed_passes = 0,
+            Some("progress") => {
+                let SessionEventKind::ProviderEvent { payload, .. } = kind else {
+                    unreachable!();
+                };
+                let completed = payload["completed_passes"].as_u64().unwrap_or(0);
+                progress &= completed > self.compaction_completed_passes;
+                if progress {
+                    self.compaction_completed_passes = completed;
+                }
+            }
+            _ => {}
+        }
         match kind {
             SessionEventKind::ToolStarted { tool_call_id, .. } => {
                 self.active_tools.insert(tool_call_id.clone());
@@ -1608,7 +1624,19 @@ fn provider_event_is_progress(event: &SessionEventKind) -> bool {
         // retry notices and replay diagnostics deliberately do not count.
         SessionEventKind::ProviderEvent { kind, .. } => {
             matches!(kind.as_str(), "action/preparing" | "action/input_delta")
-                || context_compaction_status(event).is_some()
+                || match context_compaction_status(event) {
+                    Some("started" | "completed" | "failed") => true,
+                    Some("progress") => {
+                        let SessionEventKind::ProviderEvent { payload, .. } = event else {
+                            unreachable!();
+                        };
+                        matches!(
+                            (payload["completed_passes"].as_u64(), payload["total_passes"].as_u64()),
+                            (Some(completed), Some(total)) if completed > 0 && completed <= total
+                        )
+                    }
+                    _ => false,
+                }
         }
         _ => false,
     }

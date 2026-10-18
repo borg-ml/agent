@@ -5,6 +5,19 @@ Git comparison.
 
 ## Unreleased (since 0.16.8)
 
+- Fail over web search between configured Exa, Parallel, Firecrawl, and Brave
+  backends when a provider is rate-limited or unavailable. Preserve query
+  filters, result provenance, and useful errors without treating provider
+  failures as empty results or silently using a keyless route.
+- Avoid excessively fragmented context compaction: size requests against the
+  model window, pack retained images together, and retry context-size refusals
+  with bounded smaller requests without discarding history or lowering the
+  selected reasoning effort.
+- Count completed automatic-compaction passes as real progress, preventing the
+  turn watchdog from cancelling productive compaction and restarting it from
+  scratch. Repeated pass notices and empty heartbeats still cannot keep a stuck
+  request alive.
+
 - Unify subagent lifecycle and timeline semantics across TUI, native GUI, and
   remote views. Worker state is independent of report and operation completion;
   stale updates cannot roll back current state or approvals.

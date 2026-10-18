@@ -46,7 +46,7 @@ const MAX_TOOL_RESULT_ATTACHMENT_BASE64_BYTES: usize = 6 * 1024 * 1024;
 /// Vision tokens per image are a function of pixels, not bytes; a flat
 /// estimate keeps a screenshot from being counted as a megabyte of text.
 const ESTIMATED_TOKENS_PER_IMAGE: u64 = 1_600;
-const COMPACTION_IMAGE_RESERVATION_CHARS: usize = ESTIMATED_TOKENS_PER_IMAGE as usize * 2;
+const COMPACTION_IMAGE_RESERVATION_CHARS: usize = ESTIMATED_TOKENS_PER_IMAGE as usize * 4;
 /// Stay below the provider's per-request image limit, counting overview/tiles.
 const MAX_REPLAY_IMAGE_BLOCKS: usize = 60;
 pub(crate) const MAX_APPROVAL_DETAIL_BYTES: usize = 8 * 1024;
@@ -1747,23 +1747,40 @@ impl NativeHarness {
                 }
             }
         }
-        match self
-            .compact_with_window(
-                provider,
-                model,
-                effort,
-                fast,
-                ultrafast,
-                conversation,
-                window,
-                &mut usage,
-                progress.as_ref(),
-            )
-            .await
-        {
-            Ok(summary) => Ok((summary, usage)),
-            Err(error) => Err(crate::agent::PartialCompactionUsage::attach(error, usage)),
+        let mut attempt_window = window;
+        for attempt in 0..3 {
+            match self
+                .compact_with_window(
+                    provider,
+                    model,
+                    effort,
+                    fast,
+                    ultrafast,
+                    conversation.clone(),
+                    attempt_window,
+                    &mut usage,
+                    progress.as_ref(),
+                    None,
+                )
+                .await
+            {
+                Ok(summary) => return Ok((summary, usage)),
+                Err(error)
+                    if attempt < 2
+                        && borg_provider::provider::classify_provider_error(&error)
+                            == borg_provider::provider::ProviderErrorKind::ContextLength =>
+                {
+                    // Retry from the original history, never drop an oldest frame.
+                    // Usage from any completed folds remains accounted for.
+                    attempt_window /= 2;
+                    tracing::warn!(%error, attempt_window, "shrinking compaction input budget");
+                }
+                Err(error) => {
+                    return Err(crate::agent::PartialCompactionUsage::attach(error, usage));
+                }
+            }
         }
+        unreachable!("compaction attempts return or exhaust their bounded retries")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1778,6 +1795,7 @@ impl NativeHarness {
         context_window_tokens: u64,
         usage: &mut ProviderCallUsage,
         progress: Option<&mpsc::UnboundedSender<NativeCompactionProgress>>,
+        events: Option<&mpsc::Sender<SessionEventKind>>,
     ) -> Result<String> {
         anyhow::ensure!(
             !conversation.is_empty(),
@@ -1789,7 +1807,7 @@ impl NativeHarness {
         // also make the target provider reject an otherwise valid transcript.
         let input_chars = compaction_input_chars(context_window_tokens);
         let summary_chars = compaction_summary_chars(context_window_tokens);
-        let wrapper_chars = crate::session::COMPACTION_SUMMARY_PROMPT.chars().count() + 160;
+        let wrapper_chars = crate::session::COMPACTION_SUMMARY_PROMPT.chars().count() + 256;
         let chunk_chars = input_chars.saturating_sub(summary_chars + wrapper_chars);
         anyhow::ensure!(
             chunk_chars >= 1_024,
@@ -1800,7 +1818,35 @@ impl NativeHarness {
             chunk_chars,
             COMPACTION_IMAGE_RESERVATION_CHARS,
         )?;
-        let total_passes = chunks.len();
+        // The renderer isolates images for projection, not because each image
+        // needs its own model call. Pack adjacent frames in conversation order.
+        let mut batches: Vec<(String, Vec<ModelInputAttachment>)> = Vec::new();
+        let mut batch_chars = 0;
+        for chunk in chunks {
+            let cost = chunk.text.chars().count()
+                + usize::from(chunk.attachment.is_some()) * COMPACTION_IMAGE_RESERVATION_CHARS;
+            if batches.is_empty()
+                || batch_chars + 1 + cost > chunk_chars
+                || (chunk.attachment.is_some()
+                    && batches.last().is_some_and(|(_, attachments)| {
+                        attachments.len() >= MAX_REPLAY_IMAGE_BLOCKS
+                    }))
+            {
+                batches.push((String::new(), Vec::new()));
+                batch_chars = 0;
+            }
+            let (text, attachments) = batches.last_mut().unwrap();
+            if !text.is_empty() {
+                text.push('\n');
+                batch_chars += 1;
+            }
+            text.push_str(&chunk.text);
+            if let Some(attachment) = chunk.attachment {
+                attachments.push(attachment.clone());
+            }
+            batch_chars += cost;
+        }
+        let total_passes = batches.len();
         if let Some(progress) = progress {
             let _ = progress.send(NativeCompactionProgress {
                 completed_passes: 0,
@@ -1809,37 +1855,33 @@ impl NativeHarness {
             });
         }
         let mut summary = String::new();
-        for (pass_index, chunk) in chunks.into_iter().enumerate() {
+        for (pass_index, (text, attachments)) in batches.into_iter().enumerate() {
             let prompt = if summary.is_empty() {
                 format!(
                     "<prior_provider_conversation>\n{}\n</prior_provider_conversation>\nReturn only the internal continuation checkpoint.",
-                    chunk.text
+                    text
                 )
             } else {
                 format!(
                     "<prior_summary>\n{summary}\n</prior_summary>\n\n<prior_provider_conversation>\n{}\n</prior_provider_conversation>\nReturn only the updated internal continuation checkpoint.",
-                    chunk.text
+                    text
                 )
             };
             anyhow::ensure!(
                 prompt.chars().count()
                     + crate::session::COMPACTION_SUMMARY_PROMPT.chars().count()
-                    + usize::from(chunk.attachment.is_some()) * COMPACTION_IMAGE_RESERVATION_CHARS
+                    + attachments.len() * COMPACTION_IMAGE_RESERVATION_CHARS
                     <= input_chars,
                 "native compaction prompt exceeds its bounded input budget"
             );
-            let user_message = if let Some(attachment) = chunk.attachment {
-                ModelMessage::user_with_attachments(prompt, vec![attachment.clone()])
-            } else {
-                ModelMessage::user(prompt)
-            };
+            let user_message = ModelMessage::user_with_attachments(prompt, attachments);
             let pass_started = Instant::now();
             let result = self
                 .model_client
                 .model_turn(
                     provider,
                     model,
-                    internal_compaction_effort(provider, effort),
+                    effort,
                     ModelTurnRequest {
                         fast,
                         ultrafast,
@@ -1883,13 +1925,29 @@ impl NativeHarness {
                 "native compaction returned an empty summary"
             );
             summary = crate::session::truncate_compaction_context(&next, summary_chars);
+            let pass_duration_ms = pass_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             if let Some(progress) = progress {
                 let _ = progress.send(NativeCompactionProgress {
                     completed_passes: pass_index + 1,
                     total_passes,
-                    pass_duration_ms: pass_started.elapsed().as_millis().min(u64::MAX as u128)
-                        as u64,
+                    pass_duration_ms,
                 });
+            }
+            if let Some(events) = events {
+                send(
+                    events,
+                    SessionEventKind::ProviderEvent {
+                        provider,
+                        kind: "context_compaction".into(),
+                        payload: json!({
+                            "status": "progress",
+                            "completed_passes": pass_index + 1,
+                            "total_passes": total_passes,
+                            "pass_duration_ms": pass_duration_ms,
+                        }),
+                    },
+                )
+                .await;
             }
         }
         Ok(summary)
@@ -1927,13 +1985,7 @@ impl NativeHarness {
         };
         let result = match self
             .model_client
-            .model_turn(
-                provider,
-                model,
-                internal_compaction_effort(provider, effort),
-                request,
-                None,
-            )
+            .model_turn(provider, model, effort, request, None)
             .await
         {
             Ok(result) => result,
@@ -2082,6 +2134,7 @@ impl NativeHarness {
         )
         .await;
         let mut compaction_usage = ProviderCallUsage::default();
+        let in_place_started = Instant::now();
         let in_place = match sent {
             Some(sent) => {
                 self.compact_in_place(
@@ -2099,21 +2152,67 @@ impl NativeHarness {
         };
         let in_place_used = matches!(in_place, Ok(Some(_)));
         let compacted = match in_place {
-            Ok(Some(summary)) => Ok(summary),
+            Ok(Some(summary)) => {
+                send(events, SessionEventKind::ProviderEvent {
+                    provider: turn.provider,
+                    kind: "context_compaction".into(),
+                    payload: json!({
+                        "status": "progress",
+                        "completed_passes": 1,
+                        "total_passes": 1,
+                        "pass_duration_ms": in_place_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    }),
+                }).await;
+                Ok(summary)
+            }
             Err(error) => Err(error),
             Ok(None) => {
-                self.compact_with_window(
-                    turn.provider,
-                    model,
-                    turn.effort.as_deref(),
-                    turn.fast.unwrap_or(false),
-                    turn.ultrafast.unwrap_or(false),
-                    messages.clone(),
-                    context_window_tokens,
-                    &mut compaction_usage,
-                    None,
-                )
-                .await
+                let mut attempt_window = context_window_tokens;
+                let mut retries = 0;
+                loop {
+                    let result = self
+                        .compact_with_window(
+                            turn.provider,
+                            model,
+                            turn.effort.as_deref(),
+                            turn.fast.unwrap_or(false),
+                            turn.ultrafast.unwrap_or(false),
+                            messages.clone(),
+                            attempt_window,
+                            &mut compaction_usage,
+                            None,
+                            Some(events),
+                        )
+                        .await;
+                    if let Err(error) = &result {
+                        if retries < 2
+                            && borg_provider::provider::classify_provider_error(error)
+                                == borg_provider::provider::ProviderErrorKind::ContextLength
+                        {
+                            retries += 1;
+                            attempt_window /= 2;
+                            // A real refusal starts a new bounded attempt; its
+                            // completed-pass counter starts from one again.
+                            send(
+                                events,
+                                SessionEventKind::ProviderEvent {
+                                    provider: turn.provider,
+                                    kind: "context_compaction".into(),
+                                    payload: json!({
+                                        "status": "started",
+                                        "automatic": true,
+                                        "trigger": trigger,
+                                        "retry": retries,
+                                        "input_budget_tokens": attempt_window,
+                                    }),
+                                },
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+                    break result;
+                }
             }
         };
         absorb_usage(usage, &compaction_usage);
@@ -2242,30 +2341,20 @@ impl NativeHarness {
 /// reasoning and checkpoint.
 const IN_PLACE_COMPACTION_HEADROOM_TOKENS: u64 = 16_384;
 
-fn internal_compaction_effort(
-    provider: crate::CodingProvider,
-    effort: Option<&str>,
-) -> Option<&str> {
-    if provider == crate::CodingProvider::Codex {
-        // Checkpoint serialization is not another planning turn. Inheriting
-        // xhigh made a cache-hit compaction spend nearly ten minutes generating.
-        match effort {
-            Some("none" | "off" | "minimal" | "low") => effort,
-            _ => Some("low"),
-        }
-    } else {
-        effort
-    }
-}
-
 /// Characters of history one text-fold compaction request may carry.
 fn compaction_input_chars(context_window_tokens: u64) -> usize {
-    context_window_tokens.clamp(1, 1_024_000).saturating_div(2) as usize
+    // Match the native text estimate (four characters per token), but leave
+    // room for reasoning and output. Provider refusals shrink this estimate.
+    let reserve = IN_PLACE_COMPACTION_HEADROOM_TOKENS.min(context_window_tokens / 4);
+    context_window_tokens
+        .saturating_sub(reserve)
+        .saturating_mul(4)
+        .min(usize::MAX as u64) as usize
 }
 
 /// Longest checkpoint a compaction keeps.
 fn compaction_summary_chars(context_window_tokens: u64) -> usize {
-    (compaction_input_chars(context_window_tokens) / 8).min(32 * 1024)
+    (context_window_tokens / 16).min(32 * 1024) as usize
 }
 
 struct NativeSteer {
@@ -5661,7 +5750,7 @@ mod tests {
                 request: ModelTurnRequest,
                 _: Option<mpsc::UnboundedSender<ProviderProgress>>,
             ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
-                assert_eq!(effort, Some("low"));
+                assert_eq!(effort, Some("high"));
                 assert_eq!(request.prompt_cache_key.as_deref(), Some("lineage-key"));
                 assert_eq!(request.tools.len(), 1);
                 assert_eq!(
@@ -5931,6 +6020,7 @@ mod tests {
     async fn native_compaction_folds_large_cross_provider_context_with_bounded_requests() {
         struct BoundedClient {
             prompts: Mutex<Vec<(String, Vec<ModelInputAttachment>)>>,
+            window: u64,
         }
         #[async_trait]
         impl NativeModelClient for BoundedClient {
@@ -5950,7 +6040,7 @@ mod tests {
                 request: ModelTurnRequest,
                 _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
             ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
-                assert_eq!(effort, Some("low"));
+                assert_eq!(effort, Some("max"));
                 assert_eq!(request.messages.len(), 2);
                 assert!(request.tools.is_empty());
                 assert!(request.messages.iter().all(|message| matches!(
@@ -5976,7 +6066,7 @@ mod tests {
                     .sum::<usize>()
                     + attachments.len() * COMPACTION_IMAGE_RESERVATION_CHARS;
                 assert!(
-                    input_chars <= 10_000,
+                    input_chars <= compaction_input_chars(self.window),
                     "compaction input was {input_chars} chars"
                 );
                 self.prompts
@@ -5997,133 +6087,251 @@ mod tests {
                 })
             }
         }
-        let client = Arc::new(BoundedClient {
-            prompts: Mutex::new(Vec::new()),
+        // Prevent per-image serialization and unit regressions for fitting history,
+        // while retaining bounded folds for a smaller target model window.
+        for window in [20_000, 475_000] {
+            let client = Arc::new(BoundedClient {
+                prompts: Mutex::new(Vec::new()),
+                window,
+            });
+            let harness = NativeHarness {
+                model_client: client.clone(),
+                ..NativeHarness::default()
+            };
+            let mut conversation = (0..20)
+                .map(|index| {
+                    ModelMessage::user(format!("Source message {index}: {}", "x".repeat(2_000)))
+                })
+                .collect::<Vec<_>>();
+            conversation.insert(
+                1,
+                ModelMessage::Tool {
+                    tool_call_id: "old-image".into(),
+                    content: "Old ordinary tool result".into(),
+                    attachments: vec![ModelInputAttachment {
+                        media_type: "image/png".into(),
+                        data_base64: "ZA==".into(),
+                        filename: None,
+                    }],
+                },
+            );
+            conversation.insert(
+                3,
+                ModelMessage::user_with_attachments(
+                    "Two screenshots show the original failure",
+                    ["YQ==", "Yg=="]
+                        .into_iter()
+                        .map(|data_base64| ModelInputAttachment {
+                            media_type: "image/png".into(),
+                            data_base64: data_base64.into(),
+                            filename: None,
+                        })
+                        .collect(),
+                ),
+            );
+            let last_user = conversation.len() - 1;
+            conversation.insert(
+                last_user,
+                ModelMessage::assistant(
+                    None,
+                    None,
+                    None,
+                    vec![ModelToolCall::function(
+                        "image-1".into(),
+                        "view_image".into(),
+                        "{}".into(),
+                    )],
+                ),
+            );
+            conversation.insert(
+                last_user + 1,
+                ModelMessage::Tool {
+                    tool_call_id: "image-1".into(),
+                    content: "Chart from the latest build".into(),
+                    attachments: vec![ModelInputAttachment {
+                        media_type: "image/png".into(),
+                        data_base64: "Yw==".into(),
+                        filename: None,
+                    }],
+                },
+            );
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+            let (summary, _) = harness
+                .compact(
+                    crate::CodingProvider::Codex,
+                    "test-model",
+                    Some("max"),
+                    false,
+                    false,
+                    conversation,
+                    None,
+                    Some(window),
+                    Some(progress_tx),
+                )
+                .await
+                .unwrap();
+            assert_eq!(summary, "Resume the build fix");
+            let prompts = client.prompts.lock().unwrap();
+            if window == 475_000 {
+                assert_eq!(
+                    prompts.len(),
+                    1,
+                    "fitting history and images need one request"
+                );
+            } else {
+                assert!(
+                    prompts.len() > 1,
+                    "oversized history must use bounded folds"
+                );
+            }
+            let mut passes = Vec::new();
+            while let Ok(progress) = progress_rx.try_recv() {
+                passes.push(progress);
+            }
+            assert_eq!(passes.len(), prompts.len() + 1);
+            assert_eq!(passes[0].completed_passes, 0);
+            assert!(
+                passes
+                    .iter()
+                    .all(|progress| progress.total_passes == prompts.len())
+            );
+            assert!(
+                passes
+                    .iter()
+                    .enumerate()
+                    .all(|(index, progress)| progress.completed_passes == index)
+            );
+            if prompts.len() > 1 {
+                assert!(
+                    prompts[1]
+                        .0
+                        .contains("<prior_summary>\nResume the build fix")
+                );
+            }
+            assert!(prompts.last().unwrap().0.contains("Source message 19"));
+            let images = prompts
+                .iter()
+                .flat_map(|(prompt, attachments)| {
+                    attachments.iter().map(move |image| (prompt, image))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(images.len(), 3);
+            assert_eq!(images[0].1.data_base64, "YQ==");
+            assert_eq!(images[1].1.data_base64, "Yg==");
+            for (index, (prompt, _)) in images[..2].iter().enumerate() {
+                assert!(prompt.contains("Two screenshots show the original failure"));
+                assert!(prompt.contains(&format!(
+                    "Attached image {} of 2 for this user message",
+                    index + 1
+                )));
+            }
+            assert_eq!(images[2].1.data_base64, "Yw==");
+            assert!(images[2].0.contains("Chart from the latest build"));
+            assert!(
+                images[2]
+                    .0
+                    .contains("Attached image 1 of 1 for this tool result")
+            );
+        }
+    }
+
+    // A low estimate must not loop indefinitely or delete history to recover.
+    // Exercise the provider boundary, including usage from a completed fold
+    // before a later refusal, rather than merely checking budget arithmetic.
+    #[tokio::test]
+    async fn compaction_context_refusals_retry_original_history_with_bounded_usage() {
+        struct RefusingClient {
+            calls: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl NativeModelClient for RefusingClient {
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                effort: Option<&str>,
+                request: ModelTurnRequest,
+                _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                assert_eq!(effort, Some("high"));
+                let ModelMessage::User { content, .. } = &request.messages[1] else {
+                    unreachable!()
+                };
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(content.clone());
+                if calls.len() == 1 {
+                    return Ok(ModelTurnResult {
+                        message: ModelMessage::assistant(
+                            Some("checkpoint".into()),
+                            None,
+                            None,
+                            Vec::new(),
+                        ),
+                        finish_reason: "stop".into(),
+                        usage: ProviderCallUsage {
+                            total_tokens: 42,
+                            ..Default::default()
+                        },
+                        raw_response: Value::Null,
+                        trace: ProviderAttemptTrace::default(),
+                    });
+                }
+                Err(ProviderCallError {
+                    message: "context refused".into(),
+                    trace: Box::new(ProviderAttemptTrace::default()),
+                    session_id: None,
+                    kind: borg_provider::provider::ProviderErrorKind::ContextLength,
+                })
+            }
+        }
+        let client = Arc::new(RefusingClient {
+            calls: Mutex::new(Vec::new()),
         });
         let harness = NativeHarness {
             model_client: client.clone(),
             ..NativeHarness::default()
         };
-        let mut conversation = (0..20)
-            .map(|index| {
-                ModelMessage::user(format!("Source message {index}: {}", "x".repeat(2_000)))
-            })
-            .collect::<Vec<_>>();
-        conversation.insert(
-            1,
-            ModelMessage::Tool {
-                tool_call_id: "old-image".into(),
-                content: "Old ordinary tool result".into(),
-                attachments: vec![ModelInputAttachment {
-                    media_type: "image/png".into(),
-                    data_base64: "ZA==".into(),
-                    filename: None,
-                }],
-            },
-        );
-        conversation.insert(
-            3,
-            ModelMessage::user_with_attachments(
-                "Two screenshots show the original failure",
-                ["YQ==", "Yg=="]
-                    .into_iter()
-                    .map(|data_base64| ModelInputAttachment {
-                        media_type: "image/png".into(),
-                        data_base64: data_base64.into(),
-                        filename: None,
-                    })
-                    .collect(),
-            ),
-        );
-        let last_user = conversation.len() - 1;
-        conversation.insert(
-            last_user,
-            ModelMessage::assistant(
-                None,
-                None,
-                None,
-                vec![ModelToolCall::function(
-                    "image-1".into(),
-                    "view_image".into(),
-                    "{}".into(),
-                )],
-            ),
-        );
-        conversation.insert(
-            last_user + 1,
-            ModelMessage::Tool {
-                tool_call_id: "image-1".into(),
-                content: "Chart from the latest build".into(),
-                attachments: vec![ModelInputAttachment {
-                    media_type: "image/png".into(),
-                    data_base64: "Yw==".into(),
-                    filename: None,
-                }],
-            },
-        );
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-        let (summary, _) = harness
+        let conversation = (0..80)
+            .map(|index| ModelMessage::user(format!("Source {index}: {}", "x".repeat(2_000))))
+            .collect();
+        let error = harness
             .compact(
                 crate::CodingProvider::Codex,
-                "test-model",
-                Some("max"),
+                "test",
+                Some("high"),
                 false,
                 false,
                 conversation,
                 None,
                 Some(20_000),
-                Some(progress_tx),
+                None,
             )
             .await
-            .unwrap();
-        assert_eq!(summary, "Resume the build fix");
-        let prompts = client.prompts.lock().unwrap();
-        assert!(prompts.len() > 3, "history must require multiple folds");
-        let mut passes = Vec::new();
-        while let Ok(progress) = progress_rx.try_recv() {
-            passes.push(progress);
-        }
-        assert_eq!(passes.len(), prompts.len() + 1);
-        assert_eq!(passes[0].completed_passes, 0);
-        assert!(
-            passes
-                .iter()
-                .all(|progress| progress.total_passes == prompts.len())
+            .unwrap_err();
+        assert_eq!(
+            borg_provider::provider::classify_provider_error(&error),
+            borg_provider::provider::ProviderErrorKind::ContextLength
+        );
+        assert_eq!(
+            error
+                .downcast_ref::<crate::agent::PartialCompactionUsage>()
+                .unwrap()
+                .usage
+                .total_tokens,
+            42
+        );
+        let calls = client.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            4,
+            "one completed fold and three refused attempts"
         );
         assert!(
-            passes
-                .iter()
-                .enumerate()
-                .all(|(index, progress)| progress.completed_passes == index)
+            calls[2].contains("Source 0:"),
+            "retry must restart with original history"
         );
-        assert!(
-            prompts[1]
-                .0
-                .contains("<prior_summary>\nResume the build fix")
-        );
-        assert!(prompts.last().unwrap().0.contains("Source message 19"));
-        let images = prompts
-            .iter()
-            .filter(|(_, attachments)| !attachments.is_empty())
-            .collect::<Vec<_>>();
-        assert_eq!(images.len(), 3);
-        assert_eq!(images[0].1[0].data_base64, "YQ==");
-        assert_eq!(images[1].1[0].data_base64, "Yg==");
-        for (index, (prompt, attachments)) in images[..2].iter().enumerate() {
-            assert_eq!(attachments.len(), 1);
-            assert!(prompt.contains("Two screenshots show the original failure"));
-            assert!(prompt.contains(&format!(
-                "Attached image {} of 2 for this user message",
-                index + 1
-            )));
-        }
-        assert_eq!(images[2].1[0].data_base64, "Yw==");
-        assert!(images[2].0.contains("Chart from the latest build"));
-        assert!(
-            images[2]
-                .0
-                .contains("Attached image 1 of 1 for this tool result")
-        );
+        assert!(calls[3].contains("Source 0:"));
+        assert!(calls[3].len() < calls[2].len());
     }
 
     #[tokio::test]
@@ -6187,8 +6395,15 @@ mod tests {
             }
         }
 
-        let conversation = (0..20)
-            .map(|index| ModelMessage::user(format!("Source {index}: {}", "x".repeat(2_000))))
+        // Keep real turn boundaries: adjacent users are canonicalized into one
+        // frame, whose projection can fit even when the original text is large.
+        let conversation = (0..40)
+            .flat_map(|index| {
+                [
+                    ModelMessage::user(format!("Source {index}: {}", "x".repeat(2_000))),
+                    ModelMessage::assistant(Some(format!("Reply {index}")), None, None, Vec::new()),
+                ]
+            })
             .collect::<Vec<_>>();
         let harness = NativeHarness {
             model_client: Arc::new(FailsSecondFold {
@@ -10030,6 +10245,29 @@ mod tests {
                             == Some("turn_start_context_threshold"))),
             "the oversized replay must be compacted before the first model call"
         );
+        let progress = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEventKind::ProviderEvent { kind, payload, .. }
+                    if kind == "context_compaction" && payload["status"] == "progress" =>
+                {
+                    Some(payload)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !progress.is_empty(),
+            "completed folds must reach the live actor event stream"
+        );
+        for (index, payload) in progress.iter().enumerate() {
+            assert_eq!(payload["completed_passes"].as_u64(), Some(index as u64 + 1));
+            assert_eq!(
+                payload["total_passes"].as_u64(),
+                Some(progress.len() as u64)
+            );
+            assert!(payload["pass_duration_ms"].is_u64());
+        }
         let calls = client.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 1, "one model round answers the turn");
         assert!(
@@ -10062,9 +10300,8 @@ mod tests {
                 let id = request.request_id.clone().unwrap_or_default();
                 if id.starts_with("compact:") {
                     assert_eq!(
-                        effort,
-                        Some("low"),
-                        "compaction must not inherit the work effort"
+                        effort, None,
+                        "compaction must preserve the configured effort"
                     );
                 }
                 self.requests.lock().unwrap().push(request);

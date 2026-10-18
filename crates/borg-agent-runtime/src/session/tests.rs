@@ -17806,6 +17806,42 @@ async fn provider_metadata_events_cannot_extend_the_liveness_timer() {
     );
 }
 
+// A multi-pass compaction can productively exceed the turn stall budget.
+// Only advancing, completed passes may refresh it; a stuck pass still expires.
+#[tokio::test(flavor = "current_thread")]
+async fn completed_compaction_passes_refresh_liveness_but_heartbeats_do_not() {
+    let event = |payload| SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Codex,
+        kind: "context_compaction".into(),
+        payload,
+    };
+    let mut watchdog = TurnWatchdog::new(TurnPhase::Active);
+    for completed in 1..=3 {
+        watchdog.last_output_wall =
+            std::time::SystemTime::now() - PROVIDER_ACTIVE_LIVENESS_TIMEOUT;
+        let pass = event(json!({
+            "status": "progress", "completed_passes": completed, "total_passes": 3,
+            "pass_duration_ms": 20_000,
+        }));
+        assert!(provider_event_is_progress(&pass));
+        watchdog.observe(&pass, provider_event_is_progress(&pass));
+        assert!(matches!(watchdog.verdict(), WatchdogVerdict::Healthy));
+    }
+    watchdog.last_output_wall =
+        std::time::SystemTime::now() - PROVIDER_ACTIVE_LIVENESS_TIMEOUT;
+    for payload in [
+        json!({"status": "progress"}),
+        json!({"status": "progress", "completed_passes": 0, "total_passes": 3}),
+        json!({"status": "progress", "completed_passes": 4, "total_passes": 3}),
+        json!({"status": "heartbeat"}),
+        json!({"status": "progress", "completed_passes": 3, "total_passes": 3}),
+    ] {
+        let heartbeat = event(payload);
+        watchdog.observe(&heartbeat, provider_event_is_progress(&heartbeat));
+        assert!(matches!(watchdog.verdict(), WatchdogVerdict::Expired(_)));
+    }
+}
+
 struct NeverStoppingExecutor;
 
 #[async_trait::async_trait]
