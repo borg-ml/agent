@@ -5360,14 +5360,42 @@ fn estimated_text_tokens(message: &ModelMessage) -> u64 {
 /// Move a tool result's `borg_attachments` images out of the text and into
 /// typed attachments. Anything that is not a bounded image is dropped with a
 /// note in the text so the model knows why it did not arrive.
+///
+/// Besides the top level, a backgrounded command's images sit inside its
+/// watcher entry (`list_watchers` / `await_watchers`: `[{"result": {"output":
+/// {"borg_attachments": [...]}}}]`); those are lifted too instead of reaching
+/// the model as base64 text.
 pub(crate) fn split_tool_result_attachments(output: String) -> (String, Vec<ModelInputAttachment>) {
-    let Ok(Value::Object(mut object)) = serde_json::from_str::<Value>(&output) else {
-        return (output, Vec::new());
-    };
-    let Some(Value::Array(raw)) = object.remove(TOOL_RESULT_ATTACHMENTS_KEY) else {
+    let Ok(mut value) = serde_json::from_str::<Value>(&output) else {
         return (output, Vec::new());
     };
     let mut attachments = Vec::new();
+    let top_level = value
+        .as_object()
+        .is_some_and(|object| object.contains_key(TOOL_RESULT_ATTACHMENTS_KEY));
+    let found = if top_level {
+        value
+            .as_object_mut()
+            .is_some_and(|object| split_attachments_in(object, &mut attachments))
+    } else {
+        split_watch_result_attachments(&mut value, &mut attachments)
+    };
+    if !found {
+        return (output, Vec::new());
+    }
+    (value.to_string(), attachments)
+}
+
+/// Lift `borg_attachments` from one result object, recording what arrived and
+/// what was dropped beside it. False when the object carries none.
+fn split_attachments_in(
+    object: &mut serde_json::Map<String, Value>,
+    attachments: &mut Vec<ModelInputAttachment>,
+) -> bool {
+    let Some(Value::Array(raw)) = object.remove(TOOL_RESULT_ATTACHMENTS_KEY) else {
+        return false;
+    };
+    let before = attachments.len();
     let mut dropped = Vec::new();
     for (index, entry) in raw.into_iter().enumerate() {
         let attachment = match serde_json::from_value::<ModelInputAttachment>(entry) {
@@ -5397,11 +5425,42 @@ pub(crate) fn split_tool_result_attachments(output: String) -> (String, Vec<Mode
             attachments.push(attachment);
         }
     }
-    object.insert("attached_images".to_string(), json!(attachments.len()));
+    object.insert(
+        "attached_images".to_string(),
+        json!(attachments.len() - before),
+    );
     if !dropped.is_empty() {
         object.insert("dropped_attachments".to_string(), json!(dropped));
     }
-    (Value::Object(object).to_string(), attachments)
+    true
+}
+
+/// Watcher entries (`[{..., "result": {"output": {...}}}]`, directly or in an
+/// object's array field) carry a finished command's own result object.
+fn split_watch_result_attachments(
+    value: &mut Value,
+    attachments: &mut Vec<ModelInputAttachment>,
+) -> bool {
+    let entries: Vec<&mut Value> = match value {
+        Value::Array(entries) => entries.iter_mut().collect(),
+        Value::Object(object) => object
+            .values_mut()
+            .filter_map(|field| field.as_array_mut())
+            .flat_map(|entries| entries.iter_mut())
+            .collect(),
+        _ => return false,
+    };
+    let mut found = false;
+    for entry in entries {
+        if let Some(output) = entry
+            .get_mut("result")
+            .and_then(|result| result.get_mut("output"))
+            .and_then(Value::as_object_mut)
+        {
+            found |= split_attachments_in(output, attachments);
+        }
+    }
+    found
 }
 
 /// MCP results carry images as `{"type": "image", "data", "mimeType"}`
@@ -9081,6 +9140,39 @@ mod tests {
         .to_string();
         let (_, attachments) = split_tool_result_attachments(many);
         assert_eq!(attachments.len(), MAX_TOOL_RESULT_ATTACHMENTS);
+    }
+
+    /// A command that outlived the exec yield finishes as a watcher; its
+    /// images must arrive as pixels, not as base64 in the watcher listing.
+    #[test]
+    fn watcher_result_images_are_split_into_attachments() {
+        let image = json!({"media_type": "image/png", "data_base64": "AAAA"});
+        let listing = json!([
+            {"watch_id": "a", "result": {"ok": true, "output": {"stdout": "x", TOOL_RESULT_ATTACHMENTS_KEY: [image.clone()]}}},
+            {"watch_id": "b", "result": {"ok": true, "output": {"stdout": "y"}}},
+        ])
+        .to_string();
+        let (text, attachments) = split_tool_result_attachments(listing);
+        assert_eq!(attachments.len(), 1);
+        let text: Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            text[0]["result"]["output"]
+                .get(TOOL_RESULT_ATTACHMENTS_KEY)
+                .is_none()
+        );
+        assert_eq!(text[0]["result"]["output"]["attached_images"], 1);
+        assert!(text[1]["result"]["output"].get("attached_images").is_none());
+
+        let wrapped =
+            json!({"watchers": [{"result": {"output": {TOOL_RESULT_ATTACHMENTS_KEY: [image]}}}]})
+                .to_string();
+        let (_, attachments) = split_tool_result_attachments(wrapped);
+        assert_eq!(attachments.len(), 1);
+
+        let unrelated = json!([{"result": "text"}, 3]).to_string();
+        let (text, none) = split_tool_result_attachments(unrelated.clone());
+        assert_eq!(text, unrelated);
+        assert!(none.is_empty());
     }
 
     #[tokio::test]
