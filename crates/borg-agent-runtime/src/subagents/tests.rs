@@ -9992,19 +9992,16 @@ async fn team_harness_inspection_is_scoped_paginated_and_non_mutating() {
         .await
         .unwrap();
     let revision = store.state(child).await.unwrap().latest_sequence;
-    let denied = coordinator
-        .call_tool_as(root, "inspect_agent", json!({"session_id": unrelated}))
-        .await;
-    assert!(denied.unwrap_err().to_string().contains("descendant"));
-    assert!(
+    // Reads reach any session in the host store, including other trees.
+    for (actor, target) in [(root, unrelated), (child, root), (unrelated, child)] {
         coordinator
-            .call_tool_as(child, "inspect_agent", json!({"session_id": root}))
+            .call_tool_as(actor, "inspect_agent", json!({"session_id": target}))
             .await
-            .is_err()
-    );
+            .unwrap();
+    }
     assert!(
         coordinator
-            .call_tool_as(unrelated, "inspect_agent", json!({"session_id": child}))
+            .call_tool_as(root, "inspect_agent", json!({"session_id": Uuid::new_v4()}))
             .await
             .is_err()
     );
@@ -10077,18 +10074,12 @@ async fn team_harness_inspection_is_scoped_paginated_and_non_mutating() {
         path: "/root/promoted".into(),
         epoch: 1,
     });
-    for target in [root, grandchild] {
+    for target in [root, grandchild, unrelated] {
         coordinator
             .call_tool_as(child, "inspect_agent", json!({"session_id": target}))
             .await
             .unwrap();
     }
-    assert!(
-        coordinator
-            .call_tool_as(child, "inspect_agent", json!({"session_id": unrelated}))
-            .await
-            .is_err()
-    );
     assert_eq!(
         store.state(child).await.unwrap().latest_sequence,
         revision,

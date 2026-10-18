@@ -65,6 +65,30 @@ fn public_event(event: &SessionEvent) -> Option<Value> {
             json!({"type": "status_changed", "status": status,
             "detail": detail.as_deref().map(crate::secret_scrub::scrub_secrets)})
         }
+        // Compaction metadata only: the summary and retained history stay private.
+        SessionEventKind::ProviderEvent { kind, payload, .. }
+            if matches!(
+                kind.as_str(),
+                "context_compaction" | "context_compaction_failed" | "context_microcompaction"
+            ) =>
+        {
+            let mut fields = serde_json::Map::new();
+            fields.insert("type".into(), json!(kind));
+            for key in [
+                "operation_id", "status", "trigger", "automatic", "native",
+                "context_tokens_before", "context_tokens_after",
+                "effective_context_window_tokens", "completed_passes", "total_passes",
+                "pass_duration_ms", "tokens_saved", "history_preserved",
+            ] {
+                if let Some(value) = payload.get(key) {
+                    fields.insert(key.into(), value.clone());
+                }
+            }
+            if let Some(error) = payload["error"].as_str() {
+                fields.insert("error".into(), json!(crate::secret_scrub::scrub_secrets(error)));
+            }
+            Value::Object(fields)
+        }
         _ => return None,
     };
     Some(
@@ -221,6 +245,19 @@ impl SubagentCoordinator {
         Ok(())
     }
 
+    /// Read-only access to any session in this host's store, including
+    /// sessions in other trees and instances. Control stays tree-scoped.
+    async fn authorize_read(&self, actor: Uuid, target: Uuid) -> Result<()> {
+        if self.authorize_inspection(actor, target).await.is_ok() {
+            return Ok(());
+        }
+        self.store
+            .state(target)
+            .await
+            .map(|_| ())
+            .context("session is not known to this host's session store")
+    }
+
     pub(super) async fn agent_goal(
         &self,
         actor: Uuid,
@@ -228,11 +265,24 @@ impl SubagentCoordinator {
         change: bool,
     ) -> Result<Value> {
         let args: AgentGoalArgs = serde_json::from_value(arguments)?;
-        let id = self.table.lock().await.resolve(&args.target)?;
+        let resolved = self.table.lock().await.resolve(&args.target);
+        let id = match resolved {
+            Ok(id) => id,
+            // Reads may name a session in another tree by id.
+            Err(error) if !change => {
+                let raw = args.target.trim();
+                let raw = raw
+                    .strip_prefix("session:")
+                    .or_else(|| raw.strip_prefix("participant:"))
+                    .unwrap_or(raw);
+                Uuid::parse_str(raw).map_err(|_| error)?
+            }
+            Err(error) => return Err(error),
+        };
         if change {
             self.authorize_control(actor, id).await?;
         } else {
-            self.authorize_inspection(actor, id).await?;
+            self.authorize_read(actor, id).await?;
         }
         if !change {
             ensure!(
@@ -354,7 +404,7 @@ impl SubagentCoordinator {
 
     pub(super) async fn inspect_agent(&self, actor: Uuid, arguments: Value) -> Result<Value> {
         let args: InspectArgs = serde_json::from_value(arguments)?;
-        self.authorize_inspection(actor, args.session_id).await?;
+        self.authorize_read(actor, args.session_id).await?;
         let state = self.store.state(args.session_id).await?;
         let after = args.after_sequence.unwrap_or(0);
         let limit = args.limit.unwrap_or(50).clamp(1, 200);
