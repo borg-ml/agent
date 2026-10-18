@@ -22045,3 +22045,82 @@ async fn escape_and_running_button_reach_the_same_interrupt() {
         assert_eq!(by_key.interrupt_requested, by_click.interrupt_requested);
     }
 }
+
+#[test]
+fn background_action_animates_until_settled_without_losing_failure_style() {
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Tool {
+        source_name: "exec".into(),
+        name: "Run".into(),
+        detail: "build".into(),
+        code_view: None,
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:00".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        complete: true,
+        error: false,
+        user_interrupted: false,
+        backgrounded: true,
+        expanded: false,
+        outcome: None,
+        cwd: None,
+    });
+    assert!(transcript.has_running_tool());
+    assert!(transcript.tool_activity_is_running(0));
+    let mut header = transcript
+        .lines(100)
+        .into_iter()
+        .find(|line| line.to_string().contains("Running…"))
+        .unwrap();
+    assert!(
+        header
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(USER_LABEL_BLUE))
+    );
+    ToolActivityAnimation {
+        glyph: "⠋",
+        shimmer_phase: 0,
+    }
+    .apply_header(&mut header);
+    assert!(header.to_string().contains("⠋"));
+    let mut next_header = transcript
+        .lines(100)
+        .into_iter()
+        .find(|line| line.to_string().contains("Running…"))
+        .unwrap();
+    ToolActivityAnimation {
+        glyph: "⠙",
+        shimmer_phase: 100,
+    }
+    .apply_header(&mut next_header);
+    assert!(next_header.to_string().contains("⠙"));
+    assert_ne!(header.to_string(), next_header.to_string());
+    if let TranscriptEntry::Tool { backgrounded, .. } = &mut transcript.order[0] {
+        *backgrounded = false;
+    }
+    assert!(!transcript.has_running_tool());
+    assert!(!transcript.tool_activity_is_running(0));
+    let header = transcript
+        .lines(100)
+        .into_iter()
+        .find(|line| line.to_string().contains("Ran"))
+        .unwrap();
+    assert!(!header.to_string().contains("Running in background"));
+    assert!(
+        !header
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(USER_LABEL_BLUE))
+    );
+    if let TranscriptEntry::Tool { error, .. } = &mut transcript.order[0] {
+        *error = true;
+    }
+    assert!(transcript.lines(100).iter().any(|line| {
+        line.spans
+            .iter()
+            .any(|span| span.style.fg == Some(Color::Red))
+    }));
+}

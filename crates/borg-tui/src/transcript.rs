@@ -1205,7 +1205,6 @@ impl Transcript {
             code_view,
             output_view,
             error,
-            backgrounded,
             payload_refs,
             ..
         }) = self.order.get_mut(index)
@@ -1236,7 +1235,7 @@ impl Transcript {
                     Some(&run_output),
                     *error,
                 );
-                *backgrounded = hydrated_presentation.backgrounded;
+                // Loading an old receipt must not revive a settled background job.
                 let edit_diff = (!*error)
                     .then(|| hydrated_presentation.output.clone())
                     .flatten()
@@ -1949,21 +1948,9 @@ impl Transcript {
     }
 
     fn has_running_tool(&self) -> bool {
-        self.active_reasoning.is_some_and(|index| {
-            matches!(
-                self.order.get(index),
-                Some(TranscriptEntry::Tool {
-                    complete: false,
-                    ..
-                })
-            )
-        }) || self.tools.values().any(|index| {
-            matches!(
-                self.order.get(*index),
-                Some(TranscriptEntry::Tool {
-                    complete: false,
-                    ..
-                })
+        self.order.iter().any(|entry| {
+            matches!(entry,
+                TranscriptEntry::Tool { complete, backgrounded, .. } if !*complete || *backgrounded
             )
         })
     }
@@ -1974,14 +1961,15 @@ impl Transcript {
             Some(TranscriptEntry::Tool {
                 name,
                 code_view,
-                complete: false,
+                complete,
+                backgrounded,
                 error: false,
                 user_interrupted: false,
                 ..
-            }) if !tool_action_is_instant(
+            }) if *backgrounded || (!*complete && !tool_action_is_instant(
                 name,
                 code_view.as_ref().map(|(language, _)| language.as_str()),
-            )
+            ))
         )
     }
 

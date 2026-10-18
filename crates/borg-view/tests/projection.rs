@@ -683,3 +683,109 @@ fn stale_child_metadata_cannot_erase_a_canonical_approval() {
     assert!(view.snapshot().meta.approvals.is_empty());
     assert!(view.snapshot().meta.children[0].approvals.is_empty());
 }
+
+// A background receipt admits work; only its terminal event settles nested actions.
+// Replay must preserve that distinction rather than leaving completed children blue.
+#[test]
+fn nested_background_receipt_waits_for_terminal_completion_live_and_replay() {
+    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    let session = Uuid::new_v4();
+    let watch = Uuid::new_v4();
+    let mut events = Vec::new();
+    for (id, parent) in [("outer", None), ("inner", Some("outer"))] {
+        events.push(SessionEvent::new(
+            session,
+            events.len() as u64 + 1,
+            SessionEventKind::ToolStarted {
+                tool_call_id: id.into(),
+                name: "runtime_exec".into(),
+                input: serde_json::json!({"action":"check"}),
+                input_ref: None,
+                parent_tool_call_id: parent.map(str::to_string),
+            },
+        ));
+    }
+    events.push(SessionEvent::new(
+        session,
+        3,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "outer".into(),
+            output: serde_json::json!({"running":true,"background":true,"watch_id":watch})
+                .to_string(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    let mut live = TranscriptCore::default();
+    for event in &events {
+        live.apply(event);
+    }
+    assert!(matches!(
+        &live.order[1],
+        TranscriptEntry::Tool {
+            complete: false,
+            ..
+        }
+    ));
+    let settled_watch = SessionEvent::new(
+        session,
+        4,
+        SessionEventKind::WatchesChanged {
+            watches: vec![borg_agent_runtime::WatchSummary {
+                watch_id: watch,
+                label: "check".into(),
+                command: "runtime_exec".into(),
+                running: false,
+                started_at: events[0].created_at,
+                last_event_at: Some(events[2].created_at),
+                event_count: 1,
+            }],
+        },
+    );
+    let mut watched = TranscriptCore::default();
+    for event in &events {
+        watched.apply_history(event);
+    }
+    watched.apply_history(&settled_watch);
+    assert!(watched.order.iter().all(|row| matches!(
+        row,
+        TranscriptEntry::Tool {
+            complete: true,
+            backgrounded: false,
+            error: false,
+            ..
+        }
+    )));
+    events.push(SessionEvent::new(
+        session,
+        4,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "outer".into(),
+            output: "done".into(),
+            output_ref: None,
+            is_error: true,
+            input: None,
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    live.apply(events.last().unwrap());
+    let mut replay = TranscriptCore::default();
+    for event in &events {
+        replay.apply_history(event);
+    }
+    for projection in [&live, &replay] {
+        assert!(projection.order.iter().all(|row| matches!(
+            row,
+            TranscriptEntry::Tool {
+                complete: true,
+                backgrounded: false,
+                error: true,
+                ..
+            }
+        )));
+    }
+}

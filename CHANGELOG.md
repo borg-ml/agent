@@ -5,6 +5,16 @@ Git comparison.
 
 ## Unreleased (since 0.16.8)
 
+- Animate active blue background actions with spinners. On actual completion,
+  stop the spinner, restore the normal black background, and use past-tense
+  labels. Keep nested background actions live until settlement, and prevent
+  loading an old receipt from reviving their completed state.
+
+- Prefer Codex subscription server-side compaction for eligible in-turn
+  automatic compaction, preserving its encrypted continuation and recent turns
+  through replay. Unsupported routes keep the text-summary fallback; no
+  provider or billing route is changed.
+
 - Fail over web search between configured Exa, Parallel, Firecrawl, and Brave
   backends when a provider is rate-limited or unavailable. Preserve query
   filters, result provenance, and useful errors without treating provider

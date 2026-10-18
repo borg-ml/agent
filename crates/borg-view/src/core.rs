@@ -708,8 +708,10 @@ impl TranscriptCore {
         if let SessionEventKind::ToolCompleted {
             tool_call_id,
             is_error,
+            output,
             ..
         } = &event.kind
+            && (*is_error || tool_output_background_handle(output).is_none())
         {
             let mut parents = vec![tool_call_id.clone()];
             while let Some(parent) = parents.pop() {
@@ -727,12 +729,14 @@ impl TranscriptCore {
                             complete,
                             error,
                             completed_at,
+                            backgrounded,
                             ..
                         }) = self.order.get_mut(*index)
-                        && !*complete
+                        && (!*complete || *backgrounded)
                     {
                         *complete = true;
-                        *error = *is_error;
+                        *backgrounded = false;
+                        *error |= *is_error;
                         *completed_at = Some(event.created_at);
                     }
                 }
@@ -1856,7 +1860,37 @@ impl TranscriptCore {
                     {
                         *complete = true;
                         *backgrounded = false;
-                        *completed_at = watch.last_event_at;
+                        *completed_at = watch.last_event_at.or(Some(event.created_at));
+                        let mut parents = self
+                            .tools
+                            .iter()
+                            .filter(|(_, index)| **index == process.tool_index)
+                            .map(|(id, _)| id.clone())
+                            .collect::<Vec<_>>();
+                        while let Some(parent) = parents.pop() {
+                            let children = self
+                                .tool_parents
+                                .iter()
+                                .filter(|(_, recorded)| **recorded == parent)
+                                .map(|(child, _)| child.clone())
+                                .collect::<Vec<_>>();
+                            for child in children {
+                                self.tool_parents.remove(&child);
+                                parents.push(child.clone());
+                                if let Some(index) = self.tools.get(&child)
+                                    && let Some(TranscriptEntry::Tool {
+                                        complete,
+                                        backgrounded,
+                                        completed_at,
+                                        ..
+                                    }) = self.order.get_mut(*index)
+                                {
+                                    *complete = true;
+                                    *backgrounded = false;
+                                    *completed_at = watch.last_event_at.or(Some(event.created_at));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1959,6 +1993,7 @@ impl TranscriptCore {
                 stdout,
                 stderr,
                 changes,
+                exit_code,
                 ..
             } => {
                 let edit_origin = self.originating_tool_call_id(*process_id);
@@ -1977,6 +2012,9 @@ impl TranscriptCore {
                     && let Some(TranscriptEntry::Tool {
                         output_view,
                         backgrounded,
+                        complete,
+                        completed_at,
+                        error,
                         ..
                     }) = self.order.get_mut(tool_index)
                 {
@@ -1989,6 +2027,9 @@ impl TranscriptCore {
                         *output_view = Some(("text".to_string(), output));
                     }
                     *backgrounded = false;
+                    *complete = true;
+                    *completed_at = Some(event.created_at);
+                    *error |= exit_code.is_some_and(|code| code != 0);
                 }
                 if let Some(polls) = self.poll_processes.remove(process_id) {
                     for tool_call_id in polls {
