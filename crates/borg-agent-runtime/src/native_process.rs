@@ -576,6 +576,31 @@ impl ProcessManager {
         Ok(result)
     }
 
+    /// Stop an owned command and await terminal publication, not a short exec
+    /// polling snapshot. A retired entry has already completed. Keep session
+    /// ownership checks when the entry is present (never stop a foreign process).
+    pub(crate) async fn terminate_and_wait(&self, owner: Uuid, process_id: Uuid) -> Result<()> {
+        let entry = self
+            .inner
+            .processes
+            .lock()
+            .expect("native process registry lock poisoned")
+            .get(&process_id)
+            .cloned();
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        ensure!(
+            entry.session_id == owner,
+            "process belongs to another agent session"
+        );
+        entry.cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(30), wait_for_process_finish(&entry))
+            .await
+            .context("command cancellation did not reach terminal state within 30 seconds")?;
+        Ok(())
+    }
+
     pub(crate) fn command_context(
         &self,
         owner_session_id: Uuid,
@@ -1296,10 +1321,29 @@ async fn supervise_process(
     journal: Option<std::sync::Arc<dyn crate::SessionStore>>,
     change_baseline: Option<CommandChangeBaseline>,
 ) {
+    let stdout_abort = stdout_task.abort_handle();
+    let stderr_abort = stderr_task.abort_handle();
     let complete = async {
         let result = child.wait().await;
         entry.stdin.lock().await.take();
-        let _ = tokio::join!(stdout_task, stderr_task);
+        // An escaped descendant can retain a pipe after the owned child exits.
+        // Do not let that prevent cancellation or durable terminal publication.
+        if tokio::time::timeout(Duration::from_secs(2), async {
+            let _ = tokio::join!(stdout_task, stderr_task);
+        })
+        .await
+        .is_err()
+        {
+            stdout_abort.abort();
+            stderr_abort.abort();
+            entry
+                .status
+                .lock()
+                .expect("native process status lock poisoned")
+                .error = Some(
+                "output collection stopped: inherited pipes remained open after child exit".into(),
+            );
+        }
         result
     };
     tokio::pin!(complete);
@@ -2486,6 +2530,58 @@ mod tests {
             }
         )));
         scratch.discard().await;
+    }
+
+    // Failure mode: watch stop used a short exec snapshot and could report
+    // failure before command shutdown settled. Check confirmed termination and
+    // the session boundary without weakening the separate ordinary poll API.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn confirmed_watch_termination_is_owned_and_terminal() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = Uuid::new_v4();
+        let manager = ProcessManager::default();
+        let command = manager
+            .exec(
+                owner,
+                root.path(),
+                "exec /bin/sh -c 'read reply'".into(),
+                None,
+                Some(1),
+                Some(100),
+                60_000,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(command.running);
+        assert!(
+            manager
+                .terminate_and_wait(Uuid::new_v4(), command.session_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .write_stdin(owner, command.session_id, None, false, Some(0), Some(100))
+                .await
+                .unwrap()
+                .running
+        );
+        manager
+            .terminate_and_wait(owner, command.session_id)
+            .await
+            .unwrap();
+        let terminal = manager
+            .write_stdin(owner, command.session_id, None, false, Some(0), Some(100))
+            .await
+            .unwrap();
+        assert!(!terminal.running);
+        // Repeated stop is idempotent after the terminal result is retired.
+        manager
+            .terminate_and_wait(owner, command.session_id)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
