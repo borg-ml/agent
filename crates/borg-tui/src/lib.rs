@@ -9198,7 +9198,11 @@ impl BorgTerminal {
         } else {
             self.transcript.status_label(status)
         };
-        let status_glyph = activity_glyph(status);
+        let status_glyph = if status_label == "waiting" {
+            "◔"
+        } else {
+            activity_glyph(status)
+        };
         let status_is_interruptible = status_control_is_actionable(status);
         let ConfigStatuses {
             model: model_status,
@@ -18482,10 +18486,7 @@ fn agents_status_label(active_agents: usize, waiting_agents: usize) -> Option<St
         )
     });
     let waiting = (waiting_agents > 0).then(|| format!("{waiting_agents} waiting"));
-    match (running, waiting) {
-        (Some(running), Some(waiting)) => Some(format!("{running} · {waiting}")),
-        (running, waiting) => running.or(waiting),
-    }
+    running.or(waiting)
 }
 
 fn agents_status_spinner_style(hovered: bool) -> Style {

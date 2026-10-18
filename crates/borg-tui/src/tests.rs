@@ -8760,10 +8760,7 @@ fn parked_children_show_as_waiting_and_count_as_active() {
     assert_eq!(transcript.active_subagent_count(), 1);
     assert_eq!(transcript.waiting_subagent_count(), 1);
     assert_eq!(transcript.inactive_subagent_count(), 2);
-    assert_eq!(
-        agents_status_label(1, 1).as_deref(),
-        Some("1 subagent · 1 waiting")
-    );
+    assert_eq!(agents_status_label(1, 1).as_deref(), Some("1 subagent"));
     assert_eq!(agents_status_label(0, 2).as_deref(), Some("2 waiting"));
 
     let rows = transcript.agent_roster_entries();
