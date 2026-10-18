@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.16.8)
+## Unreleased (since 0.17.0)
+
+## 0.17.0 (2026-10-18)
 
 - Animate active blue background actions with spinners. On actual completion,
   stop the spinner, restore the normal black background, and use past-tense
