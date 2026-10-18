@@ -12917,13 +12917,13 @@ fn transcript_turn_output(event: &SessionEvent) -> bool {
             actor: EventActor::Assistant,
             ..
         } | SessionEventKind::ReasoningDelta { .. }
+            | SessionEventKind::ReasoningBlockStarted { .. }
+            | SessionEventKind::ReasoningBlockDelta { .. }
+            | SessionEventKind::ReasoningBlockSnapshot { .. }
             | SessionEventKind::ToolStarted { .. }
             | SessionEventKind::ToolUpdated { .. }
             | SessionEventKind::ToolCompleted { .. }
     )
-            | SessionEventKind::ReasoningBlockStarted { .. }
-            | SessionEventKind::ReasoningBlockDelta { .. }
-            | SessionEventKind::ReasoningBlockSnapshot { .. }
 }
 
 fn transcript_turn_has_terminal_boundary(event: &SessionEvent) -> bool {
@@ -14639,14 +14639,14 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::ReasoningDelta { .. }
         | SessionEventKind::ReasoningTextDelta { .. }
         | SessionEventKind::ReasoningCompleted
-        | SessionEventKind::ToolStarted { .. }
-        | SessionEventKind::ToolUpdated { .. }
-        | SessionEventKind::ToolCompleted { .. }
-        | SessionEventKind::ApprovalRequested { .. }
         | SessionEventKind::ReasoningBlockStarted { .. }
         | SessionEventKind::ReasoningBlockDelta { .. }
         | SessionEventKind::ReasoningBlockSnapshot { .. }
         | SessionEventKind::ReasoningBlockCompleted { .. }
+        | SessionEventKind::ToolStarted { .. }
+        | SessionEventKind::ToolUpdated { .. }
+        | SessionEventKind::ToolCompleted { .. }
+        | SessionEventKind::ApprovalRequested { .. }
         | SessionEventKind::ProviderInteractionRequested { .. }
         | SessionEventKind::PlanUpdated { .. }
         | SessionEventKind::PlanProjected { .. }
