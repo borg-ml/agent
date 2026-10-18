@@ -5,6 +5,21 @@ Git comparison.
 
 ## Unreleased (since 0.17.1)
 
+- Make context compaction recover from dead provider connections. Compaction
+  requests now report streamed output, so a slow but working compaction stays
+  alive and visible. A lost connection is retried up to three attempts with
+  backoff, and an attempt silent for 15 minutes counts as lost. Auth, quota and
+  other permanent errors still fail immediately, with history preserved.
+- Let `inspect_agent` and `get_agent_goal` read any session on the host,
+  including other instances' subagents, and show compaction status in
+  inspection. Control actions remain limited to the caller's own tree.
+- Deliver child interrupt and stop through a priority channel, so cancellation
+  works even when a child's message queue is full.
+- Keep reading process output while the session journal is slow, instead of
+  stalling or misreporting an inherited pipe.
+- TUI: show waiting agents with a distinct glyph, and show only the running
+  count in the agents label.
+
 ## 0.17.1 (2026-10-18)
 
 - Upgrade ZIP extraction to fix privileged permission and symlink handling vulnerabilities.
