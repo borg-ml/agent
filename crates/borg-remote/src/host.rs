@@ -1374,9 +1374,7 @@ pub async fn login_provider(provider: CodingProvider) -> Result<()> {
     if let Some(cache) = PROVIDER_CAPABILITIES_CACHE.get() {
         cache.lock().await.clear();
     }
-    if let Some(cache) = crate::provider_usage::PROVIDER_USAGE_CACHE.get() {
-        cache.lock().await.clear();
-    }
+    crate::provider_usage::clear_login_dependent_usage_caches().await;
     Ok(())
 }
 
@@ -1408,9 +1406,7 @@ pub async fn login_provider_with_output(
         if let Some(cache) = PROVIDER_CAPABILITIES_CACHE.get() {
             cache.lock().await.clear();
         }
-        if let Some(cache) = crate::provider_usage::PROVIDER_USAGE_CACHE.get() {
-            cache.lock().await.clear();
-        }
+        crate::provider_usage::clear_login_dependent_usage_caches().await;
         on_output("Connected Claude subscription. Saved API credentials were kept.");
         return Ok(());
     }
@@ -1427,9 +1423,7 @@ pub async fn login_provider_with_output(
         if let Some(cache) = PROVIDER_CAPABILITIES_CACHE.get() {
             cache.lock().await.clear();
         }
-        if let Some(cache) = crate::provider_usage::PROVIDER_USAGE_CACHE.get() {
-            cache.lock().await.clear();
-        }
+        crate::provider_usage::clear_login_dependent_usage_caches().await;
         on_output("Connected ChatGPT subscription. Saved API credentials were kept.");
         return Ok(());
     }
@@ -1488,9 +1482,7 @@ pub async fn login_provider_with_output(
     if let Some(cache) = PROVIDER_CAPABILITIES_CACHE.get() {
         cache.lock().await.clear();
     }
-    if let Some(cache) = crate::provider_usage::PROVIDER_USAGE_CACHE.get() {
-        cache.lock().await.clear();
-    }
+    crate::provider_usage::clear_login_dependent_usage_caches().await;
     Ok(())
 }
 

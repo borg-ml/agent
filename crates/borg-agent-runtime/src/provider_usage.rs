@@ -49,6 +49,19 @@ async fn cached_claude_subscription_status() -> Option<bool> {
     Some(authenticated)
 }
 
+/// Forget everything derived from a provider's login state. Call it after any
+/// login completes: otherwise the next capability refresh still reads the
+/// pre-login "not authenticated" answer, for up to the status TTL, and the
+/// connection looks like it failed.
+pub async fn clear_login_dependent_usage_caches() {
+    if let Some(cache) = PROVIDER_USAGE_CACHE.get() {
+        cache.lock().await.clear();
+    }
+    if let Some(cache) = CLAUDE_LOGIN_STATUS_CACHE.get() {
+        *cache.lock().await = None;
+    }
+}
+
 pub async fn refresh_provider_capability_usage(
     capabilities: &[ProviderCapability],
 ) -> Vec<ProviderCapability> {
