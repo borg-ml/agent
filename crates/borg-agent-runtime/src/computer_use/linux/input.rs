@@ -400,6 +400,11 @@ fn type_text(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// A neighbouring absolute axis value, inside 0..=ABS_MAX.
+fn nudge(value: i32) -> i32 {
+    if value > 0 { value - 1 } else { value + 1 }
+}
+
 /// What a pointer op points at, resolved to desktop pixels only after the
 /// window is focused.
 enum Spec {
@@ -551,16 +556,15 @@ impl Helper {
             g(x),
             g(y)
         );
-        self.emit(
-            EventType::ABSOLUTE,
-            AbsoluteAxisCode::ABS_X.0,
-            abs_coordinate(x, width),
-        )?;
-        self.emit(
-            EventType::ABSOLUTE,
-            AbsoluteAxisCode::ABS_Y.0,
-            abs_coordinate(y, height),
-        )?;
+        let (ax, ay) = (abs_coordinate(x, width), abs_coordinate(y, height));
+        // evdev drops an absolute value equal to the device's last one, so a
+        // repeat target after the human moved the real mouse would leave the
+        // cursor where the human put it. A one-unit (sub-pixel) step first
+        // makes the target always register as motion.
+        for (ax, ay) in [(nudge(ax), nudge(ay)), (ax, ay)] {
+            self.emit(EventType::ABSOLUTE, AbsoluteAxisCode::ABS_X.0, ax)?;
+            self.emit(EventType::ABSOLUTE, AbsoluteAxisCode::ABS_Y.0, ay)?;
+        }
         std::thread::sleep(Duration::from_millis(50));
         Ok(())
     }
@@ -1227,6 +1231,15 @@ impl Helper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nudge_stays_in_range_and_differs() {
+        for v in [0, 1, 1234, super::ABS_MAX] {
+            let n = super::nudge(v);
+            assert_ne!(n, v);
+            assert!((0..=super::ABS_MAX).contains(&n));
+        }
+    }
 
     #[test]
     fn key_specs_map_to_evdev_codes() {
