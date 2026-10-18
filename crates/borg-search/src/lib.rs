@@ -74,6 +74,13 @@ impl fmt::Display for SearchBackend {
 ///
 /// The effective choice for a call is, in order: the per-call `backend`
 /// argument, the user's `[search] backend` setting, BORG_SEARCH_BACKEND, Auto.
+/// Explicit choices stay preferred: only provider/transport failures trigger
+/// sequential fallback to other keyed backends (Exa, Firecrawl, Parallel, Brave).
+/// Missing credentials are skipped. Each route is attempted once; successful
+/// empty results and invalid requests do not trigger fallback. HTTP 401/402/403,
+/// 408/429 and 5xx, transport failures, and malformed JSON permit fallback.
+/// Auto retains its existing parallel federation, without duplicate retries.
+/// No sleeps, cooldown state, or implicit keyed-to-keyless fallback are added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchBackendChoice {
     #[default]
@@ -286,6 +293,79 @@ pub struct SearchResponse {
     pub warnings: Vec<String>,
 }
 
+// Keep provider bodies and transport URLs out of fallback diagnostics: either can
+// contain credentials. Unknown errors are terminal, never guessed from prose.
+#[derive(Debug)]
+struct ProviderFailure {
+    retryable: bool,
+    message: String,
+}
+
+impl fmt::Display for ProviderFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for ProviderFailure {}
+
+fn http_failure(status: reqwest::StatusCode, label: &str) -> anyhow::Error {
+    ProviderFailure {
+        retryable: matches!(status.as_u16(), 401 | 402 | 403 | 408 | 429)
+            || status.is_server_error(),
+        message: format!("{label} returned HTTP {}", status.as_u16()),
+    }
+    .into()
+}
+
+fn retryable_failure(error: &anyhow::Error) -> bool {
+    if let Some(failure) = error.downcast_ref::<ProviderFailure>() {
+        return failure.retryable;
+    }
+    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+        return error.is_timeout() || error.is_connect() || error.is_body() || error.is_decode();
+    }
+    error.downcast_ref::<serde_json::Error>().is_some()
+}
+
+fn failure_summary(error: &anyhow::Error) -> String {
+    if let Some(failure) = error.downcast_ref::<ProviderFailure>() {
+        return failure.to_string();
+    }
+    if retryable_failure(error) {
+        "provider transport or response failure".to_string()
+    } else {
+        "non-retryable search failure".to_string()
+    }
+}
+
+/// Try each route at most once, sequentially; a successful empty response is final.
+async fn search_routes<F, Fut>(routes: &[SearchBackend], mut search: F) -> Result<SearchResponse>
+where
+    F: FnMut(SearchBackend) -> Fut,
+    Fut: std::future::Future<Output = Result<SearchResponse>>,
+{
+    let mut warnings = Vec::new();
+    for &backend in routes {
+        match search(backend).await {
+            Ok(mut response) => {
+                warnings.append(&mut response.warnings);
+                response.warnings = warnings;
+                return Ok(response);
+            }
+            Err(error) => {
+                warnings.push(format!("{backend}: {}", failure_summary(&error)));
+                if !retryable_failure(&error) {
+                    bail!("web search stopped: {}", warnings.join("; "));
+                }
+            }
+        }
+    }
+    bail!(
+        "all available web-search routes failed: {}",
+        warnings.join("; ")
+    )
+}
+
 /// The only capability the agent/tool layer needs from a search implementation.
 #[async_trait]
 pub trait WebSearchProvider: Send + Sync {
@@ -321,8 +401,7 @@ impl SearchService {
         Ok(Self { config, client })
     }
 
-    /// Construct the service only when at least one usable key is present.
-    /// This keeps the web_search tool out of sessions that cannot execute it.
+    /// Construct when the selected route or a keyed fallback is available.
     pub fn from_env() -> Result<Option<Self>> {
         let config = SearchConfig::from_env()?;
         let configured = match config.backend {
@@ -333,7 +412,9 @@ impl SearchService {
             SearchBackendChoice::Brave => config.key_for(SearchBackend::Brave).is_some(),
             SearchBackendChoice::ExaMcp => true,
         };
-        configured.then(|| Self::new(config)).transpose()
+        (configured || !keyed_backends(&config).is_empty())
+            .then(|| Self::new(config))
+            .transpose()
     }
 
     pub fn configured_backend(&self) -> Option<SearchBackend> {
@@ -449,15 +530,13 @@ impl SearchService {
             .await
             .context("Exa MCP web search request failed")?;
         let status = response.status();
+        if !status.is_success() {
+            return Err(http_failure(status, "web search"));
+        }
         let text = response
             .text()
             .await
             .context("read Exa MCP web search response")?;
-        ensure!(
-            status.is_success(),
-            "Exa MCP web search returned HTTP {}",
-            status.as_u16()
-        );
         let payload = parse_mcp_sse_payload(&text).context("decode Exa MCP web search response")?;
         let blocks = mcp_result_text(&payload, &keyed_backends(&self.config))?;
         Ok(SearchResponse {
@@ -588,24 +667,42 @@ impl WebSearchProvider for SearchService {
                 );
                 self.search_auto(&backends, &request).await
             }
-            SearchBackendChoice::Exa => {
-                self.search_with_backend(SearchBackend::Exa, &request).await
-            }
-            SearchBackendChoice::Firecrawl => {
-                self.search_with_backend(SearchBackend::Firecrawl, &request)
-                    .await
-            }
-            SearchBackendChoice::Parallel => {
-                self.search_with_backend(SearchBackend::Parallel, &request)
-                    .await
-            }
-            SearchBackendChoice::Brave => {
-                self.search_with_backend(SearchBackend::Brave, &request)
-                    .await
-            }
-            SearchBackendChoice::ExaMcp => {
-                self.search_with_backend(SearchBackend::ExaMcp, &request)
-                    .await
+            choice => {
+                let preferred = match choice {
+                    SearchBackendChoice::Exa => SearchBackend::Exa,
+                    SearchBackendChoice::Firecrawl => SearchBackend::Firecrawl,
+                    SearchBackendChoice::Parallel => SearchBackend::Parallel,
+                    SearchBackendChoice::Brave => SearchBackend::Brave,
+                    SearchBackendChoice::ExaMcp => SearchBackend::ExaMcp,
+                    SearchBackendChoice::Auto => unreachable!(),
+                };
+                let mut routes = Vec::new();
+                let available =
+                    preferred == SearchBackend::ExaMcp || self.config.key_for(preferred).is_some();
+                if available {
+                    routes.push(preferred);
+                }
+                routes.extend(
+                    keyed_backends(&self.config)
+                        .into_iter()
+                        .filter(|b| *b != preferred),
+                );
+                if routes.is_empty() {
+                    bail!(
+                        "the {preferred} search backend is selected but {} is not set on this host and no keyed fallback is configured",
+                        preferred.credential_env().unwrap_or("its API key")
+                    );
+                }
+                let mut response = search_routes(&routes, |backend| {
+                    self.search_with_backend(backend, &request)
+                })
+                .await?;
+                if !available {
+                    response
+                        .warnings
+                        .insert(0, format!("{preferred}: skipped (credential unavailable)"));
+                }
+                Ok(response)
             }
         }
     }
@@ -671,7 +768,7 @@ fn merge_search_outcomes(
                 );
                 responses.push((backend, response));
             }
-            Err(error) => failures.push(format!("{backend}: {error:#}")),
+            Err(error) => failures.push(format!("{backend}: {}", failure_summary(&error))),
         }
     }
     if responses.is_empty() {
@@ -720,6 +817,9 @@ fn result_key(raw_url: &str) -> String {
 
 async fn response_json(response: reqwest::Response, label: &str) -> Result<Value> {
     let status = response.status();
+    if !status.is_success() {
+        return Err(http_failure(status, label));
+    }
     ensure!(
         response
             .content_length()
@@ -738,19 +838,6 @@ async fn response_json(response: reqwest::Response, label: &str) -> Result<Value
             "{label} response exceeded {MAX_RESPONSE_BYTES} bytes"
         );
         body.extend_from_slice(&chunk);
-    }
-    if !status.is_success() {
-        let detail = String::from_utf8_lossy(&body);
-        let detail = detail.trim();
-        bail!(
-            "{label} returned HTTP {}{}",
-            status.as_u16(),
-            if !detail.is_empty() {
-                format!(": {detail}")
-            } else {
-                String::new()
-            }
-        );
     }
     serde_json::from_slice(&body).with_context(|| format!("decode {label} JSON response"))
 }
@@ -792,13 +879,14 @@ fn parse_mcp_sse_payload(text: &str) -> Result<Value> {
 /// error can name a retry target. It names backends only, never credentials.
 fn mcp_result_text(payload: &Value, keyed: &[SearchBackend]) -> Result<String> {
     if let Some(error) = payload.get("error") {
-        bail!(
-            "Exa MCP web search failed: {}",
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error")
-        );
+        return Err(ProviderFailure {
+            retryable: !matches!(
+                error.get("code").and_then(Value::as_i64),
+                Some(-32700 | -32600 | -32601 | -32602)
+            ),
+            message: "Exa MCP web search failed (possibly rate limited)".to_string(),
+        }
+        .into());
     }
     let content = payload
         .pointer("/result/content")
@@ -835,13 +923,18 @@ fn mcp_result_text(payload: &Value, keyed: &[SearchBackend]) -> Result<String> {
                     .join(", ")
             )
         };
-        bail!(
-            "Exa MCP web search is rate limited on the keyless route; {retry}. Provider notice: {}",
-            text.trim()
-        );
+        return Err(ProviderFailure {
+            retryable: true,
+            message: format!("Exa MCP web search is rate limited on the keyless route; {retry}"),
+        }
+        .into());
     }
     if is_error {
-        bail!("Exa MCP web search failed: {}", text.trim());
+        return Err(ProviderFailure {
+            retryable: true,
+            message: "Exa MCP web search failed".into(),
+        }
+        .into());
     }
     ensure!(
         !text.trim().is_empty(),
@@ -1113,6 +1206,71 @@ fn host_matches(host: &str, raw_domain: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // These route-level tests prevent extra billed calls and accidental retries
+    // of invalid requests without making live, credential-dependent requests.
+    #[test]
+    fn fallback_is_sequential_and_preserves_the_request() {
+        futures::executor::block_on(async {
+            let mut request = SearchRequest::bounded("query", Some(2)).unwrap();
+            request.include_domains = vec!["example.com".into()];
+            request.exclude_domains = vec!["excluded.example.com".into()];
+            let original = request.clone();
+            let mut calls = Vec::new();
+            let response = search_routes(
+                &[
+                    SearchBackend::Exa,
+                    SearchBackend::Parallel,
+                    SearchBackend::Brave,
+                ],
+                |backend| {
+                    calls.push((backend, request.clone()));
+                    std::future::ready(if backend == SearchBackend::Exa {
+                        Err(http_failure(reqwest::StatusCode::TOO_MANY_REQUESTS, "Exa"))
+                    } else {
+                        Ok(SearchResponse {
+                            backend,
+                            query: request.query.clone(),
+                            request_id: None,
+                            results: vec![],
+                            backends: vec![],
+                            warnings: vec![],
+                        })
+                    })
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                calls,
+                vec![
+                    (SearchBackend::Exa, original.clone()),
+                    (SearchBackend::Parallel, original)
+                ]
+            );
+            assert_eq!(response.backend, SearchBackend::Parallel);
+            assert_eq!(response.warnings.len(), 1);
+        });
+    }
+
+    #[test]
+    fn invalid_request_failure_does_not_fall_back() {
+        futures::executor::block_on(async {
+            let mut calls = 0;
+            let result = search_routes(&[SearchBackend::Exa, SearchBackend::Parallel], |_| {
+                calls += 1;
+                std::future::ready(Err(http_failure(reqwest::StatusCode::BAD_REQUEST, "Exa")))
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls, 1);
+        });
+        assert!(!retryable_failure(&anyhow::anyhow!("cancelled")));
+        assert!(!retryable_failure(&http_failure(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "Exa"
+        )));
+    }
 
     #[test]
     fn auto_selection_prefers_exa_and_reports_all_configured_backends() {
@@ -1411,7 +1569,8 @@ mod tests {
             }
         });
         let error = mcp_result_text(&failed, &[]).expect_err("isError must be an error");
-        assert!(error.to_string().contains("upstream timeout"));
+        assert!(retryable_failure(&error));
+        assert!(!error.to_string().contains("upstream timeout"));
     }
 
     #[test]
