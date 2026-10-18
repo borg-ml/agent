@@ -18478,15 +18478,15 @@ fn history_loading_line() -> Line<'static> {
     ])
 }
 
+/// Waiting children are parked on their own work, so they count toward the
+/// total; the label says "waiting" only when nothing is running.
 fn agents_status_label(active_agents: usize, waiting_agents: usize) -> Option<String> {
-    let running = (active_agents > 0).then(|| {
-        format!(
-            "{active_agents} subagent{}",
-            if active_agents == 1 { "" } else { "s" }
-        )
-    });
-    let waiting = (waiting_agents > 0).then(|| format!("{waiting_agents} waiting"));
-    running.or(waiting)
+    let total = active_agents + waiting_agents;
+    match (total, active_agents) {
+        (0, _) => None,
+        (_, 0) => Some(format!("{total} waiting")),
+        _ => Some(format!("{total} subagent{}", if total == 1 { "" } else { "s" })),
+    }
 }
 
 fn agents_status_spinner_style(hovered: bool) -> Style {

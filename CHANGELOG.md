@@ -17,8 +17,8 @@ Git comparison.
   works even when a child's message queue is full.
 - Keep reading process output while the session journal is slow, instead of
   stalling or misreporting an inherited pipe.
-- TUI: show waiting agents with a distinct glyph, and show only the running
-  count in the agents label.
+- TUI: show waiting agents with a distinct glyph, and count waiting subagents
+  in the agents total; the label says "waiting" only when none are running.
 
 ## 0.17.1 (2026-10-18)
 
