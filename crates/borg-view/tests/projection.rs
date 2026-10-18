@@ -211,11 +211,15 @@ fn parent_has_one_child_summary_and_source_scoped_approval_without_child_bodies(
         snapshot
             .rows
             .iter()
-            .filter(|row| row.kind == borg_view::wire::RowKind::ChildSummary)
+            .filter(|row| row.kind == borg_view::wire::RowKind::ActionGroup)
             .count(),
         1
     );
-    assert_eq!(snapshot.rows[0].id, format!("child:{child}"));
+    assert_eq!(snapshot.rows[0].source_session_id, parent.to_string());
+    assert!(
+        matches!(&snapshot.rows[0].body, RowBody::ActionGroup { actions, .. }
+        if matches!(&actions[0], borg_view::wire::ActionRow::Lifecycle { target_session_id: Some(target), .. } if target == &child.to_string()))
+    );
     assert_eq!(
         snapshot.meta.approvals[0].source_session_id,
         child.to_string()
@@ -378,11 +382,11 @@ fn worker_lifecycle_is_independent_of_reports_and_stale_deliveries() {
         borg_view::wire::Lifecycle::Running
     ));
     assert!(matches!(
-        live.core.order[0],
+        &live.core.order[0],
         borg_view::entry::TranscriptEntry::Action {
-            state: borg_view::entry::TranscriptActionState::Running,
+            execution,
             ..
-        }
+        } if execution.state() == borg_view::entry::ExecutionState::Running
     ));
 
     let mut stale = agent.clone();
@@ -394,11 +398,11 @@ fn worker_lifecycle_is_independent_of_reports_and_stale_deliveries() {
     live.apply(history[2].clone());
     assert_eq!(live.core.subagents[&child], SubagentStatus::Running);
     assert!(matches!(
-        live.core.order[0],
+        &live.core.order[0],
         borg_view::entry::TranscriptEntry::Action {
-            state: borg_view::entry::TranscriptActionState::Running,
+            execution,
             ..
-        }
+        } if execution.state() == borg_view::entry::ExecutionState::Running
     ));
 
     let stale_approval = SessionEvent::new(
@@ -424,7 +428,7 @@ fn worker_lifecycle_is_independent_of_reports_and_stale_deliveries() {
         revision: 3,
     });
     agent.detail = Some("Waiting on 1 watcher(s): tests".into());
-    history.push(event(4, &agent, None));
+    history.push(event(5, &agent, None));
     live.apply(history[3].clone());
     assert_eq!(live.core.waiting_subagent_count(), 1);
     assert!(matches!(
@@ -432,11 +436,11 @@ fn worker_lifecycle_is_independent_of_reports_and_stale_deliveries() {
         borg_view::wire::Lifecycle::Waiting
     ));
     assert!(matches!(
-        live.core.order[0],
+        &live.core.order[0],
         borg_view::entry::TranscriptEntry::Action {
-            state: borg_view::entry::TranscriptActionState::Waiting,
+            execution,
             ..
-        }
+        } if execution.state() == borg_view::entry::ExecutionState::Waiting
     ));
     let mut replay = ViewReducer::new(parent, "replay".into());
     for event in history {
@@ -451,6 +455,46 @@ fn worker_lifecycle_is_independent_of_reports_and_stale_deliveries() {
         1,
         "worker summary is not an operation receipt per update"
     );
+    agent.status = SubagentStatus::Ready;
+    agent.lifecycle = Some(SubagentLifecycle::Ready);
+    agent.source = Some(SubagentSourceCursor {
+        child_sequence: 13,
+        revision: 4,
+    });
+    live.apply(event(6, &agent, None));
+    let terminal = serde_json::to_value(&live.core.order[0]).unwrap();
+    let terminal_wire = serde_json::to_value(&live.snapshot().rows[0]).unwrap();
+    let identity = live.core.order.identities[0];
+    agent.status = SubagentStatus::Running;
+    agent.lifecycle = Some(SubagentLifecycle::Running);
+    agent.source = Some(SubagentSourceCursor {
+        child_sequence: 14,
+        revision: 5,
+    });
+    live.apply(event(7, &agent, None));
+    assert_eq!(
+        live.core.order.len(),
+        2,
+        "waking a reusable child starts a fresh execution row"
+    );
+    assert_eq!(serde_json::to_value(&live.core.order[0]).unwrap(), terminal);
+    assert_ne!(live.core.order.identities[1], identity);
+    let snapshot = live.snapshot();
+    assert_eq!(
+        serde_json::to_value(&snapshot.rows[0]).unwrap(),
+        terminal_wire,
+        "old wire receipt must not change ID, body, state or revision when the entity wakes"
+    );
+    assert_ne!(snapshot.rows[0].id, snapshot.rows[1].id);
+    assert!(
+        snapshot
+            .rows
+            .iter()
+            .all(|row| row.source_session_id == parent.to_string())
+    );
+    assert!(snapshot.rows.iter().all(|row| matches!(&row.body, RowBody::ActionGroup { actions, .. }
+        if matches!(&actions[0], borg_view::wire::ActionRow::Lifecycle { target_session_id: Some(target), .. } if target == &child.to_string()))));
+    assert_eq!(live.core.subagents[&child], SubagentStatus::Running);
 }
 
 #[test]
@@ -725,10 +769,7 @@ fn nested_background_receipt_waits_for_terminal_completion_live_and_replay() {
     }
     assert!(matches!(
         &live.order[1],
-        TranscriptEntry::Tool {
-            complete: false,
-            ..
-        }
+        TranscriptEntry::Tool { execution, .. } if !execution.is_terminal()
     ));
     let settled_watch = SessionEvent::new(
         session,
@@ -752,12 +793,7 @@ fn nested_background_receipt_waits_for_terminal_completion_live_and_replay() {
     watched.apply_history(&settled_watch);
     assert!(watched.order.iter().all(|row| matches!(
         row,
-        TranscriptEntry::Tool {
-            complete: true,
-            backgrounded: false,
-            error: false,
-            ..
-        }
+        TranscriptEntry::Tool { execution, .. } if execution.is_terminal() && !execution.is_failed()
     )));
     events.push(SessionEvent::new(
         session,
@@ -780,12 +816,641 @@ fn nested_background_receipt_waits_for_terminal_completion_live_and_replay() {
     for projection in [&live, &replay] {
         assert!(projection.order.iter().all(|row| matches!(
             row,
-            TranscriptEntry::Tool {
-                complete: true,
-                backgrounded: false,
-                error: true,
-                ..
-            }
+            TranscriptEntry::Tool { execution, .. } if execution.is_failed()
         )));
+    }
+}
+
+// A compiler check cannot prove absorbing terminal transitions or immutable timing.
+#[test]
+fn execution_terminal_state_and_clock_are_absorbing() {
+    use borg_view::entry::{Execution, ExecutionState};
+    let start = chrono::Utc::now();
+    for terminal in [
+        ExecutionState::Complete,
+        ExecutionState::Received,
+        ExecutionState::Failed,
+        ExecutionState::Stopped,
+    ] {
+        let mut execution = Execution::new(start, ExecutionState::Running);
+        assert!(execution.transition(ExecutionState::Backgrounded, start));
+        assert!(!execution.is_terminal());
+        assert_eq!(execution.completed_at(), None);
+        let end = start + chrono::Duration::seconds(3);
+        assert!(execution.transition(terminal, end));
+        let settled = execution.clone();
+        for next in [
+            ExecutionState::Running,
+            ExecutionState::Waiting,
+            ExecutionState::Backgrounded,
+            ExecutionState::Complete,
+            ExecutionState::Failed,
+        ] {
+            assert!(!execution.transition(next, end + chrono::Duration::seconds(8)));
+            assert_eq!(execution, settled);
+        }
+        let serialized = serde_json::to_value(&execution).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Execution>(serialized.clone()).unwrap(),
+            execution
+        );
+        let mut invalid = serialized;
+        invalid["completed_at"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<Execution>(invalid).is_err());
+    }
+}
+
+// Late completion used to replace the result/timer; restarting reused the old identity.
+#[test]
+fn terminal_tool_ignores_late_updates_and_new_start_gets_fresh_identity() {
+    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    let session = Uuid::new_v4();
+    let mut core = TranscriptCore::default();
+    let start = |sequence| {
+        SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "call".into(),
+                name: "exec".into(),
+                input: serde_json::json!({"cmd":"true"}),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        )
+    };
+    let finish = |sequence, output: &str| {
+        SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "call".into(),
+                output: output.into(),
+                is_error: false,
+                output_ref: None,
+                input: None,
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        )
+    };
+    core.apply(&start(1));
+    core.apply(&finish(2, "done"));
+    let identity = core.order.identities[0];
+    let settled = serde_json::to_value(&core.order[0]).unwrap();
+    core.apply(&finish(3, "late replacement"));
+    core.apply(&SessionEvent::new(
+        session,
+        4,
+        SessionEventKind::ToolUpdated {
+            tool_call_id: "call".into(),
+            name: "exec".into(),
+            input: serde_json::json!({"cmd":"false"}),
+        },
+    ));
+    assert_eq!(serde_json::to_value(&core.order[0]).unwrap(), settled);
+    core.apply(&start(5));
+    assert_eq!(
+        core.order.len(),
+        1,
+        "a repeated start for the same call is not a new execution"
+    );
+    let mut fresh = start(6);
+    if let SessionEventKind::ToolStarted { tool_call_id, .. } = &mut fresh.kind {
+        *tool_call_id = "fresh-call".into();
+    }
+    core.apply(&fresh);
+    assert_eq!(core.order.len(), 2);
+    assert_eq!(core.order.identities[0], identity);
+    assert_ne!(core.order.identities[1], identity);
+    assert!(
+        matches!(&core.order[1], TranscriptEntry::Tool { execution, .. } if !execution.is_terminal())
+    );
+}
+
+// Lifecycle resolution must settle the transcript as well as remove metadata badges.
+#[test]
+fn approval_resolution_and_broadcast_completion_are_terminal() {
+    use borg_agent_runtime::ApprovalDecision;
+    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    let session = Uuid::new_v4();
+    let mut core = TranscriptCore::default();
+    core.apply(&SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::ApprovalRequested {
+            approval_id: "approval".into(),
+            title: "Run command".into(),
+            detail: String::new(),
+            command: None,
+        },
+    ));
+    core.apply(&SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::ApprovalResolved {
+            approval_id: "approval".into(),
+            decision: ApprovalDecision::Deny,
+        },
+    ));
+    assert!(core.meta.approvals.is_empty());
+    assert!(
+        matches!(&core.order[0], TranscriptEntry::Action { execution, .. } if execution.is_interrupted())
+    );
+    let id = Uuid::new_v4();
+    let update = |sequence, acknowledged| {
+        SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::TeamBroadcastUpdated {
+                message_id: id,
+                text: "work".into(),
+                recipient_ids: vec![Uuid::nil()],
+                acknowledged,
+                steered: false,
+            },
+        )
+    };
+    core.apply(&update(3, 1));
+    let settled = serde_json::to_value(&core.order[1]).unwrap();
+    core.apply(&update(4, 0));
+    assert_eq!(serde_json::to_value(&core.order[1]).unwrap(), settled);
+}
+
+// Failed partial provider snapshots are not terminal until a turn boundary or final answer.
+#[test]
+fn message_transport_failure_does_not_reopen_terminal_execution() {
+    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    let session = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    let mut core = TranscriptCore::default();
+    core.apply(&message(
+        session,
+        1,
+        id,
+        EventActor::Assistant,
+        "partial",
+        MessageStatus::Failed,
+    ));
+    assert!(
+        matches!(&core.order[0], TranscriptEntry::Message { execution, .. } if !execution.is_terminal())
+    );
+    core.apply(&message(
+        session,
+        2,
+        id,
+        EventActor::Assistant,
+        "final",
+        MessageStatus::Complete,
+    ));
+    let terminal = serde_json::to_value(&core.order[0]).unwrap();
+    core.apply(&message(
+        session,
+        3,
+        id,
+        EventActor::Assistant,
+        "late",
+        MessageStatus::Complete,
+    ));
+    core.apply(&message(
+        session,
+        4,
+        id,
+        EventActor::Assistant,
+        "late failure",
+        MessageStatus::Failed,
+    ));
+    assert_eq!(serde_json::to_value(&core.order[0]).unwrap(), terminal);
+}
+
+// The process lifetime, not tool transport or turn completion, owns terminal timing.
+#[test]
+fn active_process_survives_transport_return_and_interruption_until_exit() {
+    use borg_agent_runtime::RuntimeProcessStatus;
+    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    let session = Uuid::new_v4();
+    let process_id = Uuid::new_v4();
+    let mut core = TranscriptCore::default();
+    core.apply(&SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "process".into(),
+            name: "exec".into(),
+            input: serde_json::json!({"cmd":"long-test"}),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    core.apply(&SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::RuntimeProcessStarted {
+            process_id,
+            pid: 42,
+            command: "long-test".into(),
+            cwd: ".".into(),
+        },
+    ));
+    core.apply(&SessionEvent::new(
+        session,
+        3,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "process".into(),
+            output: "transport returned without a background marker".into(),
+            is_error: false,
+            output_ref: None,
+            input: None,
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    core.mark_running_tools_user_interrupted(chrono::Utc::now());
+    let TranscriptEntry::Tool { execution, .. } = &core.order[0] else {
+        panic!("missing process tool")
+    };
+    assert!(execution.is_backgrounded());
+    assert_eq!(execution.completed_at(), None);
+    core.apply(&SessionEvent::new(
+        session,
+        4,
+        SessionEventKind::RuntimeProcessCompleted {
+            process_id,
+            pid: 42,
+            status: RuntimeProcessStatus::TimedOut,
+            exit_code: None,
+            timed_out: true,
+            stdout: "partial output".into(),
+            stderr: String::new(),
+            stdout_omitted_bytes: 0,
+            stderr_omitted_bytes: 0,
+            error: None,
+            changes: Vec::new(),
+        },
+    ));
+    assert!(
+        matches!(&core.order[0], TranscriptEntry::Tool { execution, .. } if execution.is_failed() && execution.completed_at().is_some())
+    );
+}
+
+// A bounded live window must not forget admission when a terminal row is evicted.
+#[test]
+fn live_replay_cannot_resurrect_evicted_executions() {
+    let session = Uuid::new_v4();
+    let mut view = ViewReducer::new(session, "epoch".into());
+    let started = SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "old-call".into(),
+            name: "exec".into(),
+            input: serde_json::json!({"cmd":"true"}),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    );
+    let completed = SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "old-call".into(),
+            output: "done".into(),
+            is_error: false,
+            input: None,
+            input_ref: None,
+            output_ref: None,
+            parent_tool_call_id: None,
+        },
+    );
+    view.apply(started.clone());
+    view.apply(completed.clone());
+    for sequence in 3..140 {
+        view.apply(message(
+            session,
+            sequence,
+            Uuid::new_v4(),
+            EventActor::Assistant,
+            "prompt",
+            MessageStatus::Complete,
+        ));
+    }
+    assert!(!view.core.tools.contains_key("old-call"));
+    let before = serde_json::to_value(&view.core.order).unwrap();
+    view.apply(started);
+    view.apply(completed);
+    assert_eq!(serde_json::to_value(&view.core.order).unwrap(), before);
+}
+
+// Historical display ordering is not journal ordering, but subsequent live input is.
+#[test]
+fn reordered_history_preserves_earlier_output_and_fences_live_replay() {
+    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    let session = Uuid::new_v4();
+    let mut core = TranscriptCore::default();
+    core.apply_history(&message(
+        session,
+        10,
+        Uuid::new_v4(),
+        EventActor::User,
+        "forked prompt",
+        MessageStatus::Complete,
+    ));
+    let start = SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "historical".into(),
+            name: "exec".into(),
+            input: serde_json::json!({"cmd":"true"}),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    );
+    core.apply_history(&start);
+    core.apply_history(&SessionEvent::new(
+        session,
+        3,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "historical".into(),
+            output: "done".into(),
+            is_error: false,
+            input: None,
+            input_ref: None,
+            output_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    assert_eq!(core.order.len(), 2);
+    assert!(
+        matches!(&core.order[1], TranscriptEntry::Tool { execution, .. } if execution.is_terminal())
+    );
+    let before = serde_json::to_value(&core.order).unwrap();
+    core.apply(&start);
+    assert_eq!(serde_json::to_value(&core.order).unwrap(), before);
+    core.apply(&message(
+        session,
+        11,
+        Uuid::new_v4(),
+        EventActor::Assistant,
+        "new answer",
+        MessageStatus::Complete,
+    ));
+    assert_eq!(core.order.len(), 3);
+}
+
+// Raw and keyed late reasoning cannot create an unfinishable spinner after a turn.
+#[test]
+fn closed_turn_rejects_new_reasoning_sources() {
+    use borg_view::core::TranscriptCore;
+    let session = Uuid::new_v4();
+    let mut core = TranscriptCore::default();
+    core.apply(&SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::TurnCompleted {
+            message_id: Uuid::new_v4(),
+            provider_session_id: None,
+            final_text: String::new(),
+            error: None,
+        },
+    ));
+    core.apply(&SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::ReasoningDelta {
+            text: "late".into(),
+        },
+    ));
+    core.apply(&SessionEvent::new(
+        session,
+        3,
+        SessionEventKind::ProviderEvent {
+            provider: borg_agent_runtime::CodingProvider::Codex,
+            kind: "reasoning_snapshot".into(),
+            payload: serde_json::json!({"reasoning_id":"late", "text":"late", "complete":false}),
+        },
+    ));
+    assert!(core.order.is_empty());
+    assert_eq!(core.active_reasoning, None);
+}
+
+// Loading canonical archived text is not a new execution or a terminal transition.
+#[test]
+fn archived_reasoning_hydrates_payload_without_changing_terminal_receipt() {
+    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    let session = Uuid::new_v4();
+    let mut core = TranscriptCore::default();
+    let snapshot = |sequence, text, complete| {
+        SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: borg_agent_runtime::CodingProvider::Codex,
+                kind: "reasoning_snapshot".into(),
+                payload: serde_json::json!({"reasoning_id":"block", "text":text, "complete":complete}),
+            },
+        )
+    };
+    core.apply(&snapshot(1, "preview", false));
+    core.apply(&SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::ReasoningCompleted,
+    ));
+    let identity = core.order.identities[0];
+    let receipt = |entry: &TranscriptEntry| match entry {
+        TranscriptEntry::Tool {
+            execution,
+            name,
+            detail,
+            time,
+            outcome,
+            ..
+        } => (
+            execution.clone(),
+            name.clone(),
+            detail.clone(),
+            time.clone(),
+            outcome.clone(),
+        ),
+        _ => panic!("missing reasoning"),
+    };
+    let sealed = receipt(&core.order[0]);
+    core.apply(&snapshot(3, "canonical full reasoning text", true));
+    assert_eq!(receipt(&core.order[0]), sealed);
+    assert_eq!(core.order.identities[0], identity);
+    assert_eq!(core.order.len(), 1);
+    assert!(
+        matches!(&core.order[0], TranscriptEntry::Tool { code_view: Some((_, text)), .. } if text == "canonical full reasoning text")
+    );
+}
+
+// A progress frame is not authority to create a fresh execution in live input.
+#[test]
+fn unknown_tool_update_is_live_progress_only_but_history_can_reconstruct_it() {
+    use borg_view::core::TranscriptCore;
+    let event = SessionEvent::new(
+        Uuid::new_v4(),
+        1,
+        SessionEventKind::ToolUpdated {
+            tool_call_id: "unseen".into(),
+            name: "exec".into(),
+            input: serde_json::json!({"cmd":"true"}),
+        },
+    );
+    let mut live = TranscriptCore::default();
+    live.apply(&event);
+    assert!(live.order.is_empty());
+    let mut history = TranscriptCore::default();
+    history.apply_history(&event);
+    assert_eq!(history.order.len(), 1);
+}
+
+// Metadata and transcript receipts must admit against the same terminal execution.
+#[test]
+fn terminal_interaction_requests_cannot_resurrect_pending_metadata() {
+    use borg_agent_runtime::ApprovalDecision;
+    use borg_view::core::TranscriptCore;
+    let session = Uuid::new_v4();
+    let mut core = TranscriptCore::default();
+    let approval = |sequence| {
+        SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::ApprovalRequested {
+                approval_id: "approval".into(),
+                title: "Run".into(),
+                detail: String::new(),
+                command: None,
+            },
+        )
+    };
+    let interaction = |sequence| {
+        SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::ProviderInteractionRequested {
+                interaction_id: "question".into(),
+                kind: "question".into(),
+                title: "Choose".into(),
+                detail: String::new(),
+                payload: serde_json::json!({}),
+            },
+        )
+    };
+    core.apply(&approval(1));
+    core.apply(&SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::ApprovalResolved {
+            approval_id: "approval".into(),
+            decision: ApprovalDecision::AllowOnce,
+        },
+    ));
+    core.apply(&interaction(3));
+    core.apply(&SessionEvent::new(
+        session,
+        4,
+        SessionEventKind::ProviderInteractionResolved {
+            interaction_id: "question".into(),
+            response: serde_json::json!({}),
+        },
+    ));
+    let rows = serde_json::to_value(&core.order).unwrap();
+    let mut metadata = serde_json::to_value(&core.meta).unwrap();
+    metadata.as_object_mut().unwrap().remove("source_sequence");
+    core.apply(&approval(5));
+    core.apply(&interaction(6));
+    assert_eq!(serde_json::to_value(&core.order).unwrap(), rows);
+    let mut after = serde_json::to_value(&core.meta).unwrap();
+    after.as_object_mut().unwrap().remove("source_sequence");
+    assert_eq!(
+        after, metadata,
+        "only the source admission cursor may advance"
+    );
+    assert_eq!(core.meta.source_sequence.as_deref(), Some("6"));
+}
+
+// Finishing unrelated work must not mark sealed receipts dirty or revise them on the wire.
+#[test]
+fn terminal_wire_receipts_do_not_churn_on_unrelated_completion_or_interrupt() {
+    let session = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let mut view = ViewReducer::new(session, "epoch".into());
+    view.apply(SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "finished".into(),
+            name: "exec".into(),
+            input: serde_json::json!({"cmd":"true"}),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    view.apply(SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "finished".into(),
+            output: "done".into(),
+            is_error: false,
+            input: None,
+            input_ref: None,
+            output_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    view.apply(message(
+        session,
+        3,
+        message_id,
+        EventActor::Assistant,
+        "answer",
+        MessageStatus::Complete,
+    ));
+    let sealed = view
+        .snapshot()
+        .rows
+        .into_iter()
+        .filter(|row| !row.id.starts_with("group:"))
+        .map(|row| (row.id.clone(), serde_json::to_value(row).unwrap()))
+        .collect::<HashMap<_, _>>();
+    let events = [
+        SessionEvent::new(
+            session,
+            4,
+            SessionEventKind::TurnCompleted {
+                message_id: Uuid::new_v4(),
+                provider_session_id: None,
+                final_text: String::new(),
+                error: None,
+            },
+        ),
+        SessionEvent::new(
+            session,
+            5,
+            SessionEventKind::StatusChanged {
+                status: borg_agent_runtime::SessionStatus::Stopped,
+                lifecycle: None,
+                detail: Some("interrupted".into()),
+            },
+        ),
+    ];
+    for event in events {
+        view.apply(event);
+        for row in view
+            .snapshot()
+            .rows
+            .into_iter()
+            .filter(|row| !row.id.starts_with("group:"))
+        {
+            assert_eq!(
+                serde_json::to_value(&row).unwrap(),
+                sealed[&row.id],
+                "sealed row {} changed",
+                row.id
+            );
+        }
     }
 }

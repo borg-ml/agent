@@ -5513,7 +5513,15 @@ impl BorgTerminal {
         }
         let identity = self.transcript.order.identities.get(index).copied()?;
         let entry = self.transcript.order.get(index)?;
-        if is_reasoning_entry(entry) {
+        if is_reasoning_entry(entry)
+            || matches!(
+                entry,
+                TranscriptEntry::Action {
+                    source_session_id: Some(_),
+                    ..
+                }
+            )
+        {
             return Some(ActionInspectorAnchor::Entry(identity));
         }
         if let Some((id, _)) = self.transcript.tools.iter().find(|(_, row)| **row == index) {
@@ -7019,9 +7027,11 @@ impl BorgTerminal {
         let (title, options) = match self.transcript.order.get(index) {
             Some(TranscriptEntry::Message {
                 actor: EventActor::User,
-                complete: true,
+                execution,
                 ..
-            }) => ("Message actions", vec!["Revert to here", "Copy message"]),
+            }) if execution.is_terminal() => {
+                ("Message actions", vec!["Revert to here", "Copy message"])
+            }
             // Not yet admitted by the provider, so there is nothing to revert to.
             Some(TranscriptEntry::Message {
                 actor: EventActor::User,
@@ -7036,19 +7046,22 @@ impl BorgTerminal {
             Some(TranscriptEntry::Info { .. }) => ("Card actions", vec!["Copy details"]),
             Some(TranscriptEntry::Action { .. }) => ("Action details", vec!["Copy action"]),
             Some(TranscriptEntry::Compaction {
-                complete: true,
+                execution,
                 summary,
                 sequence,
                 ..
-            }) if *sequence > 0 && compaction_has_expandable_detail(summary) => (
-                "Compaction actions",
-                vec!["Revert to after compaction", "Copy compaction summary"],
-            ),
+            }) if execution.is_terminal()
+                && *sequence > 0
+                && compaction_has_expandable_detail(summary) =>
+            {
+                (
+                    "Compaction actions",
+                    vec!["Revert to after compaction", "Copy compaction summary"],
+                )
+            }
             Some(TranscriptEntry::Compaction {
-                complete: true,
-                summary,
-                ..
-            }) if compaction_has_expandable_detail(summary) => {
+                execution, summary, ..
+            }) if execution.is_terminal() && compaction_has_expandable_detail(summary) => {
                 ("Compaction actions", vec!["Copy compaction summary"])
             }
             _ => return UiAction::None,
@@ -12379,7 +12392,8 @@ fn active_goal_for_view<'a>(
 }
 
 fn entry_action_runs_directly(entry: &TranscriptEntry, option_count: usize) -> bool {
-    option_count == 1 && !matches!(entry, TranscriptEntry::Compaction { complete: true, .. })
+    option_count == 1
+        && !matches!(entry, TranscriptEntry::Compaction { execution, .. } if execution.is_terminal())
 }
 
 fn is_composer_newline(keymap: &KeyMap, key: &KeyEvent) -> bool {
@@ -13235,6 +13249,17 @@ fn message_thread_target(
     director_id: Uuid,
     agents: &HashMap<Uuid, SubagentSnapshot>,
 ) -> Option<TeamRosterTarget> {
+    if let Some(TranscriptEntry::Action {
+        source_session_id: Some(id),
+        ..
+    }) = transcript.order.get(index)
+    {
+        return Some(if *id == director_id {
+            TeamRosterTarget::Director
+        } else {
+            TeamRosterTarget::Child(*id)
+        });
+    }
     let TranscriptEntry::Tool {
         source_name,
         code_view: Some((language, input)),
@@ -14515,6 +14540,7 @@ fn focused_subagent_status_color(status: SessionStatus, focused_subagent: bool) 
 fn transcript_action_glyph(state: TranscriptActionState) -> &'static str {
     match state {
         TranscriptActionState::Running => "◇",
+        TranscriptActionState::Backgrounded => "↗",
         TranscriptActionState::Waiting => "?",
         TranscriptActionState::Complete => "✓",
         TranscriptActionState::Received => "↙",

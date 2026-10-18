@@ -1,9 +1,12 @@
 use borg_view::core::*;
+#[cfg(test)]
+use borg_view::entry::Execution;
+use borg_view::entry::ExecutionState;
 use borg_view::entry::{
     ToolRunWindow, TranscriptActionKind, TranscriptActionState, TranscriptEntry,
 };
 use borg_view::grouping::{is_reasoning_entry, same_action_type};
-use borg_view::semantics::{command_output_without_changes, outcome_is_failure};
+use borg_view::semantics::command_output_without_changes;
 const USER_INTERRUPT_ACTIVITY: &str = "agent interrupted by user";
 /// The readout counts whole seconds, so the timer is repainted once per
 /// second rather than ten times for a digit nobody can read.
@@ -311,11 +314,9 @@ struct RenderResume {
 /// The part of an entry's rows that follows the render clock.
 fn render_clock_key(entry: &TranscriptEntry, now: DateTime<Utc>) -> Option<String> {
     match entry {
-        TranscriptEntry::Tool {
-            started_at,
-            completed_at,
-            ..
-        } => format_tool_elapsed_at(*started_at, *completed_at, now),
+        TranscriptEntry::Tool { execution, .. } => {
+            format_tool_elapsed_at(execution.started_at(), execution.completed_at(), now)
+        }
         TranscriptEntry::Goal { goal, .. } => format_elapsed_duration(goal_live_seconds(goal, now)),
         _ => None,
     }
@@ -323,11 +324,10 @@ fn render_clock_key(entry: &TranscriptEntry, now: DateTime<Utc>) -> Option<Strin
 
 fn format_tool_group_elapsed_at(entries: &[TranscriptEntry], now: DateTime<Utc>) -> Option<String> {
     let times = entries.iter().filter_map(|entry| match entry {
-        TranscriptEntry::Tool {
-            started_at,
-            completed_at,
-            ..
-        } => Some((*started_at, completed_at.unwrap_or(now))),
+        TranscriptEntry::Tool { execution, .. } => Some((
+            execution.started_at(),
+            execution.completed_at().unwrap_or(now),
+        )),
         _ => None,
     });
     let started_at = times.clone().map(|(start, _)| start).min()?;
@@ -430,31 +430,20 @@ const TOOL_WINDOW_HEADER_INDENT: &str = "▾ ";
 fn action_label_style(entry: &TranscriptEntry) -> Style {
     match entry {
         TranscriptEntry::Tool {
-            name,
-            error,
-            outcome,
-            user_interrupted,
-            backgrounded,
-            ..
+            name, execution, ..
         } => {
             if is_reasoning_entry(entry) {
                 Style::default()
                     .fg(Color::Gray)
                     .add_modifier(Modifier::BOLD | Modifier::ITALIC)
             } else if matches!(
-                borg_view::entry::tool_lifecycle_state(
-                    true,
-                    *error,
-                    *user_interrupted,
-                    *backgrounded,
-                    outcome.as_deref()
-                ),
+                execution.lifecycle(),
                 borg_view::wire::Lifecycle::Failed | borg_view::wire::Lifecycle::Stopped
             ) {
                 Style::default()
                     .fg(Color::LightRed)
                     .add_modifier(Modifier::BOLD)
-            } else if *backgrounded {
+            } else if execution.is_backgrounded() {
                 Style::default()
                     .fg(USER_LABEL_BLUE)
                     .add_modifier(Modifier::BOLD)
@@ -470,9 +459,9 @@ fn action_label_style(entry: &TranscriptEntry) -> Style {
                     .add_modifier(Modifier::BOLD)
             }
         }
-        TranscriptEntry::Action { kind, state, .. } => {
-            Style::default().fg(transcript_action_color(*kind, *state))
-        }
+        TranscriptEntry::Action {
+            kind, execution, ..
+        } => Style::default().fg(transcript_action_color(*kind, execution.state())),
         _ => Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
@@ -711,7 +700,34 @@ impl Transcript {
     }
 
     fn project_optimistic_message(&mut self, event: &SessionEvent) {
-        let _ = self.apply(event);
+        let mut placeholder = event.clone();
+        if event.sequence == 0
+            && let SessionEventKind::Message {
+                actor: EventActor::User,
+                status,
+                ..
+            } = &mut placeholder.kind
+        {
+            *status = MessageStatus::InProgress;
+        }
+        let _ = self.apply(&placeholder);
+        if event.sequence == 0
+            && let SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                status,
+                ..
+            } = &event.kind
+            && let Some(index) = self.messages.get(message_id).copied()
+            && let Some(TranscriptEntry::Message {
+                execution,
+                status: row_status,
+                ..
+            }) = self.order.get_mut(index)
+        {
+            execution.transition(ExecutionState::Waiting, event.created_at);
+            *row_status = *status;
+        }
         self.live_turn_closed = false;
         if event.sequence == 0
             && let SessionEventKind::Message {
@@ -951,10 +967,10 @@ impl Transcript {
         if let Some(TranscriptEntry::Compaction {
             expanded,
             summary,
-            complete,
+            execution,
             ..
         }) = self.order.get_mut(index)
-            && *complete
+            && execution.is_terminal()
             && compaction_has_expandable_detail(summary)
         {
             *expanded = !*expanded;
@@ -966,24 +982,24 @@ impl Transcript {
             self.order.get(index),
             Some(TranscriptEntry::Compaction {
                 summary,
-                complete: true,
+                execution,
                 ..
-            }) if compaction_has_expandable_detail(summary)
+            }) if execution.is_terminal() && compaction_has_expandable_detail(summary)
         )
     }
 
     fn inspector_heading(&self, index: usize) -> Option<(&str, bool)> {
         match self.order.get(index)? {
-            TranscriptEntry::Tool { name, complete, .. } => Some((name, *complete)),
-            TranscriptEntry::Action { label, state, .. } => Some((
-                label,
-                !matches!(
-                    state,
-                    TranscriptActionState::Running | TranscriptActionState::Waiting
-                ),
-            )),
+            TranscriptEntry::Tool {
+                name, execution, ..
+            } => Some((name, execution.is_terminal())),
+            TranscriptEntry::Action {
+                label, execution, ..
+            } => Some((label, execution.is_terminal())),
             TranscriptEntry::Plan { .. } => Some(("Plan", true)),
-            TranscriptEntry::Compaction { complete, .. } => Some(("Compaction", *complete)),
+            TranscriptEntry::Compaction { execution, .. } => {
+                Some(("Compaction", execution.is_terminal()))
+            }
             _ => None,
         }
     }
@@ -1009,13 +1025,13 @@ impl Transcript {
         let TranscriptEntry::Compaction {
             summary,
             sequence,
-            complete,
+            execution,
             ..
         } = self.order.get(index)?
         else {
             return None;
         };
-        (*complete && *sequence > 0 && compaction_has_expandable_detail(summary))
+        (execution.is_terminal() && *sequence > 0 && compaction_has_expandable_detail(summary))
             .then(|| sequence.checked_add(1))
             .flatten()
     }
@@ -1094,13 +1110,15 @@ impl Transcript {
             TranscriptEntry::Compaction {
                 summary,
                 expanded,
-                complete: true,
+                execution,
                 ..
-            } if compaction_has_expandable_detail(summary) => Some(if *expanded {
-                "click collapse · right-click actions"
-            } else {
-                "click expand · right-click actions"
-            }),
+            } if execution.is_terminal() && compaction_has_expandable_detail(summary) => {
+                Some(if *expanded {
+                    "click collapse · right-click actions"
+                } else {
+                    "click expand · right-click actions"
+                })
+            }
             TranscriptEntry::Plan {
                 items, expanded, ..
             } if items.len() > MAX_COLLAPSED_PLAN_ITEMS => Some(if *expanded {
@@ -1122,14 +1140,16 @@ impl Transcript {
 
     fn foreground_action_id(&self, index: usize) -> Option<String> {
         let TranscriptEntry::Tool {
-            complete: false,
-            backgrounded: false,
+            execution,
             code_view,
             ..
         } = self.order.get(index)?
         else {
             return None;
         };
+        if execution.is_terminal() || execution.is_backgrounded() {
+            return None;
+        }
         if code_view
             .as_ref()
             .is_some_and(|(language, _)| language == "reasoning")
@@ -1204,7 +1224,7 @@ impl Transcript {
             detail,
             code_view,
             output_view,
-            error,
+            execution,
             payload_refs,
             ..
         }) = self.order.get_mut(index)
@@ -1233,10 +1253,10 @@ impl Transcript {
                     source_name,
                     &serde_json::Value::Null,
                     Some(&run_output),
-                    *error,
+                    execution.is_failed(),
                 );
                 // Loading an old receipt must not revive a settled background job.
-                let edit_diff = (!*error)
+                let edit_diff = (!execution.is_failed())
                     .then(|| hydrated_presentation.output.clone())
                     .flatten()
                     .filter(|body| is_diff_language(&body.language));
@@ -1254,7 +1274,7 @@ impl Transcript {
                     }
                     *output_view = if is_mcp_resource_probe(source_name) {
                         None
-                    } else if *error
+                    } else if execution.is_failed()
                         && !run_output.trim().is_empty()
                         && hydrated_presentation
                             .output
@@ -1270,7 +1290,8 @@ impl Transcript {
             SessionPayloadKind::ToolResultInput => {
                 let input: serde_json::Value = serde_json::from_slice(&bytes)
                     .context("stored tool result input is not valid JSON")?;
-                let presentation = project_tool_presentation(source_name, &input, None, *error);
+                let presentation =
+                    project_tool_presentation(source_name, &input, None, execution.is_failed());
                 if presentation.category != ToolPresentationCategory::Edit
                     && let Some(body) = presentation.input
                 {
@@ -1293,14 +1314,14 @@ impl Transcript {
                 (*tool_index == index).then(|| tool_call_id.clone())
             })
             && let Some(TranscriptEntry::Tool {
-                time,
-                completed_at: Some(completed_at),
-                ..
+                time, execution, ..
             }) = self.order.get(index)
+            && let Some(completed_at) = execution.completed_at()
         {
             let time = time.clone();
-            let completed_at = *completed_at;
-            self.upsert_command_edit(&tool_call_id, edit, time, completed_at, None);
+            if !self.hydrate_command_edit(&tool_call_id, &edit) {
+                self.upsert_command_edit(&tool_call_id, edit, time, completed_at, None);
+            }
         }
         Ok(())
     }
@@ -1372,16 +1393,7 @@ impl Transcript {
         while let Some(entry) = self.order.get(end)
             && same_action_type(first, entry)
         {
-            live |= matches!(
-                entry,
-                TranscriptEntry::Tool {
-                    complete: false,
-                    ..
-                } | TranscriptEntry::Action {
-                    state: TranscriptActionState::Running | TranscriptActionState::Waiting,
-                    ..
-                }
-            );
+            live |= matches!(entry, TranscriptEntry::Tool { execution, .. } | TranscriptEntry::Action { execution, .. } if !execution.is_terminal());
             end += 1;
         }
         let next_is_action = matches!(
@@ -1748,37 +1760,43 @@ impl Transcript {
 
     fn active_shell_rows(&self) -> Vec<(String, Option<usize>)> {
         let mut claimed_tools = HashSet::new();
-        let mut rows = self
-            .order
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| match entry {
-                TranscriptEntry::Tool {
-                    source_name,
-                    name,
-                    detail,
-                    complete: false,
-                    error: false,
-                    user_interrupted: false,
-                    backgrounded: true,
-                    ..
-                } if tool_can_start_background_process(source_name) => {
-                    claimed_tools.insert(index);
-                    Some((
-                        compact_text(
-                            if detail.trim().is_empty() {
-                                name
-                            } else {
-                                detail
-                            },
-                            120,
-                        ),
-                        Some(index),
-                    ))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let mut rows =
+            self.order
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| match entry {
+                    TranscriptEntry::Tool {
+                        source_name,
+                        name,
+                        detail,
+                        execution,
+                        ..
+                    } if execution.is_backgrounded()
+                        && tool_can_start_background_process(source_name)
+                        && !self
+                            .provider_backgrounds
+                            .values()
+                            .any(|process| process.tool_index == index)
+                        && !self.runtime_processes.values().any(|process| {
+                            process.running && process.tool_index == Some(index)
+                        }) =>
+                    {
+                        claimed_tools.insert(index);
+                        Some((
+                            compact_text(
+                                if detail.trim().is_empty() {
+                                    name
+                                } else {
+                                    detail
+                                },
+                                120,
+                            ),
+                            Some(index),
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
         let watch_ids: HashSet<Uuid> = self.watches.iter().map(|watch| watch.watch_id).collect();
         rows.extend(
             self.runtime_processes
@@ -1923,9 +1941,9 @@ impl Transcript {
             matches!(
                 self.order.get(*index),
                 Some(TranscriptEntry::Tool {
-                    complete: false,
+                    execution,
                     ..
-                })
+                }) if !execution.is_terminal()
             ) && windows.get(*index).is_some_and(Option::is_some)
         }) {
             return Vec::new();
@@ -1933,15 +1951,16 @@ impl Transcript {
         indices
             .into_iter()
             .filter_map(|index| match self.order.get(index) {
-                Some(TranscriptEntry::Tool {
-                    started_at,
-                    completed_at,
-                    complete: false,
-                    ..
-                }) => Some((
-                    index,
-                    format_tool_elapsed_at(*started_at, *completed_at, now),
-                )),
+                Some(TranscriptEntry::Tool { execution, .. }) if !execution.is_terminal() => {
+                    Some((
+                        index,
+                        format_tool_elapsed_at(
+                            execution.started_at(),
+                            execution.completed_at(),
+                            now,
+                        ),
+                    ))
+                }
                 _ => None,
             })
             .collect()
@@ -1950,7 +1969,7 @@ impl Transcript {
     fn has_running_tool(&self) -> bool {
         self.order.iter().any(|entry| {
             matches!(entry,
-                TranscriptEntry::Tool { complete, backgrounded, .. } if !*complete || *backgrounded
+                TranscriptEntry::Tool { execution,  .. } if !execution.is_terminal()
             )
         })
     }
@@ -1961,12 +1980,9 @@ impl Transcript {
             Some(TranscriptEntry::Tool {
                 name,
                 code_view,
-                complete,
-                backgrounded,
-                error: false,
-                user_interrupted: false,
+                execution,
                 ..
-            }) if *backgrounded || (!*complete && !tool_action_is_instant(
+            }) if !execution.is_terminal() && (execution.is_backgrounded() || !tool_action_is_instant(
                 name,
                 code_view.as_ref().map(|(language, _)| language.as_str()),
             ))
@@ -2129,14 +2145,14 @@ impl Transcript {
         if self.order[window.start..window.end].iter().any(|entry| {
             matches!(
                 entry,
-                TranscriptEntry::Tool { complete, backgrounded, .. } if !*complete || *backgrounded
+                TranscriptEntry::Tool { execution,  .. } if !execution.is_terminal()
             ) || matches!(
                 entry,
                 TranscriptEntry::Action {
-                    state: TranscriptActionState::Running | TranscriptActionState::Waiting,
+                    execution,
                     ..
                 }
-            )
+             if !execution.is_terminal())
         }) {
             return true;
         }
@@ -2161,9 +2177,9 @@ impl Transcript {
                                 entry,
                                 TranscriptEntry::Message {
                                     actor: EventActor::Assistant | EventActor::User,
-                                    complete: true,
+                                    execution,
                                     ..
-                                }
+                                } if execution.is_terminal()
                             )
                         }))
             })
@@ -2349,7 +2365,7 @@ impl Transcript {
             return false;
         };
         if cached.width() != current.width()
-            || (matches!(self.order[index], TranscriptEntry::Tool { .. })
+            || (matches!(&self.order[index], TranscriptEntry::Tool { .. })
                 && width <= current.width().max(8) + 6)
         {
             return false;
@@ -2602,17 +2618,7 @@ impl Transcript {
                 let summary_entry = self.order[window.start..window.end]
                     .iter()
                     .find(|entry| {
-                        matches!(
-                            entry,
-                            TranscriptEntry::Tool {
-                                complete: false,
-                                ..
-                            } | TranscriptEntry::Action {
-                                state: TranscriptActionState::Running
-                                    | TranscriptActionState::Waiting,
-                                ..
-                            }
-                        )
+                        matches!(entry, TranscriptEntry::Tool { execution, .. } | TranscriptEntry::Action { execution, .. } if !execution.is_terminal())
                     })
                     .unwrap_or(entry);
                 let label = match summary_entry {
@@ -2635,31 +2641,31 @@ impl Transcript {
                 let timer_entry = (window.start..window.end)
                     .find(|index| {
                         matches!(
-                            self.order[*index],
+                            &self.order[*index],
                             TranscriptEntry::Tool {
-                                completed_at: None,
+                                execution,
                                 ..
-                            }
+                            } if execution.completed_at().is_none()
                         )
                     })
                     .or_else(|| {
                         (window.start..window.end).rev().find(|index| {
-                            matches!(self.order[*index], TranscriptEntry::Tool { .. })
+                            matches!(&self.order[*index], TranscriptEntry::Tool { .. })
                         })
                     });
                 if let Some(timer) = timer_entry
-                    && let TranscriptEntry::Tool {
-                        started_at,
-                        completed_at,
-                        ..
-                    } = &self.order[timer]
+                    && let TranscriptEntry::Tool { execution, .. } = &self.order[timer]
                 {
-                    if completed_at.is_none() {
+                    if execution.completed_at().is_none() {
                         trace.clock_rows.push(timer);
                         trace.clock_groups.push(window);
                         running_tool_elapsed.push((
                             timer,
-                            format_tool_elapsed_at(*started_at, *completed_at, render_time),
+                            format_tool_elapsed_at(
+                                execution.started_at(),
+                                execution.completed_at(),
+                                render_time,
+                            ),
                         ));
                     }
                     if let Some(elapsed) = format_tool_group_elapsed_at(
@@ -2730,8 +2736,7 @@ impl Transcript {
                     effort,
                     time,
                     status: _,
-                    complete,
-                    user_interrupted,
+                    execution,
                     redirected,
                 } => {
                     if message_row_hidden(entry) {
@@ -2955,15 +2960,17 @@ impl Transcript {
                             lines.push(line);
                         }
                     }
-                    if *actor == EventActor::Assistant && !complete {
+                    if *actor == EventActor::Assistant && !execution.is_terminal() {
                         trace.running_tool_rows.push(index);
                     }
-                    if *actor == EventActor::Assistant && !complete && !running_tool {
+                    if *actor == EventActor::Assistant && !execution.is_terminal() && !running_tool
+                    {
                         lines.push(Line::from(Span::styled(
                             "    ◌ responding",
                             Style::default().fg(Color::Cyan),
                         )));
-                    } else if *actor == EventActor::Assistant && (*user_interrupted || *redirected)
+                    } else if *actor == EventActor::Assistant
+                        && (execution.is_interrupted() || *redirected)
                     {
                         lines.push(Line::from(Span::styled(
                             if *redirected {
@@ -2983,7 +2990,7 @@ impl Transcript {
                     let message_end = if is_chat_message {
                         lines.push(Line::default());
                         let end = lines.len();
-                        if !defer_completed_message_backgrounds || !*complete {
+                        if !defer_completed_message_backgrounds || !execution.is_terminal() {
                             let background = if hovered_message == Some(index) {
                                 MESSAGE_HOVER_BG
                             } else {
@@ -2999,7 +3006,7 @@ impl Transcript {
                     };
                     // A sent message waiting behind a running tool is not
                     // complete yet, but its text is final and copyable.
-                    if is_chat_message && (*complete || *actor == EventActor::User) {
+                    if is_chat_message && (execution.is_terminal() || *actor == EventActor::User) {
                         message_rows.push((index, message_background_start, message_end));
                     }
                     selection_rows.push(SelectionRowRange::transcript_entry(
@@ -3046,8 +3053,9 @@ impl Transcript {
                     detail,
                     body,
                     time,
-                    state,
+                    execution,
                     expanded,
+                    ..
                 } => {
                     let time = if tool_window.is_some() {
                         String::new()
@@ -3055,8 +3063,8 @@ impl Transcript {
                         format!("{}  ", display_local_time(time, &today_prefix))
                     };
                     let prefix = "  ";
-                    let glyph = transcript_action_glyph(*state);
-                    let color = transcript_action_color(*kind, *state);
+                    let glyph = transcript_action_glyph(execution.state());
+                    let color = transcript_action_color(*kind, execution.state());
                     let mut summary = if detail.is_empty() {
                         format!("{time}{glyph} {label}")
                     } else {
@@ -3343,17 +3351,18 @@ impl Transcript {
                     summary,
                     time,
                     expanded,
-                    complete,
+                    execution,
                     ..
                 } => {
                     let time = display_local_time(time, &today_prefix);
-                    let expandable = *complete && compaction_has_expandable_detail(summary);
-                    let title = if *complete || focused_tool == Some(index) {
+                    let expandable =
+                        execution.is_terminal() && compaction_has_expandable_detail(summary);
+                    let title = if execution.is_terminal() || focused_tool == Some(index) {
                         "Compacted context".to_string()
                     } else {
                         compact_text(summary, 180)
                     };
-                    let detail = if *complete && focused_tool != Some(index) {
+                    let detail = if execution.is_terminal() && focused_tool != Some(index) {
                         let detail = summary
                             .strip_prefix("Compacted context")
                             .unwrap_or(summary)
@@ -3406,12 +3415,7 @@ impl Transcript {
                     code_view,
                     output_view,
                     time,
-                    started_at,
-                    completed_at,
-                    complete,
-                    error,
-                    user_interrupted,
-                    backgrounded,
+                    execution,
                     expanded,
                     outcome,
                     ..
@@ -3438,14 +3442,16 @@ impl Transcript {
                         code_view.as_ref().map(|(language, _)| language.as_str()),
                     );
                     let summary_start = lines.len();
-                    let failed = *error || outcome.as_deref().is_some_and(outcome_is_failure);
+                    let failed = execution.is_failed();
                     let glyph = if failed {
                         "!"
-                    } else if *user_interrupted {
+                    } else if execution.is_interrupted() {
                         "■"
-                    } else if *backgrounded {
+                    } else if execution.is_backgrounded() {
                         "↗"
-                    } else if *complete && (!is_instant || is_command_tool(source_name)) {
+                    } else if execution.is_terminal()
+                        && (!is_instant || is_command_tool(source_name))
+                    {
                         tool_kind_marker(name, is_reasoning)
                     } else {
                         "◇"
@@ -3455,29 +3461,30 @@ impl Transcript {
                     } else {
                         Style::default().fg(Color::DarkGray)
                     };
-                    let style = if failed || *user_interrupted {
+                    let style = if failed || execution.is_interrupted() {
                         Style::default().fg(Color::Red)
-                    } else if *backgrounded {
+                    } else if execution.is_backgrounded() {
                         Style::default().fg(USER_LABEL_BLUE)
                     } else {
                         gutter_style
                     };
                     let name_style = action_label_style(entry);
                     let is_edit = is_edit_tool(source_name, name);
-                    let lifecycle = if *user_interrupted {
+                    let lifecycle = if execution.is_interrupted() {
                         Some("user interrupted")
-                    } else if *backgrounded {
+                    } else if execution.is_backgrounded() {
                         Some("Running in background")
                     } else {
                         None
                     };
-                    let lifecycle_complete = *complete && !*backgrounded;
+                    let lifecycle_complete =
+                        execution.is_terminal() && !execution.is_backgrounded();
                     let display_name = if is_reasoning {
                         Cow::Borrowed(name.as_str())
                     } else {
                         tool_lifecycle_label(name, lifecycle_complete)
                     };
-                    let show_tool_body = *complete
+                    let show_tool_body = execution.is_terminal()
                         || !is_edit
                         || code_view
                             .as_ref()
@@ -3505,16 +3512,20 @@ impl Transcript {
                         summary.push_str(&format!(" · {lifecycle}"));
                     }
                     let prefix = "  ";
-                    let elapsed = format_tool_elapsed_at(*started_at, *completed_at, render_time);
+                    let elapsed = format_tool_elapsed_at(
+                        execution.started_at(),
+                        execution.completed_at(),
+                        render_time,
+                    );
                     let right = match (outcome.as_deref(), elapsed.as_deref()) {
                         (Some(outcome), Some(elapsed)) => Some(format!("{outcome}  {elapsed}")),
                         (Some(outcome), None) => Some(outcome.to_string()),
                         (None, elapsed) => elapsed.map(str::to_string),
                     };
-                    if completed_at.is_none() {
+                    if execution.completed_at().is_none() {
                         trace.clock_rows.push(index);
                     }
-                    if !*complete {
+                    if !execution.is_terminal() {
                         running_tool_elapsed.push((index, elapsed.clone()));
                     }
                     for (line_index, line) in tool_summary_lines(
@@ -3535,7 +3546,7 @@ impl Transcript {
                                 Span::styled(prefix.to_string(), gutter_style),
                                 Span::styled(line[..name_start].to_string(), style),
                             ];
-                            if *backgrounded && !is_reasoning {
+                            if execution.is_backgrounded() && !is_reasoning {
                                 let verb_end = display_name.find(' ').unwrap_or(display_name.len());
                                 let (verb, rest) = display_name.split_at(verb_end);
                                 spans.push(Span::styled(
@@ -3555,7 +3566,7 @@ impl Transcript {
                                 &line[name_end..],
                                 lifecycle,
                                 style,
-                                *backgrounded,
+                                execution.is_backgrounded(),
                             );
                             lines.push(Line::from(spans));
                         } else {
@@ -3565,7 +3576,7 @@ impl Transcript {
                                 &line,
                                 lifecycle,
                                 style,
-                                *backgrounded,
+                                execution.is_backgrounded(),
                             );
                             lines.push(Line::from(spans));
                         }
@@ -3594,7 +3605,7 @@ impl Transcript {
                                 width,
                                 body_prefix,
                             ));
-                        } else if *complete && !agent_action {
+                        } else if execution.is_terminal() && !agent_action {
                             let key = (index, width, false, tool_window.is_some());
                             let mut cache = self.tool_body_cache.borrow_mut();
                             #[cfg(test)]
@@ -3656,7 +3667,7 @@ impl Transcript {
                                 width,
                                 body_prefix,
                             ));
-                        } else if *complete && !agent_action {
+                        } else if execution.is_terminal() && !agent_action {
                             let key = (index, width, true, tool_window.is_some());
                             let mut cache = self.tool_body_cache.borrow_mut();
                             #[cfg(test)]
@@ -3845,7 +3856,8 @@ impl Transcript {
                     self.order[window.start..window.end]
                         .iter()
                         .filter_map(|entry| match entry {
-                            TranscriptEntry::Tool { completed_at, .. } => completed_at
+                            TranscriptEntry::Tool { execution, .. } => execution
+                                .completed_at()
                                 .map(|time| canonical_local_time(time.with_timezone(&Local))),
                             TranscriptEntry::Action { time, .. } => Some(time.clone()),
                             _ => None,
@@ -3856,11 +3868,11 @@ impl Transcript {
                 .map(|time| format!("done at {}", display_local_time(&time, &today_prefix)));
                 if let Some(timer) = (window.start..window.end).find(|index| {
                     matches!(
-                        self.order[*index],
+                        &self.order[*index],
                         TranscriptEntry::Tool {
-                            completed_at: None,
+                            execution,
                             ..
-                        }
+                        } if execution.completed_at().is_none()
                     )
                 }) {
                     trace.clock_rows.push(timer);
@@ -4244,8 +4256,8 @@ mod parallel_preparation_tests {
         ));
         assert_eq!(transcript.order.len(), 1);
         assert!(matches!(&transcript.order[0], TranscriptEntry::Tool {
-            code_view: Some((_, text)), complete: true, ..
-        } if text == "Checking replay safely"));
+            code_view: Some((_, text)), execution, ..
+        } if execution.is_terminal() && text == "Checking replay safely"));
     }
 
     #[test]
@@ -4282,8 +4294,8 @@ mod parallel_preparation_tests {
         transcript.apply_history(&snapshot(3, "Checking the persisted order.", true));
         assert_eq!(transcript.order.len(), 2);
         assert!(matches!(&transcript.order[0], TranscriptEntry::Tool {
-            code_view: Some((language, text)), complete: true, ..
-        } if language == "reasoning" && text == "Checking the persisted order."));
+            code_view: Some((language, text)), execution, ..
+        } if execution.is_terminal() && language == "reasoning" && text == "Checking the persisted order."));
         assert!(matches!(
             &transcript.order[1],
             TranscriptEntry::Message { .. }
@@ -4327,12 +4339,13 @@ mod parallel_preparation_tests {
                     }
                     if nested {
                         transcript.order.push(TranscriptEntry::Action {
+                            source_session_id: None,
                             kind: TranscriptActionKind::Watch,
                             label: "Watch".into(),
                             detail: "finished".into(),
                             body: None,
                             time: "19:38".into(),
-                            state: TranscriptActionState::Complete,
+                            execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
                             expanded: false,
                         });
                     }
@@ -4397,17 +4410,13 @@ mod parallel_preparation_tests {
                     // the latest completion timestamp, not the last row, wins.
                     transcript.active_reasoning = None;
                     let TranscriptEntry::Tool {
-                        name,
-                        complete,
-                        completed_at,
-                        ..
+                        name, execution, ..
                     } = &mut transcript.order[2]
                     else {
                         unreachable!()
                     };
                     *name = if kind == "exec" { "Run" } else { "Reasoned" }.into();
-                    *complete = true;
-                    *completed_at = Some(at(11_100));
+                    execution.transition(ExecutionState::Complete, at(11_100));
                     transcript.show_action_done_at = true;
                     let done_at = format!(
                         "done at {}",
@@ -4559,9 +4568,9 @@ mod parallel_preparation_tests {
             entry,
             TranscriptEntry::Tool {
                 source_name,
-                complete: false,
+                execution,
                 ..
-            } if source_name == "action_preparing"
+            } if !execution.is_terminal() && source_name == "action_preparing"
         )));
 
         for (sequence, tool_call_id, name, input) in [
@@ -4597,9 +4606,9 @@ mod parallel_preparation_tests {
             entry,
             TranscriptEntry::Tool {
                 source_name,
-                complete: false,
+                execution,
                 ..
-            } if source_name != "action_preparing"
+            } if !execution.is_terminal() && source_name != "action_preparing"
         )));
     }
 }

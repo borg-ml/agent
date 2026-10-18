@@ -13,11 +13,7 @@ pub enum TranscriptEntry {
         effort: Option<String>,
         time: String,
         status: MessageStatus,
-        complete: bool,
-        /// A live assistant message the user cut off mid-stream. The contract
-        /// status can only say the row is settled, so the partial text would
-        /// otherwise read as a finished answer.
-        user_interrupted: bool,
+        execution: Execution,
         redirected: bool,
     },
     Activity {
@@ -27,15 +23,17 @@ pub enum TranscriptEntry {
     /// A durable, typed lifecycle row.  Agent/approval/provider-interaction
     /// rows used to be flattened into strings and later reparsed to decide
     /// colour, grouping, and state.  Keep the semantic fields together so a
-    /// reconnect/update can replace one row without manufacturing duplicate
-    /// transcript text.
+    /// updates can advance a live execution without manufacturing duplicate
+    /// transcript text; terminal executions remain immutable.
     Action {
+        #[serde(default)]
+        source_session_id: Option<uuid::Uuid>,
         kind: TranscriptActionKind,
         label: String,
         detail: String,
         body: Option<String>,
         time: String,
-        state: TranscriptActionState,
+        execution: Execution,
         expanded: bool,
     },
     Plan {
@@ -60,7 +58,7 @@ pub enum TranscriptEntry {
         time: String,
         sequence: u64,
         expanded: bool,
-        complete: bool,
+        execution: Execution,
     },
     Tool {
         source_name: String,
@@ -70,12 +68,7 @@ pub enum TranscriptEntry {
         output_view: Option<(String, String)>,
         payload_refs: Vec<SessionPayloadRef>,
         time: String,
-        started_at: DateTime<Utc>,
-        completed_at: Option<DateTime<Utc>>,
-        complete: bool,
-        error: bool,
-        user_interrupted: bool,
-        backgrounded: bool,
+        execution: Execution,
         expanded: bool,
         /// A command's result in a few words: matches, exit status, tests.
         outcome: Option<String>,
@@ -93,15 +86,7 @@ pub enum TranscriptActionKind {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TranscriptActionState {
-    Running,
-    Waiting,
-    Complete,
-    Received,
-    Stopped,
-    Failed,
-}
+pub type TranscriptActionState = ExecutionState;
 
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolRunWindow {
@@ -110,24 +95,134 @@ pub struct ToolRunWindow {
     pub total: usize,
 }
 
-/// Shared terminal/host outcome classification, including successful tool transport with a failed command result.
-pub fn tool_lifecycle_state(
-    complete: bool,
-    error: bool,
-    interrupted: bool,
-    backgrounded: bool,
-    outcome: Option<&str>,
-) -> crate::wire::Lifecycle {
-    use crate::wire::Lifecycle;
-    if error || outcome.is_some_and(crate::semantics::outcome_is_failure) {
-        Lifecycle::Failed
-    } else if interrupted {
-        Lifecycle::Stopped
-    } else if backgrounded {
-        Lifecycle::Backgrounded
-    } else if complete {
-        Lifecycle::Complete
-    } else {
-        Lifecycle::Running
+/// One execution, independent of the long-lived entity that initiated it.
+/// Terminal state and its clock are immutable; a new run needs a new value and row.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Execution {
+    state: ExecutionState,
+    started_at: DateTime<Utc>,
+    completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExecutionState {
+    Running,
+    Waiting,
+    Backgrounded,
+    Complete,
+    Received,
+    Stopped,
+    Failed,
+}
+
+impl ExecutionState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Complete | Self::Received | Self::Stopped | Self::Failed
+        )
+    }
+}
+
+impl Execution {
+    pub fn new(started_at: DateTime<Utc>, state: ExecutionState) -> Self {
+        Self {
+            state,
+            started_at,
+            completed_at: state.is_terminal().then_some(started_at),
+        }
+    }
+    pub fn state(&self) -> ExecutionState {
+        self.state
+    }
+    pub fn started_at(&self) -> DateTime<Utc> {
+        self.started_at
+    }
+    pub fn completed_at(&self) -> Option<DateTime<Utc>> {
+        self.completed_at
+    }
+    pub fn is_terminal(&self) -> bool {
+        self.state.is_terminal()
+    }
+    pub fn is_backgrounded(&self) -> bool {
+        self.state == ExecutionState::Backgrounded
+    }
+    pub fn is_failed(&self) -> bool {
+        self.state == ExecutionState::Failed
+    }
+    pub fn is_interrupted(&self) -> bool {
+        self.state == ExecutionState::Stopped
+    }
+    pub fn transition(&mut self, state: ExecutionState, at: DateTime<Utc>) -> bool {
+        if self.is_terminal() {
+            return false;
+        }
+        self.state = state;
+        self.completed_at = state.is_terminal().then_some(at.max(self.started_at));
+        true
+    }
+}
+
+impl Execution {
+    pub fn lifecycle(&self) -> crate::wire::Lifecycle {
+        use crate::wire::Lifecycle;
+        match self.state {
+            ExecutionState::Running => Lifecycle::Running,
+            ExecutionState::Waiting => Lifecycle::Waiting,
+            ExecutionState::Backgrounded => Lifecycle::Backgrounded,
+            ExecutionState::Complete => Lifecycle::Complete,
+            ExecutionState::Received => Lifecycle::Received,
+            ExecutionState::Stopped => Lifecycle::Stopped,
+            ExecutionState::Failed => Lifecycle::Failed,
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for Execution {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Saved {
+            state: ExecutionState,
+            started_at: DateTime<Utc>,
+            completed_at: Option<DateTime<Utc>>,
+        }
+        let saved = Saved::deserialize(deserializer)?;
+        if saved.state.is_terminal() != saved.completed_at.is_some()
+            || saved.completed_at.is_some_and(|at| at < saved.started_at)
+        {
+            return Err(serde::de::Error::custom("invalid execution clock"));
+        }
+        Ok(Self {
+            state: saved.state,
+            started_at: saved.started_at,
+            completed_at: saved.completed_at,
+        })
+    }
+}
+
+impl Execution {
+    pub fn for_message(at: DateTime<Utc>, actor: EventActor, status: MessageStatus) -> Self {
+        Self::new(
+            at,
+            match status {
+                MessageStatus::Queued => ExecutionState::Waiting,
+                MessageStatus::InProgress => ExecutionState::Running,
+                MessageStatus::Complete => ExecutionState::Complete,
+                // Providers archive a failed partial snapshot before the turn boundary.
+                MessageStatus::Failed if actor == EventActor::Assistant => ExecutionState::Running,
+                MessageStatus::Failed => ExecutionState::Failed,
+            },
+        )
+    }
+}
+
+impl TranscriptEntry {
+    pub fn execution(&self) -> Option<&Execution> {
+        match self {
+            Self::Message { execution, .. }
+            | Self::Action { execution, .. }
+            | Self::Compaction { execution, .. }
+            | Self::Tool { execution, .. } => Some(execution),
+            _ => None,
+        }
     }
 }

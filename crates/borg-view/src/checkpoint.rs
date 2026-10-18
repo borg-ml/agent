@@ -57,14 +57,149 @@ struct Saved {
     texts: Vec<CheckpointTextRef>,
 }
 
+fn read_checkpoint(bytes: &[u8]) -> Result<Saved> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let version = value.get("version").and_then(serde_json::Value::as_u64);
+    ensure!(matches!(version, Some(1 | 2)), "unknown checkpoint version");
+    if version == Some(1) {
+        let child_owners = value
+            .pointer("/core/subagent_entries")
+            .and_then(serde_json::Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|(child, index)| {
+                        index.as_u64().map(|index| (index as usize, child.clone()))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let entries = value
+            .pointer_mut("/core/order/entries")
+            .and_then(serde_json::Value::as_array_mut)
+            .context("checkpoint has no transcript entries")?;
+        for (index, entry) in entries.iter_mut().enumerate() {
+            for kind in ["Action", "Compaction", "Message"] {
+                let Some(row) = entry
+                    .get_mut(kind)
+                    .and_then(serde_json::Value::as_object_mut)
+                else {
+                    continue;
+                };
+                let started_at = row
+                    .get("time")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+                    .map(|time| time.with_timezone(&chrono::Utc))
+                    .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+                let state = if kind == "Action" {
+                    row.insert(
+                        "source_session_id".into(),
+                        serde_json::to_value(child_owners.get(&index))?,
+                    );
+                    row.remove("state").context("legacy action has no state")?
+                } else if kind == "Message" {
+                    let complete = row
+                        .remove("complete")
+                        .and_then(|value| value.as_bool())
+                        .context("legacy message has no completion state")?;
+                    let interrupted = row
+                        .remove("user_interrupted")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
+                    let status = row
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    serde_json::json!(if interrupted {
+                        "Stopped"
+                    } else if complete && status.eq_ignore_ascii_case("failed") {
+                        "Failed"
+                    } else if complete {
+                        "Complete"
+                    } else if status.eq_ignore_ascii_case("queued") {
+                        "Waiting"
+                    } else {
+                        "Running"
+                    })
+                } else {
+                    let complete = row
+                        .remove("complete")
+                        .and_then(|value| value.as_bool())
+                        .context("legacy compaction has no completion state")?;
+                    serde_json::json!(if complete { "Complete" } else { "Running" })
+                };
+                let state: crate::entry::ExecutionState = serde_json::from_value(state)?;
+                row.insert(
+                    "execution".into(),
+                    serde_json::to_value(crate::entry::Execution::new(started_at, state))?,
+                );
+            }
+            let Some(tool) = entry
+                .get_mut("Tool")
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                continue;
+            };
+            let flag = |name: &str| {
+                tool.get(name)
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            };
+            let failed_outcome = tool
+                .get("outcome")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(crate::semantics::outcome_is_failure);
+            let state = if flag("error") || failed_outcome {
+                "Failed"
+            } else if flag("user_interrupted") {
+                "Stopped"
+            } else if flag("backgrounded") {
+                "Backgrounded"
+            } else if flag("complete") {
+                "Complete"
+            } else {
+                "Running"
+            };
+            let started_at = tool
+                .remove("started_at")
+                .context("legacy tool has no start time")?;
+            let ended_at = tool
+                .remove("completed_at")
+                .unwrap_or(serde_json::Value::Null);
+            let completed_at = if matches!(state, "Failed" | "Stopped" | "Complete") {
+                if ended_at.is_null() {
+                    started_at.clone()
+                } else {
+                    ended_at
+                }
+            } else {
+                serde_json::Value::Null
+            };
+            for name in ["complete", "error", "user_interrupted", "backgrounded"] {
+                tool.remove(name);
+            }
+            tool.insert(
+                "execution".into(),
+                serde_json::json!({
+                    "state": state, "started_at": started_at, "completed_at": completed_at,
+                }),
+            );
+        }
+        value["version"] = serde_json::json!(2);
+    }
+    let saved: Saved = serde_json::from_value(value)?;
+    ensure!(saved.version == 2, "unknown checkpoint version");
+    Ok(saved)
+}
+
 impl ViewReducer {
     pub fn checkpoint_text_refs(bytes: &[u8]) -> Result<Vec<CheckpointTextRef>> {
         ensure!(
             bytes.len() <= SNAPSHOT_BYTES,
             "checkpoint exceeds byte budget"
         );
-        let saved: Saved = serde_json::from_slice(bytes)?;
-        ensure!(saved.version == 1, "unknown checkpoint version");
+        let saved = read_checkpoint(bytes)?;
         Ok(saved.texts)
     }
 
@@ -217,7 +352,7 @@ impl ViewReducer {
             ));
         }
         let encoded = serde_json::to_vec(&Save {
-            version: 1,
+            version: 2,
             core: &self.core,
             cursor: &self.cursor,
             session_id: &self.session_id,
@@ -251,8 +386,7 @@ impl ViewReducer {
             bytes.len() <= SNAPSHOT_BYTES,
             "checkpoint exceeds byte budget"
         );
-        let saved: Saved = serde_json::from_slice(bytes)?;
-        ensure!(saved.version == 1, "unknown checkpoint version");
+        let saved = read_checkpoint(bytes)?;
         ensure!(
             saved.cursor.revision.parse::<u64>().is_ok(),
             "invalid checkpoint cursor"
@@ -349,5 +483,122 @@ impl ViewReducer {
         };
         *value = text;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_migration_tests {
+    use super::*;
+    use crate::entry::ExecutionState;
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    // Existing saved sessions must retain terminal clocks and live background work
+    // through the schema migration; type checking cannot validate legacy JSON.
+    #[test]
+    fn legacy_tool_checkpoints_restore_execution_state_and_clock() {
+        for (complete, error, interrupted, backgrounded, outcome, expected) in [
+            (false, false, false, false, None, ExecutionState::Running),
+            (true, false, false, false, None, ExecutionState::Complete),
+            (true, false, false, true, None, ExecutionState::Backgrounded),
+            (true, true, false, true, None, ExecutionState::Failed),
+            (true, false, true, false, None, ExecutionState::Stopped),
+            (
+                true,
+                false,
+                false,
+                false,
+                Some("exit 1"),
+                ExecutionState::Failed,
+            ),
+        ] {
+            let mut reducer = ViewReducer::new(Uuid::new_v4(), "epoch".into());
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&reducer.checkpoint().unwrap()).unwrap();
+            let start = Utc::now();
+            let end = start + chrono::Duration::seconds(5);
+            value["version"] = serde_json::json!(1);
+            value["core"]["order"]["entries"] = serde_json::json!([{"Tool": {
+                "source_name": "exec", "name": "Run", "detail": "", "code_view": null,
+                "output_view": null, "payload_refs": [], "time": start.to_rfc3339(),
+                "started_at": start, "completed_at": end, "complete": complete,
+                "error": error, "user_interrupted": interrupted, "backgrounded": backgrounded,
+                "expanded": false, "outcome": outcome, "cwd": null
+            }}]);
+            value["core"]["order"]["identities"] = serde_json::json!([[Uuid::new_v4(), 0]]);
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let restored = ViewReducer::restore(&bytes, |_| unreachable!()).unwrap();
+            let TranscriptEntry::Tool { execution, .. } = &restored.core.order[0] else {
+                panic!("missing tool");
+            };
+            assert_eq!(execution.state(), expected);
+            assert_eq!(execution.started_at(), start);
+            assert_eq!(
+                execution.completed_at(),
+                expected.is_terminal().then_some(end)
+            );
+        }
+    }
+    #[test]
+    fn legacy_non_tool_checkpoints_restore_execution_state() {
+        let time = Utc::now();
+        for (row, expected) in [
+            (
+                serde_json::json!({"Action": {"kind":"Approval", "label":"Approval", "detail":"", "body":null, "time":time.to_rfc3339(), "state":"Waiting", "expanded":false}}),
+                ExecutionState::Waiting,
+            ),
+            (
+                serde_json::json!({"Action": {"kind":"Agent", "label":"Agent", "detail":"", "body":null, "time":time.to_rfc3339(), "state":"Complete", "expanded":false}}),
+                ExecutionState::Complete,
+            ),
+            (
+                serde_json::json!({"Compaction": {"summary":"", "time":time.to_rfc3339(), "sequence":1, "complete":true, "expanded":false}}),
+                ExecutionState::Complete,
+            ),
+            (
+                serde_json::json!({"Message": {"actor":"assistant", "text":"partial", "attachments":[], "model":null, "effort":null, "time":time.to_rfc3339(), "status":"failed", "complete":false, "user_interrupted":false, "redirected":false}}),
+                ExecutionState::Running,
+            ),
+            (
+                serde_json::json!({"Message": {"actor":"assistant", "text":"done", "attachments":[], "model":null, "effort":null, "time":time.to_rfc3339(), "status":"complete", "complete":true, "user_interrupted":false, "redirected":false}}),
+                ExecutionState::Complete,
+            ),
+        ] {
+            let mut reducer = ViewReducer::new(Uuid::new_v4(), "epoch".into());
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&reducer.checkpoint().unwrap()).unwrap();
+            let owner = (row
+                .pointer("/Action/kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("Agent"))
+            .then(Uuid::new_v4);
+            if let Some(owner) = owner {
+                value["core"]["subagent_entries"] = serde_json::json!({(owner.to_string()):0});
+            }
+            value["version"] = serde_json::json!(1);
+            value["core"]["order"]["entries"] = serde_json::json!([row]);
+            value["core"]["order"]["identities"] = serde_json::json!([[Uuid::new_v4(), 0]]);
+            let restored =
+                ViewReducer::restore(&serde_json::to_vec(&value).unwrap(), |_| unreachable!())
+                    .unwrap();
+            let (TranscriptEntry::Action { execution, .. }
+            | TranscriptEntry::Compaction { execution, .. }
+            | TranscriptEntry::Message { execution, .. }) = &restored.core.order[0]
+            else {
+                panic!("missing action");
+            };
+            if let TranscriptEntry::Action {
+                source_session_id, ..
+            } = &restored.core.order[0]
+            {
+                assert_eq!(*source_session_id, owner);
+            }
+            assert_eq!(execution.state(), expected);
+            assert_eq!(execution.started_at(), time);
+            assert_eq!(
+                execution.completed_at(),
+                expected.is_terminal().then_some(time)
+            );
+        }
     }
 }

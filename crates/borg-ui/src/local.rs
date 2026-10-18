@@ -1373,9 +1373,14 @@ mod tests {
         let mut timeline = TimelineProjector::from_events(&[old.clone()]);
         timeline.seed_subagents(&team_agents(&team));
         let entries = timeline.into_entries();
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].running);
-        assert_eq!(entries[0].target_session_id, Some(child));
+        assert_eq!(entries.len(), 2);
+        assert!(
+            !entries[0].running,
+            "the completed execution stays terminal"
+        );
+        assert!(entries[1].running);
+        assert_ne!(entries[0].id, entries[1].id);
+        assert_eq!(entries[1].target_session_id, Some(child));
         assert_eq!(
             team_agents(&team)[0].lifecycle(),
             SubagentLifecycle::Running

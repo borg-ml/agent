@@ -113,6 +113,8 @@ pub enum RowBody {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActionRow {
     Lifecycle {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_session_id: Option<String>,
         kind: ActionKind,
         label: String,
         detail: String,

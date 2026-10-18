@@ -6,7 +6,7 @@ use borg_agent_runtime::{
 use uuid::Uuid;
 
 use crate::core::TranscriptCore;
-use crate::entry::{TranscriptActionState, TranscriptEntry};
+use crate::entry::TranscriptEntry;
 use crate::grouping::is_reasoning_entry;
 use crate::wire::*;
 
@@ -77,7 +77,9 @@ impl ViewReducer {
         let mut ops = Vec::new();
         // Settled child rows can leave the active window while their metadata
         // remains authoritative; do not resurrect them at the transcript tail.
-        if let Some(index) = self.core.subagent_entries.get(&child_id).copied() {
+        if let Some(index) = self.core.subagent_entries.get(&child_id).copied()
+            && self.core.order.dirty.borrow_mut().remove(&index)
+        {
             let id = self.semantic_row_id(index).expect("child row identity");
             self.row_revisions.insert(id.clone(), revision);
             self.history_positions
@@ -289,14 +291,6 @@ impl ViewReducer {
     }
 
     fn semantic_row_id(&self, index: usize) -> Option<String> {
-        if let Some(child) = self
-            .core
-            .subagent_entries
-            .iter()
-            .find_map(|(id, i)| (*i == index).then_some(id))
-        {
-            return Some(format!("child:{child}"));
-        }
         self.core
             .order
             .identities
@@ -312,31 +306,6 @@ impl ViewReducer {
         let (event_id, _ordinal) = *self.core.order.identities.get(index)?;
         let id = self.semantic_row_id(index)?;
         let entry = self.core.order.get(index)?;
-        if let Some(child_id) = self
-            .core
-            .subagent_entries
-            .iter()
-            .find_map(|(id, i)| (*i == index).then_some(id))
-            && let Some(child) = self.core.subagent_snapshots.get(child_id)
-        {
-            let summary = self.core.subagent_summary(*child_id)?;
-            return Some(Row {
-                id: id.clone(),
-                revision: self
-                    .row_revisions
-                    .get(&id)
-                    .copied()
-                    .unwrap_or(1)
-                    .to_string(),
-                kind: RowKind::ChildSummary,
-                timestamp: child.updated_at.to_rfc3339(),
-                source_session_id: child.session_id.to_string(),
-                history_before: self.history_positions.get(&id).cloned().unwrap_or_default(),
-                after_id: self.previous_row_id(index),
-                text_state: None,
-                body: RowBody::ChildSummary { child: summary },
-            });
-        }
         if let Some((message_id, sender_id, sender_name)) =
             self.core.team_report_sources.get(&event_id)
             && let TranscriptEntry::Action { body, time, .. } = entry
@@ -372,7 +341,7 @@ impl ViewReducer {
                 effort,
                 time,
                 status,
-                user_interrupted,
+                execution,
                 redirected,
                 ..
             } => {
@@ -392,7 +361,7 @@ impl ViewReducer {
                             Actor::Assistant
                         },
                         text: text.clone(),
-                        status: message_status(*status),
+                        status: execution.lifecycle(),
                         attachments: attachments
                             .iter()
                             .map(|(number, _)| AssetRef {
@@ -403,7 +372,7 @@ impl ViewReducer {
                             .collect(),
                         model: model.clone(),
                         effort: effort.clone(),
-                        interrupted: *user_interrupted,
+                        interrupted: execution.is_interrupted(),
                         redirected: *redirected,
                     },
                 )
@@ -416,23 +385,12 @@ impl ViewReducer {
                 output_view,
                 payload_refs,
                 time,
-                started_at,
-                completed_at,
-                complete,
-                error,
-                user_interrupted,
-                backgrounded,
+                execution,
                 outcome,
                 cwd,
                 ..
             } => {
-                let status = crate::entry::tool_lifecycle_state(
-                    *complete,
-                    *error,
-                    *user_interrupted,
-                    *backgrounded,
-                    outcome.as_deref(),
-                );
+                let status = execution.lifecycle();
                 if let Some((language, patch)) = code_view
                     .as_ref()
                     .filter(|(language, _)| borg_agent_runtime::is_diff_language(language))
@@ -497,8 +455,8 @@ impl ViewReducer {
                                 })
                                 .collect(),
                             status,
-                            started_at: started_at.to_rfc3339(),
-                            completed_at: completed_at.map(|t| t.to_rfc3339()),
+                            started_at: execution.started_at().to_rfc3339(),
+                            completed_at: execution.completed_at().map(|t| t.to_rfc3339()),
                             outcome: outcome.clone(),
                             cwd: cwd.clone(),
                             parent_id: None,
@@ -510,7 +468,7 @@ impl ViewReducer {
                 label,
                 detail,
                 time,
-                state,
+                execution,
                 ..
             } => (
                 RowKind::ActionGroup,
@@ -519,7 +477,7 @@ impl ViewReducer {
                     label: format!("{label} · {detail}"),
                     row_ids: Vec::new(),
                     actions: vec![action_row(entry)],
-                    status: action_status(*state),
+                    status: execution.lifecycle(),
                 },
             ),
             TranscriptEntry::Activity { text, time } => (
@@ -545,7 +503,7 @@ impl ViewReducer {
             TranscriptEntry::Compaction {
                 summary,
                 time,
-                complete,
+                execution,
                 ..
             } => (
                 RowKind::ActionGroup,
@@ -554,11 +512,7 @@ impl ViewReducer {
                     label: preview(summary),
                     row_ids: Vec::new(),
                     actions: vec![action_row(entry)],
-                    status: if *complete {
-                        Lifecycle::Complete
-                    } else {
-                        Lifecycle::Running
-                    },
+                    status: execution.lifecycle(),
                 },
             ),
             TranscriptEntry::Goal { time, .. } | TranscriptEntry::Plan { time, .. } => (
@@ -645,10 +599,7 @@ impl ViewReducer {
             let status = if self.core.order[window.start..window.end].iter().any(|row| {
                 matches!(
                     row,
-                    TranscriptEntry::Tool {
-                        complete: false,
-                        ..
-                    }
+                    TranscriptEntry::Tool { execution, .. } if !execution.is_terminal()
                 )
             }) {
                 Lifecycle::Running
@@ -683,12 +634,10 @@ impl ViewReducer {
     fn evict_settled_rows(&mut self) {
         while self.core.order.len() > 128 {
             let Some(index) = self.core.order.iter().position(|entry| match entry {
-                TranscriptEntry::Tool { complete, .. } => *complete,
-                TranscriptEntry::Message { status, .. } => *status != MessageStatus::InProgress,
-                TranscriptEntry::Action { state, .. } => !matches!(
-                    state,
-                    TranscriptActionState::Running | TranscriptActionState::Waiting
-                ),
+                TranscriptEntry::Tool { execution, .. } => execution.is_terminal(),
+                TranscriptEntry::Message { execution, .. } => execution.is_terminal(),
+                TranscriptEntry::Action { execution, .. }
+                | TranscriptEntry::Compaction { execution, .. } => execution.is_terminal(),
                 _ => true,
             }) else {
                 break;
@@ -801,35 +750,18 @@ fn preview(text: &str) -> String {
     }
     text[..end].to_string()
 }
-fn message_status(status: MessageStatus) -> Lifecycle {
-    match status {
-        MessageStatus::Queued => Lifecycle::Queued,
-        MessageStatus::InProgress => Lifecycle::Running,
-        MessageStatus::Complete => Lifecycle::Complete,
-        MessageStatus::Failed => Lifecycle::Failed,
-    }
-}
-fn action_status(status: TranscriptActionState) -> Lifecycle {
-    match status {
-        TranscriptActionState::Running => Lifecycle::Running,
-        TranscriptActionState::Waiting => Lifecycle::Waiting,
-        TranscriptActionState::Complete => Lifecycle::Complete,
-        TranscriptActionState::Received => Lifecycle::Received,
-        TranscriptActionState::Stopped => Lifecycle::Stopped,
-        TranscriptActionState::Failed => Lifecycle::Failed,
-    }
-}
-
 fn action_row(entry: &TranscriptEntry) -> ActionRow {
     match entry {
         TranscriptEntry::Action {
+            source_session_id,
             kind,
             label,
             detail,
             body,
-            state,
+            execution,
             ..
         } => ActionRow::Lifecycle {
+            target_session_id: source_session_id.map(|id| id.to_string()),
             kind: match kind {
                 crate::entry::TranscriptActionKind::Agent => ActionKind::Agent,
                 crate::entry::TranscriptActionKind::Watch => ActionKind::Watch,
@@ -842,7 +774,7 @@ fn action_row(entry: &TranscriptEntry) -> ActionRow {
             label: label.clone(),
             detail: preview(detail),
             body: body.as_ref().map(|text| preview(text)),
-            status: action_status(*state),
+            status: execution.lifecycle(),
         },
         TranscriptEntry::Plan {
             items, previous, ..
@@ -860,12 +792,12 @@ fn action_row(entry: &TranscriptEntry) -> ActionRow {
         TranscriptEntry::Compaction {
             summary,
             sequence,
-            complete,
+            execution,
             ..
         } => ActionRow::Compaction {
             summary: preview(summary),
             sequence: sequence.to_string(),
-            complete: *complete,
+            complete: execution.is_terminal(),
         },
         TranscriptEntry::Activity { text, .. } => ActionRow::Activity {
             text: preview(text),

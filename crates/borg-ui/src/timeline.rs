@@ -3,9 +3,7 @@ use std::sync::Arc;
 
 use borg_remote::{EventActor, MessageStatus, SessionEvent, SubagentLifecycle, SubagentSnapshot};
 use borg_view::core::{RenderInvalidation, TranscriptCore};
-use borg_view::entry::{
-    TranscriptActionKind, TranscriptActionState, TranscriptEntry, tool_lifecycle_state,
-};
+use borg_view::entry::{TranscriptActionKind, TranscriptEntry};
 use borg_view::wire::Lifecycle;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -160,9 +158,6 @@ impl TimelineProjector {
     }
 
     fn row_id(&self, index: usize) -> String {
-        if let Some(child) = self.child_id(index) {
-            return format!("child:{child}");
-        }
         if let Some((message, _)) = self.core.messages.iter().find(|(_, row)| **row == index) {
             return format!("message:{message}");
         }
@@ -171,10 +166,12 @@ impl TimelineProjector {
     }
 
     fn child_id(&self, index: usize) -> Option<Uuid> {
-        self.core
-            .subagent_entries
-            .iter()
-            .find_map(|(id, row)| (*row == index).then_some(*id))
+        match self.core.order.get(index)? {
+            TranscriptEntry::Action {
+                source_session_id, ..
+            } => *source_session_id,
+            _ => None,
+        }
     }
 
     fn project_entry(
@@ -202,6 +199,7 @@ impl TimelineProjector {
                 effort,
                 time,
                 status,
+                execution,
                 ..
             } => {
                 entry.kind = match actor {
@@ -224,8 +222,8 @@ impl TimelineProjector {
                     .join(" · ")
                     .into();
                 entry.body.clone_from(text);
-                entry.running = matches!(status, MessageStatus::Queued | MessageStatus::InProgress);
-                entry.failed = *status == MessageStatus::Failed;
+                entry.running = !execution.is_terminal();
+                entry.failed = execution.is_failed();
                 time
             }
             TranscriptEntry::Tool {
@@ -234,11 +232,7 @@ impl TimelineProjector {
                 code_view,
                 output_view,
                 time,
-                complete,
-                error,
-                user_interrupted,
-                backgrounded,
-                outcome,
+                execution,
                 ..
             } => {
                 let reasoning = code_view
@@ -268,13 +262,7 @@ impl TimelineProjector {
                                 .unwrap_or_default()
                         })
                 };
-                let lifecycle = tool_lifecycle_state(
-                    *complete,
-                    *error,
-                    *user_interrupted,
-                    *backgrounded,
-                    outcome.as_deref(),
-                );
+                let lifecycle = execution.lifecycle();
                 entry.running = matches!(
                     lifecycle,
                     Lifecycle::Running | Lifecycle::Backgrounded | Lifecycle::Waiting
@@ -288,7 +276,7 @@ impl TimelineProjector {
                 detail,
                 body,
                 time,
-                state,
+                execution,
                 ..
             } => {
                 entry.kind = match kind {
@@ -302,11 +290,8 @@ impl TimelineProjector {
                 entry.title.clone_from(label);
                 entry.detail = (!detail.is_empty()).then(|| detail.clone());
                 entry.body = body.clone().unwrap_or_default();
-                entry.running = matches!(
-                    state,
-                    TranscriptActionState::Running | TranscriptActionState::Waiting
-                );
-                entry.failed = *state == TranscriptActionState::Failed;
+                entry.running = !execution.is_terminal();
+                entry.failed = execution.is_failed();
                 time
             }
             TranscriptEntry::Activity { text, time } => {
@@ -322,12 +307,12 @@ impl TimelineProjector {
             TranscriptEntry::Compaction {
                 summary,
                 time,
-                complete,
+                execution,
                 ..
             } => {
                 entry.title = "Compaction".into();
                 entry.body.clone_from(summary);
-                entry.running = !complete;
+                entry.running = !execution.is_terminal();
                 time
             }
             TranscriptEntry::Plan { items, time, .. } => {
@@ -509,7 +494,7 @@ mod tests {
             assert_eq!(live.entries.len(), 1);
             assert_eq!(live.entries[0].as_ref(), &replay[0]);
             let card = &live.entries[0];
-            assert_eq!(card.id, format!("child:{child}"));
+            assert_eq!(card.id, format!("{}:0", events[0].id));
             assert_eq!(card.target_session_id, Some(child));
             assert_eq!((card.running, card.failed), (running, failed));
             assert!(card.body.is_empty());
@@ -701,14 +686,17 @@ mod tests {
     fn replay_parent_cancellation_settles_nested_wait_not_parallel_tool() {
         let session_id = Uuid::new_v4();
         let mut projector = TimelineProjector::default();
-        for (id, parent, name) in [
+        for (index, (id, parent, name)) in [
             ("runtime", None, "runtime_exec"),
             ("wait", Some("runtime"), "wait_agent"),
             ("parallel", None, "exec"),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             projector.push(&SessionEvent::new(
                 session_id,
-                1,
+                index as u64 + 1,
                 SessionEventKind::ToolStarted {
                     tool_call_id: id.into(),
                     name: name.into(),
@@ -720,7 +708,7 @@ mod tests {
         }
         projector.push(&SessionEvent::new(
             session_id,
-            2,
+            4,
             SessionEventKind::ToolCompleted {
                 tool_call_id: "runtime".into(),
                 output: "persistent runtime was cancelled".into(),
@@ -797,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn reused_tool_call_id_starts_a_new_audit_entry() {
+    fn fresh_tool_call_id_starts_a_new_audit_entry() {
         let session_id = Uuid::new_v4();
         let mut projector = TimelineProjector::default();
         projector.push(&SessionEvent::new(
@@ -828,7 +816,7 @@ mod tests {
             session_id,
             3,
             SessionEventKind::ToolStarted {
-                tool_call_id: "command-1".into(),
+                tool_call_id: "command-2".into(),
                 name: "exec_command".into(),
                 input: serde_json::json!({"cmd": "second"}),
                 input_ref: None,

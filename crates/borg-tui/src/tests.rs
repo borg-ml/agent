@@ -1,4 +1,5 @@
 use super::*;
+use borg_view::entry::{Execution, ExecutionState};
 
 /// A poll of a running command added a row reading "Read output" over the
 /// command it was already showing, and the rows stacked with every check. The
@@ -144,10 +145,10 @@ fn inline_diff_preview_stops_early_but_inspector_keeps_every_line() {
 fn watcher_yield_labels_ready_as_waiting_until_resumed_or_restarted() {
     let mut transcript = Transcript::default();
     let session = Uuid::new_v4();
-    let event = |kind: &str| {
+    let event = |sequence, kind: &str| {
         SessionEvent::new(
             session,
-            1,
+            sequence,
             SessionEventKind::ProviderEvent {
                 provider: CodingProvider::Claude,
                 kind: kind.to_string(),
@@ -169,7 +170,7 @@ fn watcher_yield_labels_ready_as_waiting_until_resumed_or_restarted() {
         },
     ));
     assert_eq!(durable_only.status_label(SessionStatus::Ready), "waiting");
-    transcript.apply(&event("goal_yielded"));
+    transcript.apply(&event(1, "goal_yielded"));
     transcript.apply(&SessionEvent::new(
         session,
         2,
@@ -180,17 +181,20 @@ fn watcher_yield_labels_ready_as_waiting_until_resumed_or_restarted() {
         },
     ));
     assert_eq!(transcript.status_label(SessionStatus::Ready), "waiting");
-    transcript.apply(&event("goal_resumed"));
+    transcript.apply(&event(3, "goal_resumed"));
     assert_eq!(transcript.status_label(SessionStatus::Ready), "ready");
-    for status in [
+    for (index, status) in [
         SessionStatus::Starting,
         SessionStatus::Running,
         SessionStatus::Stopped,
-    ] {
-        transcript.apply(&event("goal_yielded"));
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        transcript.apply(&event(4 + index as u64 * 2, "goal_yielded"));
         transcript.apply(&SessionEvent::new(
             session,
-            3,
+            5 + index as u64 * 2,
             SessionEventKind::StatusChanged {
                 lifecycle: None,
                 status,
@@ -1096,9 +1100,9 @@ fn child_history_merge_keeps_live_reasoning_before_its_completion() {
     assert!(matches!(
         transcript.order.first(),
         Some(TranscriptEntry::Tool {
-            completed_at: Some(_),
+            execution,
             ..
-        })
+        }) if execution.completed_at().is_some()
     ));
 }
 
@@ -1454,8 +1458,7 @@ fn transcript_attachment_rows_link_to_the_local_image() {
         effort: None,
         time: "2026-08-26 12:00".to_string(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
 
@@ -1489,8 +1492,7 @@ fn transcript_attachment_rows_link_to_the_local_image() {
         effort: None,
         time: String::new(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
     assert!(
@@ -2819,12 +2821,7 @@ fn tool_copy_uses_output_and_keeps_edit_diffs_copyable() {
         output_view,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
-        started_at: Utc::now(),
-        completed_at: Some(Utc::now()),
-        complete: true,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
         outcome: None,
         cwd: None,
@@ -2857,12 +2854,7 @@ fn tool_hover_hint_names_the_copy_target() {
         output_view: Some(("text".to_string(), " M src/main.rs".to_string())),
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
-        started_at: Utc::now(),
-        completed_at: Some(Utc::now()),
-        complete: true,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
         outcome: None,
         cwd: None,
@@ -3589,15 +3581,15 @@ fn late_completion_does_not_consume_new_action_preparation() {
     assert_eq!(transcript.order.len(), 2);
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool { complete: true, .. })
+        Some(TranscriptEntry::Tool { execution, .. }) if execution.is_terminal()
     ));
     assert!(matches!(
         transcript.order.get(1),
         Some(TranscriptEntry::Tool {
             source_name,
-            complete: false,
+            execution,
             ..
-        }) if source_name == "action_preparing"
+        }) if !execution.is_terminal() && source_name == "action_preparing"
     ));
     assert!(transcript.has_running_tool());
     let rendered = transcript
@@ -3632,7 +3624,7 @@ fn consecutive_unmatched_action_preparations_preserve_audit_rows() {
     assert_eq!(transcript.order.len(), 2);
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool { complete: true, .. })
+        Some(TranscriptEntry::Tool { execution, .. }) if execution.is_terminal()
     ));
     let rendered = transcript
         .lines(100)
@@ -3696,9 +3688,9 @@ fn matching_tool_action_updates_refine_one_live_card() {
         &transcript.order[0],
         TranscriptEntry::Tool {
             time,
-            started_at: stored_started_at,
+            execution,
             ..
-        } if time == &started_time && *stored_started_at == started_at
+        } if time == &started_time && execution.started_at() == started_at
     ));
     let rendered = transcript
         .lines(100)
@@ -3741,10 +3733,9 @@ fn unkeyed_action_label_refines_the_generic_live_card() {
         &transcript.order[0],
         TranscriptEntry::Tool {
             name,
-            started_at: stored_started_at,
-            complete: false,
+            execution,
             ..
-        } if name == "Generate edit session retry policy" && *stored_started_at == started_at
+        } if !execution.is_terminal() && name == "Generate edit session retry policy" && execution.started_at() == started_at
     ));
 }
 
@@ -3789,10 +3780,9 @@ fn generation_status_hides_action_description_and_preserves_the_card() {
         assert!(matches!(
             &transcript.order[0],
             TranscriptEntry::Tool {
-                started_at: stored_started_at,
-                complete: false,
+                execution,
                 ..
-            } if *stored_started_at == started_at
+            } if !execution.is_terminal() && execution.started_at() == started_at
         ));
         let rendered = transcript
             .lines(100)
@@ -3838,10 +3828,9 @@ fn provider_progress_keeps_an_unbacked_tool_in_the_foreground() {
     assert!(matches!(
         transcript.order.first(),
         Some(TranscriptEntry::Tool {
-            complete: false,
-            backgrounded: false,
+            execution,
             ..
-        })
+        }) if !execution.is_terminal() && !execution.is_backgrounded()
     ));
     assert_eq!(transcript.shell_status(), None);
 }
@@ -3886,18 +3875,16 @@ fn preparing_a_new_action_does_not_invent_a_background_process() {
     assert!(matches!(
         transcript.order.first(),
         Some(TranscriptEntry::Tool {
-            complete: false,
-            backgrounded: false,
+            execution,
             ..
-        })
+        }) if !execution.is_terminal() && !execution.is_backgrounded()
     ));
     assert!(matches!(
         transcript.order.get(1),
         Some(TranscriptEntry::Tool {
-            complete: false,
-            backgrounded: false,
+            execution,
             ..
-        })
+        }) if !execution.is_terminal() && !execution.is_backgrounded()
     ));
     assert_eq!(transcript.foreground_tool.as_deref(), Some("command-2"));
 }
@@ -4482,11 +4469,9 @@ fn cancelling_a_labeled_preparation_by_id_retires_only_that_row_as_not_run() {
         matches!(
             &transcript.order[0],
             TranscriptEntry::Tool {
-                complete: true,
-                user_interrupted: true,
-                error: false,
+                execution,
                 ..
-            }
+            } if execution.is_terminal() && execution.is_interrupted() && !execution.is_failed()
         ),
         "the named preparation must retire as cancelled, not as a finished action"
     );
@@ -4494,9 +4479,9 @@ fn cancelling_a_labeled_preparation_by_id_retires_only_that_row_as_not_run() {
         matches!(
             &transcript.order[1],
             TranscriptEntry::Tool {
-                complete: false,
+                execution,
                 ..
-            }
+            } if !execution.is_terminal()
         ),
         "cancelling one preparation must not retire the other"
     );
@@ -4576,7 +4561,7 @@ fn action_status_updates_refresh_cached_transcript_text() {
             assert!(text.contains(expected), "{kind}: {text}");
             assert_eq!(transcript.order.len(), 1);
             assert!(
-                matches!(&transcript.order[0], TranscriptEntry::Tool { started_at, .. } if *started_at == render_time)
+                matches!(&transcript.order[0], TranscriptEntry::Tool { execution, .. } if execution.started_at() == render_time)
             );
         }
     }
@@ -4596,12 +4581,7 @@ fn background_tool_elapsed_cache_tick_also_changes_each_second() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "10:00".to_string(),
-        started_at,
-        completed_at: None,
-        complete: false,
-        error: false,
-        user_interrupted: false,
-        backgrounded: true,
+        execution: Execution::new(started_at, ExecutionState::Backgrounded),
         expanded: false,
         outcome: None,
         cwd: None,
@@ -9049,9 +9029,9 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
             label,
             detail,
             body: None,
-            state: TranscriptActionState::Running,
+            execution,
             ..
-        } if label == "Agent"
+        }  if matches!(execution.state(), TranscriptActionState::Running) && label == "Agent"
             && detail == "inspect_ui · working"
 
     ));
@@ -9079,7 +9059,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
     ));
     agent.status = SubagentStatus::WaitingForApproval;
     transcript.apply(&activity(
-        4,
+        5,
         SubagentActivityKind::Updated,
         &agent,
         Some(Box::new(SessionEvent::new(
@@ -9100,10 +9080,10 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
             kind: TranscriptActionKind::Agent,
             label,
             detail,
-            state: TranscriptActionState::Waiting,
+            execution,
             body: None,
             ..
-        } if label == "Agent"
+        }  if matches!(execution.state(), TranscriptActionState::Waiting) && label == "Agent"
             && detail == "inspect_ui · waiting for approval · Run focused tests?"
 
     ));
@@ -9116,7 +9096,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
     // child published its completion boundary.
     agent.status = SubagentStatus::Running;
     agent.final_text = Some("Found the renderer issue.\nExtra detail".to_string());
-    transcript.apply(&activity(5, SubagentActivityKind::Completed, &agent, None));
+    transcript.apply(&activity(6, SubagentActivityKind::Completed, &agent, None));
 
     assert_eq!(transcript.order.len(), 1);
     assert_eq!(transcript.active_subagent_count(), 0);
@@ -9132,9 +9112,9 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
             label,
             detail,
             body: None,
-            state: TranscriptActionState::Complete,
+            execution,
             ..
-        } if label == "Agent"
+        }  if matches!(execution.state(), TranscriptActionState::Complete) && label == "Agent"
             && detail == "inspect_ui · ready · waiting for input"
     ));
     let rendered = transcript
@@ -9439,9 +9419,9 @@ fn ready_subagent_with_provider_isolation_is_shown_as_a_failed_turn() {
         &transcript.order[0],
         TranscriptEntry::Action {
             detail,
-            state: TranscriptActionState::Failed,
+            execution,
             ..
-        } if detail.starts_with("/root/audit · failed")
+        }  if matches!(execution.state(), TranscriptActionState::Failed) && detail.starts_with("/root/audit · failed")
     ));
 }
 
@@ -9449,12 +9429,13 @@ fn ready_subagent_with_provider_isolation_is_shown_as_a_failed_turn() {
 fn typed_agent_action_has_an_expandable_report_and_structured_copy() {
     let mut transcript = Transcript::default();
     transcript.order.push(TranscriptEntry::Action {
+        source_session_id: None,
         kind: TranscriptActionKind::Agent,
         label: "Agent".to_string(),
         detail: "/root/review · report ready".to_string(),
         body: Some("First line\nSecond line".to_string()),
         time: "12:00".to_string(),
-        state: TranscriptActionState::Complete,
+        execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
         expanded: false,
     });
 
@@ -9506,8 +9487,7 @@ fn transcript_copy_selection_can_move_beyond_last_assistant_message() {
         effort: None,
         time: "12:00".to_string(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
     transcript.order.push(TranscriptEntry::Activity {
@@ -9541,8 +9521,7 @@ fn last_assistant_message_copy_ignores_later_activity_and_selection() {
         effort: None,
         time: "12:00".to_string(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
     transcript.order.push(TranscriptEntry::Activity {
@@ -9573,8 +9552,7 @@ fn copied_markdown_message_omits_fenced_code_markers() {
         effort: None,
         time: "12:00".to_string(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     };
     assert_eq!(
@@ -9606,8 +9584,7 @@ fn assistant_message_actions_stay_out_of_the_transcript() {
         effort: None,
         time: "12:00".to_string(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
 
@@ -9644,8 +9621,8 @@ fn message_hover_shows_copy_hint_for_user_and_assistant() {
             effort: None,
             time: "12:00".to_string(),
             status: MessageStatus::Complete,
-            complete: false,
-            user_interrupted: false,
+            execution: Execution::new(Utc::now(), ExecutionState::Running),
+
             redirected: false,
         },
         TranscriptEntry::Message {
@@ -9656,8 +9633,8 @@ fn message_hover_shows_copy_hint_for_user_and_assistant() {
             effort: None,
             time: "12:01".to_string(),
             status: MessageStatus::Complete,
-            complete: true,
-            user_interrupted: false,
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
+
             redirected: false,
         },
     ];
@@ -10146,11 +10123,19 @@ async fn visible_completed_reasoning_rotates_without_a_session_event() {
             .any(|line| line.to_string().contains("First summary."))
     );
 
-    if let TranscriptEntry::Tool { completed_at, .. } = &mut terminal.transcript.order[0] {
-        *completed_at = Some(Utc::now() - chrono::Duration::seconds(3));
-    } else {
-        panic!("expected reasoning row");
-    }
+    let mut replacement = Transcript::default();
+    let mut reasoning = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ReasoningDelta {
+            text: "**First summary.**\n**Second summary.**".into(),
+        },
+    );
+    reasoning.created_at = Utc::now() - chrono::Duration::seconds(5);
+    replacement.apply(&reasoning);
+    completed.created_at = Utc::now() - chrono::Duration::seconds(3);
+    replacement.apply(&completed);
+    terminal.transcript = replacement;
     terminal.draw_for_activity().unwrap();
     let second = &terminal.last_committed_viewport_render.as_ref().unwrap().5;
     assert!(!Arc::ptr_eq(&first, second));
@@ -10653,7 +10638,7 @@ fn optimistic_idle_submission_is_visible_before_session_persistence() {
 
     let queued = SessionEvent::new(
         session_id,
-        1,
+        3,
         SessionEventKind::Message {
             message_id,
             actor: EventActor::User,
@@ -10756,9 +10741,9 @@ fn in_progress_steer_materializes_before_the_response_and_settles_on_commit() {
         [TranscriptEntry::Message {
             actor: EventActor::User,
             text,
-            complete: false,
+            execution,
             ..
-        }] if text == "follow up"
+        }] if !execution.is_terminal() && text == "follow up"
     ));
     let rendered = transcript
         .lines(80)
@@ -10775,9 +10760,9 @@ fn in_progress_steer_materializes_before_the_response_and_settles_on_commit() {
         TranscriptEntry::Message {
             actor: EventActor::User,
             text,
-            complete: true,
+            execution,
             ..
-        } if text == "follow up"
+        } if execution.is_terminal() && text == "follow up"
     ));
 }
 
@@ -10842,10 +10827,10 @@ fn resumed_in_progress_steer_is_appended_to_the_live_timeline() {
             TranscriptEntry::Message {
                 actor: EventActor::User,
                 text: resumed_text,
-                complete: false,
+                execution,
                 ..
             },
-        ] if previous_text == "previous prompt"
+        ] if !execution.is_terminal() && previous_text == "previous prompt"
             && previous_response == "previous response"
             && resumed_text == "resumed prompt"
     ));
@@ -10916,9 +10901,9 @@ fn active_turn_assistant_segments_preserve_event_order() {
         &transcript.order[assistant_index],
         TranscriptEntry::Message {
             status: MessageStatus::Complete,
-            complete: true,
+            execution,
             ..
-        }
+        } if execution.is_terminal()
     ));
 
     transcript.apply(&SessionEvent::new(
@@ -11023,9 +11008,9 @@ fn active_partial_assistant_message_stays_before_later_tool_activity() {
         &transcript.order[assistant_index],
         TranscriptEntry::Message {
             status: MessageStatus::InProgress,
-            complete: false,
+            execution,
             ..
-        }
+        } if !execution.is_terminal()
     ));
 }
 
@@ -11160,12 +11145,7 @@ fn redirected_reply_is_marked_as_redirected_not_user_interrupted() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
-        started_at: Utc::now(),
-        completed_at: None,
-        complete: false,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Running),
         expanded: false,
         outcome: None,
         cwd: None,
@@ -11186,7 +11166,7 @@ fn redirected_reply_is_marked_as_redirected_not_user_interrupted() {
             text: "New direction".into(),
         },
     ));
-    assert!(!transcript.order.iter().any(|entry| matches!(entry, TranscriptEntry::Tool { source_name, complete: false, .. } if source_name == "action_preparing")));
+    assert!(!transcript.order.iter().any(|entry| matches!(entry, TranscriptEntry::Tool { source_name, execution, .. } if !execution.is_terminal() && source_name == "action_preparing")));
     let rendered = transcript
         .lines(100)
         .into_iter()
@@ -11207,9 +11187,9 @@ fn redirected_reply_is_marked_as_redirected_not_user_interrupted() {
             entry,
             TranscriptEntry::Message {
                 redirected: true,
-                user_interrupted: false,
+                execution,
                 ..
-            }
+            } if !execution.is_interrupted()
         )),
         "the redirected reply must not be reported as interrupted"
     );
@@ -11221,10 +11201,9 @@ fn redirected_reply_is_marked_as_redirected_not_user_interrupted() {
             entry,
             TranscriptEntry::Tool {
                 source_name,
-                complete: true,
-                user_interrupted: true,
+                execution,
                 ..
-            } if source_name == "action_preparing"
+            } if execution.is_terminal() && execution.is_interrupted() && source_name == "action_preparing"
         )),
         "a swept preparation must read as not run, not as a finished action"
     );
@@ -11234,10 +11213,9 @@ fn redirected_reply_is_marked_as_redirected_not_user_interrupted() {
             entry,
             TranscriptEntry::Tool {
                 source_name,
-                complete: false,
-                user_interrupted: false,
+                execution,
                 ..
-            } if source_name == "Run"
+            } if !execution.is_terminal() && !execution.is_interrupted() && source_name == "Run"
         )),
         "a running tool must survive a sweep that only retires preparations"
     );
@@ -11431,6 +11409,7 @@ fn agent_receipt_replaces_user_projection_in_either_arrival_order() {
         // Identical text is not provenance: an independently authored human
         // prompt must retain the user's identity.
         let mut human_prompt = prompt.clone();
+        human_prompt.sequence = 3;
         if let SessionEventKind::Message { message_id, .. } = &mut human_prompt.kind {
             *message_id = Uuid::new_v4();
         }
@@ -12075,8 +12054,7 @@ async fn clicking_a_relative_message_link_opens_the_session_file() {
         effort: None,
         time: "12:00".to_string(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
     terminal.set_local_file_links(true);
@@ -12210,7 +12188,7 @@ fn recovered_idle_session_stops_orphaned_tool_spinner() {
     assert!(!transcript.has_running_tool());
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool { complete: true, .. })
+        Some(TranscriptEntry::Tool { execution, .. }) if execution.is_terminal()
     ));
 }
 
@@ -12730,10 +12708,10 @@ fn compaction_without_provider_detail_is_not_tautological() {
     assert!(matches!(
         transcript.order.last(),
         Some(TranscriptEntry::Compaction {
-            complete: true,
+            execution,
             expanded: false,
             ..
-        })
+        }) if execution.is_terminal()
     ));
     let rendered = transcript
         .lines(100)
@@ -12815,11 +12793,10 @@ fn mcp_resource_readiness_failures_are_static_and_compact() {
             detail,
             code_view: None,
             output_view: None,
-            error: true,
-            complete: true,
+            execution,
             expanded: false,
             ..
-        }) if name == "Borg agent · List MCP resources"
+        }) if execution.is_failed() && execution.is_terminal() && name == "Borg agent · List MCP resources"
             && detail == "MCP server not ready"
     ));
     assert!(!transcript.tool_is_expandable(0));
@@ -12920,13 +12897,12 @@ fn automatic_compaction_event_reports_work_in_progress() {
     assert_eq!(transcript.order.len(), 1);
     assert!(matches!(
         transcript.order.last(),
-        Some(TranscriptEntry::Compaction { summary, complete: false, .. })
-            if summary == "Compacting context: 2/5 passes complete"
+        Some(TranscriptEntry::Compaction { summary, execution, .. }) if !execution.is_terminal() && summary == "Compacting context: 2/5 passes complete"
     ));
 }
 
 #[test]
-fn failed_compaction_withdraws_the_in_progress_card() {
+fn failed_compaction_retains_a_terminal_failure_card() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
     transcript.apply(&SessionEvent::new(
@@ -12944,9 +12920,9 @@ fn failed_compaction_withdraws_the_in_progress_card() {
     assert!(matches!(
         transcript.order.last(),
         Some(TranscriptEntry::Compaction {
-            complete: false,
+            execution,
             ..
-        })
+        }) if !execution.is_terminal()
     ));
 
     transcript.apply(&SessionEvent::new(
@@ -12959,12 +12935,18 @@ fn failed_compaction_withdraws_the_in_progress_card() {
         },
     ));
 
-    assert!(
-        !transcript
-            .order
-            .iter()
-            .any(|entry| matches!(entry, TranscriptEntry::Compaction { .. }))
-    );
+    let compactions = transcript
+        .order
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::Compaction { execution, .. } => Some(execution),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(compactions.len(), 1);
+    assert!(compactions[0].is_terminal());
+    assert!(compactions[0].is_failed());
+    assert!(compactions[0].completed_at().is_some());
 }
 
 /// A replay that only truncated bulk is silent; one that dropped whole messages
@@ -13043,10 +13025,10 @@ fn compaction_completion_updates_the_live_card_and_can_expand() {
         transcript.order.last(),
         Some(TranscriptEntry::Compaction {
             summary,
-            complete: true,
+            execution,
             expanded: false,
             ..
-        }) if summary == "Compacted context: Retained the durable conversation and dropped stale tool detail."
+        }) if execution.is_terminal() && summary == "Compacted context: Retained the durable conversation and dropped stale tool detail."
     ));
 
     assert_eq!(transcript.compaction_revert_sequence(index), Some(3));
@@ -13065,10 +13047,10 @@ fn compaction_completion_updates_the_live_card_and_can_expand() {
     assert!(matches!(
         transcript.order.last(),
         Some(TranscriptEntry::Compaction {
-            complete: true,
+            execution,
             expanded: true,
             ..
-        })
+        }) if execution.is_terminal()
     ));
     let rendered = transcript
         .lines(100)
@@ -13119,7 +13101,7 @@ fn completed_compaction_copy_action_is_not_run_directly() {
         time: "20:23".to_string(),
         sequence: 0,
         expanded: false,
-        complete: true,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
     };
 
     // The first compaction has no valid revert target, but its real summary
@@ -13431,8 +13413,7 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         effort: None,
         time: "12:00".to_string(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
     transcript.order.push(TranscriptEntry::Tool {
@@ -13443,12 +13424,7 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:01".to_string(),
-        started_at: Utc::now(),
-        completed_at: Some(Utc::now()),
-        complete: true,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
         outcome: None,
         cwd: None,
@@ -13461,8 +13437,7 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         effort: Some("xhigh".to_string()),
         time: "12:02".to_string(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
     transcript.order.push(TranscriptEntry::Tool {
@@ -13473,12 +13448,7 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:03".to_string(),
-        started_at: Utc::now(),
-        completed_at: Some(Utc::now()),
-        complete: true,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
         outcome: None,
         cwd: None,
@@ -13596,12 +13566,7 @@ fn adjacent_tool_calls_are_compact_but_leave_gap_before_following_message() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
-        started_at: Utc::now(),
-        completed_at: Some(Utc::now()),
-        complete: true,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
         outcome: None,
         cwd: None,
@@ -13616,8 +13581,7 @@ fn adjacent_tool_calls_are_compact_but_leave_gap_before_following_message() {
         effort: None,
         time: "12:01".to_string(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
 
@@ -13655,8 +13619,7 @@ fn message_tool_message_edges_have_one_separator_row_each() {
         effort: None,
         time: time.to_string(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     };
     transcript
@@ -13670,12 +13633,7 @@ fn message_tool_message_edges_have_one_separator_row_each() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:01".to_string(),
-        started_at: Utc::now(),
-        completed_at: Some(Utc::now()),
-        complete: true,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
         outcome: None,
         cwd: None,
@@ -13732,12 +13690,7 @@ fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
-        started_at: Utc::now(),
-        completed_at: Some(Utc::now()),
-        complete: true,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: true,
         outcome: None,
         cwd: None,
@@ -13752,8 +13705,7 @@ fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
         effort: None,
         time: "12:01".to_string(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
 
@@ -13788,12 +13740,15 @@ fn running_actions_keep_edge_spacing_in_compact_and_boxed_runs() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
-        started_at: Utc::now(),
-        completed_at: complete.then(Utc::now),
-        complete,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: Execution::new(
+            Utc::now(),
+            if complete {
+                ExecutionState::Complete
+            } else {
+                ExecutionState::Running
+            },
+        ),
+
         expanded: false,
         outcome: None,
         cwd: None,
@@ -13872,10 +13827,9 @@ fn provider_progress_does_not_invent_a_background_process() {
     assert!(matches!(
         tool,
         TranscriptEntry::Tool {
-            complete: false,
-            backgrounded: false,
+            execution,
             ..
-        }
+        } if !execution.is_terminal() && !execution.is_backgrounded()
     ));
     assert_eq!(transcript.shell_status(), None);
     assert!(transcript.active_shell_rows().is_empty());
@@ -13968,12 +13922,7 @@ fn boxed_thinking_rows_keep_one_edge_separator_without_duplicates() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
-            started_at: Utc::now(),
-            completed_at: Some(Utc::now()),
-            complete: true,
-            error: false,
-            user_interrupted: false,
-            backgrounded: false,
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: true,
             outcome: None,
             cwd: None,
@@ -14006,12 +13955,15 @@ fn peer_reports_and_errors_keep_one_continuous_neutral_actions_gutter() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
-            started_at: Utc::now(),
-            completed_at: Some(Utc::now()),
-            complete: true,
-            error: index == 4,
-            user_interrupted: false,
-            backgrounded: false,
+            execution: Execution::new(
+                Utc::now(),
+                if index == 4 {
+                    ExecutionState::Failed
+                } else {
+                    ExecutionState::Complete
+                },
+            ),
+
             expanded: false,
             outcome: None,
             cwd: None,
@@ -14021,6 +13973,7 @@ fn peer_reports_and_errors_keep_one_continuous_neutral_actions_gutter() {
         transcript.order.insert(
             4,
             TranscriptEntry::Action {
+                source_session_id: None,
                 kind: TranscriptActionKind::Agent,
                 label: label.into(),
                 detail: "abundance".into(),
@@ -14029,7 +13982,7 @@ fn peer_reports_and_errors_keep_one_continuous_neutral_actions_gutter() {
                         .into(),
                 ),
                 time: "12:00".into(),
-                state: TranscriptActionState::Complete,
+                execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
                 expanded: true,
             },
         );
@@ -14266,12 +14219,7 @@ fn long_tool_runs_show_eight_lines_and_scroll_independently() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
-            started_at: Utc::now(),
-            completed_at: Some(Utc::now()),
-            complete: true,
-            error: false,
-            user_interrupted: false,
-            backgrounded: false,
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
             outcome: None,
             cwd: None,
@@ -14316,12 +14264,7 @@ fn actions_accordion_hides_expand_hint_when_all_rows_already_fit() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
-            started_at: Utc::now(),
-            completed_at: Some(Utc::now()),
-            complete: true,
-            error: false,
-            user_interrupted: false,
-            backgrounded: false,
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
             outcome: None,
             cwd: None,
@@ -14353,12 +14296,15 @@ fn a_group_with_a_running_command_stays_unfolded() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
-        started_at: Utc::now(),
-        completed_at: Some(Utc::now()),
-        complete: true,
-        error: false,
-        user_interrupted: false,
-        backgrounded,
+        execution: Execution::new(
+            Utc::now(),
+            if backgrounded {
+                ExecutionState::Backgrounded
+            } else {
+                ExecutionState::Complete
+            },
+        ),
+
         expanded: false,
         outcome: None,
         cwd: Some("/srv/ore-cues".to_string()),
@@ -14376,8 +14322,7 @@ fn a_group_with_a_running_command_stays_unfolded() {
         effort: None,
         time: "12:01".to_string(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
     // A later group, which is the open one.
@@ -14508,12 +14453,7 @@ fn a_finished_action_group_folds_to_its_summary_until_clicked() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
-        started_at: Utc::now(),
-        completed_at: Some(Utc::now()),
-        complete: true,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
         outcome: Some("3 matches".to_string()),
         cwd: cwd.map(str::to_string),
@@ -14533,8 +14473,7 @@ fn a_finished_action_group_folds_to_its_summary_until_clicked() {
         effort: None,
         time: "12:01".to_string(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
     transcript.order.push(tool("second-run", "Run", None));
@@ -14580,12 +14519,17 @@ fn a_group_held_open_by_unfinished_work_stays_open_until_a_new_message_ends_it()
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
-        started_at: Utc::now(),
-        completed_at: complete.then(Utc::now),
-        complete,
-        error: false,
-        user_interrupted: false,
-        backgrounded,
+        execution: Execution::new(
+            Utc::now(),
+            if backgrounded {
+                ExecutionState::Backgrounded
+            } else if complete {
+                ExecutionState::Complete
+            } else {
+                ExecutionState::Running
+            },
+        ),
+
         expanded: false,
         outcome: None,
         cwd: None,
@@ -14608,16 +14552,8 @@ fn a_group_held_open_by_unfinished_work_stays_open_until_a_new_message_ends_it()
     assert!(running.contains("long-build"), "{running}");
     assert!(running.contains("▾"), "{running}");
 
-    if let Some(TranscriptEntry::Tool {
-        complete,
-        backgrounded,
-        completed_at,
-        ..
-    }) = transcript.order.get_mut(1)
-    {
-        *complete = true;
-        *backgrounded = false;
-        *completed_at = Some(Utc::now());
+    if let Some(TranscriptEntry::Tool { execution, .. }) = transcript.order.get_mut(1) {
+        execution.transition(ExecutionState::Complete, Utc::now());
     }
 
     // The work is done but nothing has ended the group, so it stays open. It was
@@ -14635,8 +14571,7 @@ fn a_group_held_open_by_unfinished_work_stays_open_until_a_new_message_ends_it()
         effort: None,
         time: "12:01".into(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
 
@@ -14658,12 +14593,7 @@ fn expanded_tool_run_shows_every_action_and_collapses_again() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
-            started_at: Utc::now(),
-            completed_at: Some(Utc::now()),
-            complete: true,
-            error: false,
-            user_interrupted: false,
-            backgrounded: false,
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
             outcome: None,
             cwd: None,
@@ -14714,12 +14644,11 @@ fn focused_tool_inspector_isolates_one_tool_and_forces_its_live_body_open() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
-        started_at,
-        completed_at: Some(started_at),
-        complete: true,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: {
+            let mut execution = Execution::new(started_at, ExecutionState::Running);
+            execution.transition(ExecutionState::Complete, started_at);
+            execution
+        },
         expanded: false,
         outcome: None,
         cwd: None,
@@ -14735,12 +14664,7 @@ fn focused_tool_inspector_isolates_one_tool_and_forces_its_live_body_open() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
-        started_at,
-        completed_at: None,
-        complete: false,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: Execution::new(started_at, ExecutionState::Running),
         expanded: false,
         outcome: None,
         cwd: None,
@@ -14884,12 +14808,11 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "19:38".to_string(),
-        started_at: Utc::now(),
-        completed_at: Some(completed_at),
-        complete: true,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: {
+            let mut execution = Execution::new(Utc::now(), ExecutionState::Running);
+            execution.transition(ExecutionState::Complete, completed_at);
+            execution
+        },
         expanded: false,
         outcome: None,
         cwd: None,
@@ -14916,18 +14839,19 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     }
     for index in 10..12 {
         transcript.order.push(TranscriptEntry::Action {
+            source_session_id: None,
             kind: TranscriptActionKind::Watch,
             label: "Watch".into(),
             detail: format!("watch-{index}"),
             body: None,
             time: "19:38".into(),
-            state: TranscriptActionState::Complete,
+            execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
             expanded: false,
         });
     }
     transcript.order.push(tool(12, true));
     transcript.order.push(tool(13, false));
-    let identities = transcript.order.identities.clone();
+    let mut identities = transcript.order.identities.clone();
     let windows = transcript.tool_run_windows();
     assert!(windows.iter().all(Option::is_some));
     assert_eq!(windows[0].unwrap().total, 14);
@@ -15041,14 +14965,18 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     assert!(folded_parent.8.is_empty());
     assert!(folded_parent.1.is_empty());
     assert!(folded_parent.6.iter().all(|range| range.entry >= 14));
-    if let TranscriptEntry::Action { state, .. } = transcript.order.get_mut(10).unwrap() {
-        *state = TranscriptActionState::Running;
+    let mut running_action = transcript.order.remove(10);
+    if let TranscriptEntry::Action { execution, .. } = &mut running_action {
+        *execution = Execution::new(Utc::now(), TranscriptActionState::Running);
     }
+    transcript.order.insert(10, running_action);
+    assert_ne!(transcript.order.identities[10], identities[10]);
+    identities[10] = transcript.order.identities[10];
     let running = text(&render(&transcript));
     assert!(running.contains("▾ 19:38 · 14 actions"));
     assert!(!running.contains("done at"), "{running}");
-    if let TranscriptEntry::Action { state, .. } = transcript.order.get_mut(10).unwrap() {
-        *state = TranscriptActionState::Complete;
+    if let TranscriptEntry::Action { execution, .. } = transcript.order.get_mut(10).unwrap() {
+        execution.transition(TranscriptActionState::Complete, Utc::now());
     }
     assert!(transcript.action_run_expanded(0));
     assert!(transcript.toggle_tool_run_expansion(0));
@@ -15108,12 +15036,7 @@ fn active_turn_action_group_closes_after_completed_reply() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "19:38".into(),
-            started_at: Utc::now(),
-            completed_at: Some(Utc::now()),
-            complete: true,
-            error: false,
-            user_interrupted: false,
-            backgrounded: false,
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
             outcome: None,
             cwd: None,
@@ -15127,14 +15050,13 @@ fn active_turn_action_group_closes_after_completed_reply() {
         effort: None,
         time: "19:38".into(),
         status: MessageStatus::InProgress,
-        complete: false,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Running),
         redirected: false,
     });
     let windows = transcript.tool_run_windows();
     assert_eq!(transcript.open_tool_run(&windows), Some(0));
-    if let TranscriptEntry::Message { complete, .. } = transcript.order.last_mut().unwrap() {
-        *complete = true;
+    if let TranscriptEntry::Message { execution, .. } = transcript.order.last_mut().unwrap() {
+        execution.transition(ExecutionState::Complete, Utc::now());
     }
     assert_eq!(transcript.open_tool_run(&windows), None);
 }
@@ -15151,12 +15073,7 @@ fn tool_run_scroll_only_consumes_wheel_events_while_it_can_move() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
-            started_at: Utc::now(),
-            completed_at: Some(Utc::now()),
-            complete: true,
-            error: false,
-            user_interrupted: false,
-            backgrounded: false,
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
             outcome: None,
             cwd: None,
@@ -15271,12 +15188,7 @@ fn tall_expanded_tool_transcript() -> Transcript {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
-        started_at: Utc::now(),
-        completed_at: Some(Utc::now()),
-        complete: true,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: true,
         outcome: None,
         cwd: None,
@@ -15400,12 +15312,7 @@ fn line_scrolling_preserves_expanded_actions() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
-            started_at: Utc::now(),
-            completed_at: Some(Utc::now()),
-            complete: true,
-            error: false,
-            user_interrupted: false,
-            backgrounded: false,
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: index == 8,
             outcome: None,
             cwd: None,
@@ -15454,12 +15361,7 @@ fn scrolled_action_viewport_pins_the_current_tool_header() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
-            started_at: Utc::now(),
-            completed_at: Some(Utc::now()),
-            complete: true,
-            error: false,
-            user_interrupted: false,
-            backgrounded: false,
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: index == 8,
             outcome: None,
             cwd: None,
@@ -15491,12 +15393,7 @@ fn expanding_an_action_preserves_the_current_line_anchor() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
-            started_at: Utc::now(),
-            completed_at: Some(Utc::now()),
-            complete: true,
-            error: false,
-            user_interrupted: false,
-            backgrounded: false,
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
             outcome: None,
             cwd: None,
@@ -15526,10 +15423,10 @@ fn thinking_stays_collapsed_while_streaming_unless_auto_expand_is_enabled() {
     assert!(matches!(
         &transcript.order[0],
         TranscriptEntry::Tool {
-            complete: false,
+            execution,
             expanded: false,
             ..
-        }
+        } if !execution.is_terminal()
     ));
 
     transcript.set_auto_expand_thinking(true);
@@ -15558,10 +15455,10 @@ fn thinking_stays_collapsed_while_streaming_unless_auto_expand_is_enabled() {
     assert!(matches!(
         &opted_in.order[0],
         TranscriptEntry::Tool {
-            complete: false,
+            execution,
             expanded: true,
             ..
-        }
+        } if !execution.is_terminal()
     ));
 }
 
@@ -15590,10 +15487,10 @@ fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
         TranscriptEntry::Tool {
             name,
             code_view: Some((language, source)),
-            complete: false,
+            execution,
             expanded: false,
             ..
-        } if name == "Reasoning"
+        } if !execution.is_terminal() && name == "Reasoning"
             && language == "reasoning"
             && source == "Checking the source"
     ));
@@ -15622,10 +15519,10 @@ fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
     assert!(matches!(
         &transcript.order[0],
         TranscriptEntry::Tool {
-            complete: true,
+            execution,
             expanded: false,
             ..
-        }
+        } if execution.is_terminal()
     ));
     transcript.toggle_tool(0);
     assert!(matches!(
@@ -15653,10 +15550,10 @@ fn reasoning_lifecycle_events_show_reasoning_without_a_text_delta() {
         TranscriptEntry::Tool {
             name,
             code_view: Some((language, source)),
-            complete: false,
+            execution,
             expanded: false,
             ..
-        } if name == "Reasoning" && language == "reasoning" && source.is_empty()
+        } if !execution.is_terminal() && name == "Reasoning" && language == "reasoning" && source.is_empty()
     ));
 
     transcript.apply(&SessionEvent::new(
@@ -15672,10 +15569,10 @@ fn reasoning_lifecycle_events_show_reasoning_without_a_text_delta() {
         &transcript.order[0],
         TranscriptEntry::Tool {
             name,
-            complete: true,
+            execution,
             expanded: false,
             ..
-        } if name == "Reasoned"
+        } if execution.is_terminal() && name == "Reasoned"
     ));
     let rendered = transcript
         .lines(100)
@@ -15688,7 +15585,7 @@ fn reasoning_lifecycle_events_show_reasoning_without_a_text_delta() {
 }
 
 #[test]
-fn hidden_reasoning_chunks_share_one_row_within_a_request() {
+fn completed_reasoning_blocks_stay_terminal_within_a_request() {
     let session_id = Uuid::new_v4();
     let started_at = Utc::now();
     let mut transcript = Transcript::default();
@@ -15712,26 +15609,30 @@ fn hidden_reasoning_chunks_share_one_row_within_a_request() {
     apply(&mut transcript, 0, request("request-1"));
     for index in 0..20 {
         apply(&mut transcript, index * 5 + 1, chunk());
-        assert_eq!(transcript.order.len(), 1);
+        assert_eq!(transcript.order.len(), index as usize + 1);
         assert!(matches!(
-            &transcript.order[0],
+            &transcript.order[index as usize],
             TranscriptEntry::Tool {
-                complete: false,
-                completed_at: None,
+                execution,
                 ..
-            }
+            } if !execution.is_terminal() && execution.completed_at().is_none()
         ));
         apply(
             &mut transcript,
             (index + 1) * 5,
             SessionEventKind::ReasoningCompleted,
         );
+        for (closed, row) in transcript.order.iter().enumerate() {
+            assert!(matches!(row, TranscriptEntry::Tool {
+                execution,  ..
+            } if execution.is_terminal() && execution.completed_at().unwrap() == started_at + chrono::Duration::seconds((closed as i64 + 1) * 5)));
+        }
     }
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool { started_at: start, completed_at: Some(end), .. }
-            if *start == started_at + chrono::Duration::seconds(1)
-                && *end == started_at + chrono::Duration::seconds(100)
+        TranscriptEntry::Tool { execution,  .. }
+            if execution.started_at() == started_at + chrono::Duration::seconds(1)
+                && execution.completed_at().unwrap() == started_at + chrono::Duration::seconds(5)
     ));
     apply(
         &mut transcript,
@@ -15747,10 +15648,10 @@ fn hidden_reasoning_chunks_share_one_row_within_a_request() {
     apply(&mut transcript, 102, request("request-2"));
     apply(&mut transcript, 103, chunk());
     apply(&mut transcript, 104, SessionEventKind::ReasoningCompleted);
-    assert_eq!(transcript.order.len(), 3);
+    assert_eq!(transcript.order.len(), 22);
     apply(&mut transcript, 105, request("request-3"));
     apply(&mut transcript, 106, chunk());
-    assert_eq!(transcript.order.len(), 4);
+    assert_eq!(transcript.order.len(), 23);
     apply(
         &mut transcript,
         107,
@@ -15760,7 +15661,7 @@ fn hidden_reasoning_chunks_share_one_row_within_a_request() {
     );
     apply(&mut transcript, 108, SessionEventKind::ReasoningCompleted);
     apply(&mut transcript, 109, chunk());
-    assert_eq!(transcript.order.len(), 5);
+    assert_eq!(transcript.order.len(), 24);
     apply(&mut transcript, 110, SessionEventKind::ReasoningCompleted);
     apply(
         &mut transcript,
@@ -15787,7 +15688,7 @@ fn hidden_reasoning_chunks_share_one_row_within_a_request() {
             SessionEventKind::ReasoningCompleted,
         );
     }
-    assert_eq!(transcript.order.len(), 7);
+    assert_eq!(transcript.order.len(), 26);
     for (id, text) in [
         ("first-summary", "First final summary"),
         ("second-summary", "Second final summary"),
@@ -15802,11 +15703,11 @@ fn hidden_reasoning_chunks_share_one_row_within_a_request() {
             },
         );
     }
-    assert_eq!(transcript.order.len(), 7);
-    for (index, expected) in [(5, "First final summary"), (6, "Second final summary")] {
+    assert_eq!(transcript.order.len(), 26);
+    for (index, expected) in [(24, "First final summary"), (25, "Second final summary")] {
         assert!(matches!(&transcript.order[index], TranscriptEntry::Tool {
-            code_view: Some((_, text)), complete: true, ..
-        } if text == expected));
+            code_view: Some((_, text)), execution, ..
+        } if execution.is_terminal() && text == expected));
     }
 }
 
@@ -15920,16 +15821,11 @@ fn reasoning_completion_freezes_thinking_duration_before_a_delayed_tool() {
     tool.created_at = tool_started_at;
     transcript.apply(&tool);
 
-    let TranscriptEntry::Tool {
-        started_at: stored_started_at,
-        completed_at: Some(stored_completed_at),
-        ..
-    } = &transcript.order[0]
-    else {
+    let TranscriptEntry::Tool { execution, .. } = &transcript.order[0] else {
         panic!("expected completed thinking card");
     };
-    assert_eq!(*stored_started_at, started_at);
-    assert_eq!(*stored_completed_at, completed_at);
+    assert_eq!(execution.started_at(), started_at);
+    assert_eq!(execution.completed_at().unwrap(), completed_at);
     let rendered = transcript
         .lines(100)
         .into_iter()
@@ -16282,12 +16178,7 @@ fn interrupted_tools_update_in_place_with_explicit_user_cause() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
-        started_at: Utc::now(),
-        completed_at: None,
-        complete: false,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Running),
         expanded: false,
         outcome: None,
         cwd: None,
@@ -16298,10 +16189,9 @@ fn interrupted_tools_update_in_place_with_explicit_user_cause() {
     assert!(matches!(
         transcript.order.first(),
         Some(TranscriptEntry::Tool {
-            complete: true,
-            user_interrupted: true,
+            execution,
             ..
-        })
+        }) if execution.is_terminal() && execution.is_interrupted()
     ));
     assert!(
         transcript
@@ -16340,11 +16230,9 @@ fn turn_completion_settles_unresolved_foreground_tools() {
     assert!(matches!(
         transcript.order.first(),
         Some(TranscriptEntry::Tool {
-            complete: true,
-            error: false,
-            user_interrupted: false,
+            execution,
             ..
-        })
+        }) if execution.is_terminal() && !execution.is_failed() && !execution.is_interrupted()
     ));
     let rendered = transcript
         .lines(100)
@@ -16395,8 +16283,8 @@ fn completed_web_search_updates_the_started_card_with_the_late_query() {
 
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool { name, detail, complete: true, .. })
-            if name == "Search web" && detail == "“Borg Agent queue”"
+        Some(TranscriptEntry::Tool { name, detail, execution, .. })
+            if execution.is_terminal() && name == "Search web" && detail == "“Borg Agent queue”"
     ));
     let completed = transcript
         .lines(100)
@@ -17288,12 +17176,7 @@ fn selection_anchors_follow_content_when_the_actions_window_shifts() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
-        started_at: Utc::now(),
-        completed_at: Some(Utc::now()),
-        complete: true,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
         outcome: None,
         cwd: None,
@@ -17341,12 +17224,7 @@ fn mixed_actions_window_selection_ranges_match_the_visible_rows() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
-        started_at: Utc::now(),
-        completed_at: Some(Utc::now()),
-        complete: true,
-        error: false,
-        user_interrupted: false,
-        backgrounded: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
         outcome: None,
         cwd: None,
@@ -17421,12 +17299,7 @@ fn drag_selection_stays_live_when_wheel_scroll_hides_its_action_anchor() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
-            started_at: Utc::now(),
-            completed_at: Some(Utc::now()),
-            complete: true,
-            error: false,
-            user_interrupted: false,
-            backgrounded: false,
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
             outcome: None,
             cwd: None,
@@ -17509,12 +17382,7 @@ fn released_selection_follows_expanded_tool_text_during_nested_scroll() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
-            started_at: Utc::now(),
-            completed_at: Some(Utc::now()),
-            complete: true,
-            error: false,
-            user_interrupted: false,
-            backgrounded: false,
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: index == 8,
             outcome: None,
             cwd: None,
@@ -17834,13 +17702,13 @@ fn provider_background_handle_drives_shell_status_and_full_output() {
     assert_eq!(transcript.shell_status(), None);
     let TranscriptEntry::Tool {
         output_view,
-        backgrounded,
+        execution,
         ..
     } = &transcript.order[0]
     else {
         panic!("originating command tool");
     };
-    assert!(!backgrounded);
+    assert!(!execution.is_backgrounded());
     assert_eq!(
         output_view.as_ref().map(|(_, output)| output.as_str()),
         Some("first line\nsecond line\nlast line")
@@ -18049,12 +17917,13 @@ fn fullscreen_message_details_preserve_long_json_and_control_text() {
 fn fullscreen_non_tool_details_expand_without_mutating_inline_state() {
     let mut transcript = Transcript::default();
     transcript.order.push(TranscriptEntry::Action {
+        source_session_id: None,
         kind: TranscriptActionKind::Agent,
         label: "Agent".into(),
         detail: "summary".into(),
         body: Some("ACTION_BODY".into()),
         time: "12:00".into(),
-        state: TranscriptActionState::Complete,
+        execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
         expanded: false,
     });
     transcript.order.push(TranscriptEntry::Plan {
@@ -18077,7 +17946,7 @@ fn fullscreen_non_tool_details_expand_without_mutating_inline_state() {
         time: "12:00".into(),
         sequence: 1,
         expanded: false,
-        complete: true,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
     });
     for (index, expected) in [
         (0, "ACTION_BODY"),
@@ -18443,12 +18312,13 @@ async fn timeline_detail_click_policy_applies_to_every_expandable_entry() {
         *expanded = false;
     }
     terminal.transcript.order.push(TranscriptEntry::Action {
+        source_session_id: None,
         kind: TranscriptActionKind::Agent,
         label: "Agent".into(),
         detail: "detail".into(),
         body: Some("ACTION_BODY".into()),
         time: "12:00".into(),
-        state: TranscriptActionState::Complete,
+        execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
         expanded: false,
     });
     terminal.transcript.order.push(TranscriptEntry::Plan {
@@ -18468,7 +18338,7 @@ async fn timeline_detail_click_policy_applies_to_every_expandable_entry() {
         time: "12:00".into(),
         sequence: 1,
         expanded: false,
-        complete: true,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
     });
     for policy in [ToolClickBehavior::Fullscreen, ToolClickBehavior::Inline] {
         terminal.set_tool_click_behavior(policy);
@@ -18539,9 +18409,9 @@ fn spinning_tool_rows(transcript: &Transcript) -> usize {
             matches!(
                 entry,
                 TranscriptEntry::Tool {
-                    complete: false,
+                    execution,
                     ..
-                }
+                } if !execution.is_terminal()
             )
         })
         .count()
@@ -18674,16 +18544,20 @@ fn interrupted_partial_commentary_is_marked_instead_of_reading_as_final() {
     assert!(rendered.contains("user interrupted"), "{rendered}");
     assert!(!rendered.contains("responding"), "{rendered}");
 
-    // A durable redelivery of the same message carries the text the provider
-    // really ended on, so the row is no longer a stranded fragment.
+    // A late snapshot cannot replace the execution that was already stopped.
+    let stopped_render = rendered;
+    let stopped_identity = transcript.order.identities.clone();
     transcript.apply(&partial(
         4,
         MessageStatus::Complete,
         "That adds a retry budget.",
     ));
     let rendered = render(&transcript);
-    assert!(rendered.contains("That adds a retry budget."), "{rendered}");
-    assert!(!rendered.contains("user interrupted"), "{rendered}");
+    assert_eq!(rendered, stopped_render);
+    assert_eq!(transcript.order.identities, stopped_identity);
+    assert!(matches!(transcript.order.last(),
+        Some(TranscriptEntry::Message { execution, .. }) if execution.is_interrupted()
+    ));
 }
 
 #[test]
@@ -18793,10 +18667,10 @@ fn reply_start_anchor_preserves_commentary_before_preparing_tool() {
     let session = Uuid::new_v4();
     let message = Uuid::new_v4();
     let mut transcript = Transcript::default();
-    let reply = |text: &str, status| {
+    let reply = |sequence, text: &str, status| {
         SessionEvent::new(
             session,
-            1,
+            sequence,
             SessionEventKind::Message {
                 message_id: message,
                 actor: EventActor::Assistant,
@@ -18807,7 +18681,7 @@ fn reply_start_anchor_preserves_commentary_before_preparing_tool() {
             },
         )
     };
-    transcript.apply(&reply("", MessageStatus::InProgress));
+    transcript.apply(&reply(1, "", MessageStatus::InProgress));
     assert!(
         !transcript
             .lines(100)
@@ -18823,8 +18697,12 @@ fn reply_start_anchor_preserves_commentary_before_preparing_tool() {
             payload: serde_json::json!({"label":"stop stuck build","tool_call_id":"stop-build"}),
         },
     ));
-    transcript.apply(&reply("Stopping the stuck build.", MessageStatus::Complete));
-    transcript.apply(&SessionEvent::new(session, 2, SessionEventKind::ToolStarted {
+    transcript.apply(&reply(
+        2,
+        "Stopping the stuck build.",
+        MessageStatus::Complete,
+    ));
+    transcript.apply(&SessionEvent::new(session, 3, SessionEventKind::ToolStarted {
         tool_call_id: "stop-build".into(), name: "exec".into(),
         input: serde_json::json!({"action":"stop stuck build","cmd":"systemctl --user stop build.scope"}),
         input_ref: None, parent_tool_call_id: None,
@@ -19182,8 +19060,8 @@ fn completed_action_identity_survives_late_start_and_update_events() {
         assert_eq!(transcript.tools["selected"], selected);
         assert_eq!(transcript.order.len(), 1);
         assert!(matches!(&transcript.order[selected],
-            TranscriptEntry::Tool { complete: true, expanded: true, output_view: Some((_, output)), .. }
-                if output == "original result"));
+            TranscriptEntry::Tool { execution, expanded: true, output_view: Some((_, output)), .. }
+                if execution.is_terminal() && output == "original result"));
     }
 }
 
@@ -19278,8 +19156,8 @@ async fn action_inspector_keeps_identity_across_history_reprojection() {
     );
     assert!(matches!(
         &terminal.transcript.order[terminal.focused_tool.unwrap()],
-        TranscriptEntry::Tool { complete: true, output_view: Some((_, output)), .. }
-            if output.contains("selected result")
+        TranscriptEntry::Tool { execution, output_view: Some((_, output)), .. }
+            if execution.is_terminal() && output.contains("selected result")
     ));
     history.retain(|event| {
         !matches!(
@@ -19613,7 +19491,7 @@ fn empty_reasoning_row_is_not_expandable_or_hinted() {
     }
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool { name, complete: true, .. } if name == "Reasoned"
+        TranscriptEntry::Tool { name, execution, .. } if execution.is_terminal() && name == "Reasoned"
     ));
     assert_eq!(transcript.tool_copy_hint(0), None);
     assert!(!transcript.tool_is_expandable(0));
@@ -20039,8 +19917,8 @@ fn copied_image_message_round_trips_text_and_ordered_images_into_another_session
             effort: None,
             time: "12:00".into(),
             status: MessageStatus::Complete,
-            complete: true,
-            user_interrupted: false,
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
+
             redirected: false,
         });
         let copied = transcript.order[0].copy_text_owned().unwrap();
@@ -20086,8 +19964,7 @@ fn attachment_transcript(path: &Path, cell: Option<(u16, u16)>) -> Transcript {
         effort: None,
         time: "2026-08-26 12:00".to_string(),
         status: MessageStatus::Complete,
-        complete: true,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
     transcript
@@ -20171,8 +20048,7 @@ fn a_sent_message_waiting_behind_a_tool_is_clickable() {
         effort: None,
         time: "2026-09-23 17:00".to_string(),
         status: MessageStatus::InProgress,
-        complete: false,
-        user_interrupted: false,
+        execution: Execution::new(Utc::now(), ExecutionState::Running),
         redirected: false,
     });
     let rendered = transcript.render(100, None, None, None);
@@ -20220,12 +20096,13 @@ fn watch_rows_sit_in_the_action_run_without_extra_spacing() {
     };
     tool(&mut transcript, "first", 1);
     transcript.order.push(TranscriptEntry::Action {
+        source_session_id: None,
         kind: TranscriptActionKind::Agent,
         label: "Watch".to_string(),
         detail: "agent events".to_string(),
         body: None,
         time: "2026-09-25 13:40".to_string(),
-        state: TranscriptActionState::Complete,
+        execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
         expanded: false,
     });
     tool(&mut transcript, "second", 3);
@@ -20349,8 +20226,8 @@ fn team_broadcast_timeline_updates_one_durable_row_across_replay_and_insertion()
     transcript.apply(&message(2, EventActor::Assistant, "First reply"));
     transcript.apply(&update(3, 0));
     assert!(matches!(&transcript.order[2], TranscriptEntry::Action {
-        label, detail, state: TranscriptActionState::Waiting, body: Some(body), ..
-    } if label == "Team" && detail == "sent · 0/2 acknowledged" && body == "Please report status"));
+        label, detail, execution, body: Some(body), ..
+    }  if matches!(execution.state(), TranscriptActionState::Waiting) && label == "Team" && detail == "sent · 0/2 acknowledged" && body == "Please report status"));
     // A late user prompt is inserted ahead of the assistant and team rows.
     transcript.apply(&message(4, EventActor::User, "Second prompt"));
     assert_eq!(transcript.team_broadcast_entries[&message_id], 3);
@@ -20358,16 +20235,16 @@ fn team_broadcast_timeline_updates_one_durable_row_across_replay_and_insertion()
     transcript.apply(&update(6, 2));
     assert_eq!(transcript.order.len(), 4);
     assert!(matches!(&transcript.order[3], TranscriptEntry::Action {
-        detail, state: TranscriptActionState::Complete, ..
-    } if detail == "sent · 2/2 acknowledged"));
+        detail, execution, ..
+    }  if matches!(execution.state(), TranscriptActionState::Complete) && detail == "sent · 2/2 acknowledged"));
     let mut replay = Transcript::default();
     for n in 1..=3 {
         replay.apply_history(&update(n, (n - 1) as u32));
     }
     assert_eq!(replay.order.len(), 1);
     assert!(matches!(&replay.order[0], TranscriptEntry::Action {
-        detail, state: TranscriptActionState::Complete, ..
-    } if detail == "sent · 2/2 acknowledged"));
+        detail, execution, ..
+    }  if matches!(execution.state(), TranscriptActionState::Complete) && detail == "sent · 2/2 acknowledged"));
 }
 
 #[test]
@@ -20582,7 +20459,7 @@ fn a_projected_plan_update_surfaces_beside_the_action_that_made_it() {
     }
     let plan_position = |transcript: &Transcript| {
         let cards = (0..transcript.order.len())
-            .filter(|&index| matches!(transcript.order[index], TranscriptEntry::Plan { .. }))
+            .filter(|&index| matches!(&transcript.order[index], TranscriptEntry::Plan { .. }))
             .collect::<Vec<_>>();
         assert_eq!(cards.len(), 1);
         cards[0]
@@ -20762,14 +20639,17 @@ fn speed_picker_selection_dispatches_the_selected_tier() {
 fn replay_parent_cancellation_settles_nested_wait_not_parallel_tool() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
-    for (id, parent, name) in [
+    for (index, (id, parent, name)) in [
         ("runtime", None, "runtime_exec"),
         ("wait", Some("runtime"), "wait_agent"),
         ("parallel", None, "exec"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         transcript.apply(&SessionEvent::new(
             session_id,
-            1,
+            index as u64 + 1,
             SessionEventKind::ToolStarted {
                 tool_call_id: id.into(),
                 name: name.into(),
@@ -20781,7 +20661,7 @@ fn replay_parent_cancellation_settles_nested_wait_not_parallel_tool() {
     }
     transcript.apply(&SessionEvent::new(
         session_id,
-        2,
+        4,
         SessionEventKind::ToolCompleted {
             tool_call_id: "runtime".into(),
             output: "persistent runtime was cancelled".into(),
@@ -20793,19 +20673,18 @@ fn replay_parent_cancellation_settles_nested_wait_not_parallel_tool() {
         },
     ));
     assert!(matches!(
-        transcript.order[transcript.tools["wait"]],
+        &transcript.order[transcript.tools["wait"]],
         TranscriptEntry::Tool {
-            complete: true,
-            error: true,
+            execution,
             ..
-        }
+        } if execution.is_terminal() && execution.is_failed()
     ));
     assert!(matches!(
-        transcript.order[transcript.tools["parallel"]],
+        &transcript.order[transcript.tools["parallel"]],
         TranscriptEntry::Tool {
-            complete: false,
+            execution,
             ..
-        }
+        } if !execution.is_terminal()
     ));
 }
 
@@ -21085,6 +20964,24 @@ fn message_cards_resolve_team_threads_after_replay() {
             );
         }
     }
+    let mut transcript = Transcript::default();
+    let row = TranscriptEntry::Action {
+        kind: TranscriptActionKind::Agent,
+        source_session_id: Some(child),
+        label: "Agent".into(),
+        detail: "worker".into(),
+        body: None,
+        time: "12:00".into(),
+        execution: Execution::new(now, ExecutionState::Complete),
+        expanded: false,
+    };
+    transcript.order.push(row.clone());
+    transcript.order.push(row);
+    transcript.subagent_entries.insert(child, 1);
+    assert_eq!(
+        message_thread_target(&transcript, 0, director, &agents),
+        Some(TeamRosterTarget::Child(child)),
+    );
 }
 
 #[tokio::test]
@@ -21351,7 +21248,7 @@ fn compaction_preview_separates_title_and_renders_markdown_without_changing_summ
         summary: summary.into(),
         time: canonical_local_time(Local::now()),
         expanded: true,
-        complete: true,
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         sequence: 1,
     });
     let rendered = transcript
@@ -21579,9 +21476,9 @@ async fn running_action_click_backgrounds_once_and_completed_click_inspects() {
     assert!(matches!(
         &terminal.transcript.order[index],
         TranscriptEntry::Tool {
-            backgrounded: true,
+            execution,
             ..
-        }
+        } if execution.is_backgrounded()
     ));
     assert!(matches!(
         terminal.run_pending_transcript_click(PendingTranscriptClick::Tool { index, run: None }),
@@ -21607,20 +21504,18 @@ async fn running_action_click_backgrounds_once_and_completed_click_inspects() {
     assert!(matches!(
         &terminal.transcript.order[index],
         TranscriptEntry::Tool {
-            complete: true,
-            backgrounded: false,
+            execution,
             ..
-        }
+        } if execution.is_terminal() && !execution.is_backgrounded()
     ));
     // Late delivery of the initial background receipt must not resurrect a finished job.
     terminal.apply_session_event(&completion);
     assert!(matches!(
         &terminal.transcript.order[index],
         TranscriptEntry::Tool {
-            complete: true,
-            backgrounded: false,
+            execution,
             ..
-        }
+        } if execution.is_terminal() && !execution.is_backgrounded()
     ));
 }
 
@@ -22057,12 +21952,7 @@ fn background_action_animates_until_settled_without_losing_failure_style() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:00".into(),
-        started_at: Utc::now(),
-        completed_at: None,
-        complete: true,
-        error: false,
-        user_interrupted: false,
-        backgrounded: true,
+        execution: Execution::new(Utc::now(), ExecutionState::Backgrounded),
         expanded: false,
         outcome: None,
         cwd: None,
@@ -22098,8 +21988,9 @@ fn background_action_animates_until_settled_without_losing_failure_style() {
     .apply_header(&mut next_header);
     assert!(next_header.to_string().contains("⠙"));
     assert_ne!(header.to_string(), next_header.to_string());
-    if let TranscriptEntry::Tool { backgrounded, .. } = &mut transcript.order[0] {
-        *backgrounded = false;
+    let failed_row = transcript.order[0].clone();
+    if let TranscriptEntry::Tool { execution, .. } = &mut transcript.order[0] {
+        execution.transition(ExecutionState::Complete, Utc::now());
     }
     assert!(!transcript.has_running_tool());
     assert!(!transcript.tool_activity_is_running(0));
@@ -22115,10 +22006,13 @@ fn background_action_animates_until_settled_without_losing_failure_style() {
             .iter()
             .any(|span| span.style.fg == Some(USER_LABEL_BLUE))
     );
-    if let TranscriptEntry::Tool { error, .. } = &mut transcript.order[0] {
-        *error = true;
+    let mut failed_transcript = Transcript::default();
+    let mut failed_row = failed_row;
+    if let TranscriptEntry::Tool { execution, .. } = &mut failed_row {
+        execution.transition(ExecutionState::Failed, Utc::now());
     }
-    assert!(transcript.lines(100).iter().any(|line| {
+    failed_transcript.order.push(failed_row);
+    assert!(failed_transcript.lines(100).iter().any(|line| {
         line.spans
             .iter()
             .any(|span| span.style.fg == Some(Color::Red))
