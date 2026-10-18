@@ -2114,7 +2114,10 @@ return receipt
         // only host inspection so this planning contract is independent of RAM,
         // disk headroom and installed toolchains on the test host.
         let source = concat!(
-            r#"local borg_exec = function(call_id)
+            r#"local borg_tool = function(call_id, name, arguments)
+                return '{"session_id":"00000000-0000-0000-0000-000000000002"}'
+            end
+            local borg_exec = function(call_id)
                 if call_id == 2 then
                     return '{"exit_code":0,"stdout":"root=/tmp/native-contract\\noutput=/tmp/native-contract/target\\nmanifest=1\\nmem_kb=67108864\\ncpus=2\\nmax_jobs=2\\ntool_path=/usr/bin/tool\\nnice=/usr/bin/nice\\nborg=/usr/bin/borg\\nparticipant=00000000-0000-0000-0000-000000000001\\nsession=00000000-0000-0000-0000-000000000002\\n"}'
                 end

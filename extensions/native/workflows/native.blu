@@ -408,13 +408,6 @@ local function lane(options)
         "if [ -e \"$root/.git\" ]; then kv git 1; [ -n \"$(git -C \"$root\" ls-files --others --exclude-standard | head -c 1)\" ] && kv untracked 1; fi",
         "exit 0",
     })
-    next_call = next_call + 1
-    local context = decode(borg_tool(next_call, "get_tool_context", "{}"))
-    if type(context.session_id) ~= "string" or context.session_id == "" then
-        fail("session identity is unavailable for lane ownership")
-    end
-    f.session = context.session_id
-    f.participant = context.session_id
     local root = f.root
     if f.output ~= root and f.output:sub(1, #root + 1) ~= root .. "/" then
         fail("output must stay in worktree: " .. f.output)
@@ -519,6 +512,13 @@ local function lane(options)
         argv[#argv + 1] = command[index]
     end
     local memory = job_count * per_job + 2 * GIB
+    next_call = next_call + 1
+    local context = decode(borg_tool(next_call, "get_tool_context", "{}"))
+    if type(context.session_id) ~= "string" or context.session_id == "" then
+        fail("session identity is unavailable for lane ownership")
+    end
+    f.session = context.session_id
+    f.participant = context.session_id
     local spec = {
         fingerprint = fingerprint,
         lease = {
