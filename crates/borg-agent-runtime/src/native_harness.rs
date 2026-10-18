@@ -65,24 +65,6 @@ const MAX_CONTEXT_LENGTH_RECOVERIES: usize = 2;
 /// session teardown reaps anything that lingers, so this only bounds how long
 /// Escape can feel unresponsive.
 const INTERRUPT_TOOL_CANCEL_DRAIN: Duration = Duration::from_millis(300);
-/// One compaction model call. Passes normally finish in about a minute; a
-/// silent stream would otherwise hold the turn until the 20-minute provider
-/// stall timeout, because compaction calls forward no progress events.
-const COMPACTION_PASS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-
-/// Like any compaction transport failure, a timed-out pass is not retried:
-/// the turn fails with its history preserved.
-fn compaction_timeout() -> ProviderCallError {
-    ProviderCallError {
-        message: format!(
-            "context compaction produced no result within {}s",
-            COMPACTION_PASS_TIMEOUT.as_secs()
-        ),
-        trace: Box::default(),
-        session_id: None,
-        kind: borg_provider::provider::ProviderErrorKind::ConnectionLost,
-    }
-}
 #[derive(Clone)]
 pub(crate) struct NativeHarness {
     model_client: Arc<dyn NativeModelClient>,
@@ -1917,10 +1899,8 @@ impl NativeHarness {
                         output_schema: None,
                     },
                     None,
-                );
-            let result = tokio::time::timeout(COMPACTION_PASS_TIMEOUT, result)
+                )
                 .await
-                .map_err(|_| compaction_timeout())?
                 .map_err(anyhow::Error::new)?;
             absorb_usage(usage, &result.usage);
             anyhow::ensure!(
@@ -2004,12 +1984,10 @@ impl NativeHarness {
             output_schema: None,
             ..prefix.clone()
         };
-        let call = self
+        let result = match self
             .model_client
-            .model_turn(provider, model, effort, request, None);
-        let result = match tokio::time::timeout(COMPACTION_PASS_TIMEOUT, call)
+            .model_turn(provider, model, effort, request, None)
             .await
-            .map_err(|_| compaction_timeout())?
         {
             Ok(result) => result,
             Err(error)
@@ -2172,16 +2150,11 @@ impl NativeHarness {
                     output_schema: None,
                     ..prefix.clone()
                 };
-                let call = self.model_client.provider_compaction(
-                    turn.provider,
-                    model,
-                    turn.effort.as_deref(),
-                    request,
-                );
-                let outcome = tokio::time::timeout(COMPACTION_PASS_TIMEOUT, call)
+                match self
+                    .model_client
+                    .provider_compaction(turn.provider, model, turn.effort.as_deref(), request)
                     .await
-                    .unwrap_or_else(|_| Err(compaction_timeout()));
-                match outcome {
+                {
                     Ok(ModelCompactionResult::Unsupported { .. }) => {}
                     Ok(ModelCompactionResult::Compacted(result)) => {
                         absorb_usage(usage, &result.usage);
