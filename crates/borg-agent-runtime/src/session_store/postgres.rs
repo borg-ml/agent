@@ -67,6 +67,7 @@ pub const SESSIONS_SHARED_ENV: &str = "BORG_SESSIONS_SHARED";
 /// with BORG_SESSIONS_POOL_SIZE.
 const POSTGRES_MAX_CONNECTIONS: u32 = 64;
 const POSTGRES_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
+const POSTGRES_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn production_pool_size() -> u32 {
     std::env::var("BORG_SESSIONS_POOL_SIZE")
@@ -131,6 +132,8 @@ impl PostgresSessionStore {
             .log_statements(tracing::log::LevelFilter::Debug);
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
+            .min_connections(0)
+            .idle_timeout(POSTGRES_IDLE_TIMEOUT)
             .acquire_timeout(POSTGRES_ACQUIRE_TIMEOUT)
             .connect_with(options)
             .await
@@ -498,6 +501,59 @@ mod tests {
     /// mock would get wrong. Without one they skip rather than fail, so the
     /// suite still runs on a machine with no database.
     use super::testing::{ScratchDatabase, test_url};
+
+    #[tokio::test]
+    async fn idle_sessions_release_connections_and_reconnect() {
+        use crate::{SessionEvent, SessionEventKind, SessionStore};
+
+        let url = testing::required_test_url();
+        let scratch = ScratchDatabase::create(&url).await;
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+            .await
+            .unwrap();
+        let mut sessions = Vec::new();
+        for _ in 0..12 {
+            let session = uuid::Uuid::new_v4();
+            store.create_session(session).await.unwrap();
+            store
+                .append(SessionEvent::new(
+                    session,
+                    0,
+                    SessionEventKind::SessionStarted,
+                ))
+                .await
+                .unwrap();
+            sessions.push(session);
+        }
+        let observer = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        let database = scratch.url.parse::<PgConnectOptions>().unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let connections: i64 =
+                    sqlx::query_scalar("select count(*) from pg_stat_activity where datname = $1")
+                        .bind(database.get_database())
+                        .fetch_one(&observer)
+                        .await
+                        .unwrap();
+                if connections == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("idle sessions must release all database connections");
+        for session in sessions {
+            assert_eq!(store.state(session).await.unwrap().latest_sequence, 1);
+        }
+        store.pool.close().await;
+        observer.close().await;
+        scratch.discard().await;
+    }
 
     #[tokio::test]
     async fn concurrent_bootstraps_do_not_race_on_schema_objects() {

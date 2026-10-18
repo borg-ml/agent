@@ -62,6 +62,11 @@ provisioning and configuration under a short Borg-home advisory lock; journal
 writes do not hold that lock. `initdb` runs in a staging directory renamed into
 place, and PostgreSQL handles stale `postmaster.pid` files during recovery.
 
+Sessions share their owner's database connection pool. Pools keep no minimum
+number of connections and reap connections idle for at least one second,
+so an idle pool does not reserve slots that another process needs. The pool
+size bounds concurrent database work, not the number of sessions.
+
 ## Where the setting is read
 
 `borg doctor` reports the store's health:
