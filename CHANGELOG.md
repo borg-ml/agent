@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.16.8)
 
+- Keep a provider/model switch made during a running turn from inheriting the old
+  route's later usage-limit cooldown. Preserved work and fresh director tasks
+  proceed on the selected route without waiting for the old provider to reset;
+  explicit interrupts still cancel automatic retries.
+
 - Make Escape in the TUI stop a running turn exactly like clicking the Running
   button. With queued follow-ups it used a separate soft "flush pending input"
   path; it now sends the same immediate interrupt. Menus and overlays still

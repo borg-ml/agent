@@ -3107,6 +3107,172 @@ async fn next_turn_completion(event_rx: &mut mpsc::Receiver<SessionEvent>, what:
     }
 }
 
+// A configure command can settle before the old turn's usage error arrives.
+// Exercise the actor boundary: the new route must run queued work immediately.
+#[tokio::test]
+async fn in_flight_usage_limit_does_not_park_a_new_route() {
+    struct ControlledExecutor(mpsc::Sender<(AgentTurn, oneshot::Sender<bool>)>);
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for ControlledExecutor {
+        async fn execute(
+            &self,
+            turn: AgentTurn,
+            _events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            let (finish, finished) = oneshot::channel();
+            self.0.send((turn, finish)).await.unwrap();
+            if finished.await? {
+                anyhow::bail!(
+                    "You've hit your usage limit. Provider-reported retry delay: 3600 seconds."
+                );
+            }
+            Ok(AgentTurnResult {
+                provider_session_id: None,
+                final_text: "finished".into(),
+            })
+        }
+    }
+    for same_provider in [false, true] {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let original_id = Uuid::new_v4();
+        let fresh_id = Uuid::new_v4();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        store.create_session(session_id).await.unwrap();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let (turn_tx, mut turns) = mpsc::channel(8);
+        let actor = tokio::spawn({
+            let journal_path = root.path().join("session.lock");
+            let cwd = root.path().to_path_buf();
+            let store = Arc::clone(&store);
+            async move {
+                run_session_actor(
+                    &journal_path,
+                    session_id,
+                    LaunchSession {
+                        request_id: original_id,
+                        cwd,
+                        provider: CodingProvider::Claude,
+                        model: Some("claude-opus-5-5".into()),
+                        effort: None,
+                        fast: Some(false),
+                        ultrafast: None,
+                        response_language: crate::ResponseLanguage::Auto,
+                        permission_mode: PermissionMode::Manual,
+                        name: None,
+                        initial_prompt: Some("original task".into()),
+                        capabilities: Default::default(),
+                        subagent_concurrency_limit: None,
+                        extension_skill_roots: Vec::new(),
+                        team_policy: None,
+                    },
+                    command_rx,
+                    event_tx,
+                    Arc::new(ControlledExecutor(turn_tx)),
+                    store,
+                )
+                .await
+            }
+        });
+        let (first, fail_first) = tokio::time::timeout(Duration::from_secs(5), turns.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.provider, CodingProvider::Claude);
+        let provider = if same_provider {
+            CodingProvider::Claude
+        } else {
+            CodingProvider::Codex
+        };
+        let model = if same_provider {
+            "claude-sonnet-5-5"
+        } else {
+            "gpt-6.1-sol"
+        };
+        command_tx
+            .send(HostCommand::Configure {
+                session_id,
+                action: crate::SessionConfigAction::SetAgent {
+                    request_id: Uuid::new_v4(),
+                    provider: Some(provider),
+                    model: Some(model.into()),
+                    effort: Some("high".into()),
+                    fast: None,
+                    ultrafast: None,
+                },
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = event_rx.recv().await {
+                match event.kind {
+                    SessionEventKind::SessionConfigured {
+                        provider: p,
+                        model: Some(m),
+                        ..
+                    } if p == provider && m == model => break,
+                    SessionEventKind::ProviderEvent { kind, payload, .. }
+                        if kind == "child_configuration_rejected" =>
+                    {
+                        panic!("configuration was rejected: {payload}");
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("configuration settles while the old turn runs");
+        command_tx
+            .send(HostCommand::TeamPrompt {
+                session_id,
+                message_id: fresh_id,
+                text: "fresh director task".into(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Queue,
+            })
+            .await
+            .unwrap();
+        fail_first.send(true).unwrap();
+        next_turn_completion(&mut event_rx, "old route reports its usage limit").await;
+        let (retry, finish_retry) = tokio::time::timeout(Duration::from_secs(5), turns.recv())
+            .await
+            .expect("new route must not inherit the old route's hour-long wait")
+            .unwrap();
+        assert_eq!(retry.provider, provider);
+        assert_eq!(retry.model.as_deref(), Some(model));
+        assert_eq!(retry.effort.as_deref(), Some("high"));
+        finish_retry.send(false).unwrap();
+        next_turn_completion(&mut event_rx, "preserved work finishes on the new route").await;
+        let (fresh, finish_fresh) = tokio::time::timeout(Duration::from_secs(5), turns.recv())
+            .await
+            .expect("fresh director task is admitted without a usage wait")
+            .unwrap();
+        assert_eq!(fresh.message_id, fresh_id);
+        assert!(fresh.prompt.contains("fresh director task"));
+        finish_fresh.send(false).unwrap();
+        next_turn_completion(&mut event_rx, "fresh task finishes").await;
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
+        assert!(
+            store
+                .state(session_id)
+                .await
+                .unwrap()
+                .usage_limit_retry
+                .is_none()
+        );
+        assert!(turns.try_recv().is_err(), "no duplicate task is scheduled");
+        scratch.discard().await;
+    }
+}
+
 /// Failure mode: after a usage limit, a person's new message sat queued
 /// behind the automatic retry timer (up to hours) even though the account
 /// had been topped up, leaving the session stuck on "starting".

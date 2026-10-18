@@ -5741,6 +5741,8 @@ async fn run_agent_session_store_kernel_inner(
                                 provider_fork_turn_id = None;
                                 executor.stop_session(session_id).await?;
                             }
+                            let selection_changed =
+                                active_provider != launch.provider || active_model != launch.model;
                             let usage_limit_reset_delay =
                                 provider_error_usage_limit_reset_delay(&error);
                             // With a fallback chain any usage limit, including a
@@ -5748,17 +5750,26 @@ async fn run_agent_session_store_kernel_inner(
                             // route instead of stopping it.
                             // Managed workers must keep the director-selected route, not inherit
                             // the interactive session's fallback providers/models/efforts.
-                            let chain_fallback = dispatcher.parent_session_id().await.is_none()
+                            let chain_fallback = !selection_changed
+                                && dispatcher.parent_session_id().await.is_none()
                                 && !launch.capabilities.model_fallback.is_empty()
                                 && provider_error_is_usage_limited(&error)
                                 && !interrupted;
                             let usage_limit_retry = chain_fallback
                                 || (launch.capabilities.auto_resume_usage_limits
-                                    && provider_supports_usage_limit_resume(launch.provider)
+                                    && provider_supports_usage_limit_resume(active_provider)
                                     && provider_error_is_temporary_usage_limited(&error)
                                     && !interrupted);
-                            let mut usage_limit_wait = usage_limit_retry
-                                .then(|| usage_limit_reset_delay.unwrap_or(usage_limit_retry_delay));
+                            // The error belongs to the route that ran this turn, not a
+                            // selection changed in flight. Preserve its work, but do not
+                            // park the newly selected route behind the old route's limit.
+                            let mut usage_limit_wait = usage_limit_retry.then(|| {
+                                if selection_changed {
+                                    Duration::ZERO
+                                } else {
+                                    usage_limit_reset_delay.unwrap_or(usage_limit_retry_delay)
+                                }
+                            });
                             let mut fallback_switch = None;
                             if chain_fallback {
                                 fallback_switch = fall_back_on_usage_limit(
@@ -5880,6 +5891,8 @@ async fn run_agent_session_store_kernel_inner(
                                     )
                                 } else if let Some(switch) = &fallback_switch {
                                     switch.status(usage_limit_wait.unwrap_or_default())
+                                } else if selection_changed && usage_limit_retry {
+                                    "The previous route reached its usage limit; continuing preserved work on the selected provider/model.".to_string()
                                 } else if let Some(wait) = usage_limit_wait {
                                     if usage_limit_continue {
                                         format!(
@@ -5959,7 +5972,7 @@ async fn run_agent_session_store_kernel_inner(
                                 goal_turn_failures.reset();
                                 retry_not_before = Some(Instant::now() + wait);
                                 record(&mut journal, &events, session_id, SessionEventKind::ProviderEvent {
-                                    provider: launch.provider,
+                                    provider: active_provider,
                                     kind: "usage_limit_retry".into(),
                                     // Commit the deadline and replacement together before
                                     // settling the original message, closing the crash gap.
