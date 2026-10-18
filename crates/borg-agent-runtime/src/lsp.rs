@@ -1634,7 +1634,8 @@ fn server_initialization_options(spec: &ServerSpec) -> Option<Value> {
     (spec.id == "rust-analyzer").then(|| {
         json!({
             "cachePriming": { "enable": false },
-            "cargo": { "allTargets": false },
+            "cargo": { "allTargets": false, "buildScripts": { "enable": false } },
+            "procMacro": { "enable": false },
             "checkOnSave": false,
             "check": { "allTargets": false }
         })
@@ -2744,6 +2745,10 @@ mod tests {
 
         assert_eq!(options.pointer("/cachePriming/enable"), Some(&json!(false)));
         assert_eq!(options.pointer("/cargo/allTargets"), Some(&json!(false)));
+        // Disabling checkOnSave alone still permits rust-analyzer to compile
+        // build.rs helpers/proc macros during indexing (violates source-only work).
+        assert_eq!(options.pointer("/cargo/buildScripts/enable"), Some(&json!(false)));
+        assert_eq!(options.pointer("/procMacro/enable"), Some(&json!(false)));
         assert_eq!(options.get("checkOnSave"), Some(&json!(false)));
         assert_eq!(options.pointer("/check/allTargets"), Some(&json!(false)));
     }
