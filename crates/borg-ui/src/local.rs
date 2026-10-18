@@ -9,6 +9,7 @@ use borg_remote::{
     local_session_owner_is_active, local_session_owner_uses_binary, login_provider_with_output,
     send_local_session_command, session_control_socket_path,
 };
+use borg_view::{core::TranscriptCore, projection_helpers::subagent_snapshot_for_activity};
 use uuid::Uuid;
 
 use crate::{
@@ -453,6 +454,7 @@ pub struct LocalSessionClient {
     /// seeded from the complete team history, so later root events only move
     /// it forward and bounded transcript trims never drop a child.
     team_sequence: u64,
+    team: TranscriptCore,
     /// Held connection to the root owner's presence socket. The host counts
     /// it as an attached viewer, so its idle TTL never stops a session the
     /// GUI is showing; it is dropped with the client.
@@ -531,13 +533,13 @@ impl LocalSessionClient {
             .await?
             .subagent_events;
         team.sort_by_key(|event| event.sequence);
+        let mut team_projection = TranscriptCore::default();
         for event in &fork_team {
-            if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind {
-                upsert_agent(&mut view.agents, agent);
-            }
+            merge_team_snapshot(&mut team_projection, event);
         }
         let mut team_sequence = 0;
-        merge_team_events(&mut view.agents, &mut team_sequence, &team);
+        merge_team_events(&mut team_projection, &mut team_sequence, &team);
+        view.agents = team_agents(&team_projection);
         let team_sequence = team_sequence.max(root_state.latest_sequence);
         let durable_history = view.history.as_ref().clone();
         let timeline = TimelineProjector::from_events(&durable_history);
@@ -559,6 +561,7 @@ impl LocalSessionClient {
             live_revision: 0,
             root_session_id,
             team_sequence,
+            team: team_projection,
             #[cfg(unix)]
             presence: None,
             timeline,
@@ -644,6 +647,7 @@ impl LocalSessionClient {
         let mut live = self.live_events.values().cloned().collect::<Vec<_>>();
         live.sort_by_key(|event| event.created_at);
         timeline.extend(&live);
+        timeline.seed_subagents(&self.view.agents);
         SessionPresentation {
             view: self.view.clone(),
             root_session_id: self.root_session_id,
@@ -666,7 +670,10 @@ impl LocalSessionClient {
                 .events_after(self.root_session_id, self.team_sequence, 1_024)
                 .await?
         };
-        changed |= merge_team_events(&mut self.view.agents, &mut self.team_sequence, &root_events);
+        if merge_team_events(&mut self.team, &mut self.team_sequence, &root_events) {
+            self.view.agents = team_agents(&self.team);
+            changed = true;
+        }
         let director = root_events
             .iter()
             .filter_map(|event| match &event.kind {
@@ -1212,12 +1219,10 @@ pub fn peer_host_commands(
     }
 }
 
-/// Apply root journal events past `sequence` to the team roster. Events at or
-/// below it (an older history page, a re-read window) were already reflected,
-/// so they can never roll a child back to an earlier snapshot. Returns whether
-/// the roster changed.
+/// Keep the complete root roster independent of the bounded focused transcript,
+/// but accept snapshots through the same canonical gate as transcript cards.
 fn merge_team_events(
-    agents: &mut Vec<SubagentSnapshot>,
+    team: &mut TranscriptCore,
     sequence: &mut u64,
     events: &[SessionEvent],
 ) -> bool {
@@ -1227,23 +1232,33 @@ fn merge_team_events(
             continue;
         }
         *sequence = event.sequence;
-        if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind {
-            upsert_agent(agents, agent);
-            changed = true;
-        }
+        changed |= merge_team_snapshot(team, event);
     }
     changed
 }
 
-fn upsert_agent(agents: &mut Vec<SubagentSnapshot>, agent: &SubagentSnapshot) {
-    if let Some(existing) = agents
-        .iter_mut()
-        .find(|existing| existing.session_id == agent.session_id)
+fn merge_team_snapshot(team: &mut TranscriptCore, event: &SessionEvent) -> bool {
+    if let SessionEventKind::SubagentActivity {
+        activity,
+        agent,
+        event,
+    } = &event.kind
     {
-        *existing = agent.clone();
+        let snapshot = subagent_snapshot_for_activity(*activity, agent, event.as_deref());
+        team.reconcile_subagent_snapshot(&snapshot, false)
     } else {
-        agents.push(agent.clone());
+        false
     }
+}
+
+fn team_agents(team: &TranscriptCore) -> Vec<SubagentSnapshot> {
+    let mut agents = team
+        .subagent_snapshots
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    agents.sort_by_key(|agent| (agent.created_at, agent.session_id));
+    agents
 }
 
 #[cfg(test)]
@@ -1279,6 +1294,8 @@ mod tests {
                     parent_session_id: root,
                     task_name: "worker".into(),
                     status,
+                    lifecycle: None,
+                    source: None,
                     provider: CodingProvider::Codex,
                     model: None,
                     effort: None,
@@ -1322,6 +1339,57 @@ mod tests {
 
     async fn refresh_to_tail(client: &mut LocalSessionClient) {
         while client.refresh().await.unwrap() {}
+    }
+
+    // Regression: bootstrap recovery may be newer than a bounded transcript,
+    // and a later-delivered stale activity must not roll either surface back.
+    #[test]
+    fn canonical_root_roster_repairs_bounded_cards_without_stale_rollback() {
+        use borg_remote::{SubagentLifecycle, SubagentSourceCursor};
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut old = agent(root, child, SubagentStatus::Ready);
+        old.sequence = 1;
+        if let SessionEventKind::SubagentActivity { agent, .. } = &mut old.kind {
+            agent.lifecycle = Some(SubagentLifecycle::Ready);
+            agent.source = Some(SubagentSourceCursor {
+                child_sequence: 1,
+                revision: 1,
+            });
+        }
+        let mut current = old.clone();
+        current.sequence = 2;
+        if let SessionEventKind::SubagentActivity { agent, .. } = &mut current.kind {
+            agent.status = SubagentStatus::Running;
+            agent.lifecycle = Some(SubagentLifecycle::Running);
+            agent.source = Some(SubagentSourceCursor {
+                child_sequence: 2,
+                revision: 2,
+            });
+        }
+        let mut team = TranscriptCore::default();
+        let mut sequence = 0;
+        assert!(merge_team_events(&mut team, &mut sequence, &[current]));
+        let mut timeline = TimelineProjector::from_events(&[old.clone()]);
+        timeline.seed_subagents(&team_agents(&team));
+        let entries = timeline.into_entries();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].running);
+        assert_eq!(entries[0].target_session_id, Some(child));
+        assert_eq!(
+            team_agents(&team)[0].lifecycle(),
+            SubagentLifecycle::Running
+        );
+        old.sequence = 3;
+        old.created_at += chrono::Duration::hours(1);
+        assert!(!merge_team_events(&mut team, &mut sequence, &[old]));
+        assert_eq!(
+            team_agents(&team)[0].lifecycle(),
+            SubagentLifecycle::Running
+        );
+        let mut empty = TimelineProjector::default();
+        empty.seed_subagents(&team_agents(&team));
+        assert!(empty.into_entries().is_empty());
     }
 
     #[tokio::test]

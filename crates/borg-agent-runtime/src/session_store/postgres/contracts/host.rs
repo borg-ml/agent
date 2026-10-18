@@ -291,6 +291,7 @@ async fn terminal_host_settlement_cancels_abandoned_actions_and_fences_old_lease
             session_id,
             0,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Stopped,
                 detail: None,
             },
@@ -398,6 +399,7 @@ async fn host_journal_cursors_preserve_late_events_live_state_and_pagination() {
             first,
             0,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Running,
                 detail: None,
             },
@@ -477,6 +479,7 @@ async fn host_journal_cursors_preserve_late_events_live_state_and_pagination() {
             first,
             0,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Stopped,
                 detail: None,
             },

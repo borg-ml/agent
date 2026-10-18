@@ -1859,7 +1859,7 @@ mod tests {
         let event = rx
             .try_recv()
             .expect("attention settles on the parked child");
-        assert!(event.contains("waiting on the parent"), "{event}");
+        assert!(event.contains("needs parent attention"), "{event}");
         assert!(!attention.running, "it settled as it was armed");
     }
 
@@ -1871,15 +1871,28 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let watches = Watches::new(ProcessManager::default(), tx, Uuid::new_v4());
         let child = Uuid::new_v4();
+        // A worker parked on its own job needs no parent action. A compiler
+        // cannot catch this semantically valid but premature watcher wake.
+        watches
+            .observe_agent(child, SubjectLife::Waiting, "worker-a")
+            .await;
+        let waiting = watches
+            .start_agents(agent_args(vec![child], None, Aggregate::All))
+            .await
+            .unwrap();
+        assert!(waiting.running);
+        assert!(rx.try_recv().is_err());
         watches
             .observe_agent(child, SubjectLife::Parked, "worker-a")
             .await;
+        rx.try_recv()
+            .expect("real parent attention settles the waiting watch");
         let info = watches
             .start_agents(agent_args(vec![child], None, Aggregate::All))
             .await
             .unwrap();
         let event = rx.try_recv().expect("the parked child settles it");
-        assert!(event.contains("waiting on the parent"), "{event}");
+        assert!(event.contains("needs parent attention"), "{event}");
         assert!(!info.running, "it settled as it was armed");
     }
 
@@ -2398,7 +2411,7 @@ mod tests {
             .await;
 
         let event = rx.try_recv().expect("attention settles the watch");
-        assert!(event.contains("waiting on the parent"), "{event}");
+        assert!(event.contains("needs parent attention"), "{event}");
         assert!(!watches.list().await[0].running);
         let resumed = watches
             .resume_if_finished()

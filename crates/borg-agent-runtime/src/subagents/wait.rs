@@ -62,14 +62,15 @@ impl Unseen {
 }
 
 fn settled(agent: &SubagentSnapshot) -> bool {
-    match agent.status {
-        // A child parked on watchers has only said something intermediate.
-        SubagentStatus::Ready => agent.final_text.is_some() && !parked_on_watchers(agent),
-        SubagentStatus::Stopped | SubagentStatus::Failed | SubagentStatus::WaitingForApproval => {
-            true
-        }
-        SubagentStatus::Starting | SubagentStatus::Running => false,
-    }
+    matches!(
+        agent.lifecycle(),
+        SubagentLifecycle::Ready
+            | SubagentLifecycle::WaitingForApproval
+            | SubagentLifecycle::Dormant
+            | SubagentLifecycle::DormantInterrupted
+            | SubagentLifecycle::Stopped
+            | SubagentLifecycle::Failed
+    )
 }
 
 /// Identifies one settled state of a child. Not `updated_at`: every child
@@ -78,7 +79,7 @@ fn settled(agent: &SubagentSnapshot) -> bool {
 fn fingerprint(agent: &SubagentSnapshot) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (agent.status as u8).hash(&mut hasher);
+    (agent.lifecycle() as u8).hash(&mut hasher);
     if agent.status == SubagentStatus::Ready {
         agent.final_text.hash(&mut hasher);
     } else {
@@ -87,19 +88,17 @@ fn fingerprint(agent: &SubagentSnapshot) -> u64 {
     hasher.finish()
 }
 
-/// A `Ready` child that is parked on live watchers (a long build or scan it
-/// started) is not idle: it wakes itself when the watcher fires. It is not
-/// counted as `working` (the wait must not block on a watcher that may never
-/// fire), but the parent is told, so "working_children: 0" is not read as
-/// "nothing is running".
+/// Waiting on a live job is active work, not parent-action attention.
 pub(super) fn parked_on_watchers(agent: &SubagentSnapshot) -> bool {
-    agent.waiting_on_watchers().is_some()
+    agent.lifecycle() == SubagentLifecycle::WaitingOnWatchers
 }
 
 fn working(agent: &SubagentSnapshot) -> bool {
     matches!(
-        agent.status,
-        SubagentStatus::Starting | SubagentStatus::Running
+        agent.lifecycle(),
+        SubagentLifecycle::Starting
+            | SubagentLifecycle::Running
+            | SubagentLifecycle::WaitingOnWatchers
     )
 }
 
@@ -231,8 +230,21 @@ impl SubagentCoordinator {
                     return self.report(actor, reason, unseen, started).await;
                 }
             }
-            if check && settle_at.is_none() && !self.unseen(actor).await?.is_empty() {
-                settle_at = Some(tokio::time::Instant::now() + COALESCE);
+            if check && settle_at.is_none() {
+                if !self.unseen(actor).await?.is_empty() {
+                    settle_at = Some(tokio::time::Instant::now() + COALESCE);
+                } else {
+                    let awaiting_reply = self
+                        .awaiting_reply
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .contains(&actor);
+                    if !awaiting_reply && !self.children(actor).await.iter().any(working) {
+                        // A failed admission may remove the last reservation with
+                        // no worker lifecycle event. Do not wait half an hour on it.
+                        until = until.min(tokio::time::Instant::now() + IDLE_GRACE);
+                    }
+                }
             }
         }
     }
@@ -383,6 +395,7 @@ impl SubagentCoordinator {
                     "task_name": agent.task_name,
                     "session_id": agent.session_id,
                     "status": agent.status,
+                    "lifecycle": agent.lifecycle(),
                     "last": last_line(agent),
                 });
                 if working(agent) {
@@ -418,6 +431,7 @@ impl SubagentCoordinator {
                 "task_name": agent.task_name,
                 "session_id": agent.session_id,
                 "status": agent.status,
+                "lifecycle": agent.lifecycle(),
                 "detail": agent.detail.as_deref().map(|text| bounded(text, MESSAGE_TEXT_LIMIT)),
                 "final_text": agent.final_text.as_deref().map(|text| bounded(text, TEXT_LIMIT)),
                 "final_text_truncated": agent.final_text.as_deref().is_some_and(|text| text.trim().chars().count() > TEXT_LIMIT),

@@ -50,6 +50,339 @@ fn watcher_wait_detail_names_what_a_parked_child_waits_on() {
     assert_eq!(watcher_wait_label("Resumed"), None);
 }
 
+// A valid journal can contain old watcher detail or a delayed snapshot with a
+// newer wall clock. Neither may override canonical lifecycle/revision ordering.
+#[test]
+fn canonical_lifecycle_and_cursor_survive_legacy_snapshot_decode() {
+    let mut table = SubagentTable {
+        root_session_id: Uuid::new_v4(),
+        max_children: 2,
+        entries: HashMap::new(),
+        task_names: HashMap::new(),
+        parking: None,
+        resume_after_restore: Vec::new(),
+    };
+    let mut agent = table.reserve("worker", &launch()).unwrap();
+    agent.status = SubagentStatus::Ready;
+    agent.lifecycle = Some(SubagentLifecycle::Ready);
+    agent.detail = Some("Waiting on 1 watcher(s): old label".into());
+    assert_eq!(agent.waiting_on_watchers(), None);
+    let mut encoded = serde_json::to_value(&agent).unwrap();
+    encoded.as_object_mut().unwrap().remove("lifecycle");
+    encoded.as_object_mut().unwrap().remove("source");
+    let legacy: SubagentSnapshot = serde_json::from_value(encoded).unwrap();
+    assert_eq!(legacy.lifecycle(), SubagentLifecycle::WaitingOnWatchers);
+    let mut newer = agent.clone();
+    newer.lifecycle = Some(SubagentLifecycle::Running);
+    newer.advance(Some(9));
+    agent.updated_at = newer.updated_at + chrono::Duration::hours(1);
+    assert!(
+        newer.supersedes(&agent),
+        "revision, not delivery clock, owns ordering"
+    );
+    assert!(!agent.supersedes(&newer));
+    assert!(
+        !newer.supersedes(&newer),
+        "duplicate publication is not progress"
+    );
+    let mut regressed = newer.clone();
+    regressed.source.as_mut().unwrap().revision += 1;
+    regressed.source.as_mut().unwrap().child_sequence = 0;
+    assert!(
+        !regressed.supersedes(&newer),
+        "child watermark cannot regress"
+    );
+    let mut recovered = newer.clone();
+    recovered.source = Some(SubagentSourceCursor {
+        child_sequence: 7,
+        revision: 100,
+    });
+    project_child_state(
+        &mut recovered,
+        &crate::SessionState {
+            latest_sequence: 10,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        recovered.source.unwrap().revision,
+        103,
+        "journal repair must preserve the coordinator revision offset"
+    );
+}
+
+// Durable gaps and duplicate replay are normal under bounded live delivery.
+// Replaying must recover the final status without counting a completed message
+// as worker completion or applying a delayed status twice.
+#[tokio::test]
+async fn journal_repair_recovers_dropped_child_boundaries_without_report_completion() {
+    let (_directory, scratch, coordinator, root, child) = waiting_team().await;
+    let mut activity = coordinator.subscribe();
+    let report = coordinator
+        .store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: "I will run the build now.".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ))
+        .await
+        .unwrap();
+    coordinator
+        .replay_child_events(child, Some(report.sequence))
+        .await
+        .unwrap();
+    assert_eq!(
+        coordinator.get(child).await.unwrap().lifecycle(),
+        SubagentLifecycle::Running
+    );
+    let terminal = coordinator
+        .store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                lifecycle: Some(SubagentLifecycle::WaitingOnWatchers),
+                detail: Some("a display label, not a parser input".into()),
+            },
+        ))
+        .await
+        .unwrap();
+    coordinator.replay_child_events(child, None).await.unwrap();
+    let repaired = coordinator.get(child).await.unwrap();
+    assert_eq!(repaired.lifecycle(), SubagentLifecycle::WaitingOnWatchers);
+    assert_eq!(repaired.source.unwrap().child_sequence, terminal.sequence);
+    let (parent_repair, _) = coordinator
+        .activity_recovery_page(root, None, &HashMap::new())
+        .await
+        .unwrap();
+    assert!(
+        parent_repair.iter().any(|activity| matches!(activity,
+        SubagentActivity::SessionEvent { event, .. } if event.id == report.id)),
+        "parent report delivery must not be skipped using the newer snapshot watermark"
+    );
+    while activity.try_recv().is_ok() {}
+    coordinator.publish_child_event(report).await;
+    coordinator.publish_child_event(terminal).await;
+    assert!(
+        activity.try_recv().is_err(),
+        "duplicate replay must not republish or regress"
+    );
+    assert_eq!(
+        coordinator.get(child).await.unwrap().source,
+        repaired.source
+    );
+    // A delayed actor status must not lift a stop, even with a newer journal
+    // sequence. Only the authorized wake path can transition to Starting.
+    for status in [SessionStatus::Stopped, SessionStatus::Running] {
+        coordinator
+            .store
+            .append(SessionEvent::new(
+                child,
+                0,
+                SessionEventKind::StatusChanged {
+                    status,
+                    lifecycle: Some(status.into()),
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+        coordinator.replay_child_events(child, None).await.unwrap();
+    }
+    let stopped = coordinator.get(child).await.unwrap();
+    assert_eq!(stopped.lifecycle(), SubagentLifecycle::Stopped);
+    assert_eq!(stopped.status, SubagentStatus::Stopped);
+    assert_eq!(
+        stopped.source.unwrap().child_sequence,
+        coordinator
+            .store
+            .state(child)
+            .await
+            .unwrap()
+            .latest_sequence
+    );
+    scratch.discard().await;
+}
+
+// Before durable admission, a rejected spawn is only a failed operation. It
+// must release its name/slot rather than leave an unrecoverable phantom worker.
+#[tokio::test]
+async fn a_preadmission_start_failure_releases_the_worker_reservation() {
+    let (directory, scratch, coordinator, root, _worker) = waiting_team().await;
+    let child = coordinator
+        .table
+        .lock()
+        .await
+        .reserve("blocked", &launch())
+        .unwrap();
+    let path = child_lock_path(directory.path(), child.session_id);
+    let writer = crate::SessionWriterLease::acquire(&path).unwrap();
+    let mut activity = coordinator.subscribe();
+    assert!(
+        coordinator
+            .start_reserved(child.clone(), launch(), true)
+            .await
+            .is_err()
+    );
+    assert!(activity.try_recv().is_err(), "no worker was admitted");
+    assert!(coordinator.get(child.session_id).await.is_none());
+    assert!(
+        coordinator
+            .table
+            .lock()
+            .await
+            .reserve("blocked", &launch())
+            .is_ok(),
+        "a failed operation must not reserve the task name"
+    );
+    let (page, _) = coordinator
+        .activity_recovery_page(root, None, &HashMap::new())
+        .await
+        .unwrap();
+    assert!(!page.iter().any(|activity| matches!(activity,
+        SubagentActivity::Failed { agent } if agent.session_id == child.session_id)));
+    drop(writer);
+    scratch.discard().await;
+}
+
+// The parent can crash before mirroring Started. The typed child manifest must
+// recover the admitted worker, but registration alone is never permission to
+// resume a task that did not start. Forged parentage must not expand ownership.
+#[tokio::test]
+async fn a_manifest_only_child_recovers_as_failed_without_automatic_resume() {
+    let (directory, scratch, coordinator, root, worker) = waiting_team().await;
+    let registered = coordinator
+        .table
+        .lock()
+        .await
+        .reserve("registered", &launch())
+        .unwrap();
+    coordinator
+        .store
+        .register_child_session(root, registered.session_id)
+        .await
+        .unwrap();
+    coordinator
+        .store
+        .append(SessionEvent::new(
+            registered.session_id,
+            0,
+            SessionEventKind::SubagentRegistered {
+                agent: registered.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    let mut forged = registered.clone();
+    forged.session_id = Uuid::new_v4();
+    forged.parent_session_id = worker;
+    forged.task_name = "/root/worker/forged".into();
+    coordinator
+        .store
+        .register_child_session(root, forged.session_id)
+        .await
+        .unwrap();
+    coordinator
+        .store
+        .append(SessionEvent::new(
+            forged.session_id,
+            0,
+            SessionEventKind::SubagentRegistered {
+                agent: forged.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    let restarted = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        3,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        coordinator.store.clone(),
+    )
+    .unwrap();
+    let updates = restarted.restore_from_events(&[]).await.unwrap();
+    let restored = restarted.get(registered.session_id).await.unwrap();
+    assert_eq!(restored.lifecycle(), SubagentLifecycle::Failed);
+    assert!(restored.source.unwrap().child_sequence > 0);
+    assert!(
+        matches!(updates.as_slice(), [SubagentActivity::Failed { agent }]
+        if agent.session_id == registered.session_id)
+    );
+    let table = restarted.table.lock().await;
+    assert!(table.resume_after_restore.is_empty());
+    assert!(table.entries[&registered.session_id].commands.is_none());
+    assert!(!table.entries.contains_key(&forged.session_id));
+    drop(table);
+    scratch.discard().await;
+}
+
+// An actor can fail validation after durable admission but before SessionStarted.
+// The error must survive a crash before the parent receives its failure activity.
+#[tokio::test]
+async fn an_admitted_actor_start_failure_is_durable_without_a_parent_mirror() {
+    let (directory, scratch, coordinator, root, _worker) = waiting_team().await;
+    let mut invalid_launch = launch();
+    invalid_launch.subagent_concurrency_limit = Some(0);
+    let child = coordinator
+        .table
+        .lock()
+        .await
+        .reserve("invalid", &invalid_launch)
+        .unwrap();
+    let mut activity = coordinator.subscribe();
+    coordinator
+        .start_reserved(child.clone(), invalid_launch, true)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(activity.recv().await.unwrap(), SubagentActivity::Failed { agent }
+                if agent.session_id == child.session_id)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let state = coordinator.store.state(child.session_id).await.unwrap();
+    assert!(state.subagent_registration.is_some());
+    assert!(state.started_at.is_none());
+    assert_eq!(state.status, Some(SessionStatus::Failed));
+    assert!(
+        state
+            .status_detail
+            .as_deref()
+            .unwrap()
+            .contains("concurrency limit")
+    );
+    let restarted = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        3,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        coordinator.store.clone(),
+    )
+    .unwrap();
+    restarted.restore_from_events(&[]).await.unwrap();
+    let restored = restarted.get(child.session_id).await.unwrap();
+    assert_eq!(restored.lifecycle(), SubagentLifecycle::Failed);
+    assert_eq!(restored.detail, state.status_detail);
+    assert!(restarted.table.lock().await.resume_after_restore.is_empty());
+    scratch.discard().await;
+}
+
 // An exec that returns early must be the same kind of retrievable,
 // cancellable job as runtime/tools; stopping it must kill the owned process.
 #[tokio::test]
@@ -271,7 +604,15 @@ async fn live_subagent_count_tracks_lifecycle_and_descendant_scope() {
             .session_id;
         let sibling = table.reserve("sibling", &launch()).unwrap().session_id;
         table.entries.get_mut(&grandchild).unwrap().snapshot.status = SubagentStatus::Running;
+        table
+            .entries
+            .get_mut(&grandchild)
+            .unwrap()
+            .snapshot
+            .lifecycle = Some(SubagentLifecycle::Running);
         table.entries.get_mut(&sibling).unwrap().snapshot.status = SubagentStatus::Ready;
+        table.entries.get_mut(&sibling).unwrap().snapshot.lifecycle =
+            Some(SubagentLifecycle::Ready);
         (child, grandchild, sibling)
     };
     let mut dispatcher = AgentToolDispatcher::new(
@@ -318,37 +659,56 @@ async fn live_subagent_count_tracks_lifecycle_and_descendant_scope() {
     {
         let mut table = coordinator.table.lock().await;
         table.entries.get_mut(&child).unwrap().snapshot.status = SubagentStatus::Ready;
+        table.entries.get_mut(&child).unwrap().snapshot.lifecycle = Some(SubagentLifecycle::Ready);
         table.entries.get_mut(&grandchild).unwrap().snapshot.status =
             SubagentStatus::WaitingForApproval;
+        table
+            .entries
+            .get_mut(&grandchild)
+            .unwrap()
+            .snapshot
+            .lifecycle = Some(SubagentLifecycle::WaitingForApproval);
         table.entries.get_mut(&sibling).unwrap().snapshot.status = SubagentStatus::Failed;
+        table.entries.get_mut(&sibling).unwrap().snapshot.lifecycle =
+            Some(SubagentLifecycle::Failed);
     }
     dispatcher.actor_session_id = root;
     assert!(dispatcher.subagent_count_prompt().await.starts_with(
         "Live subagent counts — direct children: running=0, starting=0, waiting=0, inactive=2; all descendants: running=0, starting=0, waiting=0, inactive=3."
     ));
-    // A Ready child parked on a watcher is inactive, but the line says it is
-    // still running work, and a wait neither blocks on it nor reports it settled.
+    // A watcher-backed child remains active, and wait times out rather than
+    // claiming that no work is running or reporting its commentary as settled.
     {
         let mut table = coordinator.table.lock().await;
         let parked = &mut table.entries.get_mut(&sibling).unwrap().snapshot;
         parked.status = SubagentStatus::Ready;
+        parked.lifecycle = Some(SubagentLifecycle::WaitingOnWatchers);
         parked.detail = Some("Waiting on 1 watcher(s)".into());
         parked.final_text = Some("build started".into());
         table.entries.get_mut(&grandchild).unwrap().snapshot.status = SubagentStatus::Stopped;
+        table
+            .entries
+            .get_mut(&grandchild)
+            .unwrap()
+            .snapshot
+            .lifecycle = Some(SubagentLifecycle::Stopped);
     }
     let prompt = dispatcher.subagent_count_prompt().await;
     assert!(prompt.contains("waiting=1, inactive=1; all descendants"));
     assert!(prompt.contains("waiting=1, inactive=2."));
     assert!(prompt.contains("parked on live watchers"));
+    for agent in coordinator.list(None).await {
+        coordinator.mark_seen(root, &agent).await;
+    }
     let started = std::time::Instant::now();
     let result = coordinator
-        .wait_for(root, Duration::from_secs(30), WaitSignals::default())
+        .wait_for(root, Duration::from_millis(100), WaitSignals::default())
         .await
         .unwrap();
     assert!(started.elapsed() < Duration::from_secs(10));
-    assert_eq!(result["reason"], "no_active_children");
+    assert_eq!(result["reason"], "timeout");
     assert_eq!(result["changes"], json!([]));
-    assert_eq!(result["working_children"], 0);
+    assert_eq!(result["working_children"], 1);
     assert_eq!(result["parked_on_watchers"], 1);
 }
 
@@ -2908,6 +3268,9 @@ async fn director_configures_live_child_speed_and_reuses_its_new_lane_after_wake
     })
     .await
     .unwrap();
+    coordinator.stop_and_wait(child.session_id).await.unwrap();
+    let before_dormant_config = coordinator.get(child.session_id).await.unwrap();
+    let mut config_activity = coordinator.subscribe();
     let dormant = coordinator
         .call_tool(
             "configure_agent",
@@ -2929,6 +3292,40 @@ async fn director_configures_live_child_speed_and_reuses_its_new_lane_after_wake
         .unwrap();
     assert_eq!(saved.model.as_deref(), Some("gpt-6-sol"));
     assert_eq!(saved.effort.as_deref(), Some("high"));
+    let published = match config_activity.try_recv().unwrap() {
+        SubagentActivity::Stopped { agent } => agent,
+        other => panic!("configuration must publish a stopped snapshot: {other:?}"),
+    };
+    assert!(published.supersedes(&before_dormant_config));
+    let restarted = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        coordinator.root_launch.clone(),
+        2,
+        Arc::new(FastPeerExecutor(RecordingPeerExecutor::default())),
+        store.clone(),
+    )
+    .unwrap();
+    let updates = restarted
+        .restore_from_events(&[SessionEvent::new(
+            root,
+            1,
+            SessionEventKind::SubagentActivity {
+                activity: SubagentActivityKind::Stopped,
+                agent: before_dormant_config.clone(),
+                event: None,
+            },
+        )])
+        .await
+        .unwrap();
+    let restored = restarted.get(child.session_id).await.unwrap();
+    assert_eq!(restored.status, SubagentStatus::Stopped);
+    assert_eq!(restored.effort.as_deref(), Some("high"));
+    assert!(restored.supersedes(&before_dormant_config));
+    assert!(
+        matches!(updates.as_slice(), [SubagentActivity::Stopped { .. }]),
+        "same-status configuration recovery must be published"
+    );
     // Restore the original fixture route, still without resuming the actor.
     coordinator
         .call_tool(
@@ -3513,6 +3910,12 @@ fn live_child_limit_and_task_names_are_enforced() {
         .unwrap()
         .snapshot
         .status = SubagentStatus::Stopped;
+    table
+        .entries
+        .get_mut(&child.session_id)
+        .unwrap()
+        .snapshot
+        .lifecycle = Some(SubagentLifecycle::Stopped);
     assert!(table.reserve("second", &launch()).is_ok());
     assert!(table.reserve("SECOND", &launch()).is_err());
 }
@@ -3534,6 +3937,12 @@ fn ready_children_do_not_consume_live_child_limit() {
         .unwrap()
         .snapshot
         .status = SubagentStatus::Ready;
+    table
+        .entries
+        .get_mut(&child.session_id)
+        .unwrap()
+        .snapshot
+        .lifecycle = Some(SubagentLifecycle::Ready);
 
     assert!(table.reserve("new_work", &launch()).is_ok());
 }
@@ -3554,6 +3963,7 @@ async fn an_idle_child_releases_retained_context_and_a_stop_still_stops() {
         let (commands, released_rx) = mpsc::channel(4);
         let entry = table.entries.get_mut(&child.session_id).unwrap();
         entry.snapshot.status = SubagentStatus::Running;
+        entry.snapshot.lifecycle = Some(SubagentLifecycle::Running);
         entry.commands = Some(commands);
         (child.session_id, released_rx)
     };
@@ -3566,6 +3976,7 @@ async fn an_idle_child_releases_retained_context_and_a_stop_still_stops() {
             1,
             SessionEventKind::StatusChanged {
                 status: SessionStatus::Ready,
+                lifecycle: None,
                 detail: None,
             },
         ),
@@ -3595,6 +4006,7 @@ async fn an_idle_child_releases_retained_context_and_a_stop_still_stops() {
             2,
             SessionEventKind::StatusChanged {
                 status: SessionStatus::Stopped,
+                lifecycle: None,
                 detail: None,
             },
         ),
@@ -3845,6 +4257,7 @@ async fn sibling_messages_use_the_shared_team_directory() {
     let (commands, mut received) = mpsc::channel(1);
     let entry = table.entries.get_mut(&recipient.session_id).unwrap();
     entry.snapshot.status = SubagentStatus::Running;
+    entry.snapshot.lifecycle = Some(SubagentLifecycle::Running);
     entry.commands = Some(commands);
     drop(table);
     bind_test_team(
@@ -3974,6 +4387,12 @@ async fn waking_a_child_preserves_queued_team_message_provenance() {
             .unwrap()
             .snapshot
             .status = SubagentStatus::Ready;
+        table
+            .entries
+            .get_mut(&child.session_id)
+            .unwrap()
+            .snapshot
+            .lifecycle = Some(SubagentLifecycle::Ready);
         child
     };
     bind_test_team(directory.path(), store.as_ref(), root, &[child.session_id]).await;
@@ -4516,6 +4935,7 @@ async fn child_message_handoff_is_message_only_and_preserves_idle_delivery() {
             .unwrap()
             .session_id;
         table.entries.get_mut(&child).unwrap().snapshot.status = SubagentStatus::Ready;
+        table.entries.get_mut(&child).unwrap().snapshot.lifecycle = Some(SubagentLifecycle::Ready);
         (parent, child)
     };
     bind_test_team(directory.path(), store.as_ref(), root, &[parent]).await;
@@ -4684,6 +5104,14 @@ async fn child_message_handoff_is_message_only_and_preserves_idle_delivery() {
         .unwrap()
         .snapshot
         .status = SubagentStatus::Stopped;
+    team.table
+        .lock()
+        .await
+        .entries
+        .get_mut(&child)
+        .unwrap()
+        .snapshot
+        .lifecycle = Some(SubagentLifecycle::Stopped);
     team.deliver_child_message(child, wake.message_id)
         .await
         .unwrap();
@@ -5037,6 +5465,7 @@ async fn focused_human_prompt_and_recall_target_the_exact_child_actor() {
     let (commands, mut received) = mpsc::channel(2);
     let entry = table.entries.get_mut(&child.session_id).unwrap();
     entry.snapshot.status = SubagentStatus::Running;
+    entry.snapshot.lifecycle = Some(SubagentLifecycle::Running);
     entry.commands = Some(commands);
     drop(table);
     coordinator
@@ -5534,6 +5963,8 @@ async fn durable_parent_activity_restores_child_topology() {
         parent_session_id: root,
         task_name: "/root/review_api".into(),
         status: SubagentStatus::Starting,
+        lifecycle: None,
+        source: None,
         provider: CodingProvider::Codex,
         model: Some("gpt-test".into()),
         effort: Some("high".into()),
@@ -5942,6 +6373,8 @@ async fn a_child_restored_after_a_host_crash_is_still_addressable_in_the_team_wo
                 parent_session_id: root,
                 task_name: "/root/worker".into(),
                 status: SubagentStatus::Running,
+                lifecycle: None,
+                source: None,
                 provider: CodingProvider::Codex,
                 model: Some("gpt-test".into()),
                 effort: Some("high".into()),
@@ -6028,6 +6461,8 @@ async fn restore_mirrors_a_child_stop_journaled_before_the_parent_crashed() {
                 parent_session_id: root,
                 task_name: "/root/review_api".into(),
                 status: SubagentStatus::Running,
+                lifecycle: None,
+                source: None,
                 provider: CodingProvider::Codex,
                 model: Some("gpt-test".into()),
                 effort: Some("high".into()),
@@ -6065,6 +6500,7 @@ async fn restore_mirrors_a_child_stop_journaled_before_the_parent_crashed() {
         },
         SessionEventKind::StatusChanged {
             status: SessionStatus::Stopped,
+            lifecycle: None,
             detail: Some("crash cleanup completed".into()),
         },
     ] {
@@ -6121,6 +6557,8 @@ async fn restored_live_child_stays_dormant_and_parks_with_its_root() {
         parent_session_id: root,
         task_name: "/root/review_api".into(),
         status: SubagentStatus::Ready,
+        lifecycle: None,
+        source: None,
         provider: CodingProvider::Codex,
         model: Some("gpt-test".into()),
         effort: Some("high".into()),
@@ -6163,6 +6601,7 @@ async fn restored_live_child_stays_dormant_and_parks_with_its_root() {
         },
         SessionEventKind::StatusChanged {
             status: SessionStatus::Ready,
+            lifecycle: None,
             detail: None,
         },
     ] {
@@ -6259,6 +6698,7 @@ async fn restored_live_child_stays_dormant_and_parks_with_its_root() {
         )
         .unwrap();
         let mut agent = parked.clone();
+        agent.lifecycle = None;
         agent.detail = Some(detail.to_string());
         restarted
             .restore_from_events(&[SessionEvent::new(
@@ -6336,6 +6776,8 @@ async fn restore_wakes_a_child_cut_off_mid_turn_but_never_a_stopped_one() {
             parent_session_id: root,
             task_name: name.into(),
             status: SubagentStatus::Running,
+            lifecycle: None,
+            source: None,
             provider: CodingProvider::Codex,
             model: Some("gpt-test".into()),
             effort: Some("high".into()),
@@ -6375,6 +6817,7 @@ async fn restore_wakes_a_child_cut_off_mid_turn_but_never_a_stopped_one() {
             },
             SessionEventKind::StatusChanged {
                 status: journaled_status,
+                lifecycle: None,
                 detail: None,
             },
         ] {
@@ -8506,6 +8949,12 @@ async fn waiting_team() -> (
             .unwrap()
             .snapshot
             .status = SubagentStatus::Running;
+        table
+            .entries
+            .get_mut(&worker.session_id)
+            .unwrap()
+            .snapshot
+            .lifecycle = Some(SubagentLifecycle::Running);
         worker.session_id
     };
     bind_test_team(directory.path(), store.as_ref(), root, &[worker]).await;
@@ -8514,7 +8963,13 @@ async fn waiting_team() -> (
 
 /// Apply a child event to the table and publish it, as the child actor does.
 async fn child_event(coordinator: &SubagentCoordinator, child: Uuid, kind: SessionEventKind) {
-    let event = SessionEvent::new(child, 1, kind);
+    let sequence = coordinator
+        .get(child)
+        .await
+        .unwrap()
+        .source
+        .map_or(1, |source| source.child_sequence + 1);
+    let event = SessionEvent::new(child, sequence, kind);
     update_from_session_event(&coordinator.table, child, &event).await;
     let _ = coordinator
         .activity_tx
@@ -8594,6 +9049,15 @@ async fn nested_agent_watch_seeds_current_owned_child_state() {
             .unwrap()
             .snapshot
             .status = status;
+        coordinator
+            .table
+            .lock()
+            .await
+            .entries
+            .get_mut(&child)
+            .unwrap()
+            .snapshot
+            .lifecycle = Some(status.into());
         let result = dispatcher.call("watch", json!({"agents": [child], "label": "nested", "notify_on": if matches!(status, SubagentStatus::Stopped | SubagentStatus::Failed) { "exit" } else { "attention" }})).await.unwrap();
         assert_eq!(result["running"], json!(status == SubagentStatus::Running));
         if status == SubagentStatus::Running {
@@ -8604,7 +9068,7 @@ async fn nested_agent_watch_seeds_current_owned_child_state() {
             watches
                 .observe_agent(
                     child,
-                    crate::session::subject_life(SubagentStatus::Ready),
+                    crate::session::subject_life(SubagentLifecycle::Ready),
                     "child",
                 )
                 .await;
@@ -8717,6 +9181,7 @@ async fn wait_agent_blocks_until_a_child_finishes_and_reports_it_once() {
         worker,
         SessionEventKind::StatusChanged {
             status: SessionStatus::Ready,
+            lifecycle: None,
             detail: None,
         },
     )
@@ -9154,6 +9619,7 @@ async fn followups_reach_an_interrupted_child() {
         worker,
         SessionEventKind::StatusChanged {
             status: SessionStatus::Running,
+            lifecycle: None,
             detail: Some("cancelling".to_string()),
         },
     )
@@ -9178,6 +9644,7 @@ async fn followups_reach_an_interrupted_child() {
         worker,
         SessionEventKind::StatusChanged {
             status: SessionStatus::Ready,
+            lifecycle: None,
             detail: Some("Interrupted".to_string()),
         },
     )
@@ -9309,6 +9776,7 @@ async fn an_idle_child_does_not_end_waits_for_a_running_one() {
         let idle = table.reserve("audit", &launch()).unwrap();
         let entry = table.entries.get_mut(&idle.session_id).unwrap();
         entry.snapshot.status = SubagentStatus::Ready;
+        entry.snapshot.lifecycle = Some(SubagentLifecycle::Ready);
         entry.snapshot.final_text = Some("audit finished earlier".to_string());
     }
     let wait = || {
@@ -9336,6 +9804,7 @@ async fn an_idle_child_does_not_end_waits_for_a_running_one() {
         worker,
         SessionEventKind::StatusChanged {
             status: SessionStatus::Failed,
+            lifecycle: None,
             detail: Some("tests failed".to_string()),
         },
     )
@@ -9655,9 +10124,11 @@ async fn team_harness_batch_recovers_partial_receipts_without_duplicate_followup
         let (tx, rx) = mpsc::channel(1);
         let entry = table.entries.get_mut(&child).unwrap();
         entry.snapshot.status = SubagentStatus::Running;
+        entry.snapshot.lifecycle = Some(SubagentLifecycle::Running);
         entry.commands = Some(tx.clone());
         let entry = table.entries.get_mut(&child2).unwrap();
         entry.snapshot.status = SubagentStatus::Running;
+        entry.snapshot.lifecycle = Some(SubagentLifecycle::Running);
         entry.commands = Some(tx);
         (child, child2, rx)
     };
@@ -9832,6 +10303,7 @@ async fn team_harness_explicit_directory_starts_a_new_worker_and_preserves_exist
         let existing = table.reserve("existing", &root_launch).unwrap();
         let entry = table.entries.get_mut(&existing.session_id).unwrap();
         entry.snapshot.status = SubagentStatus::Ready;
+        entry.snapshot.lifecycle = Some(SubagentLifecycle::Ready);
         entry.snapshot.final_text = Some("preserved user context".into());
         existing.session_id
     };
@@ -10473,6 +10945,7 @@ async fn parent_goal_control_routes_real_actions_and_denies_unrelated_callers() 
         let (tx, rx) = mpsc::channel(8);
         let entry = table.entries.get_mut(&child).unwrap();
         entry.snapshot.status = SubagentStatus::Running;
+        entry.snapshot.lifecycle = Some(SubagentLifecycle::Running);
         entry.commands = Some(tx);
         (child, rx)
     };
@@ -10691,6 +11164,7 @@ async fn saturated_child_message_send_is_bounded_and_preserves_the_message() {
             .unwrap();
         let entry = table.entries.get_mut(&child).unwrap();
         entry.snapshot.status = SubagentStatus::Running;
+        entry.snapshot.lifecycle = Some(SubagentLifecycle::Running);
         entry.commands = Some(tx);
         (child, rx)
     };
@@ -10749,6 +11223,7 @@ async fn message_status_distinguishes_notifications_acknowledgements_and_linked_
         let (tx, rx) = mpsc::channel(8);
         let entry = table.entries.get_mut(&child).unwrap();
         entry.snapshot.status = SubagentStatus::Running;
+        entry.snapshot.lifecycle = Some(SubagentLifecycle::Running);
         entry.commands = Some(tx);
         (child, observer, rx)
     };
@@ -10880,6 +11355,7 @@ async fn a_parent_controls_its_childs_goal() {
         let (tx, rx) = mpsc::channel(8);
         let entry = table.entries.get_mut(&grandchild).unwrap();
         entry.snapshot.status = SubagentStatus::Running;
+        entry.snapshot.lifecycle = Some(SubagentLifecycle::Running);
         entry.commands = Some(tx);
         (child, grandchild, rx)
     };
@@ -10948,6 +11424,7 @@ async fn team_batch_goal_handoff_is_ordered_authorized_and_not_replayed() {
         let (tx, rx) = mpsc::channel(8);
         let entry = table.entries.get_mut(&child).unwrap();
         entry.snapshot.status = SubagentStatus::Running;
+        entry.snapshot.lifecycle = Some(SubagentLifecycle::Running);
         entry.commands = Some(tx);
         (child, grandchild, rx)
     };

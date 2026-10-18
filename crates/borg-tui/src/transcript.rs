@@ -68,7 +68,6 @@ fn goal_status_label(status: GoalStatus) -> &'static str {
     }
 }
 
-
 fn line_is_blank(line: &Line<'static>) -> bool {
     line.spans.iter().all(|span| span.content.trim().is_empty())
 }
@@ -131,7 +130,6 @@ fn extend_tool_lifecycle_spans(
     }
 }
 
-
 struct Transcript {
     core: TranscriptCore,
     assignment_sender: String,
@@ -157,6 +155,7 @@ struct AgentRosterEntry {
     model: String,
     effort: String,
     state: String,
+    lifecycle: Option<borg_remote::SubagentLifecycle>,
     usage: String,
     child_id: Option<Uuid>,
 }
@@ -371,7 +370,6 @@ fn billing_status_for(
         .and_then(borg_remote::ProviderCapability::billing_label)
 }
 
-
 fn compaction_has_expandable_detail(summary: &str) -> bool {
     let detail = summary
         .strip_prefix("Compacted context: ")
@@ -460,7 +458,9 @@ fn action_label_style(entry: &TranscriptEntry) -> Style {
                 Style::default()
                     .fg(USER_LABEL_BLUE)
                     .add_modifier(Modifier::BOLD)
-            } else if is_subagent_tool(name) {
+            } else if is_subagent_tool(name)
+                || matches!(entry, TranscriptEntry::Tool { source_name, .. } if is_subagent_tool(source_name))
+            {
                 Style::default()
                     .fg(SUBAGENT_PURPLE)
                     .add_modifier(Modifier::BOLD)
@@ -500,7 +500,6 @@ fn tool_window_header(
     Line::from(spans)
 }
 
-
 /// A finished row's marker: what kind of work it was, at a glance.
 fn tool_kind_marker(name: &str, is_reasoning: bool) -> &'static str {
     if is_reasoning {
@@ -517,7 +516,6 @@ fn tool_kind_marker(name: &str, is_reasoning: bool) -> &'static str {
         _ => "✓",
     }
 }
-
 
 fn tool_has_expandable_body(
     source_name: &str,
@@ -1123,14 +1121,31 @@ impl Transcript {
     }
 
     fn foreground_action_id(&self, index: usize) -> Option<String> {
-        let TranscriptEntry::Tool { complete: false, backgrounded: false, code_view, .. } = self.order.get(index)? else {
+        let TranscriptEntry::Tool {
+            complete: false,
+            backgrounded: false,
+            code_view,
+            ..
+        } = self.order.get(index)?
+        else {
             return None;
         };
-        if code_view.as_ref().is_some_and(|(language, _)| language == "reasoning") {
+        if code_view
+            .as_ref()
+            .is_some_and(|(language, _)| language == "reasoning")
+        {
             return None;
         }
-        let id = self.tools.iter().find_map(|(id, row)| (*row == index).then_some(id))?;
-        if self.preparing_tools.values().chain(&self.unkeyed_preparing_tools).any(|preparing| preparing == id) {
+        let id = self
+            .tools
+            .iter()
+            .find_map(|(id, row)| (*row == index).then_some(id))?;
+        if self
+            .preparing_tools
+            .values()
+            .chain(&self.unkeyed_preparing_tools)
+            .any(|preparing| preparing == id)
+        {
             return None;
         }
         Some(id.clone())
@@ -1419,10 +1434,6 @@ impl Transcript {
         std::mem::take(&mut self.pending_entry_insertions)
     }
 
-
-
-
-
     pub(crate) fn set_response_streaming(
         &mut self,
         streaming: borg_ui::preferences::ResponseStreaming,
@@ -1440,9 +1451,6 @@ impl Transcript {
             }
         }
     }
-
-
-
 
     fn set_diff_expansion(&mut self, policy: DiffExpansionPolicy) {
         self.diff_expansion = policy;
@@ -1573,9 +1581,8 @@ impl Transcript {
     fn active_subagent_count(&self) -> usize {
         self.subagents
             .values()
-            .copied()
-            .collect::<borg_remote::SubagentCounts>()
-            .running
+            .filter(|status| matches!(status, SubagentStatus::Starting | SubagentStatus::Running))
+            .count()
     }
 
     fn agent_roster_entries(&self) -> Vec<AgentRosterEntry> {
@@ -1585,7 +1592,11 @@ impl Transcript {
             .director
             .as_ref()
             .is_none_or(|director| director.path == "/root");
-        let host_name = if host_is_director { "director" } else { "/root" };
+        let host_name = if host_is_director {
+            "director"
+        } else {
+            "/root"
+        };
         let host_role = if host_is_director {
             "main thread"
         } else {
@@ -1601,6 +1612,7 @@ impl Transcript {
                 model: model.to_string(),
                 effort: config.effort.as_deref().unwrap_or("—").to_string(),
                 state: host_role.to_string(),
+                lifecycle: None,
                 usage: format_subagent_usage(&self.session_usage)
                     .trim_start()
                     .to_string(),
@@ -1612,14 +1624,20 @@ impl Transcript {
                 model: "model pending".to_string(),
                 effort: "—".to_string(),
                 state: host_role.to_string(),
+                lifecycle: None,
                 usage: "—".to_string(),
                 child_id: None,
             });
         }
-        let mut agents = self.subagent_snapshots.values().collect::<Vec<_>>();
-        let rank = |agent: &SubagentSnapshot| match agent.status {
-            SubagentStatus::Running => 0,
-            _ if agent.waiting_on_watchers().is_some() => 1,
+        let mut agents = self
+            .subagent_snapshots
+            .keys()
+            .filter_map(|id| self.core.effective_subagent_snapshot(*id))
+            .collect::<Vec<_>>();
+        let rank = |agent: &SubagentSnapshot| match agent.lifecycle() {
+            borg_remote::SubagentLifecycle::Starting | borg_remote::SubagentLifecycle::Running => 0,
+            borg_remote::SubagentLifecycle::WaitingOnWatchers
+            | borg_remote::SubagentLifecycle::WaitingForApproval => 1,
             _ => 2,
         };
         agents.sort_by(|left, right| {
@@ -1636,7 +1654,7 @@ impl Transcript {
             } else {
                 display_agent_name(&agent.task_name)
             };
-            let model = display_subagent_model(agent);
+            let model = display_subagent_model(&agent);
             let effort = agent.effort.as_deref().unwrap_or("—");
             let usage = format_subagent_usage(&agent.usage);
             let usage = usage
@@ -1647,16 +1665,8 @@ impl Transcript {
                 name,
                 model,
                 effort: effort.to_string(),
-                state: match agent.status {
-                    SubagentStatus::Ready if agent.waiting_on_watchers().is_some() => {
-                        agent.waiting_on_watchers().unwrap_or_default()
-                    }
-                    // Clicking the row focuses the child; a message there wakes it.
-                    SubagentStatus::Stopped | SubagentStatus::Failed => {
-                        format!("{} · click to resume", subagent_status_label(agent.status))
-                    }
-                    status => subagent_status_label(status).to_string(),
-                },
+                state: borg_view::projection_helpers::subagent_lifecycle_detail(&agent),
+                lifecycle: Some(agent.lifecycle()),
                 usage: usage.to_string(),
                 child_id: Some(agent.session_id),
             }
@@ -4605,7 +4615,6 @@ mod parallel_preparation_tests {
         )));
     }
 }
-
 
 fn format_short_age(age: chrono::Duration) -> String {
     let seconds = age.num_seconds().max(0);

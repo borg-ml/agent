@@ -23,7 +23,7 @@ pub enum RenderInvalidation {
     Cleared,
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TranscriptEntries {
     pub entries: Vec<TranscriptEntry>,
     pub identities: Vec<(Uuid, usize)>,
@@ -165,7 +165,7 @@ impl Extend<TranscriptEntry> for TranscriptEntries {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelRequestDisplay {
     pub id: String,
     pub started_at: DateTime<Utc>,
@@ -207,7 +207,7 @@ impl SessionDisplayConfig {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ActiveTurnDisplayConfig {
     pub message_id: Uuid,
     pub provider: CodingProvider,
@@ -236,13 +236,16 @@ pub enum DirectorPrompt {
     Row(Uuid),
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChildMetaReference {
     pub cursor: crate::wire::Cursor,
     pub sources: Vec<String>,
-    pub summary: crate::wire::ChildSummary,
+    #[serde(default)]
+    pub source_sequence: Option<u64>,
+    #[serde(default)]
+    pub snapshot: Option<SubagentSnapshot>,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct TranscriptCore {
     pub meta: crate::wire::Meta,
     pub child_meta_refs: HashMap<Uuid, ChildMetaReference>,
@@ -254,6 +257,11 @@ pub struct TranscriptCore {
     pub child_transcript: bool,
     pub director_prompt: DirectorPrompt,
     pub tools: HashMap<String, usize>,
+    #[serde(skip)]
+    pub retain_tool_inspection: bool,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub tool_inspection_outputs: HashMap<String, String>,
     pub tool_parents: HashMap<String, String>,
     pub command_edit_rows: HashMap<String, usize>,
     pub foreground_tool: Option<String>,
@@ -333,6 +341,8 @@ impl Default for TranscriptCore {
             child_transcript: false,
             director_prompt: DirectorPrompt::Unknown,
             tools: HashMap::new(),
+            retain_tool_inspection: false,
+            tool_inspection_outputs: HashMap::new(),
             tool_parents: HashMap::new(),
             command_edit_rows: HashMap::new(),
             foreground_tool: None,
@@ -631,6 +641,28 @@ impl TranscriptCore {
         // Scope recorded insertions to this event so a transcript nobody
         // drains (an unfocused child) cannot accumulate stale indices.
         self.pending_entry_insertions.clear();
+        let sequence = self
+            .meta
+            .source_sequence
+            .as_deref()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        self.meta.source_sequence = Some(sequence.max(event.sequence).to_string());
+        if let SessionEventKind::SubagentActivity {
+            activity,
+            agent,
+            event: child_event,
+        } = &event.kind
+        {
+            let snapshot = subagent_snapshot_for_activity(*activity, agent, child_event.as_deref());
+            if self
+                .subagent_snapshots
+                .get(&agent.session_id)
+                .is_some_and(|current| !snapshot.supersedes(current))
+            {
+                return None;
+            }
+        }
         self.observe_meta(event);
         self.observe_model_request(event, reorder_late_user_messages);
         match &event.kind {
@@ -646,11 +678,20 @@ impl TranscriptCore {
             // The durable Ready boundary carries the wait in its detail. Unlike
             // the ephemeral `goal_yielded`, it survives both a dropped live
             // event and a reconnect replay, so the label stays truthful there.
-            SessionEventKind::StatusChanged { status, detail } => {
-                self.waiting_on_watchers = *status == SessionStatus::Ready
-                    && detail
-                        .as_deref()
-                        .is_some_and(ready_detail_is_waiting_on_watchers);
+            SessionEventKind::StatusChanged {
+                status,
+                detail,
+                lifecycle,
+            } => {
+                self.waiting_on_watchers = lifecycle.map_or_else(
+                    || {
+                        *status == SessionStatus::Ready
+                            && detail
+                                .as_deref()
+                                .is_some_and(ready_detail_is_waiting_on_watchers)
+                    },
+                    |lifecycle| lifecycle == SubagentLifecycle::WaitingOnWatchers,
+                );
             }
             _ => {}
         }
@@ -769,6 +810,7 @@ impl TranscriptCore {
                     | SessionStatus::Failed
                     | SessionStatus::Stopped,
                 detail,
+                ..
             } => {
                 self.live_turn_closed = true;
                 self.finish_live_assistant_messages(
@@ -1413,7 +1455,40 @@ impl TranscriptCore {
                     self.foreground_tool = None;
                 }
                 let expand_edits = self.diff_expansion != DiffExpansionPolicy::Collapsed;
-                let tool_index = self.tools.get(tool_call_id).copied();
+                let tool_index = self.tools.get(tool_call_id).copied().or_else(|| {
+                    if self.provider_followups.contains_key(tool_call_id) {
+                        return None;
+                    }
+                    let index = self.order.len();
+                    self.tools.insert(tool_call_id.clone(), index);
+                    self.order.push(TranscriptEntry::Tool {
+                        source_name: "tool".into(),
+                        name: "Completed tool".into(),
+                        detail: String::new(),
+                        code_view: None,
+                        output_view: None,
+                        payload_refs: Vec::new(),
+                        time: local_event_time(event),
+                        started_at: event.created_at,
+                        completed_at: None,
+                        complete: false,
+                        error: false,
+                        user_interrupted: false,
+                        backgrounded: false,
+                        expanded: false,
+                        outcome: None,
+                        cwd: None,
+                    });
+                    Some(index)
+                });
+                if self.retain_tool_inspection
+                    && let Some(index) = tool_index
+                {
+                    if let Some((id, ordinal)) = self.order.identities.get(index) {
+                        self.tool_inspection_outputs
+                            .insert(format!("{id}:{ordinal}"), output.clone());
+                    }
+                }
                 let (source_name_for_process, command_for_process) = tool_index
                     .and_then(|index| self.order.get(index))
                     .and_then(|entry| match entry {
@@ -1708,6 +1783,7 @@ impl TranscriptCore {
             SessionEventKind::StatusChanged {
                 status: SessionStatus::Ready,
                 detail: Some(detail),
+                ..
             } if detail.eq_ignore_ascii_case("interrupted") => {
                 self.flush_streaming_tails();
                 self.mark_running_tools_user_interrupted(event.created_at);
@@ -2248,64 +2324,11 @@ impl TranscriptCore {
                 agent,
                 event: child_event,
             } => {
-                let status =
-                    effective_subagent_status(*activity, agent.status, child_event.as_deref());
-                self.upsert_subagent_snapshot_with_status(agent, status);
-                if let Some((label, detail, body, state)) =
-                    subagent_action_projection(*activity, agent, child_event.as_deref())
-                {
-                    let body = if !self.show_subagent_messages
-                        && matches!(
-                            state,
-                            TranscriptActionState::Complete | TranscriptActionState::Stopped
-                        ) {
-                        None
-                    } else {
-                        body
-                    };
-                    let time = local_event_time(event);
-                    if let Some(index) = self.subagent_entries.get(&agent.session_id).copied() {
-                        match self.order.get_mut(index) {
-                            Some(TranscriptEntry::Action {
-                                label: existing_label,
-                                detail: existing_detail,
-                                body: existing_body,
-                                time: existing_time,
-                                state: existing_state,
-                                expanded,
-                                ..
-                            }) => {
-                                *existing_label = label;
-                                *existing_detail = detail;
-                                *existing_body = body;
-                                *existing_time = time;
-                                *existing_state = state;
-                                if existing_body.is_none() {
-                                    *expanded = false;
-                                }
-                            }
-                            Some(TranscriptEntry::Activity {
-                                text: existing,
-                                time: existing_time,
-                            }) => {
-                                *existing = format_action_text(&label, &detail, body.as_deref());
-                                *existing_time = time;
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        self.subagent_entries
-                            .insert(agent.session_id, self.order.len());
-                        self.order.push(TranscriptEntry::Action {
-                            kind: TranscriptActionKind::Agent,
-                            label,
-                            detail,
-                            body,
-                            time,
-                            state,
-                            expanded: false,
-                        });
-                    }
+                let snapshot =
+                    subagent_snapshot_for_activity(*activity, agent, child_event.as_deref());
+                self.reconcile_subagent_snapshot(&snapshot, true);
+                if let Some(child) = child_event {
+                    self.observe_child_approval(child);
                 }
             }
             SessionEventKind::Error { message } => {
@@ -2440,6 +2463,7 @@ impl TranscriptCore {
         self.order.clear();
         self.messages.clear();
         self.tools.clear();
+        self.tool_inspection_outputs.clear();
         self.command_edit_rows.clear();
         self.subagent_entries.clear();
         self.agent_messages.clear();
@@ -3517,6 +3541,27 @@ impl TranscriptCore {
         removed
     }
 
+    pub fn tool_inspection_text(&self, index: usize) -> Option<&str> {
+        let (id, ordinal) = self.order.identities.get(index)?;
+        self.tool_inspection_outputs
+            .get(&format!("{id}:{ordinal}"))
+            .map(String::as_str)
+            .or_else(|| match self.order.get(index)? {
+                TranscriptEntry::Tool {
+                    output_view: Some((_, text)),
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+    }
+
+    pub fn prune_tool_inspection(&mut self) {
+        for (id, ordinal) in &self.order.removed {
+            self.tool_inspection_outputs
+                .remove(&format!("{id}:{ordinal}"));
+        }
+    }
+
     pub fn upsert_running_tool(
         &mut self,
         event: &SessionEvent,
@@ -3525,13 +3570,26 @@ impl TranscriptCore {
         input: &serde_json::Value,
         input_ref: Option<&SessionPayloadRef>,
     ) {
-        if self.tools.get(tool_call_id).is_some_and(|index| {
-            matches!(
-                self.order.get(*index),
-                Some(TranscriptEntry::Tool { complete: true, .. })
-            )
-        }) {
-            return;
+        if let Some(index) = self.tools.get(tool_call_id).copied()
+            && let Some(TranscriptEntry::Tool {
+                complete: true,
+                source_name,
+                code_view,
+                ..
+            }) = self.order.get(index)
+        {
+            let presentation = project_tool_presentation(name, input, None, false);
+            let same_input = presentation
+                .input
+                .as_ref()
+                .map(|body| (&body.language, &body.text))
+                == code_view.as_ref().map(|(language, text)| (language, text));
+            if matches!(event.kind, SessionEventKind::ToolUpdated { .. })
+                || (source_name == name && same_input)
+            {
+                return;
+            }
+            self.tools.remove(tool_call_id);
         }
         self.finish_reasoning(event.created_at);
         if let Some(handle) = tool_process_followup_handle(name, Some(input)) {
@@ -3644,24 +3702,119 @@ impl TranscriptCore {
         &mut self,
         agent: &SubagentSnapshot,
         status: SubagentStatus,
-    ) {
+    ) -> bool {
         if self
             .subagent_snapshots
             .get(&agent.session_id)
-            .is_some_and(|current| current.updated_at > agent.updated_at)
+            .is_some_and(|current| !agent.supersedes(current))
         {
-            return;
+            return false;
         }
         let name = display_agent_name(&agent.task_name);
-        if self.agent_names.get(&agent.session_id) != Some(&name) {
-            self.agent_names.insert(agent.session_id, name);
-        }
+        self.agent_names.insert(agent.session_id, name);
         self.pruned_settled_children.remove(&agent.session_id);
-        self.subagents.insert(agent.session_id, status);
         let mut snapshot = agent.clone();
         snapshot.status = status;
         snapshot.final_text = None;
+        let keep_meta =
+            self.child_meta_refs
+                .get(&agent.session_id)
+                .is_some_and(|reference| {
+                    match (reference.source_sequence, agent.source.as_ref()) {
+                        (Some(sequence), Some(source)) => sequence > source.child_sequence,
+                        _ => false,
+                    }
+                });
+        if !keep_meta {
+            if let Some(reference) = self.child_meta_refs.get_mut(&agent.session_id) {
+                reference.snapshot = None;
+            }
+            if snapshot.lifecycle() != SubagentLifecycle::WaitingForApproval {
+                self.meta
+                    .approvals
+                    .retain(|a| a.source_session_id != agent.session_id.to_string());
+            }
+        }
+        let status = self
+            .child_meta_refs
+            .get(&agent.session_id)
+            .and_then(|r| r.snapshot.as_ref())
+            .map_or(snapshot.status, |s| s.status);
+        self.subagents.insert(agent.session_id, status);
         self.subagent_snapshots.insert(agent.session_id, snapshot);
+        true
+    }
+
+    pub fn reconcile_subagent_snapshot(
+        &mut self,
+        agent: &SubagentSnapshot,
+        create_missing: bool,
+    ) -> bool {
+        if !self.upsert_subagent_snapshot_with_status(agent, agent.status) {
+            return false;
+        }
+        self.refresh_subagent_summary(agent.session_id, create_missing);
+        true
+    }
+
+    fn refresh_subagent_summary(&mut self, child_id: Uuid, create_missing: bool) {
+        let Some(agent) = self.effective_subagent_snapshot(child_id) else {
+            return;
+        };
+        let Some((label, detail, body, state)) =
+            subagent_action_projection(SubagentActivityKind::Updated, &agent, None)
+        else {
+            return;
+        };
+        let time = agent.updated_at.to_rfc3339();
+        if let Some(index) = self.subagent_entries.get(&child_id).copied() {
+            if let Some(entry) = self.order.get_mut(index) {
+                let expanded = matches!(entry, TranscriptEntry::Action { expanded: true, .. })
+                    && body.is_some();
+                *entry = TranscriptEntry::Action {
+                    kind: TranscriptActionKind::Agent,
+                    label,
+                    detail,
+                    body,
+                    time,
+                    state,
+                    expanded,
+                };
+            }
+        } else if create_missing {
+            self.subagent_entries.insert(child_id, self.order.len());
+            self.order.push(TranscriptEntry::Action {
+                kind: TranscriptActionKind::Agent,
+                label,
+                detail,
+                body,
+                time,
+                state,
+                expanded: false,
+            });
+        }
+    }
+
+    pub fn effective_subagent_snapshot(&self, child_id: Uuid) -> Option<SubagentSnapshot> {
+        let child = self.subagent_snapshots.get(&child_id)?.clone();
+        self.child_meta_refs
+            .get(&child_id)
+            .and_then(|reference| reference.snapshot.clone())
+            .or(Some(child))
+    }
+    pub fn subagent_summary(&self, child_id: Uuid) -> Option<crate::wire::ChildSummary> {
+        let child = self.effective_subagent_snapshot(child_id)?;
+        let mut summary = crate::reducer::child_summary(&child, &self.meta.approvals);
+        if let Some(reference) = self.child_meta_refs.get(&child_id) {
+            summary.approvals = self
+                .meta
+                .approvals
+                .iter()
+                .filter(|a| reference.sources.contains(&a.source_session_id))
+                .cloned()
+                .collect();
+        }
+        Some(summary)
     }
 }
 
@@ -3733,7 +3886,12 @@ impl TranscriptCore {
                     self.meta.director = Some(director.into());
                 }
             }
-            SessionEventKind::StatusChanged { status, detail } => {
+            SessionEventKind::StatusChanged {
+                status,
+                detail,
+                lifecycle,
+            } => {
+                self.meta.status_lifecycle = *lifecycle;
                 self.meta.status = Some(*status);
                 self.meta.status_detail = detail.clone();
             }
@@ -3819,34 +3977,7 @@ impl TranscriptCore {
                 .meta
                 .approvals
                 .retain(|item| item.id != *interaction_id),
-            SessionEventKind::SubagentActivity {
-                event: Some(child), ..
-            } => {
-                if let SessionEventKind::ApprovalRequested {
-                    approval_id,
-                    title,
-                    detail,
-                    ..
-                } = &child.kind
-                {
-                    self.meta.approvals.retain(|a| {
-                        a.id != *approval_id || a.source_session_id != child.session_id.to_string()
-                    });
-                    self.meta.approvals.push(Approval {
-                        id: approval_id.clone(),
-                        target_revision: child.id.to_string(),
-                        source_session_id: child.session_id.to_string(),
-                        label: title.clone(),
-                        detail: detail.chars().take(4096).collect(),
-                        question: None,
-                    });
-                }
-                if let SessionEventKind::ApprovalResolved { approval_id, .. } = &child.kind {
-                    self.meta.approvals.retain(|a| {
-                        a.id != *approval_id || a.source_session_id != child.session_id.to_string()
-                    });
-                }
-            }
+
             _ => {}
         }
     }
@@ -3880,13 +4011,40 @@ impl TranscriptCore {
 }
 
 impl TranscriptCore {
+    fn observe_child_approval(&mut self, child: &SessionEvent) {
+        use crate::wire::Approval;
+        if let SessionEventKind::ApprovalRequested {
+            approval_id,
+            title,
+            detail,
+            ..
+        } = &child.kind
+        {
+            self.meta.approvals.retain(|a| {
+                a.id != *approval_id || a.source_session_id != child.session_id.to_string()
+            });
+            self.meta.approvals.push(Approval {
+                id: approval_id.clone(),
+                target_revision: child.id.to_string(),
+                source_session_id: child.session_id.to_string(),
+                label: title.clone(),
+                detail: detail.chars().take(4096).collect(),
+                question: None,
+            });
+        }
+        if let SessionEventKind::ApprovalResolved { approval_id, .. } = &child.kind {
+            self.meta.approvals.retain(|a| {
+                a.id != *approval_id || a.source_session_id != child.session_id.to_string()
+            });
+        }
+    }
+
     pub fn apply_child_meta(
         &mut self,
         child_id: Uuid,
         cursor: crate::wire::Cursor,
         meta: &crate::wire::Meta,
     ) -> anyhow::Result<bool> {
-        use crate::wire::{ChildSummary, Lifecycle};
         let revision = cursor.revision.parse::<u64>()?;
         anyhow::ensure!(!cursor.epoch.is_empty(), "empty child epoch");
         if let Some(previous) = self.child_meta_refs.get(&child_id)
@@ -3904,15 +4062,53 @@ impl TranscriptCore {
                 )
             })?
             .clone();
+        let source_sequence = meta
+            .source_sequence
+            .as_deref()
+            .map(str::parse::<u64>)
+            .transpose()?;
+        if let Some(previous) = self.child_meta_refs.get(&child_id) {
+            match (source_sequence, previous.source_sequence) {
+                (Some(incoming), Some(current)) if incoming < current => return Ok(false),
+                (None, Some(_)) => return Ok(false),
+                _ => {}
+            }
+        }
+        let snapshot_sequence = child.source.as_ref().map(|source| source.child_sequence);
+        let newer = match (source_sequence, snapshot_sequence) {
+            (Some(metadata), Some(snapshot)) => metadata > snapshot,
+            (Some(_), None) | (None, None) => true,
+            (None, Some(_)) => false,
+        };
+        if source_sequence.is_none() && snapshot_sequence.is_some() {
+            return Ok(false);
+        }
         let old_sources = self
             .child_meta_refs
             .get(&child_id)
-            .map(|reference| reference.sources.clone())
+            .map(|r| r.sources.clone())
             .unwrap_or_else(|| vec![child_id.to_string()]);
-        self.meta
+        let own_is_current = match (source_sequence, snapshot_sequence) {
+            (Some(metadata), Some(snapshot)) => metadata >= snapshot,
+            (None, Some(_)) => false,
+            _ => true,
+        };
+        let own_source = child_id.to_string();
+        self.meta.approvals.retain(|approval| {
+            !old_sources.contains(&approval.source_session_id)
+                || (!own_is_current && approval.source_session_id == own_source)
+        });
+        let approvals = meta
             .approvals
-            .retain(|approval| !old_sources.contains(&approval.source_session_id));
-        self.meta.approvals.extend(meta.approvals.iter().cloned());
+            .iter()
+            .filter(|approval| {
+                approval.source_session_id != own_source
+                    || (own_is_current
+                        && (newer || child.lifecycle() == SubagentLifecycle::WaitingForApproval))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        self.meta.approvals.extend(approvals.iter().cloned());
         let mut sources = meta
             .approvals
             .iter()
@@ -3921,80 +4117,70 @@ impl TranscriptCore {
         sources.push(child_id.to_string());
         sources.sort();
         sources.dedup();
-        let status = if !meta.approvals.is_empty() || meta.waiting_on_watchers {
-            Lifecycle::Waiting
-        } else {
-            match meta.status {
-                Some(SessionStatus::Starting | SessionStatus::Running) => Lifecycle::Running,
-                Some(SessionStatus::WaitingForApproval) => Lifecycle::Waiting,
-                Some(SessionStatus::Stopped) => Lifecycle::Stopped,
-                Some(SessionStatus::Failed) => Lifecycle::Failed,
-                Some(SessionStatus::Ready | SessionStatus::Completed) => Lifecycle::Complete,
-                None => match child.status {
-                    SubagentStatus::Starting | SubagentStatus::Running => Lifecycle::Running,
-                    SubagentStatus::WaitingForApproval => Lifecycle::Waiting,
-                    SubagentStatus::Ready => Lifecycle::Complete,
-                    SubagentStatus::Stopped => Lifecycle::Stopped,
-                    SubagentStatus::Failed => Lifecycle::Failed,
-                },
+        let mut snapshot = child.clone();
+        if newer && let Some(status) = meta.status {
+            snapshot.status = match status {
+                SessionStatus::Starting => SubagentStatus::Starting,
+                SessionStatus::Running => SubagentStatus::Running,
+                SessionStatus::WaitingForApproval => SubagentStatus::WaitingForApproval,
+                SessionStatus::Ready | SessionStatus::Completed => SubagentStatus::Ready,
+                SessionStatus::Stopped => SubagentStatus::Stopped,
+                SessionStatus::Failed => SubagentStatus::Failed,
+            };
+            snapshot.detail = meta.status_detail.clone();
+            snapshot.lifecycle = Some(meta.status_lifecycle.unwrap_or_else(|| {
+                if !meta.approvals.is_empty() {
+                    SubagentLifecycle::WaitingForApproval
+                } else if meta.waiting_on_watchers {
+                    SubagentLifecycle::WaitingOnWatchers
+                } else {
+                    snapshot.status.into()
+                }
+            }));
+        }
+        self.subagents.insert(child_id, snapshot.status);
+        if newer {
+            let usage = &meta.usage;
+            let read = |value: &str, current| value.parse::<u64>().unwrap_or(current);
+            snapshot.usage.input_tokens = read(&usage.input_tokens, snapshot.usage.input_tokens);
+            snapshot.usage.output_tokens = read(&usage.output_tokens, snapshot.usage.output_tokens);
+            snapshot.usage.cached_input_tokens =
+                read(&usage.cached_tokens, snapshot.usage.cached_input_tokens);
+            if let Some(value) = &usage.total_tokens {
+                snapshot.usage.total_tokens = read(value, snapshot.usage.total_tokens);
             }
-        };
-        let detail = meta
-            .status_detail
-            .as_deref()
-            .unwrap_or(match status {
-                Lifecycle::Running => "working",
-                Lifecycle::Waiting => "waiting",
-                Lifecycle::Stopped => "stopped",
-                Lifecycle::Failed => "failed",
-                _ => "done · waiting for input",
-            })
-            .lines()
-            .next()
-            .unwrap_or("")
-            .chars()
-            .take(120)
-            .collect::<String>();
-        let state = match status {
-            Lifecycle::Running => TranscriptActionState::Running,
-            Lifecycle::Waiting => TranscriptActionState::Waiting,
-            Lifecycle::Stopped => TranscriptActionState::Stopped,
-            Lifecycle::Failed => TranscriptActionState::Failed,
-            _ => TranscriptActionState::Complete,
-        };
-        let time = child.updated_at.to_rfc3339();
-        // Metadata only refreshes a card the transcript already has. Creating
-        // one here would append a card for every settled child at the tail
-        // whenever metadata hydrates after a stall.
-        if let Some(index) = self.subagent_entries.get(&child_id).copied()
-            && let Some(TranscriptEntry::Action {
-                detail: row_detail,
-                body,
-                state: row_state,
-                ..
-            }) = self.order.get_mut(index)
-        {
-            *row_detail = format!("{} · {detail}", child.task_name);
-            *body = None;
-            *row_state = state;
+            if let Some(value) = &usage.context_tokens {
+                snapshot.usage.context_tokens =
+                    Some(read(value, snapshot.usage.context_tokens.unwrap_or(0)));
+            }
+            if let Some(value) = &usage.cache_creation_tokens {
+                snapshot.usage.cache_creation_input_tokens =
+                    read(value, snapshot.usage.cache_creation_input_tokens);
+            }
+            if let Some(value) = &usage.cost_microusd {
+                snapshot.usage.cost_microusd = value.parse().ok().or(snapshot.usage.cost_microusd);
+            }
+            if let Some(value) = &usage.cost_basis {
+                snapshot.usage.cost_basis = value.clone();
+            }
+            if let Some(config) = &meta.configuration {
+                snapshot.provider = config.provider;
+                snapshot.model = config.model.clone();
+                snapshot.effort = config.effort.clone();
+                snapshot.fast = config.fast;
+                snapshot.ultrafast = config.ultrafast;
+            }
         }
         self.child_meta_refs.insert(
             child_id,
             ChildMetaReference {
                 cursor,
                 sources,
-                summary: ChildSummary {
-                    source_session_id: child_id.to_string(),
-                    parent_session_id: child.parent_session_id.to_string(),
-                    name: child.task_name,
-                    status,
-                    last_activity: Some(detail),
-                    updated_at: time,
-                    approvals: meta.approvals.clone(),
-                    usage: meta.usage.clone(),
-                },
+                source_sequence,
+                snapshot: newer.then_some(snapshot),
             },
         );
+        self.refresh_subagent_summary(child_id, false);
         self.prune_child_metadata();
         Ok(true)
     }
@@ -4003,9 +4189,15 @@ impl TranscriptCore {
     /// bounded snapshot map.
     pub fn inactive_subagent_count(&self) -> usize {
         self.subagent_snapshots
-            .values()
+            .keys()
+            .filter_map(|id| self.effective_subagent_snapshot(*id))
             .filter(|agent| {
-                agent.status != SubagentStatus::Running && agent.waiting_on_watchers().is_none()
+                !matches!(
+                    agent.lifecycle(),
+                    SubagentLifecycle::Starting
+                        | SubagentLifecycle::Running
+                        | SubagentLifecycle::WaitingOnWatchers
+                )
             })
             .count()
             + self.pruned_settled_children.len()
@@ -4014,8 +4206,9 @@ impl TranscriptCore {
     /// Idle children parked on live watchers they started: active, not inactive.
     pub fn waiting_subagent_count(&self) -> usize {
         self.subagent_snapshots
-            .values()
-            .filter(|agent| agent.waiting_on_watchers().is_some())
+            .keys()
+            .filter_map(|id| self.effective_subagent_snapshot(*id))
+            .filter(|agent| agent.lifecycle() == SubagentLifecycle::WaitingOnWatchers)
             .count()
     }
 
@@ -4035,11 +4228,17 @@ impl TranscriptCore {
                             .child_meta_refs
                             .get(&child.session_id)
                             .is_some_and(|reference| {
-                                matches!(
-                                    reference.summary.status,
-                                    crate::wire::Lifecycle::Running
-                                        | crate::wire::Lifecycle::Waiting
-                                )
+                                reference.snapshot.as_ref().is_some_and(|snapshot| {
+                                    matches!(
+                                        snapshot.lifecycle(),
+                                        SubagentLifecycle::Starting
+                                            | SubagentLifecycle::Running
+                                            | SubagentLifecycle::WaitingOnWatchers
+                                            | SubagentLifecycle::WaitingForApproval
+                                    )
+                                }) || self.meta.approvals.iter().any(|approval| {
+                                    reference.sources.contains(&approval.source_session_id)
+                                })
                             })
                 })
                 .map(|child| (child.updated_at, child.session_id))

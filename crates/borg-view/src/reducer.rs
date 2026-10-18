@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use borg_agent_runtime::{
-    EventActor, MessageStatus, SessionEvent, SessionEventKind, SessionPayloadKind, SubagentStatus,
+    EventActor, MessageStatus, SessionEvent, SessionEventKind, SessionPayloadKind,
 };
 use uuid::Uuid;
 
@@ -319,12 +319,7 @@ impl ViewReducer {
             .find_map(|(id, i)| (*i == index).then_some(id))
             && let Some(child) = self.core.subagent_snapshots.get(child_id)
         {
-            let summary = self
-                .core
-                .child_meta_refs
-                .get(child_id)
-                .map(|reference| reference.summary.clone())
-                .unwrap_or_else(|| child_summary(child, &self.core.meta.approvals));
+            let summary = self.core.subagent_summary(*child_id)?;
             return Some(Row {
                 id: id.clone(),
                 revision: self
@@ -714,6 +709,7 @@ impl ViewReducer {
         }
         self.group_totals
             .retain(|id, _| self.group_membership.values().any(|group| group == id));
+        self.core.prune_tool_inspection();
         self.core.order.removed.clear();
         self.core.order.dirty.get_mut().clear();
         self.core.order.invalidations.get_mut().clear();
@@ -775,14 +771,8 @@ impl ViewReducer {
         self.core.meta.children = self
             .core
             .subagent_snapshots
-            .values()
-            .map(|child| {
-                self.core
-                    .child_meta_refs
-                    .get(&child.session_id)
-                    .map(|reference| reference.summary.clone())
-                    .unwrap_or_else(|| child_summary(child, &self.core.meta.approvals))
-            })
+            .keys()
+            .filter_map(|id| self.core.subagent_summary(*id))
             .collect();
     }
 }
@@ -884,7 +874,7 @@ fn action_row(entry: &TranscriptEntry) -> ActionRow {
     }
 }
 
-fn child_summary(
+pub(crate) fn child_summary(
     child: &borg_agent_runtime::SubagentSnapshot,
     approvals: &[Approval],
 ) -> ChildSummary {
@@ -892,13 +882,16 @@ fn child_summary(
         source_session_id: child.session_id.to_string(),
         parent_session_id: child.parent_session_id.to_string(),
         name: child.task_name.clone(),
-        status: match child.status {
-            SubagentStatus::Starting | SubagentStatus::Running => Lifecycle::Running,
-            SubagentStatus::Ready if child.waiting_on_watchers().is_some() => Lifecycle::Waiting,
-            SubagentStatus::Ready => Lifecycle::Complete,
-            SubagentStatus::WaitingForApproval => Lifecycle::Waiting,
-            SubagentStatus::Stopped => Lifecycle::Stopped,
-            SubagentStatus::Failed => Lifecycle::Failed,
+        status: match child.lifecycle() {
+            borg_agent_runtime::SubagentLifecycle::Starting
+            | borg_agent_runtime::SubagentLifecycle::Running => Lifecycle::Running,
+            borg_agent_runtime::SubagentLifecycle::WaitingOnWatchers
+            | borg_agent_runtime::SubagentLifecycle::WaitingForApproval
+            | borg_agent_runtime::SubagentLifecycle::Dormant
+            | borg_agent_runtime::SubagentLifecycle::DormantInterrupted => Lifecycle::Waiting,
+            borg_agent_runtime::SubagentLifecycle::Ready => Lifecycle::Complete,
+            borg_agent_runtime::SubagentLifecycle::Stopped => Lifecycle::Stopped,
+            borg_agent_runtime::SubagentLifecycle::Failed => Lifecycle::Failed,
         },
         last_activity: child
             .waiting_on_watchers()

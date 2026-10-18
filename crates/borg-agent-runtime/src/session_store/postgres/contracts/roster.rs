@@ -55,6 +55,8 @@ async fn mirrored_child_provider_audit_events_are_live_only() {
     let (scratch, store) = support::store().await;
     let child_id = Uuid::new_v4();
     let snapshot = || crate::SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child_id,
         parent_session_id: Uuid::new_v4(),
@@ -152,6 +154,7 @@ async fn mirrored_child_provider_audit_events_are_live_only() {
             delivery: None,
         },
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: crate::SessionStatus::Ready,
             detail: None,
         },
@@ -342,6 +345,8 @@ async fn dropping_live_only_child_rows_does_not_change_the_reconstructed_roster(
     let parent_id = started(&store).await;
     let child_id = Uuid::new_v4();
     let snapshot = |detail: &str, total_tokens: u64| crate::SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child_id,
         parent_session_id: parent_id,
@@ -380,6 +385,7 @@ async fn dropping_live_only_child_rows_does_not_change_the_reconstructed_roster(
         row(
             snapshot("starting", 0),
             Some(SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: crate::SessionStatus::Running,
                 detail: None,
             }),

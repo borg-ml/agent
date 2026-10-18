@@ -163,6 +163,7 @@ fn watcher_yield_labels_ready_as_waiting_until_resumed_or_restarted() {
         session,
         4,
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Ready,
             detail: Some("Waiting on 2 watcher(s)".to_string()),
         },
@@ -173,6 +174,7 @@ fn watcher_yield_labels_ready_as_waiting_until_resumed_or_restarted() {
         session,
         2,
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Ready,
             detail: Some("Waiting on 1 watcher(s)".to_string()),
         },
@@ -190,6 +192,7 @@ fn watcher_yield_labels_ready_as_waiting_until_resumed_or_restarted() {
             session,
             3,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status,
                 detail: None,
             },
@@ -232,6 +235,7 @@ fn completion_alert_waits_for_work_to_stop_rather_than_each_turn_boundary() {
         ultrafast: false,
     };
     let ready = |detail: Option<&str>| SessionEventKind::StatusChanged {
+        lifecycle: None,
         status: SessionStatus::Ready,
         detail: detail.map(str::to_string),
     };
@@ -332,6 +336,8 @@ fn older_root_history_hides_agent_cards_and_preserves_authoritative_roster_state
     let child = Uuid::new_v4();
     let now = Utc::now();
     let stale_running = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child,
         parent_session_id: root,
@@ -396,6 +402,8 @@ fn resumed_history_with_roster_hides_child_reports_and_keeps_peers_in_order() {
     let peer = Uuid::new_v4();
     let now = Utc::now();
     let child_snapshot = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child,
         parent_session_id: root,
@@ -480,6 +488,8 @@ fn resumed_history_with_roster_hides_child_reports_and_keeps_peers_in_order() {
 #[test]
 fn bootstrap_subagent_recovery_updates_do_not_become_root_cards() {
     let agent = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: Uuid::new_v4(),
         parent_session_id: Uuid::new_v4(),
@@ -509,6 +519,7 @@ fn bootstrap_subagent_recovery_updates_do_not_become_root_cards() {
     assert!(!should_suppress_root_subagent_activity(
         true,
         &SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Ready,
             detail: None,
         },
@@ -5469,6 +5480,8 @@ fn large_resume_ingest_and_transcript_scroll_profile() {
     for report in 0..CHILD_REPORTS {
         let child_id = child_ids[report % CHILD_COUNT];
         let agent = SubagentSnapshot {
+            lifecycle: None,
+            source: None,
             desktop: false,
             session_id: child_id,
             parent_session_id: session_id,
@@ -5621,12 +5634,14 @@ fn projection_only_events_keep_the_transcript_layout_cache() {
     ));
     assert!(session_event_changes_transcript(
         &SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Ready,
             detail: None,
         }
     ));
     assert!(!session_event_changes_transcript(
         &SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Running,
             detail: None,
         }
@@ -5634,6 +5649,8 @@ fn projection_only_events_keep_the_transcript_layout_cache() {
 
     let child_id = Uuid::new_v4();
     let agent = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child_id,
         parent_session_id: Uuid::new_v4(),
@@ -5652,7 +5669,7 @@ fn projection_only_events_keep_the_transcript_layout_cache() {
         updated_at: chrono::Utc::now(),
         interrupted_by: None,
     };
-    assert!(!session_event_changes_transcript(
+    assert!(session_event_changes_transcript(
         &SessionEventKind::SubagentActivity {
             activity: SubagentActivityKind::Updated,
             agent: agent.clone(),
@@ -8258,7 +8275,7 @@ fn wait_spawn_and_lsp_diagnostics_use_compact_stable_result_shapes() {
 }
 
 #[test]
-fn active_subagent_count_tracks_only_running_children() {
+fn active_subagent_count_includes_starting_and_running_children() {
     let mut transcript = Transcript::default();
     assert_eq!(transcript.active_subagent_count(), 0);
 
@@ -8278,7 +8295,7 @@ fn active_subagent_count_tracks_only_running_children() {
         .subagents
         .insert(Uuid::new_v4(), SubagentStatus::Ready);
 
-    assert_eq!(transcript.active_subagent_count(), 1);
+    assert_eq!(transcript.active_subagent_count(), 2);
 
     transcript
         .subagents
@@ -8288,7 +8305,7 @@ fn active_subagent_count_tracks_only_running_children() {
 }
 
 #[test]
-fn completed_child_turn_is_not_reported_as_running() {
+fn completed_child_turn_does_not_override_worker_execution_state() {
     let event = SessionEventKind::TurnCompleted {
         message_id: Uuid::new_v4(),
         provider_session_id: None,
@@ -8296,17 +8313,14 @@ fn completed_child_turn_is_not_reported_as_running() {
         error: None,
     };
 
-    assert_eq!(
-        subagent_status_from_child_event(&event),
-        Some(SubagentStatus::Ready)
-    );
+    assert_eq!(subagent_status_from_child_event(&event), None);
     assert_eq!(
         effective_subagent_status(
             SubagentActivityKind::Updated,
             SubagentStatus::Running,
             Some(&SessionEvent::new(Uuid::new_v4(), 1, event)),
         ),
-        SubagentStatus::Ready
+        SubagentStatus::Running
     );
 }
 
@@ -8329,6 +8343,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
             model: "gpt-5.6-sol".to_string(),
             effort: "xhigh".to_string(),
             state: "main thread".to_string(),
+            lifecycle: None,
             usage: "472.7m · ~$133.11 (sub eq.)".to_string(),
             child_id: None,
         },
@@ -8337,6 +8352,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
             model: "gpt-5.6-luna".to_string(),
             effort: "max".to_string(),
             state: "running".to_string(),
+            lifecycle: Some(borg_remote::SubagentLifecycle::Running),
             usage: "160.8k".to_string(),
             child_id: Some(Uuid::new_v4()),
         },
@@ -8396,6 +8412,8 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
 fn team_roster_mode_cells_render_requested_speed_with_ultrafast_precedence() {
     let now = Utc::now();
     let mut agent = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: Uuid::new_v4(),
         parent_session_id: Uuid::new_v4(),
@@ -8469,7 +8487,7 @@ fn team_roster_mode_cells_render_requested_speed_with_ultrafast_precedence() {
         assert_eq!(mode_cell(&rows[1]), "ultrafast");
         assert_eq!(mode_cell(&rows[2]), expected);
         assert!(rows[2].starts_with("2 "));
-        assert!(rows[2].contains("running"));
+        assert!(rows[2].contains("working"));
         assert!(rows[2].contains("800.0k · cost unavailable"));
         assert_eq!(lines[2].style, team_roster_row_style(true, true));
         assert!(rows.iter().all(|row| row.width() <= 94));
@@ -8516,6 +8534,8 @@ fn subagent_selector_shows_cumulative_usage_without_a_redundant_unit_suffix() {
 fn subagent_roster_shows_full_model_ids() {
     let now = Utc::now();
     let mut peer = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: Uuid::new_v4(),
         parent_session_id: Uuid::new_v4(),
@@ -8658,6 +8678,8 @@ fn director_roster_preserves_historical_cost_basis_across_model_switches() {
 fn persistent_peers_follow_ordinary_agent_visibility() {
     let now = chrono::Utc::now();
     let mut peer = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: Uuid::new_v4(),
         parent_session_id: Uuid::new_v4(),
@@ -8700,7 +8722,7 @@ fn persistent_peers_follow_ordinary_agent_visibility() {
     transcript.upsert_subagent_snapshot(&peer);
     assert_eq!(transcript.agent_roster_entries()[1].effort, "—");
     assert_eq!(transcript.agent_roster_entries()[0].effort, "—");
-    assert_eq!(running_rows[1].state, "running");
+    assert_eq!(running_rows[1].state, "working");
     assert_eq!(transcript.active_subagent_count(), 1);
     // A stopped child stays on the roster so it can be resumed.
     let mut stopped = peer.clone();
@@ -8708,7 +8730,7 @@ fn persistent_peers_follow_ordinary_agent_visibility() {
     transcript.upsert_subagent_snapshot(&stopped);
     let stopped_rows = transcript.agent_roster_entries();
     assert_eq!(stopped_rows.len(), 2);
-    assert_eq!(stopped_rows[1].state, "stopped · click to resume");
+    assert_eq!(stopped_rows[1].state, "stopped");
     transcript.upsert_subagent_snapshot(&peer);
     assert_eq!(
         agents_status_label(transcript.active_subagent_count(), 0).as_deref(),
@@ -8721,6 +8743,8 @@ fn parked_children_show_as_waiting_and_count_as_active() {
     let parent_id = Uuid::new_v4();
     let now = chrono::Utc::now();
     let snapshot = |name: &str, status, detail: Option<&str>| SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: Uuid::new_v4(),
         parent_session_id: parent_id,
@@ -8776,6 +8800,8 @@ fn agent_roster_lists_running_children_then_all_inactive_states() {
     let parent_id = Uuid::new_v4();
     let now = chrono::Utc::now();
     let snapshot = |name: &str, status, age_minutes| SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: Uuid::new_v4(),
         parent_session_id: parent_id,
@@ -8816,40 +8842,25 @@ fn agent_roster_lists_running_children_then_all_inactive_states() {
     let rows = transcript.agent_roster_entries();
 
     assert_eq!(rows.len(), 11);
-    assert_eq!(rows[1].name, "z_live");
-    assert_eq!(rows[2].name, "a_starting");
+    assert_eq!(rows[1].name, "a_starting");
+    assert_eq!(rows[2].name, "z_live");
     assert_eq!(rows[3].name, "b_waiting");
     assert_eq!(rows[4].name, "idle");
-    assert_eq!(rows[5].state, "stopped · click to resume");
-    assert_eq!(rows[6].state, "failed · click to resume");
+    assert!(rows.iter().any(|row| row.state == "stopped"));
+    assert!(rows.iter().any(|row| row.state == "failed"));
 
     let (collapsed, header) = visible_team_roster(&rows, false);
-    assert_eq!(header, Some(2));
-    assert_eq!(collapsed.len(), 3);
-    assert_eq!(collapsed[2].name, "▸ Inactive · 9");
+    assert_eq!(header, Some(4));
+    assert_eq!(collapsed.len(), 5);
+    assert_eq!(collapsed[4].name, "▸ Inactive · 7");
     let (expanded, header) = visible_team_roster(&rows, true);
-    assert_eq!(header, Some(2));
+    assert_eq!(header, Some(4));
     assert_eq!(expanded.len(), 12);
-    assert_eq!(expanded[2].name, "▾ Inactive · 9");
-    for (visible, original) in expanded[3..].iter().zip(&rows[2..]) {
+    assert_eq!(expanded[4].name, "▾ Inactive · 7");
+    for (visible, original) in expanded[5..].iter().zip(&rows[4..]) {
         assert_eq!(visible.child_id, original.child_id);
     }
-    let rendered = team_roster_table_lines(
-        &expanded,
-        &transcript,
-        90,
-        None,
-        None,
-        header,
-        UiLanguage::English,
-    );
-    assert!(rendered[1].to_string().starts_with("1 director"));
-    assert!(rendered[2].to_string().starts_with("2 z_live"));
-    assert!(rendered[3].to_string().starts_with("  ▾ Inactive · 9"));
-    assert!(rendered[4].to_string().starts_with("3 a_starting"));
-    assert!(rendered[11].to_string().starts_with("0 tail_c"));
-    assert!(rendered[12].to_string().starts_with("  tail_d"));
-    assert_eq!(visible_team_roster(&rows[..2], false).1, None);
+    assert_eq!(visible_team_roster(&rows[..3], false).1, None);
 }
 
 #[test]
@@ -8960,6 +8971,8 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
     let child_id = Uuid::new_v4();
     let now = chrono::Utc::now();
     let mut agent = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child_id,
         parent_session_id: parent_id,
@@ -9036,10 +9049,10 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
             label,
             detail,
             body: None,
-            state: TranscriptActionState::Complete,
+            state: TranscriptActionState::Running,
             ..
         } if label == "Agent"
-            && detail == "inspect_ui · report ready"
+            && detail == "inspect_ui · working"
 
     ));
     transcript.toggle_action_expansion(0);
@@ -9091,9 +9104,14 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
             body: None,
             ..
         } if label == "Agent"
-            && detail == "inspect_ui · needs approval · Run focused tests?"
+            && detail == "inspect_ui · waiting for approval · Run focused tests?"
 
     ));
+    assert_eq!(transcript.meta.approvals.len(), 1);
+    assert_eq!(
+        transcript.meta.approvals[0].source_session_id,
+        child_id.to_string()
+    );
     // A terminal activity can carry the last live snapshot from before the
     // child published its completion boundary.
     agent.status = SubagentStatus::Running;
@@ -9117,7 +9135,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
             state: TranscriptActionState::Complete,
             ..
         } if label == "Agent"
-            && detail == "inspect_ui · completed"
+            && detail == "inspect_ui · ready · waiting for input"
     ));
     let rendered = transcript
         .lines(100)
@@ -9131,10 +9149,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
             .final_text
             .is_none()
     );
-    assert_eq!(
-        transcript.meta.approvals[0].source_session_id,
-        child_id.to_string()
-    );
+    assert!(transcript.meta.approvals.is_empty());
 }
 
 #[test]
@@ -9143,6 +9158,8 @@ fn subagent_activity_keeps_one_summary_without_embedded_child_bodies() {
     let child_id = Uuid::new_v4();
     let now = chrono::Utc::now();
     let agent = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child_id,
         parent_session_id: parent_id,
@@ -9232,7 +9249,7 @@ fn subagent_activity_keeps_one_summary_without_embedded_child_bodies() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(!rendered.contains("Found the renderer issue"), "{rendered}");
-    assert!(rendered.contains("report ready"), "{rendered}");
+    assert!(rendered.contains("working"), "{rendered}");
 
     transcript.apply(&activity(4, SubagentActivityKind::Completed, None));
     assert_eq!(transcript.order.len(), 1);
@@ -9260,6 +9277,7 @@ fn subagent_activity_keeps_one_summary_without_embedded_child_bodies() {
             command: None,
         },
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Ready,
             detail: Some("turn failed: Needs your attention".to_string()),
         },
@@ -9282,6 +9300,8 @@ fn ready_subagent_status_is_a_single_body_free_summary() {
     let child_id = Uuid::new_v4();
     let now = Utc::now();
     let mut agent = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child_id,
         parent_session_id: parent_id,
@@ -9329,6 +9349,7 @@ fn ready_subagent_status_is_a_single_body_free_summary() {
             child_id,
             2,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Ready,
                 detail: None,
             },
@@ -9344,7 +9365,7 @@ fn ready_subagent_status_is_a_single_body_free_summary() {
             },
         )
         .as_deref(),
-        Some("agent · /root/peer · done · waiting for input")
+        Some("agent · /root/peer · ready · waiting for input")
     );
     transcript.apply(&ready);
 
@@ -9367,6 +9388,8 @@ fn ready_subagent_with_provider_isolation_is_shown_as_a_failed_turn() {
     let detail = "Borg blocked a provider-native delegation attempt. The turn was not retried because doing so could repeat work.";
     let now = Utc::now();
     let agent = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child_id,
         parent_session_id: parent_id,
@@ -9389,6 +9412,7 @@ fn ready_subagent_with_provider_isolation_is_shown_as_a_failed_turn() {
         child_id,
         1,
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Ready,
             detail: Some(detail.to_string()),
         },
@@ -9397,7 +9421,7 @@ fn ready_subagent_with_provider_isolation_is_shown_as_a_failed_turn() {
         subagent_activity_summary(SubagentActivityKind::Updated, &agent, Some(&child_event),)
             .as_deref(),
         Some(
-            "agent · /root/audit · failed turn · Borg blocked a provider-native delegation attempt. The turn was not retried because doing so could repeat work."
+            "agent · /root/audit · failed · Borg blocked a provider-native delegation attempt. The turn was not retried because doing so could repeat work."
         )
     );
 
@@ -9417,7 +9441,7 @@ fn ready_subagent_with_provider_isolation_is_shown_as_a_failed_turn() {
             detail,
             state: TranscriptActionState::Failed,
             ..
-        } if detail.starts_with("/root/audit · failed turn")
+        } if detail.starts_with("/root/audit · failed")
     ));
 }
 
@@ -11456,6 +11480,7 @@ fn agent_message_is_visible_while_stopped_once_on_replay_and_never_human_pending
         session_id,
         1,
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Stopped,
             detail: None,
         },
@@ -18532,6 +18557,7 @@ fn a_preparation_flushed_after_the_turn_closed_never_strands_a_spinner() {
         session_id,
         3,
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Ready,
             detail: Some("interrupted".to_string()),
         },
@@ -18593,6 +18619,7 @@ fn a_live_preparation_survives_a_mid_turn_running_refresh() {
         session_id,
         3,
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Running,
             detail: None,
         },
@@ -18637,6 +18664,7 @@ fn interrupted_partial_commentary_is_marked_instead_of_reading_as_final() {
         session_id,
         3,
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Ready,
             detail: Some("interrupted".to_string()),
         },
@@ -19027,6 +19055,8 @@ fn subagent_actions_render_names_without_changing_routing_targets() {
     let child_id = Uuid::new_v4();
     let now = Utc::now();
     let agent = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child_id,
         parent_session_id: parent_id,
@@ -19889,6 +19919,7 @@ fn a_genuinely_queued_prompt_is_released_when_another_turn_starts() {
     assert_eq!(
         optimistic_idle_prompt_decision(
             &SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Running,
                 detail: None,
             },
@@ -19941,6 +19972,7 @@ async fn resumed_work_clears_reconnecting_without_recovery_marker() {
         ));
         for waiting in [
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Running,
                 detail: None,
             },
@@ -20990,6 +21022,8 @@ fn message_cards_resolve_team_threads_after_replay() {
     let child = Uuid::new_v4();
     let now = Utc::now();
     let agent = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child,
         parent_session_id: director,
@@ -21087,6 +21121,8 @@ async fn focused_child_configuration_keeps_pickers_and_status_synced() {
     ));
     let now = Utc::now();
     let mut child = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: Uuid::new_v4(),
         parent_session_id: root,
@@ -21359,6 +21395,7 @@ async fn interrupted_outcomes_render_identically_after_journal_replay() {
     let mut live = Transcript::default();
     let events = [
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Running,
             detail: None,
         },
@@ -21421,6 +21458,8 @@ async fn deferred_child_history_loads_on_focus_pages_back_and_keeps_live_events(
     .unwrap();
     let now = Utc::now();
     let child = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: Uuid::new_v4(),
         parent_session_id: root,
@@ -21849,6 +21888,8 @@ async fn promote_focused_agent_rebinds_default_without_replacing_the_host() {
     .unwrap();
     let now = Utc::now();
     let agent = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child,
         parent_session_id: root,

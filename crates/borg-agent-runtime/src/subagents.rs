@@ -144,6 +144,74 @@ impl SubagentStatus {
     }
 }
 
+/// Canonical worker state. Message/report completion is deliberately separate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum SubagentLifecycle {
+    Starting,
+    Running,
+    WaitingOnWatchers,
+    Ready,
+    WaitingForApproval,
+    Dormant,
+    DormantInterrupted,
+    Stopped,
+    Failed,
+}
+
+impl From<SubagentStatus> for SubagentLifecycle {
+    fn from(status: SubagentStatus) -> Self {
+        match status {
+            SubagentStatus::Starting => Self::Starting,
+            SubagentStatus::Running => Self::Running,
+            SubagentStatus::Ready => Self::Ready,
+            SubagentStatus::WaitingForApproval => Self::WaitingForApproval,
+            SubagentStatus::Stopped => Self::Stopped,
+            SubagentStatus::Failed => Self::Failed,
+        }
+    }
+}
+
+impl From<SubagentLifecycle> for SubagentStatus {
+    fn from(lifecycle: SubagentLifecycle) -> Self {
+        match lifecycle {
+            SubagentLifecycle::Starting => Self::Starting,
+            SubagentLifecycle::Running => Self::Running,
+            SubagentLifecycle::WaitingForApproval => Self::WaitingForApproval,
+            SubagentLifecycle::Stopped => Self::Stopped,
+            SubagentLifecycle::Failed => Self::Failed,
+            SubagentLifecycle::Ready
+            | SubagentLifecycle::WaitingOnWatchers
+            | SubagentLifecycle::Dormant
+            | SubagentLifecycle::DormantInterrupted => Self::Ready,
+        }
+    }
+}
+
+impl From<SessionStatus> for SubagentLifecycle {
+    fn from(status: SessionStatus) -> Self {
+        match status {
+            SessionStatus::Starting => Self::Starting,
+            SessionStatus::Running => Self::Running,
+            SessionStatus::Ready | SessionStatus::Completed => Self::Ready,
+            SessionStatus::WaitingForApproval => Self::WaitingForApproval,
+            SessionStatus::Stopped => Self::Stopped,
+            SessionStatus::Failed => Self::Failed,
+        }
+    }
+}
+
+/// Ordering within one child's coordinator projection. Revisions survive in
+/// parent activity snapshots; child metadata may supersede them only at a
+/// strictly newer child journal sequence, never at an equal watermark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SubagentSourceCursor {
+    pub child_sequence: u64,
+    pub revision: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SubagentCounts {
     pub running: usize,
@@ -155,10 +223,15 @@ pub struct SubagentCounts {
 
 impl SubagentCounts {
     fn add_snapshot(&mut self, agent: &SubagentSnapshot, status: SubagentStatus) {
-        if status == SubagentStatus::Ready && agent.waiting_on_watchers().is_some() {
-            self.waiting += 1;
-        } else {
-            self.add(status);
+        if status.is_terminal() {
+            self.inactive += 1;
+            return;
+        }
+        match agent.lifecycle() {
+            SubagentLifecycle::Running => self.running += 1,
+            SubagentLifecycle::Starting => self.starting += 1,
+            SubagentLifecycle::WaitingOnWatchers => self.waiting += 1,
+            _ => self.inactive += 1,
         }
     }
 
@@ -200,13 +273,17 @@ pub struct SubagentUsage {
     pub cost_complete: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct SubagentSnapshot {
     pub session_id: Uuid,
     pub parent_session_id: Uuid,
     pub task_name: String,
     pub status: SubagentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<SubagentLifecycle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SubagentSourceCursor>,
     pub provider: CodingProvider,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -234,15 +311,85 @@ pub struct SubagentSnapshot {
 }
 
 impl SubagentSnapshot {
-    /// What a `Ready` child parked on live watchers waits on, e.g.
-    /// `waiting on 1 job: cargo build`. `status` stays `Ready` for API
-    /// compatibility; this is the distinct "waiting" state every UI shows.
-    pub fn waiting_on_watchers(&self) -> Option<String> {
-        if self.status != SubagentStatus::Ready {
-            return None;
-        }
-        watcher_wait_label(self.detail.as_deref()?)
+    pub fn lifecycle(&self) -> SubagentLifecycle {
+        self.lifecycle
+            .unwrap_or_else(|| legacy_lifecycle(self.status, self.detail.as_deref()))
     }
+
+    fn set_lifecycle(&mut self, lifecycle: SubagentLifecycle, detail: Option<String>) {
+        self.status = lifecycle.into();
+        self.lifecycle = Some(lifecycle);
+        self.detail = detail;
+    }
+
+    fn transition(
+        &mut self,
+        lifecycle: SubagentLifecycle,
+        detail: Option<String>,
+        child_sequence: Option<u64>,
+    ) {
+        self.set_lifecycle(lifecycle, detail);
+        self.advance(child_sequence);
+    }
+
+    /// Accept state once, before updating any dependent projection. Equal
+    /// revisions are duplicates even when a later delivery has a newer clock.
+    pub fn supersedes(&self, current: &Self) -> bool {
+        if self.session_id != current.session_id {
+            return false;
+        }
+        match (self.source, current.source) {
+            (Some(incoming), Some(current)) => {
+                incoming.revision > current.revision
+                    && incoming.child_sequence >= current.child_sequence
+            }
+            _ => self.updated_at >= current.updated_at,
+        }
+    }
+
+    fn advance(&mut self, child_sequence: Option<u64>) {
+        let current = self.source.unwrap_or(SubagentSourceCursor {
+            child_sequence: 0,
+            revision: 0,
+        });
+        self.source = Some(SubagentSourceCursor {
+            child_sequence: current.child_sequence.max(child_sequence.unwrap_or(0)),
+            revision: current
+                .revision
+                .checked_add(1)
+                .expect("subagent revision exhausted")
+                .max(child_sequence.unwrap_or(0)),
+        });
+        self.set_lifecycle(self.lifecycle(), self.detail.clone());
+        self.updated_at = self.updated_at.max(Utc::now());
+    }
+
+    /// Display text only; lifecycle never depends on this label for new data.
+    pub fn waiting_on_watchers(&self) -> Option<String> {
+        (self.lifecycle() == SubagentLifecycle::WaitingOnWatchers).then(|| {
+            self.detail
+                .as_deref()
+                .and_then(watcher_wait_label)
+                .unwrap_or_else(|| "waiting on watchers".into())
+        })
+    }
+}
+
+/// Compatibility boundary for journals predating explicit lifecycle.
+fn legacy_lifecycle(status: SubagentStatus, detail: Option<&str>) -> SubagentLifecycle {
+    if status == SubagentStatus::Ready {
+        match detail {
+            Some(PARKED_MID_TASK | PARKED_STORE_BUSY) => {
+                return SubagentLifecycle::DormantInterrupted;
+            }
+            Some(PARKED_WITH_PARENT) => return SubagentLifecycle::Dormant,
+            Some(detail) if watcher_wait_label(detail).is_some() => {
+                return SubagentLifecycle::WaitingOnWatchers;
+            }
+            _ => {}
+        }
+    }
+    status.into()
 }
 
 /// Parse the ready detail `Waiting on N watcher(s)[: label, label]` written
@@ -289,6 +436,15 @@ pub enum SubagentActivity {
     Completed {
         agent: SubagentSnapshot,
     },
+}
+
+fn snapshot_activity(agent: SubagentSnapshot) -> SubagentActivity {
+    match agent.status {
+        SubagentStatus::Ready => SubagentActivity::Completed { agent },
+        SubagentStatus::Stopped => SubagentActivity::Stopped { agent },
+        SubagentStatus::Failed => SubagentActivity::Failed { agent },
+        _ => SubagentActivity::Started { agent },
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2739,7 +2895,7 @@ impl AgentToolDispatcher {
                         watches
                             .observe_agent(
                                 agent.session_id,
-                                crate::session::subject_life(agent.status),
+                                crate::session::subject_life(agent.lifecycle()),
                                 &agent.task_name,
                             )
                             .await;
@@ -4075,6 +4231,9 @@ struct SubagentEntry {
     /// action wakes them. This prevents resuming an idle root from silently
     /// starting providers in the background.
     dormant: bool,
+    /// A child journal manifest (or legacy parent snapshot) establishes worker
+    /// admission. A pre-admission spawn failure is only a failed operation.
+    admitted: bool,
 }
 
 struct SubagentTable {
@@ -4134,6 +4293,11 @@ impl SubagentTable {
             parent_session_id,
             task_name: task_name.clone(),
             status: SubagentStatus::Starting,
+            lifecycle: Some(SubagentLifecycle::Starting),
+            source: Some(SubagentSourceCursor {
+                child_sequence: 0,
+                revision: 1,
+            }),
             provider: launch.provider,
             model: launch.model.clone(),
             effort: launch.effort.clone(),
@@ -4156,6 +4320,7 @@ impl SubagentTable {
                 commands: None,
                 inbox: Vec::new(),
                 dormant: false,
+                admitted: false,
             },
         );
         Ok(snapshot)
@@ -5070,7 +5235,12 @@ impl SubagentCoordinator {
                 ..
             } = &event.kind
             {
-                latest.insert(agent.session_id, agent.clone());
+                if latest
+                    .get(&agent.session_id)
+                    .is_none_or(|current| agent.supersedes(current))
+                {
+                    latest.insert(agent.session_id, agent.clone());
+                }
                 if let Some(child_event) = child_event
                     && let SessionEventKind::Message {
                         message_id,
@@ -5085,6 +5255,54 @@ impl SubagentCoordinator {
         *self.projected_root_messages.lock().await = projected_root_messages;
         let mut recovery_updates = Vec::new();
         let root_session_id = self.table.lock().await.root_session_id;
+        let mut after = None;
+        loop {
+            let ids = self
+                .store
+                .descendant_sessions(root_session_id, after, 64)
+                .await?;
+            let full = ids.len() == 64;
+            for id in &ids {
+                if latest.contains_key(id) {
+                    continue;
+                }
+                let state = self.store.state(*id).await?;
+                let Some(mut agent) = state.subagent_registration else {
+                    continue;
+                };
+                let owner = self.store.session_owner(*id).await?;
+                if agent.session_id != *id
+                    || agent.parent_session_id == *id
+                    || owner != Some(agent.parent_session_id)
+                    || (agent.parent_session_id != root_session_id
+                        && !self
+                            .store
+                            .is_descendant(root_session_id, agent.parent_session_id)
+                            .await?)
+                {
+                    tracing::warn!(session_id = %id, "ignored child registration with mismatched durable ownership");
+                    continue;
+                }
+                if latest
+                    .values()
+                    .any(|current| current.task_name == agent.task_name)
+                {
+                    // A failed sidecar replacement can be admitted before its
+                    // caller restores the previous worker's name. Recover its
+                    // identity without stealing that existing routing address.
+                    let parent_path = agent
+                        .task_name
+                        .rsplit_once('/')
+                        .map_or("/root", |(parent, _)| parent);
+                    agent.task_name = format!("{parent_path}/recovered_{}", id.simple());
+                }
+                latest.insert(*id, agent);
+            }
+            if !full {
+                break;
+            }
+            after = ids.last().copied();
+        }
         let mut descendants = HashSet::from([root_session_id]);
         loop {
             let before = descendants.len();
@@ -5101,12 +5319,13 @@ impl SubagentCoordinator {
             if !descendants.contains(&snapshot.session_id) {
                 continue;
             }
+            let mirrored = snapshot.clone();
             let mirrored_status = snapshot.status;
-            let mut parked_mid_task = mirrored_status == SubagentStatus::Ready
-                && snapshot.detail.as_deref() == Some(PARKED_MID_TASK);
+            let mut parked_mid_task = snapshot.lifecycle() == SubagentLifecycle::DormantInterrupted;
             let actor_path = child_lock_path(&self.journal_root, snapshot.session_id);
             let mut recovery_failed = false;
-            if !snapshot.status.is_terminal() {
+            {
+                // Configuration is recoverable even when lifecycle is stopped.
                 let recovered = async {
                     let _writer = crate::SessionWriterLease::try_acquire(&actor_path)?
                         .with_context(|| {
@@ -5119,8 +5338,28 @@ impl SubagentCoordinator {
                 }
                 .await;
                 match recovered {
-                    Ok(state) if state.latest_sequence > 0 => {
+                    Ok(state)
+                        if state.subagent_registration.is_some() && state.started_at.is_none() =>
+                    {
                         project_child_state(&mut snapshot, &state);
+                        let detail = if state.status == Some(SessionStatus::Failed) {
+                            snapshot.detail.clone()
+                        } else {
+                            Some("child startup was interrupted before its session started; explicitly retry the worker".into())
+                        };
+                        snapshot.set_lifecycle(SubagentLifecycle::Failed, detail);
+                        parked_mid_task = false;
+                        recovery_failed = true;
+                    }
+                    Ok(state) if state.latest_sequence > 0 => {
+                        let newer_launch = state
+                            .subagent_registration
+                            .as_ref()
+                            .is_some_and(|registered| registered.supersedes(&snapshot));
+                        project_child_state(&mut snapshot, &state);
+                        if mirrored_status.is_terminal() && !newer_launch {
+                            snapshot.set_lifecycle(mirrored.lifecycle(), mirrored.detail.clone());
+                        }
                         // The owner can die without parking its children (a
                         // crash, or its host failing on a store error). A child
                         // whose own journal still ends in flight was cut off
@@ -5139,31 +5378,43 @@ impl SubagentCoordinator {
                         let parked_by_parent = snapshot.status == SubagentStatus::Stopped
                             && mirrored_status == SubagentStatus::Ready;
                         if !snapshot.status.is_terminal() || parked_by_parent {
-                            snapshot.status = SubagentStatus::Ready;
-                            snapshot.detail = Some(
+                            snapshot.set_lifecycle(
                                 if parked_mid_task {
-                                    PARKED_MID_TASK
+                                    SubagentLifecycle::DormantInterrupted
                                 } else {
-                                    PARKED_WITH_PARENT
-                                }
-                                .to_string(),
+                                    SubagentLifecycle::Dormant
+                                },
+                                Some(
+                                    if parked_mid_task {
+                                        PARKED_MID_TASK
+                                    } else {
+                                        PARKED_WITH_PARENT
+                                    }
+                                    .into(),
+                                ),
                             );
                         }
                     }
+                    Ok(_) if mirrored_status.is_terminal() => {}
                     Ok(_) => {
-                        snapshot.status = SubagentStatus::Failed;
-                        snapshot.updated_at = Utc::now();
-                        snapshot.detail = Some(
-                            "child session had not started before the restart; spawn it again"
-                                .into(),
+                        snapshot.set_lifecycle(
+                            SubagentLifecycle::Failed,
+                            Some(
+                                "child session had not started before the restart; spawn it again"
+                                    .into(),
+                            ),
                         );
                         recovery_failed = true;
                     }
+                    Err(error) if mirrored_status.is_terminal() => {
+                        tracing::warn!(session_id = %snapshot.session_id, %error,
+                            "could not refresh stopped child configuration during restore");
+                    }
                     Err(error) => {
-                        snapshot.status = SubagentStatus::Failed;
-                        snapshot.updated_at = Utc::now();
-                        snapshot.detail =
-                            Some(format!("child session cannot be recovered: {error:#}"));
+                        snapshot.set_lifecycle(
+                            SubagentLifecycle::Failed,
+                            Some(format!("child session cannot be recovered: {error:#}")),
+                        );
                         recovery_failed = true;
                     }
                 }
@@ -5184,6 +5435,11 @@ impl SubagentCoordinator {
                     ));
                 }
             }
+            snapshot.set_lifecycle(snapshot.lifecycle(), snapshot.detail.clone());
+            let changed = serde_json::to_value(&snapshot)? != serde_json::to_value(&mirrored)?;
+            if changed {
+                snapshot.advance(snapshot.source.map(|source| source.child_sequence));
+            }
             {
                 let mut table = self.table.lock().await;
                 table
@@ -5196,13 +5452,14 @@ impl SubagentCoordinator {
                         commands: None,
                         inbox: Vec::new(),
                         dormant: !snapshot.status.is_terminal() && !recovery_failed,
+                        admitted: true,
                     },
                 );
                 if parked_mid_task && !recovery_failed && !snapshot.status.is_terminal() {
                     table.resume_after_restore.push(snapshot.session_id);
                 }
             }
-            if snapshot.status != mirrored_status {
+            if changed {
                 let update = match snapshot.status {
                     SubagentStatus::Ready => Some(SubagentActivity::Completed {
                         agent: snapshot.clone(),
@@ -5461,7 +5718,9 @@ impl SubagentCoordinator {
             .await
             .reserve_as(parent_session_id, task_name, &launch)?;
         self.start_reserved(snapshot.clone(), launch, true).await?;
-        Ok(snapshot)
+        self.get(snapshot.session_id)
+            .await
+            .context("started child disappeared")
     }
 
     /// Spawn a new child without repurposing another task's session.
@@ -5583,9 +5842,11 @@ impl SubagentCoordinator {
             }
             if snapshot.status.is_terminal() {
                 let mut revived = snapshot.clone();
-                revived.status = SubagentStatus::Starting;
-                revived.detail = Some("Waking persistent peer after resume".to_string());
-                revived.updated_at = Utc::now();
+                revived.transition(
+                    SubagentLifecycle::Starting,
+                    Some("Waking persistent peer after resume".into()),
+                    None,
+                );
                 let mut launch = self.root_launch.clone();
                 launch.capabilities.model_fallback.clear();
                 launch.request_id = Uuid::new_v4();
@@ -5611,10 +5872,15 @@ impl SubagentCoordinator {
                 if let Err(error) = self.start_reserved(revived, launch, true).await {
                     let mut table = self.table.lock().await;
                     if let Some(entry) = table.entries.get_mut(&snapshot.session_id) {
-                        entry.snapshot.status = SubagentStatus::Stopped;
-                        entry.snapshot.detail = Some(format!("Could not wake: {error:#}"));
-                        entry.snapshot.updated_at = Utc::now();
+                        entry.snapshot.transition(
+                            SubagentLifecycle::Stopped,
+                            Some(format!("Could not wake: {error:#}")),
+                            None,
+                        );
                         entry.dormant = false;
+                        let _ = self
+                            .activity_tx
+                            .send(snapshot_activity(entry.snapshot.clone()));
                     }
                     return Err(error);
                 }
@@ -5654,7 +5920,9 @@ impl SubagentCoordinator {
             .await
             .reserve(task_name.trim_start_matches("/root/"), &launch)?;
         self.start_reserved(snapshot.clone(), launch, true).await?;
-        Ok(snapshot)
+        self.get(snapshot.session_id)
+            .await
+            .context("started child disappeared")
     }
 
     /// Replace a deterministic sidecar lane with a fresh child. The previous
@@ -5714,14 +5982,15 @@ impl SubagentCoordinator {
                     .expect("sidecar still exists while rotating");
                 let mut archived = entry.snapshot.clone();
                 archived.task_name = archived_name.clone();
-                if archived.status != SubagentStatus::Failed {
-                    archived.status = SubagentStatus::Stopped;
-                }
-                archived.detail = Some(format!(
-                    "Archived persistent peer; replaced at {}",
-                    task_name
-                ));
-                archived.updated_at = Utc::now();
+                archived.transition(
+                    if archived.lifecycle() == SubagentLifecycle::Failed {
+                        SubagentLifecycle::Failed
+                    } else {
+                        SubagentLifecycle::Stopped
+                    },
+                    Some(format!("Archived persistent peer; replaced at {task_name}")),
+                    None,
+                );
                 entry.snapshot = archived.clone();
                 entry.commands = None;
                 entry.dormant = false;
@@ -5753,14 +6022,21 @@ impl SubagentCoordinator {
                         let archived_name = format!("/root/peer_archive_{}", previous_id.simple());
                         let mut restored = previous.clone();
                         restored.task_name = task_name.clone();
-                        restored.status = SubagentStatus::Stopped;
-                        restored.detail = Some(format!("Peer rotation failed: {error:#}"));
-                        restored.updated_at = Utc::now();
+
                         let entry = table
                             .entries
                             .get_mut(&previous_id)
                             .expect("archived sidecar still exists after reservation failure");
+                        restored.source = entry.snapshot.source;
+                        restored.transition(
+                            SubagentLifecycle::Stopped,
+                            Some(format!("Peer rotation failed: {error:#}")),
+                            None,
+                        );
                         entry.snapshot = restored;
+                        let _ = self
+                            .activity_tx
+                            .send(snapshot_activity(entry.snapshot.clone()));
                         entry.commands = None;
                         entry.dormant = false;
                         table.task_names.remove(&archived_name);
@@ -5782,14 +6058,21 @@ impl SubagentCoordinator {
                 let archived_name = format!("/root/peer_archive_{}", previous_id.simple());
                 let mut restored = previous;
                 restored.task_name = task_name.clone();
-                restored.status = SubagentStatus::Stopped;
-                restored.detail = Some(format!("Peer rotation failed: {error:#}"));
-                restored.updated_at = Utc::now();
+
                 let entry = table
                     .entries
                     .get_mut(&previous_id)
                     .expect("archived sidecar still exists after replacement failure");
+                restored.source = entry.snapshot.source;
+                restored.transition(
+                    SubagentLifecycle::Stopped,
+                    Some(format!("Peer rotation failed: {error:#}")),
+                    None,
+                );
                 entry.snapshot = restored;
+                let _ = self
+                    .activity_tx
+                    .send(snapshot_activity(entry.snapshot.clone()));
                 entry.commands = None;
                 entry.dormant = false;
                 table.task_names.remove(&archived_name);
@@ -5863,10 +6146,9 @@ impl SubagentCoordinator {
             if let Some(commands) = state.0
                 && !stop_sent
             {
-                commands
-                    .send(HostCommand::Stop { session_id })
-                    .await
-                    .map_err(|_| anyhow::anyhow!("{} peer command channel closed", state.3))?;
+                // The actor can close its receiver before its exit task clears
+                // the table entry. Still wait for that cleanup before reuse.
+                let _ = commands.send(HostCommand::Stop { session_id }).await;
                 stop_sent = true;
             }
             anyhow::ensure!(
@@ -6112,6 +6394,7 @@ impl SubagentCoordinator {
                         SessionEventKind::StatusChanged {
                             status: SessionStatus::Failed | SessionStatus::Stopped,
                             detail,
+                            ..
                         } => {
                             return PeerConsultationOutcome::Failed(format!(
                                 "persistent {label} peer stopped before replying{}",
@@ -6219,15 +6502,17 @@ impl SubagentCoordinator {
                         active < max_children,
                         "subagent concurrency limit reached ({max_children})"
                     );
-                    let previous = (entry.snapshot.status, entry.snapshot.detail.clone());
+                    let previous = entry.snapshot.lifecycle();
                     entry.dormant = false;
-                    entry.snapshot.status = SubagentStatus::Starting;
-                    entry.snapshot.updated_at = Utc::now();
-                    entry.snapshot.detail = Some(if terminal {
-                        "Waking stopped subagent after explicit follow-up".to_string()
-                    } else {
-                        "Waking after parent resume".to_string()
-                    });
+                    entry.snapshot.transition(
+                        SubagentLifecycle::Starting,
+                        Some(if terminal {
+                            "Waking stopped subagent after explicit follow-up".to_string()
+                        } else {
+                            "Waking after parent resume".to_string()
+                        }),
+                        None,
+                    );
                     Some((entry.snapshot.clone(), terminal.then_some(previous)))
                 } else {
                     None
@@ -6250,17 +6535,24 @@ impl SubagentCoordinator {
                     let mut table = self.table.lock().await;
                     if let Some(entry) = table.entries.get_mut(&session_id) {
                         entry.commands = None;
-                        match revived_from {
-                            Some((status, _)) => {
+                        let lifecycle = match revived_from {
+                            Some(lifecycle) => {
                                 entry.dormant = false;
-                                entry.snapshot.status = status;
+                                lifecycle
                             }
                             None => {
                                 entry.dormant = true;
-                                entry.snapshot.status = SubagentStatus::Ready;
+                                SubagentLifecycle::Dormant
                             }
-                        }
-                        entry.snapshot.detail = Some(format!("Could not wake: {error:#}"));
+                        };
+                        entry.snapshot.transition(
+                            lifecycle,
+                            Some(format!("Could not wake: {error:#}")),
+                            None,
+                        );
+                        let _ = self
+                            .activity_tx
+                            .send(snapshot_activity(entry.snapshot.clone()));
                     }
                     return Err(error);
                 }
@@ -6297,14 +6589,36 @@ impl SubagentCoordinator {
         tokio::spawn(async move {
             let result = this.start_reserved_now(snapshot, launch, announce).await;
             if let Err(error) = &result {
-                let mut table = this.table.lock().await;
-                if let Some(entry) = table.entries.get_mut(&session_id)
-                    && entry.commands.is_none()
-                    && entry.snapshot.status == SubagentStatus::Starting
-                {
-                    entry.snapshot.status = SubagentStatus::Failed;
-                    entry.snapshot.detail = Some(format!("Could not start: {error:#}"));
-                    entry.snapshot.updated_at = Utc::now();
+                let failed = {
+                    let mut table = this.table.lock().await;
+                    if table
+                        .entries
+                        .get(&session_id)
+                        .is_some_and(|entry| !entry.admitted && entry.commands.is_none())
+                    {
+                        if let Some(entry) = table.entries.remove(&session_id)
+                            && table.task_names.get(&entry.snapshot.task_name) == Some(&session_id)
+                        {
+                            table.task_names.remove(&entry.snapshot.task_name);
+                        }
+                        None
+                    } else {
+                        table
+                            .entries
+                            .get_mut(&session_id)
+                            .filter(|entry| entry.commands.is_none())
+                            .map(|entry| {
+                                entry.snapshot.transition(
+                                    SubagentLifecycle::Failed,
+                                    Some(format!("Could not start: {error:#}")),
+                                    None,
+                                );
+                                entry.snapshot.clone()
+                            })
+                    }
+                };
+                if let Some(agent) = failed {
+                    let _ = this.activity_tx.send(SubagentActivity::Failed { agent });
                 }
             }
             result
@@ -6328,15 +6642,50 @@ impl SubagentCoordinator {
         self.store
             .register_child_session(snapshot.parent_session_id, actor_session_id)
             .await?;
-        self.join_team_workspace(actor_session_id, &snapshot.task_name)
-            .await?;
-        if let Some(capabilities) = self
-            .store
-            .state(actor_session_id)
-            .await?
-            .effective_capabilities
-        {
-            launch.capabilities.director_eligible &= capabilities.director_eligible;
+        let preflight = async {
+            let state = self.store.state(actor_session_id).await?;
+            let registered = self
+                .store
+                .append(SessionEvent::new(
+                    actor_session_id,
+                    0,
+                    SessionEventKind::SubagentRegistered {
+                        agent: snapshot.clone(),
+                    },
+                ))
+                .await?;
+            if let Some(entry) = self.table.lock().await.entries.get_mut(&actor_session_id) {
+                entry.admitted = true;
+            }
+            self.publish_child_event(registered).await;
+            self.join_team_workspace(actor_session_id, &snapshot.task_name)
+                .await?;
+            if let Some(capabilities) = state.effective_capabilities {
+                launch.capabilities.director_eligible &= capabilities.director_eligible;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = preflight {
+            if self
+                .table
+                .lock()
+                .await
+                .entries
+                .get(&actor_session_id)
+                .is_some_and(|entry| entry.admitted)
+            {
+                // Keep the lease until this failure is durable. Parent publication
+                // may be delayed or lost; manifest + child status remain recoverable.
+                if let Err(record_error) = self
+                    .record_child_failure(actor_session_id, &error, &writer)
+                    .await
+                {
+                    tracing::error!(%actor_session_id, %record_error,
+                        "could not record child startup failure; incomplete manifest remains recoverable");
+                }
+            }
+            return Err(error);
         }
         let queued_inbox = {
             let mut table = self.table.lock().await;
@@ -6350,7 +6699,10 @@ impl SubagentCoordinator {
         };
         if announce {
             let _ = self.activity_tx.send(SubagentActivity::Started {
-                agent: snapshot.clone(),
+                agent: self
+                    .get(actor_session_id)
+                    .await
+                    .unwrap_or_else(|| snapshot.clone()),
             });
         }
         let actor = tokio::spawn(boxed_agent_store_session(
@@ -6364,29 +6716,69 @@ impl SubagentCoordinator {
             writer,
             self.clone(),
         ));
+        let coordinator = self.clone();
         let table = self.table.clone();
         let activity_tx = self.activity_tx.clone();
-        let spawned_task_name = snapshot.task_name.clone();
-        let parent_session_id = snapshot.parent_session_id;
         tokio::spawn(async move {
-            while let Some(event) = event_rx.recv().await {
-                // Read the name back out of the table instead of the one
-                // captured at spawn: the root projects a child report as
-                // `AgentMessageReceived` under this name, so a reused worker
-                // would otherwise keep answering as its previous task.
-                let task_name = update_from_session_event(&table, actor_session_id, &event)
+            let mut repair = tokio::time::interval(Duration::from_secs(1));
+            repair.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let event = tokio::select! {
+                    event = event_rx.recv() => match event {
+                        Some(event) => event,
+                        None => break,
+                    },
+                    _ = repair.tick() => {
+                        if let Err(error) = coordinator.replay_child_events(actor_session_id, None).await {
+                            tracing::warn!(%actor_session_id, %error, "child projection repair will retry");
+                        }
+                        continue;
+                    }
+                };
+                let after = coordinator
+                    .get(actor_session_id)
                     .await
-                    .unwrap_or_else(|| spawned_task_name.clone());
-                let _ = activity_tx.send(SubagentActivity::SessionEvent {
-                    parent_session_id,
-                    task_name,
-                    event,
-                });
+                    .and_then(|agent| agent.source)
+                    .map_or(0, |source| source.child_sequence);
+                if event.sequence > after.saturating_add(1) {
+                    // Delivery timeouts may drop any durable boundary, including
+                    // status/configuration. Repair before accepting its successor.
+                    if let Err(error) = coordinator
+                        .replay_child_events(actor_session_id, Some(event.sequence))
+                        .await
+                    {
+                        tracing::warn!(%actor_session_id, %error, "child event gap repair will retry");
+                    }
+                } else {
+                    coordinator.publish_child_event(event).await;
+                }
+            }
+            if let Err(error) = coordinator
+                .replay_child_events(actor_session_id, None)
+                .await
+            {
+                tracing::warn!(%actor_session_id, %error, "could not repair final child journal suffix");
             }
             let outcome = actor
                 .await
                 .context("subagent actor task failed")
                 .and_then(|x| x);
+            if let Err(error) = &outcome
+                && !is_store_pool_timeout(error)
+            {
+                let recorded = async {
+                    let path = child_lock_path(&coordinator.journal_root, actor_session_id);
+                    let writer = crate::SessionWriterLease::try_acquire(&path)?
+                        .context("child writer still owned after its actor exited")?;
+                    coordinator
+                        .record_child_failure(actor_session_id, error, &writer)
+                        .await
+                }
+                .await;
+                if let Err(record_error) = recorded {
+                    tracing::error!(%actor_session_id, %record_error, "could not durably record child actor failure");
+                }
+            }
             if let Some(activity) = finish_agent(&table, actor_session_id, outcome.err()).await {
                 let table = table.lock().await;
                 let activity = match (
@@ -6427,6 +6819,75 @@ impl SubagentCoordinator {
         Ok(())
     }
 
+    async fn record_child_failure(
+        &self,
+        session_id: Uuid,
+        error: &anyhow::Error,
+        _writer: &crate::SessionWriterLease,
+    ) -> Result<()> {
+        let event = self
+            .store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Failed,
+                    lifecycle: Some(SubagentLifecycle::Failed),
+                    detail: Some(format!("{error:#}")),
+                },
+            ))
+            .await?;
+        self.publish_child_event(event).await;
+        Ok(())
+    }
+
+    async fn publish_child_event(&self, event: SessionEvent) {
+        let Some(task_name) =
+            update_from_session_event(&self.table, event.session_id, &event).await
+        else {
+            return;
+        };
+        let Some(agent) = self.get(event.session_id).await else {
+            return;
+        };
+        let _ = self.activity_tx.send(SubagentActivity::SessionEvent {
+            parent_session_id: agent.parent_session_id,
+            task_name,
+            event,
+        });
+    }
+
+    /// The bounded channel is a latency optimization, not the state authority.
+    /// A fixed watermark and bounded pages repair gaps without an unbounded queue.
+    async fn replay_child_events(&self, session_id: Uuid, through: Option<u64>) -> Result<()> {
+        let through = match through {
+            Some(sequence) => sequence,
+            None => self.store.state(session_id).await?.latest_sequence,
+        };
+        loop {
+            let Some(agent) = self.get(session_id).await else {
+                return Ok(());
+            };
+            let after = agent.source.map_or(0, |source| source.child_sequence);
+            if after >= through {
+                return Ok(());
+            }
+            let events = self.store.events_after(session_id, after, 256).await?;
+            ensure!(
+                events
+                    .first()
+                    .is_some_and(|event| event.sequence <= through),
+                "child journal suffix missing after {after}"
+            );
+            for event in events
+                .into_iter()
+                .take_while(|event| event.sequence <= through)
+            {
+                self.publish_child_event(event).await;
+            }
+        }
+    }
+
     pub async fn list(&self, path_prefix: Option<&str>) -> Vec<SubagentSnapshot> {
         let prefix = path_prefix
             .map(str::trim)
@@ -6440,39 +6901,79 @@ impl SubagentCoordinator {
             .collect()
     }
 
-    /// Recover bounded child activity from canonical journals after broadcast lag.
+    pub(crate) async fn child_activity_after(
+        &self,
+        session_id: Uuid,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<SubagentActivity>> {
+        let Some(agent) = self.get(session_id).await else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .store
+            .events_after(session_id, after, limit)
+            .await?
+            .into_iter()
+            .map(|event| SubagentActivity::SessionEvent {
+                parent_session_id: agent.parent_session_id,
+                task_name: agent.task_name.clone(),
+                event,
+            })
+            .collect())
+    }
+
+    /// Repair canonical worker snapshots and independent child-event delivery
+    /// after broadcast lag, including children whose start failed before registration.
     pub(crate) async fn activity_recovery_page(
         &self,
         parent: Uuid,
         after: Option<Uuid>,
+        child_sequences: &HashMap<Uuid, u64>,
     ) -> Result<(Vec<SubagentActivity>, Option<Uuid>)> {
-        let ids = self.store.descendant_sessions(parent, after, 64).await?;
-        let next = if ids.len() == 64 {
-            ids.last().copied()
-        } else {
-            None
-        };
-        let mut activity = Vec::with_capacity(ids.len());
-        for id in ids {
-            // A descendant the store knows but the coordinator never tracked
-            // (a child whose start failed) has no snapshot to project. Failing
-            // the page on it would stall recovery, and with it every live
-            // activity, forever.
-            let Some(agent) = self.get(id).await else {
-                continue;
-            };
-            let state = self.store.state(id).await?;
-            let events = self
-                .store
-                .events_after(id, state.latest_sequence.saturating_sub(1), 1)
-                .await?;
-            for event in events {
-                activity.push(SubagentActivity::SessionEvent {
-                    parent_session_id: agent.parent_session_id,
-                    task_name: agent.task_name.clone(),
-                    event,
-                });
+        let table = self.table.lock().await;
+        let mut descendants = HashSet::from([parent]);
+        loop {
+            let before = descendants.len();
+            for entry in table.entries.values() {
+                if descendants.contains(&entry.snapshot.parent_session_id) {
+                    descendants.insert(entry.snapshot.session_id);
+                }
             }
+            if before == descendants.len() {
+                break;
+            }
+        }
+        let mut snapshots = table
+            .entries
+            .values()
+            .map(|entry| &entry.snapshot)
+            .filter(|agent| {
+                agent.session_id != parent
+                    && descendants.contains(&agent.session_id)
+                    && after.is_none_or(|after| agent.session_id > after)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        snapshots.sort_by_key(|agent| agent.session_id);
+        snapshots.truncate(64);
+        let next = (snapshots.len() == 64).then(|| snapshots.last().unwrap().session_id);
+        drop(table);
+        let mut activity = Vec::new();
+        for agent in snapshots {
+            // Report/message delivery has its own cursor: the coordinator's
+            // state watermark may already be ahead of what this parent received.
+            let after = child_sequences.get(&agent.session_id).copied().unwrap_or(0);
+            if agent
+                .source
+                .is_some_and(|source| source.child_sequence > after)
+            {
+                activity.extend(
+                    self.child_activity_after(agent.session_id, after, 16)
+                        .await?,
+                );
+            }
+            activity.push(snapshot_activity(agent));
         }
         Ok((activity, next))
     }
@@ -6529,6 +7030,8 @@ impl SubagentCoordinator {
                 parent_session_id: id,
                 task_name: "/root".into(),
                 status: SubagentStatus::Ready,
+                lifecycle: Some(SubagentLifecycle::Ready),
+                source: None,
                 provider: self.root_launch.provider,
                 model: self.root_launch.model.clone(),
                 effort: self.root_launch.effort.clone(),
@@ -7674,6 +8177,9 @@ impl SubagentCoordinator {
                 .is_some_and(|entry| entry.dormant || entry.snapshot.status.is_terminal())
         };
         if dormant {
+            // A terminal status can precede actor cleanup. Do not write its
+            // journal from here until the old writer has relinquished it.
+            self.stop_and_wait(session_id).await?;
             let mut launch = self.root_launch.clone();
             launch.capabilities.model_fallback.clear();
             launch.cwd = current.cwd.clone();
@@ -7706,10 +8212,8 @@ impl SubagentCoordinator {
                 },
             )
             .await?;
-            let config = self
-                .store
-                .state(session_id)
-                .await?
+            let state = self.store.state(session_id).await?;
+            let config = state
                 .configuration
                 .context("configured session has no configuration")?;
             let mut table = self.table.lock().await;
@@ -7722,7 +8226,11 @@ impl SubagentCoordinator {
             entry.snapshot.effort = config.effort;
             entry.snapshot.fast = config.fast;
             entry.snapshot.ultrafast = config.ultrafast;
-            return Ok(serde_json::to_value(&entry.snapshot)?);
+            entry.snapshot.advance(Some(state.latest_sequence));
+            let agent = entry.snapshot.clone();
+            drop(table);
+            let _ = self.activity_tx.send(snapshot_activity(agent.clone()));
+            return Ok(serde_json::to_value(agent)?);
         }
         // Configuration never starts a parked actor.
         let sender = if session_id == self.root_session_id {
@@ -7784,24 +8292,23 @@ impl SubagentCoordinator {
         })
         .await
         .context("agent did not confirm its configuration within 30 seconds")??;
-        let config = self
-            .store
-            .state(session_id)
-            .await?
+        let state = self.store.state(session_id).await?;
+        if self.get(session_id).await.is_some() {
+            self.replay_child_events(session_id, Some(state.latest_sequence))
+                .await?;
+            let agent = self
+                .get(session_id)
+                .await
+                .context("configured child disappeared")?;
+            let _ = self.activity_tx.send(snapshot_activity(agent.clone()));
+            return Ok(serde_json::to_value(agent)?);
+        }
+        let config = state
             .configuration
             .context("configured session has no configuration")?;
-        let mut table = self.table.lock().await;
-        if let Some(entry) = table.entries.get_mut(&session_id) {
-            entry.snapshot.provider = config.provider;
-            entry.snapshot.model = config.model;
-            entry.snapshot.effort = config.effort;
-            entry.snapshot.fast = config.fast;
-            entry.snapshot.ultrafast = config.ultrafast;
-            return Ok(serde_json::to_value(&entry.snapshot)?);
-        }
         let mut value = serde_json::to_value(config)?;
         value["session_id"] = json!(session_id);
-        value["task_name"] = json!(table.task_name(session_id)?);
+        value["task_name"] = json!(self.table.lock().await.task_name(session_id)?);
         Ok(value)
     }
 
@@ -7837,6 +8344,7 @@ impl SubagentCoordinator {
             && let Some(entry) = table.entries.get_mut(&id)
         {
             entry.snapshot.interrupted_by = interrupter;
+            entry.snapshot.advance(None);
         }
     }
 
@@ -8632,6 +9140,7 @@ impl SubagentCoordinator {
                     let id = table.resolve(&args.target)?;
                     if let Some(entry) = table.entries.get_mut(&id) {
                         entry.snapshot.interrupted_by = Some(actor_session_id);
+                        entry.snapshot.advance(None);
                     }
                 }
                 if let Err(error) = self
@@ -12194,6 +12703,14 @@ async fn update_from_session_event(
 ) -> Option<String> {
     let mut table = table.lock().await;
     let entry = table.entries.get_mut(&session_id)?;
+    if event.sequence > 0
+        && entry
+            .snapshot
+            .source
+            .is_some_and(|source| event.sequence <= source.child_sequence)
+    {
+        return None;
+    }
     match &event.kind {
         SessionEventKind::SessionConfigured {
             provider,
@@ -12223,16 +12740,28 @@ async fn update_from_session_event(
                 entry.snapshot.interrupted_by = None;
             }
         }
-        SessionEventKind::StatusChanged { status, detail } => {
-            entry.snapshot.status = match status {
-                SessionStatus::Starting => SubagentStatus::Starting,
-                SessionStatus::Running => SubagentStatus::Running,
-                SessionStatus::WaitingForApproval => SubagentStatus::WaitingForApproval,
-                SessionStatus::Ready | SessionStatus::Completed => SubagentStatus::Ready,
-                SessionStatus::Failed => SubagentStatus::Failed,
-                SessionStatus::Stopped => SubagentStatus::Stopped,
-            };
-            entry.snapshot.detail = detail.clone();
+        SessionEventKind::StatusChanged {
+            status,
+            detail,
+            lifecycle,
+        } => {
+            let lifecycle = lifecycle.unwrap_or_else(|| {
+                legacy_lifecycle(SubagentLifecycle::from(*status).into(), detail.as_deref())
+            });
+            if entry.snapshot.status.is_terminal()
+                && !matches!(
+                    lifecycle,
+                    SubagentLifecycle::Stopped | SubagentLifecycle::Failed
+                )
+            {
+                // Only an authorized wake may leave a terminal worker state.
+                // Consume stale actor output without undoing that overlay.
+                entry.snapshot.advance(Some(event.sequence));
+            } else {
+                entry
+                    .snapshot
+                    .transition(lifecycle, detail.clone(), Some(event.sequence));
+            }
             // An idle child stays reusable for the life of the parent, so its
             // actor would otherwise retain the whole conversation between
             // turns. Release that in-memory context: the actor stays live and
@@ -12326,24 +12855,49 @@ async fn update_from_session_event(
         }
         _ => {}
     }
-    entry.snapshot.updated_at = event.created_at;
+    entry.snapshot.updated_at = entry.snapshot.updated_at.max(event.created_at);
+    if event.sequence > 0 && !matches!(event.kind, SessionEventKind::StatusChanged { .. }) {
+        entry.snapshot.advance(Some(event.sequence));
+    }
     Some(entry.snapshot.task_name.clone())
 }
 
 fn project_child_state(snapshot: &mut SubagentSnapshot, state: &crate::SessionState) {
     if let Some(status) = state.status {
-        snapshot.status = match status {
-            SessionStatus::Starting => SubagentStatus::Starting,
-            SessionStatus::Running => SubagentStatus::Running,
-            SessionStatus::WaitingForApproval => SubagentStatus::WaitingForApproval,
-            SessionStatus::Ready | SessionStatus::Completed => SubagentStatus::Ready,
-            SessionStatus::Failed => SubagentStatus::Failed,
-            SessionStatus::Stopped => SubagentStatus::Stopped,
-        };
-        snapshot.detail = state.status_detail.clone();
+        let lifecycle = state.status_lifecycle.unwrap_or_else(|| {
+            legacy_lifecycle(
+                SubagentLifecycle::from(status).into(),
+                state.status_detail.as_deref(),
+            )
+        });
+        snapshot.set_lifecycle(lifecycle, state.status_detail.clone());
     }
+    let mut previous = snapshot.source.unwrap_or(SubagentSourceCursor {
+        child_sequence: 0,
+        revision: 0,
+    });
+    if let Some(registered) = state
+        .subagent_registration
+        .as_ref()
+        .and_then(|agent| agent.source)
+        && registered.revision > previous.revision
+        && registered.child_sequence >= previous.child_sequence
+    {
+        previous = registered;
+    }
+    snapshot.source = Some(SubagentSourceCursor {
+        child_sequence: previous.child_sequence.max(state.latest_sequence),
+        revision: previous
+            .revision
+            .checked_add(
+                state
+                    .latest_sequence
+                    .saturating_sub(previous.child_sequence),
+            )
+            .expect("subagent revision exhausted"),
+    });
     if let Some(updated_at) = state.activity_at {
-        snapshot.updated_at = updated_at;
+        snapshot.updated_at = snapshot.updated_at.max(updated_at);
     }
     if let Some(config) = &state.configuration {
         snapshot.provider = config.provider;
@@ -12393,19 +12947,20 @@ async fn finish_agent(
     // that this child's work is wrong. Park it wakeable instead of failing it
     // for good; its journal still ends in flight, so a restore resumes it too.
     let store_busy = error.as_ref().is_some_and(is_store_pool_timeout);
-    entry.snapshot.status = match (&error, parked_mid_task) {
-        (Some(_), _) if !store_busy => SubagentStatus::Failed,
-        (Some(_), _) | (None, Some(_)) => SubagentStatus::Ready,
-        (None, None) => SubagentStatus::Stopped,
+    let lifecycle = match (&error, parked_mid_task) {
+        (Some(_), _) if !store_busy => SubagentLifecycle::Failed,
+        (Some(_), _) | (None, Some(true)) => SubagentLifecycle::DormantInterrupted,
+        (None, Some(false)) => SubagentLifecycle::Dormant,
+        (None, None) => SubagentLifecycle::Stopped,
     };
-    entry.snapshot.detail = match (error, parked_mid_task) {
+    let detail = match (error, parked_mid_task) {
         (Some(error), _) if !store_busy => Some(format!("{error:#}")),
         (Some(_), _) => Some(PARKED_STORE_BUSY.to_string()),
         (None, Some(true)) => Some(PARKED_MID_TASK.to_string()),
         (None, Some(false)) => Some(PARKED_WITH_PARENT.to_string()),
         (None, None) => None,
     };
-    entry.snapshot.updated_at = Utc::now();
+    entry.snapshot.transition(lifecycle, detail, None);
     entry.commands = None;
     if entry.snapshot.status == SubagentStatus::Ready {
         entry.dormant = true;

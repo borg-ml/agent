@@ -1505,6 +1505,16 @@ impl SessionStore for PostgresSessionStore {
         Ok(())
     }
 
+    async fn session_owner(&self, session_id: Uuid) -> Result<Option<Uuid>> {
+        Ok(sqlx::query_scalar::<_, Option<Uuid>>(
+            "select owner_session_id from sessions where id = $1",
+        )
+        .bind(session_id)
+        .fetch_optional(self.pool())
+        .await?
+        .flatten())
+    }
+
     async fn session_lineage_page(
         &self,
         after: Option<Uuid>,
@@ -2347,6 +2357,7 @@ mod tests {
                 session_id,
                 0,
                 SessionEventKind::StatusChanged {
+                    lifecycle: Some(SessionStatus::Running.into()),
                     status: SessionStatus::Running,
                     detail: None,
                 },

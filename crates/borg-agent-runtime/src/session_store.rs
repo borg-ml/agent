@@ -405,6 +405,7 @@ impl SessionEventKind {
         matches!(
             self,
             Self::SessionStarted
+                | Self::SubagentRegistered { .. }
                 | Self::SessionTitled { .. }
                 | Self::SessionConfigured { .. }
                 | Self::ProviderCapabilitiesUpdated { .. }
@@ -425,6 +426,7 @@ impl SessionEventKind {
         !matches!(
             self,
             Self::ProviderSessionLinked { .. }
+                | Self::SubagentRegistered { .. }
                 | Self::PlanProjected { .. }
                 | Self::AgentPlanProjected { .. }
                 | Self::ProviderCapabilitiesUpdated { .. }
@@ -835,6 +837,8 @@ pub struct SessionState {
     pub effective_capabilities: Option<crate::EffectiveCapabilities>,
     pub status: Option<SessionStatus>,
     pub status_detail: Option<String>,
+    pub status_lifecycle: Option<crate::SubagentLifecycle>,
+    pub subagent_registration: Option<crate::SubagentSnapshot>,
     pub imported_from: Option<String>,
     pub imported_title: Option<String>,
     pub title: Option<String>,
@@ -1001,9 +1005,17 @@ impl SessionState {
             SessionEventKind::EffectiveCapabilitiesUpdated { capabilities } => {
                 self.effective_capabilities = Some(capabilities.clone());
             }
-            SessionEventKind::StatusChanged { status, detail } => {
+            SessionEventKind::SubagentRegistered { agent } => {
+                self.subagent_registration = Some(agent.clone());
+            }
+            SessionEventKind::StatusChanged {
+                status,
+                detail,
+                lifecycle,
+            } => {
                 self.status = Some(*status);
                 self.status_detail = detail.clone();
+                self.status_lifecycle = *lifecycle;
             }
             SessionEventKind::ProviderSessionLinked {
                 provider_session_id,
@@ -1309,6 +1321,8 @@ impl SessionState {
         state.latest_sequence = inherited_event_count;
         state.status = None;
         state.status_detail = None;
+        state.status_lifecycle = None;
+        state.subagent_registration = None;
         state.usage_limit_retry = None;
         // A conversation fork is not an assignment or identity transfer.
         state.todos.clear();
@@ -1509,6 +1523,10 @@ pub trait SessionStore: Send + Sync {
         cursors: &HashMap<Uuid, u64>,
     ) -> Result<()>;
     async fn register_child_session(&self, owner_session_id: Uuid, session_id: Uuid) -> Result<()>;
+    /// Exact durable owner, independent of conversation fork ancestry.
+    async fn session_owner(&self, _session_id: Uuid) -> Result<Option<Uuid>> {
+        Ok(None)
+    }
     /// The manager at the top of the canonical ownership chain, not a workspace
     /// or a fork ancestor. Hosted children do not have their own control socket.
     async fn owning_root_session(&self, _session_id: Uuid) -> Result<Option<Uuid>> {

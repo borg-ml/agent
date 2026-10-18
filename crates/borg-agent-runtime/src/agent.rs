@@ -1529,6 +1529,7 @@ pub async fn run_agent_turn_controlled(
 ) -> Result<AgentTurnResult> {
     events
         .send(SessionEventKind::StatusChanged {
+            lifecycle: Some(SessionStatus::Running.into()),
             status: SessionStatus::Running,
             detail: None,
         })
@@ -2283,6 +2284,7 @@ async fn run_borg_provider_turn(
                 send(
                     &events,
                     SessionEventKind::StatusChanged {
+                        lifecycle: Some(SessionStatus::WaitingForApproval.into()),
                         status: SessionStatus::WaitingForApproval,
                         detail: None,
                     },
@@ -2472,6 +2474,7 @@ async fn run_borg_provider_turn(
     send(
         &events,
         SessionEventKind::StatusChanged {
+            lifecycle: Some(SessionStatus::Ready.into()),
             status: SessionStatus::Ready,
             detail: None,
         },

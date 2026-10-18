@@ -17,6 +17,8 @@ use uuid::Uuid;
 pub(crate) enum SubjectLife {
     /// Starting, running, or working a tool call.
     Live,
+    /// Alive and awaiting its own live jobs, not parent action.
+    Waiting,
     /// Alive but not working for the parent: idle after finishing one
     /// assignment, or blocked on an approval only the parent can give.
     Parked,
@@ -29,7 +31,8 @@ impl SubjectLife {
     pub fn describe(self) -> &'static str {
         match self {
             Self::Live => "running",
-            Self::Parked => "waiting on the parent",
+            Self::Waiting => "waiting on watchers",
+            Self::Parked => "idle or needs parent attention",
             Self::Exited => "exited",
         }
     }
@@ -42,8 +45,8 @@ pub(crate) enum AgentSignal {
     /// exits, and a child whose status means nothing to this session still
     /// exits.
     Exit,
-    /// The child is alive and waiting on the parent: the one case exit can
-    /// never report, and the reason a watch would otherwise wait forever.
+    /// The child needs no more execution to reach parent attention: idle,
+    /// blocked, stopped or failed. Its own running jobs do not qualify.
     Attention,
 }
 
@@ -51,7 +54,7 @@ impl AgentSignal {
     fn matches(self, life: SubjectLife) -> bool {
         match self {
             Self::Exit => life == SubjectLife::Exited,
-            Self::Attention => life == SubjectLife::Parked,
+            Self::Attention => matches!(life, SubjectLife::Parked | SubjectLife::Exited),
         }
     }
 }
@@ -103,11 +106,8 @@ impl AgentSubjects {
     /// the aggregate asks for them. `None` means it keeps waiting: a subject the
     /// session has never been told about is unknown rather than exited, and
     /// guessing would wake the session before the child was ever terminal.
-    ///
-    /// Every subject being gone settles the watch whatever its signal asks for.
-    /// Nothing can make a dead child signal, so such a watch can never fire
-    /// again, and a watch left running holds a yielded session on a wake that
-    /// cannot arrive.
+    /// Stopped/failed children satisfy attention as well as exit, so a mixed
+    /// idle/failed batch cannot wait for a dead worker to ask for attention.
     pub fn settle(
         &self,
         states: &BTreeMap<Uuid, SubjectRecord>,
@@ -126,12 +126,7 @@ impl AgentSubjects {
             Aggregate::All => signalled.len() == self.subjects.len(),
             Aggregate::Any => !signalled.is_empty(),
         };
-        if settled {
-            return Some(signalled);
-        }
-        let gone = known.len() == self.subjects.len()
-            && known.iter().all(|(_, life)| *life == SubjectLife::Exited);
-        gone.then_some(known)
+        settled.then_some(signalled)
     }
 }
 
@@ -199,6 +194,22 @@ mod tests {
                 .settle(&states(&[(child, SubjectLife::Live)]))
                 .is_none(),
             "a child still working needs nothing from the parent"
+        );
+        assert!(
+            AgentSubjects::new(vec![child], AgentSignal::Attention, Aggregate::All)
+                .settle(&states(&[(child, SubjectLife::Waiting)]))
+                .is_none(),
+            "a child awaiting its own jobs needs no parent action"
+        );
+        let failed = Uuid::new_v4();
+        assert!(
+            AgentSubjects::new(vec![child, failed], AgentSignal::Attention, Aggregate::All)
+                .settle(&states(&[
+                    (child, SubjectLife::Parked),
+                    (failed, SubjectLife::Exited)
+                ]))
+                .is_some(),
+            "a failed child must not leave a mixed completed batch waiting forever"
         );
     }
 

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 pub use borg_remote::{
     ApprovalDecision, CodingProvider, GoalAction, PermissionMode, PlanItem, PlanItemStatus,
     PromptDelivery, ResponseLanguage, SessionEvent, SessionGoal, SessionState, SessionStatus,
-    SubagentSnapshot, TodoAction,
+    SubagentLifecycle, SubagentSnapshot, TodoAction,
 };
 use uuid::Uuid;
 
@@ -438,9 +438,9 @@ pub struct SessionPresentation {
 
 impl SessionPresentation {
     pub fn new(view: SessionView) -> Self {
-        let timeline = std::sync::Arc::new(
-            timeline::TimelineProjector::from_events(&view.history).into_shared_entries(),
-        );
+        let mut projector = timeline::TimelineProjector::from_events(&view.history);
+        projector.seed_subagents(&view.agents);
+        let timeline = std::sync::Arc::new(projector.into_shared_entries());
         let root_session_id = view.session_id;
         Self {
             view,

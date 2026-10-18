@@ -1446,6 +1446,7 @@ fn history_reprojection_uses_delivered_durable_and_live_projection() {
             session_id,
             5,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Running,
                 detail: None,
             },
@@ -1511,6 +1512,7 @@ async fn delivered_projection_repairs_durable_workflow_events_missing_from_live_
             session_id,
             0,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Running,
                 detail: None,
             },
@@ -1552,6 +1554,8 @@ fn initial_subagent_state_uses_only_the_loaded_root_tail() {
     let child = Uuid::new_v4();
     let now = Utc::now();
     let snapshot = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child,
         parent_session_id: root,
@@ -1597,6 +1601,8 @@ fn resumed_roster_never_claims_an_unowned_child_is_running() {
     let child = Uuid::new_v4();
     let now = Utc::now();
     let mut snapshot = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child,
         parent_session_id: root,
@@ -1652,6 +1658,7 @@ async fn resumed_roster_prefers_the_child_terminal_ledger_over_a_stale_parent_mi
             child,
             0,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Stopped,
                 detail: Some("crash cleanup completed".to_string()),
             },
@@ -1659,6 +1666,8 @@ async fn resumed_roster_prefers_the_child_terminal_ledger_over_a_stale_parent_mi
         .await
         .unwrap();
     let mut snapshots = vec![SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child,
         parent_session_id: root,
@@ -1897,6 +1906,8 @@ fn team_history_restores_every_agent_and_child_approval() {
     let child = Uuid::new_v4();
     let now = Utc::now();
     let mut agent = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child,
         parent_session_id: root,
@@ -2880,6 +2891,7 @@ async fn recent_sessions_are_ordered_by_latest_conversation_activity() {
             (
                 now,
                 SessionEventKind::StatusChanged {
+                    lifecycle: None,
                     status: SessionStatus::Ready,
                     detail: None,
                 },
@@ -3018,6 +3030,7 @@ async fn host_bookkeeping_does_not_outrank_the_session_the_user_worked_in() {
                 (
                     now - chrono::TimeDelta::seconds(10),
                     SessionEventKind::StatusChanged {
+                        lifecycle: None,
                         status: SessionStatus::Stopped,
                         detail: None,
                     },
@@ -3157,10 +3170,12 @@ async fn resume_discovery_ignores_launch_only_probe_sessions() {
                 speed_support: Default::default(),
             },
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Ready,
                 detail: None,
             },
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Stopped,
                 detail: None,
             },
@@ -3971,6 +3986,8 @@ async fn owner_upgrade_waits_for_child_work_and_background_processes() {
     store.create_session(root).await.unwrap();
     store.create_session(child).await.unwrap();
     let snapshot = SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child,
         parent_session_id: root,
@@ -4011,6 +4028,7 @@ async fn owner_upgrade_waits_for_child_work_and_background_processes() {
                 child,
                 0,
                 SessionEventKind::StatusChanged {
+                    lifecycle: None,
                     status,
                     detail: None,
                 },

@@ -402,32 +402,100 @@ pub fn tool_action_is_instant(display_name: &str, language: Option<&str>) -> boo
         )
 }
 
-pub fn is_subagent_tool(display_name: &str) -> bool {
-    matches!(
-        tool_leaf_name(display_name).as_str(),
-        "spawn_agent"
-            | "scout"
-            | "list_agents"
-            | "send_message"
-            | "followup_task"
-            | "inspect_agent"
-            | "configure_agent"
-            | "get_agent_goal"
-            | "control_agent_goal"
-            | "interrupt_agent"
-            | "stop_agent"
-            | "wait_agent"
-            | "spawn agent"
-            | "delegate task"
-            | "list agents"
-            | "follow up with agent"
-            | "send message to agent"
-            | "follow up"
-            | "message agent"
-            | "interrupt agent"
-            | "stop agent"
-            | "wait for agents"
-    )
+/// Canonical control operation, independent of its display label or transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentTool {
+    Spawn,
+    Scout,
+    List,
+    Inspect,
+    Configure,
+    GetGoal,
+    ControlGoal,
+    Interrupt,
+    Stop,
+    Wait,
+    SendMessage,
+    Followup,
+}
+
+impl SubagentTool {
+    const ALL: [Self; 12] = [
+        Self::Spawn,
+        Self::Scout,
+        Self::List,
+        Self::Inspect,
+        Self::Configure,
+        Self::GetGoal,
+        Self::ControlGoal,
+        Self::Interrupt,
+        Self::Stop,
+        Self::Wait,
+        Self::SendMessage,
+        Self::Followup,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Spawn => "Delegate task",
+            Self::Scout => "Scout task",
+            Self::List => "List agents",
+            Self::Inspect => "Inspect agent",
+            Self::Configure => "Configure agent",
+            Self::GetGoal => "Read agent goal",
+            Self::ControlGoal => "Control agent goal",
+            Self::Interrupt => "Interrupt agent",
+            Self::Stop => "Stop agent",
+            Self::Wait => "Wait for agents",
+            Self::SendMessage => "Send message to agent",
+            Self::Followup => "Follow up with agent",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match tool_leaf_name(name).as_str() {
+            "spawn_agent" => Self::Spawn,
+            "scout" => Self::Scout,
+            "list_agents" => Self::List,
+            "inspect_agent" => Self::Inspect,
+            "configure_agent" => Self::Configure,
+            "get_agent_goal" => Self::GetGoal,
+            "control_agent_goal" => Self::ControlGoal,
+            "interrupt_agent" => Self::Interrupt,
+            "stop_agent" => Self::Stop,
+            "wait_agent" => Self::Wait,
+            "send_message" => Self::SendMessage,
+            "followup_task" => Self::Followup,
+            _ => return None,
+        })
+    }
+}
+
+/// Resolve the actual operation inside a capability call, including a call
+/// without arguments. A capability search or nested wrapper is not an agent.
+pub fn subagent_tool(name: &str, input: &Value) -> Option<SubagentTool> {
+    let name = if tool_leaf_name(name) == "capability" {
+        if string_field(input, "search").is_some() {
+            return None;
+        }
+        string_field(input, "name")?
+    } else {
+        name
+    };
+    SubagentTool::from_name(name)
+}
+
+/// Compatibility for consumers holding a display label rather than raw call
+/// metadata. New call classification should use `subagent_tool` instead.
+pub fn is_subagent_tool(name: &str) -> bool {
+    SubagentTool::from_name(name).is_some()
+        || SubagentTool::ALL
+            .into_iter()
+            .any(|tool| tool.label().eq_ignore_ascii_case(name))
+        || matches!(
+            name.to_ascii_lowercase().as_str(),
+            "spawn agent" | "follow up" | "message agent"
+        )
 }
 
 /// Whether a tool edits files, decided from the raw tool name and its display
@@ -529,6 +597,14 @@ pub fn canonical_action_descriptor(name: &str, input: &Value) -> String {
 
 pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
     let tool = tool_leaf_name(name);
+    if tool == "capability"
+        && let Some(search) = string_field(input, "search")
+    {
+        return ("Search tools".to_string(), compact_text(search, 160));
+    }
+    if let Some((target, arguments)) = capability_inner_call(name, input) {
+        return tool_call_summary(target, arguments);
+    }
 
     if tool == "action_preparing" {
         let label = string_field(input, "label").unwrap_or_default().trim();
@@ -666,62 +742,53 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
         );
     }
 
-    if tool == "spawn_agent" {
-        let task = string_field(input, "task_name").unwrap_or("child");
-        let model = string_field(input, "model")
-            .map(|model| format!(" · {model}"))
-            .unwrap_or_default();
-        return ("Delegate task".to_string(), format!("{task}{model}"));
-    }
-
-    if tool == "list_agents" {
-        return (
-            "List agents".to_string(),
-            string_field(input, "path_prefix")
-                .unwrap_or("all children")
-                .to_string(),
-        );
-    }
-
-    if matches!(tool.as_str(), "send_message" | "followup_task") {
-        let target = string_field(input, "target").unwrap_or("agent");
-        let message = string_field(input, "message")
-            .map(|message| format!(" · {}", compact_text(message, 100)))
-            .unwrap_or_default();
-        let action = if tool == "send_message" {
-            "Send message to agent"
+    if let Some(agent_tool) = subagent_tool(name, input) {
+        let detail = if tool == "capability" {
+            concise_tool_input(input)
         } else {
-            "Follow up with agent"
-        };
-        return (action.to_string(), format!("{target}{message}"));
-    }
-
-    if matches!(tool.as_str(), "interrupt_agent" | "stop_agent") {
-        return (
-            if tool == "stop_agent" {
-                "Stop agent"
-            } else {
-                "Interrupt agent"
+            match agent_tool {
+                SubagentTool::Spawn | SubagentTool::Scout => {
+                    let task = string_field(input, "task_name").unwrap_or("child");
+                    let model = string_field(input, "model")
+                        .map(|model| format!(" · {model}"))
+                        .unwrap_or_default();
+                    format!("{task}{model}")
+                }
+                SubagentTool::List => string_field(input, "path_prefix")
+                    .unwrap_or("all children")
+                    .to_string(),
+                SubagentTool::SendMessage | SubagentTool::Followup => {
+                    let target = string_field(input, "target").unwrap_or("agent");
+                    let message = string_field(input, "message")
+                        .map(|message| format!(" · {}", compact_text(message, 100)))
+                        .unwrap_or_default();
+                    format!("{target}{message}")
+                }
+                SubagentTool::Wait => input
+                    .get("timeout_ms")
+                    .and_then(Value::as_u64)
+                    .map(|milliseconds| {
+                        let duration = if milliseconds >= 60_000 && milliseconds % 60_000 == 0 {
+                            format!("{}m", milliseconds / 60_000)
+                        } else {
+                            format_duration(milliseconds)
+                        };
+                        format!("up to {duration}")
+                    })
+                    .unwrap_or_else(|| "updates".to_string()),
+                SubagentTool::Inspect => string_field(input, "session_id")
+                    .unwrap_or("child")
+                    .to_string(),
+                SubagentTool::Configure
+                | SubagentTool::GetGoal
+                | SubagentTool::ControlGoal
+                | SubagentTool::Interrupt
+                | SubagentTool::Stop => {
+                    string_field(input, "target").unwrap_or("child").to_string()
+                }
             }
-            .to_string(),
-            string_field(input, "target").unwrap_or("child").to_string(),
-        );
-    }
-
-    if tool == "wait_agent" {
-        let timeout = input
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .map(|milliseconds| {
-                let duration = if milliseconds >= 60_000 && milliseconds % 60_000 == 0 {
-                    format!("{}m", milliseconds / 60_000)
-                } else {
-                    format_duration(milliseconds)
-                };
-                format!("up to {duration}")
-            })
-            .unwrap_or_else(|| "updates".to_string());
-        return ("Wait for agents".to_string(), timeout);
+        };
+        return (agent_tool.label().to_string(), detail);
     }
 
     if matches!(tool.as_str(), "subagentactivity" | "subagent_activity") {
@@ -847,9 +914,6 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
             .and_then(Value::as_str)
             .filter(|target| !target.is_empty())
     {
-        if let Some((target, arguments)) = capability_inner_call(name, input) {
-            return tool_call_summary(target, arguments);
-        }
         let label = if tool_leaf_name(target) == "capability" {
             "Capability".to_string()
         } else {
@@ -864,7 +928,8 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
 /// The call a `capability` wrapper makes. A wrapper of itself is not unwrapped,
 /// so untrusted nesting cannot recurse.
 fn capability_inner_call<'a>(name: &str, input: &'a Value) -> Option<(&'a str, &'a Value)> {
-    (tool_leaf_name(name) == "capability").then_some(())?;
+    (tool_leaf_name(name) == "capability" && string_field(input, "search").is_none())
+        .then_some(())?;
     let target = string_field(input, "name").filter(|target| !target.is_empty())?;
     let arguments = input
         .get("arguments")
@@ -1150,7 +1215,7 @@ fn product_tool_summary(name: &str, input: &Value) -> Option<(String, String)> {
 
 fn tool_category(name: &str, label: &str, input: &Value) -> ToolPresentationCategory {
     let leaf = tool_leaf_name(name);
-    if is_subagent_tool(label)
+    if subagent_tool(name, input).is_some()
         || matches!(
             leaf.as_str(),
             "task"
@@ -1351,6 +1416,13 @@ fn summarize_tool_result(
                 )
             });
     }
+    if let Some(tool) = subagent_tool(name, input) {
+        // The tool call can be finished while the recipient is still working.
+        // Unknown shapes keep their full output but make no completion claim.
+        return serde_json::from_str::<Value>(trimmed)
+            .ok()
+            .and_then(|value| subagent_result_summary(tool, &value));
+    }
     if git_call(name, input).is_some() {
         return concise_git_result(trimmed);
     }
@@ -1423,6 +1495,98 @@ fn summarize_tool_result(
     } else {
         "completed".to_string()
     })
+}
+
+fn subagent_result_summary(tool: SubagentTool, value: &Value) -> Option<String> {
+    let accepted = value.get("accepted").and_then(Value::as_bool) == Some(true)
+        || string_field(value, "type") == Some("accepted");
+    let count = |key: &str, noun: &str| {
+        let count = value.get(key)?.as_array()?.len();
+        Some(format!(
+            "{count} {noun}{}",
+            if count == 1 { "" } else { "s" }
+        ))
+    };
+    match tool {
+        SubagentTool::Spawn | SubagentTool::Scout => value
+            .get("agent")
+            .unwrap_or(value)
+            .get("session_id")
+            .map(|_| "spawn accepted".to_string()),
+        SubagentTool::List => count("agents", "agent"),
+        SubagentTool::Inspect => count("events", "event").map(|summary| {
+            if value.get("has_more").and_then(Value::as_bool) == Some(true) {
+                format!("{summary} · more available")
+            } else {
+                summary
+            }
+        }),
+        SubagentTool::Configure => value
+            .get("agent")
+            .map(|_| "configuration updated".to_string()),
+        SubagentTool::GetGoal => {
+            let goal = value.get("goal")?;
+            if goal.is_null() {
+                Some("no goal".to_string())
+            } else {
+                string_field(goal, "status").map(|status| format!("goal {status}"))
+            }
+        }
+        SubagentTool::ControlGoal => accepted.then(|| {
+            if value.get("applied").and_then(Value::as_bool) == Some(true) {
+                "goal control applied".to_string()
+            } else {
+                "goal control accepted · application unverified".to_string()
+            }
+        }),
+        SubagentTool::Interrupt | SubagentTool::Stop => accepted.then(|| {
+            let operation = if tool == SubagentTool::Interrupt {
+                "interrupt"
+            } else {
+                "stop"
+            };
+            format!("{operation} accepted · worker state unverified")
+        }),
+        SubagentTool::SendMessage | SubagentTool::Followup => {
+            let queued = value.get("queued").and_then(Value::as_bool) == Some(true);
+            (accepted || queued).then(|| {
+                let receipt = string_field(value, "delivery_state")
+                    .map(|state| state.replace('_', " "))
+                    .unwrap_or_else(|| if queued { "queued" } else { "accepted" }.to_string());
+                let action =
+                    if value.get("action_requested").and_then(Value::as_bool) == Some(false) {
+                        "notification only"
+                    } else {
+                        "recipient action unverified"
+                    };
+                format!("{receipt} · {action}")
+            })
+        }
+        SubagentTool::Wait => {
+            let reason = match string_field(value, "reason")? {
+                "child_settled" => "child state changed",
+                "child_message" => "child message received",
+                "child_update" => "child updates received",
+                "input_pending" => "input pending",
+                "no_active_children" => "no working children",
+                "timeout" => "wait timed out",
+                "cancelled" => "wait cancelled",
+                _ => return None,
+            };
+            let mut summary = reason.to_string();
+            if let Some(working) = value.get("working_children").and_then(Value::as_u64) {
+                summary.push_str(&format!(" · {working} working"));
+            }
+            if let Some(waiting) = value
+                .get("parked_on_watchers")
+                .and_then(Value::as_u64)
+                .filter(|count| *count > 0)
+            {
+                summary.push_str(&format!(" · {waiting} waiting on watchers"));
+            }
+            Some(summary)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3480,6 +3644,251 @@ all green"
         assert_eq!(gmail.category, ToolPresentationCategory::Read);
     }
 
+    // These are shared projection contracts: valid tool JSON previously rendered
+    // as Generic or "completed" depending on its transport or English label.
+    #[test]
+    fn canonical_agent_tools_ignore_display_labels_and_transport() {
+        use super::SubagentTool;
+
+        let input = json!({
+            "action": "read files",
+            "task_name": "audit",
+            "target": "/root/audit",
+            "session_id": "child-session",
+        });
+        for (name, tool) in [
+            ("spawn_agent", SubagentTool::Spawn),
+            ("scout", SubagentTool::Scout),
+            ("list_agents", SubagentTool::List),
+            ("inspect_agent", SubagentTool::Inspect),
+            ("configure_agent", SubagentTool::Configure),
+            ("get_agent_goal", SubagentTool::GetGoal),
+            ("control_agent_goal", SubagentTool::ControlGoal),
+            ("interrupt_agent", SubagentTool::Interrupt),
+            ("stop_agent", SubagentTool::Stop),
+            ("wait_agent", SubagentTool::Wait),
+            ("send_message", SubagentTool::SendMessage),
+            ("followup_task", SubagentTool::Followup),
+        ] {
+            let direct = project_tool_presentation(name, &input, None, false);
+            assert_eq!(direct.label, tool.label());
+            assert!(super::is_subagent_tool(&direct.label), "{name}");
+            for identity in [
+                name.to_string(),
+                format!("functions.{name}"),
+                format!("mcp__borg_agent__{name}"),
+            ] {
+                assert_eq!(super::subagent_tool(&identity, &input), Some(tool));
+                assert_eq!(
+                    super::tool_category(&identity, "unrelated display label", &input),
+                    ToolPresentationCategory::Agent,
+                );
+                for wrapper in [
+                    "capability",
+                    "functions.capability",
+                    "mcp__borg_agent__capability",
+                ] {
+                    let wrapped = json!({
+                        "action": "read files",
+                        "name": identity,
+                        "arguments": input,
+                    });
+                    assert_eq!(super::subagent_tool(wrapper, &wrapped), Some(tool));
+                    let presentation = project_tool_presentation(wrapper, &wrapped, None, false);
+                    assert_eq!(presentation.category, ToolPresentationCategory::Agent);
+                    assert_eq!(presentation.label, direct.label);
+                    assert_eq!(presentation.detail, direct.detail);
+                    let bare = json!({"name": identity});
+                    assert_eq!(super::subagent_tool(wrapper, &bare), Some(tool));
+                    assert_eq!(
+                        project_tool_presentation(wrapper, &bare, None, false).category,
+                        ToolPresentationCategory::Agent,
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            super::tool_category("unknown_tool", "Configure agent", &json!({})),
+            ToolPresentationCategory::Generic,
+        );
+        for input in [
+            json!({"search": "spawn_agent"}),
+            json!({"search": "tools", "name": "spawn_agent", "arguments": {}}),
+            json!({"name": "capability", "arguments": {"name": "spawn_agent"}}),
+        ] {
+            assert_eq!(super::subagent_tool("capability", &input), None);
+            assert_ne!(
+                project_tool_presentation("capability", &input, None, false).category,
+                ToolPresentationCategory::Agent,
+            );
+        }
+    }
+
+    #[test]
+    fn agent_result_summaries_preserve_operation_and_worker_distinction() {
+        let snapshot = json!({
+            "session_id": "child-session", "task_name": "/root/audit", "status": "running",
+            "provider": "codex", "model": "worker-model", "effort": "high",
+            "fast": false, "ultrafast": false, "final_text": null,
+        });
+        for (name, value, expected) in [
+            ("spawn_agent", snapshot.clone(), "spawn accepted"),
+            ("scout", snapshot.clone(), "spawn accepted"),
+            (
+                "list_agents",
+                json!({"agents": [snapshot.clone()]}),
+                "1 agent",
+            ),
+            (
+                "configure_agent",
+                json!({"agent": snapshot}),
+                "configuration updated",
+            ),
+            (
+                "inspect_agent",
+                json!({
+                    "canonical": {"session_id": "child-session", "revision": 10},
+                    "events": [{"sequence": 8, "body": {"type": "message", "text": "report"}}],
+                    "next_after_sequence": 8, "has_more": true,
+                }),
+                "1 event · more available",
+            ),
+            (
+                "get_agent_goal",
+                json!({
+                    "session_id": "child-session", "goal": {"status": "complete"},
+                    "execution_status": "running",
+                }),
+                "goal complete",
+            ),
+            ("get_agent_goal", json!({"goal": null}), "no goal"),
+            (
+                "control_agent_goal",
+                json!({
+                    "accepted": true, "applied": null, "before_revision": 10,
+                }),
+                "goal control accepted · application unverified",
+            ),
+            (
+                "interrupt_agent",
+                json!({"accepted": true}),
+                "interrupt accepted · worker state unverified",
+            ),
+            (
+                "stop_agent",
+                json!({
+                    "type": "accepted", "agent": {"status": "running"},
+                }),
+                "stop accepted · worker state unverified",
+            ),
+            (
+                "send_message",
+                json!({
+                    "queued": true, "delivery_state": "queued_idle", "action_requested": false,
+                }),
+                "queued idle · notification only",
+            ),
+            (
+                "followup_task",
+                json!({
+                    "accepted": true, "delivery_state": "dispatched", "action_requested": true,
+                }),
+                "dispatched · recipient action unverified",
+            ),
+        ] {
+            let input = json!({"target": "/root/audit"});
+            // Native, MCP structured, and MCP text results must retain their
+            // complete bodies while presenting the same operation outcome.
+            for output in [
+                value.to_string(),
+                json!({"structuredContent": value}).to_string(),
+                json!({"content": [{"type": "text", "text": value.to_string()}]}).to_string(),
+            ] {
+                for (identity, arguments) in [
+                    (name, input.clone()),
+                    ("capability", json!({"name": name, "arguments": input})),
+                ] {
+                    let presentation =
+                        project_tool_presentation(identity, &arguments, Some(&output), false);
+                    assert_eq!(presentation.result.as_deref(), Some(expected), "{name}");
+                    let body = presentation
+                        .output
+                        .expect("canonical output remains available");
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&body.text).unwrap(),
+                        value
+                    );
+                }
+            }
+        }
+        for value in [json!({"accepted": false}), json!({"status": "completed"})] {
+            let presentation = project_tool_presentation(
+                "control_agent_goal",
+                &json!({}),
+                Some(&value.to_string()),
+                false,
+            );
+            assert_eq!(presentation.result, None);
+        }
+        let error = project_tool_presentation(
+            "interrupt_agent",
+            &json!({}),
+            Some("permission denied"),
+            true,
+        );
+        assert_eq!(error.result.as_deref(), Some("permission denied"));
+    }
+
+    #[test]
+    fn agent_wait_summaries_report_reason_and_live_work() {
+        for (reason, expected) in [
+            ("child_settled", "child state changed"),
+            ("child_message", "child message received"),
+            ("child_update", "child updates received"),
+            ("input_pending", "input pending"),
+            ("no_active_children", "no working children"),
+            ("timeout", "wait timed out"),
+            ("cancelled", "wait cancelled"),
+        ] {
+            let output = json!({
+                "reason": reason, "waited_ms": 100,
+                "changes": [], "messages": [], "agents": [], "agents_mode": "delta",
+                "working_children": 0, "parked_on_watchers": 1,
+            });
+            let presentation = project_tool_presentation(
+                "mcp__borg_agent__wait_agent",
+                &json!({}),
+                Some(&output.to_string()),
+                false,
+            );
+            assert_eq!(
+                presentation.result,
+                Some(format!("{expected} · 0 working · 1 waiting on watchers")),
+            );
+        }
+        for state in [
+            "dispatched",
+            "relay_pending",
+            "queued_offline",
+            "queued_idle",
+        ] {
+            let output = json!({"accepted": true, "delivery_state": state});
+            let presentation = project_tool_presentation(
+                "followup_task",
+                &json!({}),
+                Some(&output.to_string()),
+                false,
+            );
+            assert_eq!(
+                presentation.result,
+                Some(format!(
+                    "{} · recipient action unverified",
+                    state.replace('_', " ")
+                )),
+            );
+        }
+    }
+
     #[test]
     fn projects_provider_subagent_activity_without_raw_identifiers() {
         let activity = project_tool_presentation(
@@ -3563,7 +3972,7 @@ all green"
         // Nothing to name falls back rather than rendering an empty title.
         assert_eq!(
             tool_call_summary("capability", &serde_json::json!({"search": "x"})).0,
-            "Capability"
+            "Search tools"
         );
     }
 

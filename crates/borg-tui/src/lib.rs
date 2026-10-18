@@ -4,9 +4,8 @@ use borg_view::projection_helpers::{
     borg_control_tool_output_view, borg_lsp_diagnostics_view, number_message_attachments,
 };
 use borg_view::projection_helpers::{
-    context_remaining_percent, display_agent_name, effective_subagent_status,
-    format_context_tokens, image_numbers_in_text, is_context_compaction, is_live_tool_call_event,
-    ready_detail_is_failure, subagent_status_from_child_event,
+    context_remaining_percent, display_agent_name, format_context_tokens, image_numbers_in_text,
+    is_context_compaction, is_live_tool_call_event, subagent_status_from_child_event,
 };
 #[cfg(test)]
 use borg_view::semantics::{assistant_message_is_retired_action_leak, parse_watch_event};
@@ -20,6 +19,8 @@ mod key_hints;
 mod markdown;
 mod rendering;
 mod terminal_input;
+#[cfg(test)]
+use borg_view::projection_helpers::effective_subagent_status;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -3496,6 +3497,7 @@ impl BorgTerminal {
             self.session_id,
             0,
             SessionEventKind::StatusChanged {
+                lifecycle: Some(SessionStatus::Ready.into()),
                 status: SessionStatus::Ready,
                 detail: Some("Interrupted".into()),
             },
@@ -4535,10 +4537,12 @@ impl BorgTerminal {
                     event: child_event,
                 } = &event.kind
                 {
-                    transcript.upsert_subagent_snapshot_with_status(
+                    let snapshot = borg_view::projection_helpers::subagent_snapshot_for_activity(
+                        *activity,
                         agent,
-                        effective_subagent_status(*activity, agent.status, child_event.as_deref()),
+                        child_event.as_deref(),
                     );
+                    transcript.reconcile_subagent_snapshot(&snapshot, false);
                 }
                 None
             } else if replaying_history {
@@ -4676,11 +4680,23 @@ impl BorgTerminal {
             return false;
         };
         let child_id = agent.session_id;
-        let status = subagent_session_status(effective_subagent_status(
+        let snapshot = borg_view::projection_helpers::subagent_snapshot_for_activity(
             *activity,
-            agent.status,
+            agent,
             child_event.as_deref(),
-        ));
+        );
+        let root = self
+            .director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript);
+        let current = root.subagent_snapshots.get(&child_id);
+        if current.is_some_and(|current| match (snapshot.source, current.source) {
+            (Some(incoming), Some(current)) => incoming.revision < current.revision,
+            _ => snapshot.updated_at < current.updated_at,
+        }) {
+            return false;
+        }
+        let status = subagent_session_status(snapshot.status);
         self.child_statuses.insert(child_id, status);
         let observed_at = if self.child_activity_clocks.contains_key(&child_id) {
             event.created_at
@@ -12469,6 +12485,7 @@ fn completion_alert_due(pending: &mut bool, kind: &SessionEventKind) -> bool {
         SessionEventKind::StatusChanged {
             status: SessionStatus::Ready | SessionStatus::Stopped | SessionStatus::Failed,
             detail,
+            ..
         } => {
             return std::mem::take(pending)
                 && !detail
@@ -13504,11 +13521,20 @@ enum TeamRosterTarget {
 }
 
 fn roster_entry_is_active(entry: &AgentRosterEntry) -> bool {
-    entry.state == "running" || roster_entry_is_waiting(entry)
+    matches!(
+        entry.lifecycle,
+        Some(
+            borg_remote::SubagentLifecycle::Starting
+                | borg_remote::SubagentLifecycle::Running
+                | borg_remote::SubagentLifecycle::WaitingOnWatchers
+                | borg_remote::SubagentLifecycle::WaitingForApproval
+        )
+    )
 }
 
 fn roster_entry_is_waiting(entry: &AgentRosterEntry) -> bool {
-    entry.child_id.is_some() && entry.state.starts_with("waiting on ")
+    entry.child_id.is_some()
+        && entry.lifecycle == Some(borg_remote::SubagentLifecycle::WaitingOnWatchers)
 }
 
 fn visible_team_roster(
@@ -13532,6 +13558,7 @@ fn visible_team_roster(
         model: String::new(),
         effort: String::new(),
         state: String::new(),
+        lifecycle: None,
         usage: String::new(),
         child_id: None,
     });
@@ -14307,17 +14334,6 @@ fn deletes_next_word(key: &KeyEvent) -> bool {
 
 include!("transcript.rs");
 
-fn subagent_status_label(status: SubagentStatus) -> &'static str {
-    match status {
-        SubagentStatus::Starting => "starting",
-        SubagentStatus::Running => "running",
-        SubagentStatus::Ready => "ready",
-        SubagentStatus::WaitingForApproval => "awaiting approval",
-        SubagentStatus::Stopped => "stopped",
-        SubagentStatus::Failed => "failed",
-    }
-}
-
 fn format_subagent_usage(usage: &borg_remote::SubagentUsage) -> String {
     let displayed_tokens = (usage.total_tokens > 0).then_some(usage.total_tokens);
     if displayed_tokens.is_none() && usage.cost_microusd.is_none() {
@@ -14539,6 +14555,7 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::ContextWindowUpdated { .. }
         | SessionEventKind::UserStopChanged { .. }
         | SessionEventKind::SubagentControl { .. }
+        | SessionEventKind::SubagentRegistered { .. }
         | SessionEventKind::TeamDirectorChanged { .. }
         | SessionEventKind::WatchesChanged { .. }
         | SessionEventKind::ProviderSessionLinked { .. }
@@ -14578,11 +14595,7 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
                 // same frame as the tool call it precedes.
                 || TranscriptCore::provider_reasoning_lifecycle(kind, payload).is_some()
         }
-        SessionEventKind::SubagentActivity {
-            activity,
-            agent,
-            event,
-        } => subagent_activity_summary(*activity, agent, event.as_deref()).is_some(),
+        SessionEventKind::SubagentActivity { .. } => true,
         SessionEventKind::AgentMessageReceived { .. }
         | SessionEventKind::TeamBroadcastUpdated { .. }
         | SessionEventKind::Message { .. }
@@ -14622,68 +14635,13 @@ pub fn subagent_activity_summary(
     agent: &SubagentSnapshot,
     child_event: Option<&SessionEvent>,
 ) -> Option<String> {
-    let task = &agent.task_name;
-    match activity {
-        SubagentActivityKind::Started => Some(format!("agent · {task} · started")),
-        SubagentActivityKind::Updated => match child_event.map(|event| &event.kind) {
-            Some(SessionEventKind::Message {
-                actor: EventActor::Assistant,
-                text,
-                status: MessageStatus::Complete,
-                ..
-            }) if !text.trim().is_empty() => Some(format!("agent · {task} · report ready")),
-            Some(SessionEventKind::ApprovalRequested { title, detail, .. }) => Some(format!(
-                "agent · {task} · needs approval · {}",
-                compact_text(
-                    if title.trim().is_empty() {
-                        detail
-                    } else {
-                        title
-                    },
-                    120
-                )
-            )),
-            Some(SessionEventKind::StatusChanged {
-                status: SessionStatus::Ready | SessionStatus::Completed,
-                detail: Some(detail),
-            }) if ready_detail_is_failure(detail) => Some(format!(
-                "agent · {task} · failed turn · {}",
-                compact_text(detail, 120)
-            )),
-            Some(SessionEventKind::StatusChanged {
-                status: SessionStatus::Ready | SessionStatus::Completed,
-                ..
-            }) => Some(format!("agent · {task} · done · waiting for input")),
-            Some(SessionEventKind::StatusChanged {
-                status: SessionStatus::WaitingForApproval,
-                ..
-            }) => Some(format!("agent · {task} · waiting for input")),
-            Some(SessionEventKind::Error { message }) => Some(format!(
-                "agent · {task} · error · {}",
-                compact_text(message, 120)
-            )),
-            _ => None,
-        },
-        SubagentActivityKind::Completed => Some(terminal_agent_summary(
-            task,
-            "completed",
-            agent.final_text.as_deref(),
-        )),
-        SubagentActivityKind::Stopped => Some(terminal_agent_summary(
-            task,
-            "stopped",
-            agent.final_text.as_deref(),
-        )),
-        SubagentActivityKind::Failed => Some(format!(
-            "agent · {task} · failed{}",
-            agent
-                .detail
-                .as_deref()
-                .filter(|detail| !detail.trim().is_empty())
-                .map(|detail| format!(" · {}", compact_text(detail, 120)))
-                .unwrap_or_default()
-        )),
-    }
+    let snapshot =
+        borg_view::projection_helpers::subagent_snapshot_for_activity(activity, agent, child_event);
+    Some(format!(
+        "agent · {} · {}",
+        snapshot.task_name,
+        borg_view::projection_helpers::subagent_lifecycle_detail(&snapshot)
+    ))
 }
 
 #[test]
@@ -14705,14 +14663,6 @@ fn large_reasoning_snapshot_overlap_stays_linear() {
         elapsed < Duration::from_millis(50),
         "TUI reasoning overlap exceeded 50 ms: {elapsed:?}"
     );
-}
-
-fn terminal_agent_summary(task: &str, outcome: &str, final_text: Option<&str>) -> String {
-    let result = final_text
-        .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
-        .map(|text| format!(" · {}", compact_text(text, 120)))
-        .unwrap_or_default();
-    format!("agent · {task} · {outcome}{result}")
 }
 
 fn normalize_terminal_capture_paste(value: &str) -> Cow<'_, str> {

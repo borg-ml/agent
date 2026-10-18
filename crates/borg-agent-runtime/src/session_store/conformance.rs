@@ -153,6 +153,7 @@ async fn persistence_classes_agree_across_backends() {
                 session_id,
                 0,
                 SessionEventKind::StatusChanged {
+                    lifecycle: None,
                     status: SessionStatus::Running,
                     detail: None,
                 },

@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use borg_remote::{
-    EventActor, MessageStatus, SessionEvent, SessionEventKind, edit_is_awaiting_diff,
-    tool_call_summary,
+use borg_remote::{EventActor, MessageStatus, SessionEvent, SubagentLifecycle, SubagentSnapshot};
+use borg_view::core::{RenderInvalidation, TranscriptCore};
+use borg_view::entry::{
+    TranscriptActionKind, TranscriptActionState, TranscriptEntry, tool_lifecycle_state,
 };
+use borg_view::wire::Lifecycle;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 pub use borg_view::grouping::tool_lifecycle_label;
+pub use borg_view::projection_helpers::subagent_lifecycle_detail;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimelineKind {
@@ -22,7 +25,7 @@ pub enum TimelineKind {
     Error,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TimelineEntry {
     pub id: String,
     pub created_at: DateTime<Utc>,
@@ -33,32 +36,50 @@ pub struct TimelineEntry {
     pub rich_body: Option<Arc<crate::markdown::RichText>>,
     pub running: bool,
     pub failed: bool,
+    /// Only current-state worker summaries navigate. Tool receipts still inspect output.
+    pub target_session_id: Option<Uuid>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TimelineProjector {
+    session_id: Option<Uuid>,
+    core: TranscriptCore,
     entries: Vec<Arc<TimelineEntry>>,
-    messages: HashMap<Uuid, usize>,
-    tools: HashMap<String, usize>,
-    tool_parents: HashMap<String, String>,
-    preparing_tools: HashMap<String, usize>,
-    unkeyed_preparing_tools: Vec<usize>,
-    reasoning: Option<usize>,
-    turn_tier: Option<&'static str>,
-    message_tiers: HashMap<Uuid, Option<&'static str>>,
+}
+
+impl Default for TimelineProjector {
+    fn default() -> Self {
+        let mut core = TranscriptCore::default();
+        core.retain_tool_inspection = true;
+        Self {
+            session_id: None,
+            core,
+            entries: Vec::new(),
+        }
+    }
 }
 
 impl TimelineProjector {
     pub fn from_events(events: &[SessionEvent]) -> Self {
-        let mut projector = Self::default();
-        projector.extend(events);
+        let mut projector = Self {
+            session_id: events.first().map(|event| event.session_id),
+            ..Self::default()
+        };
+        for event in events {
+            projector.core.apply_history(event);
+        }
+        projector.sync_entries();
         projector
     }
 
     pub fn extend(&mut self, events: &[SessionEvent]) {
+        self.session_id = self
+            .session_id
+            .or_else(|| events.first().map(|event| event.session_id));
         for event in events {
-            self.push(event);
+            self.core.apply(event);
         }
+        self.sync_entries();
     }
 
     pub fn into_entries(self) -> Vec<TimelineEntry> {
@@ -69,483 +90,293 @@ impl TimelineProjector {
         self.entries
     }
 
-    fn has_preparing_tool(&self, tool_call_id: &str) -> bool {
-        self.preparing_tools.contains_key(tool_call_id) || !self.unkeyed_preparing_tools.is_empty()
-    }
-
-    fn take_preparing_tool(&mut self, tool_call_id: &str) -> Option<usize> {
-        self.preparing_tools.remove(tool_call_id).or_else(|| {
-            (!self.unkeyed_preparing_tools.is_empty())
-                .then(|| self.unkeyed_preparing_tools.remove(0))
-        })
+    /// Recovery metadata covers more history than the bounded transcript window.
+    /// Reconcile it through the same freshness gate, without resurrecting old rows.
+    pub fn seed_subagents(&mut self, agents: &[SubagentSnapshot]) {
+        for agent in agents {
+            if Some(agent.parent_session_id) == self.session_id {
+                self.core.reconcile_subagent_snapshot(agent, false);
+            }
+        }
+        self.sync_entries();
     }
 
     pub fn push(&mut self, event: &SessionEvent) {
-        if let SessionEventKind::ToolStarted {
-            tool_call_id,
-            parent_tool_call_id: Some(parent),
-            ..
-        } = &event.kind
-        {
-            self.tool_parents
-                .insert(tool_call_id.clone(), parent.clone());
-        }
-        if let SessionEventKind::ToolCompleted {
-            tool_call_id,
-            is_error,
-            ..
-        } = &event.kind
-        {
-            let mut parents = vec![tool_call_id.clone()];
-            while let Some(parent) = parents.pop() {
-                let children = self
-                    .tool_parents
-                    .iter()
-                    .filter(|(_, recorded_parent)| **recorded_parent == parent)
-                    .map(|(child, _)| child.clone())
-                    .collect::<Vec<_>>();
-                for child in children {
-                    self.tool_parents.remove(&child);
-                    parents.push(child.clone());
-                    if let Some(index) = self.tools.get(&child) {
-                        let entry = Arc::make_mut(&mut self.entries[*index]);
-                        if entry.running {
-                            entry.running = false;
-                            entry.failed = *is_error;
-                        }
-                    }
+        self.session_id.get_or_insert(event.session_id);
+        self.core.apply(event);
+        self.sync_entries();
+    }
+
+    fn sync_entries(&mut self) {
+        let changed_from = self.core.order.take_changed_from();
+        let structural = self.entries.len() != self.core.order.len()
+            || self
+                .core
+                .order
+                .invalidations
+                .borrow()
+                .iter()
+                .any(|change| !matches!(change, RenderInvalidation::Changed(_)));
+        self.core.order.invalidations.borrow_mut().clear();
+        self.core.prune_tool_inspection();
+        self.core.order.removed.clear();
+        let dirty = self
+            .core
+            .order
+            .dirty
+            .borrow_mut()
+            .drain()
+            .collect::<Vec<_>>();
+        if structural {
+            let start = changed_from
+                .min(self.entries.len())
+                .min(self.core.order.len());
+            let old = self
+                .entries
+                .drain(start..)
+                .map(|entry| (entry.id.clone(), entry))
+                .collect::<HashMap<_, _>>();
+            for index in start..self.core.order.len() {
+                let id = self.row_id(index);
+                let entry = self.project_entry(index, id.clone(), old.get(&id).map(Arc::as_ref));
+                self.entries.push(match old.get(&id) {
+                    Some(previous) if previous.as_ref() == &entry => Arc::clone(previous),
+                    _ => Arc::new(entry),
+                });
+            }
+        } else {
+            for index in dirty {
+                let Some(previous) = self.entries.get(index) else {
+                    continue;
+                };
+                let entry = self.project_entry(index, self.row_id(index), Some(previous));
+                if previous.as_ref() != &entry {
+                    self.entries[index] = Arc::new(entry);
                 }
             }
         }
-        match &event.kind {
-            SessionEventKind::TurnStarted {
-                fast, ultrafast, ..
-            } => {
-                self.turn_tier = if *ultrafast {
-                    Some("ultrafast")
-                } else if *fast {
-                    Some("fast")
-                } else {
-                    None
-                };
-            }
-            SessionEventKind::Message {
-                message_id,
+    }
+
+    fn row_id(&self, index: usize) -> String {
+        if let Some(child) = self.child_id(index) {
+            return format!("child:{child}");
+        }
+        if let Some((message, _)) = self.core.messages.iter().find(|(_, row)| **row == index) {
+            return format!("message:{message}");
+        }
+        let (event, ordinal) = self.core.order.identities[index];
+        format!("{event}:{ordinal}")
+    }
+
+    fn child_id(&self, index: usize) -> Option<Uuid> {
+        self.core
+            .subagent_entries
+            .iter()
+            .find_map(|(id, row)| (*row == index).then_some(*id))
+    }
+
+    fn project_entry(
+        &self,
+        index: usize,
+        id: String,
+        previous: Option<&TimelineEntry>,
+    ) -> TimelineEntry {
+        let mut entry = TimelineEntry {
+            id,
+            created_at: DateTime::<Utc>::default(),
+            kind: TimelineKind::Status,
+            title: String::new(),
+            detail: None,
+            body: String::new(),
+            rich_body: None,
+            running: false,
+            failed: false,
+            target_session_id: self.child_id(index),
+        };
+        let time = match &self.core.order[index] {
+            TranscriptEntry::Message {
                 actor,
                 text,
+                effort,
+                time,
                 status,
                 ..
             } => {
-                let kind = match actor {
+                entry.kind = match actor {
                     EventActor::User => TimelineKind::User,
                     EventActor::Assistant => TimelineKind::Assistant,
                     EventActor::Tool | EventActor::System => TimelineKind::Status,
                 };
-                let title = match actor {
+                entry.title = match actor {
                     EventActor::User => "you",
                     EventActor::Assistant => "borg",
                     EventActor::Tool => "tool",
                     EventActor::System => "system",
-                };
-                let entry = TimelineEntry {
-                    id: format!("message:{message_id}"),
-                    created_at: event.created_at,
-                    kind,
-                    title: title.into(),
-                    detail: if *actor == EventActor::Assistant {
-                        let tier = *self
-                            .message_tiers
-                            .entry(*message_id)
-                            .or_insert(self.turn_tier);
-                        match (tier, message_status_label(*status)) {
-                            (Some(tier), Some(status)) => Some(format!("{tier} · {status}")),
-                            (Some(tier), None) => Some(tier.to_string()),
-                            (None, status) => status.map(str::to_string),
-                        }
-                    } else {
-                        message_status_label(*status).map(str::to_string)
-                    },
-                    body: text.clone(),
-                    rich_body: matches!(actor, EventActor::Assistant)
-                        .then(|| Arc::new(crate::markdown::project_markdown(text))),
-                    running: matches!(status, MessageStatus::Queued | MessageStatus::InProgress),
-                    failed: *status == MessageStatus::Failed,
-                };
-                if let Some(index) = self.messages.get(message_id).copied() {
-                    self.entries[index] = Arc::new(entry);
-                } else {
-                    self.messages.insert(*message_id, self.entries.len());
-                    self.entries.push(Arc::new(entry));
                 }
+                .into();
+                entry.detail = effort
+                    .iter()
+                    .map(String::as_str)
+                    .chain(message_status_label(*status))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+                    .into();
+                entry.body.clone_from(text);
+                entry.running = matches!(status, MessageStatus::Queued | MessageStatus::InProgress);
+                entry.failed = *status == MessageStatus::Failed;
+                time
             }
-            SessionEventKind::ReasoningDelta { text } => {
-                if let Some(index) = self.reasoning {
-                    if !text.is_empty() {
-                        let body = &mut Arc::make_mut(&mut self.entries[index]).body;
-                        if text.starts_with(body.as_str()) {
-                            body.clone_from(text);
-                        } else if !body.starts_with(text) {
-                            body.push_str(text);
-                        }
-                    }
-                } else {
-                    self.reasoning = Some(self.entries.len());
-                    self.entries.push(Arc::new(TimelineEntry {
-                        id: format!("reasoning:{}", event.id),
-                        created_at: event.created_at,
-                        kind: TimelineKind::Reasoning,
-                        title: "Reasoning".into(),
-                        detail: None,
-                        body: text.clone(),
-                        rich_body: None,
-                        running: true,
-                        failed: false,
-                    }));
-                }
-            }
-            SessionEventKind::TurnCompleted { .. } => {
-                for index in self
-                    .preparing_tools
-                    .drain()
-                    .map(|(_, index)| index)
-                    .chain(self.unkeyed_preparing_tools.drain(..))
-                {
-                    Arc::make_mut(&mut self.entries[index]).running = false;
-                }
-            }
-            SessionEventKind::ReasoningCompleted => {
-                if let Some(index) = self.reasoning.take() {
-                    Arc::make_mut(&mut self.entries[index]).running = false;
-                }
-            }
-            SessionEventKind::ProviderEvent { kind, payload, .. }
-                if kind == "action/preparing_cancelled" =>
-            {
-                let index = match payload
-                    .get("tool_call_id")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    Some(tool_call_id) => self.take_preparing_tool(tool_call_id),
-                    None => self.unkeyed_preparing_tools.pop(),
-                };
-                if let Some(index) = index {
-                    if index + 1 == self.entries.len() {
-                        self.entries.pop();
-                    } else if let Some(entry) = self.entries.get_mut(index) {
-                        Arc::make_mut(entry).running = false;
-                    }
-                }
-            }
-            SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "action/preparing" => {
-                self.reasoning = None;
-                let provider_tool_id = payload
-                    .get("tool_call_id")
-                    .and_then(serde_json::Value::as_str);
-                let label = payload
-                    .get("label")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default();
-                let existing = provider_tool_id
-                    .and_then(|provider_tool_id| {
-                        self.preparing_tools
-                            .get(provider_tool_id)
-                            .copied()
-                            .or_else(|| {
-                                if self.unkeyed_preparing_tools.is_empty() {
-                                    return None;
-                                }
-                                let index = self.unkeyed_preparing_tools.remove(0);
-                                self.preparing_tools
-                                    .insert(provider_tool_id.to_string(), index);
-                                Some(index)
-                            })
-                    })
-                    .or_else(|| {
-                        provider_tool_id
-                            .is_none()
-                            .then(|| {
-                                self.unkeyed_preparing_tools
-                                    .last()
-                                    .copied()
-                                    .filter(|index| {
-                                        self.entries.get(*index).is_some_and(|entry| {
-                                            entry.running
-                                                && matches!(
-                                                    entry.title.as_str(),
-                                                    "Generate" | "Wait for provider"
-                                                )
-                                        })
-                                    })
-                            })
-                            .flatten()
-                    });
-                if provider_tool_id.is_none()
-                    && !label.is_empty()
-                    && existing.is_none()
-                    && let Some(index) = self.unkeyed_preparing_tools.pop()
-                {
-                    Arc::make_mut(&mut self.entries[index]).running = false;
-                }
-                let input = serde_json::json!({"label": label});
-                let (title, detail) = tool_call_summary("action_preparing", &input);
-                if let Some(index) = existing {
-                    let entry = Arc::make_mut(&mut self.entries[index]);
-                    entry.title = title;
-                    entry.detail = (!detail.is_empty()).then_some(detail);
-                    entry.body.clear();
-                    entry.rich_body = None;
-                    entry.running = true;
-                    entry.failed = false;
-                    return;
-                }
-                let index = self.entries.len();
-                self.entries.push(Arc::new(TimelineEntry {
-                    id: format!("action:{}", event.id),
-                    created_at: event.created_at,
-                    kind: TimelineKind::Tool,
-                    title,
-                    detail: (!detail.is_empty()).then_some(detail),
-                    body: String::new(),
-                    rich_body: None,
-                    running: true,
-                    failed: false,
-                }));
-                if let Some(provider_tool_id) = provider_tool_id {
-                    self.preparing_tools
-                        .insert(provider_tool_id.to_string(), index);
-                } else {
-                    self.unkeyed_preparing_tools.push(index);
-                }
-            }
-            SessionEventKind::ProviderEvent { kind, .. } if kind == "native_steer_applied" => {
-                for index in self
-                    .preparing_tools
-                    .drain()
-                    .map(|(_, index)| index)
-                    .chain(self.unkeyed_preparing_tools.drain(..))
-                {
-                    Arc::make_mut(&mut self.entries[index]).running = false;
-                }
-            }
-            SessionEventKind::ProviderEvent { kind, payload, .. }
-                if kind == "action/generation_status" =>
-            {
-                let provider_tool_id = payload
-                    .get("tool_call_id")
-                    .and_then(serde_json::Value::as_str);
-                if provider_tool_id.is_some_and(|tool_call_id| {
-                    self.tools.contains_key(tool_call_id)
-                        && !self.preparing_tools.contains_key(tool_call_id)
-                }) {
-                    return;
-                }
-                let mapped = provider_tool_id
-                    .and_then(|tool_call_id| self.preparing_tools.get(tool_call_id).copied());
-                let index = mapped.or_else(|| self.unkeyed_preparing_tools.last().copied());
-                let Some(index) = index else {
-                    return;
-                };
-                let Some(entry) = self.entries.get_mut(index) else {
-                    return;
-                };
-                let entry = Arc::make_mut(entry);
-                if !entry.running || entry.kind != TimelineKind::Tool {
-                    return;
-                }
-                let waiting = payload
-                    .get("waiting")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-                let label = payload
-                    .get("label")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default();
-                entry.title = if waiting {
-                    "Wait for provider".into()
-                } else if label.is_empty() {
-                    "Generate".into()
-                } else {
-                    format!("Generate {label}")
-                };
-                if mapped.is_none()
-                    && let Some(provider_tool_id) = provider_tool_id
-                {
-                    self.unkeyed_preparing_tools
-                        .retain(|candidate| *candidate != index);
-                    self.preparing_tools
-                        .insert(provider_tool_id.to_string(), index);
-                }
-            }
-            SessionEventKind::ToolStarted {
-                tool_call_id,
+            TranscriptEntry::Tool {
                 name,
-                input,
-                ..
-            } if !self.tools.contains_key(tool_call_id)
-                && self.has_preparing_tool(tool_call_id)
-                && edit_is_awaiting_diff(name, input) =>
-            {
-                self.reasoning = None;
-            }
-            SessionEventKind::ToolStarted {
-                tool_call_id,
-                name,
-                input,
-                ..
-            }
-            | SessionEventKind::ToolUpdated {
-                tool_call_id,
-                name,
-                input,
-            } => {
-                self.reasoning = None;
-                let (title, detail) = tool_call_summary(name, input);
-                let known_tool = self.tools.get(tool_call_id).copied();
-                let running_tool = known_tool.filter(|index| self.entries[*index].running);
-                let matching_preparation = known_tool
-                    .is_none()
-                    .then(|| self.take_preparing_tool(tool_call_id))
-                    .flatten();
-                let index = if matches!(&event.kind, SessionEventKind::ToolStarted { .. }) {
-                    matching_preparation.or(running_tool)
-                } else {
-                    running_tool.or_else(|| {
-                        if known_tool.is_none() {
-                            matching_preparation
-                        } else {
-                            None
-                        }
-                    })
-                };
-                let index = if let Some(index) = index {
-                    let entry = Arc::make_mut(&mut self.entries[index]);
-                    entry.title = title;
-                    entry.detail = (!detail.is_empty()).then_some(detail);
-                    entry.body.clear();
-                    entry.rich_body = None;
-                    entry.running = true;
-                    entry.failed = false;
-                    index
-                } else {
-                    let index = self.entries.len();
-                    self.entries.push(Arc::new(TimelineEntry {
-                        id: format!("tool:{tool_call_id}:{}", event.id),
-                        created_at: event.created_at,
-                        kind: TimelineKind::Tool,
-                        title,
-                        detail: (!detail.is_empty()).then_some(detail),
-                        body: String::new(),
-                        rich_body: None,
-                        running: true,
-                        failed: false,
-                    }));
-                    index
-                };
-                self.tools.insert(tool_call_id.clone(), index);
-            }
-            SessionEventKind::ToolCompleted {
-                tool_call_id,
-                output,
-                is_error,
+                detail,
+                code_view,
+                output_view,
+                time,
+                complete,
+                error,
+                user_interrupted,
+                backgrounded,
+                outcome,
                 ..
             } => {
-                let known_index = self.tools.get(tool_call_id).copied();
-                let index = known_index.filter(|index| self.entries[*index].running);
-                if let Some(index) = index {
-                    let entry = Arc::make_mut(&mut self.entries[index]);
-                    entry.running = false;
-                    entry.failed = *is_error;
-                    entry.body = output.clone();
-                    entry.rich_body = None;
-                } else if known_index.is_none()
-                    && let Some(index) = self.take_preparing_tool(tool_call_id)
-                {
-                    let entry = Arc::make_mut(&mut self.entries[index]);
-                    let label = entry.detail.take().unwrap_or_else(|| {
-                        entry
-                            .title
-                            .strip_prefix("Generate ")
-                            .unwrap_or("command")
-                            .to_string()
-                    });
-                    entry.title = format!("Run {label}");
-                    entry.running = false;
-                    entry.failed = *is_error;
-                    entry.body = output.clone();
-                    entry.rich_body = None;
-                    self.tools.insert(tool_call_id.clone(), index);
+                let reasoning = code_view
+                    .as_ref()
+                    .is_some_and(|(language, _)| language == "reasoning");
+                entry.kind = if reasoning {
+                    TimelineKind::Reasoning
                 } else {
-                    let index = self.entries.len();
-                    self.entries.push(Arc::new(TimelineEntry {
-                        id: format!("tool:{tool_call_id}:{}", event.id),
-                        created_at: event.created_at,
-                        kind: TimelineKind::Tool,
-                        title: "Completed tool".into(),
-                        detail: None,
-                        body: output.clone(),
-                        rich_body: None,
-                        running: false,
-                        failed: *is_error,
-                    }));
-                    self.tools.insert(tool_call_id.clone(), index);
-                }
+                    TimelineKind::Tool
+                };
+                entry.title.clone_from(name);
+                entry.detail = (!detail.is_empty()).then(|| detail.clone());
+                entry.body = if reasoning {
+                    code_view
+                        .as_ref()
+                        .map(|(_, text)| text.clone())
+                        .unwrap_or_default()
+                } else {
+                    self.core
+                        .tool_inspection_text(index)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            output_view
+                                .as_ref()
+                                .or(code_view.as_ref())
+                                .map(|(_, text)| text.clone())
+                                .unwrap_or_default()
+                        })
+                };
+                let lifecycle = tool_lifecycle_state(
+                    *complete,
+                    *error,
+                    *user_interrupted,
+                    *backgrounded,
+                    outcome.as_deref(),
+                );
+                entry.running = matches!(
+                    lifecycle,
+                    Lifecycle::Running | Lifecycle::Backgrounded | Lifecycle::Waiting
+                );
+                entry.failed = lifecycle == Lifecycle::Failed;
+                time
             }
-            SessionEventKind::ApprovalRequested { title, detail, .. } => {
-                self.entries.push(Arc::new(simple_entry(
-                    event,
-                    TimelineKind::Approval,
-                    title,
-                    detail,
-                    true,
-                    false,
-                )));
+            TranscriptEntry::Action {
+                kind,
+                label,
+                detail,
+                body,
+                time,
+                state,
+                ..
+            } => {
+                entry.kind = match kind {
+                    TranscriptActionKind::Agent => TimelineKind::Subagent,
+                    TranscriptActionKind::Approval | TranscriptActionKind::ProviderInteraction => {
+                        TimelineKind::Approval
+                    }
+                    TranscriptActionKind::Error => TimelineKind::Error,
+                    TranscriptActionKind::Watch => TimelineKind::Status,
+                };
+                entry.title.clone_from(label);
+                entry.detail = (!detail.is_empty()).then(|| detail.clone());
+                entry.body = body.clone().unwrap_or_default();
+                entry.running = matches!(
+                    state,
+                    TranscriptActionState::Running | TranscriptActionState::Waiting
+                );
+                entry.failed = *state == TranscriptActionState::Failed;
+                time
             }
-            SessionEventKind::SubagentActivity { agent, .. } => {
-                self.entries.push(Arc::new(simple_entry(
-                    event,
-                    TimelineKind::Subagent,
-                    &agent.task_name,
-                    agent.detail.as_deref().unwrap_or_default(),
-                    agent.final_text.is_none(),
-                    false,
-                )));
+            TranscriptEntry::Activity { text, time } => {
+                entry.title = "Status".into();
+                entry.body.clone_from(text);
+                time
             }
-            SessionEventKind::Error { message } => self.entries.push(Arc::new(simple_entry(
-                event,
-                TimelineKind::Error,
-                "Error",
-                message,
-                false,
-                true,
-            ))),
-            _ => {}
+            TranscriptEntry::Info { title, text, time } => {
+                entry.title.clone_from(title);
+                entry.body.clone_from(text);
+                time
+            }
+            TranscriptEntry::Compaction {
+                summary,
+                time,
+                complete,
+                ..
+            } => {
+                entry.title = "Compaction".into();
+                entry.body.clone_from(summary);
+                entry.running = !complete;
+                time
+            }
+            TranscriptEntry::Plan { items, time, .. } => {
+                entry.title = "Plan".into();
+                entry.body = items
+                    .iter()
+                    .map(|item| format!("{:?} · {}", item.status, item.content))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                time
+            }
+            TranscriptEntry::Goal { goal, time } => {
+                entry.title = "Goal".into();
+                entry.body.clone_from(&goal.objective);
+                time
+            }
+        };
+        entry.created_at = DateTime::parse_from_rfc3339(time)
+            .map(|time| time.with_timezone(&Utc))
+            .unwrap_or_default();
+        if let Some(agent) = entry
+            .target_session_id
+            .and_then(|id| self.core.effective_subagent_snapshot(id))
+        {
+            // A parked worker is waiting, not executing. The shared action
+            // state also uses Waiting for approvals and dormant summaries.
+            entry.running = matches!(
+                agent.lifecycle(),
+                SubagentLifecycle::Starting
+                    | SubagentLifecycle::Running
+                    | SubagentLifecycle::WaitingOnWatchers
+                    | SubagentLifecycle::WaitingForApproval
+            );
         }
+        entry.detail = entry.detail.filter(|detail| !detail.is_empty());
+        if entry.kind == TimelineKind::Assistant
+            || (entry.kind == TimelineKind::Subagent
+                && entry.target_session_id.is_none()
+                && !entry.body.is_empty())
+        {
+            entry.rich_body = previous
+                .filter(|previous| previous.body == entry.body)
+                .and_then(|previous| previous.rich_body.clone())
+                .or_else(|| Some(Arc::new(crate::markdown::project_markdown(&entry.body))));
+        }
+        entry
     }
 }
 
 pub fn project_timeline(events: &[SessionEvent]) -> Vec<TimelineEntry> {
     TimelineProjector::from_events(events).into_entries()
-}
-
-fn simple_entry(
-    event: &SessionEvent,
-    kind: TimelineKind,
-    title: &str,
-    body: &str,
-    running: bool,
-    failed: bool,
-) -> TimelineEntry {
-    TimelineEntry {
-        id: format!("event:{}", event.id),
-        created_at: event.created_at,
-        kind,
-        title: title.into(),
-        detail: None,
-        body: body.into(),
-        rich_body: None,
-        running,
-        failed,
-    }
 }
 
 fn message_status_label(status: MessageStatus) -> Option<&'static str> {
@@ -560,7 +391,270 @@ fn message_status_label(status: MessageStatus) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use borg_remote::CodingProvider;
+    use borg_remote::{CodingProvider, SessionEventKind};
+
+    // Regression: valid snapshots used to append forever-live cards, while a
+    // report boundary or stale delivery could contradict the roster. Type
+    // checks cannot protect this live/replay and privacy contract.
+    #[test]
+    fn worker_cards_follow_shared_lifecycle_and_keep_reports_private_in_live_and_replay() {
+        use borg_remote::{
+            SubagentActivityKind, SubagentLifecycle, SubagentSourceCursor, SubagentStatus,
+            SubagentUsage,
+        };
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let started = Utc::now();
+        let mut snapshot = SubagentSnapshot {
+            session_id: child,
+            parent_session_id: root,
+            task_name: "worker".into(),
+            status: SubagentStatus::Running,
+            lifecycle: Some(SubagentLifecycle::Running),
+            source: None,
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+            ultrafast: false,
+            desktop: false,
+            cwd: ".".into(),
+            created_at: started,
+            updated_at: started,
+            detail: None,
+            final_text: None,
+            usage: SubagentUsage::default(),
+            interrupted_by: None,
+        };
+        let mut live = TimelineProjector::default();
+        let mut events = Vec::new();
+        for (revision, lifecycle, status, activity, running, failed) in [
+            (
+                1,
+                SubagentLifecycle::Running,
+                SubagentStatus::Running,
+                SubagentActivityKind::Started,
+                true,
+                false,
+            ),
+            (
+                2,
+                SubagentLifecycle::Running,
+                SubagentStatus::Running,
+                SubagentActivityKind::Updated,
+                true,
+                false,
+            ),
+            (
+                3,
+                SubagentLifecycle::WaitingOnWatchers,
+                SubagentStatus::Ready,
+                SubagentActivityKind::Completed,
+                true,
+                false,
+            ),
+            (
+                4,
+                SubagentLifecycle::Dormant,
+                SubagentStatus::Ready,
+                SubagentActivityKind::Completed,
+                false,
+                false,
+            ),
+            (
+                5,
+                SubagentLifecycle::Failed,
+                SubagentStatus::Failed,
+                SubagentActivityKind::Failed,
+                false,
+                true,
+            ),
+        ] {
+            snapshot.status = status;
+            snapshot.lifecycle = Some(lifecycle);
+            snapshot.source = Some(SubagentSourceCursor {
+                child_sequence: revision,
+                revision,
+            });
+            snapshot.updated_at = started + chrono::Duration::seconds(revision as i64);
+            snapshot.final_text = Some("private child report".into());
+            let child_event = (revision == 2).then(|| {
+                Box::new(SessionEvent::new(
+                    child,
+                    revision,
+                    SessionEventKind::Message {
+                        message_id: Uuid::new_v4(),
+                        actor: EventActor::Assistant,
+                        text: "private commentary completed before tools".into(),
+                        attachments: Vec::new(),
+                        status: MessageStatus::Complete,
+                        delivery: None,
+                    },
+                ))
+            });
+            let event = SessionEvent::new(
+                root,
+                revision,
+                SessionEventKind::SubagentActivity {
+                    activity,
+                    agent: snapshot.clone(),
+                    event: child_event,
+                },
+            );
+            live.push(&event);
+            events.push(event);
+            let replay = project_timeline(&events);
+            assert_eq!(live.entries.len(), 1);
+            assert_eq!(live.entries[0].as_ref(), &replay[0]);
+            let card = &live.entries[0];
+            assert_eq!(card.id, format!("child:{child}"));
+            assert_eq!(card.target_session_id, Some(child));
+            assert_eq!((card.running, card.failed), (running, failed));
+            assert!(card.body.is_empty());
+        }
+        let current = Arc::clone(&live.entries[0]);
+        let mut stale = events[0].clone();
+        stale.sequence = 6;
+        stale.created_at = started + chrono::Duration::hours(1);
+        live.push(&stale);
+        events.push(stale);
+        assert!(Arc::ptr_eq(&current, &live.entries[0]));
+
+        for (from_child, text) in [
+            (true, "private child receipt"),
+            (false, "**visible peer report**"),
+        ] {
+            let event = SessionEvent::new(
+                root,
+                events.len() as u64 + 1,
+                SessionEventKind::AgentMessageReceived {
+                    message_id: Uuid::new_v4(),
+                    sender_id: child,
+                    sender_name: "worker".into(),
+                    text: text.into(),
+                    from_child: Some(from_child),
+                },
+            );
+            live.push(&event);
+            events.push(event);
+        }
+        let replay = project_timeline(&events);
+        assert_eq!(live.into_entries(), replay);
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[1].body, "**visible peer report**");
+        assert!(replay[1].rich_body.is_some());
+        assert_eq!(replay[1].target_session_id, None);
+
+        // The root roster is still shown when focusing a child, but siblings
+        // are peers, not that child's private subagents (including old receipts).
+        let mut focused = TimelineProjector::from_events(&[SessionEvent::new(
+            child,
+            1,
+            SessionEventKind::SessionStarted,
+        )]);
+        snapshot.session_id = Uuid::new_v4();
+        focused.seed_subagents(&[snapshot.clone()]);
+        focused.push(&SessionEvent::new(
+            child,
+            2,
+            SessionEventKind::AgentMessageReceived {
+                message_id: Uuid::new_v4(),
+                sender_id: snapshot.session_id,
+                sender_name: "sibling".into(),
+                text: "visible sibling report".into(),
+                from_child: None,
+            },
+        ));
+        assert_eq!(focused.entries.len(), 1);
+        assert_eq!(focused.entries[0].body, "visible sibling report");
+    }
+
+    // Regression: a shared-core adapter must not replace full GUI inspection
+    // with a formatted/preview body, or reallocate unrelated markdown on each
+    // tool update. Neither condition is observable to the compiler.
+    #[test]
+    fn shared_adapter_preserves_full_inspection_markdown_and_incremental_identity() {
+        let session = Uuid::new_v4();
+        let message = Uuid::new_v4();
+        let output = format!("{}\ninspection tail", "full output\n".repeat(2_000));
+        let events = [
+            SessionEventKind::Message {
+                message_id: message,
+                actor: EventActor::Assistant,
+                text: "## Answer\n**kept markdown**".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+            SessionEventKind::ReasoningDelta {
+                text: "checking".into(),
+            },
+            SessionEventKind::ReasoningDelta {
+                text: "checking the workspace".into(),
+            },
+            SessionEventKind::ReasoningCompleted,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "inspect".into(),
+                name: "exec".into(),
+                input: serde_json::json!({"cmd":"inspect"}),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "inspect".into(),
+                output: output.clone(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| SessionEvent::new(session, index as u64 + 1, kind))
+        .collect::<Vec<_>>();
+        let mut live = TimelineProjector::default();
+        live.extend(&events[..5]);
+        let assistant = Arc::clone(&live.entries[0]);
+        let reasoning = Arc::clone(&live.entries[1]);
+        let tool_id = live.entries[2].id.clone();
+        live.push(&events[5]);
+        assert!(Arc::ptr_eq(&assistant, &live.entries[0]));
+        assert!(Arc::ptr_eq(&reasoning, &live.entries[1]));
+        assert_eq!(live.entries[0].id, format!("message:{message}"));
+        assert!(
+            assistant
+                .rich_body
+                .as_ref()
+                .unwrap()
+                .spans
+                .iter()
+                .any(|span| span.style.strong)
+        );
+        assert_eq!(reasoning.body, "checking the workspace");
+        assert!(!reasoning.running);
+        let tool = &live.entries[2];
+        assert_eq!(tool.id, tool_id);
+        assert_eq!(tool.body, output);
+        assert_eq!(tool.target_session_id, None);
+        assert!(!tool.running);
+        assert_eq!(live.into_entries(), project_timeline(&events));
+        // A bounded reconnect may start at the result, without the call.
+        let bounded = project_timeline(&events[5..]);
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].body, output);
+        assert!(!bounded[0].running);
+        let mut cleared = TimelineProjector::from_events(&events[5..]);
+        assert_eq!(cleared.core.tool_inspection_text(0), Some(output.as_str()));
+        cleared.push(&SessionEvent::new(
+            session,
+            7,
+            SessionEventKind::ContextCleared,
+        ));
+        assert!(cleared.entries.is_empty());
+        assert_eq!(cleared.core.tool_inspection_text(0), None);
+    }
 
     #[test]
     fn keyed_preparation_cancellation_allows_id_reuse_without_orphaning_parallel_rows() {
@@ -583,8 +677,12 @@ mod tests {
             ));
         }
         assert!(!projector.entries[0].running);
-        assert!(projector.entries[projector.preparing_tools["parallel"]].running);
-        let retry = &projector.entries[projector.preparing_tools["retry"]];
+        assert!(
+            projector.entries[projector.core.tools[&projector.core.preparing_tools["parallel"]]]
+                .running
+        );
+        let retry =
+            &projector.entries[projector.core.tools[&projector.core.preparing_tools["retry"]]];
         assert!(retry.running);
         assert!(retry.title.ends_with("new attempt"));
         assert_eq!(
@@ -631,9 +729,9 @@ mod tests {
                 parent_tool_call_id: None,
             },
         ));
-        assert!(!projector.entries[projector.tools["wait"]].running);
-        assert!(projector.entries[projector.tools["wait"]].failed);
-        assert!(projector.entries[projector.tools["parallel"]].running);
+        assert!(!projector.entries[projector.core.tools["wait"]].running);
+        assert!(projector.entries[projector.core.tools["wait"]].failed);
+        assert!(projector.entries[projector.core.tools["parallel"]].running);
     }
     #[test]
     fn replay_preserves_ultrafast_badge_when_an_old_message_updates() {
@@ -903,7 +1001,10 @@ mod tests {
         }
 
         assert_eq!(projector.entries.len(), 2);
-        assert_ne!(projector.tools["tool-a"], projector.tools["tool-b"]);
+        assert_ne!(
+            projector.core.tools["tool-a"],
+            projector.core.tools["tool-b"]
+        );
         assert!(projector.entries.iter().all(|entry| entry.running));
         assert!(
             projector

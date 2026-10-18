@@ -3577,6 +3577,7 @@ async fn settle_inactive_host_session(
                     session_id,
                     0,
                     crate::SessionEventKind::StatusChanged {
+                        lifecycle: Some(crate::SessionStatus::Stopped.into()),
                         status: crate::SessionStatus::Stopped,
                         detail: None,
                     },
@@ -3645,6 +3646,7 @@ async fn reject_host_launch(
                     session_id,
                     0,
                     crate::SessionEventKind::StatusChanged {
+                        lifecycle: Some(crate::SessionStatus::Failed.into()),
                         status: crate::SessionStatus::Failed,
                         detail: Some(reason.to_owned()),
                     },
@@ -4835,6 +4837,7 @@ async fn expire_host_session(
                 session_id,
                 0,
                 crate::SessionEventKind::StatusChanged {
+                    lifecycle: Some(crate::SessionStatus::Failed.into()),
                     status: crate::SessionStatus::Failed,
                     detail: Some(format!(
                         "host session exceeded the configured {} second limit",
@@ -9257,6 +9260,7 @@ mod tests {
                     speed_support: Default::default(),
                 },
                 crate::SessionEventKind::StatusChanged {
+                    lifecycle: Some(crate::SessionStatus::Ready.into()),
                     status: crate::SessionStatus::Ready,
                     detail: None,
                 },
@@ -9616,6 +9620,7 @@ mod tests {
                 speed_support: Default::default(),
             },
             crate::SessionEventKind::StatusChanged {
+                lifecycle: Some(crate::SessionStatus::Ready.into()),
                 status: crate::SessionStatus::Ready,
                 detail: None,
             },
@@ -10678,6 +10683,7 @@ connection: close
                 session_id,
                 0,
                 crate::SessionEventKind::StatusChanged {
+                    lifecycle: Some(crate::SessionStatus::Stopped.into()),
                     status: crate::SessionStatus::Stopped,
                     detail: None,
                 },
@@ -11535,6 +11541,7 @@ connection: close
         for kind in [
             crate::SessionEventKind::SessionStarted,
             crate::SessionEventKind::StatusChanged {
+                lifecycle: Some(crate::SessionStatus::Stopped.into()),
                 status: crate::SessionStatus::Stopped,
                 detail: None,
             },
@@ -11839,6 +11846,8 @@ connection: close
                 crate::SessionEventKind::StatusChanged {
                     status: crate::SessionStatus::Failed,
                     detail: Some(_),
+
+                    ..
                 }
             ));
             let saved = session_store

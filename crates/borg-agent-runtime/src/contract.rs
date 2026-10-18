@@ -2620,6 +2620,8 @@ pub enum SessionEventKind {
     StatusChanged {
         status: SessionStatus,
         detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lifecycle: Option<crate::SubagentLifecycle>,
     },
     Message {
         message_id: Uuid,
@@ -2875,6 +2877,10 @@ pub enum SessionEventKind {
     /// Legacy journal compatibility only; ignored during replay.
     UserStopChanged {
         engaged: bool,
+    },
+    /// Durable admission manifest in the child's journal, before its actor starts.
+    SubagentRegistered {
+        agent: crate::SubagentSnapshot,
     },
     SubagentActivity {
         activity: crate::SubagentActivityKind,

@@ -7,7 +7,7 @@ use borg_ui::{
     localization::{UiLanguage, text as ui_text},
     palette,
     preferences::EditorPreferences,
-    timeline::{TimelineEntry, TimelineKind, tool_lifecycle_label},
+    timeline::{TimelineEntry, TimelineKind, subagent_lifecycle_detail, tool_lifecycle_label},
 };
 use gpui::{
     App, Application, Bounds, Context, Entity, Focusable, FontStyle, FontWeight, HighlightStyle,
@@ -912,8 +912,18 @@ impl BorgGui {
                 )
             })
             .child(div().text_color(rgb(palette::TEXT_MUTED)).child(time))
-            .child(div().text_color(rgb(color)).child(indicator));
+            .child(div().text_color(rgb(color)).child(indicator))
+            .when(entry.target_session_id.is_some(), |row| {
+                row.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(palette::PINK))
+                        .child("open worker ↗"),
+                )
+            });
         let entry_id = entry.id.clone();
+        let target_session_id = entry.target_session_id;
+        let worker_view = view.clone();
         div()
             .id(SharedString::from(entry.id))
             .flex()
@@ -944,6 +954,16 @@ impl BorgGui {
                         cx.notify();
                     });
                 })
+            })
+            .when_some(target_session_id, |card, session_id| {
+                card.cursor_pointer()
+                    .hover(|card| card.border_color(rgb(palette::PINK)))
+                    .on_click(move |_, _, cx| {
+                        worker_view.update(cx, |this, cx| {
+                            this.send(FrontendCommand::FocusAgent(Some(session_id)));
+                            cx.notify();
+                        });
+                    })
             })
             .when_some(rich_body, |card, rich| {
                 card.child(
@@ -1512,15 +1532,12 @@ impl Render for BorgGui {
                                     )
                                     .children(agents.into_iter().map(|agent| {
                                         let session_id = agent.session_id;
-                                        let waiting = agent.waiting_on_watchers();
-                                        let status_color = if waiting.is_some() {
-                                            palette::BLUE
-                                        } else {
-                                            palette::TEXT_MUTED
+                                        let status_color = match agent.lifecycle() {
+                                            borg_ui::SubagentLifecycle::WaitingOnWatchers => palette::BLUE,
+                                            borg_ui::SubagentLifecycle::Failed => palette::RED,
+                                            _ => palette::TEXT_MUTED,
                                         };
-                                        let status = waiting.unwrap_or_else(|| {
-                                            format!("{:?}", agent.status).to_lowercase()
-                                        });
+                                        let status = subagent_lifecycle_detail(&agent);
                                         div()
                                             .id(SharedString::from(format!("agent-{session_id}")))
                                             .border_1()

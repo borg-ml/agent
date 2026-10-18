@@ -414,6 +414,8 @@ mod tests {
                 SessionEventKind::SubagentActivity {
                     activity: crate::SubagentActivityKind::Started,
                     agent: crate::SubagentSnapshot {
+                        lifecycle: None,
+                        source: None,
                         desktop: false,
                         session_id: id,
                         parent_session_id: parent,
@@ -502,6 +504,8 @@ mod tests {
         let child_id = Uuid::new_v4();
         let before = Utc::now() - chrono::Duration::minutes(1);
         let mut agent = crate::SubagentSnapshot {
+            lifecycle: None,
+            source: None,
             desktop: false,
             session_id: child_id,
             parent_session_id: parent,
@@ -723,6 +727,7 @@ mod tests {
                     parent,
                     0,
                     SessionEventKind::StatusChanged {
+                        lifecycle: Some(crate::SessionStatus::Ready.into()),
                         status: crate::SessionStatus::Ready,
                         detail: None,
                     },

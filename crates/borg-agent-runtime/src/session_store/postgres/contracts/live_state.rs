@@ -30,6 +30,7 @@ async fn parallel_generation_status_survives_reconnect_and_clears_per_call() {
         SessionEventKind::SessionStarted,
         configured(std::path::Path::new("/tmp")),
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Running,
             detail: None,
         },
@@ -92,6 +93,7 @@ async fn parallel_generation_status_survives_reconnect_and_clears_per_call() {
             session_id,
             0,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Ready,
                 detail: None,
             },
@@ -118,6 +120,7 @@ async fn live_state_coalesces_between_durable_anchors_and_boundaries() {
         SessionEventKind::SessionStarted,
         configured(std::path::Path::new("/tmp")),
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Running,
             detail: None,
         },
@@ -247,6 +250,7 @@ async fn reasoning_boundaries_clear_the_snapshot_before_the_next_thought() {
         SessionEventKind::SessionStarted,
         configured(std::path::Path::new("/tmp")),
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Running,
             detail: None,
         },
@@ -410,6 +414,7 @@ async fn terminal_boundaries_clear_all_turn_live_state_but_keep_context_window()
             session_id,
             0,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Ready,
                 detail: None,
             },
@@ -472,6 +477,7 @@ async fn reopening_repairs_turn_live_state_left_on_a_terminal_session() {
             session_id,
             0,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Ready,
                 detail: None,
             },
@@ -556,6 +562,7 @@ async fn reopening_leaves_the_live_state_of_a_running_session_alone() {
             session_id,
             0,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Running,
                 detail: None,
             },
@@ -613,6 +620,7 @@ async fn first_visible_assistant_message_keeps_its_position_after_read() {
                 session_id,
                 0,
                 SessionEventKind::StatusChanged {
+                    lifecycle: None,
                     status: SessionStatus::Running,
                     detail: None,
                 },
@@ -727,6 +735,7 @@ async fn interrupted_assistant_text_survives_terminal_cleanup_without_entering_m
                 session_id,
                 0,
                 SessionEventKind::StatusChanged {
+                    lifecycle: None,
                     status: SessionStatus::Running,
                     detail: None,
                 },
@@ -755,6 +764,7 @@ async fn interrupted_assistant_text_survives_terminal_cleanup_without_entering_m
                 session_id,
                 0,
                 SessionEventKind::StatusChanged {
+                    lifecycle: None,
                     status,
                     detail: None,
                 },
@@ -797,6 +807,7 @@ async fn reasoning_is_archived_at_its_original_position_with_full_text() {
             session_id,
             0,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Running,
                 detail: None,
             },
@@ -887,6 +898,7 @@ async fn append_chunks_survive_reopen_and_archive_partial_without_quadratic_stor
             session,
             0,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Running,
                 detail: None,
             },
@@ -934,6 +946,7 @@ async fn append_chunks_survive_reopen_and_archive_partial_without_quadratic_stor
             session,
             0,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Ready,
                 detail: None,
             },

@@ -3936,6 +3936,7 @@ mod tests {
                 session_id,
                 0,
                 SessionEventKind::StatusChanged {
+                    lifecycle: Some(SessionStatus::Running.into()),
                     status: SessionStatus::Running,
                     detail: None,
                 },
@@ -4053,6 +4054,7 @@ mod tests {
                 session_id,
                 0,
                 SessionEventKind::StatusChanged {
+                    lifecycle: Some(SessionStatus::Running.into()),
                     status: SessionStatus::Running,
                     detail: None,
                 },
@@ -4102,6 +4104,7 @@ mod tests {
                     session_id,
                     0,
                     SessionEventKind::StatusChanged {
+                        lifecycle: Some(SessionStatus::Ready.into()),
                         status: SessionStatus::Ready,
                         detail: None,
                     },
@@ -4322,6 +4325,7 @@ mod tests {
                 session_id,
                 0,
                 SessionEventKind::StatusChanged {
+                    lifecycle: Some(SessionStatus::Ready.into()),
                     status: SessionStatus::Ready,
                     detail: None,
                 },
@@ -4333,6 +4337,7 @@ mod tests {
                 session_id,
                 0,
                 SessionEventKind::StatusChanged {
+                    lifecycle: Some(SessionStatus::Running.into()),
                     status: SessionStatus::Running,
                     detail: None,
                 },
@@ -4422,6 +4427,7 @@ mod tests {
                 session_id,
                 0,
                 SessionEventKind::StatusChanged {
+                    lifecycle: Some(SessionStatus::Ready.into()),
                     status: SessionStatus::Ready,
                     detail: None,
                 },

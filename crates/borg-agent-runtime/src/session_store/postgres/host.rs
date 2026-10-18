@@ -1038,6 +1038,7 @@ mod tests {
                 session_id,
                 0,
                 SessionEventKind::StatusChanged {
+                    lifecycle: Some(SessionStatus::Running.into()),
                     status: SessionStatus::Running,
                     detail: None,
                 },
@@ -1072,6 +1073,7 @@ mod tests {
                 session_id,
                 0,
                 SessionEventKind::StatusChanged {
+                    lifecycle: Some(SessionStatus::Stopped.into()),
                     status: SessionStatus::Stopped,
                     detail: None,
                 },

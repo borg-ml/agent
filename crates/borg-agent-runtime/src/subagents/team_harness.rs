@@ -61,7 +61,7 @@ fn public_event(event: &SessionEvent) -> Option<Value> {
         SessionEventKind::GoalCleared { goal_id } => {
             json!({"type": "goal_cleared", "goal_id": goal_id})
         }
-        SessionEventKind::StatusChanged { status, detail } => {
+        SessionEventKind::StatusChanged { status, detail, .. } => {
             json!({"type": "status_changed", "status": status,
             "detail": detail.as_deref().map(crate::secret_scrub::scrub_secrets)})
         }

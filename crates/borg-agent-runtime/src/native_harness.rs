@@ -489,6 +489,7 @@ impl NativeHarness {
         send(
             &events,
             SessionEventKind::StatusChanged {
+                lifecycle: Some(SessionStatus::Running.into()),
                 status: SessionStatus::Running,
                 detail: None,
             },
@@ -1236,6 +1237,7 @@ impl NativeHarness {
                 send(
                     &events,
                     SessionEventKind::StatusChanged {
+                        lifecycle: Some(SessionStatus::Ready.into()),
                         status: SessionStatus::Ready,
                         detail: None,
                     },
@@ -4341,6 +4343,7 @@ async fn request_tool_approval(
     send(
         events,
         SessionEventKind::StatusChanged {
+            lifecycle: Some(SessionStatus::WaitingForApproval.into()),
             status: SessionStatus::WaitingForApproval,
             detail: None,
         },
@@ -4365,6 +4368,7 @@ async fn request_tool_approval(
                 send(
                     events,
                     SessionEventKind::StatusChanged {
+                        lifecycle: Some(SessionStatus::Running.into()),
                         status: SessionStatus::Running,
                         detail: None,
                     },
@@ -4585,6 +4589,7 @@ async fn settle_parked_turn(
     send(
         events,
         SessionEventKind::StatusChanged {
+            lifecycle: Some(SessionStatus::Ready.into()),
             status: SessionStatus::Ready,
             detail: None,
         },

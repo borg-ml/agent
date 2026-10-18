@@ -420,6 +420,7 @@ async fn copy_thread(
     );
     push(
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Ready,
             detail: Some(format!("Imported from {} · {}", source.key(), thread.title)),
         },

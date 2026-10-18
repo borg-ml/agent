@@ -76,13 +76,13 @@ pub struct CacheUsage<'a> {
     pub provider_context_reused: Option<bool>,
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CacheDiagnostics {
     previous: Option<PromptSnapshot>,
     latest: Option<LatestCacheUse>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct PromptSnapshot {
     prompt_tokens: u64,
     cached_input_tokens: u64,
@@ -108,7 +108,7 @@ impl PromptSnapshot {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct LatestCacheUse {
     hit_percent: u8,
     signature: CacheSignature,

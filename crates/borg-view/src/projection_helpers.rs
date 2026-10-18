@@ -37,7 +37,8 @@ pub fn subagent_status_from_child_event(kind: &SessionEventKind) -> Option<Subag
             SessionStatus::Stopped => SubagentStatus::Stopped,
             SessionStatus::Failed => SubagentStatus::Failed,
         }),
-        SessionEventKind::TurnCompleted { .. } => Some(SubagentStatus::Ready),
+
+        SessionEventKind::ApprovalRequested { .. } => Some(SubagentStatus::WaitingForApproval),
         _ => None,
     }
 }
@@ -174,147 +175,92 @@ pub fn format_action_text(label: &str, detail: &str, body: Option<&str>) -> Stri
     text
 }
 
-pub fn subagent_action_projection(
+pub fn subagent_snapshot_for_activity(
     activity: SubagentActivityKind,
     agent: &SubagentSnapshot,
     child_event: Option<&SessionEvent>,
-) -> Option<SubagentActionProjection> {
-    let task = agent.task_name.clone();
-    let project = |detail: String, _body: Option<String>, state| {
-        Some((
-            "Agent".to_string(),
-            format!("{task} · {detail}"),
-            None,
-            state,
-        ))
-    };
-    match activity {
-        SubagentActivityKind::Started => {
-            project("started".to_string(), None, TranscriptActionState::Running)
+) -> SubagentSnapshot {
+    let mut snapshot = agent.clone();
+    if snapshot.lifecycle.is_none() {
+        snapshot.status = effective_subagent_status(activity, snapshot.status, child_event);
+        if let Some(SessionEvent {
+            kind:
+                SessionEventKind::StatusChanged {
+                    detail, lifecycle, ..
+                },
+            ..
+        }) = child_event
+        {
+            snapshot.detail = detail.clone();
+            snapshot.lifecycle = *lifecycle;
         }
-        SubagentActivityKind::Completed => project(
-            "completed".to_string(),
-            agent.final_text.clone(),
-            TranscriptActionState::Complete,
-        ),
-        SubagentActivityKind::Stopped => project(
-            "stopped".to_string(),
-            agent.final_text.clone(),
-            TranscriptActionState::Stopped,
-        ),
-        SubagentActivityKind::Failed => project(
-            format!(
-                "failed{}",
-                agent
-                    .detail
-                    .as_deref()
-                    .filter(|detail| !detail.trim().is_empty())
-                    .map(|detail| format!(" · {}", compact_text(detail, 120)))
-                    .unwrap_or_default()
-            ),
-            agent.detail.clone(),
-            TranscriptActionState::Failed,
-        ),
-        SubagentActivityKind::Updated => match child_event.map(|event| &event.kind) {
-            Some(SessionEventKind::Message {
-                actor: EventActor::Assistant,
-                text,
-                status: MessageStatus::Complete,
-                ..
-            }) if !text.trim().is_empty() => project(
-                "report ready".to_string(),
-                Some(text.clone()),
-                TranscriptActionState::Complete,
-            ),
-            Some(SessionEventKind::ApprovalRequested { title, detail, .. }) => project(
-                format!(
-                    "needs approval · {}",
-                    compact_text(
-                        if title.trim().is_empty() {
-                            detail
-                        } else {
-                            title
-                        },
-                        120
-                    )
-                ),
-                (!detail.trim().is_empty()).then(|| detail.clone()),
-                TranscriptActionState::Waiting,
-            ),
-            Some(SessionEventKind::StatusChanged {
-                status: SessionStatus::Ready | SessionStatus::Completed,
-                detail: Some(detail),
-            }) if ready_detail_is_failure(detail) => project(
-                format!("failed turn · {}", compact_text(detail, 120)),
-                Some(detail.clone()),
-                TranscriptActionState::Failed,
-            ),
-            Some(SessionEventKind::StatusChanged {
-                status: SessionStatus::Ready | SessionStatus::Completed,
-                ..
-            }) => project(
-                "done · waiting for input".to_string(),
-                agent.final_text.clone(),
-                TranscriptActionState::Complete,
-            ),
-            Some(SessionEventKind::StatusChanged {
-                status: SessionStatus::WaitingForApproval,
-                detail,
-            }) => project(
-                "waiting for input".to_string(),
-                detail.clone(),
-                TranscriptActionState::Waiting,
-            ),
-            Some(SessionEventKind::Error { message }) => project(
-                format!("error · {}", compact_text(message, 120)),
-                Some(message.clone()),
-                TranscriptActionState::Failed,
-            ),
-            _ => match agent.status {
-                SubagentStatus::Starting => {
-                    project("starting".to_string(), None, TranscriptActionState::Running)
-                }
-                SubagentStatus::Running => {
-                    project("working".to_string(), None, TranscriptActionState::Running)
-                }
-                SubagentStatus::WaitingForApproval => project(
-                    "waiting for approval".to_string(),
-                    None,
-                    TranscriptActionState::Waiting,
-                ),
-                SubagentStatus::Ready => {
-                    if let Some(detail) = agent
-                        .detail
-                        .as_deref()
-                        .filter(|detail| ready_detail_is_failure(detail))
-                    {
-                        project(
-                            format!("failed turn · {}", compact_text(detail, 120)),
-                            Some(detail.to_string()),
-                            TranscriptActionState::Failed,
-                        )
-                    } else {
-                        Some((
-                            "Agent".to_string(),
-                            format!("{task} · done · waiting for input"),
-                            agent.final_text.clone(),
-                            TranscriptActionState::Complete,
-                        ))
-                    }
-                }
-                SubagentStatus::Stopped => project(
-                    "stopped".to_string(),
-                    agent.final_text.clone(),
-                    TranscriptActionState::Stopped,
-                ),
-                SubagentStatus::Failed => project(
-                    "failed".to_string(),
-                    agent.detail.clone(),
-                    TranscriptActionState::Failed,
-                ),
-            },
-        },
+        if let Some(SessionEvent {
+            kind: SessionEventKind::ApprovalRequested { title, .. },
+            ..
+        }) = child_event
+        {
+            snapshot.detail = Some(title.clone());
+        }
+        snapshot.lifecycle = Some(if snapshot.status == SubagentStatus::Ready
+            && snapshot.detail.as_deref().is_some_and(ready_detail_is_failure)
+        {
+            SubagentLifecycle::Failed
+        } else {
+            snapshot.lifecycle()
+        });
     }
+    snapshot
+}
+
+pub fn subagent_lifecycle_detail(agent: &SubagentSnapshot) -> String {
+    use SubagentLifecycle::*;
+    let label = match agent.lifecycle() {
+        Starting => "starting",
+        Running => "working",
+        WaitingOnWatchers => {
+            return agent
+                .waiting_on_watchers()
+                .unwrap_or_else(|| "waiting on background work".into());
+        }
+        Ready => "ready · waiting for input",
+        WaitingForApproval => "waiting for approval",
+        Dormant => "paused · parent inactive",
+        DormantInterrupted => "paused · unfinished work",
+        Stopped => "stopped",
+        Failed => "failed",
+    };
+    if let Some(detail) = agent
+        .detail
+        .as_deref()
+        .filter(|detail| !detail.trim().is_empty())
+    {
+        format!("{label} · {}", compact_text(detail, 120))
+    } else {
+        label.to_string()
+    }
+}
+
+pub fn subagent_action_projection(
+    _activity: SubagentActivityKind,
+    agent: &SubagentSnapshot,
+    _child_event: Option<&SessionEvent>,
+) -> Option<SubagentActionProjection> {
+    use SubagentLifecycle::*;
+    let state = match agent.lifecycle() {
+        Starting | Running => TranscriptActionState::Running,
+        WaitingOnWatchers | WaitingForApproval | Dormant | DormantInterrupted => {
+            TranscriptActionState::Waiting
+        }
+        Ready => TranscriptActionState::Complete,
+        Stopped => TranscriptActionState::Stopped,
+        Failed => TranscriptActionState::Failed,
+    };
+    Some((
+        "Agent".into(),
+        format!("{} · {}", agent.task_name, subagent_lifecycle_detail(agent)),
+        None,
+        state,
+    ))
 }
 
 pub fn number_message_attachments(
@@ -432,6 +378,44 @@ pub fn borg_control_tool_output_view(
     input: Option<&serde_json::Value>,
     output: &str,
 ) -> Option<String> {
+    let empty = serde_json::Value::Null;
+    if let Some(tool) = borg_agent_runtime::subagent_tool(name, input.unwrap_or(&empty))
+        && matches!(
+            tool,
+            SubagentTool::Configure | SubagentTool::Inspect | SubagentTool::GetGoal | SubagentTool::ControlGoal
+        )
+    {
+        let value = decoded_tool_output(output)?;
+        let input = input.unwrap_or(&empty);
+        let presentation = borg_agent_runtime::project_tool_presentation(
+            name,
+            input,
+            Some(&value.to_string()),
+            false,
+        );
+        let mut rows = vec![presentation.label];
+        if let Some(result) = presentation.result {
+            rows.push(result);
+        }
+        let target = input
+            .get("target")
+            .or_else(|| input.get("task_name"))
+            .and_then(serde_json::Value::as_str);
+        if let Some(target) = target {
+            rows.push(format!("target · {target}"));
+        }
+        rows.push(serde_json::to_string_pretty(&value).ok()?);
+        return Some(rows.join("\n"));
+    }
+    let name = match borg_agent_runtime::subagent_tool(name, input.unwrap_or(&empty)) {
+        Some(SubagentTool::List) => "list_agents",
+        Some(SubagentTool::Wait) => "wait_agent",
+        Some(SubagentTool::Spawn) => "spawn_agent",
+        Some(SubagentTool::SendMessage) => "send_message",
+        Some(SubagentTool::Followup) => "followup_task",
+        _ => name,
+    };
+    let input = input.map(|input| input.get("arguments").unwrap_or(input));
     let leaf = name
         .rsplit(['.', '_'])
         .next()

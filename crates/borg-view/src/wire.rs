@@ -154,7 +154,7 @@ pub enum Actor {
     User,
     Assistant,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum Lifecycle {
     Queued,
@@ -275,6 +275,10 @@ impl From<&borg_agent_runtime::TeamDirector> for ViewDirector {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, TS)]
 pub struct Meta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sequence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_lifecycle: Option<borg_agent_runtime::SubagentLifecycle>,
     #[serde(default)]
     pub director: Option<ViewDirector>,
     pub configuration: Option<ViewConfiguration>,

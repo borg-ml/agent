@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.16.8)
 
+- Unify subagent lifecycle and timeline semantics across TUI, native GUI, and
+  remote views. Worker state is independent of report and operation completion;
+  stale updates cannot roll back current state or approvals.
+- Make child admission, stopped-worker configuration, and recovery durable.
+  Repair missed activity without crossing parent boundaries or implicitly
+  waking stopped workers.
+
 - Settle Escape at turn boundaries so its stop flag cannot cancel the next
   message or leave it waiting for a provider that never starts. An Escape racing
   task completion now follows interrupt cleanup instead of reporting a cancelled

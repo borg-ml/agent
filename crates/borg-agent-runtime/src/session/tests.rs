@@ -1024,6 +1024,7 @@ fn provider_event_batch_coalescing_preserves_text_and_boundaries() {
             delivery: None,
         },
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Running,
             detail: Some("durable boundary".to_string()),
         },
@@ -2423,6 +2424,7 @@ impl AgentTurnExecutor for NarrationThenDelayedCompletionExecutor {
             .unwrap();
         events
             .send(SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Ready,
                 detail: None,
             })
@@ -2456,6 +2458,7 @@ impl AgentTurnExecutor for ReadyThenHungExecutor {
             .unwrap();
         events
             .send(SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Ready,
                 detail: None,
             })
@@ -2824,6 +2827,7 @@ impl AgentTurnExecutor for PrematureReadyExecutor {
         }
         events
             .send(SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Running,
                 detail: Some("executor lifecycle".to_string()),
             })
@@ -2842,6 +2846,7 @@ impl AgentTurnExecutor for PrematureReadyExecutor {
             .unwrap();
         events
             .send(SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Ready,
                 detail: Some("executor returned early".to_string()),
             })
@@ -3867,6 +3872,8 @@ async fn queued_retry_can_be_recalled_while_waiting_without_later_delivery() {
             .unwrap();
         if matches!(event.kind, SessionEventKind::StatusChanged {
             status: SessionStatus::Ready, detail: Some(ref detail),
+
+            ..
         } if detail.contains("usage limit"))
         {
             break;
@@ -4178,6 +4185,8 @@ async fn provider_setup_stall_has_a_durable_terminal_boundary() {
         SessionEventKind::StatusChanged {
             status: SessionStatus::Running,
             detail: Some(detail),
+
+            ..
         } if detail == TurnPhase::AwaitingProvider.detail()
     )));
     assert!(observed.iter().any(|kind| matches!(
@@ -5428,6 +5437,7 @@ async fn legacy_user_stop_does_not_block_background_wake_after_actor_restart() {
             error: Some("turn interrupted".to_string()),
         },
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Ready,
             detail: Some("Interrupted".to_string()),
         },
@@ -5616,6 +5626,8 @@ async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
         SessionEventKind::StatusChanged {
             status: SessionStatus::Running,
             detail: Some(detail),
+
+            ..
         } if detail == "turn phase: cancelling"
     )));
     assert!(!before_cleanup.iter().any(|event| matches!(
@@ -5638,6 +5650,7 @@ async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
             SessionEventKind::StatusChanged {
                 status: SessionStatus::Ready,
                 detail: Some(detail),
+                ..
             } if detail == "Interrupted" => {
                 assert!(saw_turn_completed, "Ready must follow TurnCompleted");
                 break;
@@ -8194,6 +8207,8 @@ async fn crash_reconciled_child_stop_is_durable_before_resumed_ready() {
         SessionEventKind::SubagentActivity {
             activity: SubagentActivityKind::Updated,
             agent: crate::SubagentSnapshot {
+                lifecycle: None,
+                source: None,
                 desktop: false,
                 session_id: child_id,
                 parent_session_id: session_id,
@@ -8215,6 +8230,7 @@ async fn crash_reconciled_child_stop_is_durable_before_resumed_ready() {
             event: None,
         },
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Stopped,
             detail: None,
         },
@@ -8260,6 +8276,7 @@ async fn crash_reconciled_child_stop_is_durable_before_resumed_ready() {
             child_id,
             0,
             SessionEventKind::StatusChanged {
+                lifecycle: None,
                 status: SessionStatus::Stopped,
                 detail: Some("crash cleanup completed".to_string()),
             },
@@ -10610,6 +10627,7 @@ async fn resumed_session_drains_unresolved_input_and_preserves_last_context_usag
             context_window_tokens: Some(100_000),
         },
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Ready,
             detail: None,
         },
@@ -14477,6 +14495,7 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
             error: None,
         },
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Ready,
             detail: None,
         },
@@ -14643,6 +14662,7 @@ async fn crash_resume_forks_the_last_completed_codex_turn_before_replaying_input
             ultrafast: false,
         },
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Running,
             detail: Some("provider active when host crashed".to_string()),
         },
@@ -14794,6 +14814,8 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
         SessionEventKind::SubagentActivity {
             activity: SubagentActivityKind::Stopped,
             agent: crate::SubagentSnapshot {
+                lifecycle: None,
+                source: None,
                 desktop: false,
                 session_id: child_id,
                 parent_session_id: session_id,
@@ -14846,6 +14868,7 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
             context_window_tokens: Some(258_400),
         },
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Running,
             detail: Some("provider active when host crashed".to_string()),
         },
@@ -15581,6 +15604,8 @@ async fn parent_journal_preserves_full_child_transcript_events() {
     )
     .unwrap();
     let snapshot = crate::SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id: child_id,
         parent_session_id: parent_id,
@@ -17073,6 +17098,7 @@ async fn escape_cancels_connection_retry_without_losing_the_prompt() {
             SessionEventKind::StatusChanged {
                 status: SessionStatus::Ready,
                 detail: Some(detail),
+                ..
             } if detail.contains("Reconnection cancelled") => break,
             _ => {}
         }
@@ -17940,6 +17966,8 @@ async fn a_provider_stall_is_visible_before_the_turn_fails() {
                 SessionEventKind::StatusChanged {
                     status: SessionStatus::Running,
                     detail: Some(detail),
+
+                    ..
                 } if detail.contains("no provider output")
                     && detail.contains("the model has not responded")
             )
@@ -20295,6 +20323,7 @@ async fn assert_immediate_interrupt(control_backlog: usize) {
             SessionEventKind::StatusChanged {
                 status: SessionStatus::Ready,
                 detail: Some(detail),
+                ..
             } if detail == "Interrupted" => {
                 assert!(
                     saw_turn_completed,
@@ -20395,6 +20424,7 @@ async fn forwarded_child_activity_keeps_the_coordinator_order() {
         None,
         coordinator,
         root,
+        HashMap::new(),
     ));
     let children: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
     for child in &children {
@@ -20450,6 +20480,7 @@ async fn child_activity_after_a_lag_survives_an_untracked_descendant() {
         None,
         coordinator,
         root,
+        HashMap::new(),
     ));
     activity_tx
         .send(SubagentActivity::SessionEvent {
@@ -20457,8 +20488,9 @@ async fn child_activity_after_a_lag_survives_an_untracked_descendant() {
             task_name: "/root/resumed".to_string(),
             event: SessionEvent::new(
                 child,
-                7,
+                1,
                 SessionEventKind::StatusChanged {
+                    lifecycle: None,
                     status: SessionStatus::Ready,
                     detail: None,
                 },
@@ -20504,6 +20536,7 @@ async fn forwarded_nested_child_activity_preserves_lifecycle_and_parent_boundary
         Some(parent),
         coordinator,
         parent,
+        HashMap::new(),
     ));
     let mut agent = watched_child(child);
     agent.parent_session_id = parent;
@@ -20529,6 +20562,7 @@ async fn forwarded_nested_child_activity_preserves_lifecycle_and_parent_boundary
                     child,
                     1,
                     SessionEventKind::StatusChanged {
+                        lifecycle: None,
                         status: SessionStatus::Ready,
                         detail: None,
                     },
@@ -20550,7 +20584,7 @@ async fn forwarded_nested_child_activity_preserves_lifecycle_and_parent_boundary
             } => assert_eq!(parent_session_id, parent),
             SubagentActivity::Completed { agent } => {
                 assert_eq!(agent.parent_session_id, parent);
-                lives.push(subject_life(agent.status));
+                lives.push(subject_life(agent.lifecycle()));
             }
             _ => panic!("out-of-role activity must not cross into the actor"),
         }
@@ -20572,6 +20606,8 @@ async fn forwarded_nested_child_activity_preserves_lifecycle_and_parent_boundary
 
 fn watched_child(session_id: Uuid) -> crate::SubagentSnapshot {
     crate::SubagentSnapshot {
+        lifecycle: None,
+        source: None,
         desktop: false,
         session_id,
         parent_session_id: Uuid::new_v4(),
@@ -21363,6 +21399,7 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
             error: Some("turn interrupted".into()),
         },
         SessionEventKind::StatusChanged {
+            lifecycle: None,
             status: SessionStatus::Ready,
             detail: None,
         },
@@ -24949,6 +24986,7 @@ async fn promote_moves_live_authority_and_restores_without_moving_session_state(
                 sibling.session_id,
                 0,
                 SessionEventKind::StatusChanged {
+                    lifecycle: None,
                     status: SessionStatus::Failed,
                     detail: Some("failed eligibility fixture".into()),
                 },

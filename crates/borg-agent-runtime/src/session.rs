@@ -20,8 +20,8 @@ use crate::{
     SessionEvent, SessionEventKind, SessionGoal, SessionGoalToolRequest, SessionGoalToolResponse,
     SessionState, SessionStatus, SessionStore, SessionTodoToolRequest, SessionTodoToolResponse,
     SessionWriterLease, SubagentAction, SubagentActivity, SubagentActivityKind,
-    SubagentControlOutcome, SubagentCoordinator, SubagentStatus, TodoAction, TodoItemUpdate,
-    WorkspaceEvent, WorkspaceEventKind, WorkspaceStore,
+    SubagentControlOutcome, SubagentCoordinator, SubagentLifecycle, SubagentStatus, TodoAction,
+    TodoItemUpdate, WorkspaceEvent, WorkspaceEventKind, WorkspaceStore,
 };
 
 pub struct AbortTask<T = ()>(pub tokio::task::JoinHandle<T>);
@@ -519,6 +519,7 @@ pub(crate) struct RuntimeSessionStore {
     plan_projection_generation: u64,
     received_agent_messages: HashSet<Uuid>,
     assistant_row_anchors: HashSet<Uuid>,
+    subagent_snapshots: HashMap<Uuid, crate::SubagentSnapshot>,
 }
 
 #[derive(Clone)]
@@ -875,6 +876,7 @@ impl RuntimeSessionStore {
             plan_projection_generation: 0,
             received_agent_messages: HashSet::new(),
             assistant_row_anchors: HashSet::new(),
+            subagent_snapshots: HashMap::new(),
         }
     }
 
@@ -1080,6 +1082,16 @@ impl RuntimeSessionStore {
         }
         if let SessionEventKind::AgentMessageReceived { message_id, .. } = &event.kind {
             self.received_agent_messages.insert(*message_id);
+        }
+        if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind
+            && matches!(event.kind.persistence(), crate::EventPersistence::Durable)
+            && self
+                .subagent_snapshots
+                .get(&agent.session_id)
+                .is_none_or(|current| agent.supersedes(current))
+        {
+            self.subagent_snapshots
+                .insert(agent.session_id, agent.clone());
         }
         if matches!(
             event.kind,
@@ -2209,7 +2221,9 @@ async fn run_agent_session_store_kernel_inner(
         });
     }
     let initial_state = store.state(session_id).await?;
-    let fresh = initial_state.latest_sequence == 0;
+    // A child admission manifest precedes the actor's first SessionStarted.
+    let fresh = initial_state.latest_sequence == 0
+        || (initial_state.subagent_registration.is_some() && initial_state.started_at.is_none());
     // A revert fork inherits its parent's goal but none of its own history.
     // Goal work there waits for the user's next message instead of starting
     // a turn the moment the reverted session opens.
@@ -2725,6 +2739,23 @@ async fn run_agent_session_store_kernel_inner(
             (!owns_team).then_some(session_id),
             subagents.as_ref().expect("enabled coordinator").clone(),
             session_id,
+            recovery
+                .subagent_events
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    SessionEventKind::SubagentActivity {
+                        event: Some(child), ..
+                    } if child.sequence > 0 => Some((child.session_id, child.sequence)),
+                    _ => None,
+                })
+                .fold(
+                    HashMap::<Uuid, u64>::new(),
+                    |mut cursors, (child, sequence)| {
+                        let cursor = cursors.entry(child).or_default();
+                        *cursor = (*cursor).max(sequence);
+                        cursors
+                    },
+                ),
         )))
     });
     let mut root_message_rx = subagents
@@ -2794,7 +2825,7 @@ async fn run_agent_session_store_kernel_inner(
             watches
                 .observe_agent(
                     agent.session_id,
-                    subject_life(agent.status),
+                    subject_life(agent.lifecycle()),
                     &agent.task_name,
                 )
                 .await;
@@ -3168,6 +3199,13 @@ async fn run_agent_session_store_kernel_inner(
                     } else {
                         SessionStatus::Ready
                     },
+                    lifecycle: Some(if network_retry_message_id.is_some() {
+                        SubagentLifecycle::Starting
+                    } else if watches.yielded().is_some() {
+                        SubagentLifecycle::WaitingOnWatchers
+                    } else {
+                        SubagentLifecycle::Ready
+                    }),
                     detail: next_ready_detail.take(),
                 },
             )
@@ -3673,6 +3711,7 @@ async fn run_agent_session_store_kernel_inner(
                             session_id,
                             SessionEventKind::StatusChanged {
                                 status: SessionStatus::Ready,
+                                lifecycle: Some(SubagentLifecycle::Ready),
                                 detail: Some(
                                     "Automatic retry cancelled. Your work is saved.".into(),
                                 ),
@@ -3933,6 +3972,7 @@ async fn run_agent_session_store_kernel_inner(
                                 session_id,
                                 SessionEventKind::StatusChanged {
                                     status: SessionStatus::Starting,
+                                    lifecycle: Some(SubagentLifecycle::Starting),
                                     detail: None,
                                 },
                             )
@@ -4094,6 +4134,7 @@ async fn run_agent_session_store_kernel_inner(
                             session_id,
                             SessionEventKind::StatusChanged {
                                 status: SessionStatus::Running,
+                                lifecycle: Some(SubagentLifecycle::Running),
                                 detail: Some("Compacting context".to_string()),
                             },
                         )
@@ -4431,6 +4472,7 @@ async fn run_agent_session_store_kernel_inner(
                             session_id,
                             SessionEventKind::StatusChanged {
                                 status: SessionStatus::Ready,
+                                lifecycle: Some(SubagentLifecycle::Ready),
                                 detail: None,
                             },
                         )
@@ -4524,6 +4566,7 @@ async fn run_agent_session_store_kernel_inner(
                             session_id,
                             SessionEventKind::StatusChanged {
                                 status: SessionStatus::Ready,
+                                lifecycle: Some(SubagentLifecycle::Ready),
                                 detail: Some("Interrupted".into()),
                             },
                         )
@@ -4714,6 +4757,7 @@ async fn run_agent_session_store_kernel_inner(
                     session_id,
                     SessionEventKind::StatusChanged {
                         status: SessionStatus::Running,
+                        lifecycle: Some(SubagentLifecycle::Running),
                         detail: Some("Automatically compacting context".to_string()),
                     },
                 )
@@ -5158,6 +5202,7 @@ async fn run_agent_session_store_kernel_inner(
                 session_id,
                 SessionEventKind::StatusChanged {
                     status: SessionStatus::Ready,
+                    lifecycle: Some(SubagentLifecycle::Ready),
                     detail: Some(
                         "Provider input exceeded its safe limit; the active goal was paused and the durable thread was preserved."
                             .to_string(),
@@ -5212,6 +5257,7 @@ async fn run_agent_session_store_kernel_inner(
             session_id,
             SessionEventKind::StatusChanged {
                 status: SessionStatus::Running,
+                lifecycle: Some(SubagentLifecycle::Running),
                 detail: Some(TurnPhase::AwaitingProvider.detail().to_string()),
             },
         )
@@ -5496,7 +5542,8 @@ async fn run_agent_session_store_kernel_inner(
                     if request.response.is_closed() { continue; }
                     let approval_id = Uuid::new_v4().to_string();
                     record(&mut journal, &events, session_id, SessionEventKind::StatusChanged {
-                        status: SessionStatus::WaitingForApproval, detail: None,
+                        status: SessionStatus::WaitingForApproval,
+                        lifecycle: Some(SubagentLifecycle::WaitingForApproval), detail: None,
                     }).await?;
                     record(&mut journal, &events, session_id, SessionEventKind::ApprovalRequested {
                         approval_id: approval_id.clone(), title: request.title, detail: request.detail, command: None,
@@ -5507,7 +5554,8 @@ async fn run_agent_session_store_kernel_inner(
                 _ = tool_approval_caller_closed(&mut pending_approval) => {
                     deny_pending_approval(&mut journal, &events, session_id, &mut pending_approval).await?;
                     record(&mut journal, &events, session_id, SessionEventKind::StatusChanged {
-                        status: SessionStatus::Running, detail: None,
+                        status: SessionStatus::Running,
+                        lifecycle: Some(SubagentLifecycle::Running), detail: None,
                     }).await?;
                     watchdog.note_output();
                 }
@@ -5595,6 +5643,7 @@ async fn run_agent_session_store_kernel_inner(
                                 session_id,
                                 SessionEventKind::StatusChanged {
                                     status: SessionStatus::Running,
+                                    lifecycle: Some(SubagentLifecycle::Running),
                                     detail: Some(TurnPhase::Active.detail().to_string()),
                                 },
                             )
@@ -6696,6 +6745,7 @@ async fn run_agent_session_store_kernel_inner(
                                 session_id,
                                 SessionEventKind::StatusChanged {
                                     status: SessionStatus::Running,
+                                    lifecycle: Some(SubagentLifecycle::Running),
                                     detail: None,
                                 },
                             ).await?;
@@ -6866,6 +6916,7 @@ async fn run_agent_session_store_kernel_inner(
                                     ).await?;
                                     let terminal = vec![SessionEventKind::StatusChanged {
                                         status: SessionStatus::Running,
+                                        lifecycle: Some(SubagentLifecycle::Running),
                                         detail: Some(TurnPhase::Cancelling.detail().to_string()),
                                     }];
                                     record_all(&mut journal, &events, session_id, terminal).await?;
@@ -7094,6 +7145,7 @@ async fn run_agent_session_store_kernel_inner(
                                 session_id,
                                 SessionEventKind::StatusChanged {
                                     status: SessionStatus::Running,
+                                    lifecycle: Some(SubagentLifecycle::Running),
                                     detail: Some(detail),
                                 },
                             ).await?;
@@ -7349,6 +7401,7 @@ async fn run_agent_session_store_kernel_inner(
                                 session_id,
                                 SessionEventKind::StatusChanged {
                                     status: SessionStatus::Running,
+                                    lifecycle: Some(SubagentLifecycle::Running),
                                     detail: Some(watchdog.phase().detail().to_string()),
                                 },
                             ).await?;
@@ -7386,6 +7439,7 @@ async fn run_agent_session_store_kernel_inner(
                             session_id,
                             SessionEventKind::StatusChanged {
                                 status: SessionStatus::Running,
+                                lifecycle: Some(SubagentLifecycle::Running),
                                 detail: Some(TurnPhase::Active.detail().to_string()),
                             },
                         ).await?;
@@ -7397,6 +7451,7 @@ async fn run_agent_session_store_kernel_inner(
                             session_id,
                             SessionEventKind::StatusChanged {
                                 status: SessionStatus::Running,
+                                lifecycle: Some(SubagentLifecycle::Running),
                                 detail: Some(watchdog.phase().detail().to_string()),
                             },
                         ).await?;
@@ -13337,17 +13392,17 @@ async fn apply_model_goal_request(
     })
 }
 
-/// What a child's recorded status means to a watcher.
-///
-/// `Ready` is a child that finished its assignment and stays addressable, and
-/// `WaitingForApproval` one blocked on the parent: both are alive and waiting on
-/// the parent, which is what `notify_on=attention` reports. `Starting` and
-/// `Running` are working, and `Stopped` and `Failed` are gone.
-pub(crate) fn subject_life(status: SubagentStatus) -> SubjectLife {
-    match status {
-        SubagentStatus::Starting | SubagentStatus::Running => SubjectLife::Live,
-        SubagentStatus::Ready | SubagentStatus::WaitingForApproval => SubjectLife::Parked,
-        SubagentStatus::Stopped | SubagentStatus::Failed => SubjectLife::Exited,
+/// Watcher attention requires an idle/blocked worker, not a worker waiting on
+/// its own live jobs. Report/message boundaries do not participate.
+pub(crate) fn subject_life(lifecycle: SubagentLifecycle) -> SubjectLife {
+    match lifecycle {
+        SubagentLifecycle::Starting | SubagentLifecycle::Running => SubjectLife::Live,
+        SubagentLifecycle::WaitingOnWatchers => SubjectLife::Waiting,
+        SubagentLifecycle::Ready
+        | SubagentLifecycle::WaitingForApproval
+        | SubagentLifecycle::Dormant
+        | SubagentLifecycle::DormantInterrupted => SubjectLife::Parked,
+        SubagentLifecycle::Stopped | SubagentLifecycle::Failed => SubjectLife::Exited,
     }
 }
 
@@ -13438,9 +13493,17 @@ async fn forward_child_activity(
     parent: Option<Uuid>,
     coordinator: SubagentCoordinator,
     session_id: Uuid,
+    mut child_sequences: HashMap<Uuid, u64>,
 ) {
+    let mut repair = tokio::time::interval(Duration::from_secs(5));
+    repair.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        match activity.recv().await {
+        let received = tokio::select! {
+            _ = forwarded.closed() => return,
+            activity = activity.recv() => activity,
+            _ = repair.tick() => Err(broadcast::error::RecvError::Lagged(0)),
+        };
+        match received {
             Ok(activity) => {
                 let owner = match &activity {
                     SubagentActivity::Started { agent }
@@ -13454,17 +13517,79 @@ async fn forward_child_activity(
                 if parent.is_some_and(|parent| parent != owner) {
                     continue;
                 }
+                if let SubagentActivity::SessionEvent { event, .. } = &activity
+                    && event.sequence > 0
+                {
+                    let child = event.session_id;
+                    let mut after = child_sequences.get(&child).copied().unwrap_or(0);
+                    if event.sequence <= after {
+                        continue;
+                    }
+                    if event.sequence > after.saturating_add(1) {
+                        let through = event.sequence;
+                        while after < through {
+                            let page = match coordinator
+                                .child_activity_after(child, after, 256)
+                                .await
+                            {
+                                Ok(page) if !page.is_empty() => page,
+                                result => {
+                                    tracing::warn!(%child, ?result, "parent child-event gap repair will retry");
+                                    break;
+                                }
+                            };
+                            let before = after;
+                            for activity in page {
+                                let SubagentActivity::SessionEvent { event, .. } = &activity else {
+                                    unreachable!();
+                                };
+                                if event.sequence > through {
+                                    break;
+                                }
+                                after = event.sequence;
+                                if forwarded.send(activity).await.is_err() {
+                                    return;
+                                }
+                                child_sequences.insert(child, after);
+                            }
+                            if after == before {
+                                tracing::warn!(%child, after, through, "parent child-event repair made no progress");
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    child_sequences.insert(child, event.sequence);
+                }
                 if forwarded.send(activity).await.is_err() {
                     return;
                 }
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!(%session_id, skipped, "child activity lag; recovering canonical roster");
+                if skipped > 0 {
+                    tracing::warn!(%session_id, skipped, "child activity lag; recovering canonical roster");
+                }
                 let mut cursor = None;
                 loop {
-                    match coordinator.activity_recovery_page(session_id, cursor).await {
+                    match coordinator
+                        .activity_recovery_page(session_id, cursor, &child_sequences)
+                        .await
+                    {
                         Ok((page, next)) => {
                             for activity in page {
+                                let owner = match &activity {
+                                    SubagentActivity::Started { agent }
+                                    | SubagentActivity::Completed { agent }
+                                    | SubagentActivity::Stopped { agent }
+                                    | SubagentActivity::Failed { agent } => agent.parent_session_id,
+                                    SubagentActivity::SessionEvent { parent_session_id, .. } => *parent_session_id,
+                                };
+                                if parent.is_some_and(|parent| parent != owner) {
+                                    continue;
+                                }
+                                if let SubagentActivity::SessionEvent { event, .. } = &activity {
+                                    child_sequences.insert(event.session_id, event.sequence);
+                                }
                                 if forwarded.send(activity).await.is_err() {
                                     return;
                                 }
@@ -13578,17 +13703,25 @@ async fn record_subagent_activity(
             (SubagentActivityKind::Updated, agent, Some(Box::new(event)))
         }
     };
-    // The snapshot the journal is about to record, so a watch cannot be told a
-    // life the session did not record. A child the coordinator no longer tracks
-    // was skipped above rather than guessed at.
-    watches
-        .observe_agent(
-            agent.session_id,
-            subject_life(agent.status),
-            &agent.task_name,
-        )
-        .await;
-    let mut agent = agent;
+    // Child events remain independent transcript/report facts. Their snapshot
+    // is resolved once so delayed activity cannot regress any state consumer.
+    let mut agent = match subagents.get(agent.session_id).await {
+        Some(current) if current.supersedes(&agent) => current,
+        _ => agent,
+    };
+    if let Some(current) = journal.subagent_snapshots.get(&agent.session_id)
+        && !agent.supersedes(current)
+    {
+        if event.is_none() {
+            return Ok(());
+        }
+        agent = current.clone();
+    }
+    let observed_agent = (
+        agent.session_id,
+        subject_life(agent.lifecycle()),
+        agent.task_name.clone(),
+    );
     agent.final_text = None;
     if let Some(detail) = &mut agent.detail
         && detail.len() > 4096
@@ -13605,6 +13738,9 @@ async fn record_subagent_activity(
         event,
     };
     record(journal, events, session_id, kind).await?;
+    watches
+        .observe_agent(observed_agent.0, observed_agent.1, &observed_agent.2)
+        .await;
     if let Some(message_id) = projected_message_id {
         subagents.mark_root_message_projected(message_id).await;
     }
@@ -14939,6 +15075,7 @@ async fn stop(
         session_id,
         SessionEventKind::StatusChanged {
             status: SessionStatus::Stopped,
+            lifecycle: Some(SubagentLifecycle::Stopped),
             detail: None,
         },
     )
