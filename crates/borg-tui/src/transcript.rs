@@ -1651,8 +1651,16 @@ impl Transcript {
             | borg_remote::SubagentLifecycle::WaitingForApproval => 1,
             _ => 2,
         };
+        // Inactive agents list the most recently active first.
         agents.sort_by(|left, right| {
-            (rank(left), &left.task_name).cmp(&(rank(right), &right.task_name))
+            let recency = |agent: &SubagentSnapshot| {
+                (rank(agent) == 2).then_some(std::cmp::Reverse(agent.updated_at))
+            };
+            (rank(left), recency(left), &left.task_name).cmp(&(
+                rank(right),
+                recency(right),
+                &right.task_name,
+            ))
         });
         rows.extend(agents.into_iter().map(|agent| {
             let name = if self
