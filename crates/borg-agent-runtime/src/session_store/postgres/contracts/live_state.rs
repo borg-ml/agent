@@ -958,3 +958,129 @@ async fn append_chunks_survive_reopen_and_archive_partial_without_quadratic_stor
     drop(store);
     scratch.discard().await;
 }
+
+// A singleton key lets a delayed old completion archive/delete its successor.
+// Compiler checks cannot enforce the transactional admission/recovery contract.
+#[tokio::test]
+async fn correlated_reasoning_rejects_late_frames_and_recovers_identity() {
+    let (scratch, store) = store().await;
+    let session = Uuid::new_v4();
+    let old = Uuid::new_v4();
+    let current = Uuid::new_v4();
+    store.create_session(session).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(std::path::Path::new("/tmp")),
+        SessionEventKind::StatusChanged {
+            lifecycle: None,
+            status: SessionStatus::Running,
+            detail: None,
+        },
+        SessionEventKind::ReasoningBlockStarted { reasoning_id: old },
+        SessionEventKind::ReasoningBlockDelta {
+            reasoning_id: old,
+            delta: "old".into(),
+        },
+        SessionEventKind::ReasoningBlockCompleted { reasoning_id: old },
+        SessionEventKind::ReasoningBlockStarted {
+            reasoning_id: current,
+        },
+        SessionEventKind::ReasoningBlockDelta {
+            reasoning_id: current,
+            delta: "current".into(),
+        },
+        SessionEventKind::ReasoningBlockCompleted { reasoning_id: old },
+        SessionEventKind::ReasoningBlockDelta {
+            reasoning_id: old,
+            delta: "late".into(),
+        },
+        SessionEventKind::ReasoningBlockSnapshot {
+            reasoning_id: old,
+            text: "late snapshot".into(),
+        },
+    ] {
+        let started = match &kind {
+            SessionEventKind::ReasoningBlockStarted { reasoning_id } => Some(*reasoning_id),
+            _ => None,
+        };
+        store
+            .append(SessionEvent::new(session, 0, kind))
+            .await
+            .unwrap();
+        if let Some(id) = started {
+            let blank = store.live_events_after(session, 0).await.unwrap();
+            assert_eq!(blank.len(), 2);
+            assert!(blank[0].revision > 0);
+            assert!(
+                matches!(blank[0].event.kind, SessionEventKind::ReasoningBlockStarted { reasoning_id } if reasoning_id == id)
+            );
+            assert!(
+                matches!(&blank[1].event.kind, SessionEventKind::ReasoningBlockSnapshot { reasoning_id, text } if *reasoning_id == id && text.is_empty())
+            );
+        }
+    }
+    let duplicate = SessionEvent::new(
+        session,
+        0,
+        SessionEventKind::ReasoningBlockStarted { reasoning_id: old },
+    );
+    assert_ne!(duplicate.id, old);
+    assert!(
+        store.append(duplicate).await.is_err(),
+        "closed UUID cannot be readmitted with a fresh event envelope"
+    );
+    let live = store.live_events_after(session, 0).await.unwrap();
+    assert_eq!(live.len(), 2);
+    assert!(
+        matches!(live[0].event.kind, SessionEventKind::ReasoningBlockStarted { reasoning_id } if reasoning_id == current)
+    );
+    assert_eq!(live[0].event.id, current);
+    assert!(
+        matches!(&live[1].event.kind, SessionEventKind::ReasoningBlockSnapshot { reasoning_id, text } if *reasoning_id == current && text == "current")
+    );
+    assert_eq!(live[0].event.created_at, live[1].event.created_at);
+    store
+        .append(SessionEvent::new(
+            session,
+            0,
+            SessionEventKind::StatusChanged {
+                lifecycle: None,
+                status: SessionStatus::Ready,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .live_events_after(session, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let archived = store
+        .read(session)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "reasoning_snapshot" && payload["complete"] == true =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(archived.len(), 2);
+    assert_eq!(archived[0]["reasoning_id"], serde_json::json!(old));
+    assert_eq!(archived[0]["text"], "old");
+    assert_eq!(archived[1]["reasoning_id"], serde_json::json!(current));
+    assert_eq!(archived[1]["text"], "current");
+    assert!(
+        archived
+            .iter()
+            .all(|payload| payload["reasoning_block"] == true)
+    );
+    scratch.discard().await;
+}

@@ -4131,6 +4131,8 @@ impl BorgTerminal {
                 ..
             }
             | SessionEventKind::ReasoningDelta { .. }
+            | SessionEventKind::ReasoningBlockDelta { .. }
+            | SessionEventKind::ReasoningBlockSnapshot { .. }
             | SessionEventKind::ToolStarted { .. } => self.prompt_awaiting_output = None,
             SessionEventKind::Message {
                 message_id,
@@ -4163,6 +4165,9 @@ impl BorgTerminal {
                         actor: EventActor::Assistant,
                         ..
                     } | SessionEventKind::ReasoningDelta { .. }
+                        | SessionEventKind::ReasoningBlockStarted { .. }
+                        | SessionEventKind::ReasoningBlockDelta { .. }
+                        | SessionEventKind::ReasoningBlockSnapshot { .. }
                         | SessionEventKind::ToolStarted { .. }
                 )
             {
@@ -4731,7 +4736,9 @@ impl BorgTerminal {
         }
         if !matches!(
             child_event.kind,
-            SessionEventKind::MessageDelta { .. } | SessionEventKind::ReasoningTextDelta { .. }
+            SessionEventKind::MessageDelta { .. }
+                | SessionEventKind::ReasoningTextDelta { .. }
+                | SessionEventKind::ReasoningBlockDelta { .. }
         ) {
             if !self.hydrated_children.contains(&child_id) {
                 self.child_unhydrated_events
@@ -12914,6 +12921,9 @@ fn transcript_turn_output(event: &SessionEvent) -> bool {
             | SessionEventKind::ToolUpdated { .. }
             | SessionEventKind::ToolCompleted { .. }
     )
+            | SessionEventKind::ReasoningBlockStarted { .. }
+            | SessionEventKind::ReasoningBlockDelta { .. }
+            | SessionEventKind::ReasoningBlockSnapshot { .. }
 }
 
 fn transcript_turn_has_terminal_boundary(event: &SessionEvent) -> bool {
@@ -14633,6 +14643,10 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::ToolUpdated { .. }
         | SessionEventKind::ToolCompleted { .. }
         | SessionEventKind::ApprovalRequested { .. }
+        | SessionEventKind::ReasoningBlockStarted { .. }
+        | SessionEventKind::ReasoningBlockDelta { .. }
+        | SessionEventKind::ReasoningBlockSnapshot { .. }
+        | SessionEventKind::ReasoningBlockCompleted { .. }
         | SessionEventKind::ProviderInteractionRequested { .. }
         | SessionEventKind::PlanUpdated { .. }
         | SessionEventKind::PlanProjected { .. }

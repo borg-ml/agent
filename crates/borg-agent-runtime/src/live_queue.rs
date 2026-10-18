@@ -19,6 +19,7 @@ use crate::{MessageStatus, SessionEvent, SessionEventKind};
 pub(crate) enum SnapshotKey {
     Message(Uuid),
     Reasoning,
+    ReasoningBlock(Uuid),
     ContextWindow,
 }
 
@@ -31,6 +32,9 @@ pub(crate) fn snapshot_key(kind: &SessionEventKind) -> Option<SnapshotKey> {
             ..
         } => Some(SnapshotKey::Message(*message_id)),
         SessionEventKind::ReasoningDelta { .. } => Some(SnapshotKey::Reasoning),
+        SessionEventKind::ReasoningBlockSnapshot { reasoning_id, .. } => {
+            Some(SnapshotKey::ReasoningBlock(*reasoning_id))
+        }
         SessionEventKind::ContextWindowUpdated { .. } => Some(SnapshotKey::ContextWindow),
         _ => None,
     }
@@ -48,6 +52,18 @@ pub(crate) fn merge_snapshot(previous: &mut SessionEventKind, mut next: SessionE
         next.clone_from(previous);
     }
     match (previous, next) {
+        (
+            SessionEventKind::ReasoningBlockSnapshot { reasoning_id, text },
+            SessionEventKind::ReasoningBlockSnapshot {
+                reasoning_id: next_id,
+                text: next,
+            },
+        ) if *reasoning_id == next_id => {
+            // Correlated snapshots are cumulative, never plain fragments.
+            if next.len() >= text.len() {
+                *text = next;
+            }
+        }
         (
             SessionEventKind::ReasoningDelta { text: previous },
             SessionEventKind::ReasoningDelta { text: next },
@@ -107,6 +123,27 @@ fn merge_event(pending: &mut SessionEvent, next: SessionEvent) {
 
 fn append_adjacent_delta(previous: &mut SessionEventKind, next: &SessionEventKind) -> bool {
     match (previous, next) {
+        (
+            SessionEventKind::ReasoningBlockDelta {
+                reasoning_id,
+                delta,
+            },
+            SessionEventKind::ReasoningBlockDelta {
+                reasoning_id: next_id,
+                delta: next,
+            },
+        ) if reasoning_id == next_id => {
+            delta.push_str(next);
+        }
+        (
+            SessionEventKind::ReasoningBlockSnapshot { reasoning_id, text },
+            SessionEventKind::ReasoningBlockDelta {
+                reasoning_id: next_id,
+                delta,
+            },
+        ) if reasoning_id == next_id => {
+            text.push_str(delta);
+        }
         (
             SessionEventKind::MessageDelta { message_id, delta },
             SessionEventKind::MessageDelta {
@@ -325,5 +362,39 @@ mod tests {
             drained[0].created_at, started_at,
             "a block keeps its start time"
         );
+    }
+    // The singleton key conflates interleaved blocks even when consumers are correct.
+    #[test]
+    fn correlated_snapshots_conflate_only_with_the_same_block() {
+        let session = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut queue = LiveEventQueue::default();
+        for (reasoning_id, text) in [(first, "a"), (second, "b"), (first, "aa")] {
+            queue.push_back(event(
+                session,
+                0,
+                SessionEventKind::ReasoningBlockSnapshot {
+                    reasoning_id,
+                    text: text.into(),
+                },
+            ));
+        }
+        assert!(matches!(queue.pop_front().unwrap().kind,
+            SessionEventKind::ReasoningBlockSnapshot { reasoning_id, text } if reasoning_id == first && text == "aa"));
+        assert!(matches!(queue.pop_front().unwrap().kind,
+            SessionEventKind::ReasoningBlockSnapshot { reasoning_id, text } if reasoning_id == second && text == "b"));
+        assert!(queue.pop_front().is_none());
+        for reasoning_id in [first, second] {
+            queue.push_back(event(
+                session,
+                0,
+                SessionEventKind::ReasoningBlockDelta {
+                    reasoning_id,
+                    delta: "fragment".into(),
+                },
+            ));
+        }
+        assert_eq!(std::iter::from_fn(|| queue.pop_front()).count(), 2);
     }
 }

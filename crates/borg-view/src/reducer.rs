@@ -148,6 +148,9 @@ impl ViewReducer {
                 SessionEventKind::ReasoningTextDelta { .. } => {
                     self.core.active_reasoning == Some(index)
                 }
+                SessionEventKind::ReasoningBlockDelta { reasoning_id, .. } => {
+                    self.core.reasoning_blocks.get(reasoning_id).copied() == Some(index)
+                }
                 _ => false,
             };
             if append_target

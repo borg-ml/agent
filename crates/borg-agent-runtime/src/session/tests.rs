@@ -7482,17 +7482,41 @@ async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() 
         .unwrap();
 
     let mut observed_compaction = false;
+    let mut compaction_operation = None;
+    let mut compaction_frames = 0;
     while !observed_compaction {
         let event = tokio::time::timeout(EVENT_WAIT, event_rx.recv())
             .await
             .expect("compaction completes")
             .expect("session remains open");
+        if let SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind,
+            payload,
+        } = &event.kind
+            && kind == "context_compaction"
+        {
+            let operation_id = payload["operation_id"]
+                .as_str()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .expect("actor compaction frame has an execution identity");
+            assert_eq!(
+                *compaction_operation.get_or_insert(operation_id),
+                operation_id
+            );
+            compaction_frames += 1;
+        }
         observed_compaction = matches!(
             event.kind,
             SessionEventKind::ProviderEvent { provider: CodingProvider::Codex, kind, payload }
                 if kind == "context_compaction" && payload["status"] == "completed"
         );
     }
+
+    assert!(
+        compaction_frames >= 2,
+        "start and completion share one operation"
+    );
 
     let followup_id = Uuid::new_v4();
     command_tx

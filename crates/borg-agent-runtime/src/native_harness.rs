@@ -1795,7 +1795,7 @@ impl NativeHarness {
         context_window_tokens: u64,
         usage: &mut ProviderCallUsage,
         progress: Option<&mpsc::UnboundedSender<NativeCompactionProgress>>,
-        events: Option<&mpsc::Sender<SessionEventKind>>,
+        events: Option<(&mpsc::Sender<SessionEventKind>, Uuid)>,
     ) -> Result<String> {
         anyhow::ensure!(
             !conversation.is_empty(),
@@ -1933,13 +1933,14 @@ impl NativeHarness {
                     pass_duration_ms,
                 });
             }
-            if let Some(events) = events {
+            if let Some((events, operation_id)) = events {
                 send(
                     events,
                     SessionEventKind::ProviderEvent {
                         provider,
                         kind: "context_compaction".into(),
                         payload: json!({
+                            "operation_id": operation_id,
                             "status": "progress",
                             "completed_passes": pass_index + 1,
                             "total_passes": total_passes,
@@ -2053,6 +2054,7 @@ impl NativeHarness {
         if !force && !budget.needs_auto_compaction(&compaction_budget) {
             return Ok(());
         }
+        let operation_id = Uuid::new_v4();
         // Context is reduced in two stages, cheapest first. Clearing the
         // contents of old tool results keeps the message structure, the tool
         // call pairing and every recent result, and it touches only the view
@@ -2086,6 +2088,7 @@ impl NativeHarness {
                     provider: turn.provider,
                     kind: "context_microcompaction".to_string(),
                     payload: json!({
+                            "operation_id": operation_id,
                         "status": "completed",
                         "summary": format!(
                             "Cleared {} older tool results to free {} tokens of context; the transcript keeps them.",
@@ -2121,6 +2124,7 @@ impl NativeHarness {
                 provider: turn.provider,
                 kind: "context_compaction".to_string(),
                 payload: json!({
+                            "operation_id": operation_id,
                     "status": "started",
                     "summary": "Compacting context…",
                     "automatic": true,
@@ -2164,7 +2168,8 @@ impl NativeHarness {
                         if !valid {
                             send(events, SessionEventKind::ProviderEvent {
                                 provider: turn.provider, kind: "context_compaction_failed".into(),
-                                payload: json!({"automatic":true, "server_compaction":true,
+                                payload: json!({
+                            "operation_id": operation_id,"automatic":true, "server_compaction":true,
                                     "error":"invalid native compaction continuation", "history_preserved":true}),
                             }).await;
                             bail!("invalid native compaction continuation; history preserved");
@@ -2175,6 +2180,7 @@ impl NativeHarness {
                             provider: turn.provider,
                             kind: "context_compaction".into(),
                             payload: json!({
+                            "operation_id": operation_id,
                                 "status": "completed", "native": true, "automatic": true,
                                 "server_compaction": true, "trigger": trigger,
                                 "retained_tail": replacement,
@@ -2216,7 +2222,8 @@ impl NativeHarness {
                             SessionEventKind::ProviderEvent {
                                 provider: turn.provider,
                                 kind: "context_compaction_failed".into(),
-                                payload: json!({"automatic": true, "server_compaction": true,
+                                payload: json!({
+                            "operation_id": operation_id,"automatic": true, "server_compaction": true,
                                 "error": error.to_string(), "history_preserved": true}),
                             },
                         )
@@ -2250,6 +2257,7 @@ impl NativeHarness {
                     provider: turn.provider,
                     kind: "context_compaction".into(),
                     payload: json!({
+                            "operation_id": operation_id,
                         "status": "progress",
                         "completed_passes": 1,
                         "total_passes": 1,
@@ -2274,7 +2282,7 @@ impl NativeHarness {
                             attempt_window,
                             &mut compaction_usage,
                             None,
-                            Some(events),
+                            Some((events, operation_id)),
                         )
                         .await;
                     if let Err(error) = &result
@@ -2292,12 +2300,13 @@ impl NativeHarness {
                                 provider: turn.provider,
                                 kind: "context_compaction".into(),
                                 payload: json!({
-                                    "status": "started",
-                                    "automatic": true,
-                                    "trigger": trigger,
-                                    "retry": retries,
-                                    "input_budget_tokens": attempt_window,
-                                }),
+                                "operation_id": operation_id,
+                                        "status": "started",
+                                        "automatic": true,
+                                        "trigger": trigger,
+                                        "retry": retries,
+                                        "input_budget_tokens": attempt_window,
+                                    }),
                             },
                         )
                         .await;
@@ -2318,6 +2327,7 @@ impl NativeHarness {
                         provider: turn.provider,
                         kind: "context_compaction".to_string(),
                         payload: json!({
+                            "operation_id": operation_id,
                             "status": "completed",
                             "summary": summary,
                             "native": true,
@@ -2365,6 +2375,7 @@ impl NativeHarness {
                         provider: turn.provider,
                         kind: "context_compaction_failed".to_string(),
                         payload: json!({
+                            "operation_id": operation_id,
                             "automatic": true,
                             "trigger": trigger,
                             "context_tokens_before": context_tokens,
@@ -3665,8 +3676,7 @@ async fn call_model_streaming_with_timeout(
     let mut text = String::new();
     let mut emitted_text_len = 0;
     let mut last_text_emit = Instant::now() - Duration::from_millis(50);
-    let mut pending_reasoning = String::new();
-    let mut reasoning_accumulated = String::new();
+    let mut reasoning = crate::agent::ReasoningBlocks::default();
     let mut last_reasoning_emit = Instant::now() - Duration::from_millis(50);
     let mut progress_open = true;
     let mut saw_reasoning_output = false;
@@ -3683,7 +3693,7 @@ async fn call_model_streaming_with_timeout(
         // deadline instead of letting it wait for an unrelated boundary event.
         let pending_text_flush = (text.len() != emitted_text_len)
             .then(|| crate::agent::live_output_interval().saturating_sub(last_text_emit.elapsed()));
-        let pending_reasoning_flush = (!pending_reasoning.is_empty()).then(|| {
+        let pending_reasoning_flush = (reasoning.pending()).then(|| {
             crate::agent::live_output_interval().saturating_sub(last_reasoning_emit.elapsed())
         });
         tokio::select! {
@@ -3757,14 +3767,7 @@ async fn call_model_streaming_with_timeout(
             () = tokio::time::sleep(pending_reasoning_flush.unwrap_or_default()),
                 if pending_reasoning_flush.is_some() =>
             {
-                send(
-                    context.events,
-                    SessionEventKind::ReasoningDelta {
-                        text: reasoning_accumulated.clone(),
-                    },
-                )
-                .await;
-                pending_reasoning.clear();
+                reasoning.flush(context.events).await;
                 last_reasoning_emit = Instant::now();
             }
             progress = progress_rx.recv(), if progress_open => {
@@ -3791,17 +3794,8 @@ async fn call_model_streaming_with_timeout(
                     // disclosure still buffered when prose begins must reach the
                     // screen first; otherwise the answer renders above the
                     // thinking block that produced it.
-                    if !pending_reasoning.is_empty() {
-                        send(
-                            context.events,
-                            SessionEventKind::ReasoningDelta {
-                                text: reasoning_accumulated.clone(),
-                            },
-                        )
-                        .await;
-                        pending_reasoning.clear();
-                        last_reasoning_emit = Instant::now();
-                    }
+                    reasoning.finish(context.events).await;
+                    last_reasoning_emit = Instant::now();
                     let delta = String::from_utf8_lossy(&chunk);
                     text.push_str(&delta);
                     send(
@@ -3824,55 +3818,36 @@ async fn call_model_streaming_with_timeout(
                     kind,
                     payload,
                     content_text,
+                    provider_item_id,
                     ..
                 }) if kind == "reasoning_delta" => {
                     if let Some(text) = content_text
                         .or_else(|| payload.get("text").and_then(Value::as_str).map(str::to_string))
                     {
-                        if let Some(delta) = normalize_reasoning_delta(&mut reasoning_accumulated, &text)
-                        {
-                            saw_reasoning_output = true;
-                            pending_reasoning.push_str(&delta);
-                            send(
-                                context.events,
-                                SessionEventKind::ReasoningTextDelta { delta },
-                            )
-                            .await;
-                        }
-                        if !pending_reasoning.is_empty()
-                            && last_reasoning_emit.elapsed()
-                            >= crate::agent::live_output_interval()
-                            || pending_reasoning.ends_with('\n')
-                        {
-                            send(
-                                context.events,
-                                SessionEventKind::ReasoningDelta {
-                                    text: reasoning_accumulated.clone(),
-                                },
-                            )
-                            .await;
-                            pending_reasoning.clear();
+                        saw_reasoning_output |= reasoning.delta(context.events, provider_item_id.as_deref(), &text).await;
+                        if reasoning.pending() && (last_reasoning_emit.elapsed() >= crate::agent::live_output_interval() || reasoning.ends_line()) {
+                            reasoning.flush(context.events).await;
                             last_reasoning_emit = Instant::now();
                         }
                     }
                 }
-                Some(ProviderProgress::ProviderEvent { kind, payload, .. }) => {
+                Some(ProviderProgress::ProviderEvent { kind, mut payload, provider_item_id, .. }) => {
+                    if kind == "reasoning_snapshot" && !reasoning.correlate_archive(&mut payload) {
+                        continue;
+                    }
+                    if kind == "item/started:reasoning" {
+                        reasoning.begin(context.events, provider_item_id.as_deref()).await;
+                        continue;
+                    }
                     if kind == "item/completed:reasoning" {
-                        if !pending_reasoning.is_empty() {
-                            send(context.events, SessionEventKind::ReasoningDelta {
-                                text: reasoning_accumulated.clone(),
-                            }).await;
-                            pending_reasoning.clear();
-                        }
-                        send(context.events, SessionEventKind::ReasoningCompleted).await;
-                        reasoning_accumulated.clear();
+                        reasoning.complete(context.events, provider_item_id.as_deref()).await;
+                        continue;
                     }
                     if kind == "native_model_attempt_failed" {
                         cancel_preparing_tool_calls(context.events, context.coding_provider, &mut preparing).await;
                         text.clear();
                         emitted_text_len = 0;
-                        pending_reasoning.clear();
-                        reasoning_accumulated.clear();
+                        reasoning.finish(context.events).await;
                     }
                     if kind == "claude_usage_grace"
                         && payload.get("five_hour").and_then(Value::as_f64).is_some_and(|v| v > 0.0)
@@ -3887,6 +3862,7 @@ async fn call_model_streaming_with_timeout(
                     }).await;
                 }
                 Some(ProviderProgress::ToolCallGenerating { id }) => {
+                    reasoning.finish(context.events).await;
                     note_preparing(&mut preparing, id.clone());
                     send(
                         context.events,
@@ -3906,6 +3882,7 @@ async fn call_model_streaming_with_timeout(
                     }).await;
                 }
                 Some(ProviderProgress::ToolCallStarted { id, .. }) => {
+                    reasoning.finish(context.events).await;
                     note_preparing(&mut preparing, Some(id.clone()));
                     send(
                         context.events,
@@ -3918,6 +3895,7 @@ async fn call_model_streaming_with_timeout(
                     .await;
                 }
                 Some(ProviderProgress::ToolCallAction { id, action }) => {
+                    reasoning.finish(context.events).await;
                     note_preparing(&mut preparing, id.clone());
                     send(
                         context.events,
@@ -3950,15 +3928,8 @@ async fn call_model_streaming_with_timeout(
             // durable message can trail the stream close by a tool round.
             // Thinking precedes the prose it produced, so it must be published
             // first or the final answer is emitted above its own reasoning.
-            if !pending_reasoning.is_empty() {
-                send(
-                    context.events,
-                    SessionEventKind::ReasoningDelta {
-                        text: reasoning_accumulated.clone(),
-                    },
-                )
-                .await;
-                pending_reasoning.clear();
+            if reasoning.pending() {
+                reasoning.flush(context.events).await;
             }
             if text.len() != emitted_text_len {
                 send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
@@ -3987,6 +3958,7 @@ async fn call_model_streaming_with_timeout(
                 )
                 .await;
             }
+            reasoning.finish(context.events).await;
             return outcome;
         }
     }
@@ -4025,6 +3997,7 @@ fn progress_follows_live_text(progress: &ProviderProgress) -> bool {
     )
 }
 
+#[cfg(test)]
 fn normalize_reasoning_delta(accumulated: &mut String, incoming: &str) -> Option<String> {
     if incoming.is_empty() || incoming == accumulated {
         return None;
@@ -8014,12 +7987,16 @@ mod tests {
                 );
                 assert!(matches!(
                     events.recv().await,
-                    Some(SessionEventKind::ReasoningTextDelta { delta })
+                    Some(SessionEventKind::ReasoningBlockStarted { .. })
+                ));
+                assert!(matches!(
+                    events.recv().await,
+                    Some(SessionEventKind::ReasoningBlockDelta { delta, .. })
                         if delta == "weighing the next step"
                 ));
                 assert!(matches!(
                     events.recv().await,
-                    Some(SessionEventKind::ReasoningDelta { text })
+                    Some(SessionEventKind::ReasoningBlockSnapshot { text, .. })
                         if text == "weighing the next step"
                 ));
             },
@@ -8105,21 +8082,29 @@ mod tests {
         let observe = async {
             assert!(matches!(
                 events_rx.recv().await,
-                Some(SessionEventKind::ReasoningTextDelta { delta }) if delta == "weighing "
+                Some(SessionEventKind::ReasoningBlockStarted { .. })
             ));
             assert!(matches!(
                 events_rx.recv().await,
-                Some(SessionEventKind::ReasoningDelta { text }) if text == "weighing "
+                Some(SessionEventKind::ReasoningBlockDelta { delta, .. }) if delta == "weighing "
             ));
             assert!(matches!(
                 events_rx.recv().await,
-                Some(SessionEventKind::ReasoningTextDelta { delta }) if delta == "the next step"
+                Some(SessionEventKind::ReasoningBlockSnapshot { text, .. }) if text == "weighing "
+            ));
+            assert!(matches!(
+                events_rx.recv().await,
+                Some(SessionEventKind::ReasoningBlockDelta { delta, .. }) if delta == "the next step"
             ));
             // The model reasons before it writes, so the throttled tail must
             // reach the reader before the prose it produced.
             assert!(matches!(
                 events_rx.recv().await,
-                Some(SessionEventKind::ReasoningDelta { text }) if text == "weighing the next step"
+                Some(SessionEventKind::ReasoningBlockSnapshot { text, .. }) if text == "weighing the next step"
+            ));
+            assert!(matches!(
+                events_rx.recv().await,
+                Some(SessionEventKind::ReasoningBlockCompleted { .. })
             ));
             assert!(matches!(
                 events_rx.recv().await,
@@ -8198,14 +8183,18 @@ mod tests {
         );
         tokio::pin!(call);
         let observe = async {
+            assert!(matches!(
+                events_rx.recv().await,
+                Some(SessionEventKind::ReasoningBlockStarted { .. })
+            ));
             assert!(matches!(events_rx.recv().await,
-                Some(SessionEventKind::ReasoningTextDelta { delta }) if delta == "weighing "));
+                Some(SessionEventKind::ReasoningBlockDelta { delta, .. }) if delta == "weighing "));
             assert!(matches!(events_rx.recv().await,
-                Some(SessionEventKind::ReasoningDelta { text }) if text == "weighing "));
+                Some(SessionEventKind::ReasoningBlockSnapshot { text, .. }) if text == "weighing "));
             assert!(matches!(events_rx.recv().await,
-                Some(SessionEventKind::ReasoningTextDelta { delta }) if delta == "the next step"));
+                Some(SessionEventKind::ReasoningBlockDelta { delta, .. }) if delta == "the next step"));
             assert!(matches!(events_rx.recv().await,
-                Some(SessionEventKind::ReasoningDelta { text }) if text == "weighing the next step"));
+                Some(SessionEventKind::ReasoningBlockSnapshot { text, .. }) if text == "weighing the next step"));
         };
         tokio::select! {
             _ = &mut call => panic!("model must remain unfinished during the quiet tail"),
@@ -8490,7 +8479,8 @@ mod tests {
         let client = HoldingProgressClient {
             held_progress: Arc::clone(&held_progress),
         };
-        let (events_tx, mut events_rx) = mpsc::channel(8);
+        // Undrained until the turn is released, so it must hold every event the stream emits.
+        let (events_tx, mut events_rx) = mpsc::channel(32);
         let (controls_tx, controls_rx) = mpsc::channel(1);
         let mut task = tokio::spawn(async move {
             let mut controls = Some(controls_rx);
@@ -8569,10 +8559,14 @@ mod tests {
         assert!(!queued_steer[0].admission.is_accepted());
         assert!(received.try_recv().is_err());
         held_progress.lock().unwrap().take();
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(SessionEventKind::ReasoningBlockStarted { .. })
+        ));
         assert!(matches!(events_rx.recv().await,
-            Some(SessionEventKind::ReasoningTextDelta { delta }) if delta == "thinking"));
+            Some(SessionEventKind::ReasoningBlockDelta { delta, .. }) if delta == "thinking"));
         assert!(matches!(events_rx.recv().await,
-            Some(SessionEventKind::ReasoningDelta { text }) if text == "thinking"));
+            Some(SessionEventKind::ReasoningBlockSnapshot { text, .. }) if text == "thinking"));
         assert!(matches!(
             events_rx.recv().await,
             Some(SessionEventKind::ProviderEvent {
@@ -8581,6 +8575,11 @@ mod tests {
                 ..
             }) if kind == "background_task_live" && payload["task_id"] == "task-1"
         ));
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(SessionEventKind::ReasoningBlockCompleted { .. })
+        ));
+
         assert!(matches!(
             events_rx.recv().await,
             Some(SessionEventKind::ProviderEvent { kind, payload, .. })
@@ -11025,6 +11024,24 @@ mod tests {
         )
         .await;
         assert!(!completed);
+        let operations = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEventKind::ProviderEvent { kind, payload, .. }
+                    if kind == "context_compaction" || kind == "context_compaction_failed" =>
+                {
+                    Some(
+                        payload["operation_id"]
+                            .as_str()
+                            .and_then(|id| Uuid::parse_str(id).ok())
+                            .expect("compaction lifecycle frame must carry its operation identity"),
+                    )
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(operations.len() >= 2, "start and failure must correlate");
+        assert!(operations.iter().all(|id| *id == operations[0]));
         assert!(events.iter().any(|event| matches!(event,
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "context_compaction_failed"
@@ -12902,6 +12919,112 @@ mod tests {
                 Some(expected.as_str()),
                 "the marker names the durable message the session is waiting on"
             );
+        }
+    }
+    // A typed fence is insufficient if the old opaque completion is also sent
+    // to legacy consumers, where it would finish the successor globally.
+    #[tokio::test]
+    async fn normalized_reasoning_does_not_forward_stale_opaque_lifecycle() {
+        struct SourceItems;
+        #[async_trait]
+        impl NativeModelClient for SourceItems {
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                _request: ModelTurnRequest,
+                progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                let progress = progress.unwrap();
+                for (kind, source, text) in [
+                    ("item/started:reasoning", "a", ""),
+                    ("reasoning_delta", "a", "old"),
+                    ("item/completed:reasoning", "a", ""),
+                    ("item/started:reasoning", "b", ""),
+                    ("reasoning_delta", "b", "new"),
+                    ("item/completed:reasoning", "a", ""),
+                    ("reasoning_delta", "a", "late"),
+                    ("reasoning_delta", "b", "new tail"),
+                ] {
+                    let mut event = reasoning_progress(text);
+                    if let ProviderProgress::ProviderEvent {
+                        kind: event_kind,
+                        provider_item_id,
+                        ..
+                    } = &mut event
+                    {
+                        *event_kind = kind.into();
+                        *provider_item_id = Some(source.into());
+                    }
+                    progress.send(event).unwrap();
+                }
+                std::future::pending().await
+            }
+        }
+        let (events, mut received) = mpsc::channel(32);
+        let mut controls = None;
+        let mut steers = Vec::new();
+        let call = call_model_streaming(
+            &SourceItems,
+            crate::CodingProvider::Codex,
+            "test",
+            None,
+            ModelTurnRequest {
+                fast: false,
+                ultrafast: false,
+                request_id: None,
+                session_id: None,
+                prompt_cache_key: None,
+                turn_routing: Default::default(),
+                messages: vec![ModelMessage::user("test")],
+                tools: Vec::new(),
+                output_schema: None,
+            },
+            ModelStreamContext {
+                coding_provider: crate::CodingProvider::Codex,
+                assistant_message_id: Uuid::new_v4(),
+                events: &events,
+                controls: &mut controls,
+                queued_steer: &mut steers,
+                allow_preemption: true,
+                grace_wrapup: None,
+            },
+        );
+        tokio::pin!(call);
+        let observe = async {
+            let mut starts = Vec::new();
+            let mut completions = Vec::new();
+            loop {
+                match received.recv().await.unwrap() {
+                    SessionEventKind::ReasoningBlockStarted { reasoning_id } => {
+                        starts.push(reasoning_id)
+                    }
+                    SessionEventKind::ReasoningBlockCompleted { reasoning_id } => {
+                        completions.push(reasoning_id)
+                    }
+                    SessionEventKind::ReasoningBlockSnapshot { reasoning_id, text }
+                        if text == "new tail" =>
+                    {
+                        assert_eq!(starts.len(), 2);
+                        assert_ne!(starts[0], starts[1]);
+                        assert_eq!(reasoning_id, starts[1]);
+                        assert_eq!(completions, vec![starts[0]]);
+                        break;
+                    }
+                    SessionEventKind::ProviderEvent { kind, .. } => {
+                        panic!("normalized opaque lifecycle leaked: {kind}")
+                    }
+                    SessionEventKind::ReasoningBlockDelta { delta, .. } => {
+                        assert_ne!(delta, "late")
+                    }
+                    _ => {}
+                }
+            }
+        };
+        tokio::select! {
+            _ = &mut call => panic!("source fixture remains active"),
+            result = tokio::time::timeout(Duration::from_secs(2), observe) => result.expect("successor must remain active and flush"),
         }
     }
 }

@@ -2638,6 +2638,21 @@ pub enum SessionEventKind {
         message_id: Uuid,
         delta: String,
     },
+    /// A producer-minted identity for one reasoning execution block.
+    ReasoningBlockStarted {
+        reasoning_id: Uuid,
+    },
+    ReasoningBlockDelta {
+        reasoning_id: Uuid,
+        delta: String,
+    },
+    ReasoningBlockSnapshot {
+        reasoning_id: Uuid,
+        text: String,
+    },
+    ReasoningBlockCompleted {
+        reasoning_id: Uuid,
+    },
     /// Append-only reasoning text for the live observer.
     ReasoningTextDelta {
         delta: String,
@@ -3610,5 +3625,23 @@ mod prompt_replacement_compatibility_tests {
             serde_json::from_value::<HostCommand>(encoded).unwrap(),
             HostCommand::ReplaceRecalledPrompt { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod reasoning_journal_compatibility {
+    use super::*;
+
+    // Existing persisted unit/struct variants must survive the additive migration.
+    #[test]
+    fn legacy_reasoning_events_keep_their_json_shape() {
+        for json in [
+            serde_json::json!({"type":"reasoning_text_delta", "delta":"fragment"}),
+            serde_json::json!({"type":"reasoning_delta", "text":"snapshot"}),
+            serde_json::json!({"type":"reasoning_completed"}),
+        ] {
+            let event: SessionEventKind = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(event).unwrap(), json);
+        }
     }
 }

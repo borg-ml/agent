@@ -257,6 +257,8 @@ pub struct TranscriptCore {
     pub child_transcript: bool,
     pub director_prompt: DirectorPrompt,
     pub tools: HashMap<String, usize>,
+    #[serde(default)]
+    pub reasoning_blocks: HashMap<Uuid, usize>,
     #[serde(skip)]
     pub retain_tool_inspection: bool,
     #[serde(skip)]
@@ -296,6 +298,8 @@ pub struct TranscriptCore {
     pub team_broadcast_entries: HashMap<Uuid, usize>,
     #[serde(default)]
     pub interaction_entries: HashMap<String, usize>,
+    #[serde(default)]
+    pub compaction_entries: HashMap<Uuid, usize>,
     pub agent_message_senders: HashSet<Uuid>,
     pub runtime_processes: HashMap<Uuid, RuntimeProcessProjection>,
     pub poll_processes: HashMap<Uuid, Vec<String>>,
@@ -343,6 +347,7 @@ impl Default for TranscriptCore {
             child_transcript: false,
             director_prompt: DirectorPrompt::Unknown,
             tools: HashMap::new(),
+            reasoning_blocks: HashMap::new(),
             retain_tool_inspection: false,
             tool_inspection_outputs: HashMap::new(),
             tool_parents: HashMap::new(),
@@ -374,6 +379,7 @@ impl Default for TranscriptCore {
             agent_message_order: Default::default(),
             team_broadcast_entries: HashMap::new(),
             interaction_entries: HashMap::new(),
+            compaction_entries: HashMap::new(),
             agent_message_senders: HashSet::new(),
             runtime_processes: HashMap::new(),
             poll_processes: HashMap::new(),
@@ -566,8 +572,80 @@ impl TranscriptCore {
         self.stream_into_message(message_id, delta);
     }
 
+    fn start_reasoning_block(&mut self, reasoning_id: Uuid, event: &SessionEvent) {
+        if self.live_turn_closed || self.reasoning_blocks.contains_key(&reasoning_id) {
+            return;
+        }
+        self.finish_reasoning(event.created_at);
+        self.start_reasoning(event.created_at, local_event_time(event));
+        if let Some(index) = self.active_reasoning {
+            self.reasoning_blocks.insert(reasoning_id, index);
+            self.order.identities[index] = (reasoning_id, 0);
+        }
+    }
+
+    fn update_reasoning_block(&mut self, reasoning_id: Uuid, text: &str, snapshot: bool) {
+        let Some(index) = self.reasoning_blocks.get(&reasoning_id).copied() else {
+            return;
+        };
+        if self
+            .order
+            .get(index)
+            .and_then(TranscriptEntry::execution)
+            .is_none_or(Execution::is_terminal)
+        {
+            return;
+        }
+        if let Some(TranscriptEntry::Tool {
+            code_view: Some((language, source)),
+            detail,
+            ..
+        }) = self.order.get_mut(index)
+            && language == "reasoning"
+        {
+            if snapshot {
+                Self::merge_reasoning_snapshot(source, text);
+            } else {
+                source.push_str(text);
+            }
+            *detail = reasoning_preview(source);
+            if self.active_reasoning == Some(index) {
+                self.reasoning_has_preview = true;
+            }
+        }
+    }
+
+    fn complete_reasoning_block(&mut self, reasoning_id: Uuid, at: DateTime<Utc>) {
+        let Some(index) = self.reasoning_blocks.get(&reasoning_id).copied() else {
+            return;
+        };
+        if self
+            .order
+            .get(index)
+            .and_then(TranscriptEntry::execution)
+            .is_none_or(Execution::is_terminal)
+        {
+            return;
+        }
+        if let Some(TranscriptEntry::Tool {
+            execution,
+            name,
+            expanded,
+            ..
+        }) = self.order.get_mut(index)
+        {
+            execution.transition(ExecutionState::Complete, at);
+            *name = "Reasoned".to_string();
+            *expanded = false;
+        }
+        if self.active_reasoning == Some(index) {
+            self.active_reasoning = None;
+            self.reasoning_has_preview = false;
+        }
+    }
+
     pub fn append_reasoning(&mut self, text: &str, started_at: DateTime<Utc>, time: String) {
-        if self.live_turn_closed {
+        if self.live_turn_closed || self.has_active_reasoning_block() {
             return;
         }
         if let Some(index) = self.active_reasoning
@@ -615,7 +693,7 @@ impl TranscriptCore {
         started_at: DateTime<Utc>,
         time: String,
     ) {
-        if self.live_turn_closed || delta.is_empty() {
+        if self.live_turn_closed || self.has_active_reasoning_block() || delta.is_empty() {
             return;
         }
         if self.active_reasoning.is_none() {
@@ -690,6 +768,63 @@ impl TranscriptCore {
             .and_then(|index| self.order.get(*index))
             .and_then(TranscriptEntry::execution)
             .is_some_and(Execution::is_terminal)
+        {
+            return None;
+        }
+        match &event.kind {
+            SessionEventKind::ReasoningBlockStarted { reasoning_id } => {
+                if self.live_turn_closed || self.reasoning_blocks.contains_key(reasoning_id) {
+                    return None;
+                }
+            }
+            SessionEventKind::ReasoningBlockDelta { reasoning_id, .. }
+            | SessionEventKind::ReasoningBlockSnapshot { reasoning_id, .. }
+            | SessionEventKind::ReasoningBlockCompleted { reasoning_id } => {
+                if self
+                    .reasoning_blocks
+                    .get(reasoning_id)
+                    .and_then(|index| self.order.get(*index))
+                    .and_then(TranscriptEntry::execution)
+                    .is_none_or(Execution::is_terminal)
+                {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        if let SessionEventKind::ProviderEvent { kind, payload, .. } = &event.kind
+            && (is_context_compaction(kind) || kind == "context_compaction_failed")
+            && let Some(operation_id) = payload.get("operation_id")
+        {
+            if let Some(id) = operation_id
+                .as_str()
+                .and_then(|id| Uuid::parse_str(id).ok())
+            {
+                self.apply_compaction_operation(id, kind, payload, event, mode);
+            }
+            return None;
+        }
+        if self.has_active_reasoning_block()
+            && (matches!(
+                event.kind,
+                SessionEventKind::ReasoningDelta { .. }
+                    | SessionEventKind::ReasoningTextDelta { .. }
+                    | SessionEventKind::ReasoningCompleted
+            ) || matches!(&event.kind, SessionEventKind::ProviderEvent { kind, payload, .. } if Self::provider_reasoning_lifecycle(kind, payload).is_some()))
+        {
+            return None;
+        }
+        if mode == ApplyMode::Live
+            && let SessionEventKind::ProviderEvent { kind, payload, .. } = &event.kind
+            && (is_context_compaction(kind) || kind == "context_compaction_failed")
+            && payload.get("operation_id").is_none()
+            && (self.has_active_reasoning_block()
+                || self.compaction_entries.values().any(|index| {
+                    self.order
+                        .get(*index)
+                        .and_then(TranscriptEntry::execution)
+                        .is_some_and(|execution| !execution.is_terminal())
+                }))
         {
             return None;
         }
@@ -787,6 +922,10 @@ impl TranscriptCore {
                 | SessionEventKind::ReasoningDelta { .. }
                 | SessionEventKind::ReasoningTextDelta { .. }
                 | SessionEventKind::ReasoningCompleted
+                | SessionEventKind::ReasoningBlockStarted { .. }
+                | SessionEventKind::ReasoningBlockDelta { .. }
+                | SessionEventKind::ReasoningBlockSnapshot { .. }
+                | SessionEventKind::ReasoningBlockCompleted { .. }
                 | SessionEventKind::ToolStarted { .. }
         ) || matches!(
             &event.kind,
@@ -1330,6 +1469,21 @@ impl TranscriptCore {
             }
             SessionEventKind::MessageDelta { message_id, delta } => {
                 self.append_assistant_message_delta(*message_id, delta, event);
+            }
+            SessionEventKind::ReasoningBlockStarted { reasoning_id } => {
+                self.start_reasoning_block(*reasoning_id, event);
+            }
+            SessionEventKind::ReasoningBlockDelta {
+                reasoning_id,
+                delta,
+            } => {
+                self.update_reasoning_block(*reasoning_id, delta, false);
+            }
+            SessionEventKind::ReasoningBlockSnapshot { reasoning_id, text } => {
+                self.update_reasoning_block(*reasoning_id, text, true);
+            }
+            SessionEventKind::ReasoningBlockCompleted { reasoning_id } => {
+                self.complete_reasoning_block(*reasoning_id, event.created_at);
             }
             SessionEventKind::ReasoningDelta { text } => {
                 self.append_reasoning(text, event.created_at, local_event_time(event));
@@ -2227,9 +2381,13 @@ impl TranscriptCore {
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "context_compaction_failed" =>
             {
-                self.finish_reasoning(event.created_at);
+                if !self.has_active_reasoning_block() {
+                    self.finish_reasoning(event.created_at);
+                }
                 self.cache_diagnostics.reset();
-                if let Some(TranscriptEntry::Compaction { execution, .. }) = self.order.last_mut()
+                if let Some(index) = self.legacy_compaction_index()
+                    && let Some(TranscriptEntry::Compaction { execution, .. }) =
+                        self.order.get_mut(index)
                     && !execution.is_terminal()
                 {
                     execution.transition(ExecutionState::Failed, event.created_at);
@@ -2263,7 +2421,9 @@ impl TranscriptCore {
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if is_context_compaction(kind) =>
             {
-                self.finish_reasoning(event.created_at);
+                if !self.has_active_reasoning_block() {
+                    self.finish_reasoning(event.created_at);
+                }
                 self.cache_diagnostics.reset();
                 let started = context_compaction_started(kind, payload);
                 let progress = payload
@@ -2271,59 +2431,15 @@ impl TranscriptCore {
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|status| status.eq_ignore_ascii_case("progress"));
                 if started || progress {
-                    let progress_summary = if progress {
-                        payload
-                            .get("summary")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("Compacting context…")
-                    } else {
-                        "Compacting context…"
-                    };
-                    let refused = payload
-                        .get("context_window_source")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("refusal");
-                    let progress_summary = if started
-                        && refused
-                        && let Some(tokens) = payload
-                            .get("context_tokens_before")
-                            .and_then(serde_json::Value::as_u64)
-                    {
-                        // The recovery window is the estimate itself, not the
-                        // model's window, so showing it as one misleads.
-                        format!(
-                            "{progress_summary} · provider refused the request · local estimate {}",
-                            format_context_tokens(tokens)
-                        )
-                    } else if started
-                        && payload
-                            .get("context_source")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("estimated")
-                        && let (Some(tokens), Some(window)) = (
-                            payload
-                                .get("context_tokens_before")
-                                .and_then(serde_json::Value::as_u64),
-                            payload
-                                .get("effective_context_window_tokens")
-                                .and_then(serde_json::Value::as_u64),
-                        )
-                    {
-                        format!(
-                            "{progress_summary} · local estimate {} / {} window",
-                            format_context_tokens(tokens),
-                            format_context_tokens(window)
-                        )
-                    } else {
-                        progress_summary.to_string()
-                    };
-                    if let Some(TranscriptEntry::Compaction {
-                        summary,
-                        time,
-                        sequence,
-                        expanded,
-                        execution,
-                    }) = self.order.last_mut()
+                    let progress_summary = context_compaction_progress_summary(kind, payload);
+                    if let Some(index) = self.legacy_compaction_index()
+                        && let Some(TranscriptEntry::Compaction {
+                            summary,
+                            time,
+                            sequence,
+                            expanded,
+                            execution,
+                        }) = self.order.get_mut(index)
                         && !execution.is_terminal()
                     {
                         *summary = progress_summary.to_string();
@@ -2341,13 +2457,14 @@ impl TranscriptCore {
                     }
                 } else {
                     let summary = context_compaction_card_summary(payload);
-                    if let Some(TranscriptEntry::Compaction {
-                        summary: previous,
-                        time,
-                        sequence,
-                        execution,
-                        expanded,
-                    }) = self.order.last_mut()
+                    if let Some(index) = self.legacy_compaction_index()
+                        && let Some(TranscriptEntry::Compaction {
+                            summary: previous,
+                            time,
+                            sequence,
+                            execution,
+                            expanded,
+                        }) = self.order.get_mut(index)
                         && !execution.is_terminal()
                     {
                         *previous = summary;
@@ -2515,6 +2632,113 @@ impl TranscriptCore {
         removed
     }
 
+    fn apply_compaction_operation(
+        &mut self,
+        operation_id: Uuid,
+        kind: &str,
+        payload: &serde_json::Value,
+        event: &SessionEvent,
+        mode: ApplyMode,
+    ) {
+        let started = context_compaction_started(kind, payload);
+        let progress = payload
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|status| status.eq_ignore_ascii_case("progress"));
+        let failed = kind == "context_compaction_failed";
+        let state = if failed {
+            ExecutionState::Failed
+        } else if started || progress {
+            ExecutionState::Running
+        } else {
+            ExecutionState::Complete
+        };
+        let existing = self.compaction_entries.get(&operation_id).copied();
+        if let Some(index) = existing {
+            if self
+                .order
+                .get(index)
+                .and_then(TranscriptEntry::execution)
+                .is_none_or(Execution::is_terminal)
+            {
+                return;
+            }
+        } else if (progress && mode == ApplyMode::Live) || (started && self.live_turn_closed) {
+            return;
+        }
+        let summary = if failed {
+            let detail = payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("the provider did not return a summary");
+            if payload
+                .get("history_preserved")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                format!("Context compaction failed; history preserved: {detail}")
+            } else {
+                format!("Context compaction failed: {detail}")
+            }
+        } else if state == ExecutionState::Running {
+            context_compaction_progress_summary(kind, payload)
+        } else {
+            context_compaction_card_summary(payload)
+        };
+        if existing.is_none() && started {
+            self.finish_reasoning(event.created_at);
+            self.cache_diagnostics.reset();
+        }
+        if let Some(index) = existing {
+            if let Some(TranscriptEntry::Compaction {
+                execution,
+                summary: stored,
+                time,
+                sequence,
+                expanded,
+            }) = self.order.get_mut(index)
+            {
+                execution.transition(state, event.created_at);
+                *stored = summary;
+                *time = local_event_time(event);
+                *sequence = event.sequence;
+                *expanded = false;
+            }
+            return;
+        }
+        if started {
+            // A new operation supersedes an abandoned live attempt; retries
+            // within one operation keep its original execution and clock.
+            let previous = self
+                .compaction_entries
+                .values()
+                .copied()
+                .collect::<Vec<_>>();
+            for index in previous {
+                if self
+                    .order
+                    .get(index)
+                    .and_then(TranscriptEntry::execution)
+                    .is_some_and(|execution| !execution.is_terminal())
+                    && let Some(TranscriptEntry::Compaction { execution, .. }) =
+                        self.order.get_mut(index)
+                {
+                    execution.transition(ExecutionState::Stopped, event.created_at);
+                }
+            }
+        }
+        let index = self.order.len();
+        self.order.push(TranscriptEntry::Compaction {
+            summary,
+            time: local_event_time(event),
+            sequence: event.sequence,
+            expanded: false,
+            execution: Execution::new(event.created_at, state),
+        });
+        self.order.identities[index] = (operation_id, 0);
+        self.compaction_entries.insert(operation_id, index);
+    }
+
     pub fn apply_reasoning_snapshot(&mut self, payload: &serde_json::Value, event: &SessionEvent) {
         let (Some(id), Some(text)) = (
             payload
@@ -2524,39 +2748,78 @@ impl TranscriptCore {
         ) else {
             return;
         };
-        let key = format!("reasoning:{id}");
-        let index = if let Some(index) = self.tools.get(&key).copied() {
-            index
-        } else {
-            if self.live_turn_closed {
+        let correlated = payload
+            .get("reasoning_block")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let finalized = payload.get("complete").and_then(serde_json::Value::as_bool) == Some(true);
+        let block_id = if correlated {
+            let Ok(id) = Uuid::parse_str(id) else {
                 return;
-            }
-            let started_at = payload
+            };
+            Some(id)
+        } else {
+            None
+        };
+        let key = format!("reasoning:{id}");
+        let existing = if let Some(id) = block_id {
+            self.reasoning_blocks.get(&id).copied()
+        } else {
+            self.tools.get(&key).copied()
+        };
+        let started_at = || {
+            payload
                 .get("started_at")
                 .and_then(serde_json::Value::as_str)
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                 .map(|value| value.with_timezone(&Utc))
-                .unwrap_or(event.created_at);
-            self.start_reasoning(started_at, local_event_time(event));
+                .unwrap_or(event.created_at)
+        };
+        let index = if let Some(index) = existing {
+            index
+        } else if let Some(id) = block_id {
+            if !finalized {
+                return;
+            }
+            let mut execution = Execution::new(started_at(), ExecutionState::Running);
+            execution.transition(ExecutionState::Complete, event.created_at);
+            let index = self.order.len();
+            self.order.push(TranscriptEntry::Tool {
+                source_name: "reasoning".into(),
+                name: "Reasoned".into(),
+                detail: reasoning_preview(text),
+                code_view: Some(("reasoning".into(), text.into())),
+                output_view: None,
+                payload_refs: Vec::new(),
+                time: started_at().to_rfc3339(),
+                execution,
+                expanded: false,
+                outcome: None,
+                cwd: None,
+            });
+            self.order.identities[index] = (id, 0);
+            self.reasoning_blocks.insert(id, index);
+            return;
+        } else {
+            if self.live_turn_closed || self.has_active_reasoning_block() {
+                return;
+            }
+            self.start_reasoning(started_at(), local_event_time(event));
             let Some(index) = self.active_reasoning else {
                 return;
             };
             self.tools.insert(key, index);
             index
         };
-        let finalized = payload.get("complete").and_then(serde_json::Value::as_bool) == Some(true);
-        if finalized && self.order.get(index).is_some_and(|entry| {
-            matches!(entry, TranscriptEntry::Tool { execution, .. } if execution.is_terminal())
-        }) {
-            self.hydrate_reasoning_payload(index, text);
-            return;
-        }
         if self
             .order
             .get(index)
             .and_then(TranscriptEntry::execution)
-            .is_some_and(Execution::is_terminal)
+            .is_none_or(Execution::is_terminal)
         {
+            if finalized {
+                self.hydrate_reasoning_payload(index, text);
+            }
             return;
         }
         if let Some(TranscriptEntry::Tool {
@@ -2568,17 +2831,16 @@ impl TranscriptCore {
             ..
         }) = self.order.get_mut(index)
             && language == "reasoning"
-            && !execution.is_terminal()
         {
             if finalized {
                 source.clear();
                 source.push_str(text);
-            } else if !execution.is_terminal() {
+            } else {
                 Self::merge_reasoning_snapshot(source, text);
             }
             *detail = reasoning_preview(source);
             if finalized {
-                *name = "Reasoned".to_string();
+                *name = "Reasoned".into();
                 execution.transition(ExecutionState::Complete, event.created_at);
                 *expanded = false;
             }
@@ -2587,6 +2849,17 @@ impl TranscriptCore {
             self.active_reasoning = None;
             self.reasoning_has_preview = false;
         }
+    }
+
+    fn has_active_reasoning_block(&self) -> bool {
+        self.active_reasoning
+            .is_some_and(|active| self.reasoning_blocks.values().any(|index| *index == active))
+    }
+
+    fn legacy_compaction_index(&self) -> Option<usize> {
+        let index = self.order.len().checked_sub(1)?;
+        (!self.compaction_entries.values().any(|stored| *stored == index)
+            && matches!(&self.order[index], TranscriptEntry::Compaction { execution, .. } if !execution.is_terminal())).then_some(index)
     }
 
     // Canonical archived content can arrive after the execution boundary. This
@@ -2664,6 +2937,7 @@ impl TranscriptCore {
         self.order.clear();
         self.messages.clear();
         self.tools.clear();
+        self.reasoning_blocks.clear();
         self.tool_inspection_outputs.clear();
         self.command_edit_rows.clear();
         self.subagent_entries.clear();
@@ -2671,6 +2945,7 @@ impl TranscriptCore {
         self.agent_message_order.clear();
         self.team_broadcast_entries.clear();
         self.interaction_entries.clear();
+        self.compaction_entries.clear();
         self.poll_processes.clear();
         self.agent_message_senders.clear();
         self.watch_messages.clear();
@@ -3200,10 +3475,12 @@ impl TranscriptCore {
             .messages
             .values_mut()
             .chain(self.tools.values_mut())
+            .chain(self.reasoning_blocks.values_mut())
             .chain(self.command_edit_rows.values_mut())
             .chain(self.subagent_entries.values_mut())
             .chain(self.team_broadcast_entries.values_mut())
             .chain(self.interaction_entries.values_mut())
+            .chain(self.compaction_entries.values_mut())
         {
             if *stored_index >= index {
                 *stored_index += 1;
@@ -3246,15 +3523,21 @@ impl TranscriptCore {
     }
 
     pub fn reindex_after_removal(&mut self, index: usize) {
+        self.reasoning_blocks
+            .retain(|_, stored_index| *stored_index != index);
+        self.compaction_entries
+            .retain(|_, stored_index| *stored_index != index);
         self.interaction_entries
             .retain(|_, stored_index| *stored_index != index);
         for stored_index in self
             .messages
             .values_mut()
             .chain(self.tools.values_mut())
+            .chain(self.reasoning_blocks.values_mut())
             .chain(self.subagent_entries.values_mut())
             .chain(self.team_broadcast_entries.values_mut())
             .chain(self.interaction_entries.values_mut())
+            .chain(self.compaction_entries.values_mut())
         {
             if *stored_index > index {
                 *stored_index -= 1;

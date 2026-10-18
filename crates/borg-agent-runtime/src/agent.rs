@@ -1886,6 +1886,7 @@ async fn run_borg_provider_turn(
     let mut first_model_output = true;
     let mut terminal_seen = false;
     let mut reasoning_text = String::new();
+    let mut reasoning_blocks = ReasoningBlocks::default();
     let mut pending_reasoning = String::new();
     let mut last_reasoning_emit = Instant::now() - Duration::from_millis(50);
     let mut last_completed_reasoning = None;
@@ -1911,7 +1912,8 @@ async fn run_borg_provider_turn(
             }
             () = tokio::time::sleep(pending_reasoning_flush.unwrap_or_default()),
                 if pending_reasoning_flush.is_some() => {
-                flush_pending_reasoning(&events, &mut pending_reasoning).await;
+                reasoning_blocks.flush(&events).await;
+                pending_reasoning.clear();
                 last_reasoning_emit = Instant::now();
                 continue;
             }
@@ -1931,7 +1933,25 @@ async fn run_borg_provider_turn(
         last_provider_output = Instant::now();
         let Some(event) = event else { break };
         match event {
-            ChatStreamEvent::ProviderEvent { kind, payload, .. } => {
+            ChatStreamEvent::ProviderEvent {
+                kind, mut payload, ..
+            } => {
+                if kind == "item/started:reasoning" {
+                    reasoning_blocks
+                        .begin(&events, payload.pointer("/item/id").and_then(Value::as_str))
+                        .await;
+                    continue;
+                }
+                if kind == "item/completed:reasoning" {
+                    reasoning_blocks
+                        .complete(&events, payload.pointer("/item/id").and_then(Value::as_str))
+                        .await;
+                    continue;
+                }
+                if kind == "reasoning_snapshot" && !reasoning_blocks.correlate_archive(&mut payload)
+                {
+                    continue;
+                }
                 if let Some(usage) = live_context_usage(&kind, &payload) {
                     send(
                         &events,
@@ -1974,8 +1994,13 @@ async fn run_borg_provider_turn(
                 .await;
             }
             ChatStreamEvent::Delta(delta) => {
+                reasoning_blocks.finish(&events).await;
+                if !reasoning_text.is_empty() {
+                    last_completed_reasoning = Some(std::mem::take(&mut reasoning_text));
+                }
                 if !pending_reasoning.is_empty() {
-                    flush_pending_reasoning(&events, &mut pending_reasoning).await;
+                    reasoning_blocks.flush(&events).await;
+                    pending_reasoning.clear();
                     last_reasoning_emit = Instant::now();
                 }
                 if first_model_output {
@@ -2036,18 +2061,21 @@ async fn run_borg_provider_turn(
                 }
                 saw_reasoning_output = true;
                 pending_reasoning.push_str(&delta);
-                send(&events, SessionEventKind::ReasoningTextDelta { delta }).await;
+                reasoning_blocks.delta(&events, None, &reasoning_text).await;
                 if last_reasoning_emit.elapsed() >= live_output_interval()
                     || pending_reasoning.ends_with('\n')
                 {
-                    flush_pending_reasoning(&events, &mut pending_reasoning).await;
+                    reasoning_blocks.flush(&events).await;
+                    pending_reasoning.clear();
                     last_reasoning_emit = Instant::now();
                 }
             }
             ChatStreamEvent::Narration {
                 text: narration_text,
             } => {
-                flush_pending_reasoning(&events, &mut pending_reasoning).await;
+                reasoning_blocks.flush(&events).await;
+                pending_reasoning.clear();
+                reasoning_blocks.finish(&events).await;
                 reasoning_text.clear();
                 last_completed_reasoning = None;
                 if first_model_output {
@@ -2087,11 +2115,14 @@ async fn run_borg_provider_turn(
             }
             ChatStreamEvent::Phase { name, input } => {
                 if name == "reasoning_completed" {
-                    flush_pending_reasoning(&events, &mut pending_reasoning).await;
-                    last_completed_reasoning =
-                        (!reasoning_text.is_empty()).then(|| reasoning_text.clone());
+                    reasoning_blocks.flush(&events).await;
+                    pending_reasoning.clear();
+                    if !reasoning_text.is_empty() {
+                        last_completed_reasoning = Some(reasoning_text.clone());
+                    }
+                    reasoning_blocks.finish(&events).await;
                     reasoning_text.clear();
-                    send(&events, SessionEventKind::ReasoningCompleted).await;
+                    reasoning_blocks.finish(&events).await;
                     continue;
                 }
                 send(
@@ -2173,7 +2204,9 @@ async fn run_borg_provider_turn(
                     "{:?} exposed a forbidden provider-native agent tool: {name}",
                     turn.provider
                 );
-                flush_pending_reasoning(&events, &mut pending_reasoning).await;
+                reasoning_blocks.flush(&events).await;
+                pending_reasoning.clear();
+                reasoning_blocks.finish(&events).await;
                 reasoning_text.clear();
                 last_completed_reasoning = None;
                 // A tool call ends the current assistant text segment. Commit it
@@ -2326,7 +2359,9 @@ async fn run_borg_provider_turn(
                 session_id,
                 provider_turn_id,
             } => {
-                flush_pending_reasoning(&events, &mut pending_reasoning).await;
+                reasoning_blocks.flush(&events).await;
+                pending_reasoning.clear();
+                reasoning_blocks.finish(&events).await;
                 terminal_seen = true;
                 final_output = final_text;
                 if let Some(session_id) = session_id {
@@ -2419,7 +2454,8 @@ async fn run_borg_provider_turn(
                 emitted_text_len = text.len();
             }
             ChatStreamEvent::Failed { error, kind } => {
-                flush_pending_reasoning(&events, &mut pending_reasoning).await;
+                reasoning_blocks.flush(&events).await;
+                pending_reasoning.clear();
                 if text.len() != emitted_text_len {
                     send_live_assistant_text(&events, assistant_message_id, &text).await;
                 }
@@ -2438,6 +2474,7 @@ async fn run_borg_provider_turn(
                 // `bail!`-ing a bare string. `bail!` would drop the kind the
                 // transport already determined and force the session layer
                 // back to guessing from prose.
+                reasoning_blocks.finish(&events).await;
                 return Err(anyhow::Error::new(ProviderStreamError {
                     kind,
                     message: error,
@@ -2445,7 +2482,8 @@ async fn run_borg_provider_turn(
             }
         }
     }
-    flush_pending_reasoning(&events, &mut pending_reasoning).await;
+    reasoning_blocks.finish(&events).await;
+    pending_reasoning.clear();
     if !terminal_seen && text.len() != emitted_text_len {
         send_live_assistant_text(&events, assistant_message_id, &text).await;
     }
@@ -2520,15 +2558,145 @@ async fn send_live_assistant_text(
     .await;
 }
 
-async fn flush_pending_reasoning(events: &mpsc::Sender<SessionEventKind>, pending: &mut String) {
-    if !pending.is_empty() {
+/// Request-scoped source identities retain closed entries until the request ends.
+/// A late provider frame can therefore never create a second execution for an item.
+#[derive(Default)]
+pub(crate) struct ReasoningBlocks {
+    sources: std::collections::HashMap<String, (Uuid, bool)>,
+    active: Option<Uuid>,
+    text: String,
+    pending: bool,
+}
+
+impl ReasoningBlocks {
+    pub(crate) async fn begin(
+        &mut self,
+        events: &mpsc::Sender<SessionEventKind>,
+        source: Option<&str>,
+    ) -> Option<Uuid> {
+        if let Some(source) = source
+            && let Some(id) = self.sources.get(source)
+        {
+            return id.1.then_some(id.0);
+        }
+        if source.is_none() && self.active.is_some() {
+            return self.active;
+        }
+        self.finish(events).await;
+        let id = Uuid::new_v4();
+        self.active = Some(id);
+        if let Some(source) = source {
+            self.sources.insert(source.to_owned(), (id, true));
+        }
         send(
             events,
-            SessionEventKind::ReasoningDelta {
-                text: std::mem::take(pending),
+            SessionEventKind::ReasoningBlockStarted { reasoning_id: id },
+        )
+        .await;
+        Some(id)
+    }
+
+    pub(crate) async fn delta(
+        &mut self,
+        events: &mpsc::Sender<SessionEventKind>,
+        source: Option<&str>,
+        incoming: &str,
+    ) -> bool {
+        if incoming.is_empty() {
+            return false;
+        }
+        let id = match source {
+            Some(source) => self
+                .sources
+                .get(source)
+                .and_then(|(id, open)| open.then_some(*id)),
+            None => self.begin(events, None).await,
+        };
+        let Some(id) = id else {
+            return false;
+        };
+        if self.active != Some(id) {
+            return false;
+        }
+        let Some(delta) = normalize_reasoning_delta(&mut self.text, incoming) else {
+            return false;
+        };
+        self.pending = true;
+        send(
+            events,
+            SessionEventKind::ReasoningBlockDelta {
+                reasoning_id: id,
+                delta,
             },
         )
         .await;
+        true
+    }
+
+    pub(crate) fn correlate_archive(&self, payload: &mut Value) -> bool {
+        let Some(source) = payload.get("reasoning_id").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some((id, _)) = self.sources.get(source) else {
+            return false;
+        };
+        payload["reasoning_id"] = serde_json::json!(id);
+        payload["reasoning_block"] = serde_json::json!(true);
+        true
+    }
+
+    pub(crate) fn pending(&self) -> bool {
+        self.pending
+    }
+    pub(crate) fn ends_line(&self) -> bool {
+        self.text.ends_with('\n')
+    }
+
+    pub(crate) async fn flush(&mut self, events: &mpsc::Sender<SessionEventKind>) {
+        if self.pending
+            && let Some(id) = self.active
+        {
+            send(
+                events,
+                SessionEventKind::ReasoningBlockSnapshot {
+                    reasoning_id: id,
+                    text: self.text.clone(),
+                },
+            )
+            .await;
+            self.pending = false;
+        }
+    }
+
+    pub(crate) async fn complete(
+        &mut self,
+        events: &mpsc::Sender<SessionEventKind>,
+        source: Option<&str>,
+    ) {
+        if let Some(source) = source {
+            match self.sources.get(source) {
+                Some((id, true)) if Some(*id) == self.active => {}
+                _ => return,
+            }
+        }
+        self.finish(events).await;
+    }
+
+    pub(crate) async fn finish(&mut self, events: &mpsc::Sender<SessionEventKind>) {
+        self.flush(events).await;
+        if let Some(id) = self.active.take() {
+            for value in self.sources.values_mut() {
+                if value.0 == id {
+                    value.1 = false;
+                }
+            }
+            send(
+                events,
+                SessionEventKind::ReasoningBlockCompleted { reasoning_id: id },
+            )
+            .await;
+        }
+        self.text.clear();
     }
 }
 
@@ -3827,5 +3995,53 @@ mod tests {
             "provider completed without a visible response (empty result)"
         );
         assert_eq!(terminal_assistant_text("", "", false, true).unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod reasoning_block_tests {
+    use super::*;
+
+    // Text-only checks cannot catch an old item's completion closing its successor.
+    #[tokio::test]
+    async fn completed_source_cannot_reopen_or_finish_successor() {
+        let (events, mut received) = mpsc::channel(32);
+        let mut blocks = ReasoningBlocks::default();
+        assert!(!blocks.delta(&events, Some("unknown"), "late").await);
+        blocks.begin(&events, Some("old")).await;
+        assert!(blocks.delta(&events, Some("old"), "first").await);
+        blocks.complete(&events, Some("old")).await;
+        blocks.begin(&events, Some("new")).await;
+        assert!(blocks.delta(&events, Some("new"), "second").await);
+        let current = blocks.active.unwrap();
+        assert!(!blocks.delta(&events, Some("old"), "late").await);
+        assert_eq!(blocks.begin(&events, Some("old")).await, None);
+        blocks.complete(&events, Some("old")).await;
+        assert_eq!(blocks.active, Some(current));
+        blocks.flush(&events).await;
+        let mut starts = Vec::new();
+        let mut snapshots = Vec::new();
+        while let Ok(event) = received.try_recv() {
+            match event {
+                SessionEventKind::ReasoningBlockStarted { reasoning_id } => {
+                    starts.push(reasoning_id)
+                }
+                SessionEventKind::ReasoningBlockSnapshot { reasoning_id, text } => {
+                    snapshots.push((reasoning_id, text))
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(starts.len(), 2);
+        assert_ne!(starts[0], starts[1]);
+        assert_eq!(
+            snapshots,
+            vec![(starts[0], "first".into()), (current, "second".into())]
+        );
+        let mut archive =
+            serde_json::json!({"reasoning_id":"old", "text":"final first", "complete":true});
+        assert!(blocks.correlate_archive(&mut archive));
+        assert_eq!(archive["reasoning_id"], serde_json::json!(starts[0]));
+        assert_eq!(blocks.active, Some(current));
     }
 }

@@ -340,15 +340,16 @@ impl SessionEventKind {
                 EventPersistence::Coalesced
             }
             Self::ProviderEvent { .. } => EventPersistence::Ephemeral,
-            Self::MessageDelta { .. } | Self::ReasoningTextDelta { .. } => {
-                EventPersistence::Ephemeral
-            }
+            Self::MessageDelta { .. }
+            | Self::ReasoningTextDelta { .. }
+            | Self::ReasoningBlockDelta { .. } => EventPersistence::Ephemeral,
             Self::Message {
                 actor: crate::EventActor::User | crate::EventActor::System,
                 status: MessageStatus::InProgress,
                 ..
             } => EventPersistence::Durable,
-            Self::ReasoningDelta { .. }
+            Self::ReasoningBlockSnapshot { .. }
+            | Self::ReasoningDelta { .. }
             | Self::ContextWindowUpdated { .. }
             | Self::Message {
                 status: MessageStatus::InProgress,
@@ -600,6 +601,9 @@ impl SessionEventKind {
                 status: MessageStatus::InProgress,
                 ..
             } => Some(format!("message:{message_id}")),
+            Self::ReasoningBlockSnapshot { reasoning_id, .. } => {
+                Some(format!("reasoning:{reasoning_id}"))
+            }
             Self::ReasoningDelta { .. } => Some("reasoning".to_string()),
             Self::ProviderEvent { kind, payload, .. }
                 if kind == "action/preparing"
@@ -626,6 +630,9 @@ impl SessionEventKind {
 
     pub fn cleared_live_state_keys(&self) -> Vec<String> {
         match self {
+            Self::ReasoningBlockCompleted { reasoning_id } => {
+                vec![format!("reasoning:{reasoning_id}")]
+            }
             Self::ProviderEvent { kind, payload, .. } if kind == "action/preparing" => {
                 let id = payload
                     .get("tool_call_id")

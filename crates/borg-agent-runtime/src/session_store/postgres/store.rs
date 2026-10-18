@@ -43,9 +43,22 @@ fn reasoning_snapshot(
     complete: bool,
     created_at: DateTime<Utc>,
 ) -> SessionEvent {
-    let SessionEventKind::ReasoningDelta { text } = &reasoning.kind else {
-        unreachable!("reasoning live key contains a reasoning snapshot");
+    let (reasoning_id, text, correlated) = match &reasoning.kind {
+        SessionEventKind::ReasoningBlockSnapshot { reasoning_id, text } => {
+            (*reasoning_id, text, true)
+        }
+        SessionEventKind::ReasoningDelta { text } => (reasoning.id, text, false),
+        _ => unreachable!("reasoning live key contains a reasoning snapshot"),
     };
+    let mut payload = serde_json::json!({
+        "reasoning_id": reasoning_id,
+        "text": text,
+        "started_at": reasoning.created_at,
+        "complete": complete,
+    });
+    if correlated {
+        payload["reasoning_block"] = serde_json::json!(true);
+    }
     let mut event = SessionEvent::new(
         reasoning.session_id,
         0,
@@ -55,12 +68,7 @@ fn reasoning_snapshot(
                 .as_ref()
                 .map_or(CodingProvider::Codex, |config| config.provider),
             kind: "reasoning_snapshot".into(),
-            payload: serde_json::json!({
-                "reasoning_id": reasoning.id,
-                "text": text,
-                "started_at": reasoning.created_at,
-                "complete": complete,
-            }),
+            payload,
         },
     );
     event.created_at = created_at;
@@ -273,6 +281,12 @@ impl PostgresSessionStore {
         transaction: &mut Transaction<'_, Postgres>,
         mut event: SessionEvent,
     ) -> Result<SessionEvent> {
+        if let SessionEventKind::ReasoningBlockStarted { reasoning_id } = &event.kind {
+            // Reuse the durable event uniqueness constraint as the admission
+            // fence: a completed block UUID can never be started again.
+            event.id = *reasoning_id;
+        }
+
         // `for update` is the whole design: it serialises writers for THIS
         // session and no other. Two agents appending to two sessions proceed
         // in parallel, which is what SQLite's single file writer made
@@ -286,32 +300,30 @@ impl PostgresSessionStore {
         .await?
         .with_context(|| format!("session {} does not exist", event.session_id))?;
 
-        if event.sequence == 0
-            && (event.kind.clears_live_turn_state()
-                || event
-                    .kind
-                    .cleared_live_state_keys()
-                    .iter()
-                    .any(|key| key == "reasoning"))
-        {
-            let prior: Option<serde_json::Value> = sqlx::query_scalar(
-                "select event_json from session_live_state where session_id = $1 and live_key = 'reasoning'",
-            )
-            .bind(event.session_id)
-            .fetch_optional(&mut **transaction)
-            .await?;
-            if let Some(prior) = prior {
+        let reasoning_keys = event.kind.cleared_live_state_keys();
+        let close_all_reasoning = event.kind.clears_live_turn_state()
+            || reasoning_keys.iter().any(|key| key == "reasoning");
+        let close_reasoning_id = match &event.kind {
+            SessionEventKind::ReasoningBlockCompleted { reasoning_id } => {
+                Some(format!("reasoning:{reasoning_id}"))
+            }
+            _ => None,
+        };
+        if event.sequence == 0 && (close_all_reasoning || close_reasoning_id.is_some()) {
+            let prior: Vec<serde_json::Value> = sqlx::query_scalar(
+                "select event_json from session_live_state where session_id=$1 and \
+                 (($2 and (live_key='reasoning' or live_key like 'reasoning:%')) or live_key=$3) order by updated_at,live_key",
+            ).bind(event.session_id).bind(close_all_reasoning).bind(&close_reasoning_id)
+                .fetch_all(&mut **transaction).await?;
+            for prior in prior {
                 let mut reasoning: SessionEvent = serde_json::from_value(prior)?;
                 super::live_text::materialize(transaction, &mut reasoning).await?;
                 let state: SessionState = serde_json::from_str(row.try_get("state_json")?)?;
                 let snapshot = reasoning_snapshot(&reasoning, &state, true, event.created_at);
                 Box::pin(self.append_durable_in_transaction(transaction, snapshot)).await?;
                 row = sqlx::query(
-                    "select inherited_event_count, next_sequence, state_json from sessions where id = $1",
-                )
-                .bind(event.session_id)
-                .fetch_one(&mut **transaction)
-                .await?;
+                    "select inherited_event_count,next_sequence,state_json from sessions where id=$1",
+                ).bind(event.session_id).fetch_one(&mut **transaction).await?;
             }
         }
 
@@ -439,6 +451,32 @@ impl PostgresSessionStore {
         // record of why it started.
         super::sync::sync_session_action(transaction, &event).await?;
 
+        if let SessionEventKind::ReasoningBlockStarted { reasoning_id } = &event.kind
+            && matches!(
+                state.status,
+                Some(SessionStatus::Running | SessionStatus::WaitingForApproval)
+            )
+        {
+            let mut live = event.clone();
+            live.sequence = 0;
+            live.kind = SessionEventKind::ReasoningBlockSnapshot {
+                reasoning_id: *reasoning_id,
+                text: String::new(),
+            };
+            let revision: i64 = sqlx::query_scalar(
+                "update sessions set live_revision=live_revision+1 where id=$1 returning live_revision",
+            ).bind(event.session_id).fetch_one(&mut **transaction).await?;
+            sqlx::query(
+                "insert into session_live_state(session_id,live_key,revision,event_json,updated_at) \
+                 values($1,$2,$3,$4,$5) on conflict(session_id,live_key) do nothing",
+            ).bind(event.session_id).bind(format!("reasoning:{reasoning_id}"))
+                .bind(revision).bind(serde_json::to_value(live)?).bind(event.created_at)
+                .execute(&mut **transaction).await?;
+        }
+        if close_all_reasoning {
+            sqlx::query("delete from session_live_state where session_id=$1 and live_key like 'reasoning:%'")
+                .bind(event.session_id).execute(&mut **transaction).await?;
+        }
         if event.kind.clears_live_turn_state() {
             sqlx::query(
                 "delete from session_live_state \
@@ -534,7 +572,21 @@ impl PostgresSessionStore {
                 delivery: None,
             };
         }
-        let reasoning_fragment = matches!(&event.kind, SessionEventKind::ReasoningTextDelta { .. });
+        let reasoning_fragment = matches!(
+            &event.kind,
+            SessionEventKind::ReasoningTextDelta { .. }
+                | SessionEventKind::ReasoningBlockDelta { .. }
+        );
+        if let SessionEventKind::ReasoningBlockDelta {
+            reasoning_id,
+            delta,
+        } = &event.kind
+        {
+            event.kind = SessionEventKind::ReasoningBlockSnapshot {
+                reasoning_id: *reasoning_id,
+                text: delta.clone(),
+            };
+        }
         if let SessionEventKind::ReasoningTextDelta { delta } = &event.kind {
             event.kind = SessionEventKind::ReasoningDelta {
                 text: delta.clone(),
@@ -561,6 +613,15 @@ impl PostgresSessionStore {
                 .await?;
         }
 
+        if matches!(&event.kind, SessionEventKind::ReasoningBlockSnapshot { .. }) {
+            let admitted: bool = sqlx::query_scalar(
+                "select exists(select 1 from session_live_state where session_id=$1 and live_key=$2)",
+            ).bind(event.session_id).bind(&live_key).fetch_one(&mut *transaction).await?;
+            if !admitted {
+                transaction.commit().await?;
+                return Ok(original_event);
+            }
+        }
         let current_revision: i64 = row.try_get("live_revision")?;
         let state: SessionState = serde_json::from_str(row.try_get("state_json")?)?;
         let turn_live_allowed = matches!(
@@ -591,7 +652,10 @@ impl PostgresSessionStore {
         let revision = current_revision.saturating_add(1);
         let mut stored_event = event.clone();
         let streamed = match &event.kind {
-            SessionEventKind::ReasoningDelta { text } => Some((text.as_str(), reasoning_fragment)),
+            SessionEventKind::ReasoningDelta { text }
+            | SessionEventKind::ReasoningBlockSnapshot { text, .. } => {
+                Some((text.as_str(), reasoning_fragment))
+            }
             SessionEventKind::Message {
                 text,
                 actor: crate::EventActor::Assistant,
@@ -608,14 +672,16 @@ impl PostgresSessionStore {
                 stored_event.created_at = prior.created_at;
             }
             match &mut stored_event.kind {
-                SessionEventKind::ReasoningDelta { text }
+                SessionEventKind::ReasoningBlockSnapshot { text, .. }
+                | SessionEventKind::ReasoningDelta { text }
                 | SessionEventKind::Message { text, .. } => text.clear(),
                 _ => {}
             }
         }
         // The first nonblank reasoning frame adds one durable display anchor,
         // so the block keeps its transcript position; later frames stay live.
-        if let SessionEventKind::ReasoningDelta { text } = &event.kind
+        if let SessionEventKind::ReasoningDelta { text }
+        | SessionEventKind::ReasoningBlockSnapshot { text, .. } = &event.kind
             && !text.trim().is_empty()
         {
             let visible: bool = sqlx::query_scalar(
@@ -629,7 +695,15 @@ impl PostgresSessionStore {
             .await?;
             if !visible {
                 let mut snapshot = stored_event.clone();
-                snapshot.kind = SessionEventKind::ReasoningDelta { text: text.clone() };
+                snapshot.kind = match &event.kind {
+                    SessionEventKind::ReasoningBlockSnapshot { reasoning_id, .. } => {
+                        SessionEventKind::ReasoningBlockSnapshot {
+                            reasoning_id: *reasoning_id,
+                            text: text.clone(),
+                        }
+                    }
+                    _ => SessionEventKind::ReasoningDelta { text: text.clone() },
+                };
                 self.append_durable_in_transaction(
                     &mut transaction,
                     reasoning_snapshot(&snapshot, &state, false, snapshot.created_at),
@@ -969,7 +1043,7 @@ impl SessionStore for PostgresSessionStore {
         match event.kind.persistence() {
             EventPersistence::Ephemeral => {
                 event.sequence = 0;
-                if matches!(&event.kind, SessionEventKind::ReasoningTextDelta { delta } | SessionEventKind::MessageDelta { delta, .. } if !delta.is_empty())
+                if matches!(&event.kind, SessionEventKind::ReasoningBlockDelta { delta, .. } | SessionEventKind::ReasoningTextDelta { delta } | SessionEventKind::MessageDelta { delta, .. } if !delta.is_empty())
                 {
                     return self.append_live(event).await;
                 }
@@ -1087,6 +1161,18 @@ impl SessionStore for PostgresSessionStore {
             let event: serde_json::Value = row.try_get("event_json")?;
             let mut event: SessionEvent = serde_json::from_value(event)?;
             super::live_text::materialize(&mut transaction, &mut event).await?;
+            if let SessionEventKind::ReasoningBlockSnapshot { reasoning_id, .. } = &event.kind {
+                let mut start = event.clone();
+                start.id = *reasoning_id;
+                start.sequence = 0;
+                start.kind = SessionEventKind::ReasoningBlockStarted {
+                    reasoning_id: *reasoning_id,
+                };
+                live.push(SessionLiveEvent {
+                    revision: u64::try_from(revision).unwrap_or(0),
+                    event: start,
+                });
+            }
             live.push(SessionLiveEvent {
                 revision: u64::try_from(revision).unwrap_or(0),
                 event,

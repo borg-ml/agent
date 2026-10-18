@@ -1454,3 +1454,262 @@ fn terminal_wire_receipts_do_not_churn_on_unrelated_completion_or_interrupt() {
         }
     }
 }
+
+// Correlation, not arrival order, owns the reasoning execution being updated.
+#[test]
+fn late_reasoning_block_events_cannot_change_or_finish_another_block() {
+    use borg_view::entry::TranscriptEntry;
+    let session = Uuid::new_v4();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let mut view = ViewReducer::new(session, "epoch".into());
+    for (sequence, kind) in [
+        (
+            1,
+            SessionEventKind::ReasoningBlockStarted { reasoning_id: a },
+        ),
+        (
+            2,
+            SessionEventKind::ReasoningBlockDelta {
+                reasoning_id: a,
+                delta: "first".into(),
+            },
+        ),
+        (
+            3,
+            SessionEventKind::ReasoningBlockCompleted { reasoning_id: a },
+        ),
+        (
+            4,
+            SessionEventKind::ReasoningBlockStarted { reasoning_id: b },
+        ),
+        (
+            5,
+            SessionEventKind::ReasoningBlockDelta {
+                reasoning_id: b,
+                delta: "second".into(),
+            },
+        ),
+    ] {
+        view.apply(SessionEvent::new(session, sequence, kind));
+    }
+    let sealed = serde_json::to_value(&view.core.order[0]).unwrap();
+    let live = serde_json::to_value(&view.core.order[1]).unwrap();
+    let texts = view
+        .checkpoint_texts()
+        .into_iter()
+        .map(|(reference, text)| {
+            (
+                (reference.row_id, format!("{:?}", reference.field)),
+                text.to_string(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut restored = ViewReducer::restore(&view.checkpoint().unwrap(), |reference| {
+        Ok(texts[&(reference.row_id.clone(), format!("{:?}", reference.field))].clone())
+    })
+    .unwrap();
+    let late = [
+        SessionEventKind::ReasoningBlockCompleted { reasoning_id: a },
+        SessionEventKind::ReasoningBlockDelta { reasoning_id: a, delta: "late".into() },
+        SessionEventKind::ReasoningBlockSnapshot { reasoning_id: a, text: "late snapshot".into() },
+        SessionEventKind::ReasoningBlockStarted { reasoning_id: a },
+        SessionEventKind::ReasoningBlockDelta { reasoning_id: Uuid::new_v4(), delta: "unknown".into() },
+        SessionEventKind::ReasoningCompleted,
+        SessionEventKind::ReasoningDelta { text: "legacy late text".into() },
+        SessionEventKind::ProviderEvent { provider: borg_agent_runtime::CodingProvider::Codex,
+            kind: "item/completed:reasoning".into(), payload: serde_json::json!({"item":{"type":"reasoning","id":"old-provider-item"}}) },
+        SessionEventKind::ProviderEvent { provider: borg_agent_runtime::CodingProvider::Codex,
+            kind: "reasoning_snapshot".into(), payload: serde_json::json!({"reasoning_id":"old-provider-item","text":"legacy","complete":false}) },
+    ].into_iter().enumerate().map(|(index, kind)| SessionEvent::new(session, index as u64 + 6, kind)).collect::<Vec<_>>();
+    let completion = SessionEvent::new(
+        session,
+        15,
+        SessionEventKind::ReasoningBlockCompleted { reasoning_id: b },
+    );
+    for projection in [&mut view, &mut restored] {
+        for event in &late {
+            projection.apply(event.clone());
+        }
+        assert_eq!(projection.core.order.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&projection.core.order[0]).unwrap(),
+            sealed
+        );
+        assert_eq!(
+            serde_json::to_value(&projection.core.order[1]).unwrap(),
+            live
+        );
+        assert_eq!(projection.core.active_reasoning, Some(1));
+        assert_eq!(projection.core.order.identities, vec![(a, 0), (b, 0)]);
+        projection.apply(completion.clone());
+        assert!(
+            matches!(&projection.core.order[1], TranscriptEntry::Tool { execution, .. }
+            if execution.is_terminal() && execution.completed_at() == Some(completion.created_at))
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(&view.core.order[1]).unwrap(),
+        serde_json::to_value(&restored.core.order[1]).unwrap()
+    );
+}
+
+// Recovery synthesizes admission for the same source block, not another UI execution.
+#[test]
+fn reasoning_recovery_preserves_block_identity_and_start_clock() {
+    use borg_view::core::TranscriptCore;
+    let session = Uuid::new_v4();
+    let block = Uuid::new_v4();
+    let mut started = SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::ReasoningBlockStarted {
+            reasoning_id: block,
+        },
+    );
+    let mut snapshot = SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::ReasoningBlockSnapshot {
+            reasoning_id: block,
+            text: "live text".into(),
+        },
+    );
+    snapshot.created_at = started.created_at;
+    let mut live = TranscriptCore::default();
+    live.apply(&started);
+    live.apply(&snapshot);
+    started.id = block;
+    started.sequence = 0;
+    snapshot.sequence = 0;
+    let mut recovered = TranscriptCore::default();
+    recovered.apply(&started);
+    recovered.apply(&snapshot);
+    assert_eq!(recovered.order.identities, live.order.identities);
+    assert_eq!(
+        serde_json::to_value(&recovered.order[0]).unwrap(),
+        serde_json::to_value(&live.order[0]).unwrap()
+    );
+    // Receiving the synthetic admission again is idempotent and cannot reset the clock.
+    recovered.apply(&started);
+    assert_eq!(recovered.order.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&recovered.order[0]).unwrap(),
+        serde_json::to_value(&live.order[0]).unwrap()
+    );
+}
+
+// A truncated archived block may be shown as history, but must never become active.
+#[test]
+fn unknown_final_reasoning_archive_is_terminal_only_and_does_not_finish_live_block() {
+    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    let session = Uuid::new_v4();
+    let current = Uuid::new_v4();
+    let archived = Uuid::new_v4();
+    let mut core = TranscriptCore::default();
+    core.apply(&SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::ReasoningBlockStarted {
+            reasoning_id: current,
+        },
+    ));
+    core.apply(&SessionEvent::new(session, 2, SessionEventKind::ProviderEvent {
+        provider: borg_agent_runtime::CodingProvider::Codex, kind: "reasoning_snapshot".into(),
+        payload: serde_json::json!({"reasoning_block":true,"reasoning_id":archived,"text":"archived full text","complete":true}),
+    }));
+    assert_eq!(core.active_reasoning, Some(0));
+    assert!(
+        matches!(&core.order[0], TranscriptEntry::Tool { execution, .. } if !execution.is_terminal())
+    );
+    assert!(
+        matches!(&core.order[1], TranscriptEntry::Tool { execution, .. } if execution.is_terminal())
+    );
+    assert_eq!(core.order.identities[1], (archived, 0));
+    core.apply(&SessionEvent::new(session, 3, SessionEventKind::ProviderEvent {
+        provider: borg_agent_runtime::CodingProvider::Codex, kind: "reasoning_snapshot".into(),
+        payload: serde_json::json!({"reasoning_block":true,"reasoning_id":Uuid::new_v4(),"text":"unknown progress","complete":false}),
+    }));
+    assert_eq!(core.order.len(), 2);
+    assert_eq!(core.active_reasoning, Some(0));
+}
+
+// Operation correlation must survive retries and interleaved reasoning or later compactions.
+#[test]
+fn compaction_operation_retries_preserve_clock_and_old_events_cannot_touch_current_work() {
+    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    let session = Uuid::new_v4();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let reasoning = Uuid::new_v4();
+    let start = chrono::Utc::now();
+    let event = |sequence: u64, operation, status: &str| {
+        let mut event = SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: borg_agent_runtime::CodingProvider::Codex,
+                kind: if status == "failed" {
+                    "context_compaction_failed"
+                } else {
+                    "context_compaction"
+                }
+                .into(),
+                payload: serde_json::json!({"operation_id":operation,"status":status,"summary":"current progress","error":"failed"}),
+            },
+        );
+        event.created_at = start + chrono::Duration::seconds(sequence as i64);
+        event
+    };
+    let mut core = TranscriptCore::default();
+    core.apply(&event(1, a, "started"));
+    core.apply(&event(2, a, "progress"));
+    core.apply(&event(3, a, "started"));
+    assert_eq!(core.order.len(), 1);
+    assert_eq!(
+        core.order[0].execution().unwrap().started_at(),
+        start + chrono::Duration::seconds(1)
+    );
+    core.apply(&event(4, b, "started"));
+    assert!(core.order[0].execution().unwrap().is_interrupted());
+    core.apply(&SessionEvent::new(
+        session,
+        5,
+        SessionEventKind::ReasoningBlockStarted {
+            reasoning_id: reasoning,
+        },
+    ));
+    let old = serde_json::to_value(&core.order[0]).unwrap();
+    let current = serde_json::to_value(&core.order[1]).unwrap();
+    for (sequence, status) in [
+        (6, "progress"),
+        (7, "completed"),
+        (8, "failed"),
+        (9, "started"),
+    ] {
+        core.apply(&event(sequence, a, status));
+    }
+    core.apply(&event(10, Uuid::new_v4(), "progress"));
+    assert_eq!(core.order.len(), 3);
+    assert_eq!(serde_json::to_value(&core.order[0]).unwrap(), old);
+    assert_eq!(serde_json::to_value(&core.order[1]).unwrap(), current);
+    assert_eq!(core.active_reasoning, Some(2));
+    core.apply(&SessionEvent::new(session, 11, SessionEventKind::ProviderEvent {
+        provider: borg_agent_runtime::CodingProvider::Codex, kind: "context_compaction".into(),
+        payload: serde_json::json!({"status":"progress", "summary":"uncorrelated late progress"}),
+    }));
+    assert_eq!(core.order.len(), 3);
+    assert_eq!(core.active_reasoning, Some(2));
+    core.apply(&event(12, b, "progress"));
+    core.apply(&event(13, b, "completed"));
+    assert!(
+        matches!(&core.order[1], TranscriptEntry::Compaction { execution, .. } if execution.is_terminal() && execution.started_at() == start + chrono::Duration::seconds(4))
+    );
+    assert_eq!(core.active_reasoning, Some(2));
+    core.apply(&event(14, b, "started"));
+    let historical = Uuid::new_v4();
+    core.apply(&event(15, historical, "completed"));
+    assert_eq!(core.active_reasoning, Some(2));
+    assert_eq!(core.order.identities[3], (historical, 0));
+    assert!(core.order[3].execution().unwrap().is_terminal());
+}

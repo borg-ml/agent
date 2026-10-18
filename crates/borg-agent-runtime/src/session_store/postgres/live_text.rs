@@ -71,6 +71,7 @@ pub async fn materialize(
     let text = String::from_utf8(bytes)?;
     match &mut event.kind {
         SessionEventKind::Message { text: value, .. }
+        | SessionEventKind::ReasoningBlockSnapshot { text: value, .. }
         | SessionEventKind::ReasoningDelta { text: value } => *value = text,
         _ => ensure!(false, "text chunks on nontext live key"),
     }
@@ -102,7 +103,9 @@ pub async fn seed_inline(
     .await?;
     if !exists && let Some(prior) = &prior {
         match &prior.kind {
-            SessionEventKind::Message { text, .. } | SessionEventKind::ReasoningDelta { text } => {
+            SessionEventKind::Message { text, .. }
+            | SessionEventKind::ReasoningBlockSnapshot { text, .. }
+            | SessionEventKind::ReasoningDelta { text } => {
                 append(tx, prior, key, text, false, 0).await?
             }
             _ => {}

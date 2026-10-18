@@ -44,9 +44,9 @@ enum LocalLiveFrame {
 struct LocalLivePublisher {
     events: broadcast::Sender<LocalLiveWire>,
     latest_sequence: u64,
-    reasoning_bytes: HashMap<Uuid, usize>,
+    reasoning_bytes: HashMap<(Uuid, Option<Uuid>), usize>,
     message_bytes: HashMap<(Uuid, Uuid), usize>,
-    reasoning_snapshots: HashMap<Uuid, SessionEvent>,
+    reasoning_snapshots: HashMap<(Uuid, Option<Uuid>), SessionEvent>,
     message_snapshots: HashMap<(Uuid, Uuid), SessionEvent>,
     pending_delta: Option<PendingLiveDelta>,
     pending_generation: u64,
@@ -56,7 +56,7 @@ struct LocalLivePublisher {
 
 #[derive(PartialEq, Eq)]
 enum LiveDeltaKey {
-    Reasoning(Uuid),
+    Reasoning(Uuid, Option<Uuid>),
     Message(Uuid, Uuid),
 }
 
@@ -78,15 +78,49 @@ impl LocalLivePublisher {
     fn publish(&mut self, event: &SessionEvent) -> Option<(u64, tokio::time::Instant)> {
         self.latest_sequence = self.latest_sequence.max(event.sequence);
         let (session_id, kind) = preview_event_kind(event);
+        let reasoning_key = (session_id, reasoning_block_id(kind));
+        if matches!(
+            kind,
+            SessionEventKind::ReasoningBlockDelta { .. }
+                | SessionEventKind::ReasoningBlockSnapshot { .. }
+        ) && !self.reasoning_bytes.contains_key(&reasoning_key)
+        {
+            return None;
+        }
         let text_start = match kind {
-            SessionEventKind::ReasoningTextDelta { delta } => {
-                let start = self.reasoning_bytes.entry(session_id).or_default();
+            SessionEventKind::ReasoningBlockStarted { .. } => {
+                self.reasoning_bytes.entry(reasoning_key).or_default();
+                self.reasoning_snapshots
+                    .entry(reasoning_key)
+                    .or_insert_with(|| {
+                        let mut snapshot = event.clone();
+                        let (_, kind) = preview_event_kind_mut(&mut snapshot);
+                        *kind = SessionEventKind::ReasoningBlockSnapshot {
+                            reasoning_id: reasoning_key.1.unwrap(),
+                            text: String::new(),
+                        };
+                        snapshot.sequence = 0;
+                        snapshot
+                    });
+                None
+            }
+            SessionEventKind::ReasoningBlockCompleted { .. } => {
+                self.reasoning_bytes.remove(&reasoning_key);
+                self.reasoning_snapshots.remove(&reasoning_key);
+                None
+            }
+            SessionEventKind::ReasoningTextDelta { delta }
+            | SessionEventKind::ReasoningBlockDelta { delta, .. } => {
+                let start = self.reasoning_bytes.entry(reasoning_key).or_default();
                 let previous = *start;
                 *start += delta.len();
-                if let Some(snapshot) = self.reasoning_snapshots.get_mut(&session_id)
+                if let Some(snapshot) = self.reasoning_snapshots.get_mut(&reasoning_key)
                     && snapshot.sequence == 0
-                    && let (_, SessionEventKind::ReasoningDelta { text }) =
-                        preview_event_kind_mut(snapshot)
+                    && let (
+                        _,
+                        SessionEventKind::ReasoningDelta { text }
+                        | SessionEventKind::ReasoningBlockSnapshot { text, .. },
+                    ) = preview_event_kind_mut(snapshot)
                 {
                     text.push_str(delta);
                 }
@@ -108,9 +142,11 @@ impl LocalLivePublisher {
                 }
                 Some(previous)
             }
-            SessionEventKind::ReasoningDelta { text } => {
-                self.reasoning_bytes.insert(session_id, text.len());
-                self.reasoning_snapshots.insert(session_id, event.clone());
+            SessionEventKind::ReasoningDelta { text }
+            | SessionEventKind::ReasoningBlockSnapshot { text, .. } => {
+                self.reasoning_bytes.insert(reasoning_key, text.len());
+                self.reasoning_snapshots
+                    .insert(reasoning_key, event.clone());
                 None
             }
             SessionEventKind::Message {
@@ -129,25 +165,30 @@ impl LocalLivePublisher {
                     self.message_bytes.remove(&(session_id, *message_id));
                     self.message_snapshots.remove(&(session_id, *message_id));
                 }
-                self.reasoning_bytes.remove(&session_id);
-                self.reasoning_snapshots.remove(&session_id);
+                self.clear_reasoning(session_id);
                 None
             }
-            SessionEventKind::ReasoningCompleted
-            | SessionEventKind::ToolStarted { .. }
+            SessionEventKind::ReasoningCompleted => {
+                self.reasoning_bytes.remove(&(session_id, None));
+                self.reasoning_snapshots.remove(&(session_id, None));
+                None
+            }
+            SessionEventKind::ToolStarted { .. }
             | SessionEventKind::ToolUpdated { .. }
             | SessionEventKind::ToolCompleted { .. } => {
-                self.reasoning_bytes.remove(&session_id);
-                self.reasoning_snapshots.remove(&session_id);
+                self.clear_reasoning(session_id);
                 None
             }
             SessionEventKind::TurnStarted { .. }
             | SessionEventKind::TurnCompleted { .. }
             | SessionEventKind::ContextCleared => {
-                self.reasoning_bytes.remove(&session_id);
+                self.reasoning_bytes
+                    .retain(|(owner, _), _| *owner != session_id);
+                self.reasoning_snapshots
+                    .retain(|(owner, _), _| *owner != session_id);
                 self.message_bytes
                     .retain(|(owner, _), _| *owner != session_id);
-                self.reasoning_snapshots.remove(&session_id);
+                self.reasoning_snapshots.remove(&reasoning_key);
                 self.message_snapshots
                     .retain(|(owner, _), _| *owner != session_id);
                 None
@@ -251,6 +292,13 @@ impl LocalLivePublisher {
         let _ = self.events.send(wire);
     }
 
+    fn clear_reasoning(&mut self, session_id: Uuid) {
+        self.reasoning_bytes
+            .retain(|(owner, _), _| *owner != session_id);
+        self.reasoning_snapshots
+            .retain(|(owner, _), _| *owner != session_id);
+    }
+
     fn snapshots(&self) -> Vec<SessionEvent> {
         let mut snapshots = self
             .reasoning_snapshots
@@ -259,7 +307,22 @@ impl LocalLivePublisher {
             .cloned()
             .collect::<Vec<_>>();
         snapshots.sort_by_key(|event| (event.created_at, event.id));
-        snapshots
+        let mut recovered = Vec::with_capacity(snapshots.len() * 2);
+        for snapshot in snapshots {
+            if let (_, SessionEventKind::ReasoningBlockSnapshot { reasoning_id, .. }) =
+                preview_event_kind(&snapshot)
+            {
+                let id = *reasoning_id;
+                let mut start = snapshot.clone();
+                start.id = id;
+                start.sequence = 0;
+                let (_, kind) = preview_event_kind_mut(&mut start);
+                *kind = SessionEventKind::ReasoningBlockStarted { reasoning_id: id };
+                recovered.push(start);
+            }
+            recovered.push(snapshot);
+        }
+        recovered
     }
 }
 
@@ -269,8 +332,11 @@ fn live_delta_key(event: &SessionEvent) -> Option<LiveDeltaKey> {
     }
     match &event.kind {
         SessionEventKind::ReasoningTextDelta { .. } => {
-            Some(LiveDeltaKey::Reasoning(event.session_id))
+            Some(LiveDeltaKey::Reasoning(event.session_id, None))
         }
+        SessionEventKind::ReasoningBlockDelta { reasoning_id, .. } => Some(
+            LiveDeltaKey::Reasoning(event.session_id, Some(*reasoning_id)),
+        ),
         SessionEventKind::MessageDelta { message_id, .. } => {
             Some(LiveDeltaKey::Message(event.session_id, *message_id))
         }
@@ -280,7 +346,8 @@ fn live_delta_key(event: &SessionEvent) -> Option<LiveDeltaKey> {
 
 fn live_delta_len(event: &SessionEvent) -> usize {
     match &event.kind {
-        SessionEventKind::ReasoningTextDelta { delta }
+        SessionEventKind::ReasoningBlockDelta { delta, .. }
+        | SessionEventKind::ReasoningTextDelta { delta }
         | SessionEventKind::MessageDelta { delta, .. } => delta.len(),
         _ => 0,
     }
@@ -288,6 +355,19 @@ fn live_delta_len(event: &SessionEvent) -> usize {
 
 fn append_live_delta(pending: &mut SessionEvent, event: &SessionEvent) -> bool {
     match (&mut pending.kind, &event.kind) {
+        (
+            SessionEventKind::ReasoningBlockDelta {
+                reasoning_id,
+                delta: text,
+            },
+            SessionEventKind::ReasoningBlockDelta {
+                reasoning_id: next_id,
+                delta,
+            },
+        ) if reasoning_id == next_id => {
+            text.push_str(delta);
+            true
+        }
         (
             SessionEventKind::ReasoningTextDelta { delta: text },
             SessionEventKind::ReasoningTextDelta { delta },
@@ -300,6 +380,16 @@ fn append_live_delta(pending: &mut SessionEvent, event: &SessionEvent) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+fn reasoning_block_id(kind: &SessionEventKind) -> Option<Uuid> {
+    match kind {
+        SessionEventKind::ReasoningBlockStarted { reasoning_id }
+        | SessionEventKind::ReasoningBlockDelta { reasoning_id, .. }
+        | SessionEventKind::ReasoningBlockSnapshot { reasoning_id, .. }
+        | SessionEventKind::ReasoningBlockCompleted { reasoning_id } => Some(*reasoning_id),
+        _ => None,
     }
 }
 
@@ -1751,7 +1841,7 @@ struct ReasoningPreviewCursor {
 
 #[derive(Default)]
 struct AttachedPreviewCursor {
-    reasoning: HashMap<Uuid, ReasoningPreviewCursor>,
+    reasoning: HashMap<(Uuid, Option<Uuid>), ReasoningPreviewCursor>,
     messages: HashMap<(Uuid, Uuid), String>,
     fresh_turns: HashSet<Uuid>,
 }
@@ -1767,8 +1857,11 @@ impl AttachedPreviewCursor {
 
     fn accept_store_snapshot(&mut self, event: SessionEvent) -> Option<SessionEvent> {
         let (session_id, kind) = preview_event_kind(&event);
-        let result = if let SessionEventKind::ReasoningDelta { .. } = kind {
-            let cursor = self.reasoning.entry(session_id).or_default();
+        let reasoning_key = (session_id, reasoning_block_id(kind));
+        let result = if let SessionEventKind::ReasoningBlockSnapshot { .. } = kind {
+            Some(event.clone())
+        } else if let SessionEventKind::ReasoningDelta { .. } = kind {
+            let cursor = self.reasoning.entry(reasoning_key).or_default();
             if cursor.raw_sent {
                 Some(event.clone())
             } else {
@@ -1787,9 +1880,30 @@ impl AttachedPreviewCursor {
         text_start: Option<usize>,
     ) -> Option<SessionEvent> {
         let (session_id, kind) = preview_event_kind_mut(&mut event);
+        let reasoning_key = (session_id, reasoning_block_id(kind));
+        if matches!(
+            kind,
+            SessionEventKind::ReasoningBlockDelta { .. }
+                | SessionEventKind::ReasoningBlockSnapshot { .. }
+        ) && !self.reasoning.contains_key(&reasoning_key)
+        {
+            return None;
+        }
         match kind {
-            SessionEventKind::ReasoningTextDelta { delta } => {
-                let cursor = self.reasoning.entry(session_id).or_default();
+            SessionEventKind::ReasoningBlockStarted { .. } => {
+                self.reasoning
+                    .entry(reasoning_key)
+                    .or_insert_with(|| ReasoningPreviewCursor {
+                        known: true,
+                        ..Default::default()
+                    });
+            }
+            SessionEventKind::ReasoningBlockCompleted { .. } => {
+                self.reasoning.remove(&reasoning_key);
+            }
+            SessionEventKind::ReasoningTextDelta { delta }
+            | SessionEventKind::ReasoningBlockDelta { delta, .. } => {
+                let cursor = self.reasoning.entry(reasoning_key).or_default();
                 if !cursor.known {
                     return None;
                 }
@@ -1818,8 +1932,9 @@ impl AttachedPreviewCursor {
                 text.push_str(&suffix);
                 *delta = suffix;
             }
-            SessionEventKind::ReasoningDelta { text } => {
-                let cursor = self.reasoning.entry(session_id).or_default();
+            SessionEventKind::ReasoningDelta { text }
+            | SessionEventKind::ReasoningBlockSnapshot { text, .. } => {
+                let cursor = self.reasoning.entry(reasoning_key).or_default();
                 if !cursor.text.starts_with(text.as_str()) {
                     cursor.text.clone_from(text);
                 }
@@ -1841,20 +1956,30 @@ impl AttachedPreviewCursor {
                 } else {
                     self.messages.remove(&key);
                 }
+                self.reasoning.retain(|(owner, _), _| *owner != session_id);
                 self.reasoning.insert(
-                    session_id,
+                    (session_id, None),
                     ReasoningPreviewCursor {
                         known: true,
                         ..Default::default()
                     },
                 );
             }
-            SessionEventKind::ReasoningCompleted
-            | SessionEventKind::ToolStarted { .. }
+            SessionEventKind::ReasoningCompleted => {
+                self.reasoning.insert(
+                    (session_id, None),
+                    ReasoningPreviewCursor {
+                        known: true,
+                        ..Default::default()
+                    },
+                );
+            }
+            SessionEventKind::ToolStarted { .. }
             | SessionEventKind::ToolUpdated { .. }
             | SessionEventKind::ToolCompleted { .. } => {
+                self.reasoning.retain(|(owner, _), _| *owner != session_id);
                 self.reasoning.insert(
-                    session_id,
+                    (session_id, None),
                     ReasoningPreviewCursor {
                         known: true,
                         ..Default::default()
@@ -1865,7 +1990,7 @@ impl AttachedPreviewCursor {
                 self.clear_session(session_id);
                 self.fresh_turns.insert(session_id);
                 self.reasoning.insert(
-                    session_id,
+                    (session_id, None),
                     ReasoningPreviewCursor {
                         known: true,
                         ..Default::default()
@@ -1881,7 +2006,7 @@ impl AttachedPreviewCursor {
     }
 
     fn clear_session(&mut self, session_id: Uuid) {
-        self.reasoning.remove(&session_id);
+        self.reasoning.retain(|(owner, _), _| *owner != session_id);
         self.messages.retain(|(owner, _), _| *owner != session_id);
         self.fresh_turns.remove(&session_id);
     }
@@ -3435,7 +3560,7 @@ mod tests {
             matches!(seen[1], SessionEventKind::MessageDelta { ref delta, .. } if delta == "yz")
         );
         assert!(matches!(seen[2], SessionEventKind::ReasoningDelta { ref text } if text == "abc"));
-        assert_eq!(preview.reasoning[&session_id].text, "abc");
+        assert_eq!(preview.reasoning[&(session_id, None)].text, "abc");
         assert_eq!(preview.messages[&(session_id, message_id)], "xyz");
     }
 
@@ -3738,7 +3863,10 @@ mod tests {
         assert!(
             matches!(preview.accept(resumed, Some("thinking again".len())).unwrap().kind, SessionEventKind::ReasoningTextDelta { ref delta } if delta == " more")
         );
-        assert_eq!(preview.reasoning[&session_id].text, "thinking again more");
+        assert_eq!(
+            preview.reasoning[&(session_id, None)].text,
+            "thinking again more"
+        );
     }
 
     #[tokio::test]
@@ -4524,5 +4652,72 @@ mod tests {
             SessionEventKind::ReasoningDelta { ref text } if text == "new reasoning"
         ));
         assert_eq!(previous, "new reasoning");
+    }
+}
+
+#[cfg(test)]
+mod correlated_reasoning_transport {
+    use super::*;
+
+    // A cursor that keys only by session accepts an old snapshot as the new block.
+    #[test]
+    fn completed_block_cannot_reset_successor_cursor() {
+        let session = Uuid::new_v4();
+        let old = Uuid::new_v4();
+        let current = Uuid::new_v4();
+        let mut cursor = AttachedPreviewCursor::default();
+        for kind in [
+            SessionEventKind::ReasoningBlockStarted { reasoning_id: old },
+            SessionEventKind::ReasoningBlockCompleted { reasoning_id: old },
+            SessionEventKind::ReasoningBlockStarted {
+                reasoning_id: current,
+            },
+        ] {
+            assert!(
+                cursor
+                    .accept(SessionEvent::new(session, 0, kind), None)
+                    .is_some()
+            );
+        }
+        assert!(
+            cursor
+                .accept_store_snapshot(SessionEvent::new(
+                    session,
+                    0,
+                    SessionEventKind::ReasoningBlockSnapshot {
+                        reasoning_id: old,
+                        text: "late".into()
+                    },
+                ))
+                .is_none()
+        );
+        assert!(
+            cursor
+                .accept_store_snapshot(SessionEvent::new(
+                    session,
+                    0,
+                    SessionEventKind::ReasoningBlockSnapshot {
+                        reasoning_id: current,
+                        text: "new".into()
+                    },
+                ))
+                .is_some()
+        );
+        let event = cursor
+            .accept(
+                SessionEvent::new(
+                    session,
+                    0,
+                    SessionEventKind::ReasoningBlockDelta {
+                        reasoning_id: current,
+                        delta: " tail".into(),
+                    },
+                ),
+                Some(3),
+            )
+            .unwrap();
+        assert!(
+            matches!(event.kind, SessionEventKind::ReasoningBlockDelta { reasoning_id, delta } if reasoning_id == current && delta == " tail")
+        );
     }
 }

@@ -47,7 +47,7 @@ impl PostgresAuthority {
         after: u64,
     ) -> Result<Vec<(u64, crate::SessionEvent)>> {
         use sqlx::Row;
-        let rows=sqlx::query("select revision,body,event_json from (select c.revision,c.body,s.event_json from session_live_text_chunks c join session_live_state s using(session_id,live_key) where c.session_id=$1 and c.revision>$2 union all select s.revision,null::bytea,s.event_json from session_live_state s where s.session_id=$1 and s.revision>$2 and s.live_key not like 'message:%' and s.live_key<>'reasoning') live order by revision limit 128")
+        let rows=sqlx::query("select revision,body,event_json from (select c.revision,c.body,s.event_json from session_live_text_chunks c join session_live_state s using(session_id,live_key) where c.session_id=$1 and c.revision>$2 union all select s.revision,null::bytea,s.event_json from session_live_state s where s.session_id=$1 and s.revision>$2 and s.live_key not like 'message:%' and s.live_key<>'reasoning' and s.live_key not like 'reasoning:%') live order by revision limit 128")
             .bind(session).bind(i64::try_from(after)?).fetch_all(&self.pool).await?;
         let mut result = Vec::with_capacity(rows.len());
         let mut bytes = 0;
@@ -64,6 +64,12 @@ impl PostgresAuthority {
                 event.kind = match event.kind {
                     crate::SessionEventKind::Message { message_id, .. } => {
                         crate::SessionEventKind::MessageDelta { message_id, delta }
+                    }
+                    crate::SessionEventKind::ReasoningBlockSnapshot { reasoning_id, .. } => {
+                        crate::SessionEventKind::ReasoningBlockDelta {
+                            reasoning_id,
+                            delta,
+                        }
                     }
                     crate::SessionEventKind::ReasoningDelta { .. } => {
                         crate::SessionEventKind::ReasoningTextDelta { delta }

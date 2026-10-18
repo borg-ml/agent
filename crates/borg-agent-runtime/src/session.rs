@@ -1597,6 +1597,10 @@ fn provider_event_is_progress(event: &SessionEventKind) -> bool {
         | SessionEventKind::ReasoningDelta { .. }
         | SessionEventKind::ReasoningTextDelta { .. }
         | SessionEventKind::ReasoningCompleted
+        | SessionEventKind::ReasoningBlockStarted { .. }
+        | SessionEventKind::ReasoningBlockDelta { .. }
+        | SessionEventKind::ReasoningBlockSnapshot { .. }
+        | SessionEventKind::ReasoningBlockCompleted { .. }
         // Tool calls.
         | SessionEventKind::ToolStarted { .. }
         | SessionEventKind::ToolUpdated { .. }
@@ -4151,6 +4155,7 @@ async fn run_agent_session_store_kernel_inner(
                     }) if command_session_id == session_id => {
                         if let Some(extension_api) = executor.extension_api_snapshot() {
                             dispatcher.configure_extension_api(extension_api)?;
+                        let operation_id = Uuid::new_v4();
                         }
                         let provider_context_compaction = launch.provider == CodingProvider::Codex
                             && subscription_context_reusable
@@ -4177,6 +4182,7 @@ async fn run_agent_session_store_kernel_inner(
                                 payload: serde_json::json!({
                                     "status": "started",
                                     "summary": "Compacting context…",
+                                            "operation_id": operation_id,
                                 }),
                             },
                         )
@@ -4387,6 +4393,7 @@ async fn run_agent_session_store_kernel_inner(
                                         payload: serde_json::json!({
                                             "status": "completed",
                                             "summary": summary,
+                                            "operation_id": operation_id,
                                             "native": executor.uses_native_harness(launch.provider)
                                                 || provider_context_preserved,
                                             "provider_context_preserved":
@@ -4482,6 +4489,7 @@ async fn run_agent_session_store_kernel_inner(
                                         payload: serde_json::json!({
                                             "error": message,
                                         }),
+                                            "operation_id": operation_id,
                                     },
                                 )
                                 .await?;
@@ -4779,6 +4787,7 @@ async fn run_agent_session_store_kernel_inner(
             if provider_context_usage_valid && native_auto_compaction_needed(&state) {
                 let context_tokens = state.usage.context_tokens.unwrap_or_default();
                 let context_window_tokens = state.usage.context_window_tokens.unwrap_or_default();
+                let operation_id = Uuid::new_v4();
                 record(
                     &mut journal,
                     &events,
@@ -4800,6 +4809,7 @@ async fn run_agent_session_store_kernel_inner(
                         payload: serde_json::json!({
                             "status": "started",
                             "summary": "Compacting context…",
+                                    "operation_id": operation_id,
                             "automatic": true,
                             "trigger": "context_threshold",
                         }),
@@ -4861,6 +4871,7 @@ async fn run_agent_session_store_kernel_inner(
                                         payload: serde_json::json!({
                                             "status": "progress",
                                             "summary": format!(
+                                    "operation_id": operation_id,
                                                 "Compacting context: {}/{} passes complete",
                                                 progress.completed_passes,
                                                 progress.total_passes,
@@ -4899,6 +4910,7 @@ async fn run_agent_session_store_kernel_inner(
                                 payload: serde_json::json!({
                                     "status": "completed",
                                     "summary": compaction.summary,
+                                    "operation_id": operation_id,
                                     "native": true,
                                     "automatic": true,
                                     "trigger": "context_threshold",
@@ -4951,6 +4963,7 @@ async fn run_agent_session_store_kernel_inner(
                                 payload: serde_json::json!({
                                     "automatic": true,
                                     "trigger": "context_threshold",
+                                    "operation_id": operation_id,
                                     "context_tokens_before": context_tokens,
                                     "effective_context_window_tokens": context_window_tokens,
                                     "error": message,
@@ -5002,6 +5015,7 @@ async fn run_agent_session_store_kernel_inner(
         {
             let full_context = retained_context
                 .take()
+            let operation_id = Uuid::new_v4();
                 .expect("oversized subscription context was present");
             record(
                 &mut journal,
@@ -5013,6 +5027,7 @@ async fn run_agent_session_store_kernel_inner(
                     payload: serde_json::json!({
                         "status": "started",
                         "summary": "Compacting context…",
+                                "operation_id": operation_id,
                         "automatic": true,
                         "trigger": "provider_input_size",
                     }),
@@ -5056,6 +5071,7 @@ async fn run_agent_session_store_kernel_inner(
                             payload: serde_json::json!({
                                 "status": "completed",
                                 "summary": compaction.summary,
+                                "operation_id": operation_id,
                                 "automatic": true,
                                 "trigger": "provider_input_size",
                                 "retained_messages": retained_tail.len(),
@@ -5100,6 +5116,7 @@ async fn run_agent_session_store_kernel_inner(
                             payload: serde_json::json!({
                                 "automatic": true,
                                 "trigger": "provider_input_size",
+                                "operation_id": operation_id,
                                 "error": format!("{error:#}"),
                                 // The client renders these: history was kept
                                 // whole, and the turn fails on the real cause.
@@ -12158,14 +12175,17 @@ async fn record_provider_event(
     // fragments also update the coalesced state archived at the next boundary.
     if matches!(
         kind,
-        SessionEventKind::MessageDelta { .. } | SessionEventKind::ReasoningTextDelta { .. }
+        SessionEventKind::MessageDelta { .. }
+            | SessionEventKind::ReasoningTextDelta { .. }
+            | SessionEventKind::ReasoningBlockDelta { .. }
     ) {
         let event = SessionEvent::new(session_id, 0, kind);
         let needs_store = match &event.kind {
             SessionEventKind::MessageDelta { message_id, delta } => {
                 !delta.is_empty() && !journal.assistant_row_anchors.contains(message_id)
             }
-            SessionEventKind::ReasoningTextDelta { .. } => true,
+            SessionEventKind::ReasoningTextDelta { .. }
+            | SessionEventKind::ReasoningBlockDelta { .. } => true,
             _ => false,
         };
         let event = if needs_store {
@@ -14548,6 +14568,8 @@ fn provider_event_has_side_effect(kind: &SessionEventKind) -> bool {
             | SessionEventKind::ReasoningTextDelta { .. }
             | SessionEventKind::MessageDelta { .. }
             | SessionEventKind::Message {
+            | SessionEventKind::ReasoningBlockDelta { .. }
+            | SessionEventKind::ReasoningBlockSnapshot { .. }
                 actor: EventActor::Assistant | EventActor::Tool,
                 ..
             }
