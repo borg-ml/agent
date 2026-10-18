@@ -49,8 +49,10 @@ pub struct TimelineProjector {
 
 impl Default for TimelineProjector {
     fn default() -> Self {
-        let mut core = TranscriptCore::default();
-        core.retain_tool_inspection = true;
+        let core = TranscriptCore {
+            retain_tool_inspection: true,
+            ..Default::default()
+        };
         Self {
             session_id: None,
             core,
