@@ -365,7 +365,7 @@ fn windows_archive_root(zip: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<Stri
                 root.is_none(),
                 "Borg release zip contains multiple borg.exe files"
             );
-            root = entry.name().strip_suffix("borg.exe").map(str::to_owned);
+            root = entry.name()?.strip_suffix("borg.exe").map(str::to_owned);
         }
     }
     root.context("Borg release zip does not contain `borg.exe`")

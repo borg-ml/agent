@@ -1145,7 +1145,8 @@ fn extract_runtime(archive_path: &Path, runtime_dir: &Path) -> Result<()> {
         let mut archive = zip::ZipArchive::new(file).context("failed to read Parakeet zip")?;
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index)?;
-            let path = Path::new(entry.name());
+            let name = entry.name()?;
+            let path = Path::new(name.as_ref());
             ensure_safe_archive_path(path)?;
             let destination = staging_dir.join(path);
             if entry.is_dir() {
