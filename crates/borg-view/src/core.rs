@@ -1487,11 +1487,10 @@ impl TranscriptCore {
                 });
                 if self.retain_tool_inspection
                     && let Some(index) = tool_index
+                    && let Some((id, ordinal)) = self.order.identities.get(index)
                 {
-                    if let Some((id, ordinal)) = self.order.identities.get(index) {
-                        self.tool_inspection_outputs
-                            .insert(format!("{id}:{ordinal}"), output.clone());
-                    }
+                    self.tool_inspection_outputs
+                        .insert(format!("{id}:{ordinal}"), output.clone());
                 }
                 let (source_name_for_process, command_for_process) = tool_index
                     .and_then(|index| self.order.get(index))
