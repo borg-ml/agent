@@ -39,6 +39,9 @@ pub(super) struct Request {
 #[serde(tag = "method", rename_all = "snake_case")]
 pub(super) enum Operation {
     Status,
+    ReleaseIdle {
+        idle_seconds: u64,
+    },
     Diagnostics {
         path: PathBuf,
     },
@@ -187,14 +190,15 @@ fn socket_paths_in(base: PathBuf) -> Result<(PathBuf, PathBuf)> {
         meta.file_type().is_dir() && meta.uid() == uid && meta.permissions().mode() & 0o077 == 0,
         "LSP broker directory is not private to this OS user"
     );
-    // V1 used EOF to frame requests, so it cannot detect client abandonment.
-    // Never silently attach a fixed client to an old broker implementation.
-    let socket = dir.join("pool-v2.sock");
+    // V1 lacked cancellation framing; V2 lacks idle cleanup/resource lifecycle.
+    // Never silently attach a fixed client to a broker missing these semantics.
+    // Old live broker processes are not terminated or taken over.
+    let socket = dir.join("pool-v3.sock");
     ensure!(
         socket.as_os_str().len() < 104,
         "LSP broker socket path is too long"
     );
-    Ok((socket, dir.join("election-v2.lock")))
+    Ok((socket, dir.join("election-v3.lock")))
 }
 
 async fn serve(listener: UnixListener) {
@@ -292,8 +296,11 @@ async fn dispatch(request: Request, sessions: Sessions) -> Result<Value> {
         Operation::Status => {
             let mut status = service.status_local().await;
             status["broker_pid"] = Value::from(std::process::id());
-            status["broker_protocol"] = Value::from(2);
+            status["broker_protocol"] = Value::from(3);
             Ok(status)
+        }
+        Operation::ReleaseIdle { idle_seconds } => {
+            Ok(service.release_idle_local(idle_seconds).await)
         }
         Operation::Diagnostics { path } => service.diagnostics_local(&path).await,
         Operation::Hover {
@@ -460,7 +467,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status["broker_pid"], json!(std::process::id()));
-        assert_eq!(status["broker_protocol"], json!(2));
+        assert_eq!(status["broker_protocol"], json!(3));
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("lsp::broker::tests::broker_subprocess_client")

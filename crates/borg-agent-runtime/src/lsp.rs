@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -55,6 +55,11 @@ const PUBLISHED_DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(15);
 /// workspace pass and forced a full (for clangd and rust-analyzer, very
 /// expensive) restart. Keep warm servers long enough to span normal turns.
 const LSP_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+// Reclaim only request-idle servers under host memory pressure, never a busy
+// slot or a queued request holding a client lease. Normal warm TTL stays 10m.
+const LSP_PRESSURE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const LSP_MIN_AVAILABLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_OPEN_DOCUMENTS: usize = 8;
 const LSP_REAPER_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_LSP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WORKSPACE_DIAGNOSTIC_FILES: usize = 4096;
@@ -188,6 +193,7 @@ struct LspClient {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    last_activity: Instant,
     // Reads and writes may be interrupted by tool cancellation, including in
     // the middle of a frame. Keep all consumed/emitted bytes on the client.
     incoming: Vec<u8>,
@@ -197,6 +203,7 @@ struct LspClient {
     supports_pull_diagnostics: bool,
     compilation_configuration: Vec<(PathBuf, u64, std::time::SystemTime)>,
     opened_versions: HashMap<PathBuf, i32>,
+    open_order: VecDeque<PathBuf>,
     // Retain generations after close so late publications cannot match a reopen.
     last_versions: HashMap<PathBuf, i32>,
     published_diagnostics: HashMap<String, Value>,
@@ -213,6 +220,7 @@ struct LspClient {
 struct LspClientSlot {
     client: SharedLspClient,
     last_used: Instant,
+    owners: Vec<std::sync::Weak<Mutex<std::collections::BTreeSet<LspClientKey>>>>,
 }
 
 /// A leased slot is not evidence that a server runs there. Recording the
@@ -394,11 +402,20 @@ impl LspService {
     }
 
     async fn status_local(&self) -> Value {
-        let slots = self.active_clients().await;
+        let slots = self.active_clients(false).await;
         let mut active = Vec::new();
         let mut active_workspaces = Vec::new();
         for (key, shared) in &slots {
             let mut workspace = json!({ "server": key.server_id, "root": key.workspace_root });
+            let last_used = self
+                .clients
+                .lock()
+                .await
+                .get(key)
+                .map(|slot| slot.last_used);
+            if let Some(last_used) = last_used {
+                workspace["idle_seconds"] = json!(last_used.elapsed().as_secs());
+            }
             // Never block on a slot: status must stay answerable while a
             // long workspace pass holds the server.
             match shared.try_lock() {
@@ -407,6 +424,16 @@ impl LspService {
                         active.push(key.server_id);
                     }
                     workspace["state"] = Value::String(state.label().to_string());
+                    if let LspClientState::Ready(client) = &*state {
+                        if let Some(last_used) = last_used {
+                            workspace["idle_seconds"] =
+                                json!(last_used.max(client.last_activity).elapsed().as_secs());
+                        }
+                        workspace["pid"] = json!(client.child.id());
+                        workspace["open_documents"] = json!(client.opened_versions.len());
+                        workspace["rss_bytes"] =
+                            json!(client.child.id().and_then(process_rss_bytes));
+                    }
                     if let LspClientState::Failed(error) = &*state {
                         workspace["error"] = Value::String(error.clone());
                     }
@@ -446,6 +473,62 @@ impl LspService {
             status["recently_stopped"] = Value::Array(recently_stopped);
         }
         status
+    }
+
+    /// Explicit release affects only this service's exclusively leased idle
+    /// slots. Busy/queued requests and other live service owners are preserved.
+    pub async fn release_idle(&self, idle_seconds: u64) -> Result<Value> {
+        let idle_seconds = idle_seconds.max(60);
+        #[cfg(unix)]
+        if let Some(value) = self
+            .shared_request(broker::Operation::ReleaseIdle { idle_seconds })
+            .await?
+        {
+            return Ok(value);
+        }
+        Ok(self.release_idle_local(idle_seconds).await)
+    }
+
+    async fn release_idle_local(&self, idle_seconds: u64) -> Value {
+        let mine = self.leased.lock().await.clone();
+        let mut released = Vec::new();
+        let mut skipped = Vec::new();
+        let mut clients = self.clients.lock().await;
+        clients.retain(|key, slot| {
+            if !mine.contains(key) {
+                return true;
+            }
+            let shared_owner = slot
+                .owners
+                .iter()
+                .filter_map(|owner| owner.upgrade())
+                .any(|owner| !std::sync::Arc::ptr_eq(&owner, &self.leased));
+            let idle_for = slot
+                .client
+                .try_lock()
+                .ok()
+                .map(|state| slot_idle_for(slot, &state));
+            let reason = if shared_owner {
+                Some("shared with another session")
+            } else if idle_for.is_some_and(|idle| idle < Duration::from_secs(idle_seconds.max(60)))
+            {
+                Some("recent analysis")
+            } else if std::sync::Arc::strong_count(&slot.client) != 1 || idle_for.is_none() {
+                Some("active or queued request")
+            } else {
+                None
+            };
+            let record =
+                json!({"server": key.server_id, "root": key.workspace_root, "reason": reason});
+            if reason.is_some() {
+                skipped.push(record);
+                true
+            } else {
+                released.push(record);
+                false
+            } // kill_on_drop owns exactly this child
+        });
+        json!({"released": released, "skipped": skipped, "minimum_idle_seconds": idle_seconds.max(60)})
     }
 
     pub fn supported_status() -> Value {
@@ -503,7 +586,13 @@ impl LspService {
             let slot = clients.entry(key).or_insert_with(|| LspClientSlot {
                 client: std::sync::Arc::new(Mutex::new(LspClientState::NotStarted)),
                 last_used: Instant::now(),
+                owners: Vec::new(),
             });
+            let owner = std::sync::Arc::downgrade(&self.leased);
+            slot.owners.retain(|owner| owner.strong_count() != 0);
+            if !slot.owners.iter().any(|known| known.ptr_eq(&owner)) {
+                slot.owners.push(owner);
+            }
             slot.last_used = Instant::now();
             slot.client.clone()
         };
@@ -512,9 +601,9 @@ impl LspService {
     }
 
     /// Snapshot of every slot, taken under the map lock and released before
-    /// any server is spoken to. Taking the snapshot counts as use: a long
-    /// workspace pass must not leave its own servers looking idle.
-    async fn active_clients(&self) -> Vec<(LspClientKey, SharedLspClient)> {
+    /// any server is spoken to. Analysis snapshots count as use; status does
+    /// not renew TTL, or monitoring would retain idle servers indefinitely.
+    async fn active_clients(&self, touch: bool) -> Vec<(LspClientKey, SharedLspClient)> {
         let leased = self.leased.lock().await.clone();
         let snapshot = {
             let mut clients = self.clients.lock().await;
@@ -523,7 +612,9 @@ impl LspService {
                 .iter_mut()
                 .filter(|(key, _)| leased.contains(*key))
                 .map(|(key, slot)| {
-                    slot.last_used = now;
+                    if touch {
+                        slot.last_used = now;
+                    }
                     (key.clone(), slot.client.clone())
                 })
                 .collect::<Vec<_>>()
@@ -648,7 +739,7 @@ impl LspService {
     }
 
     async fn workspace_symbols_local(&self, query: &str) -> Result<Value> {
-        let clients = self.active_clients().await;
+        let clients = self.active_clients(true).await;
         if clients.is_empty() {
             return Err(self.no_active_server_error().await);
         }
@@ -715,7 +806,7 @@ impl LspService {
             None
         };
 
-        let clients = self.active_clients().await;
+        let clients = self.active_clients(true).await;
         if clients.is_empty() {
             return Err(self.no_active_server_error().await);
         }
@@ -921,6 +1012,7 @@ impl LspClient {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
+            last_activity: Instant::now(),
             incoming: Vec::new(),
             outgoing: Vec::new(),
             outgoing_written: 0,
@@ -928,6 +1020,7 @@ impl LspClient {
             supports_pull_diagnostics: false,
             compilation_configuration: compilation_configuration_stamp(spec, root).await,
             opened_versions: HashMap::new(),
+            open_order: VecDeque::new(),
             last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
             _private_preamble_storage: private_preamble_storage,
@@ -975,6 +1068,15 @@ impl LspClient {
             .await
             .with_context(|| format!("cannot read {}", path.display()))?;
         let was_open = self.opened_versions.contains_key(path);
+        if !was_open && self.opened_versions.len() >= MAX_OPEN_DOCUMENTS {
+            if let Some(oldest) = self.open_order.front().cloned() {
+                let old_uri = Url::from_file_path(&oldest)
+                    .map_err(|_| anyhow::anyhow!("invalid LSP document path"))?;
+                self.close_document(&oldest, old_uri.as_str()).await?;
+            }
+        }
+        self.open_order.retain(|opened| opened != path);
+        self.open_order.push_back(path.to_path_buf());
         let version = self
             .last_versions
             .get(path)
@@ -1019,6 +1121,7 @@ impl LspClient {
         if self.opened_versions.remove(path).is_none() {
             return Ok(());
         }
+        self.open_order.retain(|opened| opened != path);
         self.published_diagnostics.remove(uri);
         self.notify(
             "textDocument/didClose",
@@ -1267,6 +1370,7 @@ impl LspClient {
                 }
             }) => result.with_context(|| format!("{method} timed out")).and_then(|result| result),
         };
+        self.last_activity = Instant::now();
         if result.is_err() {
             // Best effort now; an interrupted write/cancel stays queued and
             // MUST finish before any later request is emitted on this client.
@@ -1353,6 +1457,7 @@ impl LspClient {
     }
 
     async fn write_message(&mut self, message: &Value) -> Result<()> {
+        self.last_activity = Instant::now();
         let body = serde_json::to_vec(message)?;
         // Queue the complete frame before awaiting: didOpen/didClose have
         // already updated document state, even if an older write was paused.
@@ -1416,6 +1521,7 @@ impl LspClient {
                     let message = serde_json::from_slice(&self.incoming[end..end + length])
                         .context("language server returned invalid JSON");
                     self.incoming.drain(..end + length);
+                    self.last_activity = Instant::now();
                     return message;
                 }
             } else if self.incoming.len() >= MAX_HEADER_BYTES {
@@ -1593,15 +1699,24 @@ fn spawn_idle_reaper(
                 return;
             };
             let mut records = Vec::new();
+            let pressure = host_memory_pressure();
             clients.lock().await.retain(|key, slot| {
-                let Some(reason) = lsp_client_reap_reason(key, slot.last_used.elapsed()) else {
-                    return true;
-                };
-                // A slot whose server is mid-request is not idle, whatever
-                // its timestamp says.
-                if slot.client.try_lock().is_err() {
+                // External Arcs include queued requests not yet holding the lock.
+                if std::sync::Arc::strong_count(&slot.client) != 1 {
                     return true;
                 }
+                let Ok(state) = slot.client.try_lock() else {
+                    return true;
+                };
+                let idle_for = slot_idle_for(slot, &state);
+                let reason = lsp_client_reap_reason(key, idle_for).or_else(|| {
+                    (pressure && idle_for >= LSP_PRESSURE_IDLE_TIMEOUT)
+                        .then_some("stopped while idle under host memory pressure")
+                });
+                let Some(reason) = reason else {
+                    return true;
+                };
+                drop(state);
                 records.push(ReapRecord {
                     key: key.clone(),
                     reason,
@@ -1617,6 +1732,43 @@ fn spawn_idle_reaper(
             reaped.drain(..overflow);
         }
     })
+}
+
+fn slot_idle_for(slot: &LspClientSlot, state: &LspClientState) -> Duration {
+    let last_activity = match state {
+        LspClientState::Ready(client) => slot.last_used.max(client.last_activity),
+        _ => slot.last_used,
+    };
+    last_activity.elapsed()
+}
+
+fn host_memory_pressure() -> bool {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                line.strip_prefix("MemAvailable:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+        })
+        .is_some_and(|kib| kib.saturating_mul(1024) < LSP_MIN_AVAILABLE_BYTES)
+}
+
+fn process_rss_bytes(pid: u32) -> Option<u64> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("VmRSS:")?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .map(|kib| kib.saturating_mul(1024))
 }
 
 fn lsp_client_is_expired(idle_for: Duration) -> bool {
@@ -2471,6 +2623,77 @@ mod tests {
         }
     }
 
+    // Product regression: repeatedly observing status must not keep multi-GB
+    // idle indexers alive forever. These pool tests start NO child servers.
+    #[tokio::test]
+    async fn status_observation_does_not_renew_idle_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let service = LspService::new(root.path());
+        let shared = service
+            .lease_client(spec_for_id("clangd").unwrap(), root.path())
+            .await;
+        drop(shared);
+        let key = service.leased.lock().await.iter().next().unwrap().clone();
+        let before = Instant::now() - Duration::from_secs(120);
+        service
+            .clients
+            .lock()
+            .await
+            .get_mut(&key)
+            .unwrap()
+            .last_used = before;
+        let _ = service.status_local().await;
+        assert_eq!(
+            service.clients.lock().await.get(&key).unwrap().last_used,
+            before
+        );
+        let released = service.release_idle_local(60).await;
+        assert_eq!(released["released"].as_array().unwrap().len(), 1);
+    }
+
+    // Product boundary: a cleanup request cannot evict another session's
+    // shared workspace or a request queued on the same server mutex.
+    #[tokio::test]
+    async fn explicit_idle_release_preserves_queued_and_shared_clients() {
+        let root = tempfile::tempdir().unwrap();
+        let first = LspService::new(root.path());
+        let held = first
+            .lease_client(spec_for_id("clangd").unwrap(), root.path())
+            .await;
+        let key = first.leased.lock().await.iter().next().unwrap().clone();
+        first.clients.lock().await.get_mut(&key).unwrap().last_used =
+            Instant::now() - Duration::from_secs(120);
+        assert!(
+            first.release_idle_local(60).await["released"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        drop(held);
+        let second = LspService::new(root.path());
+        drop(
+            second
+                .lease_client(spec_for_id("clangd").unwrap(), root.path())
+                .await,
+        );
+        first.clients.lock().await.get_mut(&key).unwrap().last_used =
+            Instant::now() - Duration::from_secs(120);
+        assert!(
+            first.release_idle_local(60).await["released"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        drop(second);
+        assert_eq!(
+            first.release_idle_local(60).await["released"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn inactive_language_servers_expire_at_the_idle_boundary() {
         assert!(!lsp_client_is_expired(
@@ -2612,7 +2835,7 @@ mod tests {
         );
 
         assert_eq!(
-            restricted.active_clients().await.len(),
+            restricted.active_clients(true).await.len(),
             1,
             "a session reports the servers it leased, not every server on the host"
         );
@@ -2679,6 +2902,7 @@ mod tests {
                 stdin,
                 stdout: BufReader::new(stdout),
                 next_id: 1,
+                last_activity: Instant::now(),
                 incoming: Vec::new(),
                 outgoing: Vec::new(),
                 outgoing_written: 0,
@@ -2686,6 +2910,7 @@ mod tests {
                 supports_pull_diagnostics: false,
                 compilation_configuration: Vec::new(),
                 opened_versions: HashMap::new(),
+                open_order: VecDeque::new(),
                 last_versions: HashMap::new(),
                 published_diagnostics: HashMap::new(),
                 _private_preamble_storage: None,
@@ -2696,6 +2921,7 @@ mod tests {
             LspClientSlot {
                 client: std::sync::Arc::clone(&shared),
                 last_used: Instant::now(),
+                owners: Vec::new(),
             },
         );
 
@@ -2747,7 +2973,10 @@ mod tests {
         assert_eq!(options.pointer("/cargo/allTargets"), Some(&json!(false)));
         // Disabling checkOnSave alone still permits rust-analyzer to compile
         // build.rs helpers/proc macros during indexing (violates source-only work).
-        assert_eq!(options.pointer("/cargo/buildScripts/enable"), Some(&json!(false)));
+        assert_eq!(
+            options.pointer("/cargo/buildScripts/enable"),
+            Some(&json!(false))
+        );
         assert_eq!(options.pointer("/procMacro/enable"), Some(&json!(false)));
         assert_eq!(options.get("checkOnSave"), Some(&json!(false)));
         assert_eq!(options.pointer("/check/allTargets"), Some(&json!(false)));
@@ -2979,6 +3208,7 @@ mod tests {
                     "clangd is not available; install it on PATH".to_string(),
                 ))),
                 last_used: Instant::now(),
+                owners: Vec::new(),
             },
         );
 
@@ -3197,6 +3427,7 @@ mod tests {
             stdout: BufReader::new(child.stdout.take().expect("stdout")),
             child,
             next_id: 1,
+            last_activity: Instant::now(),
             incoming: Vec::new(),
             outgoing: Vec::new(),
             outgoing_written: 0,
@@ -3204,6 +3435,7 @@ mod tests {
             supports_pull_diagnostics: false,
             compilation_configuration: Vec::new(),
             opened_versions: HashMap::new(),
+            open_order: VecDeque::new(),
             last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
             _private_preamble_storage: None,
@@ -3276,6 +3508,7 @@ mod tests {
             stdout: BufReader::new(child.stdout.take().expect("stdout")),
             child,
             next_id: 1,
+            last_activity: Instant::now(),
             incoming: Vec::new(),
             outgoing: Vec::new(),
             outgoing_written: 0,
@@ -3283,6 +3516,7 @@ mod tests {
             supports_pull_diagnostics: false,
             compilation_configuration: Vec::new(),
             opened_versions: HashMap::new(),
+            open_order: VecDeque::new(),
             last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
             _private_preamble_storage: None,
@@ -3369,6 +3603,7 @@ mod tests {
             stdin,
             stdout,
             next_id: 1,
+            last_activity: Instant::now(),
             incoming: Vec::new(),
             outgoing: Vec::new(),
             outgoing_written: 0,
@@ -3376,6 +3611,7 @@ mod tests {
             supports_pull_diagnostics: false,
             compilation_configuration: Vec::new(),
             opened_versions: HashMap::new(),
+            open_order: VecDeque::new(),
             last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
             _private_preamble_storage: None,
@@ -3517,6 +3753,7 @@ w.write(frame({'jsonrpc':'2.0','id':second['id'],'result':'fresh'}));w.flush()
                     stdout: BufReader::new(child.stdout.take().unwrap()),
                     child,
                     next_id: 1,
+                    last_activity: Instant::now(),
                     incoming: Vec::new(),
                     outgoing: Vec::new(),
                     outgoing_written: 0,
@@ -3524,6 +3761,7 @@ w.write(frame({'jsonrpc':'2.0','id':second['id'],'result':'fresh'}));w.flush()
                     supports_pull_diagnostics: false,
                     compilation_configuration: Vec::new(),
                     opened_versions: HashMap::new(),
+                    open_order: VecDeque::new(),
                     last_versions: HashMap::new(),
                     published_diagnostics: HashMap::new(),
                     _private_preamble_storage: None,
@@ -3694,6 +3932,7 @@ read() # didClose cleanup
             stdout: BufReader::new(child.stdout.take().unwrap()),
             child,
             next_id: 1,
+            last_activity: Instant::now(),
             incoming: Vec::new(),
             outgoing: Vec::new(),
             outgoing_written: 0,
@@ -3701,6 +3940,7 @@ read() # didClose cleanup
             supports_pull_diagnostics: false,
             compilation_configuration: Vec::new(),
             opened_versions: HashMap::new(),
+            open_order: VecDeque::new(),
             last_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
             _private_preamble_storage: None,

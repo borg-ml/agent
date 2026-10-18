@@ -3293,6 +3293,19 @@ impl AgentToolDispatcher {
                 let args: LaneWorkspaceArgs = serde_json::from_value(arguments)?;
                 self.call_lane_workspace(args).await
             }
+            "lsp_release_idle" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct ReleaseIdleArgs {
+                    idle_seconds: Option<u64>,
+                }
+                let args: ReleaseIdleArgs = serde_json::from_value(arguments)?;
+                let idle_seconds = args.idle_seconds.unwrap_or(60);
+                if idle_seconds < 60 {
+                    bail!("idle_seconds must be at least 60");
+                }
+                self.lsp.release_idle(idle_seconds).await
+            }
             "lsp_status" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
                 Ok(self.lsp.status().await)
@@ -10221,6 +10234,11 @@ pub fn agent_tool_specs_for_surface(
             "update_plan",
             "Replace your ordered assigned todo projection with revision checking. Omitted items become unassigned, not deleted. Refresh with get_plan after a conflict. Exact call: {\"explanation\":\"optional\",\"plan\":[{\"id\":\"UUID from get_plan\",\"content\":\"concise step\",\"status\":\"pending\"}]}. Call get_plan first, reuse exact UUIDs for existing items, and omit id for new items. Use at most 100 items and 500 characters per content. Multiple items may be in_progress.",
             update_plan_schema,
+        ),
+        tool(
+            "lsp_release_idle",
+            "Release this session's exclusively leased language servers after at least 60 seconds without analysis. Skips active/queued requests and servers shared with other live sessions. Does not stop the broker or other workers' tools.",
+            json!({"type":"object", "properties":{"idle_seconds":{"type":"integer","minimum":60,"default":60}},"additionalProperties":false}),
         ),
         tool(
             "lsp_status",
