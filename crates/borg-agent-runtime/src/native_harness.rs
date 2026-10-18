@@ -65,6 +65,184 @@ const MAX_CONTEXT_LENGTH_RECOVERIES: usize = 2;
 /// session teardown reaps anything that lingers, so this only bounds how long
 /// Escape can feel unresponsive.
 const INTERRUPT_TOOL_CANCEL_DRAIN: Duration = Duration::from_millis(300);
+
+/// Attempts per compaction request, including the first.
+const COMPACTION_ATTEMPTS: usize = 3;
+/// Backstop for one attempt. Passes normally take about a minute; this only
+/// catches a connection that neither delivers nor closes.
+#[cfg(not(test))]
+const COMPACTION_ATTEMPT_LIMIT: Duration = Duration::from_secs(15 * 60);
+#[cfg(test)]
+const COMPACTION_ATTEMPT_LIMIT: Duration = Duration::from_millis(200);
+#[cfg(not(test))]
+const COMPACTION_RETRY_BACKOFF: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(10)];
+#[cfg(test)]
+const COMPACTION_RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(1), Duration::from_millis(1)];
+/// How often streamed output is reported, so the turn watchdog and the
+/// transcript see a working compaction without a row per delta.
+const COMPACTION_LIVENESS_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Lifecycle of one compaction model request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompactionCallState {
+    /// Request sent; nothing received on this attempt yet.
+    Waiting,
+    /// The provider is delivering output on this attempt.
+    Streaming,
+    /// The attempt failed transiently; the next one starts after a backoff.
+    Retrying,
+    Succeeded,
+    Failed,
+}
+
+/// Transitions only; the async driver owns the request and the clock.
+#[derive(Debug)]
+struct CompactionCall {
+    attempt: usize,
+    state: CompactionCallState,
+    last_reported: Option<Instant>,
+}
+
+impl CompactionCall {
+    fn new() -> Self {
+        Self {
+            attempt: 1,
+            state: CompactionCallState::Waiting,
+            last_reported: None,
+        }
+    }
+
+    /// Output arrived. True when it should be reported as liveness.
+    fn on_output(&mut self, now: Instant) -> bool {
+        debug_assert!(matches!(
+            self.state,
+            CompactionCallState::Waiting | CompactionCallState::Streaming
+        ));
+        let first = self.state == CompactionCallState::Waiting;
+        self.state = CompactionCallState::Streaming;
+        let due = first
+            || self
+                .last_reported
+                .is_none_or(|last| now.duration_since(last) >= COMPACTION_LIVENESS_INTERVAL);
+        if due {
+            self.last_reported = Some(now);
+        }
+        due
+    }
+
+    fn on_success(&mut self) {
+        self.state = CompactionCallState::Succeeded;
+    }
+
+    /// The attempt failed. Returns the backoff before the next attempt, or
+    /// `None` when the failure is final: only a lost connection is worth
+    /// repeating, and only a bounded number of times.
+    fn on_failure(&mut self, kind: borg_provider::provider::ProviderErrorKind) -> Option<Duration> {
+        let transient = kind == borg_provider::provider::ProviderErrorKind::ConnectionLost;
+        if !transient || self.attempt >= COMPACTION_ATTEMPTS {
+            self.state = CompactionCallState::Failed;
+            return None;
+        }
+        self.state = CompactionCallState::Retrying;
+        Some(COMPACTION_RETRY_BACKOFF[self.attempt - 1])
+    }
+
+    fn on_retry_started(&mut self) {
+        debug_assert_eq!(self.state, CompactionCallState::Retrying);
+        self.attempt += 1;
+        self.state = CompactionCallState::Waiting;
+        self.last_reported = None;
+    }
+}
+
+/// Drive one compaction request through [`CompactionCall`]: forward streamed
+/// output as liveness, bound each attempt, and retry a lost connection.
+/// Reports go to the turn's event stream as `context_compaction` progress
+/// with a `phase`, which the watchdog counts and the transcript shows.
+async fn drive_compaction_call<T, F, Fut>(
+    provider: crate::CodingProvider,
+    events: Option<(&mpsc::Sender<SessionEventKind>, Uuid)>,
+    mut start: F,
+) -> std::result::Result<T, ProviderCallError>
+where
+    F: FnMut(mpsc::UnboundedSender<ProviderProgress>) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, ProviderCallError>>,
+{
+    let report = |phase: &'static str, attempt: usize, summary: String| async move {
+        if let Some((events, operation_id)) = events {
+            send(
+                events,
+                SessionEventKind::ProviderEvent {
+                    provider,
+                    kind: "context_compaction".into(),
+                    payload: json!({
+                        "operation_id": operation_id,
+                        "status": "progress",
+                        "phase": phase,
+                        "attempt": attempt,
+                        "max_attempts": COMPACTION_ATTEMPTS,
+                        "summary": summary,
+                    }),
+                },
+            )
+            .await;
+        }
+    };
+    let mut call = CompactionCall::new();
+    loop {
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let request = start(progress_tx);
+        tokio::pin!(request);
+        let deadline = tokio::time::sleep(COMPACTION_ATTEMPT_LIMIT);
+        tokio::pin!(deadline);
+        let mut progress_open = true;
+        let result = loop {
+            tokio::select! {
+                biased;
+                result = &mut request => break result,
+                update = progress_rx.recv(), if progress_open => match update {
+                    Some(_) if call.on_output(Instant::now()) => {
+                        report("streaming", call.attempt, "Compacting context… receiving summary".into()).await;
+                    }
+                    Some(_) => {}
+                    None => progress_open = false,
+                },
+                () = &mut deadline => break Err(ProviderCallError {
+                    message: format!(
+                        "context compaction attempt produced no result within {}m",
+                        COMPACTION_ATTEMPT_LIMIT.as_secs() / 60
+                    ),
+                    trace: Box::default(),
+                    session_id: None,
+                    kind: borg_provider::provider::ProviderErrorKind::ConnectionLost,
+                }),
+            }
+        };
+        let error = match result {
+            Ok(value) => {
+                call.on_success();
+                return Ok(value);
+            }
+            Err(error) => error,
+        };
+        let Some(backoff) = call.on_failure(error.kind) else {
+            return Err(error);
+        };
+        tracing::warn!(%error, attempt = call.attempt, "compaction attempt failed; retrying");
+        report(
+            "retrying",
+            call.attempt,
+            format!(
+                "Compacting context… attempt {} of {COMPACTION_ATTEMPTS} failed ({}); retrying",
+                call.attempt,
+                crate::secret_scrub::scrub_secrets(&error.message)
+            ),
+        )
+        .await;
+        tokio::time::sleep(backoff).await;
+        call.on_retry_started();
+    }
+}
 #[derive(Clone)]
 pub(crate) struct NativeHarness {
     model_client: Arc<dyn NativeModelClient>,
@@ -1732,7 +1910,7 @@ impl NativeHarness {
                 };
                 if let Some(summary) = self
                     .compact_in_place(
-                        provider, model, effort, &request, messages, window, &mut usage,
+                        provider, model, effort, &request, messages, window, &mut usage, None,
                     )
                     .await?
                 {
@@ -1876,32 +2054,32 @@ impl NativeHarness {
             );
             let user_message = ModelMessage::user_with_attachments(prompt, attachments);
             let pass_started = Instant::now();
-            let result = self
-                .model_client
-                .model_turn(
-                    provider,
-                    model,
-                    effort,
-                    ModelTurnRequest {
-                        fast,
-                        ultrafast,
-                        request_id: Some(format!("compact:{}", Uuid::new_v4())),
-                        session_id: None,
-                        prompt_cache_key: None,
-                        turn_routing: Default::default(),
-                        messages: vec![
-                            ModelMessage::System {
-                                content: crate::session::COMPACTION_SUMMARY_PROMPT.to_string(),
-                            },
-                            user_message,
-                        ],
-                        tools: Vec::new(),
-                        output_schema: None,
+            let request = ModelTurnRequest {
+                fast,
+                ultrafast,
+                request_id: None,
+                session_id: None,
+                prompt_cache_key: None,
+                turn_routing: Default::default(),
+                messages: vec![
+                    ModelMessage::System {
+                        content: crate::session::COMPACTION_SUMMARY_PROMPT.to_string(),
                     },
-                    None,
-                )
-                .await
-                .map_err(anyhow::Error::new)?;
+                    user_message,
+                ],
+                tools: Vec::new(),
+                output_schema: None,
+            };
+            let result = drive_compaction_call(provider, events, |progress| {
+                let request = ModelTurnRequest {
+                    request_id: Some(format!("compact:{}", Uuid::new_v4())),
+                    ..request.clone()
+                };
+                self.model_client
+                    .model_turn(provider, model, effort, request, Some(progress))
+            })
+            .await
+            .map_err(anyhow::Error::new)?;
             absorb_usage(usage, &result.usage);
             anyhow::ensure!(
                 result.finish_reason == "stop",
@@ -1968,6 +2146,7 @@ impl NativeHarness {
         mut messages: Vec<ModelMessage>,
         context_window_tokens: u64,
         usage: &mut ProviderCallUsage,
+        events: Option<(&mpsc::Sender<SessionEventKind>, Uuid)>,
     ) -> Result<Option<String>> {
         messages.push(ModelMessage::user(
             crate::session::IN_PLACE_COMPACTION_PROMPT,
@@ -1978,16 +2157,20 @@ impl NativeHarness {
             return Ok(None);
         }
         let request = ModelTurnRequest {
-            request_id: Some(format!("compact:{}", Uuid::new_v4())),
             messages,
             // A response schema would shape the checkpoint itself.
             output_schema: None,
             ..prefix.clone()
         };
-        let result = match self
-            .model_client
-            .model_turn(provider, model, effort, request, None)
-            .await
+        let result = match drive_compaction_call(provider, events, |progress| {
+            let request = ModelTurnRequest {
+                request_id: Some(format!("compact:{}", Uuid::new_v4())),
+                ..request.clone()
+            };
+            self.model_client
+                .model_turn(provider, model, effort, request, Some(progress))
+        })
+        .await
         {
             Ok(result) => result,
             Err(error)
@@ -2145,15 +2328,20 @@ impl NativeHarness {
             repair_native_messages(&mut native_messages, turn.provider);
             if validate_native_messages(&native_messages).is_ok() {
                 let request = ModelTurnRequest {
-                    request_id: Some(format!("compact:{}", Uuid::new_v4())),
                     messages: native_messages,
                     output_schema: None,
                     ..prefix.clone()
                 };
-                match self
-                    .model_client
-                    .provider_compaction(turn.provider, model, turn.effort.as_deref(), request)
-                    .await
+                let effort = turn.effort.as_deref();
+                match drive_compaction_call(turn.provider, Some((events, operation_id)), |progress| {
+                    let request = ModelTurnRequest {
+                        request_id: Some(format!("compact:{}", Uuid::new_v4())),
+                        ..request.clone()
+                    };
+                    self.model_client
+                        .provider_compaction(turn.provider, model, effort, request, Some(progress))
+                })
+                .await
                 {
                     Ok(ModelCompactionResult::Unsupported { .. }) => {}
                     Ok(ModelCompactionResult::Compacted(result)) => {
@@ -2245,6 +2433,7 @@ impl NativeHarness {
                     sent,
                     context_window_tokens,
                     &mut compaction_usage,
+                    Some((events, operation_id)),
                 )
                 .await
             }
@@ -2495,6 +2684,7 @@ trait NativeModelClient: Send + Sync {
         _model: &str,
         _effort: Option<&str>,
         _request: ModelTurnRequest,
+        _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
     ) -> std::result::Result<ModelCompactionResult, ProviderCallError> {
         Ok(ModelCompactionResult::Unsupported {
             reason: "route has no native compaction".into(),
@@ -2931,6 +3121,7 @@ impl NativeModelClient for ProviderModelClient {
         model: &str,
         effort: Option<&str>,
         request: ModelTurnRequest,
+        progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
     ) -> std::result::Result<ModelCompactionResult, ProviderCallError> {
         #[cfg(feature = "subscription-adapters")]
         if let Ok(NativeRoute::CodexAccount(account)) = self.route(provider, model) {
@@ -2997,7 +3188,12 @@ impl NativeModelClient for ProviderModelClient {
             loop {
                 tokio::select! {
                     biased;
-                    Some(update) = receiver.recv() => self.record_audit(provider, update).await.map_err(fatal)?,
+                    Some(update) = receiver.recv() => {
+                        if let Some(progress) = &progress {
+                            let _ = progress.send(update.clone());
+                        }
+                        self.record_audit(provider, update).await.map_err(fatal)?
+                    }
                     result = &mut call => {
                         while let Ok(update) = receiver.try_recv() {
                             self.record_audit(provider, update).await.map_err(fatal)?;
@@ -3015,7 +3211,7 @@ impl NativeModelClient for ProviderModelClient {
             }
         }
         #[cfg(not(feature = "subscription-adapters"))]
-        let _ = (provider, model, effort, request);
+        let _ = (provider, model, effort, request, progress);
         Ok(ModelCompactionResult::Unsupported {
             reason: "route has no native compaction".into(),
         })
@@ -5967,10 +6163,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_reuses_the_durable_request_prefix_and_does_not_retry_auth_or_transport_errors()
-     {
+    async fn compaction_reuses_the_durable_request_prefix_and_retries_only_lost_connections() {
         struct Client {
             error: Option<borg_provider::provider::ProviderErrorKind>,
+            calls: std::sync::atomic::AtomicUsize,
         }
         #[async_trait]
         impl NativeModelClient for Client {
@@ -5982,6 +6178,7 @@ mod tests {
                 request: ModelTurnRequest,
                 _: Option<mpsc::UnboundedSender<ProviderProgress>>,
             ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 assert_eq!(effort, Some("high"));
                 assert_eq!(request.prompt_cache_key.as_deref(), Some("lineage-key"));
                 assert_eq!(request.tools.len(), 1);
@@ -6032,8 +6229,12 @@ mod tests {
             Some(borg_provider::provider::ProviderErrorKind::Fatal),
             Some(borg_provider::provider::ProviderErrorKind::ConnectionLost),
         ] {
+            let client = Arc::new(Client {
+                error,
+                calls: Default::default(),
+            });
             let harness = NativeHarness {
-                model_client: Arc::new(Client { error }),
+                model_client: client.clone(),
                 ..NativeHarness::default()
             };
             let result = harness
@@ -6049,6 +6250,13 @@ mod tests {
                     None,
                 )
                 .await;
+            let calls = client.calls.load(std::sync::atomic::Ordering::SeqCst);
+            match error {
+                Some(borg_provider::provider::ProviderErrorKind::ConnectionLost) => {
+                    assert_eq!(calls, COMPACTION_ATTEMPTS)
+                }
+                _ => assert_eq!(calls, 1),
+            }
             if error.is_some() {
                 assert_eq!(result.unwrap_err().to_string(), "stop here");
             } else {
@@ -6057,6 +6265,42 @@ mod tests {
                 assert_eq!(usage.cached_input_tokens, 90);
             }
         }
+    }
+
+    // The incident: a compaction stream that neither delivers nor closes must
+    // be retried, and a working stream must be visible to the turn watchdog.
+    #[tokio::test]
+    async fn compaction_call_retries_a_silent_attempt_and_reports_streaming_output() {
+        let (events, mut received) = mpsc::channel(16);
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result = drive_compaction_call(
+            crate::CodingProvider::Codex,
+            Some((&events, Uuid::nil())),
+            |progress| {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        std::future::pending::<()>().await;
+                    }
+                    let _ = progress.send(ProviderProgress::Narration { text: "x".into() });
+                    tokio::task::yield_now().await;
+                    Ok::<_, ProviderCallError>("checkpoint")
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap(), "checkpoint");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        drop(events);
+        let mut phases = Vec::new();
+        while let Some(SessionEventKind::ProviderEvent { payload, .. }) = received.recv().await {
+            assert_eq!(payload["status"], "progress");
+            phases.push((payload["phase"].as_str().unwrap().to_string(), payload["attempt"].clone()));
+        }
+        assert_eq!(
+            phases,
+            [("retrying".to_string(), json!(1)), ("streaming".to_string(), json!(2))]
+        );
     }
 
     #[test]
@@ -6596,7 +6840,8 @@ mod tests {
                 );
                 let mut calls = self.calls.lock().unwrap();
                 *calls += 1;
-                if *calls == 2 {
+                // Every retry of the second fold fails too.
+                if *calls >= 2 {
                     return Err(ProviderCallError {
                         message: "second fold disconnected".into(),
                         trace: Box::new(ProviderAttemptTrace::default()),
@@ -10904,6 +11149,7 @@ mod tests {
                 _: &str,
                 _: Option<&str>,
                 request: ModelTurnRequest,
+                _: Option<mpsc::UnboundedSender<ProviderProgress>>,
             ) -> std::result::Result<ModelCompactionResult, ProviderCallError> {
                 self.attempts
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

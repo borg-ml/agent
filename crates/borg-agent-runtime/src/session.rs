@@ -1465,10 +1465,14 @@ impl TurnWatchdog {
                 let SessionEventKind::ProviderEvent { payload, .. } = kind else {
                     unreachable!();
                 };
-                let completed = payload["completed_passes"].as_u64().unwrap_or(0);
-                progress &= completed > self.compaction_completed_passes;
-                if progress {
-                    self.compaction_completed_passes = completed;
+                // A request reporting output or a retry is live; a pass
+                // count is live only when it advances.
+                if payload.get("phase").is_none() {
+                    let completed = payload["completed_passes"].as_u64().unwrap_or(0);
+                    progress &= completed > self.compaction_completed_passes;
+                    if progress {
+                        self.compaction_completed_passes = completed;
+                    }
                 }
             }
             _ => {}
@@ -1634,10 +1638,11 @@ fn provider_event_is_progress(event: &SessionEventKind) -> bool {
                         let SessionEventKind::ProviderEvent { payload, .. } = event else {
                             unreachable!();
                         };
-                        matches!(
-                            (payload["completed_passes"].as_u64(), payload["total_passes"].as_u64()),
-                            (Some(completed), Some(total)) if completed > 0 && completed <= total
-                        )
+                        payload.get("phase").is_some()
+                            || matches!(
+                                (payload["completed_passes"].as_u64(), payload["total_passes"].as_u64()),
+                                (Some(completed), Some(total)) if completed > 0 && completed <= total
+                            )
                     }
                     _ => false,
                 }
