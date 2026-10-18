@@ -2277,32 +2277,31 @@ impl NativeHarness {
                             Some(events),
                         )
                         .await;
-                    if let Err(error) = &result {
-                        if retries < 2
-                            && borg_provider::provider::classify_provider_error(error)
-                                == borg_provider::provider::ProviderErrorKind::ContextLength
-                        {
-                            retries += 1;
-                            attempt_window /= 2;
-                            // A real refusal starts a new bounded attempt; its
-                            // completed-pass counter starts from one again.
-                            send(
-                                events,
-                                SessionEventKind::ProviderEvent {
-                                    provider: turn.provider,
-                                    kind: "context_compaction".into(),
-                                    payload: json!({
-                                        "status": "started",
-                                        "automatic": true,
-                                        "trigger": trigger,
-                                        "retry": retries,
-                                        "input_budget_tokens": attempt_window,
-                                    }),
-                                },
-                            )
-                            .await;
-                            continue;
-                        }
+                    if let Err(error) = &result
+                        && retries < 2
+                        && borg_provider::provider::classify_provider_error(error)
+                            == borg_provider::provider::ProviderErrorKind::ContextLength
+                    {
+                        retries += 1;
+                        attempt_window /= 2;
+                        // A real refusal starts a new bounded attempt; its
+                        // completed-pass counter starts from one again.
+                        send(
+                            events,
+                            SessionEventKind::ProviderEvent {
+                                provider: turn.provider,
+                                kind: "context_compaction".into(),
+                                payload: json!({
+                                    "status": "started",
+                                    "automatic": true,
+                                    "trigger": trigger,
+                                    "retry": retries,
+                                    "input_budget_tokens": attempt_window,
+                                }),
+                            },
+                        )
+                        .await;
+                        continue;
                     }
                     break result;
                 }
@@ -10848,18 +10847,20 @@ mod tests {
                                 effective_effort: None,
                             }),
                         };
-                        Ok(ModelCompactionResult::Compacted(ModelTurnResult {
-                            message,
-                            finish_reason: if self.outcome == "truncated" {
-                                "length"
-                            } else {
-                                "stop"
-                            }
-                            .into(),
-                            usage: ProviderCallUsage::default(),
-                            raw_response: Value::Null,
-                            trace: ProviderAttemptTrace::default(),
-                        }))
+                        Ok(ModelCompactionResult::Compacted(Box::new(
+                            ModelTurnResult {
+                                message,
+                                finish_reason: if self.outcome == "truncated" {
+                                    "length"
+                                } else {
+                                    "stop"
+                                }
+                                .into(),
+                                usage: ProviderCallUsage::default(),
+                                raw_response: Value::Null,
+                                trace: ProviderAttemptTrace::default(),
+                            },
+                        )))
                     }
                 }
             }

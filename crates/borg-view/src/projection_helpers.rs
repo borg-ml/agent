@@ -201,13 +201,18 @@ pub fn subagent_snapshot_for_activity(
         {
             snapshot.detail = Some(title.clone());
         }
-        snapshot.lifecycle = Some(if snapshot.status == SubagentStatus::Ready
-            && snapshot.detail.as_deref().is_some_and(ready_detail_is_failure)
-        {
-            SubagentLifecycle::Failed
-        } else {
-            snapshot.lifecycle()
-        });
+        snapshot.lifecycle = Some(
+            if snapshot.status == SubagentStatus::Ready
+                && snapshot
+                    .detail
+                    .as_deref()
+                    .is_some_and(ready_detail_is_failure)
+            {
+                SubagentLifecycle::Failed
+            } else {
+                snapshot.lifecycle()
+            },
+        );
     }
     snapshot
 }
@@ -382,7 +387,10 @@ pub fn borg_control_tool_output_view(
     if let Some(tool) = borg_agent_runtime::subagent_tool(name, input.unwrap_or(&empty))
         && matches!(
             tool,
-            SubagentTool::Configure | SubagentTool::Inspect | SubagentTool::GetGoal | SubagentTool::ControlGoal
+            SubagentTool::Configure
+                | SubagentTool::Inspect
+                | SubagentTool::GetGoal
+                | SubagentTool::ControlGoal
         )
     {
         let value = decoded_tool_output(output)?;

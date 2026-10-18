@@ -17864,8 +17864,7 @@ async fn completed_compaction_passes_refresh_liveness_but_heartbeats_do_not() {
     };
     let mut watchdog = TurnWatchdog::new(TurnPhase::Active);
     for completed in 1..=3 {
-        watchdog.last_output_wall =
-            std::time::SystemTime::now() - PROVIDER_ACTIVE_LIVENESS_TIMEOUT;
+        watchdog.last_output_wall = std::time::SystemTime::now() - PROVIDER_ACTIVE_LIVENESS_TIMEOUT;
         let pass = event(json!({
             "status": "progress", "completed_passes": completed, "total_passes": 3,
             "pass_duration_ms": 20_000,
@@ -17874,8 +17873,7 @@ async fn completed_compaction_passes_refresh_liveness_but_heartbeats_do_not() {
         watchdog.observe(&pass, provider_event_is_progress(&pass));
         assert!(matches!(watchdog.verdict(), WatchdogVerdict::Healthy));
     }
-    watchdog.last_output_wall =
-        std::time::SystemTime::now() - PROVIDER_ACTIVE_LIVENESS_TIMEOUT;
+    watchdog.last_output_wall = std::time::SystemTime::now() - PROVIDER_ACTIVE_LIVENESS_TIMEOUT;
     for payload in [
         json!({"status": "progress"}),
         json!({"status": "progress", "completed_passes": 0, "total_passes": 3}),

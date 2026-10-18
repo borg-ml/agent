@@ -13610,7 +13610,9 @@ async fn forward_child_activity(
                                     | SubagentActivity::Completed { agent }
                                     | SubagentActivity::Stopped { agent }
                                     | SubagentActivity::Failed { agent } => agent.parent_session_id,
-                                    SubagentActivity::SessionEvent { parent_session_id, .. } => *parent_session_id,
+                                    SubagentActivity::SessionEvent {
+                                        parent_session_id, ..
+                                    } => *parent_session_id,
                                 };
                                 if parent.is_some_and(|parent| parent != owner) {
                                     continue;

@@ -1068,12 +1068,13 @@ impl LspClient {
             .await
             .with_context(|| format!("cannot read {}", path.display()))?;
         let was_open = self.opened_versions.contains_key(path);
-        if !was_open && self.opened_versions.len() >= MAX_OPEN_DOCUMENTS {
-            if let Some(oldest) = self.open_order.front().cloned() {
-                let old_uri = Url::from_file_path(&oldest)
-                    .map_err(|_| anyhow::anyhow!("invalid LSP document path"))?;
-                self.close_document(&oldest, old_uri.as_str()).await?;
-            }
+        if !was_open
+            && self.opened_versions.len() >= MAX_OPEN_DOCUMENTS
+            && let Some(oldest) = self.open_order.front().cloned()
+        {
+            let old_uri = Url::from_file_path(&oldest)
+                .map_err(|_| anyhow::anyhow!("invalid LSP document path"))?;
+            self.close_document(&oldest, old_uri.as_str()).await?;
         }
         self.open_order.retain(|opened| opened != path);
         self.open_order.push_back(path.to_path_buf());

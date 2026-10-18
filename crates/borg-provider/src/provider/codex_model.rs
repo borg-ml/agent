@@ -568,7 +568,7 @@ impl CodexModelProvider {
         request.output_schema = None;
         self.model_turn_capped(request, progress, expected_account, None, auth_file, true)
             .await
-            .map(ModelCompactionResult::Compacted)
+            .map(|result| ModelCompactionResult::Compacted(Box::new(result)))
     }
 
     /// Re-send `request` with a minimal output budget so OpenAI resets the

@@ -35,5 +35,5 @@ impl ModelTurnResult {
 #[derive(Debug, Clone)]
 pub enum ModelCompactionResult {
     Unsupported { reason: String },
-    Compacted(ModelTurnResult),
+    Compacted(Box<ModelTurnResult>),
 }
