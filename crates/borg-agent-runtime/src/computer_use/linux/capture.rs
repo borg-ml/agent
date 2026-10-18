@@ -404,6 +404,12 @@ impl Helper {
         )
     }
 
+    /// A fresh full-desktop frame (PPM, decoded).
+    pub(super) fn desktop_rgb(&self) -> Result<Rgb> {
+        let shot = run_bytes(&["grim", "-t", "ppm", "-"], 5)?;
+        Ok(decode_rgb(&shot)?.0)
+    }
+
     /// Locate the window's pixels on a fresh desktop frame. Also returns a new
     /// window capture (decoded, raw) when one was taken.
     pub(super) fn locate_on_desktop(

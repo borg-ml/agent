@@ -858,6 +858,18 @@ impl Helper {
                 let scale = self.window_captures.get(wid).map_or(1.0, |c| c.scale);
                 let point =
                     windows::window_point(*x, *y, (origin.0 as f64, origin.1 as f64), scale);
+                // Located by matching pixels: refuse a target hidden under a
+                // panel or another surface, which would receive the click.
+                if let Some((image, _)) = self.located.get(wid).and_then(|l| l.image.as_ref()) {
+                    let desktop = self.desktop_rgb()?;
+                    let local = ((point.0 as i64) - origin.0, (point.1 as i64) - origin.1);
+                    ensure!(
+                        !windows::point_covered(image, &desktop, origin, local),
+                        "the target point ({}, {}) on the desktop is covered by another surface (a panel, popup or window) and would receive the click instead; scroll/move the window so the target is visible, use the keyboard, or pick a visible point",
+                        g(point.0),
+                        g(point.1)
+                    );
+                }
                 Ok((
                     point,
                     json!({"coordinate_space": "window", "window_origin": [origin.0, origin.1],

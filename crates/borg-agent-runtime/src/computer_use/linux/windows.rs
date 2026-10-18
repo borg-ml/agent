@@ -933,6 +933,29 @@ pub(super) fn locate_window(window: &Rgb, desktop: &Rgb, alpha: Option<&[u8]>) -
     })
 }
 
+/// Whether the window pixels around window-local `point` are hidden on the
+/// desktop by another surface (a panel, notification or other window): the
+/// located window can match overall while a bar covers the strip being clicked.
+pub(super) fn point_covered(window: &Rgb, desktop: &Rgb, origin: (i64, i64), point: (i64, i64)) -> bool {
+    let (mut differ, mut total) = (0usize, 0usize);
+    for dy in -4..=4 {
+        for dx in -4..=4 {
+            let (wx, wy) = (point.0 + dx, point.1 + dy);
+            let (sx, sy) = (origin.0 + wx, origin.1 + wy);
+            if wx < 0 || wy < 0 || wx as usize >= window.width || wy as usize >= window.height
+                || sx < 0 || sy < 0 || sx as usize >= desktop.width || sy as usize >= desktop.height
+            {
+                continue;
+            }
+            let win = window.pixel(wx as usize, wy as usize);
+            let desk = desktop.pixel(sx as usize, sy as usize);
+            total += 1;
+            differ += usize::from(win.iter().zip(desk).any(|(a, b)| a.abs_diff(*b) > 2));
+        }
+    }
+    total > 0 && differ * 2 > total
+}
+
 /// The single MIME type worth restoring after a compositor clobbered the clipboard.
 pub(super) fn clipboard_restore_type(types: &[String]) -> Option<String> {
     for preferred in [
@@ -1382,6 +1405,18 @@ mod tests {
         }
         paste(&mut desktop, &window, (200, 100), (0, 0, 240, 160));
         assert_eq!(at(locate_window(&window, &desktop, None)), Some((200, 100)));
+    }
+
+    #[test]
+    fn a_panel_over_the_click_target_is_reported_as_covered() {
+        let mut noise = Noise(11);
+        let mut desktop = noise.image(400, 300);
+        let window = noise.image(160, 120);
+        paste(&mut desktop, &window, (230, 50), (0, 0, 160, 120));
+        fill(&mut desktop, (0, 0, 400, 60), [20, 20, 20]); // a top bar over the window's menu row
+        assert_eq!(at(locate_window(&window, &desktop, None)), Some((230, 50)));
+        assert!(point_covered(&window, &desktop, (230, 50), (20, 5)));
+        assert!(!point_covered(&window, &desktop, (230, 50), (20, 60)));
     }
 
     #[test]
