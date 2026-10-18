@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.17.0)
+## Unreleased (since 0.17.1)
+
+## 0.17.1 (2026-10-18)
 
 - Upgrade ZIP extraction to fix privileged permission and symlink handling vulnerabilities.
 - Restore CI advisory checks with documented exceptions for unmaintained zbus 5 components required by AT-SPI and GPUI.
