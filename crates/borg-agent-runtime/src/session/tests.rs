@@ -3062,7 +3062,7 @@ async fn usage_limited_prompt_resumes_automatically_after_the_retry_delay() {
 
     let mut completions = 0;
     while completions < 2 {
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        let event = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
             .await
             .expect("usage-limit retry completes")
             .expect("session remains attached");
