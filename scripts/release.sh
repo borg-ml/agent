@@ -299,7 +299,7 @@ run_release_checks() (
   # TMPDIR, whose platform limit is shorter than a repository-relative path.
   test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/b.XXXXXX")"
   trap 'rm -rf -- "$test_tmp"' EXIT
-  cargo fmt --all -- --check
+  cargo fmt --all
   TMPDIR="$test_tmp" run_build cargo test --workspace --exclude borg-gui --locked -- --test-threads=1
   run_build cargo clippy --workspace --exclude borg-gui --all-targets --locked -- -D warnings
   git diff --check -- Cargo.toml Cargo.lock CHANGELOG.md

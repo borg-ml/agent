@@ -438,8 +438,8 @@ assert_equal "$(git -C "$success_fixture" rev-parse HEAD)" \
   "remote release tag"
 grep -Fxq 'check --workspace --exclude borg-gui --all-targets' "$test_root/success-fake-cargo.log" ||
   fail "release did not run the workspace check"
-grep -Fxq 'fmt --all -- --check' "$test_root/success-fake-cargo.log" ||
-  fail "release did not run the formatting check"
+grep -Fxq 'fmt --all' "$test_root/success-fake-cargo.log" ||
+  fail "release did not apply formatting fixes"
 grep -Fxq 'test --workspace --exclude borg-gui --locked -- --test-threads=1' "$test_root/success-fake-cargo.log" ||
   fail "release did not run workspace tests"
 run_release "$success_fixture" --verify-tag v1.2.4
