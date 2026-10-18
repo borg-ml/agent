@@ -901,22 +901,20 @@ impl Watches {
         let entry = entries
             .get_mut(&watch_id)
             .context("watcher not found in this session")?;
-        entry.cancel.cancel();
+        let cancel = entry.cancel.clone();
         let command_running =
             entry.agent.is_none() && !entry.runtime && !entry.attached && entry.info.running;
         let stopped = entry.stopped.clone();
         let mut info = entry.info.clone();
         drop(entries);
         if command_running {
-            // Cancel the detached process as well as its notification task.
-            if let Ok(snapshot) = self
-                .processes
-                .write_stdin(self.session_id, watch_id, None, true, Some(0), Some(1024))
-                .await
-            {
-                ensure!(!snapshot.running, "watcher command did not stop");
-            }
+            // Confirm command termination before cancelling its notification
+            // task. A 2-second exec snapshot is not a terminal acknowledgement.
+            self.processes
+                .terminate_and_wait(self.session_id, watch_id)
+                .await?;
         }
+        cancel.cancel();
         stopped.cancelled().await;
         // An agent watch has no task to clear this, and a command watch's task
         // has already done so by the time its stop token resolves.
