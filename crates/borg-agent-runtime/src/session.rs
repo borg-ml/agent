@@ -2095,6 +2095,8 @@ pub(crate) async fn run_agent_session_with_store_and_writer_and_team(
     session_id: Uuid,
     launch: LaunchSession,
     commands: mpsc::Receiver<HostCommand>,
+    priority_commands: mpsc::Receiver<HostCommand>,
+    interrupt: SessionInterrupt,
     events: mpsc::Sender<SessionEvent>,
     executor: Arc<dyn AgentTurnExecutor>,
     store: Arc<dyn SessionStore>,
@@ -2125,7 +2127,7 @@ pub(crate) async fn run_agent_session_with_store_and_writer_and_team(
         crate::LspPathPolicy::unrestricted(),
         Some(team),
         Vec::new(),
-        None,
+        Some((priority_commands, interrupt)),
     ))
     .await
 }

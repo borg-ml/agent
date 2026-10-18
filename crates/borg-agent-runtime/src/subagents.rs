@@ -4239,6 +4239,7 @@ fn is_shared_work_event(kind: &WorkspaceEventKind) -> bool {
 struct SubagentEntry {
     snapshot: SubagentSnapshot,
     commands: Option<mpsc::Sender<HostCommand>>,
+    control: Option<(mpsc::Sender<HostCommand>, crate::SessionInterrupt)>,
     inbox: Vec<TeamInboxMessage>,
     /// Restored children are metadata-only until an explicit child-directed
     /// action wakes them. This prevents resuming an idle root from silently
@@ -4331,6 +4332,7 @@ impl SubagentTable {
             SubagentEntry {
                 snapshot: snapshot.clone(),
                 commands: None,
+                control: None,
                 inbox: Vec::new(),
                 dormant: false,
                 admitted: false,
@@ -5463,6 +5465,7 @@ impl SubagentCoordinator {
                     SubagentEntry {
                         snapshot: snapshot.clone(),
                         commands: None,
+                        control: None,
                         inbox: Vec::new(),
                         dormant: !snapshot.status.is_terminal() && !recovery_failed,
                         admitted: true,
@@ -5880,6 +5883,7 @@ impl SubagentCoordinator {
                         .expect("existing sidecar remains in the coordinator");
                     entry.snapshot = revived.clone();
                     entry.commands = None;
+                    entry.control = None;
                     entry.dormant = false;
                 }
                 if let Err(error) = self.start_reserved(revived, launch, true).await {
@@ -6006,6 +6010,7 @@ impl SubagentCoordinator {
                 );
                 entry.snapshot = archived.clone();
                 entry.commands = None;
+                entry.control = None;
                 entry.dormant = false;
                 table.task_names.remove(&task_name);
                 table
@@ -6051,6 +6056,7 @@ impl SubagentCoordinator {
                             .activity_tx
                             .send(snapshot_activity(entry.snapshot.clone()));
                         entry.commands = None;
+                        entry.control = None;
                         entry.dormant = false;
                         table.task_names.remove(&archived_name);
                         table.task_names.insert(task_name.clone(), previous_id);
@@ -6087,6 +6093,7 @@ impl SubagentCoordinator {
                     .activity_tx
                     .send(snapshot_activity(entry.snapshot.clone()));
                 entry.commands = None;
+                entry.control = None;
                 entry.dormant = false;
                 table.task_names.remove(&archived_name);
                 table.task_names.insert(task_name, previous_id);
@@ -6156,12 +6163,12 @@ impl SubagentCoordinator {
             if state.0.is_none() && (state.1 || state.2) {
                 return Ok(());
             }
-            if let Some(commands) = state.0
+            if let Some(_commands) = state.0
                 && !stop_sent
             {
                 // The actor can close its receiver before its exit task clears
                 // the table entry. Still wait for that cleanup before reuse.
-                let _ = commands.send(HostCommand::Stop { session_id }).await;
+                let _ = self.stop(&session_id.to_string()).await;
                 stop_sent = true;
             }
             anyhow::ensure!(
@@ -6548,6 +6555,7 @@ impl SubagentCoordinator {
                     let mut table = self.table.lock().await;
                     if let Some(entry) = table.entries.get_mut(&session_id) {
                         entry.commands = None;
+                        entry.control = None;
                         let lifecycle = match revived_from {
                             Some(lifecycle) => {
                                 entry.dormant = false;
@@ -6647,6 +6655,8 @@ impl SubagentCoordinator {
         announce: bool,
     ) -> Result<()> {
         let (command_tx, command_rx) = mpsc::channel(64);
+        let (control_tx, control_rx) = mpsc::channel(8);
+        let interrupt = crate::SessionInterrupt::default();
         let (event_tx, mut event_rx) = mpsc::channel(256);
         let actor_path = child_lock_path(&self.journal_root, snapshot.session_id);
         let actor_session_id = snapshot.session_id;
@@ -6707,6 +6717,7 @@ impl SubagentCoordinator {
                 .get_mut(&snapshot.session_id)
                 .expect("reserved subagent exists");
             entry.commands = Some(command_tx.clone());
+            entry.control = Some((control_tx, interrupt.clone()));
             entry.dormant = false;
             std::mem::take(&mut entry.inbox)
         };
@@ -6723,6 +6734,8 @@ impl SubagentCoordinator {
             actor_session_id,
             launch,
             command_rx,
+            control_rx,
+            interrupt,
             event_tx,
             Arc::clone(&self.executor),
             Arc::clone(&self.store),
@@ -8411,8 +8424,8 @@ impl SubagentCoordinator {
             .iter()
             .map(|(session_id, _)| *session_id)
             .collect::<Vec<_>>();
-        for (session_id, commands) in children {
-            let _ = commands.send(HostCommand::Stop { session_id }).await;
+        for (session_id, _commands) in children {
+            let _ = self.stop(&session_id.to_string()).await;
         }
         let mut warn_at = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -8512,8 +8525,29 @@ impl SubagentCoordinator {
                 .map_err(|_| anyhow::anyhow!("physical host control channel closed"));
         }
         let sender = self.ensure_child_actor(id).await?;
+        let command = command(id);
+        if matches!(
+            command,
+            HostCommand::Interrupt { .. } | HostCommand::Stop { .. }
+        ) {
+            let control = self
+                .table
+                .lock()
+                .await
+                .entries
+                .get(&id)
+                .and_then(|entry| entry.control.clone());
+            if let Some((priority, interrupt)) = control {
+                interrupt.request();
+                return priority.try_send(command).map_err(|error| {
+                    anyhow::anyhow!(
+                        "generation interrupted; could not queue child control: {error}"
+                    )
+                });
+            }
+        }
         sender
-            .send(command(id))
+            .send(command)
             .await
             .map_err(|_| anyhow::anyhow!("subagent command channel closed"))
     }
@@ -9293,6 +9327,8 @@ fn boxed_agent_store_session(
     session_id: Uuid,
     launch: LaunchSession,
     commands: mpsc::Receiver<HostCommand>,
+    priority_commands: mpsc::Receiver<HostCommand>,
+    interrupt: crate::SessionInterrupt,
     events: mpsc::Sender<SessionEvent>,
     executor: Arc<dyn crate::AgentTurnExecutor>,
     store: Arc<dyn SessionStore>,
@@ -9305,6 +9341,8 @@ fn boxed_agent_store_session(
             session_id,
             launch,
             commands,
+            priority_commands,
+            interrupt,
             events,
             executor,
             store,
@@ -12980,6 +13018,7 @@ async fn finish_agent(
     };
     entry.snapshot.transition(lifecycle, detail, None);
     entry.commands = None;
+    entry.control = None;
     if entry.snapshot.status == SubagentStatus::Ready {
         entry.dormant = true;
         return Some(SubagentActivity::Completed {

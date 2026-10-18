@@ -3005,6 +3005,7 @@ async fn configure_agent_self_and_current_uuid_apply_inside_the_live_root_turn()
         .unwrap()
         .unwrap();
     let (commands, receiver) = mpsc::channel(16);
+    let (_priority_commands, priority_receiver) = mpsc::channel(8);
     let (events, mut output) = mpsc::channel(128);
     let server = crate::LocalSessionControlServer::start(
         crate::session_control_socket_path(directory.path(), root),
@@ -3018,6 +3019,8 @@ async fn configure_agent_self_and_current_uuid_apply_inside_the_live_root_turn()
         root,
         request,
         receiver,
+        priority_receiver,
+        crate::SessionInterrupt::default(),
         events,
         executor,
         store.clone(),
@@ -9555,6 +9558,48 @@ async fn wait_agent_times_out_with_a_status_line_per_child_and_accepts_long_wait
     assert_eq!(timeout["maximum"], 1_800_000);
     let args: WaitAgentArgs = serde_json::from_value(json!({})).unwrap();
     assert_eq!(args.timeout(), Duration::from_secs(600));
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn child_cancellation_bypasses_a_full_message_queue() {
+    let (_directory, scratch, coordinator, _root, worker) = waiting_team().await;
+    for stop in [false, true] {
+        let (commands, _received) = mpsc::channel(1);
+        commands
+            .try_send(HostCommand::ClearContext { session_id: worker })
+            .unwrap();
+        let (priority, mut controls) = mpsc::channel(1);
+        let interrupt = crate::SessionInterrupt::default();
+        let mut cancelled = interrupt.subscribe();
+        {
+            let mut table = coordinator.table.lock().await;
+            let entry = table.entries.get_mut(&worker).unwrap();
+            entry.commands = Some(commands);
+            entry.control = Some((priority, interrupt));
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            if stop {
+                coordinator.stop("worker").await
+            } else {
+                coordinator.interrupt("worker").await
+            }
+        })
+        .await
+        .expect("cancellation must not wait for ordinary messages")
+        .unwrap();
+        assert!(
+            cancelled.has_changed().unwrap(),
+            "turn abort signal was not sent"
+        );
+        cancelled.borrow_and_update();
+        let command = controls.recv().await.unwrap();
+        assert!(if stop {
+            matches!(command, HostCommand::Stop { .. })
+        } else {
+            matches!(command, HostCommand::Interrupt { .. })
+        });
+    }
     scratch.discard().await;
 }
 
