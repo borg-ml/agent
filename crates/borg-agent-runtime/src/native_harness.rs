@@ -8,10 +8,10 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use borg_core::compaction::{CompactionBudgetPolicy, EffectiveCompactionBudget};
 use borg_provider::provider::{
-    ModelGateway, ModelInputAttachment, ModelMessage, ModelToolCall, ModelToolDefinition,
-    ModelTurnRequest, ModelTurnResult, OpenAiCompatibleProfile, OpenAiCompatibleProvider,
-    PromptCacheRefresh, ProviderAttemptTrace, ProviderCallError, ProviderInvocation,
-    ProviderProgress, ProviderProgressStream,
+    ModelCompactionResult, ModelGateway, ModelInputAttachment, ModelMessage, ModelToolCall,
+    ModelToolDefinition, ModelTurnRequest, ModelTurnResult, OpenAiCompatibleProfile,
+    OpenAiCompatibleProvider, PromptCacheRefresh, ProviderAttemptTrace, ProviderCallError,
+    ProviderInvocation, ProviderProgress, ProviderProgressStream,
 };
 use borg_provider::{CostBasis, ProviderCallUsage};
 use serde::Deserialize;
@@ -2133,6 +2133,99 @@ impl NativeHarness {
             },
         )
         .await;
+        let retained =
+            retain_recent_native_messages(messages, compaction_budget.keep_recent_tokens);
+        let compact_end = messages.len().saturating_sub(retained.len());
+        if turn.provider == crate::CodingProvider::Codex && compact_end > 1 {
+            let mut native_messages = messages[..compact_end].to_vec();
+            repair_native_messages(&mut native_messages, turn.provider);
+            if validate_native_messages(&native_messages).is_ok() {
+                let request = ModelTurnRequest {
+                    request_id: Some(format!("compact:{}", Uuid::new_v4())),
+                    messages: native_messages,
+                    output_schema: None,
+                    ..prefix.clone()
+                };
+                match self
+                    .model_client
+                    .provider_compaction(turn.provider, model, turn.effort.as_deref(), request)
+                    .await
+                {
+                    Ok(ModelCompactionResult::Unsupported { .. }) => {}
+                    Ok(ModelCompactionResult::Compacted(result)) => {
+                        absorb_usage(usage, &result.usage);
+                        let valid = result.finish_reason == "stop"
+                            && matches!(&result.message,
+                            ModelMessage::Assistant { content: None, tool_calls,
+                                provider_state: Some(borg_core::ModelProviderState::OpenAiResponses { output, .. }), .. }
+                            if tool_calls.is_empty() && output.len() == 1
+                                && output[0]["type"] == "compaction"
+                                && output[0]["encrypted_content"].as_str().is_some_and(|value| !value.is_empty()));
+                        if !valid {
+                            send(events, SessionEventKind::ProviderEvent {
+                                provider: turn.provider, kind: "context_compaction_failed".into(),
+                                payload: json!({"automatic":true, "server_compaction":true,
+                                    "error":"invalid native compaction continuation", "history_preserved":true}),
+                            }).await;
+                            bail!("invalid native compaction continuation; history preserved");
+                        }
+                        let mut replacement = vec![result.message];
+                        replacement.extend(retained);
+                        send(events, SessionEventKind::ProviderEvent {
+                            provider: turn.provider,
+                            kind: "context_compaction".into(),
+                            payload: json!({
+                                "status": "completed", "native": true, "automatic": true,
+                                "server_compaction": true, "trigger": trigger,
+                                "retained_tail": replacement,
+                                "retained_messages": replacement.len(),
+                                "retained_system_override": turn.system_prompt_override,
+                                "retained_request_prefix": crate::NativeRequestPrefix {
+                                    provider: turn.provider, model: model.to_string(),
+                                    system_prompt: match messages.first() {
+                                        Some(ModelMessage::System { content }) => content.clone(),
+                                        _ => String::new(),
+                                    },
+                                    tools: prefix.tools.clone(),
+                                    prompt_cache_key: prefix.prompt_cache_key.clone().unwrap_or_default(),
+                                },
+                                "input_tokens": result.usage.input_tokens,
+                                "cached_input_tokens": result.usage.cached_input_tokens,
+                                "output_tokens": result.usage.output_tokens,
+                                "provider_duration_ms": result.usage.duration_ms,
+                            }),
+                        }).await;
+                        messages.truncate(1);
+                        messages.extend(replacement);
+                        if let Some(warmer) = warmer {
+                            warmer.on_context_changed();
+                        }
+                        send(
+                            events,
+                            SessionEventKind::ContextWindowUpdated {
+                                context_tokens: estimated_messages_tokens(messages),
+                                context_window_tokens,
+                            },
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        send(
+                            events,
+                            SessionEventKind::ProviderEvent {
+                                provider: turn.provider,
+                                kind: "context_compaction_failed".into(),
+                                payload: json!({"automatic": true, "server_compaction": true,
+                                "error": error.to_string(), "history_preserved": true}),
+                            },
+                        )
+                        .await;
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
         let mut compaction_usage = ProviderCallUsage::default();
         let in_place_started = Instant::now();
         let in_place = match sent {
@@ -2385,6 +2478,18 @@ trait NativeModelClient: Send + Sync {
         request: ModelTurnRequest,
         progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError>;
+
+    async fn provider_compaction(
+        &self,
+        _provider: crate::CodingProvider,
+        _model: &str,
+        _effort: Option<&str>,
+        _request: ModelTurnRequest,
+    ) -> std::result::Result<ModelCompactionResult, ProviderCallError> {
+        Ok(ModelCompactionResult::Unsupported {
+            reason: "route has no native compaction".into(),
+        })
+    }
 
     /// This client seen as a prompt-cache refresh route, when it has one.
     ///
@@ -2808,6 +2913,102 @@ impl NativeModelClient for ProviderModelClient {
                 }
             }
         }
+    }
+
+    async fn provider_compaction(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+        effort: Option<&str>,
+        request: ModelTurnRequest,
+    ) -> std::result::Result<ModelCompactionResult, ProviderCallError> {
+        #[cfg(feature = "subscription-adapters")]
+        if let Ok(NativeRoute::CodexAccount(account)) = self.route(provider, model) {
+            let mut request = request;
+            let fatal = |error: anyhow::Error| ProviderCallError {
+                message: error.to_string(),
+                trace: Box::default(),
+                session_id: None,
+                kind: borg_provider::provider::ProviderErrorKind::Fatal,
+            };
+            if !account.starts_with("sha256:") {
+                return Ok(ModelCompactionResult::Unsupported {
+                    reason: "not a Codex subscription".into(),
+                });
+            }
+            let mut matched = false;
+            for message in &request.messages {
+                if let ModelMessage::Assistant {
+                    provider_state: Some(state),
+                    ..
+                } = message
+                {
+                    match state {
+                        borg_core::ModelProviderState::OpenAiResponses {
+                            account_identity: Some(identity),
+                            request_model: Some(origin_model),
+                            ..
+                        } if identity == account && origin_model == model => matched = true,
+                        _ => {
+                            return Ok(ModelCompactionResult::Unsupported {
+                                reason: "history is not from the selected Codex account and model"
+                                    .into(),
+                            });
+                        }
+                    }
+                }
+            }
+            if !matched {
+                return Ok(ModelCompactionResult::Unsupported {
+                    reason: "no native Codex history".into(),
+                });
+            }
+            limit_request_images(&mut request);
+            if request.session_id.is_none() {
+                request.session_id = self
+                    .access
+                    .as_ref()
+                    .map(|access| native_model_session_id(provider, access.session_id));
+            }
+            let adapter = borg_provider::provider::CodexModelProvider {
+                model: model.to_string(),
+                effort: effort
+                    .unwrap_or(borg_provider::codex_default_effort())
+                    .to_string(),
+            };
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let call = adapter.compact_for_account_with_auth(
+                request,
+                Some(sender),
+                account,
+                self.codex_auth_file.clone(),
+            );
+            tokio::pin!(call);
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(update) = receiver.recv() => self.record_audit(provider, update).await.map_err(fatal)?,
+                    result = &mut call => {
+                        while let Ok(update) = receiver.try_recv() {
+                            self.record_audit(provider, update).await.map_err(fatal)?;
+                        }
+                        let mut result = result?;
+                        if let ModelCompactionResult::Compacted(compacted) = &mut result
+                            && compacted.usage.cost_microusd.is_none()
+                        {
+                            borg_provider::models_catalog::ensure_loaded().await;
+                            borg_provider::models_catalog::price_usage("openai", model, &mut compacted.usage, 0);
+                        }
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "subscription-adapters"))]
+        let _ = (provider, model, effort, request);
+        Ok(ModelCompactionResult::Unsupported {
+            reason: "route has no native compaction".into(),
+        })
     }
 
     /// This client does reach a real provider, so it can replay a request.
@@ -4923,7 +5124,7 @@ fn repair_native_messages(messages: &mut Vec<ModelMessage>, provider: crate::Cod
                         if provider == crate::CodingProvider::Codex =>
                     {
                         output.iter().any(|item| {
-                            item["type"] == "reasoning"
+                            matches!(item["type"].as_str(), Some("reasoning" | "compaction"))
                                 && item["encrypted_content"]
                                     .as_str()
                                     .is_some_and(|value| !value.is_empty())
@@ -10589,6 +10790,192 @@ mod tests {
                 assert!(replay.iter().any(|message| matches!(message,
                     ModelMessage::User { content, .. }
                         if content.contains("Previous conversation summary:\n\ncheckpoint"))));
+            }
+        }
+    }
+
+    // Protects native selection, durable opaque replay, and the no-billing-fallback boundary.
+    #[tokio::test]
+    async fn server_compaction_precedes_text_and_only_unsupported_falls_back() {
+        struct Client {
+            outcome: &'static str,
+            attempts: std::sync::atomic::AtomicUsize,
+            text_calls: std::sync::atomic::AtomicUsize,
+            requests: std::sync::Mutex<Vec<Vec<ModelMessage>>>,
+        }
+        #[async_trait]
+        impl NativeModelClient for Client {
+            async fn context_window(&self, _: crate::CodingProvider, _: &str) -> Option<u64> {
+                Some(10_000)
+            }
+            async fn provider_compaction(
+                &self,
+                _: crate::CodingProvider,
+                _: &str,
+                _: Option<&str>,
+                request: ModelTurnRequest,
+            ) -> std::result::Result<ModelCompactionResult, ProviderCallError> {
+                self.attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(matches!(&request.messages[0], ModelMessage::System { .. }));
+                assert_eq!(
+                    &request.messages[1..],
+                    &[ModelMessage::user("x".repeat(40_000))]
+                );
+                match self.outcome {
+                    "unsupported" => Ok(ModelCompactionResult::Unsupported {
+                        reason: "not supported".into(),
+                    }),
+                    "auth" | "rate" => Err(ProviderCallError {
+                        message: self.outcome.into(),
+                        trace: Box::default(),
+                        session_id: None,
+                        kind: borg_provider::provider::ProviderErrorKind::Fatal,
+                    }),
+                    _ => {
+                        let message = ModelMessage::Assistant {
+                            content: None,
+                            reasoning_content: None,
+                            reasoning_details: None,
+                            tool_calls: vec![],
+                            provider_state: Some(borg_core::ModelProviderState::OpenAiResponses {
+                                output: vec![
+                                    json!({"type":"compaction","encrypted_content": if self.outcome == "malformed" { "" } else { "opaque-secret" }}),
+                                ],
+                                account_identity: Some("sha256:account".into()),
+                                request_model: Some("test-model".into()),
+                                request_effort: None,
+                                effective_effort: None,
+                            }),
+                        };
+                        Ok(ModelCompactionResult::Compacted(ModelTurnResult {
+                            message,
+                            finish_reason: if self.outcome == "truncated" {
+                                "length"
+                            } else {
+                                "stop"
+                            }
+                            .into(),
+                            usage: ProviderCallUsage::default(),
+                            raw_response: Value::Null,
+                            trace: ProviderAttemptTrace::default(),
+                        }))
+                    }
+                }
+            }
+            async fn model_turn(
+                &self,
+                _: crate::CodingProvider,
+                _: &str,
+                _: Option<&str>,
+                request: ModelTurnRequest,
+                _: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                self.text_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.outcome == "native" {
+                    assert!(request.messages.iter().any(|message| matches!(message,
+                        ModelMessage::Assistant { provider_state: Some(borg_core::ModelProviderState::OpenAiResponses { output, .. }), .. }
+                            if output[0]["encrypted_content"] == "opaque-secret")));
+                    self.requests.lock().unwrap().push(request.messages.clone());
+                }
+                Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(Some("checkpoint".into()), None, None, vec![]),
+                    finish_reason: "stop".into(),
+                    usage: ProviderCallUsage::default(),
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+        for outcome in [
+            "native",
+            "unsupported",
+            "auth",
+            "rate",
+            "truncated",
+            "malformed",
+        ] {
+            let client = Arc::new(Client {
+                outcome,
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+                text_calls: std::sync::atomic::AtomicUsize::new(0),
+                requests: std::sync::Mutex::new(Vec::new()),
+            });
+            let root = tempfile::tempdir().unwrap();
+            let (events, completed) = run_turn_events(
+                client.clone(),
+                crate::CodingProvider::Codex,
+                root.path().to_path_buf(),
+                Uuid::new_v4(),
+                vec![
+                    ModelMessage::user("x".repeat(40_000)),
+                    ModelMessage::assistant(Some("previous answer".into()), None, None, vec![]),
+                ],
+                HashMap::new(),
+                "live tail",
+                "",
+                "",
+            )
+            .await;
+            assert_eq!(client.attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(completed, matches!(outcome, "native" | "unsupported"));
+            if matches!(outcome, "auth" | "rate" | "truncated" | "malformed") {
+                assert_eq!(
+                    client.text_calls.load(std::sync::atomic::Ordering::SeqCst),
+                    0
+                );
+            }
+            if outcome == "native" {
+                let payload = events
+                    .iter()
+                    .find_map(|event| match event {
+                        SessionEventKind::ProviderEvent { kind, payload, .. }
+                            if kind == "context_compaction"
+                                && payload["server_compaction"] == true =>
+                        {
+                            Some(payload)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(payload.get("summary").is_none());
+                let persisted: Vec<ModelMessage> =
+                    serde_json::from_value(payload["retained_tail"].clone()).unwrap();
+                // Runtime prompt-context messages are appended to the user prompt and
+                // canonicalized before compaction. Rebuild that exact tail from its
+                // pre-boundary evidence rather than assuming a standalone user message.
+                let mut expected_tail = vec![ModelMessage::assistant(
+                    Some("previous answer".into()),
+                    None,
+                    None,
+                    vec![],
+                )];
+                for event in &events {
+                    let SessionEventKind::ProviderEvent { kind, payload, .. } = event else {
+                        continue;
+                    };
+                    if kind == "context_compaction" && payload["status"] == "completed" {
+                        break;
+                    }
+                    if kind == "native_model_message" {
+                        expected_tail.push(serde_json::from_value(payload.clone()).unwrap());
+                    } else if kind == crate::prompt_context::PROMPT_CONTEXT_EVENT {
+                        expected_tail
+                            .push(ModelMessage::user(payload["content"].as_str().unwrap()));
+                    }
+                }
+                canonicalize_native_messages(&mut expected_tail);
+                assert_eq!(&persisted[1..], expected_tail.as_slice());
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(&requests[0][1..], persisted.as_slice());
+                let mut replay = vec![ModelMessage::System {
+                    content: "system".into(),
+                }];
+                replay.extend(persisted.clone());
+                repair_native_messages(&mut replay, crate::CodingProvider::Codex);
+                assert_eq!(&replay[1..], persisted.as_slice());
             }
         }
     }

@@ -17,9 +17,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::{
-    ModelMessage, ModelToolCall, ModelTurnRequest, ModelTurnResult, PromptCacheRefresh,
-    ProviderAttemptTrace, ProviderCallError, ProviderInvocation, ProviderProgress,
-    ProviderProgressStream, StreamedToolAction, apply_provider_request_timeout,
+    ModelCompactionResult, ModelMessage, ModelToolCall, ModelTurnRequest, ModelTurnResult,
+    PromptCacheRefresh, ProviderAttemptTrace, ProviderCallError, ProviderInvocation,
+    ProviderProgress, ProviderProgressStream, StreamedToolAction, apply_provider_request_timeout,
 };
 
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -547,8 +547,28 @@ impl CodexModelProvider {
         expected_account: &str,
         auth_file: Option<std::path::PathBuf>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
-        self.model_turn_capped(request, progress, expected_account, None, auth_file)
+        self.model_turn_capped(request, progress, expected_account, None, auth_file, false)
             .await
+    }
+
+    /// Native Codex V2 compaction over the selected subscription's Responses transport.
+    pub async fn compact_for_account_with_auth(
+        &self,
+        mut request: ModelTurnRequest,
+        progress: Option<UnboundedSender<ProviderProgress>>,
+        expected_account: &str,
+        auth_file: Option<std::path::PathBuf>,
+    ) -> std::result::Result<ModelCompactionResult, ProviderCallError> {
+        // Decide from the admitted identity, not from the mere presence of an API key.
+        if !expected_account.starts_with("sha256:") {
+            return Ok(ModelCompactionResult::Unsupported {
+                reason: "native compaction is enabled only for Codex subscriptions".into(),
+            });
+        }
+        request.output_schema = None;
+        self.model_turn_capped(request, progress, expected_account, None, auth_file, true)
+            .await
+            .map(ModelCompactionResult::Compacted)
     }
 
     /// Re-send `request` with a minimal output budget so OpenAI resets the
@@ -576,9 +596,16 @@ impl CodexModelProvider {
         refresh: PromptCacheRefresh,
         auth_file: Option<std::path::PathBuf>,
     ) -> std::result::Result<ProviderCallUsage, ProviderCallError> {
-        self.model_turn_capped(request, None, expected_account, Some(refresh), auth_file)
-            .await
-            .map(|result| result.usage)
+        self.model_turn_capped(
+            request,
+            None,
+            expected_account,
+            Some(refresh),
+            auth_file,
+            false,
+        )
+        .await
+        .map(|result| result.usage)
     }
 
     async fn model_turn_capped(
@@ -588,6 +615,7 @@ impl CodexModelProvider {
         expected_account: &str,
         refresh: Option<PromptCacheRefresh>,
         auth_file: Option<std::path::PathBuf>,
+        compact: bool,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
         request
             .request_id
@@ -595,6 +623,9 @@ impl CodexModelProvider {
         // See the same guard in `openai_compatible`: a refresh gets its own
         // client request id so an upstream cannot deduplicate it against the
         // real turn and return without refreshing anything.
+        if compact && let Some(id) = request.request_id.as_mut() {
+            id.push_str(":compact");
+        }
         if refresh.is_some()
             && let Some(id) = request.request_id.as_mut()
         {
@@ -619,6 +650,7 @@ impl CodexModelProvider {
             trace.invocation.executable = access.endpoint().into();
             ensure!(access.identity() == expected_account,
                 "OpenAI credentials changed during this turn; retry to use the currently selected account");
+            ensure!(!compact || !access.is_api_key(), "native compaction requires the selected Codex subscription");
             let client = model_http_client(expected_account)?;
             let capabilities = if access.is_api_key() {
                 None
@@ -651,11 +683,15 @@ impl CodexModelProvider {
             if let Some(refresh) = refresh {
                 body["max_output_tokens"] = json!(refresh.max_output_tokens);
             }
+            if compact {
+                body["input"].as_array_mut().context("Codex input is not an array")?
+                    .push(json!({"type": "compaction_trigger"}));
+            }
             let endpoint = access.endpoint();
             publish_model_audit(progress.as_ref(), "native_model_request", json!({
                 "request_id": request.request_id,
                 "session_id": request.session_id,
-                "protocol": "openai_responses",
+                "protocol": "openai_responses", "native_compaction": compact,
                 "model": self.model, "effort": self.effort, "fast": request.fast, "ultrafast": request.ultrafast,
                 "reasoning": body["reasoning"], "text": body.get("text"),
                 "stream_options": body.get("stream_options"),
@@ -675,6 +711,19 @@ impl CodexModelProvider {
             let (mut message, response) = self
                 .send_with_terminal_retries(&client, &mut access, expected_account,
                     &request, (endpoint, &body), progress.as_ref()).await?;
+            if compact {
+                let output = response["output"].as_array().context("Codex compaction output is missing")?;
+                ensure!(response["status"] == "completed"
+                    && output.iter().filter(|item| item["type"] == "compaction").count() == 1,
+                    "Codex native compaction must complete with exactly one compaction item");
+                if let ModelMessage::Assistant { content, reasoning_content, tool_calls,
+                    provider_state: Some(ModelProviderState::OpenAiResponses { output, .. }), .. } = &mut message {
+                    output.retain(|item| item["type"] == "compaction");
+                    *content = None;
+                    *reasoning_content = None;
+                    tool_calls.clear();
+                }
+            }
             if let ModelMessage::Assistant { provider_state: Some(ModelProviderState::OpenAiResponses { account_identity, request_model, request_effort, effective_effort, .. }), .. } = &mut message {
                 *account_identity = Some(expected_account.to_string());
                 *request_model = Some(self.model.clone());
@@ -1718,6 +1767,14 @@ impl ResponseState {
                     ));
                 }
                 Some("reasoning") => {}
+                Some("compaction") => {
+                    ensure!(
+                        item["encrypted_content"]
+                            .as_str()
+                            .is_some_and(|value| !value.is_empty()),
+                        "Codex compaction has no encrypted continuation"
+                    );
+                }
                 _ => bail!("Codex returned an unsupported output item; no tools were executed"),
             }
         }
@@ -1727,6 +1784,7 @@ impl ResponseState {
         // continue from the preserved reasoning instead of failing the turn.
         ensure!(
             !content.is_empty()
+                || output.iter().any(|item| item["type"] == "compaction")
                 || !calls.is_empty()
                 || response_hit_output_limit(&response)
                 || response_completed_without_answer_items(&response, &output),

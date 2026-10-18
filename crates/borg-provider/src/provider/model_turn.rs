@@ -30,3 +30,10 @@ impl ModelTurnResult {
         }
     }
 }
+
+/// Unsupported is a route capability result, never an authentication or quota failure.
+#[derive(Debug, Clone)]
+pub enum ModelCompactionResult {
+    Unsupported { reason: String },
+    Compacted(ModelTurnResult),
+}

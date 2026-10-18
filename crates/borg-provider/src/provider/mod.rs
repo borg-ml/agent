@@ -42,8 +42,8 @@ pub use chat_stream::{
     run_opencode_local_chat_stream,
 };
 pub use model_turn::{
-    ModelFunctionCall, ModelInputAttachment, ModelMessage, ModelToolCall, ModelToolDefinition,
-    ModelTurnRequest, ModelTurnResult, TurnRouting,
+    ModelCompactionResult, ModelFunctionCall, ModelInputAttachment, ModelMessage, ModelToolCall,
+    ModelToolDefinition, ModelTurnRequest, ModelTurnResult, TurnRouting,
 };
 pub use openai_compatible::{ModelGateway, OpenAiCompatibleProfile, OpenAiCompatibleProvider};
 

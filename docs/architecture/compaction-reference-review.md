@@ -32,3 +32,23 @@ This is not a reason to change the human's selected reasoning effort, route,
 subscription, or billing. Running old binaries do not acquire these source
 changes automatically. The active Abundance process was not interrupted or
 reconfigured during diagnosis.
+
+## Native acceleration
+
+Current Codex V2 (`compact_remote_v2_attempt.rs`) appends a
+`compaction_trigger` item to the normal subscription Responses transport. Borg
+uses this only for in-turn automatic compaction of history bound to the same
+selected subscription account and model. It retains the encrypted compaction
+item and recent tail through the existing durable boundary, never converts the
+encrypted continuation to a text summary. Manual/session-idle compaction still
+uses the explicit text-summary path. Unsupported capability alone falls back;
+authentication, quota and malformed-result failures preserve history and surface
+normally, without provider/billing changes.
+
+Claude's official on-demand API describes `compact-2026-09-04`,
+`compaction: {type: summarize}`, a signed compaction block, and model capability
+discovery with that beta. This does not prove support on Borg's subscription
+OAuth endpoint. Its current verified beta allowlist/capability source and stream
+validation do not implement that contract. Leave native Claude compaction off
+until account/model capability and exact signed-block replay are verified. The
+older threshold strategy `compact_20260112` is not the on-demand operation.

@@ -13432,6 +13432,53 @@ fn subscription_compaction_tail_replays_from_the_boundary_event_alone() {
     );
 }
 
+// A restart must restore the encrypted continuation and request head from the boundary alone.
+#[test]
+fn server_compaction_replays_opaque_state_without_a_text_summary() {
+    use borg_provider::provider::ModelMessage;
+    let opaque = ModelMessage::Assistant {
+        content: None,
+        reasoning_content: None,
+        reasoning_details: None,
+        tool_calls: vec![],
+        provider_state: Some(borg_core::ModelProviderState::OpenAiResponses {
+            output: vec![json!({"type":"compaction","encrypted_content":"encrypted-checkpoint"})],
+            account_identity: Some("sha256:account".into()),
+            request_model: Some("test-model".into()),
+            request_effort: Some("high".into()),
+            effective_effort: Some("high".into()),
+        }),
+    };
+    let prefix = crate::NativeRequestPrefix {
+        provider: CodingProvider::Codex,
+        model: "test-model".into(),
+        system_prompt: "original system".into(),
+        tools: vec![],
+        prompt_cache_key: "original-cache".into(),
+    };
+    let tail = vec![opaque, ModelMessage::user("live tail")];
+    let event = SessionEvent::new(
+        Uuid::new_v4(),
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".into(),
+            payload: json!({"status":"completed", "server_compaction":true,
+            "retained_tail":tail, "retained_request_prefix":prefix}),
+        },
+    );
+    let restored: SessionEvent =
+        serde_json::from_slice(&serde_json::to_vec(&event).unwrap()).unwrap();
+    let events = vec![restored];
+    assert_eq!(
+        native_conversation(&events, CodingProvider::Codex).unwrap(),
+        tail
+    );
+    let restored_prefix = native_request_prefix(&events).unwrap();
+    assert_eq!(restored_prefix.system_prompt, "original system");
+    assert_eq!(restored_prefix.prompt_cache_key, "original-cache");
+}
+
 /// Two ways a bounded tail turns into a corrupt one: it can open on a tool
 /// result whose call fell outside the window, which asks the model to trust an
 /// answer to a question it cannot see, and it can carry the prompt this turn is
