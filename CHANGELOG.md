@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.17.0)
 
+- Upgrade ZIP extraction to fix privileged permission and symlink handling vulnerabilities.
+- Restore CI advisory checks with documented exceptions for unmaintained zbus 5 components required by AT-SPI and GPUI.
+
 ## 0.17.0 (2026-10-18)
 
 - Animate active blue background actions with spinners. On actual completion,
