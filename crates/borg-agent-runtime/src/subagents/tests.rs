@@ -11990,3 +11990,22 @@ async fn show_image_stores_a_copy_and_posts_an_assistant_message() {
             .is_err()
     );
 }
+
+// A `pgrep -f` wait loop matches its own shell and never ends: an agent burned
+// ten minutes in one before a human noticed.
+#[test]
+fn self_matching_pgrep_wait_loops_are_recognised() {
+    use super::waits_on_self_matching_pgrep as refused;
+    assert!(refused(
+        r#"while pgrep -f "cargo check --workspace" >/dev/null; do sleep 10; done"#
+    ));
+    assert!(refused("until ! pgrep -af ninja; do sleep 5; done"));
+    assert!(refused(
+        "while /usr/bin/pgrep --full build; do sleep 1; done"
+    ));
+    assert!(!refused("pgrep -af cargo | head"));
+    assert!(!refused("while pgrep cargo; do sleep 1; done"));
+    assert!(!refused(
+        "while read line; do echo $line; done < pgrep-notes.txt"
+    ));
+}

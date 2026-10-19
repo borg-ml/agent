@@ -1610,6 +1610,13 @@ impl AgentToolDispatcher {
             return Ok(result);
         }
         let args = command.expect("a shell call is a command or a process write");
+        ensure!(
+            !waits_on_self_matching_pgrep(&args.cmd),
+            "Refused: this loop waits on `pgrep -f`, which also matches the shell running \
+             this very command (its command line contains the pattern), so it never ends. \
+             Run the awaited command itself in a blocking exec, start it with `async: true` \
+             and await its watcher, or wait on a known PID with `tail --pid=PID -f /dev/null`."
+        );
         let output_token_limit = self.resource_limits.as_ref().map(|limits| {
             usize::try_from((limits.max_workspace_command_output_bytes / 4).max(1))
                 .unwrap_or(usize::MAX)
@@ -12415,6 +12422,27 @@ pub(crate) fn file_mutation_tool_specs() -> Vec<Value> {
 
 /// Seconds slept by a command that does nothing but sleep, optionally
 /// followed by an `echo`: the blind-wait shape, not a pause inside real work.
+/// A `while`/`until` loop polling `pgrep -f`: the shell that runs the command
+/// carries the pattern in its own command line, so the poll always matches it
+/// and the loop never exits.
+fn waits_on_self_matching_pgrep(command: &str) -> bool {
+    let words = command
+        .split(|character: char| character.is_whitespace() || ";&|()`$!".contains(character))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let looping = words.iter().any(|word| matches!(*word, "while" | "until"));
+    looping
+        && words.iter().enumerate().any(|(index, word)| {
+            word.rsplit('/').next() == Some("pgrep")
+                && words[index + 1..]
+                    .iter()
+                    .take_while(|flag| flag.starts_with('-'))
+                    .any(|flag| {
+                        *flag == "--full" || (!flag.starts_with("--") && flag.contains('f'))
+                    })
+        })
+}
+
 fn bare_sleep_seconds(command: &str) -> Option<u64> {
     static BARE_SLEEP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"^\s*sleep\s+(\d+)([smh]?)\s*(?:(?:;|&&)\s*echo\b[^;&|]*)?;?\s*$")
