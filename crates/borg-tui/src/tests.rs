@@ -8823,7 +8823,10 @@ fn agent_roster_lists_running_children_then_all_inactive_states() {
     assert_eq!(rows[1].name, "a_starting");
     assert_eq!(rows[2].name, "z_live");
     assert_eq!(rows[3].name, "b_waiting");
-    assert_eq!(rows[4].name, "idle");
+    let inactive = rows[4..].iter().map(|row| row.name.as_str());
+    assert!(inactive.eq([
+        "tail_d", "tail_c", "tail_b", "tail_a", "older", "oldest", "idle"
+    ]));
     assert!(rows.iter().any(|row| row.state == "stopped"));
     assert!(rows.iter().any(|row| row.state == "failed"));
 
