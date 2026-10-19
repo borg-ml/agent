@@ -182,7 +182,7 @@ Expert-offload flags are present and are central to Phase 3:
 
 ### 1.6 Blu is a real runtime, but is not linked into Borg
 
-Blu (`github.com/borg-ml/blu`, sibling checkout at `../blu`) is a Lua/Luau
+Blu (`github.com/blulang/blu`, sibling checkout at `../blu`) is a Lua/Luau
 runtime, ~110k LOC across 8 crates. Relevant primitives:
 
 - `try_set_global` + `NativeFunctionId` — host injects natives

@@ -474,7 +474,7 @@ the workload.
 
 ## References checked
 
-- [Blu repository](https://github.com/borg-ml/blu)
+- [Blu repository](https://github.com/blulang/blu)
 - [Prime Agent README](https://github.com/PrimeIntellect-ai/prime-agent)
 - [Prime Agent architecture](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/docs/architecture.md)
 - [Prime Agent RLM/IPython model](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/docs/rlm.md)

@@ -14,7 +14,7 @@ Please report what breaks.
 [Русский](docs/ru/README.md) ·
 [Documentation](docs/) ·
 [Architecture](docs/architecture.md) ·
-[Blu language](https://github.com/borg-ml/blu)
+[Blu language](https://github.com/blulang/blu)
 
 ## Install
 
@@ -178,7 +178,7 @@ selection.
 
 ## Extensions
 
-[Blu](https://github.com/borg-ml/blu) is a Lua/Luau superset language and
+[Blu](https://github.com/blulang/blu) is a Lua/Luau superset language and
 runtime that Borg embeds for bounded workflows and live extension packages. A
 package can provide skills, namespaced MCP servers, workflows, or an explicitly
 admitted native runtime.

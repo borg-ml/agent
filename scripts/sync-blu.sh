@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 manifest="$repo_root/Cargo.toml"
-remote="https://github.com/borg-ml/blu.git"
+remote="https://github.com/blulang/blu.git"
 mode="${1:---update}"
 
 case "$mode" in
