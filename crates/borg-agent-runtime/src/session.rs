@@ -3192,6 +3192,7 @@ async fn run_agent_session_store_kernel_inner(
     dispatcher.configure_native_skill_roots(launch.extension_skill_roots.clone());
     let workflow_autonomy_store = autonomy_store.clone();
     let workflow_session_store = dispatcher.session_store();
+    dispatcher.configure_attachment_root(session_root.join(format!("{session_id}.attachments")));
     let agent_tool_server =
         crate::AgentToolServer::start(session_root, session_id, dispatcher.clone()).await?;
     let agent_mcp_server = agent_tool_server.external_mcp_server()?;

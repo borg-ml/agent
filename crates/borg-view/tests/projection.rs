@@ -1813,3 +1813,29 @@ fn late_message_of_the_same_response_does_not_background_a_running_command() {
     let execution = tool_state(&core);
     assert!(!execution.is_backgrounded() && !execution.is_terminal());
 }
+
+// An image an agent shows needs no caption: an empty-text assistant message
+// that carries attachments is content, not a dropped empty reply.
+#[test]
+fn captionless_assistant_image_stays_in_the_transcript() {
+    let session = Uuid::new_v4();
+    let mut reducer = ViewReducer::new(session, "epoch".into());
+    reducer.apply(SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: String::new(),
+            status: MessageStatus::Complete,
+            attachments: vec!["/tmp/shown.png".into()],
+            delivery: None,
+        },
+    ));
+    let snapshot = reducer.snapshot();
+    assert_eq!(snapshot.rows.len(), 1);
+    assert!(matches!(
+        &snapshot.rows[0].body,
+        borg_view::wire::RowBody::Message { attachments, .. } if attachments.len() == 1
+    ));
+}

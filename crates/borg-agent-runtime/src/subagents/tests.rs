@@ -11926,3 +11926,67 @@ async fn reached_nested_guidance_stays_in_the_instructions() {
             .contains("nested rule")
     );
 }
+
+// show_image is how an agent puts a picture in front of the human: the image
+// must be kept in the session store (the source may be a temp file) and land
+// as a visible assistant message.
+#[tokio::test]
+async fn show_image_stores_a_copy_and_posts_an_assistant_message() {
+    let directory = tempdir().unwrap();
+    let png = b"\x89PNG\r\n\x1a\nrest-of-file";
+    std::fs::write(directory.path().join("shot.png"), png).unwrap();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        Uuid::new_v4(),
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    let store = directory.path().join("store");
+    dispatcher.configure_attachment_root(store.clone());
+    let (events, mut received) = tokio::sync::mpsc::channel(4);
+    dispatcher.set_turn_events(&events);
+    dispatcher
+        .call(
+            "show_image",
+            json!({"paths": ["shot.png"], "caption": "look"}),
+        )
+        .await
+        .unwrap();
+    std::fs::remove_file(directory.path().join("shot.png")).unwrap();
+    let Some(SessionEventKind::Message {
+        actor,
+        text,
+        attachments,
+        status,
+        ..
+    }) = received.recv().await
+    else {
+        panic!("show_image posts a message");
+    };
+    assert_eq!(
+        (actor, text.as_str(), status),
+        (EventActor::Assistant, "look", MessageStatus::Complete)
+    );
+    assert_eq!(attachments.len(), 1);
+    assert!(attachments[0].starts_with(&store));
+    assert_eq!(std::fs::read(&attachments[0]).unwrap(), png);
+    assert!(
+        dispatcher
+            .call("show_image", json!({"paths": ["missing.png"]}))
+            .await
+            .is_err()
+    );
+}

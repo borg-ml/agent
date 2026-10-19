@@ -1347,7 +1347,9 @@ impl TranscriptCore {
                     return removed_entry;
                 }
                 if *actor == EventActor::Assistant
-                    && ((text.trim().is_empty() && *status != MessageStatus::InProgress)
+                    && ((text.trim().is_empty()
+                        && attachments.is_empty()
+                        && *status != MessageStatus::InProgress)
                         || assistant_message_is_retired_action_leak(text))
                 {
                     removed_entry = self.remove_message(*message_id);

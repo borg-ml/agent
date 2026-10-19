@@ -517,6 +517,9 @@ pub struct AgentToolDispatcher {
     shell_startups: Arc<RwLock<HashMap<Uuid, CancellationToken>>>,
     /// Nested AGENTS.md/CLAUDE.md files already handed to the model.
     announced_guidance: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+    /// Where images shown to the user are kept for this session, so the
+    /// transcript still renders them after the source file is gone.
+    attachment_root: Arc<RwLock<Option<PathBuf>>>,
     persistent_runtimes: PersistentRuntimeRegistry,
     #[cfg(unix)]
     lanes: crate::lane_tools::LaneTools,
@@ -1186,6 +1189,7 @@ impl AgentToolDispatcher {
             shell_directory: Arc::new(RwLock::new(None)),
             shell_startups: Default::default(),
             announced_guidance: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            attachment_root: Arc::new(RwLock::new(None)),
             persistent_runtimes: PersistentRuntimeRegistry::default(),
             #[cfg(unix)]
             lanes: crate::lane_tools::LaneTools::default(),
@@ -1316,6 +1320,81 @@ impl AgentToolDispatcher {
         // Names this command as the parent of any Borg call it makes.
         environment.insert("BORG_TOOL_CALL_ID".to_string(), Uuid::new_v4().to_string());
         environment
+    }
+
+    pub(crate) fn configure_attachment_root(&self, root: PathBuf) {
+        *self
+            .attachment_root
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(root);
+    }
+
+    /// Copy `paths` into the session's attachment store and post them as an
+    /// assistant message, which the transcript renders as images.
+    async fn show_image(&self, args: ShowImageArgs) -> Result<Value> {
+        const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+        ensure!(
+            (1..=4).contains(&args.paths.len()),
+            "show_image takes one to four image paths"
+        );
+        let root = self
+            .attachment_root
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .context("this session has no attachment store")?;
+        let base = self
+            .shell_directory
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_else(|| self.runtime_root.clone());
+        tokio::fs::create_dir_all(&root)
+            .await
+            .with_context(|| format!("create attachment store {}", root.display()))?;
+        let mut stored = Vec::with_capacity(args.paths.len());
+        for path in &args.paths {
+            let source = base.join(path);
+            let metadata = tokio::fs::metadata(&source)
+                .await
+                .with_context(|| format!("image not found: {}", source.display()))?;
+            ensure!(
+                metadata.is_file() && metadata.len() <= MAX_IMAGE_BYTES,
+                "{} is not a regular file of at most 20 MiB",
+                source.display()
+            );
+            let bytes = tokio::fs::read(&source)
+                .await
+                .with_context(|| format!("read {}", source.display()))?;
+            let extension = image_extension(&bytes).with_context(|| {
+                format!("{} is not a PNG, JPEG, GIF or WebP image", source.display())
+            })?;
+            let target = root.join(format!("{}.{extension}", Uuid::new_v4()));
+            tokio::fs::write(&target, &bytes)
+                .await
+                .with_context(|| format!("store {}", target.display()))?;
+            stored.push(target);
+        }
+        let events = self
+            .turn_events
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(tokio::sync::mpsc::WeakSender::upgrade)
+            .context("show_image is only available during a turn")?;
+        let message_id = Uuid::new_v4();
+        events
+            .send(SessionEventKind::Message {
+                message_id,
+                actor: EventActor::Assistant,
+                text: args.caption.unwrap_or_default(),
+                attachments: stored.clone(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("the turn ended before the image was shown"))?;
+        Ok(json!({ "shown": stored.len(), "message_id": message_id }))
     }
 
     pub(crate) fn set_turn_events(&self, events: &tokio::sync::mpsc::Sender<SessionEventKind>) {
@@ -3360,6 +3439,10 @@ impl AgentToolDispatcher {
                         args.handoff.as_deref(),
                     )
                     .await
+            }
+            "show_image" => {
+                let args: ShowImageArgs = serde_json::from_value(arguments)?;
+                self.show_image(args).await
             }
             "get_plan" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
@@ -10348,6 +10431,25 @@ pub fn agent_tool_specs_for_surface(
             }),
         ),
         tool(
+            "show_image",
+            "Show PNG, JPEG, GIF or WebP images to the human as a message in this session's transcript, with an optional caption. Use it whenever a picture says more than text: captures, renders, plots, diagrams, before/after. A subagent's image appears in its own transcript; to put one in front of the director, also attach it to send_message or followup_task. This does not let you see the pixels yourself; use `borg image PATH` for that. Downscale large images to at most 1600 px first.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "description": "Image files, absolute or relative to the current directory."
+                    },
+                    "caption": { "type": "string", "description": "Text shown with the images." }
+                },
+                "required": ["paths"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
             "get_plan",
             "Get the current durable task plan. Call with {} before changing an existing plan.",
             json!({
@@ -11817,6 +11919,29 @@ async fn call_autonomy_tool(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShowImageArgs {
+    paths: Vec<String>,
+    #[serde(default)]
+    caption: Option<String>,
+}
+
+/// The file extension for an image the transcript can render, from its bytes.
+fn image_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("jpg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
 fn goal_response(
     response: std::result::Result<crate::SessionGoalToolResponse, String>,
 ) -> Result<Value> {
@@ -11967,8 +12092,9 @@ pub(crate) fn exec_tool_spec() -> Value {
 /// The schemas are the catalog's own, taken by name rather than rewritten here.
 /// A second copy of a description is a second thing to forget to update, and
 /// these are descriptions the runtime already depends on.
-pub(crate) fn promoted_capability_tools() -> [&'static str; 13] {
+pub(crate) fn promoted_capability_tools() -> [&'static str; 14] {
     [
+        "show_image",
         "get_goal",
         "create_goal",
         "update_goal",
