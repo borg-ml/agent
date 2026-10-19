@@ -2131,44 +2131,48 @@ impl AgentToolDispatcher {
         .await?;
         appendix.push_str(&crate::imported_memory::prompt_appendix(&self.runtime_root).await?);
         appendix.push_str(&self.reached_guidance_appendix());
+        appendix.push_str(&self.goal_appendix().await);
         Ok(appendix)
     }
 
-    /// The active goal and current plan, restated after a mid-turn context
-    /// compaction so neither depends on the summary having kept it. Empty
-    /// when there is no unfinished goal and no plan.
-    pub(crate) async fn compaction_work_state(&self) -> String {
-        let mut text = String::new();
-        if let Ok(response) = self.goals.call(SessionGoalToolRequest::Get).await
-            && let Some(goal) = response.goal
-            && goal.status != crate::GoalStatus::Complete
-        {
-            text.push_str(&format!(
-                "Session goal ({}).\n\n{}",
+    /// The unfinished session goal, carried with the turn context so it is
+    /// in front of the model on every turn, not only goal continuations, and
+    /// restated with that context after a mid-turn compaction.
+    async fn goal_appendix(&self) -> String {
+        let Ok(response) = self.goals.call(SessionGoalToolRequest::Get).await else {
+            return String::new();
+        };
+        match response.goal {
+            Some(goal) if goal.status != crate::GoalStatus::Complete => format!(
+                "\n\n## Session goal ({})\n{}",
                 crate::session::goal_status_name(goal.status),
                 crate::session::goal_objective_block(&goal)
+            ),
+            _ => String::new(),
+        }
+    }
+
+    /// The current plan, restated after a mid-turn context compaction so it
+    /// does not depend on the summary having kept it. The goal needs no
+    /// restatement here: it rides the harness context slot.
+    pub(crate) async fn compaction_plan_state(&self) -> String {
+        let Ok(response) = self.todos.call(SessionTodoToolRequest::Get).await else {
+            return String::new();
+        };
+        if response.items.is_empty() {
+            return String::new();
+        }
+        let mut text = format!(
+            "Context was compacted mid-turn; current plan (revision {}) restated by the harness:",
+            response.revision
+        );
+        for item in &response.items {
+            text.push_str(&format!(
+                "\n- [{:?}] {} ({})",
+                item.status, item.content, item.id
             ));
         }
-        if let Ok(response) = self.todos.call(SessionTodoToolRequest::Get).await
-            && !response.items.is_empty()
-        {
-            if !text.is_empty() {
-                text.push_str("\n\n");
-            }
-            text.push_str(&format!("Current plan (revision {}):", response.revision));
-            for item in &response.items {
-                text.push_str(&format!(
-                    "\n- [{:?}] {} ({})",
-                    item.status, item.content, item.id
-                ));
-            }
-        }
-        if text.is_empty() {
-            return text;
-        }
-        format!(
-            "Context was compacted mid-turn; durable work state restated by the harness.\n\n{text}"
-        )
+        text
     }
 
     /// Nested AGENTS.md/CLAUDE.md files the session has already reached,

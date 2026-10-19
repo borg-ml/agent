@@ -5011,8 +5011,8 @@ fn command_result_for_model(output: &str) -> String {
 
 /// Re-deliver what the model must not lose after a mid-turn summary: the
 /// turn's instruction slots, which were sent once at turn start and fell out
-/// with the summarized history, and the live goal and plan, which otherwise
-/// survive only if the summary happened to mention them. Each is journaled
+/// with the summarized history (the goal rides the harness slot), and the
+/// live plan, which otherwise survives only if the summary mentioned it. Each is journaled
 /// after the boundary so a replay rebuilds the same request.
 async fn restate_after_compaction(
     turn: &AgentTurn,
@@ -5031,9 +5031,9 @@ async fn restate_after_compaction(
         record_prompt_context(events, turn.provider, *slot, content).await?;
         messages.push(ModelMessage::user(content.clone()));
     }
-    let work_state = turn.agent_tools.compaction_work_state().await;
-    if !work_state.is_empty() {
-        let message = ModelMessage::user(work_state);
+    let plan = turn.agent_tools.compaction_plan_state().await;
+    if !plan.is_empty() {
+        let message = ModelMessage::user(plan);
         record_native_message(events, turn.provider, &message).await?;
         messages.push(message);
     }
