@@ -320,6 +320,10 @@ struct NativeCompactionContext<'a> {
     /// after the provider has already refused for context length, where the
     /// estimate is demonstrably wrong or its window unknown.
     force: bool,
+    /// The turn's instruction slots (project guidance, skills, harness and
+    /// provider/team state) as the model holds them. They were sent once at
+    /// turn start, so a mid-turn summary drops them unless restated.
+    restated_context: &'a [(ContextSlot, String)],
 }
 
 impl NativeHarness {
@@ -855,6 +859,17 @@ impl NativeHarness {
             .prompt_context_base
             .get(&ContextSlot::Subagents)
             .cloned();
+        let restated_context = [
+            (ContextSlot::Instructions, varying_instructions.clone()),
+            (ContextSlot::Harness, harness_prompt_appendix.clone()),
+            (
+                ContextSlot::ProviderStatus,
+                turn.volatile_system_prompt_appendix.clone(),
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, content)| !content.trim().is_empty())
+        .collect::<Vec<_>>();
         for (slot, current) in [
             (ContextSlot::Instructions, varying_instructions),
             (ContextSlot::Harness, harness_prompt_appendix),
@@ -1022,6 +1037,7 @@ impl NativeHarness {
                         earlier_tool_calls: &earlier_tool_calls,
                         prefix: &request_template,
                         force: false,
+                        restated_context: &restated_context,
                     },
                 )
                 .await?;
@@ -1180,6 +1196,7 @@ impl NativeHarness {
                             earlier_tool_calls: &earlier_tool_calls,
                             prefix: &request_template,
                             force: true,
+                            restated_context: &restated_context,
                         },
                     )
                     .await?;
@@ -1415,6 +1432,7 @@ impl NativeHarness {
                                 earlier_tool_calls: &earlier_tool_calls,
                                 prefix: &request_template,
                                 force: false,
+                                restated_context: &restated_context,
                             },
                         )
                         .await;
@@ -1795,6 +1813,7 @@ impl NativeHarness {
                     earlier_tool_calls: &earlier_tool_calls,
                     prefix: &request_template,
                     force: false,
+                    restated_context: &restated_context,
                 },
             )
             .await?;
@@ -2238,6 +2257,7 @@ impl NativeHarness {
             earlier_tool_calls,
             prefix,
             force,
+            restated_context,
         } = context;
         send(
             events,
@@ -2415,6 +2435,7 @@ impl NativeHarness {
                         }).await;
                         messages.truncate(1);
                         messages.extend(replacement);
+                        restate_after_compaction(turn, events, messages, restated_context).await?;
                         if let Some(warmer) = warmer {
                             warmer.on_context_changed();
                         }
@@ -2618,6 +2639,7 @@ impl NativeHarness {
             record_native_message(events, turn.provider, message).await?;
         }
         messages.extend(retained);
+        restate_after_compaction(turn, events, messages, restated_context).await?;
         canonicalize_native_messages(messages);
         send(
             events,
@@ -4985,6 +5007,37 @@ fn command_result_for_model(output: &str) -> String {
     } else {
         output.to_string()
     }
+}
+
+/// Re-deliver what the model must not lose after a mid-turn summary: the
+/// turn's instruction slots, which were sent once at turn start and fell out
+/// with the summarized history, and the live goal and plan, which otherwise
+/// survive only if the summary happened to mention them. Each is journaled
+/// after the boundary so a replay rebuilds the same request.
+async fn restate_after_compaction(
+    turn: &AgentTurn,
+    events: &mpsc::Sender<SessionEventKind>,
+    messages: &mut Vec<ModelMessage>,
+    restated_context: &[(ContextSlot, String)],
+) -> Result<()> {
+    for (slot, content) in restated_context {
+        // A short turn's retained tail can still hold the slot verbatim.
+        let retained = messages.iter().skip(1).any(|message| {
+            matches!(message, ModelMessage::User { content: held, .. } if held == content)
+        });
+        if retained {
+            continue;
+        }
+        record_prompt_context(events, turn.provider, *slot, content).await?;
+        messages.push(ModelMessage::user(content.clone()));
+    }
+    let work_state = turn.agent_tools.compaction_work_state().await;
+    if !work_state.is_empty() {
+        let message = ModelMessage::user(work_state);
+        record_native_message(events, turn.provider, &message).await?;
+        messages.push(message);
+    }
+    Ok(())
 }
 
 async fn record_native_message(
@@ -10914,6 +10967,13 @@ mod tests {
 
         let client = Arc::new(Recording::default());
         let root = tempfile::tempdir().unwrap();
+        // Larger than the retained tail, so only a restatement can carry it
+        // past the summary.
+        std::fs::write(
+            root.path().join("AGENTS.md"),
+            "standing project rule ".repeat(6_000),
+        )
+        .unwrap();
         let (events, completed) = run_turn_events(
             client.clone(),
             crate::CodingProvider::Codex,
@@ -10982,6 +11042,27 @@ mod tests {
         canonicalize_native_messages(&mut replay);
         let last = requests.last().unwrap();
         assert_eq!(&replay[..replay.len() - 1], &last.messages[1..]);
+        // The project guidance went out once at turn start; the summary
+        // replaced that history, so the request after it must restate it.
+        let summary_at = last
+            .messages
+            .iter()
+            .position(|message| {
+                matches!(message, ModelMessage::User { content, .. }
+                if content.starts_with("Previous conversation summary"))
+            })
+            .expect("the request after compaction starts from the summary");
+        let restated = last.messages[summary_at..]
+            .iter()
+            .filter(|message| {
+                matches!(message,
+                ModelMessage::User { content, .. } if content.contains("standing project rule"))
+            })
+            .count();
+        assert_eq!(
+            restated, 1,
+            "guidance restated exactly once after the summary"
+        );
         let next = turn_start_context_budget(&replay, WINDOW, restored, true, 500);
         assert_eq!(next.context_tokens, 10_600);
         assert!(

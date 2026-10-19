@@ -11900,16 +11900,29 @@ async fn reached_nested_guidance_stays_in_the_instructions() {
         crate::native_process::ProcessManager::default(),
         PermissionMode::FullAccess,
     );
-    assert!(!dispatcher.reached_guidance_appendix().contains("nested rule"));
+    assert!(
+        !dispatcher
+            .reached_guidance_appendix()
+            .contains("nested rule")
+    );
     let first = dispatcher
         .call("exec", json!({"cmd": "ls nested", "blocking": true}))
         .await
         .unwrap();
-    assert!(first["project_guidance"].as_str().unwrap().contains("nested rule"));
+    assert!(
+        first["project_guidance"]
+            .as_str()
+            .unwrap()
+            .contains("nested rule")
+    );
     let second = dispatcher
         .call("exec", json!({"cmd": "ls nested", "blocking": true}))
         .await
         .unwrap();
     assert!(second.get("project_guidance").is_none());
-    assert!(dispatcher.reached_guidance_appendix().contains("nested rule"));
+    assert!(
+        dispatcher
+            .reached_guidance_appendix()
+            .contains("nested rule")
+    );
 }
