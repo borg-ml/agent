@@ -9875,8 +9875,10 @@ fn input_redraw_measures_history_at_the_committed_frame_width() {
     assert_eq!(transcript_frame_width(100, true, Some(98)), 98);
     // History that fit on screen was committed ungutted and stays ungutted.
     assert_eq!(transcript_frame_width(100, true, Some(100)), 100);
-    // An ordinary frame always measures full width and decides for itself.
-    assert_eq!(transcript_frame_width(100, false, Some(98)), 100);
+    // An ordinary frame keeps overflowing history guttered, but re-measures
+    // history that fit at full width.
+    assert_eq!(transcript_frame_width(100, false, Some(98)), 98);
+    assert_eq!(transcript_frame_width(100, false, Some(100)), 100);
     // Nothing committed yet, so there is no width to hold on to.
     assert_eq!(transcript_frame_width(100, true, None), 100);
     // A width from a terminal this narrow no longer belongs to: measure afresh.

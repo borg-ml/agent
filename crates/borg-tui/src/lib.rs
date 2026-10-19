@@ -16911,11 +16911,12 @@ fn transcript_frame_width(
     input_fast_path: bool,
     committed_width: Option<usize>,
 ) -> usize {
+    // Overflowing history stays guttered. Measuring it ungutted first laid
+    // out a newly viewed agent's whole transcript a second time.
     committed_width
-        .filter(|_| input_fast_path)
         .filter(|width| {
-            *width == transcript_width_without_gutter(content_width)
-                || *width == transcript_width_with_gutter(content_width)
+            *width == transcript_width_with_gutter(content_width)
+                || (input_fast_path && *width == transcript_width_without_gutter(content_width))
         })
         .unwrap_or_else(|| transcript_width_without_gutter(content_width))
 }

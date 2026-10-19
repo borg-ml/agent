@@ -92,20 +92,35 @@ pub(super) fn tool_body_lines(
 ) -> Vec<Line<'static>> {
     let prefix_width = UnicodeWidthStr::width(prefix);
     let content_width = width.saturating_sub(prefix_width).max(1);
-    let mut lines = match language {
-        "json" => json_tree_lines(source, content_width)
-            .unwrap_or_else(|| code_block_lines(language, source, content_width)),
-        "text" => plain_lines(source, content_width),
-        _ => code_block_lines(language, source, content_width),
-    };
     let is_diff = matches!(language.split(':').next(), Some("diff" | "patch" | "udiff"));
-    let hidden = if is_diff && lines.len() > INLINE_DIFF_PREVIEW_ROWS {
-        let hidden = lines.len() - INLINE_DIFF_PREVIEW_ROWS;
-        lines.truncate(INLINE_DIFF_PREVIEW_ROWS);
-        hidden
+    let (mut lines, mut hidden) = if is_diff {
+        // Highlighting a whole command's diff output only to keep its first
+        // rows made the first render of a busy agent take seconds.
+        let mut take = INLINE_DIFF_PREVIEW_ROWS + 1;
+        loop {
+            let end = source
+                .match_indices('\n')
+                .nth(take - 1)
+                .map_or(source.len(), |(index, _)| index + 1);
+            let lines = code_block_lines(language, &source[..end], content_width);
+            if lines.len() > INLINE_DIFF_PREVIEW_ROWS || end == source.len() {
+                break (lines, source[end..].lines().count());
+            }
+            take *= 2;
+        }
     } else {
-        0
+        let lines = match language {
+            "json" => json_tree_lines(source, content_width)
+                .unwrap_or_else(|| code_block_lines(language, source, content_width)),
+            "text" => plain_lines(source, content_width),
+            _ => code_block_lines(language, source, content_width),
+        };
+        (lines, 0)
     };
+    if lines.len() > INLINE_DIFF_PREVIEW_ROWS && is_diff {
+        hidden += lines.len() - INLINE_DIFF_PREVIEW_ROWS;
+        lines.truncate(INLINE_DIFF_PREVIEW_ROWS);
+    }
     let mut lines: Vec<_> = lines
         .into_iter()
         .map(|mut line| {
