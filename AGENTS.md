@@ -31,6 +31,10 @@
 
 ## Long-running work and version control
 
+- Commit and push every finished change to `origin/main` before reporting it
+  done, without waiting to be asked. A change that exists only in the working
+  tree is not delivered: end each task with the commit and push (or state the
+  concrete blocker), and run the relevant tests first so the push is not broken.
 - Work on `main` unless the user explicitly requests another workflow.
 - During long-running agent work, commit coherent units of progress frequently
   and push them to `origin/main` so work stays visible and recoverable.
