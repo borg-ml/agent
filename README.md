@@ -1,19 +1,20 @@
 # Borg Agent
 
-Borg Agent is a Rust-based agent harness and orchestrator. It provides a
-terminal and native GPUI frontends, durable sessions, native tools, provider
-adapters, and optional remote hosts. Releases include the `borg` CLI; the
-experimental `borg-gui` frontend is developed and built separately.
+Borg Agent is a Rust agent harness and orchestrator. It runs coding agents on
+your choice of model provider, with durable resumable sessions, a shell-first
+tool surface, subagents and teams, and optional remote hosts. Releases ship the
+`borg` CLI with its terminal UI; the experimental native `borg-gui` frontend is
+built from source.
 
-**Beta.** Borg Agent is pre-1.0: usable and feature-complete for everyday work,
-with rough edges expected. Please report what breaks.
+**Beta.** Borg Agent is pre-1.0: usable for everyday work, with rough edges.
+Please report what breaks.
 
 [简体中文](docs/zh-Hans/README.md) ·
 [Español](docs/es/README.md) ·
-[Русский](docs/ru/README.md) · 
-[Blu language](https://github.com/borg-ml/blu) ·
+[Русский](docs/ru/README.md) ·
 [Documentation](docs/) ·
-[Backend architecture](docs/architecture.md)
+[Architecture](docs/architecture.md) ·
+[Blu language](https://github.com/borg-ml/blu)
 
 ## Install
 
@@ -29,204 +30,154 @@ Windows PowerShell:
 irm https://borg.ml/install.ps1 | iex
 ```
 
-The installer chooses the platform and CPU, verifies the release checksum, and
-installs `borg` in a user-local binary directory. Run `borg update` to update
-an existing installation. The native GUI is experimental and is built from
-source separately.
+The installer picks your platform and CPU, verifies the release checksum, and
+installs `borg` in a user-local binary directory. `borg update` updates an
+existing installation.
 
-## Use Borg
-
-Run `borg` or `borg agent` to start an interactive session. Useful commands
-include:
+## Quick start
 
 ```sh
-borg resume
-borg gui
-borg capabilities
-borg bug
-borg extensions list
+borg login codex      # or: claude, opencode, openrouter, ... (see below)
+borg                  # start a session in the current directory
+borg resume           # pick up the latest session; `borg resume <id>` for one
+borg doctor           # check storage and provider readiness
 ```
 
-For an edge-to-edge TUI in Ghostty, see the [terminal setup](docs/terminal-setup.md#ghostty).
+Inside a session, type a request; `/help` lists the controls and Ctrl-C twice
+exits (the session stays resumable). For an edge-to-edge TUI in Ghostty, see the
+[terminal setup](docs/terminal-setup.md#ghostty).
 
-Use `/login` (or `/connect`) to choose ChatGPT subscription access or OpenAI
-API billing on this machine. Borg keeps the saved API key when you switch back
-to ChatGPT. ChatGPT login and token recovery are handled natively by Borg.
-To keep an existing file-backed subscription, select its authority in place:
-`borg login codex --auth-file /path/to/auth.json`. Borg stores the path, not a
-second copy of its rotating tokens. `BORG_OPENAI_AUTH_FILE` overrides that path.
-Fresh device logins use `~/.borg/openai-subscription.json` unless an existing
-authority was selected or discovered through `CODEX_HOME` or `~/.codex/auth.json`.
-Keychain-only logins need a fresh `borg login codex` device approval. You can
-also add a key directly with `borg login codex --api-key`; input is hidden,
-or you can pipe it through stdin.
+## Connecting providers
 
-Provider credentials do not own a Borg session: switching accounts or replacing
-an API key preserves its ledger, forks, and collaborators. OpenAI continuation
-data is reused only for its originating account; other turns use Borg's ordinary
-conversation history. Credentials remain fixed within an in-flight turn.
+`borg login` with no argument lists every provider and whether it is connected.
+Inside a session, `/login` switches connections and `/model` switches models.
 
-For OpenCode Go, run `borg login opencode --api-key` and enter your Go
-subscription key. `/model` lists Go models under **OpenCode Go** using the
-`opencode-go/<model>` route. The footer shows the selected billing mode.
-Subscription limits never trigger an automatic switch to API billing.
+| Provider | Connect | Notes |
+| --- | --- | --- |
+| ChatGPT / Codex | `borg login codex` | Device sign-in to `~/.borg/openai-subscription.json`; an existing Codex login in `~/.codex/auth.json` (or `CODEX_HOME`) is reused if found. `--auth-file PATH` uses an existing auth file in place (Borg stores the path, not a copy of its rotating tokens); `BORG_OPENAI_AUTH_FILE` overrides it. `--api-key` uses OpenAI API billing instead. |
+| Claude | `borg login claude` | Browser sign-in to Borg's own login in `~/.borg/claude` (`BORG_CLAUDE_CONFIG_DIR` overrides), separate from Claude Code's, so the two never refresh one login. The new login is used only once sign-in succeeds. `--api-key` stores an Anthropic API key. |
+| Anthropic API | `borg login anthropic` | API-key lane billed to your Anthropic account. |
+| OpenCode | `borg login opencode --api-key` | Go subscription key; Go models appear under **OpenCode Go** in `/model`. Other OpenCode models run through the OpenCode CLI. |
+| OpenRouter, Vercel AI Gateway | `borg login openrouter`, `borg login vercel` | API keys. |
+| Kimi, GLM, Qwen coding plans | `borg login kimi`, `glm`, `qwen` | Selects the plan and stores its key. |
+| OpenAI-compatible | `BORG_OPENAI_COMPATIBLE_BASE_URL` | Plus `BORG_OPENAI_COMPATIBLE_API_KEY` if the endpoint needs one. |
+| Grok, Muse | `borg login grok`, `borg login muse` | Reached through the vendor's own CLI. |
 
-Interactive sessions run in a detached per-session host. Closing one TUI or
-GUI view does not stop an active turn, its provider app server, or subagents;
-another view can attach to the same durable session. An unattended host exits
-after five minutes only when the session is ready, has no pending prompt, and
-has no running background processes.
-See [`docs/session-lifecycle.md`](docs/session-lifecycle.md).
+Everything else runs on Borg's own agent loop, tools and compaction. Keys
+are stored in `~/.borg/credentials.json` (mode 0600); an environment variable
+for the same key takes precedence. Subscription limits never switch you to API
+billing automatically, and the footer shows the active billing mode.
 
-Session history is kept in a durable journal on PostgreSQL, which Borg
-provisions for you; `BORG_SESSIONS_URL` points it at an existing server
-instead. Writers serialise per session row rather than per file, so throughput
-keeps scaling as agents are added. See
-[`docs/session-store-backends.md`](docs/session-store-backends.md).
+Credentials do not own a session: switching accounts or replacing a key keeps
+its history, forks and collaborators. Provider continuation data is reused only
+for the account that created it, and credentials stay fixed within a running
+turn.
 
-The default native-provider harness exposes one shell-first `exec` surface.
-The model can use shell pipelines or invoke the installed language best suited
-to the problem; session-scoped Borg, Blu, plugin, workflow, and collaboration
-capabilities are discovered from that shell with `borg tools` and invoked with
-`borg call NAME JSON`, or from code with `import borg` in Python
-(`borg.send_message(target=..., message=...)`) and `import borg from "borg"` in
-Bun. Every such call shows in the transcript as a step of the command that made
-it. `borg tools --search QUERY` and `borg.tools("query")` find capabilities by
-name or purpose, and a malformed call answers with the expected signature.
-SDK discovery also includes native tools, available skills, extension workflows
-and configured MCP tools; computed names use `borg.call(name, arguments)`.
-These calls keep the host's approval, confirmation and cancellation checks. Code
-whose state should last between calls runs through `runtime_exec`, a
-persistent Python or Bun namespace with `borg` preloaded, and the `harness`
-capability keeps evidence-backed prompt, memory and skill refinements that Borg
-adds to later turns, with rollback. Set `capabilities.harness = "native"` only when the
-direct one-tool-per-capability fallback is preferred.
+## Working with Borg
 
-Ask Borg to watch a log or deployment, for example: “Watch the build log and
-let me know when it fails.” The `watch` tool runs a background shell command
-and delivers stdout lines automatically, in bounded batches. `list_watchers`
-and `stop_watcher` manage the watchers. The old `list_watches` and `stop_watch`
-names remain compatibility aliases. Watchers last for the current session,
-up to 24 hours (or the host's command limit), and stop with their process trees
-when the session ends. A watcher can wake an idle agent; human messages take
-priority, and arriving events are handled at the next turn boundary.
+### Sessions
+
+Each interactive session runs in a detached per-session host. Closing a TUI or
+GUI view does not stop the active turn or its subagents, and another view can
+attach to the same session. An unattended host exits after five minutes once
+the session is idle with no pending prompt or background process. See
+[session lifecycle](docs/session-lifecycle.md).
+
+History lives in a durable journal on PostgreSQL, which Borg provisions for
+you; `BORG_SESSIONS_URL` points it at an existing server instead. See
+[session store backends](docs/session-store-backends.md).
+
+Bring existing conversations with you using `/import` or `borg import`: Codex
+CLI/Desktop, Claude Code, Claude Desktop exports and portable JSON. Imports
+copy originals, skip duplicates and appear in `/resume`. See
+[importing threads and memory](docs/importing.md).
+
+### Tools
+
+The agent works through one shell-first `exec` tool: shell pipelines, or
+whichever installed language fits the problem. Borg, Blu, plugin, workflow and
+collaboration capabilities are discovered from that shell with
+`borg tools [--search QUERY]` and invoked with `borg call NAME JSON`, or from
+code through the `borg` module in Python and Bun
+(`borg.send_message(target=..., message=...)`, `borg.call(name, arguments)`).
+Each such call appears in the transcript as a step of the command that made it,
+and keeps the host's approval, confirmation and cancellation checks.
+
+- `runtime_exec` keeps a persistent Python or Bun namespace between calls.
+- The `harness` capability keeps evidence-backed prompt, memory and skill
+  refinements that Borg adds to later turns, with rollback.
+- Project guidance in `AGENTS.md`/`CLAUDE.md` (including nested ones the
+  session reaches), skills, the current goal and the plan stay in the model's
+  context, including after compaction.
+- Commands run in Full Access, Auto or Manual approval mode.
+- Web search works with Exa, Firecrawl, Parallel and Brave backends; see
+  [web search](docs/web-search.md).
+
+Set `capabilities.harness = "native"` to expose one tool per capability
+instead of the shell-first surface.
+
+### Images
+
+`borg image PATH` shows an image to the model. The `show_image` tool shows
+images to you: an agent or subagent posts them, with an optional caption, as a
+message in its transcript. They are kept with the session, so they still render
+after the source file is gone. See [image delivery](docs/image-delivery.md).
+
+### Watchers
+
+Ask Borg to watch something, for example “Watch the build log and tell me when
+it fails.” The `watch` tool runs a background command and delivers its output
+in bounded batches; `list_watchers` and `stop_watcher` manage them. Watchers
+last for the session (up to 24 hours or the host's command limit) and can wake
+an idle agent. Human messages take priority.
+
+### Agents, goals and plans
+
+Agents can spawn subagents, run scouts for bounded exploration, and message
+agents in other local projects or on other machines enrolled under the same
+account (`list_instances`, then `send_message` or `followup_task`). A durable
+goal keeps an agent working across turns until it is complete or blocked; a
+plan tracks the steps. See [team harness](docs/team-harness.md) and
+[multiplayer messaging](docs/multiplayer-workspaces.md).
+
+### Recovery and limits
 
 If the provider connection drops, Borg saves the interrupted work and retries
-automatically with delays capped at 30 seconds. The terminal shows the retry
-countdown; Escape cancels recovery. Completed tool work is included in recovery
-context so the agent can check interrupted commands before continuing.
+with delays capped at 30 seconds; the terminal shows the countdown and Escape
+cancels. Usage limits wait until the provider's reported reset time (or 30
+minutes when none is given); `/login` or `/model` lets you continue sooner on
+another connection.
 
-Usage limits wait until the provider's reported reset time, including its time
-zone. If no reset is supplied, Borg retries after 30 minutes. The terminal shows
-when work will resume; Escape cancels the wait, and `/login` or `/model` lets
-you switch connections and continue sooner.
+### Remote hosts
 
-On macOS, Option/Ctrl+Left/Right move by word, Cmd+Left/Right go to line
-boundaries, and Cmd+Up/Down go to the start/end of the composer. Shift extends
-the selection. Legacy terminal word and line shortcuts are supported too.
-Full-screen action inspection wraps long commands so their final arguments
-remain visible alongside the output.
-
-Bring existing conversations with you using `/import` or `borg import`.
-Threads and Memory are both selected by default, with independent opt-outs.
-Codex CLI/Desktop, Claude Code, Claude Desktop exports, and portable JSON are
-supported. Imports copy originals, skip duplicates, and appear in `/resume`.
-See [importing threads and memory](docs/importing.md).
-
-## What it provides
-
-- Responsive TUI and native GPU-rendered frontends over the same durable
-  session runtime, with resumable sessions, compaction, image input, transcript
-  navigation, dictation, goals, plans, and subagent controls.
-- Codex and Claude subscription adapters, OpenCode, Kimi, OpenRouter, and
-  configured OpenAI-compatible providers.
-- A provider-neutral `borg-core` crate with no provider SDK, HTTP, MCP, or
-  subprocess dependency.
-- A shell-first, polyglot execution surface backed by files, processes, LSP,
-  MCP, skills, goals, plans, Blu workflows, and subagents.
-- Provider-neutral web search with Exa, Firecrawl, Parallel, and Brave
-  backends; see [`docs/web-search.md`](docs/web-search.md).
-- Full Access, Auto, and Manual command-approval modes.
-- Borg Remote hosts that use the same durable session and tool runtime.
-  See the [unattended-host runbook](docs/remote-unattended-runbook.md) for
-  preflight, fault recovery, and rollback procedures.
-- Agent discovery and direct messaging across local projects and machines
-  enrolled under the same account. Agents use `list_instances`, then
-  `send_message` or `followup_task`; no shared project workspace is required.
-  See [multiplayer messaging](docs/multiplayer-workspaces.md).
-
-Extension authority is user-controlled. Packages can request `sandboxed`,
-`trusted`, or `native` runtime access; user policy caps project and user
-packages independently. Native mode loads hash-pinned, versioned C ABI code
-inside Borg's process and is never enabled by repository configuration alone.
+Borg Remote hosts run the same durable sessions and tools on other machines.
+See the [unattended-host runbook](docs/remote-unattended-runbook.md) for
+preflight, fault recovery and rollback.
 
 ## Configuration
 
-Copy the example files to Borg's configuration directory:
+`borg config init` writes a commented `agent.toml`; `borg config path` shows
+where it lives (`~/.config/borg/`, or `$XDG_CONFIG_HOME/borg`). The agent
+configuration covers providers, capabilities, MCP servers, aliases and team
+settings; `editor.toml` covers interface language, TUI presentation and input.
+Examples are in [`configs/`](configs/). `/ui-language` changes interface
+labels, and `/language` the model's response language.
 
-```sh
-cp configs/agent.example.toml ~/.config/borg/agent.toml
-cp configs/editor.example.toml ~/.config/borg/editor.toml
-```
+See [customization](docs/customization.md) for keybindings, alerts, extension
+authority and native extensions. `borg customize inspect|export|import` moves a
+complete setup between machines, and `borg capabilities --json` shows the
+effective runtime capabilities. Automated checks can use
+`borg agent --ephemeral --local-only` to leave resume history untouched.
 
-Use `$XDG_CONFIG_HOME/borg` instead when `XDG_CONFIG_HOME` is set. The agent
-configuration covers providers, capabilities, MCP servers, aliases, and team
-settings. The agent interface configuration covers shared language plus TUI
-presentation and input behavior; the native frontend uses the same interface
-language with platform-native input and rendering. `/ui-language` changes UI
-labels, while `/language` independently controls the model's response language.
+On macOS, Option/Ctrl+Left/Right move by word, Cmd+Left/Right to line
+boundaries and Cmd+Up/Down to the start/end of the composer; Shift extends the
+selection.
 
-See [`docs/customization.md`](docs/customization.md) for agent interface settings,
-keybindings, alerts, extension authority, and native extension authoring.
-Use `borg customize inspect`, `borg customize export`, and
-`borg customize import` to inspect or move the complete effective setup.
-
-`borg capabilities --json` shows the effective runtime capabilities. Automated
-checks can use `borg agent --ephemeral --local-only` to avoid changing resume
-history.
-
-## Privacy-minimal usage count
-
-Release download totals provide the all-time installation proxy. To estimate
-active installations, release builds send at most one content-free heartbeat
-per day. It contains one random identifier that rotates every 31 days—no
-version, OS, model, session, prompt, path, or device data. Set
-`usage_count.enabled = false` in `agent.toml` or export
-`BORG_DISABLE_USAGE_COUNT=1` to disable it. The receiver must discard network
-metadata and raw request logs and retain only aggregate daily/monthly counts.
-
-## Diagnostic bundles
-
-`borg bug` collects a diagnostic bundle to attach to a bug report. It is local
-only: it opens no socket, calls no model, and uploads nothing. The bundle is a
-file you read and decide about.
-
-```sh
-borg bug                                            # summary only
-borg bug --output bundle.json                       # write the full bundle
-borg bug --output bundle.json --include-transcript  # add conversation text
-```
-
-What it collects is an allowlist: build identification, durable store
-readiness, provider runtime readiness, and session metadata. Credentials,
-environment variables, request headers, and configuration file contents have no
-code path into the bundle, and the working directory is deliberately left out.
-Failures are recorded as a fixed class — `connection_refused`,
-`permission_denied` — rather than as their original message, because an error
-message is the field most likely to carry a URL or a password.
-
-Conversation text is excluded unless you pass `--include-transcript`, which
-requires `--output`: a transcript may only be written to a file, created
-readable by you alone, never to a terminal or a pipe where permissions mean
-nothing. Read the bundle before you share it.
-
-## Blu extensions
+## Extensions
 
 [Blu](https://github.com/borg-ml/blu) is a Lua/Luau superset language and
-runtime. Its source and documentation live in the separate
-[`borg-ml/blu`](https://github.com/borg-ml/blu) repository. Borg embeds Blu for
-bounded workflows and uses it in the live extension package system. A package
-can provide skills, namespaced MCP servers, workflows, or an explicitly
+runtime that Borg embeds for bounded workflows and live extension packages. A
+package can provide skills, namespaced MCP servers, workflows, or an explicitly
 admitted native runtime.
 
 ```sh
@@ -235,65 +186,83 @@ borg extensions new <id> --project
 borg extensions doctor
 ```
 
-See [`docs/blu-extensions.md`](docs/blu-extensions.md) and the
-[extension manifest example](configs/extension.example.toml) for the package
-contract. Blu workflow files may use `.blu`, `.lua`, or `.luau` entrypoints.
+Packages request `sandboxed`, `trusted` or `native` access, and your policy caps
+project and user packages independently. Native mode loads hash-pinned,
+versioned C ABI code and is never enabled by repository configuration alone.
+See [Blu extensions](docs/blu-extensions.md) and the
+[manifest example](configs/extension.example.toml).
+
+## Privacy and diagnostics
+
+**Usage count.** To estimate active installations, release builds send at most
+one content-free heartbeat a day carrying a random identifier that rotates every
+31 days: no version, OS, model, session, prompt, path or device data. Disable it
+with `usage_count.enabled = false` in `agent.toml` or `BORG_DISABLE_USAGE_COUNT=1`.
+See [usage count](docs/usage-count.md).
+
+**Bug reports.** `borg bug` collects a local-only diagnostic bundle: it opens no
+socket, calls no model and uploads nothing.
+
+```sh
+borg bug                                            # summary only
+borg bug --output bundle.json                       # full bundle
+borg bug --output bundle.json --include-transcript  # add conversation text
+```
+
+The bundle is an allowlist of build identification, storage and provider
+readiness, and session metadata. Credentials, environment variables, headers,
+configuration contents and the working directory are never included, and
+failures are recorded as fixed classes rather than raw messages. Conversation
+text is included only with `--include-transcript`, written to a file readable by
+you alone. Read the bundle before you share it.
 
 ## Documentation
 
-- [`docs/model-context.md`](docs/model-context.md) — agent-controlled model
-  context inspection and text-first editing, safety boundaries and recovery
-- [`docs/customization.md`](docs/customization.md) — agent interface settings,
-  keybindings, alerts, trust policy, and native extensions
-- [`docs/session-lifecycle.md`](docs/session-lifecycle.md) — detached hosts,
-  attachment, resume, and shutdown behavior
-- [`docs/usage-count.md`](docs/usage-count.md) — active-install metric and
-  privacy contract
-- [`docs/zh-Hans/README.md`](docs/zh-Hans/README.md) — Simplified Chinese guide
-- [`docs/es/README.md`](docs/es/README.md) — Spanish guide
-- [`docs/ru/README.md`](docs/ru/README.md) — Russian guide
-- [`TODO.md`](TODO.md) — remaining customization surface and extension API work
-- [`docs/blu-extensions.md`](docs/blu-extensions.md) — extension packages and
-  workflows
-- [`docs/web-search.md`](docs/web-search.md) — web-search providers
-- [`docs/multiplayer-workspaces.md`](docs/multiplayer-workspaces.md) — local
-  workspaces and collaboration
-- [`docs/agent-runtime-protocol-v1.md`](docs/agent-runtime-protocol-v1.md) —
-  runtime protocol
-- [`docs/public-release-checklist.md`](docs/public-release-checklist.md) —
-  release process
-
-## Repository layout
-
-- `borg-core` — provider-neutral message, tool, usage, and channel contracts
-- `borg-provider` — model gateways and provider adapters
-- `borg-remote` — durable sessions, hosts, protocols, and native tools
-- `borg-search` — bounded web-search contracts and backends
-- `borg-ui` — frontend-neutral commands, projections, preferences, and local
-  session bridge
-- `borg-tui` — Ratatui terminal frontend
-- `borg-gui` — experimental GPUI native frontend (opt-in)
-- `borg-cli` — public command shell and frontend launchers
+- [Model context](docs/model-context.md): inspecting and editing the model's
+  context, safety boundaries and recovery
+- [Customization](docs/customization.md): interface settings, keybindings,
+  alerts, trust policy and native extensions
+- [Session lifecycle](docs/session-lifecycle.md): detached hosts, attachment,
+  resume and shutdown
+- [Blu extensions](docs/blu-extensions.md): extension packages and workflows
+- [Web search](docs/web-search.md): search providers
+- [Multiplayer messaging](docs/multiplayer-workspaces.md): local workspaces and
+  collaboration
+- [Agent runtime protocol](docs/agent-runtime-protocol-v1.md): the runtime
+  protocol
+- [Usage count](docs/usage-count.md): the active-install metric and its privacy
+  contract
+- [Release checklist](docs/public-release-checklist.md): the release process
+- [`TODO.md`](TODO.md): remaining customization and extension API work
 
 ## Development
+
+| Crate | Purpose |
+| --- | --- |
+| `borg-core` | Provider-neutral model, tool, usage and channel contracts |
+| `borg-provider` | Model gateways, provider adapters, authentication and MCP |
+| `borg-agent-runtime` | Agent loop, tool dispatch, code-mode runtimes, session store and orchestration |
+| `borg-remote` | Durable session protocol, hosts and remote tools |
+| `borg-search` | Bounded web-search contracts and backends |
+| `borg-lanes` | Host-local job queues, services and resource leases |
+| `borg-view` | Renderer-independent session view contracts |
+| `borg-ui` | Frontend-neutral commands, projections and preferences |
+| `borg-tui` | Ratatui terminal frontend |
+| `borg-gui` | Experimental GPUI native frontend (opt-in) |
+| `borg-dictation` | Local speech-to-text backend |
+| `borg-display` | Private headless Wayland display for computer use |
+| `borg-cli` | The `borg` command and frontend launchers |
 
 ```sh
 cargo fmt --all -- --check
 cargo check --workspace --exclude borg-gui
 cargo test --workspace --exclude borg-gui
-
-# Opt in to the experimental native GUI.
-cargo run -p borg-gui
+cargo run -p borg-gui    # opt-in experimental native GUI
 ```
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) before submitting a change.
-
-## Releases
-
-Release tags matching `v*` build checksum-paired archives for Linux, macOS,
-and Windows on x86-64 and ARM64. See the
-[changelog](CHANGELOG.md) for user-visible changes and the
-[public release checklist](docs/public-release-checklist.md) before publishing
-a release.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) before submitting a change. Release
+tags matching `v*` build checksummed archives for Linux, macOS and Windows on
+x86-64 and ARM64; see the [changelog](CHANGELOG.md) and the
+[release checklist](docs/public-release-checklist.md).
 
 MIT licensed.

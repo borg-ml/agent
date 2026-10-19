@@ -3153,7 +3153,7 @@ impl AgentToolDispatcher {
                     },
                 )
             }
-            "list_watchers" | "list_watches" => {
+            "list_watchers" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
                 Ok(serde_json::to_value(
                     self.watches
@@ -3163,7 +3163,7 @@ impl AgentToolDispatcher {
                         .await,
                 )?)
             }
-            "stop_watcher" | "stop_watch" => {
+            "stop_watcher" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct Args {

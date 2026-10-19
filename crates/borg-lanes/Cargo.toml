@@ -1,5 +1,6 @@
 [package]
 name = "borg-lanes"
+description = "Host-local job queues, services and resource leases for Borg"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
