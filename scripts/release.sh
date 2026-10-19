@@ -379,6 +379,20 @@ fi
 git remote get-url "$remote" >/dev/null 2>&1 ||
   die "git remote '$remote' does not exist"
 
+# Agents land on main under this lock (see AGENTS.md). Hold it for the whole
+# release so a landing cannot move main between verification and the atomic
+# push, which would reject the push and abort the release.
+landing_lock="$(git rev-parse --path-format=absolute --git-common-dir)/borg-landing.lock"
+if command -v flock >/dev/null 2>&1; then
+  exec {landing_lock_fd}>"$landing_lock"
+  if ! flock -n "$landing_lock_fd"; then
+    echo "release: waiting for an in-progress landing to finish" >&2
+    flock "$landing_lock_fd"
+  fi
+else
+  echo "release: flock unavailable; not serialising with agent landings" >&2
+fi
+
 echo "Fetching $remote/$branch and release tags..."
 git fetch --quiet "$remote" "$branch" --tags
 

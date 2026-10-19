@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.17.1)
 
+- Load a user-wide `~/.borg/AGENTS.md` (or `CLAUDE.md`) in every session, ahead
+  of the project's own guidance, like Codex's `~/.codex/AGENTS.md` and Claude
+  Code's `~/.claude/CLAUDE.md`.
+- Harness memory shared by a project's sessions now uses the scope name
+  `project` (was `global`, which suggested user-wide) and is stored in
+  `~/.borg/projects/` instead of a `.borg/` folder inside the repository.
 - Add `show_image`: any agent or subagent can show PNG, JPEG, GIF or WebP
   images, with an optional caption, as a message in its transcript. Images are
   kept in the session store, so they still render after the source file is

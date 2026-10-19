@@ -37,15 +37,18 @@ impl HarnessKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HarnessScope {
+    /// This session only, kept in the session store.
     Local,
-    Global,
+    /// Every session in this project, kept under Borg's home rather than in
+    /// the repository.
+    Project,
 }
 
 impl HarnessScope {
     fn label(self) -> &'static str {
         match self {
             Self::Local => "local",
-            Self::Global => "global",
+            Self::Project => "project",
         }
     }
 }
@@ -165,8 +168,39 @@ struct HarnessRequest {
     steps: Option<usize>,
 }
 
+/// Project state lives in Borg's home, keyed by the project root, so it never
+/// shows up as an untracked file in the user's repository.
 fn state_path(root: &Path) -> PathBuf {
-    root.join(".borg").join("harness_state.json")
+    #[cfg(test)]
+    return root.join(".borg").join("harness_state.json");
+    #[cfg(not(test))]
+    {
+        use sha2::{Digest, Sha256};
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("root")
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let digest = Sha256::digest(root.to_string_lossy().as_bytes());
+        let key = digest
+            .iter()
+            .take(6)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        crate::host_paths::host_home()
+            .join("projects")
+            .join(format!("{name}-{key}"))
+            .join("harness_state.json")
+    }
 }
 
 async fn load_state(
@@ -180,12 +214,12 @@ async fn load_state(
             let store = store.context("local harness state requires a durable session store")?;
             store.load_harness_state(session_id).await?
         }
-        HarnessScope::Global => match tokio::fs::read(state_path(root)).await {
+        HarnessScope::Project => match tokio::fs::read(state_path(root)).await {
             Ok(bytes) => Some(
-                serde_json::from_slice(&bytes).context("global harness state is invalid JSON")?,
+                serde_json::from_slice(&bytes).context("project harness state is invalid JSON")?,
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error).context("failed to read global harness state"),
+            Err(error) => return Err(error).context("failed to read project harness state"),
         },
     };
     value
@@ -209,17 +243,17 @@ async fn save_state(
             let store = store.context("local harness state requires a durable session store")?;
             store.save_harness_state(session_id, &value).await
         }
-        HarnessScope::Global => {
+        HarnessScope::Project => {
             let path = state_path(root);
             let parent = path
                 .parent()
-                .context("global harness state has no parent")?;
+                .context("project harness state has no parent")?;
             tokio::fs::create_dir_all(parent).await?;
             let temporary = parent.join(format!(".harness_state.{}.tmp", Uuid::new_v4()));
             tokio::fs::write(&temporary, serde_json::to_vec_pretty(&value)?).await?;
             if let Err(error) = tokio::fs::rename(&temporary, &path).await {
                 let _ = tokio::fs::remove_file(&temporary).await;
-                return Err(error).context("failed to replace global harness state");
+                return Err(error).context("failed to replace project harness state");
             }
             Ok(())
         }
@@ -332,7 +366,7 @@ async fn list_entries(
     let scopes = request
         .scope
         .map(|scope| vec![scope])
-        .unwrap_or_else(|| vec![HarnessScope::Local, HarnessScope::Global]);
+        .unwrap_or_else(|| vec![HarnessScope::Local, HarnessScope::Project]);
     let mut entries = Vec::new();
     for scope in scopes {
         let state = load_state(scope, session_id, root, store).await?;
@@ -356,7 +390,7 @@ async fn overview(
     store: Option<&dyn crate::SessionStore>,
 ) -> Result<Value> {
     let local = load_state(HarnessScope::Local, session_id, root, store).await?;
-    let global = load_state(HarnessScope::Global, session_id, root, store).await?;
+    let project = load_state(HarnessScope::Project, session_id, root, store).await?;
     let count = |state: &HarnessState, kind| {
         state
             .entries
@@ -366,18 +400,18 @@ async fn overview(
     };
     Ok(json!({
         "schema": 1,
-        "revision": local.revision.max(global.revision),
+        "revision": local.revision.max(project.revision),
         "scopes": {
             "local": {"entries": local.entries.len(), "refinements": local.refinements.len()},
-            "global": {"entries": global.entries.len(), "refinements": global.refinements.len()},
+            "project": {"entries": project.entries.len(), "refinements": project.refinements.len()},
         },
         "counts": {
-            "prompt": count(&local, HarnessKind::Prompt) + count(&global, HarnessKind::Prompt),
-            "memory": count(&local, HarnessKind::Memory) + count(&global, HarnessKind::Memory),
-            "skill": count(&local, HarnessKind::Skill) + count(&global, HarnessKind::Skill),
-            "subagent": count(&local, HarnessKind::Subagent) + count(&global, HarnessKind::Subagent),
+            "prompt": count(&local, HarnessKind::Prompt) + count(&project, HarnessKind::Prompt),
+            "memory": count(&local, HarnessKind::Memory) + count(&project, HarnessKind::Memory),
+            "skill": count(&local, HarnessKind::Skill) + count(&project, HarnessKind::Skill),
+            "subagent": count(&local, HarnessKind::Subagent) + count(&project, HarnessKind::Subagent),
         },
-        "recent_refinements": local.refinements.into_iter().chain(global.refinements).rev().take(request.limit.unwrap_or(8).clamp(1, 16)).collect::<Vec<_>>(),
+        "recent_refinements": local.refinements.into_iter().chain(project.refinements).rev().take(request.limit.unwrap_or(8).clamp(1, 16)).collect::<Vec<_>>(),
     }))
 }
 
@@ -570,7 +604,7 @@ async fn mutate(
             let steps = request.steps.unwrap_or(1);
             ensure!(
                 scope == HarnessScope::Local,
-                "global harness rollback is not available"
+                "project harness rollback is not available"
             );
             let store = store.context("local harness state requires a durable session store")?;
             return Ok(json!({
@@ -631,15 +665,15 @@ pub(crate) async fn prompt_appendix(
     } else {
         HarnessState::default()
     };
-    let global = load_state(HarnessScope::Global, session_id, root, store).await?;
+    let project = load_state(HarnessScope::Project, session_id, root, store).await?;
     let entries = sorted_entries(
-        local.entries.into_iter().chain(global.entries).collect(),
+        local.entries.into_iter().chain(project.entries).collect(),
         MAX_ENTRIES,
     );
     let refinements = local
         .refinements
         .into_iter()
-        .chain(global.refinements)
+        .chain(project.refinements)
         .rev()
         .take(4)
         .collect::<Vec<_>>();
@@ -690,7 +724,7 @@ mod tests {
         let id = next_id(&state, HarnessKind::Memory, "Surf ramp contact");
         assert_eq!(id, "surf_ramp_contact");
         assert_eq!(HarnessKind::Memory.label(), "memory");
-        assert_eq!(HarnessScope::Global.label(), "global");
+        assert_eq!(HarnessScope::Project.label(), "project");
     }
 
     #[test]

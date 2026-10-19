@@ -32,10 +32,31 @@ impl NativeContext {
     }
 
     fn load_blocking(cwd: &Path, extension_skill_roots: &[PathBuf]) -> Result<Self> {
+        // Tests must not depend on the developer's own ~/.borg/AGENTS.md.
+        #[cfg(not(test))]
+        let user_dir = crate::host_paths::host_home();
+        #[cfg(test)]
+        let user_dir = PathBuf::new();
+        Self::load_with_user_guidance(cwd, extension_skill_roots, &user_dir)
+    }
+
+    /// `user_dir` holds the user's own AGENTS.md/CLAUDE.md (`~/.borg`), which
+    /// applies to every session ahead of the project's chain, as Codex's
+    /// `~/.codex/AGENTS.md` and Claude Code's `~/.claude/CLAUDE.md` do.
+    fn load_with_user_guidance(
+        cwd: &Path,
+        extension_skill_roots: &[PathBuf],
+        user_dir: &Path,
+    ) -> Result<Self> {
         let cwd = cwd.canonicalize().context("canonicalize agent workspace")?;
         let project_chain = project_chain(&cwd);
         let mut project_instructions = String::new();
-        for directory in &project_chain {
+        let user_dir = user_dir.canonicalize().ok();
+        let guidance_dirs = user_dir
+            .iter()
+            .filter(|user_dir| !project_chain.contains(user_dir))
+            .chain(&project_chain);
+        for directory in guidance_dirs {
             for (path, content) in guidance_files(directory)? {
                 if project_instructions.len().saturating_add(content.len())
                     > MAX_PROJECT_INSTRUCTIONS_BYTES
@@ -332,6 +353,23 @@ fn skill_metadata(content: &str, fallback_name: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_guidance_applies_ahead_of_the_project_chain() {
+        let user = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".git")).unwrap();
+        std::fs::write(user.path().join("AGENTS.md"), "user rule").unwrap();
+        std::fs::write(project.path().join("AGENTS.md"), "project rule").unwrap();
+        let context =
+            NativeContext::load_with_user_guidance(project.path(), &[], user.path()).unwrap();
+        let appendix = context.prompt_appendix();
+        let user_at = appendix.find("user rule").expect("user guidance is loaded");
+        let project_at = appendix
+            .find("project rule")
+            .expect("project guidance is loaded");
+        assert!(user_at < project_at, "user guidance comes first");
+    }
 
     #[test]
     fn project_skills_override_user_skills_by_name() {

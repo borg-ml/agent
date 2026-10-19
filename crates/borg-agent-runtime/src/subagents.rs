@@ -11774,7 +11774,7 @@ fn harness_tool_spec() -> Value {
             "properties": {
                 "op": {"type": "string", "enum": ["list", "overview", "get", "create", "update", "delete", "refine", "rollback", "plan_refinement"]},
                 "kind": {"type": "string", "enum": ["prompt", "memory", "skill", "subagent"]},
-                "scope": {"type": "string", "enum": ["local", "global"], "default": "local"},
+                "scope": {"type": "string", "enum": ["local", "project"], "default": "local", "description": "local: this session only. project: every session in this project, stored in Borg's home, never in the repository."},
                 "id": {"type": "string"},
                 "title": {"type": "string"},
                 "content": {"type": "string"},

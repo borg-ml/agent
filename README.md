@@ -105,10 +105,13 @@ and keeps the host's approval, confirmation and cancellation checks.
 
 - `runtime_exec` keeps a persistent Python or Bun namespace between calls.
 - The `harness` capability keeps evidence-backed prompt, memory and skill
-  refinements that Borg adds to later turns, with rollback.
-- Project guidance in `AGENTS.md`/`CLAUDE.md` (including nested ones the
-  session reaches), skills, the current goal and the plan stay in the model's
-  context, including after compaction.
+  refinements that Borg adds to later turns, for one session (`local`) or every
+  session in the project (`project`, kept in `~/.borg/projects/`, never in the
+  repository), with rollback.
+- Your own `~/.borg/AGENTS.md` applies to every session, ahead of the project's
+  `AGENTS.md`/`CLAUDE.md` (including nested ones the session reaches). These,
+  skills, the current goal and the plan stay in the model's context, including
+  after compaction.
 - Commands run in Full Access, Auto or Manual approval mode.
 - Web search works with Exa, Firecrawl, Parallel and Brave backends; see
   [web search](docs/web-search.md).
