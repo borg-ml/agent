@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.17.1)
 
+- Stop bundling Claude Code: release archives drop the ~270 MB binary, since
+  Claude runs on Borg's native subscription transport. `borg update` no longer
+  installs `providers/claude`; an existing copy is left alone and can be
+  deleted. Archives keep tiny placeholder files there only so older Borg
+  versions can still update.
 - Preserve images emitted before a shell command exits, including synchronous
   exec calls collected through a watcher, instead of intermittently losing
   `borg image` and screenshot attachments.

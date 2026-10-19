@@ -159,17 +159,14 @@ async fn update(check_only: bool, quiet: bool) -> Result<UpdateOutcome> {
     verify_checksum(&asset_name, &archive, &checksum_bytes)?;
     let temporary = tempfile::tempdir().context("failed to create update staging directory")?;
     let candidate = temporary.path().join(executable_name());
-    let provider_candidate = temporary.path().join("providers/claude");
     let display_candidate = temporary.path().join(DISPLAY_EXECUTABLE);
     extract_executable(&archive, &candidate)?;
-    extract_native_provider(&archive, &provider_candidate)?;
     let display = extract_display(&archive, &display_candidate)?.then_some(display_candidate);
     validate_candidate(&candidate, &latest)?;
-    validate_native_provider(&provider_candidate)?;
     if let Some(display) = &display {
         validate_display_candidate(display, &latest)?;
     }
-    install_candidate(&candidate, &provider_candidate, display.as_deref(), &latest)?;
+    install_candidate(&candidate, display.as_deref(), &latest)?;
     clear_background_failure();
     Ok(UpdateOutcome::Installed(latest))
 }
@@ -281,54 +278,6 @@ fn extract_display(_archive: &[u8], _destination: &Path) -> Result<bool> {
     Ok(false)
 }
 
-#[cfg(unix)]
-fn extract_native_provider(archive: &[u8], destination: &Path) -> Result<()> {
-    use flate2::read::GzDecoder;
-    let mut tar = tar::Archive::new(GzDecoder::new(Cursor::new(archive)));
-    fs::create_dir_all(destination)
-        .context("failed to create native provider staging directory")?;
-    let mut found_binary = false;
-    for entry in tar.entries().context("invalid Borg release archive")? {
-        let mut entry = entry.context("invalid Borg release entry")?;
-        let path = entry.path().context("invalid Borg release path")?;
-        let Ok(relative) = path.strip_prefix(Path::new("providers/claude")) else {
-            continue;
-        };
-        let Some(name) = relative.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if relative.components().count() != 1
-            || !matches!(
-                name,
-                "claude" | "manifest.json" | "package.json" | "LICENSE.md"
-            )
-        {
-            continue;
-        }
-        let name = name.to_string();
-        let output = destination.join(&name);
-        let mut file = fs::File::create(&output).with_context(|| {
-            format!("failed to stage native provider file {}", output.display())
-        })?;
-        std::io::copy(&mut entry, &mut file).with_context(|| {
-            format!(
-                "failed to extract native provider file {}",
-                output.display()
-            )
-        })?;
-        file.sync_all()
-            .context("failed to sync native provider file")?;
-        if name == "claude" {
-            found_binary = true;
-        }
-    }
-    anyhow::ensure!(
-        found_binary,
-        "Borg release archive does not contain providers/claude/claude"
-    );
-    Ok(())
-}
-
 #[cfg(windows)]
 fn extract_executable(archive: &[u8], destination: &Path) -> Result<()> {
     extract_windows_executable(archive, destination, "borg.exe")
@@ -344,11 +293,6 @@ fn extract_windows_executable(archive: &[u8], destination: &Path, name: &str) ->
     let mut output = fs::File::create(destination).context("failed to stage Borg update")?;
     std::io::copy(&mut entry, &mut output).context("failed to extract Borg update")?;
     output.sync_all().context("failed to sync Borg update")
-}
-
-#[cfg(windows)]
-fn extract_native_provider(archive: &[u8], destination: &Path) -> Result<()> {
-    extract_windows_native_provider(archive, destination)
 }
 
 #[cfg(any(windows, test))]
@@ -369,39 +313,6 @@ fn windows_archive_root(zip: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<Stri
         }
     }
     root.context("Borg release zip does not contain `borg.exe`")
-}
-
-#[cfg(any(windows, test))]
-fn extract_windows_native_provider(archive: &[u8], destination: &Path) -> Result<()> {
-    let mut zip = zip::ZipArchive::new(Cursor::new(archive)).context("invalid Borg release zip")?;
-    fs::create_dir_all(destination)
-        .context("failed to create native provider staging directory")?;
-    let root = windows_archive_root(&mut zip)?;
-    for name in ["claude.exe", "manifest.json", "package.json", "LICENSE.md"] {
-        let archive_name = format!("{root}providers/claude/{name}");
-        let mut entry = match zip.by_name(&archive_name) {
-            Ok(entry) => entry,
-            Err(zip::result::ZipError::FileNotFound) if name == "LICENSE.md" => continue,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("Borg release zip does not contain `{archive_name}`")
-                });
-            }
-        };
-        let output = destination.join(name);
-        let mut file = fs::File::create(&output).with_context(|| {
-            format!("failed to stage native provider file {}", output.display())
-        })?;
-        std::io::copy(&mut entry, &mut file).with_context(|| {
-            format!(
-                "failed to extract native provider file {}",
-                output.display()
-            )
-        })?;
-        file.sync_all()
-            .context("failed to sync native provider file")?;
-    }
-    Ok(())
 }
 
 fn validate_candidate(candidate: &Path, expected: &Version) -> Result<()> {
@@ -451,43 +362,16 @@ fn validate_display_candidate(candidate: &Path, expected: &Version) -> Result<()
     Ok(())
 }
 
-fn validate_native_provider(provider: &Path) -> Result<()> {
-    for name in [
-        native_provider_executable_name(),
-        "manifest.json",
-        "package.json",
-    ] {
-        anyhow::ensure!(
-            provider.join(name).is_file(),
-            "staged native provider is missing `{name}`"
-        );
-    }
-    Ok(())
-}
-
 #[cfg(unix)]
-fn install_candidate(
-    candidate: &Path,
-    provider: &Path,
-    display: Option<&Path>,
-    _version: &Version,
-) -> Result<()> {
+fn install_candidate(candidate: &Path, display: Option<&Path>, _version: &Version) -> Result<()> {
     let executable = std::env::current_exe().context("failed to locate installed Borg")?;
-    let target = native_provider_target(&executable)?;
-    install_release_at(candidate, provider, display, &executable, &target)
+    install_release_at(candidate, display, &executable)
 }
 
-/// Install the provider, then borg-display beside `borg`, then `borg` last;
-/// a failure at any step restores everything installed before it.
+/// Install borg-display beside `borg`, then `borg` last; a failure installing
+/// `borg` restores the previous borg-display.
 #[cfg(unix)]
-fn install_release_at(
-    candidate: &Path,
-    provider: &Path,
-    display: Option<&Path>,
-    executable: &Path,
-    provider_target: &Path,
-) -> Result<()> {
-    let provider_swap = stage_native_provider(provider, provider_target)?;
+fn install_release_at(candidate: &Path, display: Option<&Path>, executable: &Path) -> Result<()> {
     let display_swap = match display {
         None => None,
         Some(display) => {
@@ -495,15 +379,7 @@ fn install_release_at(
                 .parent()
                 .context("installed Borg has no parent")?
                 .join(DISPLAY_EXECUTABLE);
-            match stage_display(display, &target) {
-                Ok(swap) => Some(swap),
-                Err(error) => {
-                    provider_swap.rollback().context(
-                        "failed to roll back native provider after borg-display update failure",
-                    )?;
-                    return Err(error);
-                }
-            }
+            Some(stage_display(display, &target)?)
         }
     };
     if let Err(error) = install_candidate_at(candidate, executable) {
@@ -511,15 +387,12 @@ fn install_release_at(
             swap.rollback()
                 .context("failed to roll back borg-display after binary update failure")?;
         }
-        provider_swap
-            .rollback()
-            .context("failed to roll back native provider after binary update failure")?;
         return Err(error);
     }
-    if let Some(swap) = display_swap {
-        swap.commit()?;
+    match display_swap {
+        Some(swap) => swap.commit(),
+        None => Ok(()),
     }
-    provider_swap.commit()
 }
 
 /// A single-file replacement that can still be undone: the previous file is
@@ -605,116 +478,7 @@ fn install_candidate_at(candidate: &Path, executable: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn install_native_provider_at(provider: &Path, executable: &Path) -> Result<()> {
-    validate_native_provider(provider)?;
-    let target = native_provider_target(executable)?;
-    stage_native_provider(provider, &target)?.commit()
-}
-
-fn native_provider_target(executable: &Path) -> Result<PathBuf> {
-    let target = std::env::var_os("BORG_HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("providers/claude"))
-        .or_else(|| {
-            executable
-                .parent()
-                .map(|parent| parent.join("providers/claude"))
-        })
-        .context("installed Borg has no provider destination")?;
-    Ok(target)
-}
-
-#[cfg(any(test, windows))]
-fn install_native_provider_to(provider: &Path, target: &Path) -> Result<()> {
-    stage_native_provider(provider, target)?.commit()
-}
-
-struct NativeProviderSwap {
-    target: PathBuf,
-    backup: Option<PathBuf>,
-}
-
-impl NativeProviderSwap {
-    fn commit(self) -> Result<()> {
-        if let Some(backup) = self.backup {
-            fs::remove_dir_all(backup).context("failed to remove old native provider")?;
-        }
-        Ok(())
-    }
-
-    fn rollback(self) -> Result<()> {
-        if self.target.exists() {
-            fs::remove_dir_all(&self.target)
-                .context("failed to remove partially installed native provider")?;
-        }
-        if let Some(backup) = self.backup {
-            fs::rename(backup, &self.target)
-                .context("failed to restore the previous native provider")?;
-        }
-        Ok(())
-    }
-}
-
-fn stage_native_provider(provider: &Path, target: &Path) -> Result<NativeProviderSwap> {
-    validate_native_provider(provider)?;
-    let providers_parent = target
-        .parent()
-        .context("native provider destination has no parent")?;
-    fs::create_dir_all(providers_parent)
-        .context("failed to create installed provider directory")?;
-    let staged = providers_parent.join(format!(".claude-update-{}", std::process::id()));
-    let backup = providers_parent.join(format!(".claude-backup-{}", std::process::id()));
-    if staged.exists() {
-        fs::remove_dir_all(&staged).context("failed to clear stale provider staging")?;
-    }
-    if backup.exists() {
-        fs::remove_dir_all(&backup).context("failed to clear stale provider backup")?;
-    }
-    fs::create_dir(&staged).context("failed to stage native provider")?;
-    for name in [
-        native_provider_executable_name(),
-        "manifest.json",
-        "package.json",
-    ] {
-        fs::copy(provider.join(name), staged.join(name))
-            .with_context(|| format!("failed to copy native provider `{name}`"))?;
-    }
-    if provider.join("LICENSE.md").is_file() {
-        fs::copy(provider.join("LICENSE.md"), staged.join("LICENSE.md"))
-            .context("failed to copy native provider `LICENSE.md`")?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(
-            staged.join(native_provider_executable_name()),
-            fs::Permissions::from_mode(0o700),
-        )
-        .context("failed to make native provider executable")?;
-    }
-    let had_target = target.exists();
-    if had_target {
-        fs::rename(target, &backup).context("failed to stage the installed native provider")?;
-    }
-    if let Err(error) = fs::rename(&staged, target) {
-        if backup.exists() {
-            let _ = fs::rename(&backup, target);
-        }
-        return Err(error).context("failed to atomically install native provider");
-    }
-    Ok(NativeProviderSwap {
-        target: target.to_path_buf(),
-        backup: had_target.then_some(backup),
-    })
-}
-
-#[cfg(windows)]
-fn install_candidate(
-    candidate: &Path,
-    provider: &Path,
-    _display: Option<&Path>,
-    version: &Version,
-) -> Result<()> {
+fn install_candidate(candidate: &Path, _display: Option<&Path>, version: &Version) -> Result<()> {
     use std::os::windows::process::CommandExt;
     let executable = std::env::current_exe().context("failed to locate installed Borg")?;
     let parent = executable
@@ -724,7 +488,6 @@ fn install_candidate(
     let staged = parent.join(format!(".borg-update-{id}.exe"));
     let helper = parent.join(format!(".borg-update-{id}.ps1"));
     fs::copy(candidate, &staged).context("failed to stage update beside installed Borg")?;
-    install_native_provider_at(provider, &executable)?;
     let script = r#"param([int]$ParentId,[string]$Source,[string]$Destination,[string]$Helper)
 Wait-Process -Id $ParentId -ErrorAction SilentlyContinue
 for ($i = 0; $i -lt 120; $i++) {
@@ -782,14 +545,6 @@ fn platform_asset() -> Result<String> {
 
 fn executable_name() -> &'static str {
     if cfg!(windows) { "borg.exe" } else { "borg" }
-}
-
-fn native_provider_executable_name() -> &'static str {
-    if cfg!(windows) {
-        "claude.exe"
-    } else {
-        "claude"
-    }
 }
 
 fn state_path() -> Option<PathBuf> {
@@ -1024,103 +779,21 @@ mod tests {
         assert_eq!(fs::read(destination).unwrap(), b"borg-binary");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn unix_release_archive_extracts_the_native_provider_payload() {
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
-        let mut archive = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
-        for (name, bytes) in [
-            ("providers/claude/claude", b"claude-binary".as_slice()),
-            (
-                "providers/claude/manifest.json",
-                br#"{"sdkCompat":{"harnessSchema":1}}"#,
-            ),
-            ("providers/claude/package.json", br#"{"version":"1.0.0"}"#),
-            ("providers/claude/LICENSE.md", b"platform license"),
-        ] {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(bytes.len() as u64);
-            header.set_mode(0o700);
-            header.set_cksum();
-            archive
-                .append_data(&mut header, name, Cursor::new(bytes))
-                .unwrap();
-        }
-        let compressed = archive.into_inner().unwrap().finish().unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let destination = directory.path().join("providers/claude");
-        extract_native_provider(&compressed, &destination).unwrap();
-        validate_native_provider(&destination).unwrap();
-        assert_eq!(
-            fs::read(destination.join("claude")).unwrap(),
-            b"claude-binary"
-        );
-        assert_eq!(
-            fs::read(destination.join("LICENSE.md")).unwrap(),
-            b"platform license"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn older_native_provider_archives_without_a_license_still_install() {
-        let archive = release_archive(&[
-            ("providers/claude/claude", b"claude-binary"),
-            ("providers/claude/manifest.json", b"{}"),
-            ("providers/claude/package.json", b"{}"),
-        ]);
-        let directory = tempfile::tempdir().unwrap();
-        let staged = directory.path().join("staged");
-        extract_native_provider(&archive, &staged).unwrap();
-        let installed = directory.path().join("providers/claude");
-        install_native_provider_to(&staged, &installed).unwrap();
-        assert_eq!(
-            fs::read(installed.join("claude")).unwrap(),
-            b"claude-binary"
-        );
-        assert!(!installed.join("LICENSE.md").exists());
-    }
-
-    #[test]
-    fn windows_archives_extract_borg_and_its_native_provider() {
+    fn windows_archives_extract_borg_from_any_root() {
         use zip::write::SimpleFileOptions;
 
-        for (root, has_license) in [("", false), ("", true), ("borg-windows/", true)] {
-            let mut files: Vec<(&str, &[u8])> = vec![
-                ("borg.exe", b"borg-binary"),
-                ("providers/claude/claude.exe", b"claude-binary"),
-                ("providers/claude/manifest.json", b"{}"),
-                ("providers/claude/package.json", b"{}"),
-            ];
-            if has_license {
-                files.push(("providers/claude/LICENSE.md", b"platform license"));
-            }
+        for root in ["", "borg-windows/"] {
             let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
-            for (name, bytes) in files {
-                archive
-                    .start_file(format!("{root}{name}"), SimpleFileOptions::default())
-                    .unwrap();
-                archive.write_all(bytes).unwrap();
-            }
+            archive
+                .start_file(format!("{root}borg.exe"), SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(b"borg-binary").unwrap();
             let archive = archive.finish().unwrap().into_inner();
             let directory = tempfile::tempdir().unwrap();
-            let staged = directory.path().join("staged");
             let binary = directory.path().join("borg.exe");
             extract_windows_executable(&archive, &binary, "borg.exe").unwrap();
             assert_eq!(fs::read(binary).unwrap(), b"borg-binary");
-            extract_windows_native_provider(&archive, &staged).unwrap();
-            assert_eq!(
-                fs::read(staged.join("claude.exe")).unwrap(),
-                b"claude-binary"
-            );
-            assert_eq!(staged.join("LICENSE.md").exists(), has_license);
-            if has_license {
-                assert_eq!(
-                    fs::read(staged.join("LICENSE.md")).unwrap(),
-                    b"platform license"
-                );
-            }
         }
     }
 
@@ -1134,30 +807,6 @@ mod tests {
         fs::write(&candidate, b"new").unwrap();
         install_candidate_at(&candidate, &installed).unwrap();
         assert_eq!(fs::read(installed).unwrap(), b"new");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unix_install_replaces_the_native_provider_atomically() {
-        let directory = tempfile::tempdir().unwrap();
-        let installed = directory.path().join("borg");
-        let provider = directory.path().join("staged-provider");
-        fs::write(&installed, b"borg").unwrap();
-        fs::create_dir(&provider).unwrap();
-        fs::write(provider.join("claude"), b"new-claude").unwrap();
-        fs::write(provider.join("manifest.json"), b"{}").unwrap();
-        fs::write(provider.join("package.json"), b"{}").unwrap();
-        fs::write(provider.join("LICENSE.md"), b"platform license").unwrap();
-        install_native_provider_to(&provider, &directory.path().join("providers/claude")).unwrap();
-        let installed_provider = directory.path().join("providers/claude");
-        assert_eq!(
-            fs::read(installed_provider.join("claude")).unwrap(),
-            b"new-claude"
-        );
-        assert_eq!(
-            fs::read(installed_provider.join("LICENSE.md")).unwrap(),
-            b"platform license"
-        );
     }
 
     #[cfg(unix)]
@@ -1175,14 +824,6 @@ mod tests {
                 .unwrap();
         }
         archive.into_inner().unwrap().finish().unwrap()
-    }
-
-    #[cfg(unix)]
-    fn write_provider(directory: &Path, claude: &[u8]) {
-        fs::create_dir_all(directory).unwrap();
-        fs::write(directory.join("claude"), claude).unwrap();
-        fs::write(directory.join("manifest.json"), b"{}").unwrap();
-        fs::write(directory.join("package.json"), b"{}").unwrap();
     }
 
     /// Failure mode: an update from a release built before borg-display
@@ -1211,52 +852,38 @@ mod tests {
         let root = directory.path();
         let executable = root.join("bin/borg");
         let display = root.join("bin").join(DISPLAY_EXECUTABLE);
-        let provider_target = root.join("bin/providers/claude");
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::write(&executable, b"old-borg").unwrap();
         fs::write(&display, b"old-display").unwrap();
-        write_provider(&provider_target, b"old-claude");
         let staged = root.join("staged");
-        write_provider(&staged.join("provider"), b"new-claude");
+        fs::create_dir_all(&staged).unwrap();
         fs::write(staged.join("borg"), b"new-borg").unwrap();
         fs::write(staged.join(DISPLAY_EXECUTABLE), b"new-display").unwrap();
 
-        // The borg binary fails to install: everything before it is undone.
+        // The borg binary fails to install: borg-display is restored.
         install_release_at(
             &staged.join("missing-borg"),
-            &staged.join("provider"),
             Some(&staged.join(DISPLAY_EXECUTABLE)),
             &executable,
-            &provider_target,
         )
         .unwrap_err();
         assert_eq!(fs::read(&display).unwrap(), b"old-display");
-        assert_eq!(
-            fs::read(provider_target.join("claude")).unwrap(),
-            b"old-claude"
-        );
         assert_eq!(fs::read(&executable).unwrap(), b"old-borg");
 
         install_release_at(
             &staged.join("borg"),
-            &staged.join("provider"),
             Some(&staged.join(DISPLAY_EXECUTABLE)),
             &executable,
-            &provider_target,
         )
         .unwrap();
         assert_eq!(fs::read(&display).unwrap(), b"new-display");
-        assert_eq!(
-            fs::read(provider_target.join("claude")).unwrap(),
-            b"new-claude"
-        );
         assert_eq!(fs::read(&executable).unwrap(), b"new-borg");
         let mut left: Vec<String> = fs::read_dir(root.join("bin"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        assert_eq!(left, ["borg", DISPLAY_EXECUTABLE, "providers"]);
+        assert_eq!(left, ["borg", DISPLAY_EXECUTABLE]);
     }
 
     #[cfg(unix)]
@@ -1266,15 +893,11 @@ mod tests {
         let root = directory.path();
         let executable = root.join("borg");
         fs::write(&executable, b"old-borg").unwrap();
-        write_provider(&root.join("providers/claude"), b"old-claude");
-        write_provider(&root.join("staged-provider"), b"new-claude");
         fs::write(root.join("staged-display"), b"new-display").unwrap();
         install_release_at(
             &root.join("missing-borg"),
-            &root.join("staged-provider"),
             Some(&root.join("staged-display")),
             &executable,
-            &root.join("providers/claude"),
         )
         .unwrap_err();
         assert!(!root.join(DISPLAY_EXECUTABLE).exists());
@@ -1291,26 +914,5 @@ mod tests {
         validate_display_candidate(&candidate, &Version::new(1, 2, 3)).unwrap();
         let error = validate_display_candidate(&candidate, &Version::new(1, 2, 4)).unwrap_err();
         assert!(error.to_string().contains("did not match"), "{error}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unix_native_provider_swap_can_roll_back_before_commit() {
-        let directory = tempfile::tempdir().unwrap();
-        let provider = directory.path().join("staged-provider");
-        let target = directory.path().join("providers/claude");
-        fs::create_dir_all(&provider).unwrap();
-        fs::create_dir_all(&target).unwrap();
-        fs::write(provider.join("claude"), b"new-claude").unwrap();
-        fs::write(provider.join("manifest.json"), b"{}").unwrap();
-        fs::write(provider.join("package.json"), b"{}").unwrap();
-        fs::write(target.join("claude"), b"old-claude").unwrap();
-        fs::write(target.join("manifest.json"), b"{}").unwrap();
-        fs::write(target.join("package.json"), b"{}").unwrap();
-
-        let swap = stage_native_provider(&provider, &target).unwrap();
-        assert_eq!(fs::read(target.join("claude")).unwrap(), b"new-claude");
-        swap.rollback().unwrap();
-        assert_eq!(fs::read(target.join("claude")).unwrap(), b"old-claude");
     }
 }

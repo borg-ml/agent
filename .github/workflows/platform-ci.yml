@@ -81,7 +81,6 @@ jobs:
           fi
           "$binary" --version
           "$binary" --help >/dev/null
-      - uses: ./.github/actions/install-claude-native
       - name: Package and extract-smoke the Unix archive
         if: matrix.archive == 'tar'
         shell: bash
@@ -92,21 +91,14 @@ jobs:
           trap 'rm -rf "$stage" "$extract"' EXIT
           mkdir "$stage/borg-${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release/borg" "$stage/borg-${{ matrix.target }}/"
-          native_package=""
-          for candidate in packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk-*; do
-            if [[ -x "$candidate/claude" ]]; then
-              native_package="$candidate"
-              break
-            fi
-          done
-          test -n "$native_package"
-          sdk_package="packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk"
+          # Placeholder providers/claude payload, kept only so updaters older than
+          # this release (which require these files) can install it; delete once
+          # those versions are gone.
           mkdir -p "$stage/borg-${{ matrix.target }}/providers/claude"
-          cp "$native_package/claude" "$stage/borg-${{ matrix.target }}/providers/claude/claude"
-          cp "$native_package/LICENSE.md" "$stage/borg-${{ matrix.target }}/providers/claude/LICENSE.md"
-          cp "$sdk_package/manifest.json" "$stage/borg-${{ matrix.target }}/providers/claude/manifest.json"
-          cp "$sdk_package/package.json" "$stage/borg-${{ matrix.target }}/providers/claude/package.json"
+          printf '#!/bin/sh\necho "Retired Borg placeholder: Borg no longer bundles Claude Code."\n' >"$stage/borg-${{ matrix.target }}/providers/claude/claude"
           chmod 700 "$stage/borg-${{ matrix.target }}/providers/claude/claude"
+          printf '{}\n' >"$stage/borg-${{ matrix.target }}/providers/claude/manifest.json"
+          printf '{"name":"borg-retired-claude-placeholder","private":true}\n' >"$stage/borg-${{ matrix.target }}/providers/claude/package.json"
           mkdir -p "$stage/borg-${{ matrix.target }}/docs" "$stage/borg-${{ matrix.target }}/configs" "$stage/borg-${{ matrix.target }}/include"
           cp docs/blu-extensions.md "$stage/borg-${{ matrix.target }}/docs/"
           cp docs/terminal-setup.md "$stage/borg-${{ matrix.target }}/docs/"
@@ -118,8 +110,9 @@ jobs:
             borg providers docs configs include CHANGELOG.md LICENSE NOTICE.md README.md
           tar -xzf "$asset" -C "$extract"
           "$extract/borg" --version
-          "$extract/providers/claude/claude" --version
-          test -f "$extract/providers/claude/LICENSE.md"
+          for name in claude manifest.json package.json; do
+            test -f "$extract/providers/claude/$name"
+          done
           test -f "$extract/docs/blu-extensions.md"
           test -f "$extract/docs/terminal-setup.md"
           test -f "$extract/configs/extension.example.toml"
@@ -137,16 +130,13 @@ jobs:
           if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/borg.exe" $stage
-          $platformPackage = Get-ChildItem "packages/claude-native-runtime/node_modules/@anthropic-ai" -Directory |
-            Where-Object { $_.Name -like "claude-agent-sdk-*" -and (Test-Path (Join-Path $_.FullName "claude.exe")) } |
-            Select-Object -First 1
-          if (-not $platformPackage) { throw "Claude native platform package was not installed" }
-          $sdkPackage = "packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk"
+          # Placeholder providers/claude payload, kept only so updaters older than
+          # this release (which require these files) can install it; delete once
+          # those versions are gone.
           New-Item -ItemType Directory -Path "$stage/providers/claude"
-          Copy-Item (Join-Path $platformPackage.FullName "claude.exe") "$stage/providers/claude/claude.exe"
-          Copy-Item (Join-Path $platformPackage.FullName "LICENSE.md") "$stage/providers/claude/LICENSE.md"
-          Copy-Item (Join-Path $sdkPackage "manifest.json") "$stage/providers/claude/manifest.json"
-          Copy-Item (Join-Path $sdkPackage "package.json") "$stage/providers/claude/package.json"
+          Set-Content -NoNewline -Path "$stage/providers/claude/claude.exe" -Value "Retired Borg placeholder: Borg no longer bundles Claude Code."
+          Set-Content -NoNewline -Path "$stage/providers/claude/manifest.json" -Value "{}"
+          Set-Content -NoNewline -Path "$stage/providers/claude/package.json" -Value '{"name":"borg-retired-claude-placeholder","private":true}'
           New-Item -ItemType Directory -Path "$stage/docs", "$stage/configs", "$stage/include"
           Copy-Item "docs/blu-extensions.md" "$stage/docs/"
           Copy-Item "docs/terminal-setup.md" "$stage/docs/"
@@ -159,10 +149,9 @@ jobs:
           $binary = Get-ChildItem -Path $extract -Filter "borg.exe" | Select-Object -First 1
           if (-not $binary) { throw "packaged borg.exe was not found" }
           & $binary.FullName --version
-          $native = Get-ChildItem -Path $extract -Recurse -Filter "claude.exe" | Select-Object -First 1
-          if (-not $native) { throw "packaged native claude.exe was not found" }
-          & $native.FullName --version
-          if (-not (Test-Path (Join-Path $extract "providers/claude/LICENSE.md"))) { throw "Claude native license was not packaged" }
+          foreach ($name in "claude.exe", "manifest.json", "package.json") {
+            if (-not (Test-Path (Join-Path $extract "providers/claude/$name"))) { throw "Updater placeholder $name was not packaged" }
+          }
           if (-not (Get-ChildItem -Path $extract -Recurse -Filter "blu-extensions.md")) { throw "Blu documentation was not packaged" }
           if (-not (Test-Path (Join-Path $extract "docs/terminal-setup.md"))) { throw "Terminal setup guide was not packaged" }
           if (-not (Get-ChildItem -Path $extract -Recurse -Filter "extension.example.toml")) { throw "Blu manifest example was not packaged" }

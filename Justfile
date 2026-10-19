@@ -15,32 +15,6 @@ blu-update:
 blu-check:
     ./scripts/sync-blu.sh --check
 
-# Install only the Claude binary used by the native Rust runtime.
-claude-native:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    source_dir="$PWD/packages/claude-native-runtime"
-    install_dir="${BORG_HOME:-$HOME/.borg}/providers/claude-native-runtime"
-    native_dir="${BORG_HOME:-$HOME/.borg}/providers/claude"
-    test -f "$source_dir/package-lock.json"
-    mkdir -p "$install_dir" "$native_dir"
-    cp "$source_dir/package.json" "$source_dir/package-lock.json" "$install_dir/"
-    npm --prefix "$install_dir" ci --omit=dev --ignore-scripts
-    platform_dir=""
-    for candidate in "$install_dir"/node_modules/@anthropic-ai/claude-agent-sdk-*; do
-        if [[ -x "$candidate/claude" ]]; then
-            platform_dir="$candidate"
-            break
-        fi
-    done
-    test -n "$platform_dir"
-    sdk_dir="$install_dir/node_modules/@anthropic-ai/claude-agent-sdk"
-    cp "$platform_dir/claude" "$native_dir/claude"
-    cp "$platform_dir/LICENSE.md" "$native_dir/LICENSE.md"
-    cp "$sdk_dir/manifest.json" "$native_dir/manifest.json"
-    cp "$sdk_dir/package.json" "$native_dir/package.json"
-    chmod 700 "$native_dir/claude"
-
 # Validate a release without changing the repository.
 release-check version="":
     ./scripts/release.sh --check {{ quote(version) }}

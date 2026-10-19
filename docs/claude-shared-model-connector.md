@@ -1,5 +1,10 @@
 # Claude shared model connector: a working ownership boundary
 
+**Historical record.** The shared helper, its preload and the pinned Claude Code
+binary described below were replaced by Borg's native Rust subscription
+transport (`claude_native_client.rs`). Borg no longer bundles, downloads or runs
+a Claude Code binary; the ownership boundary below still holds.
+
 2026-09-24. Implemented and activated in the local agent executor. Claude turns
 and children now use Borg's native harness through one shared subscription model
 helper per persistent credential authority. No Claude agent loop runs on this
@@ -8,8 +13,7 @@ path. The historical prototype measurements below are labeled separately.
 ## Implementation verification
 
 The [subscription model provider](../crates/borg-provider/src/provider/claude_model.rs)
-now uses a [host broker](../crates/borg-provider/src/provider/claude_connector.rs)
-and [model-only preload](../crates/borg-provider/src/provider/claude_connector.js).
+then used a host broker and a model-only preload (both since removed).
 The broker validates the official **2.1.285** binary checksum, coordinates startup
 across Borg processes, and protects its local transport with a private random
 credential. The helper inherits the startup lock and publishes its own endpoint,
@@ -319,7 +323,7 @@ These responsibilities move together in the native execution path:
   `native_conversation_with_images` and `native_request_prefix`.
 - [Lossless model state](../crates/borg-core/src/model.rs): `ModelProviderState`.
 - [Native content codec](../crates/borg-provider/src/provider/anthropic_messages.rs).
-- [Pinned binary and shared helper](../crates/borg-provider/src/provider/claude_connector.rs).
+- [Native subscription transport](../crates/borg-provider/src/provider/claude_native_client.rs).
 
 ## Remaining evidence limits
 

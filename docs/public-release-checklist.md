@@ -24,8 +24,6 @@ with default parallelism to catch races hidden by the serial workspace gate.
 - Provide a private security-reporting path and a `SECURITY.md` that names it.
 - Confirm the contributor licence signing path described in
   `CONTRIBUTING.md` is available before inviting external contributions.
-- Review redistribution rights and notices for the bundled native Claude
-  payload before publishing its archives.
 
 ## Recovery and boundaries
 
@@ -48,7 +46,7 @@ with default parallelism to catch races hidden by the serial workspace gate.
 
 - Build and smoke-test every supported platform archive.
 - Test fresh install, upgrade, interrupted update, and next-launch recovery.
-- Verify the Borg binary and bundled native provider together.
+- Verify the Borg binary and, on Linux, `borg-display` together.
 - Install the candidate archive on a canary host and exercise one real provider
   session before tagging the release.
 

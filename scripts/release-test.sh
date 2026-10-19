@@ -28,8 +28,13 @@ if [[ -f "$repo_root/.github/workflows/release.yml" ]]; then
   if grep -Eq -- 'cargo test.*-p borg --lib' "$release_workflow"; then
     fail "release workflow still invokes --lib for the binary-only borg package"
   fi
-  grep -Fq 'providers/claude' "$release_workflow" ||
-    fail "release archive does not package the native Claude payload"
+  # Updaters older than the placeholder release refuse archives without these.
+  for placeholder in 'providers/claude/claude"' 'providers/claude/claude.exe"' \
+    'providers/claude/manifest.json"' 'providers/claude/package.json"'
+  do
+    grep -Fq "$placeholder" "$release_workflow" ||
+      fail "release archive is missing the updater placeholder $placeholder"
+  done
   grep -Fq 'release/borg-display" "$package_dir/"' "$release_workflow" ||
     fail "Linux release archives do not package borg-display"
   grep -Fq 'components: rustfmt, clippy' "$release_workflow" ||
@@ -61,22 +66,10 @@ if [[ -f "$repo_root/.github/workflows/release.yml" ]]; then
   fi
   grep -Fq 'needs: [validate, build]' "$release_workflow" ||
     fail "release publication does not wait for both validation and artifacts"
-  grep -Fq '$sdk_package/manifest.json' "$release_workflow" ||
-    fail "Unix release packaging does not use the SDK manifest"
-  grep -Fq '$native_package/LICENSE.md' "$release_workflow" ||
-    fail "Unix release packaging omits the native Claude license"
-  grep -Fq 'Join-Path $sdkPackage "manifest.json"' "$release_workflow" ||
-    fail "Windows release packaging does not use the SDK manifest"
-  grep -Fq 'Join-Path $platformPackage.FullName "LICENSE.md"' "$release_workflow" ||
-    fail "Windows release packaging omits the native Claude license"
   grep -Fq 'cp LICENSE NOTICE.md README.md CHANGELOG.md' "$release_workflow" ||
     fail "Unix release packaging omits the changelog"
   grep -Fq 'Copy-Item LICENSE, NOTICE.md, README.md, CHANGELOG.md' "$release_workflow" ||
     fail "Windows release packaging omits the changelog"
-  if grep -Fq '$native_package/manifest.json' "$release_workflow" ||
-    grep -Fq 'Join-Path $platformPackage.FullName "manifest.json"' "$release_workflow"; then
-    fail "release packaging reads a manifest that is absent from platform packages"
-  fi
   grep -Fq 'docs/blu-extensions.md' "$release_workflow" ||
     fail "release archive does not package the Blu guide"
   grep -Fq 'docs/customization.md' "$release_workflow" ||
@@ -88,8 +81,8 @@ if [[ -f "$repo_root/.github/workflows/release.yml" ]]; then
   if grep -Fq 'release/borg-gui' "$release_workflow"; then
     fail "release archive packages the experimental native GUI"
   fi
-  if grep -Eq 'providers/claude-sdk|BORG_CLAUDE_NATIVE|borg-claude-sdk' "$release_workflow"; then
-    fail "release workflow still contains the removed Claude fallback"
+  if grep -Eq 'claude-native|claude-agent-sdk|providers/claude-sdk|BORG_CLAUDE_NATIVE' "$release_workflow"; then
+    fail "release workflow still packages a real Claude binary"
   fi
 fi
 
@@ -112,18 +105,15 @@ if [[ -f "$repo_root/.github/workflows/platform-ci.yml" ]]; then
   grep -Fq 'cargo test --locked --target ${{ matrix.target }} -p borg --no-fail-fast' \
     "$platform_workflow" ||
     fail "platform workflow is missing the binary-only native test matrix"
-  grep -Fq 'providers/claude' "$platform_workflow" ||
-    fail "platform archive does not package the native Claude payload"
+  # Updaters older than the placeholder release refuse archives without these.
+  for placeholder in 'providers/claude/claude"' 'providers/claude/claude.exe"' \
+    'providers/claude/manifest.json"' 'providers/claude/package.json"'
+  do
+    grep -Fq "$placeholder" "$platform_workflow" ||
+      fail "platform archive is missing the updater placeholder $placeholder"
+  done
   grep -Fq 'components: rustfmt, clippy' "$platform_workflow" ||
     fail "platform quality job does not install rustfmt and clippy"
-  grep -Fq '$sdk_package/manifest.json' "$platform_workflow" ||
-    fail "Unix platform packaging does not use the SDK manifest"
-  grep -Fq 'Join-Path $sdkPackage "manifest.json"' "$platform_workflow" ||
-    fail "Windows platform packaging does not use the SDK manifest"
-  if grep -Fq '$native_package/manifest.json' "$platform_workflow" ||
-    grep -Fq 'Join-Path $platformPackage.FullName "manifest.json"' "$platform_workflow"; then
-    fail "platform packaging reads a manifest that is absent from platform packages"
-  fi
   grep -Fq 'docs/blu-extensions.md' "$platform_workflow" ||
     fail "platform archive does not package the Blu guide"
   grep -Fq 'configs/extension.example.toml' "$platform_workflow" ||
@@ -133,16 +123,8 @@ if [[ -f "$repo_root/.github/workflows/platform-ci.yml" ]]; then
   if grep -Fq 'release/borg-gui' "$platform_workflow"; then
     fail "platform archive packages the experimental native GUI"
   fi
-  if grep -Eq 'providers/claude-sdk|BORG_CLAUDE_NATIVE|borg-claude-sdk' "$platform_workflow"; then
-    fail "platform workflow still contains the removed Claude fallback"
-  fi
-fi
-
-if [[ -f "$repo_root/Justfile" ]]; then
-  grep -Fq 'cp "$sdk_dir/manifest.json" "$native_dir/manifest.json"' "$repo_root/Justfile" ||
-    fail "just claude-native does not install the SDK manifest"
-  if grep -Fq 'cp "$platform_dir/manifest.json"' "$repo_root/Justfile"; then
-    fail "just claude-native reads a manifest that is absent from platform packages"
+  if grep -Eq 'claude-native|claude-agent-sdk|providers/claude-sdk|BORG_CLAUDE_NATIVE' "$platform_workflow"; then
+    fail "platform workflow still packages a real Claude binary"
   fi
 fi
 

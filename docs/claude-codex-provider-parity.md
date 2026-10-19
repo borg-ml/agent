@@ -4,9 +4,11 @@ This document defines practical parity for Borg's coding-provider transports.
 Parity means equivalent user-visible behavior and reliability; it does not
 require identical provider protocols.
 
-Codex no longer runs an app server, so the Codex column records the historical
-transport rather than a current path. The capability comparison below is still
-the record of what parity required.
+Codex no longer runs an app server, and Claude no longer runs the Claude Code
+CLI: the CLI route and its process pool were removed, and Claude turns run on
+Borg's native harness over a direct model transport. Both columns record
+historical transports rather than current paths; the capability comparison
+below is still the record of what parity required.
 
 ## Capability matrix
 
@@ -25,28 +27,25 @@ the record of what parity required.
 | Manual compaction | `thread/compact` | No public direct compact method; `/compact` can be sent as session input | Implemented through resumed `/compact` turn |
 | Cancellation cleanup | Interrupt plus app-server shutdown | `interrupt()` and `close()` | Implemented; receipt/cancellation cleanup is confirmed before pool reuse |
 | Prewarm | Local app-server prewarm | Native Claude process can be kept alive | Native process is retained after the first turn |
-| Runtime packaging | Codex binary is discovered directly | Claude binary plus `claude-agents` Rust runtime | Native binary is discovered from installed/release locations; Rust runtime is imported from the standalone crate |
 
 ## Acceptance criteria
 
 Claude reaches practical parity when:
 
-1. A pinned Claude binary is installed or packaged by supported Borg install and
-   release flows without relying on an untracked local file.
-2. A local session keeps one controllable native Claude runtime alive across turns
+1. A local session keeps one controllable native Claude runtime alive across turns
    when its workspace, model, permissions, and routing configuration remain
    compatible.
-3. steer, interrupt, permission decisions, and shutdown have acknowledgements
+2. steer, interrupt, permission decisions, and shutdown have acknowledgements
    and deterministic terminal behavior.
-4. provider session IDs resume safely, with a full-context fallback rather
+3. provider session IDs resume safely, with a full-context fallback rather
    than silently losing the durable Borg conversation.
-5. live context usage, final usage, tool activity, SDK errors, and auth errors
+4. live context usage, final usage, tool activity, SDK errors, and auth errors
    map into the same provider-neutral event contract used by Codex.
-6. manual compaction either uses a supported SDK control or sends `/compact`
+5. manual compaction either uses a supported SDK control or sends `/compact`
    through the active streaming session and confirms its compact boundary.
-7. unit and integration tests cover messages, tools, structured output,
-   attachments, MCP, permissions, resume, control races, cancellation,
-   malformed/provider-error events, and packaged native-payload resolution.
+6. unit and integration tests cover messages, tools, structured output,
+   attachments, MCP, permissions, resume, control races, cancellation, and
+   malformed/provider-error events.
 
 Known protocol differences include Claude's lack of a dedicated public
 compaction method equivalent to Codex `thread/compact`, and Codex app-server's
@@ -80,10 +79,6 @@ git clone https://github.com/borg-ml/claude-agents.git
 cargo test --manifest-path claude-agents/Cargo.toml --locked
 ```
 
-The native path needs the packaged or installed `claude` binary. The
-`packages/claude-native-runtime` npm manifest is only used to fetch that
-upstream platform binary; it is not a runtime adapter.
-
 A credentialed smoke must then run two turns in one Claude thread, verify the
 second turn reuses the native process/session, run `/compact`, and confirm nonzero
 final usage. These smokes cover upstream authentication and service behavior
@@ -91,17 +86,14 @@ that deterministic tests cannot emulate.
 
 ## Claude authentication and recovery
 
-Claude uses the Claude CLI's account login rather than storing credentials in
-Borg:
+Borg signs in to the Claude subscription natively; it does not run the Claude
+CLI:
 
-1. Run `borg remote login claude`, or enter `/login` in an idle Claude thread.
-2. Borg runs `claude auth login` in a normal terminal so the interactive flow
-   can complete.
-3. Borg then verifies `claude auth status --json` reports `loggedIn: true`.
-4. Retry the message. Provider authentication failures are normalized to an
+1. Run `borg login claude`, or enter `/login` in an idle Claude thread.
+2. Borg runs the browser sign-in itself and stores the login in its own config
+   directory (`~/.borg/claude` by default), separate from Claude Code's.
+3. Retry the message. Provider authentication failures are normalized to an
    actionable `/login` prompt.
 
 The same flow runs on the machine executing the agent. For an enrolled remote
 host, log in on that host; credentials are not copied through Borg Remote.
-Requests carrying scoped provider or git credentials bypass the reusable
-Claude process pool so credentials cannot leak into a later turn.

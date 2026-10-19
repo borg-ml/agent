@@ -6,11 +6,10 @@ Add a native Anthropic route: Borg agent loop driving the Anthropic Messages
 API with the user own API key, billed per token to that key.
 
 This is a new, explicitly selected billing lane. It does not touch the existing
-Claude lane, which stays exactly as it is: the unmodified Claude Code binary,
-signed in with the user own subscription. Anthropic published policy permits
-that binary path and forbids third-party routing through Free/Pro/Max
-credentials, so subscription tokens are never replayed by this lane, and the two
-routes must never be selected implicitly for one another.
+Claude lane, which stays exactly as it is, signed in with the user own
+subscription. Anthropic published policy forbids third-party routing through
+Free/Pro/Max credentials, so subscription tokens are never replayed by this
+lane, and the two routes must never be selected implicitly for one another.
 
 Backing for treating these as separate lanes rather than one Claude entry:
 CodingProvider::Claude is a CLI-route provider in Borg today and every session on

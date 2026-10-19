@@ -19,9 +19,7 @@ mod env;
 pub mod subprocess;
 
 pub use auth::{ProviderAuthBundle, ProviderAuthFile, ProviderAuthProvider};
-pub use provider_bin::{
-    CODEX_BIN_ENV, Runtime, command as runtime_command, executable as runtime_executable,
-};
+pub use provider_bin::{Runtime, command as runtime_command, executable as runtime_executable};
 pub use provider_install::Healed;
 pub use runtime::{
     CLAUDE_EFFORT_LEVELS, CLAUDE_MODEL_CATALOG, CLAUDE_SELECTABLE_MODELS, CODEX_EFFORT_LEVELS,

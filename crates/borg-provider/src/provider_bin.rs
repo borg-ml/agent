@@ -21,7 +21,6 @@ pub const AUTO_INSTALL_ENV: &str = "BORG_AUTO_INSTALL";
 /// An external CLI that Borg drives as a provider backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Runtime {
-    Claude,
     OpenCode,
     /// xAI's CLI. Grok's coding plan is only reachable through this binary:
     /// xAI publishes no Anthropic-compatible endpoint, so no other agent CLI
@@ -45,8 +44,7 @@ pub(crate) enum InstallStrategy {
 }
 
 impl Runtime {
-    pub const ALL: [Runtime; 5] = [
-        Runtime::Claude,
+    pub const ALL: [Runtime; 4] = [
         Runtime::OpenCode,
         Runtime::Grok,
         Runtime::Muse,
@@ -56,7 +54,6 @@ impl Runtime {
     /// Human-facing name, also used in log and error text.
     pub fn label(self) -> &'static str {
         match self {
-            Runtime::Claude => "Claude Code",
             Runtime::OpenCode => "OpenCode",
             Runtime::Grok => "Grok",
             Runtime::Muse => "Muse Code",
@@ -67,7 +64,6 @@ impl Runtime {
     /// The executable's base name, without any platform extension.
     pub fn program(self) -> &'static str {
         match self {
-            Runtime::Claude => "claude",
             Runtime::OpenCode => "opencode",
             Runtime::Grok => "grok",
             Runtime::Muse => "muse",
@@ -78,7 +74,6 @@ impl Runtime {
     /// Environment variable that pins this runtime to an explicit path.
     pub fn pin_env(self) -> &'static str {
         match self {
-            Runtime::Claude => "BORG_CLAUDE_BIN",
             Runtime::OpenCode => "BORG_OPENCODE_BIN",
             Runtime::Grok => "BORG_GROK_BIN",
             Runtime::Muse => "BORG_MUSE_BIN",
@@ -88,9 +83,6 @@ impl Runtime {
 
     pub(crate) fn install_strategy(self) -> InstallStrategy {
         match self {
-            Runtime::Claude => InstallStrategy::Script {
-                url: "https://claude.ai/install.sh",
-            },
             Runtime::OpenCode => InstallStrategy::Script {
                 url: "https://opencode.ai/install",
             },
@@ -121,10 +113,6 @@ impl Runtime {
         let mut dirs: Vec<PathBuf> = Vec::new();
         if let Some(home) = home_directory() {
             match self {
-                Runtime::Claude => {
-                    dirs.push(home.join(".local").join("bin"));
-                    dirs.push(home.join(".claude").join("local"));
-                }
                 Runtime::OpenCode => {
                     dirs.push(home.join(".opencode").join("bin"));
                     dirs.push(home.join(".local").join("bin"));
@@ -409,9 +397,6 @@ pub fn candidate_paths(runtime: Runtime) -> Vec<PathBuf> {
     candidates(runtime)
 }
 
-// Kept so existing call sites and tests keep a stable name for the pin env.
-pub const CODEX_BIN_ENV: &str = "BORG_CODEX_BIN";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,7 +427,7 @@ mod tests {
     #[tokio::test]
     async fn probe_rejects_a_command_that_exits_non_zero() {
         assert!(
-            probe_path(Runtime::Claude, Path::new("/usr/bin/false"))
+            probe_path(Runtime::OpenCode, Path::new("/usr/bin/false"))
                 .await
                 .is_err()
         );
@@ -451,7 +436,7 @@ mod tests {
     #[tokio::test]
     async fn probe_accepts_a_command_that_exits_zero() {
         assert!(
-            probe_path(Runtime::Claude, Path::new("/usr/bin/true"))
+            probe_path(Runtime::OpenCode, Path::new("/usr/bin/true"))
                 .await
                 .is_ok()
         );
@@ -460,20 +445,19 @@ mod tests {
     #[test]
     fn unresolved_message_names_every_rejected_candidate() {
         let message = unresolved_message(
-            Runtime::Claude,
+            Runtime::OpenCode,
             &[Rejected {
-                path: PathBuf::from("/opt/homebrew/bin/claude"),
+                path: PathBuf::from("/opt/homebrew/bin/opencode"),
                 reason: "`--version` failed: boom".to_string(),
             }],
         );
-        assert!(message.contains("/opt/homebrew/bin/claude"));
+        assert!(message.contains("/opt/homebrew/bin/opencode"));
         assert!(message.contains("boom"));
         assert!(message.contains("borg doctor"));
     }
 
     #[test]
     fn each_runtime_suggests_its_own_installer() {
-        assert!(unresolved_message(Runtime::Claude, &[]).contains("claude.ai/install.sh"));
         assert!(unresolved_message(Runtime::OpenCode, &[]).contains("opencode.ai/install"));
 
         assert!(unresolved_message(Runtime::Grok, &[]).contains("x.ai/cli/install.sh"));
