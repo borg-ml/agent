@@ -5,6 +5,22 @@ Git comparison.
 
 ## Unreleased (since 0.17.1)
 
+- Add `show_image`: any agent or subagent can show PNG, JPEG, GIF or WebP
+  images, with an optional caption, as a message in its transcript. Images are
+  kept in the session store, so they still render after the source file is
+  gone, and an image without a caption is no longer dropped.
+- `borg login claude` signs in to a Borg-owned login (`~/.borg/claude`)
+  instead of sharing Claude Code's, so the two no longer refresh one login and
+  invalidate each other's tokens. The selection is saved only after the
+  sign-in succeeds; until then the existing login keeps working.
+- Keep project guidance, the session goal and the plan in context after a
+  mid-turn compaction. Previously a long turn could lose AGENTS.md, skills and
+  harness state after compacting, and the goal and plan survived only if the
+  summary mentioned them. The unfinished goal now also accompanies every turn,
+  not only goal continuations, and nested AGENTS.md files a session reached are
+  restated on every request.
+- Refuse `while`/`until` loops that wait on `pgrep -f`: they match the shell
+  running the command and never end.
 - Stop bundling Claude Code: release archives drop the ~270 MB binary, since
   Claude runs on Borg's native subscription transport. `borg update` no longer
   installs `providers/claude`; an existing copy is left alone and can be
