@@ -25198,3 +25198,79 @@ async fn promote_moves_live_authority_and_restores_without_moving_session_state(
         scratch.discard().await;
     }
 }
+
+// A run of plain provider output commits as one transaction. Writes and
+// streaming deltas recorded in between must still land in the journal and reach
+// live delivery in exactly the order they were recorded.
+#[tokio::test]
+async fn deferred_provider_run_keeps_journal_and_delivery_order() {
+    let session_id = Uuid::new_v4();
+    let (scratch, store, mut journal) = runtime_store(session_id).await;
+    let (events, mut receiver) = mpsc::channel(64);
+    let usage = |n: u64| SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Claude,
+        kind: "native_model_usage".into(),
+        payload: serde_json::json!({ "probe": n }),
+    };
+    let status = SessionEventKind::StatusChanged {
+        status: SessionStatus::Running,
+        lifecycle: Some(SubagentLifecycle::Running),
+        detail: Some("probe".into()),
+    };
+    assert!(batchable_provider_event(&usage(1)));
+    journal.defer(&events, SessionEvent::new(session_id, 0, usage(1)));
+    journal.defer(&events, SessionEvent::new(session_id, 0, usage(2)));
+    record(&mut journal, &events, session_id, status)
+        .await
+        .unwrap();
+    journal.defer(&events, SessionEvent::new(session_id, 0, usage(3)));
+    record_provider_event(
+        SessionEventKind::MessageDelta {
+            message_id: Uuid::new_v4(),
+            delta: "streamed".into(),
+        },
+        &mut VecDeque::new(),
+        &mut HashMap::new(),
+        &mut journal,
+        &events,
+        session_id,
+    )
+    .await
+    .unwrap();
+    journal.defer(&events, SessionEvent::new(session_id, 0, usage(4)));
+    journal.flush_deferred().await.unwrap();
+    drop(events);
+
+    let label = |event: &SessionEvent| match &event.kind {
+        SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "native_model_usage" => {
+            Some(format!("usage {}", payload["probe"]))
+        }
+        SessionEventKind::StatusChanged { .. } => Some("status".to_string()),
+        // The live store hands the delta back as the streamed message snapshot.
+        SessionEventKind::Message {
+            actor: EventActor::Assistant,
+            ..
+        } => Some("delta".to_string()),
+        _ => None,
+    };
+    let mut delivered = Vec::new();
+    while let Some(event) = receiver.recv().await {
+        delivered.extend(label(&event));
+    }
+    assert_eq!(
+        delivered,
+        [
+            "usage 1", "usage 2", "status", "usage 3", "delta", "usage 4"
+        ]
+    );
+    let journaled = store
+        .read(session_id)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(label)
+        .collect::<Vec<_>>();
+    assert_eq!(journaled, delivered);
+    drop((store, journal));
+    scratch.discard().await;
+}

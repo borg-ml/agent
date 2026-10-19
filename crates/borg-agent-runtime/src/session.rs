@@ -520,6 +520,10 @@ pub(crate) struct RuntimeSessionStore {
     received_agent_messages: HashSet<Uuid>,
     assistant_row_anchors: HashSet<Uuid>,
     subagent_snapshots: HashMap<Uuid, crate::SubagentSnapshot>,
+    /// Plain durable provider output held so a run of it commits as one
+    /// transaction. Every other write flushes it first.
+    deferred: Vec<SessionEvent>,
+    deferred_delivery: Option<mpsc::Sender<SessionEvent>>,
 }
 
 #[derive(Clone)]
@@ -877,6 +881,8 @@ impl RuntimeSessionStore {
             received_agent_messages: HashSet::new(),
             assistant_row_anchors: HashSet::new(),
             subagent_snapshots: HashMap::new(),
+            deferred: Vec::new(),
+            deferred_delivery: None,
         }
     }
 
@@ -1055,7 +1061,12 @@ impl RuntimeSessionStore {
     /// stays authoritative and still takes every event in order; the mirror is
     /// repairable by design (`repair` batches ordinary rows and runs from every
     /// turn boundary), and a person waiting at the keyboard is not.
-    async fn append_all(&mut self, mut events: Vec<SessionEvent>) -> Result<Vec<SessionEvent>> {
+    async fn append_all(&mut self, events: Vec<SessionEvent>) -> Result<Vec<SessionEvent>> {
+        self.flush_deferred().await?;
+        self.append_all_now(events).await
+    }
+
+    async fn append_all_now(&mut self, mut events: Vec<SessionEvent>) -> Result<Vec<SessionEvent>> {
         if events.is_empty() {
             return Ok(Vec::new());
         }
@@ -1064,9 +1075,42 @@ impl RuntimeSessionStore {
         let mut absorbed = Vec::with_capacity(appended.len());
         for event in appended {
             self.absorb_appended(&event).await?;
+            self.note_assistant_row_anchor(&event);
             absorbed.push(event);
         }
         Ok(absorbed)
+    }
+
+    /// Hold plain durable provider output so a run of it commits as one
+    /// transaction. Under a slow database one commit per event is what let the
+    /// provider channel back up behind the journal.
+    fn defer(&mut self, events: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
+        self.deferred_delivery.get_or_insert_with(|| events.clone());
+        self.deferred.push(event);
+    }
+
+    /// Commit and deliver the deferred run. Every other write and delivery
+    /// path calls this first, so journal and delivery order stay exactly the
+    /// order in which events were recorded.
+    async fn flush_deferred(&mut self) -> Result<()> {
+        if self.deferred.is_empty() {
+            return Ok(());
+        }
+        let run = std::mem::take(&mut self.deferred);
+        let events = self
+            .deferred_delivery
+            .take()
+            .expect("a deferred run has a delivery channel");
+        let session_id = run[0].session_id;
+        let preceding = self.take_projection_diagnostics();
+        let appended = self.append_all_now(run).await?;
+        let following = self.take_projection_diagnostics();
+        for event in preceding.into_iter().chain(appended).chain(following) {
+            deliver_recorded_event(&events, session_id, event, crate::EventPersistence::Durable)
+                .await;
+        }
+        self.wake_workspace_projector(session_id);
+        Ok(())
     }
 
     /// Fold a persisted event into the live context, exactly as `append` does.
@@ -1155,6 +1199,7 @@ impl RuntimeSessionStore {
     }
 
     async fn append(&mut self, mut event: SessionEvent) -> Result<SessionEvent> {
+        self.flush_deferred().await?;
         self.retain_system_override(std::slice::from_mut(&mut event))
             .await?;
         let event = self.store.append(event).await?;
@@ -1169,6 +1214,11 @@ impl RuntimeSessionStore {
             self.wake_workspace_projector(event.session_id);
         }
         self.absorb_appended(&event).await?;
+        self.note_assistant_row_anchor(&event);
+        Ok(event)
+    }
+
+    fn note_assistant_row_anchor(&mut self, event: &SessionEvent) {
         match &event.kind {
             SessionEventKind::MessageDelta { message_id, delta } if !delta.is_empty() => {
                 self.assistant_row_anchors.insert(*message_id);
@@ -1184,7 +1234,6 @@ impl RuntimeSessionStore {
             SessionEventKind::TurnStarted { .. } => self.assistant_row_anchors.clear(),
             _ => {}
         }
-        Ok(event)
     }
 }
 
@@ -7533,15 +7582,19 @@ async fn run_agent_session_store_kernel_inner(
                     if context_usage_observation(&kind) {
                         provider_context_usage_valid = true;
                     }
-                    record_provider_event(
-                        kind,
-                        &mut pending_steers,
-                        &mut steers_awaiting_consumption,
-                        &mut journal,
-                        &events,
-                        session_id,
-                    )
-                    .await?;
+                    if batchable_provider_event(&kind) {
+                        journal.defer(&events, SessionEvent::new(session_id, 0, kind));
+                    } else {
+                        record_provider_event(
+                            kind,
+                            &mut pending_steers,
+                            &mut steers_awaiting_consumption,
+                            &mut journal,
+                            &events,
+                            session_id,
+                        )
+                        .await?;
+                    }
                     if retry_steers && !context_compaction_in_progress && !interrupted {
                         steer_boundary_generation = steer_boundary_generation.saturating_add(1);
                         retry_pending_steers(
@@ -7564,6 +7617,7 @@ async fn run_agent_session_store_kernel_inner(
                         .await?;
                     }
                     }
+                    journal.flush_deferred().await?;
                 }
                 Some(kind) = receipt_rx.recv() => {
                     record(&mut journal, &events, session_id, kind).await?;
@@ -12186,6 +12240,7 @@ async fn record_provider_event(
             | SessionEventKind::ReasoningTextDelta { .. }
             | SessionEventKind::ReasoningBlockDelta { .. }
     ) {
+        journal.flush_deferred().await?;
         let event = SessionEvent::new(session_id, 0, kind);
         let needs_store = match &event.kind {
             SessionEventKind::MessageDelta { message_id, delta } => {
@@ -14893,6 +14948,7 @@ async fn record(
     {
         return Ok(());
     }
+    journal.flush_deferred().await?;
     let preceding_diagnostics = journal.take_projection_diagnostics();
     let persistence = kind.persistence();
     let event = journal
@@ -14937,6 +14993,7 @@ async fn record_all(
     if kinds.is_empty() {
         return Ok(());
     }
+    journal.flush_deferred().await?;
     let preceding_diagnostics = journal.take_projection_diagnostics();
     let persistences: Vec<_> = kinds.iter().map(SessionEventKind::persistence).collect();
     let pending = kinds
@@ -14980,6 +15037,30 @@ async fn next_provider_event(
         return Some(kind);
     }
     events.recv().await
+}
+
+/// Durable provider output with no steer, approval or delivery side effect, so
+/// a run of it can share one journal transaction without changing what any
+/// later step observes.
+fn batchable_provider_event(kind: &SessionEventKind) -> bool {
+    matches!(kind.persistence(), crate::EventPersistence::Durable)
+        && !matches!(
+            kind,
+            SessionEventKind::AgentMessageReceived { .. }
+                | SessionEventKind::ApprovalRequested { .. }
+                | SessionEventKind::ProviderInteractionRequested { .. }
+                | SessionEventKind::PromptRecalled { .. }
+                | SessionEventKind::TurnCompleted { .. }
+                | SessionEventKind::Message {
+                    actor: EventActor::User | EventActor::System,
+                    ..
+                }
+        )
+        && !matches!(
+            kind,
+            SessionEventKind::ProviderEvent { kind, .. }
+                if kind == "claude.command_lifecycle" || kind == NATIVE_STEER_APPLIED
+        )
 }
 
 fn push_coalesced_provider_event(batch: &mut Vec<SessionEventKind>, next: SessionEventKind) {
