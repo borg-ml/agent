@@ -168,7 +168,14 @@ fn read_checkpoint(bytes: &[u8]) -> Result<Saved> {
                 .remove("completed_at")
                 .unwrap_or(serde_json::Value::Null);
             let completed_at = if matches!(state, "Failed" | "Stopped" | "Complete") {
-                if ended_at.is_null() {
+                let instant = |value: &serde_json::Value| {
+                    serde_json::from_value::<chrono::DateTime<chrono::Utc>>(value.clone()).ok()
+                };
+                // Older writers could stamp an end before the start; the
+                // execution clock never runs backwards, so settle at the start.
+                if ended_at.is_null()
+                    || matches!((instant(&ended_at), instant(&started_at)), (Some(end), Some(start)) if end < start)
+                {
                     started_at.clone()
                 } else {
                     ended_at
@@ -541,6 +548,31 @@ mod lifecycle_migration_tests {
                 expected.is_terminal().then_some(end)
             );
         }
+    }
+    // Old writers saved tool rows that ended before they started; such a
+    // checkpoint must still restore or its session can never project again.
+    #[test]
+    fn legacy_tool_checkpoint_ending_before_it_started_restores() {
+        let mut reducer = ViewReducer::new(Uuid::new_v4(), "epoch".into());
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&reducer.checkpoint().unwrap()).unwrap();
+        let start = Utc::now();
+        let end = start - chrono::Duration::seconds(7);
+        value["version"] = serde_json::json!(1);
+        value["core"]["order"]["entries"] = serde_json::json!([{"Tool": {
+            "source_name": "exec", "name": "Run", "detail": "", "code_view": null,
+            "output_view": null, "payload_refs": [], "time": start.to_rfc3339(),
+            "started_at": start, "completed_at": end, "complete": true,
+            "error": false, "user_interrupted": false, "backgrounded": false,
+            "expanded": false, "outcome": null, "cwd": null
+        }}]);
+        value["core"]["order"]["identities"] = serde_json::json!([[Uuid::new_v4(), 0]]);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let restored = ViewReducer::restore(&bytes, |_| unreachable!()).unwrap();
+        let TranscriptEntry::Tool { execution, .. } = &restored.core.order[0] else {
+            panic!("missing tool");
+        };
+        assert_eq!(execution.completed_at(), Some(start));
     }
     #[test]
     fn legacy_non_tool_checkpoints_restore_execution_state() {
