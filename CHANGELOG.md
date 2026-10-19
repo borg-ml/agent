@@ -21,6 +21,11 @@ Git comparison.
   restated on every request.
 - Refuse `while`/`until` loops that wait on `pgrep -f`: they match the shell
   running the command and never end.
+- `list_watchers` returns watcher status only; pass `watch_ids` to get those
+  watchers' results. A long session's finished watchers no longer flood the
+  context, and completion notices name the exact call. The retired
+  `list_watches` and `stop_watch` aliases are removed; use `list_watchers` and
+  `stop_watcher`.
 - Stop bundling Claude Code: release archives drop the ~270 MB binary, since
   Claude runs on Borg's native subscription transport. `borg update` no longer
   installs `providers/claude`; an existing copy is left alone and can be
