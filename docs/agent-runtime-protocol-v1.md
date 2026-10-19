@@ -30,10 +30,11 @@ the live session actor remains unchanged while transport migration begins.
 The canonical CLI provider layer now also carries the Web-only Kimi gateway
 profile and OpenCode JSON subprocess adapter. Web still owns credentials,
 gateway policy, and scoped product MCP; the CLI owns their provider-neutral
-execution and normalized events. The next gate is shadowing one Web
-Codex/Claude/Kimi/OpenCode turn and comparing event,
-usage, approval, goal, artifact, and final-output projections before moving
-the actor behind a shared dependency or worker client.
+execution and normalized events. Claude and Codex execute on Borg’s native
+harness only. Compatibility CLI execution is limited to non-Go OpenCode, Grok Build, and Muse Code; OpenCode
+Go uses Borg’s native loop. A shared dependency or worker-client extraction
+must preserve event, usage, approval, goal, artifact, and final-output
+projections; this protocol document does not establish Web deployment parity.
 
 Web-owned MCP context is a separate authenticated capability grant. After the
 host accepts a launch, it requests

@@ -3,7 +3,7 @@
 `context` lets an agent inspect and edit its own **model-facing projection** on
 Borg-owned native model turns. It does not rewrite the canonical journal, undo
 external actions, rerun historical tools, or change runtime permissions, account
-credentials or billing. Compatibility CLI turns whose inner loop is owned by
+credentials or billing. Compatibility turns whose inner loop is owned by
 another program cannot use this API.
 
 The normal interface is message IDs and plain text, not reconstructed provider
@@ -107,3 +107,23 @@ to the existing permission and atomicity checks. When retaining human requests,
 keep their answered/completed status so old requests do not look newly pending.
 A failed subscription compaction preserves the full replay rather than falling
 back to selective message omission.
+
+## Instructions and unfinished work after compaction
+
+Root project guidance and every reached nested `AGENTS.md` / `CLAUDE.md` file
+are instruction context, not facts entrusted only to a summary. Reached nested
+files are reread and restated on every model request, including after compaction.
+Duplicate guidance files are deduplicated; nested guidance has a 256 KiB bound
+and omitted guidance is identified so the agent can read it directly.
+
+An unfinished durable goal is included in per-turn harness context on ordinary
+turns as well as goal continuations, and restated after mid-turn compaction.
+After mid-turn compaction Borg also restates the instruction slots (project
+guidance, skills, harness state, provider and team status) and the current plan.
+These reminders do
+not override a human stop/pause or authorize resuming blocked work.
+
+Native compaction retains a bounded recent evidence tail with valid tool pairs
+and journals it for recovery. Summaries preserve answered/completed request
+status and distinguish approved active work from backlog. Failed compaction
+preserves source history instead of recording a degraded summary boundary.

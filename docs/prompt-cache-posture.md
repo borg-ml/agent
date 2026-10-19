@@ -1,9 +1,7 @@
 # Prompt cache posture
 
-How Borg maximises cache hits per route, what each lane actually sends, and what
-is still missing. Measured against the reference clients: Codex CLI (open
-source) and Claude Code (recovered bundle), plus the ZCode harness, whose cache
-discipline is the most explicit of the harnesses available to read.
+Borg keeps stable request prefixes and preserves provider-native continuation
+state without delegating context policy to an upstream agent loop.
 
 ## What each route sends
 
@@ -12,7 +10,7 @@ discipline is the most explicit of the harnesses available to read.
 | Anthropic API | Explicit `cache_control` breakpoints, at most four per request | One on the system block, one on the last tool definition, and one on the newest text so the marker advances with the conversation |
 | Codex (ChatGPT subscription, Responses API) | Implicit prefix cache, keyed by `prompt_cache_key`, with turn-scoped sticky routing | Stable per-session key, deterministic `instructions`, `store: false`, reasoning items replayed through `provider_state`, and the `x-codex-turn-state` token from a turn's first response replayed on the rest of that turn |
 | OpenAI-compatible family: Go gateway, Kimi, GLM, Qwen, OpenRouter, configured endpoints | Implicit prefix cache, keyed by `prompt_cache_key` for vendors that honour it | Same stable key; some profiles also send the session id |
-| Claude subscription (shared model connector) | Explicit Messages cache breakpoints with one-hour retention; the shared helper supplies native subscription authentication and required request attribution | Borg constructs stable instructions, sorted tools, breakpoint placement, lossless native history and thinking settings. All children on a credential authority share one helper; restart replays Borg's journal without a provider-owned session |
+| Claude subscription (native HTTP/SSE) | Explicit Messages cache breakpoints with one-hour retention; the native Rust transport supplies subscription authentication and required request attribution | Borg constructs stable instructions, sorted tools, breakpoint placement, lossless native history and thinking settings. Restart replays Borg's journal without a provider-owned session |
 
 ## Automatic warming
 
@@ -23,7 +21,7 @@ route/context changes, errors, or fixed one-hour active / thirty-minute idle
 horizons. A refresh does not extend those horizons.
 
 Claude subscription refreshes use the same pinned account, credential directory,
-and shared connector as real turns, with a one-token output cap and the original
+and native transport as real turns, with a one-token output cap and the original
 one-hour cache markers. Adaptive thinking settings remain unchanged; budget-based
 thinking is rejected before inference because reducing its output budget cannot
 faithfully preserve the cached request. Subscription warming consumes quota, not
@@ -72,95 +70,24 @@ subscription allowance.
   the original transcript remains available. Manual and between-turn compaction
   likewise recover the previous system/tools/cache key from `native_request_prefix`.
 
-## Measurement and token definitions (verified 2026-09-24)
+## Usage and verification
 
-Borg's `input_tokens` means input that was neither read from nor written to the
-cache. Cached reads and cache writes are separate counters. `total_tokens` is
-all three input categories plus output. Reasoning is a subset of output, not an
-additional charge to add to this total. These are processed tokens, not a
-measurement of subscription allowance consumed. Codex CLI also presents a
-blended total that subtracts cached input; comparing that display directly with
-Borg's processed total exaggerates the difference.
+`input_tokens` is uncached input, excluding cache writes. Cache reads and writes
+are separate counters; `total_tokens` includes all input categories plus output.
+Reasoning is a subset of output. These are processed tokens, not measured
+subscription-allowance debits or dollar savings.
 
-`native_model_usage` now journals raw provider usage per request, including
-reasoning and cache-write breakdowns where supplied. Records sharing a request
-and provider response ID are cumulative snapshots: use the latest for that
-pair, and check `complete`. A retry with a new response ID is a separate call. Interrupted
-Claude streams can retain partial counters. A failed Codex response can retain
-terminal usage even when its output is rejected. An absent counter is unknown,
-not a measured zero. These audit events do not increment the existing
-`usage_updated` turn totals and are not inherited into a fork's request audit.
-The child's own journal holds its audit; its parent does not duplicate it.
-The bound native client also journals auxiliary approval, consultation and
-compaction requests. Optional title generation currently exposes its successful
-processed total through `SessionTitled`; standalone TUI commit-message drafts do
-not enter a conversation journal. Neither is included in the matched workload
-measurements below.
+`native_model_usage` journals raw request usage. Snapshots sharing a request and
+response ID are cumulative: use the latest and check `complete`. A new response
+ID is a separate call. Interrupted streams can have partial usage; absent
+counters are unknown, not zero. Audit events do not increment turn totals again.
 
-Fresh matched adapter probes against Codex 0.156.1 did not establish a general
-Borg cache failure. The simple warm follow-ups cached 98.00% in Borg and 98.92%
-in Codex; the absolute uncached difference across those two follow-ups was 18
-tokens. A controlled restart preserved warm caching in both. Earlier cold
-Codex results were confounded by changed workspace context. Cache writes were
-zero in these small matched samples; a nonzero-write SSE regression fixture
-checks their normalization separately. These probes do not cover long coding
-sessions, compaction, production tool catalogs, or subscription allowance.
+Warm-cache checks must match the model, account, instructions, tools and workload.
+Byte-stable replay is necessary but does not guarantee a service-side hit.
+Restart, fork, effort changes, long contexts and expiry need separate checks;
+a bounded successful continuation does not establish general provider parity.
+Codex uses full-history HTTP replay rather than incremental WebSockets.
 
-The current Codex subscription adapter also follows the model catalog for
-Responses Lite, reasoning summaries, verbosity, and supported effort updates.
-Lite instructions and tool declarations have deterministic IDs. Borg persists
-the original request effort and places trusted effort updates at their original
-conversation positions, including the initial selection. Account-scoped HTTP
-clients retain only allowlisted infrastructure cookies; they never retain
-authentication cookies or send routing cookies to the API-key endpoint.
-
-Three subsequent seven-request probes exercised a larger prefix, a tool
-continuation, warm turns, an effort change, process recovery, and a fork. With
-Codex's effort-update feature enabled, Borg reported 59,293 input tokens,
-41,600 cached input, and 58 output; Codex reported 102,525 input, 72,576 cached,
-and 61 output. Both reported zero cache writes. Their prompt overhead differed
-by about 6,000 tokens per request, so raw totals are not an allowance comparison.
-Borg had one unexplained warm cache miss; Codex missed on the fork. Earlier
-runs used Codex's default-disabled effort-update feature and are not a clean
-comparison for that behavior. These probes preceded the final initial-effort
-marker correction, which has replay/serialization test coverage. They establish
-successful continuation and recovery, not cache parity or an allowance saving.
-
-The unmatched historical cohort (2026-08-25 through 2026-09-23 UTC) cached
-93.231% of Borg Codex input and 97.536% of local Codex input. The local records
-were predominantly VS Code sessions and used different workloads and models;
-this is not a causal CLI comparison. The prior 95.6% baseline and 80.7%
-short-follow-up figure could not be reproduced with an explicit matching
-cohort. The 134 legacy compactions did reread 16,072,256 noncached input tokens.
-One recorded compaction using the cached request instead read 220,032 cached
-and 1,121 noncached tokens. The earlier follow-up with 14,848 cached of 14,993
-input tokens was also reproduced from the journal.
-
-Claude's unmatched historical input was 99.101% cached. The prior attribution
-of roughly 5M writes to cold restarts was not independently established.
-The shared-connector measurements and activation status are recorded in
-[Claude shared model connector](claude-shared-model-connector.md).
-
-Raw measurements, source versions, cohort queries, and the full audit are kept
-in `/home/shulgin/.local/share/borg/assessments/2026-09-24-subscriptions/`.
-
-## Gaps, in the order they are worth closing
-
-1. **Codex intermittent warm misses.** Catalog-driven request conformance and
-   infrastructure cookies are implemented. Some controlled warm calls still
-   missed completely. The final effort-marker correction and transport effects
-   have not been isolated as causes; byte-stable replay alone does not prove
-   that the service will return a cache hit.
-2. **Responses over WebSocket.** Codex CLI sends incremental input with
-   `previous_response_id` over a persistent socket. Borg stays on HTTP, which
-   the backend still caches by prefix; the socket mainly saves upload and
-   latency.
-3. **Long-context Claude verification.** Shared-helper restart and signed-state
-   replay reused warm cache in bounded tests. Larger coding sessions and cache
-   expiry have not been matched against native Claude. The old process-per-child
-   and volatile-system-status gaps are removed by the native harness cutover.
-4. **Warming where no lifetime is documented.** Warming fires wherever a
-   documented lifetime exists, which today is the direct Anthropic route. An
-   operator who knows a vendor retention can declare `prompt_cache_ttl_seconds`
-   for a configured provider. Automatic warming is disabled for subscription
-   routes: an API-price saving does not establish a subscription-quota saving.
+Configured endpoints may declare `prompt_cache_ttl_seconds` when the operator
+knows the vendor retention. Never invent an expiry timer or switch to API
+credentials to warm a subscription request.

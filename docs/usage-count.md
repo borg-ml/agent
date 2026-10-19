@@ -27,7 +27,7 @@ Development builds do not send the heartbeat. Users can disable it with:
 enabled = false
 ```
 
-The environment variable `BORG_DISABLE_USAGE_COUNT=1` is an immediate override.
+The presence of `BORG_DISABLE_USAGE_COUNT` (any value) is an immediate override.
 
 ## Receiver contract
 

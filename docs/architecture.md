@@ -4,7 +4,7 @@ Borg is a local-first Rust agent host. **One session actor owns execution;
 PostgreSQL owns durable truth; frontends attach as clients.** Provider-neutral
 ownership is the direction, not yet the reality of every provider route.
 
-Source baseline: `d6b19e2` (v0.8.1). This is one diagram-led reference page,
+This is a diagram-led reference to the current implementation,
 not a target design. Arrows show runtime flow, not all Cargo dependencies.
 **D1–D8** identify choices to challenge in the review table below.
 
@@ -81,9 +81,9 @@ sequenceDiagram
     Note over C,S: Controls are handled during the turn, not only at completion.
 ```
 
-**D2:** Codex and Claude use `NativeHarness` by default, as do Anthropic,
-Kimi, GLM, Qwen, OpenRouter, Vercel and OpenAI-compatible routes. Selected
-OpenCode Go models also run on Borg's native loop; other OpenCode routes,
+**D2:** Codex and Claude use only `NativeHarness`; there is no compatibility CLI
+execution route for either. Anthropic, Kimi, GLM, Qwen, OpenRouter, Vercel and
+OpenAI-compatible routes also use it. Selected OpenCode Go models also run on Borg's native loop; other OpenCode routes,
 Grok Build and Muse Code retain compatibility CLI execution through
 `run_borg_provider_turn`. Borg owns the loop and context on native routes;
 compatibility routes still delegate the inner loop upstream. Borg manages
@@ -106,7 +106,7 @@ flowchart LR
     Classify -->|"ephemeral"| Stream["Live delivery only"]
     Journal --> Recovery["SessionState / resume / fork / retry"]
     Journal --> Context["Model context projection<br/>compaction + recent evidence"]
-    Journal --> Search["FTS5 or tsvector / history index<br/>resolve hits to canonical events"]
+    Journal --> Search["tsvector / history index<br/>resolve hits to canonical events"]
     Journal <-->|"transactional writes"| Actions[("Action lifecycle / idempotency")]
     Related[("Related durable state<br/>goals, plans, team policy, jobs,<br/>receipts, relay cursors")] --- Actions
     Context -.-> Cache["Provider continuation<br/>optimization, not authority"]
@@ -118,6 +118,15 @@ network effects exactly-once. Inspect uncertain effects before retrying.
 Compaction and search are projections, not replacement journals. Streaming
 deltas and mirrored child activity are deliberately coalesced/filtered.
 Session-scoped process memory is not recovered from the event log.
+
+After mid-turn compaction, Borg re-delivers the turn’s instruction slots
+(project/skill instructions, harness context, and provider status) and reads and
+restates the live plan with its revision and item IDs. The unfinished goal is
+carried in harness context on every turn, not just automatic continuations.
+Reached nested `AGENTS.md`/`CLAUDE.md` guidance is re-read and restated for each
+request (bounded to 256 KiB, with an omission notice), rather than relying on
+an earlier tool result surviving compaction. These are context projections;
+the canonical journal is not replaced.
 
 **Source:** `SessionEventKind::persistence` / the `SessionStore` trait and its
 `PostgresSessionStore` backend in

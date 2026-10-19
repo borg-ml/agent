@@ -28,8 +28,8 @@ with default parallelism to catch races hidden by the serial workspace gate.
 ## Recovery and boundaries
 
 - Start a fresh install and resume a session after a forced process kill.
-- Open an intentionally old local database and confirm it is archived as
-  `*.incompatible-*`, not silently migrated or overwritten.
+- Verify supported PostgreSQL schema upgrades and rejection of future schema
+  versions without losing durable session history.
 - Exercise Remote reconnect, duplicate delivery, late delivery, and expired
   host-token behavior.
 - Verify non-loopback Remote endpoints use HTTPS and that host config files do

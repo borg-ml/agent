@@ -13,7 +13,9 @@ model, effort, session identity, conversation, goals and queued tools are retain
 unless explicitly changed. Combined settings are admitted atomically: an
 unsupported or unconfirmed fast request leaves the previous configuration intact.
 
-Fast requires the selected model's subscription speed metadata. Codex sends
+Fast is supported by Claude and Codex only when the selected model/account
+admits it. Claude validates its native subscription capabilities; ultrafast is
+not supported on Claude. Codex sends
 `service_tier: "priority"`, never switches models or reduces effort, and refuses
 fast requests on API-key billing. Priority may consume additional subscription
 quota; model support alone does not establish its quota multiplier or price.

@@ -110,10 +110,10 @@ merely because the CLI process is alive.
 
 ## Verification gates
 
-Tests cover happy paths plus duplicate, reordered, delayed, truncated, corrupt,
-oversize, unauthorized, revoked, cancelled, timeout, disk-full, busy database,
+Adapter verification must cover happy paths plus duplicate, reordered, delayed,
+truncated, corrupt, oversize, unauthorized, revoked, cancelled, timeout, disk-full, busy database,
 process crash, host crash, relay loss, and restart at every commit/ack boundary.
-Property tests assert monotonic sequences, nonce uniqueness, capability
+Property checks should assert monotonic sequences, nonce uniqueness, capability
 non-escalation, idempotency, and projection equivalence after arbitrary replay.
 
 ## Operator commands

@@ -64,14 +64,13 @@ Use installed Unreal engine and its existing shared DDC/Zen through the
 adapter; do not copy it per tree. Sharing a writable Cargo target across
 branches risks lock contention and stale outputs, and is not enabled. A
 reflink copy can seed *immutable* artifacts on CoW filesystems but is not a
-live shared writable cache. `sccache` would be worth measuring after it is
-installed; it was not installed here. `borg worktree target-status --cap-gib 24` reports per-worktree target
+live shared writable cache. Measure `sccache` separately before claiming a cache speedup. `borg worktree target-status --cap-gib 24` reports per-worktree target
 usage and cap breaches (MCP op `target_status` is also read-only). Lanes should
 queue further builds with the budget reason until an owner clears outputs.
 Per-output target cleaning on a live
 worktree is deliberately not automated: wait for all owner jobs to finish,
-request the owner's confirmation, then `cargo clean` there. Whole-tree GC
-only handles clean merged Borg-created trees with confirmed-dead owners.
+request the owner's confirmation, then `cargo clean` there. Whole-tree GC protects live/unknown owners and the primary tree; see the
+eligibility and explicit-confirmation rules above.
 
 ## Freeze protocol
 
@@ -160,50 +159,6 @@ the adapter's bounded job count. Explicit environment values (including empty)
 and tool/test CLI overrides remain intact. This does not constrain every custom
 thread pool or implement a parent/descendant fairness quota; host RAM/disk
 admission and cgroup limits remain the separate enforced boundary.
-
-## Measured read-only demo (2026-09-23, this host)
-
-Commands used a debug `borg` binary built from this branch. **No deletion or
-Abundance edit was performed.** Initial `df -h /home`: ~218 GiB free;
-`MemAvailable` varied 9–30 GiB with concurrent builds. `/home` is btrfs;
-`cp --reflink=always` on a scratch file succeeded. `sccache` and `ccache`
-were absent. `~/agent/target` was **42 GiB**, our worktree `target` **3.4 GiB**
-during debug build. Sample Abundance per-worktree intermediates:
-`build-lane/Intermediate` **1.4 GiB**, `header-split/Intermediate` **6.3 GiB**;
-per-tree `Binaries` about **288–290 MiB**. `du` is logical on CoW/reflink
-filesystems; real freed blocks may be lower.
-
-- `borg worktree --project ~/agent gc` took **3.403 s**. No tree passed
-  the ownership/merge/clean/exited-owner gate: **0 bytes safely reclaimable**.
-- `borg worktree --project /home/shulgin/abundance gc` took **2.912 s**:
-  likewise **0 bytes safely reclaimable**, because the observed worktrees are
-  user/agent-created without a Borg owner marker or are dirty/live. The GC
-  report lists protected paths and their sizes rather than offering to remove
-  another worker's output. Do not interpret this as zero disk pressure.
-- `borg worktree --project /home/shulgin/abundance freeze-preview
-  'Source/**/*.h'` took **1.085 s** and found 3 dirty worktrees: main
-  (6 matching headers, known live session), `header-split` (15), and
-  `header-split-xform` (15). The two split worktree session IDs were unknown
-  to local directory matching; the paths and files are still shown. Nothing
-  was frozen or altered.
-
-### Final CLI replay after concurrent agent updates
-
-With the final debug binary, `borg worktree --project ~/agent gc` took
-**3.482 s** and listed **14** checked-out trees, **0 eligible**, **0 B safely
-reclaimable**. `borg worktree --project /home/shulgin/abundance gc` took
-**2.742 s**, listed **10** trees, **0 eligible**. The report includes protection
-reasons and sizes; the main Borg checkout was ~297 GiB total logical usage,
-Abundance main ~101 GiB, `header-split` ~7.6 GiB. These figures are transient
-and may count CoW shared extents. `borg worktree --project ~/agent
- target-status --cap-gib 24` took **1.082 s**, reported **14** targets,
-**2 over cap** (`~/agent/target` ~42.8 GiB and `window-capture/target` ~39.2
-GiB). `freeze-preview 'Source/**/*.h'` took **1.174 s** and now listed **2**
-dirty worktrees (main: 6 matching headers, header-split-xform: 23): the
-header-split tree changed while other agents worked. `gc --apply` from
-non-interactive shell returned `GC deletion requires a human at a terminal...`
-and made no modifications. The earlier three-owner snapshot is retained above
-as a demonstration of why this report must be live, not cached.
 
 ## Limitations / integration decisions
 

@@ -191,8 +191,8 @@ raw editor MCP mutations are **not** model-facing: restart lacks an atomic
 actor fence in the supervisor, and no raw editor MCP proxy guarantees
 per-owner enforcement on every mutating call. `borg lane service` remains
 a host-local CLI for operators and approved Blu workflows. The MCP bridge
-rejects all model-facing exclusive job templates until atomic foreign-client
-preemption is proved; trusted CLI `borg lane job submit --spec <file>`
+rejects all model-facing exclusive job templates even with the implemented
+foreign-client handshake; trusted CLI `borg lane job submit --spec <file>`
 requires coordinating with the editor lease holder. This is not a same-UID
 security sandbox.
 
@@ -206,105 +206,10 @@ launch while that exclusive lease remains `Preparing` or `Granted`, even after
 TTL expiry; post-release they resume. This was verified with two fake services,
 not a live Unreal editor.
 
-## Evidence (fake HTTP backend, not Unreal)
+## Verification reference
 
-`CARGO_BUILD_JOBS=6 nice -n 10 cargo test -p borg-lanes services::tests -- --nocapture`:
-15 passed, including independent multi-owner leases, bounded shared capacity,
-per-owner TTL/release/restore, two-owner yield and failed-restore fencing,
-two-service atomic RAM/disk reservation denial and
-yield-to-admit handoff, crash/hang restart, A/B debounced restart, active-client
-restoration before yield, expired-yield and forced-restart denial under a
-`Granted` exclusive lane lease, default-deny proxy and pipelining guards,
-wrong-owner resume, idle/active hooks, and readiness checks. Warm A/B restart
-sampled the proxy continuously: **0 unavailable requests, ~310–410 ms** on
-the fake backend (not an Unreal timing).
-
-Production fake HTTP CLI smoke (local systemd user unit, not Unreal): start
-Healthy, an active client lease and detached `setsid sleep` child inside the
-delegated backend cgroup, yield returned `Yielded` with no backend/client and
-its child gone, proxy returned JSON 503, and resume became Healthy on a new
-PID. User-unit `MemoryCurrent` was 20.7 MiB with backend and 9.8 MiB after
-yield (one fake HTTP service; not a steady-state Unreal footprint).
-
-Crash-subtree production smoke: fake `/childexit` spawned a detached `setsid`
-child in the backend subgroup and exited its leader. Recovery verified the
-child gone, restarted on the alternate port (`restarts=1`), then the owned
-fixture was stopped; its unit was inactive and subgroup removed.
-
-Historical no-hook two-service scoped gate (external probe, pre-alias-fix CLI SHA256
-`4022be198a99c3e8f8cac3069387f222bd2cb4e1bfdfb7a4135e8048c19a34b2`):
-the test exited 0 on a real systemd-user job; both backend PIDs, detached descendants and delegated
-subgroups were gone before exclusive grant, both proxies returned 503, a
-client was restored, restart attempts remained fenced, and both services
-auto-resumed on release. See `/tmp/gd-two-service-scoped.log`. No real Unreal
-editor, engine-specific mutating MCP or model-facing registration was tested.
-
-An owned-unit supervisor-crash smoke SIGKILLed only the test supervisor main
-process; `KillMode=control-group` killed its detached backend child and the
-unit became inactive. The lack of a safe non-systemd process-tree scope still
-prevents a standalone `setsid` production fallback.
-
-Production two-service disk capacity smoke on pre-alias-fix CLI SHA256
-`73aed7d927988e189b245d631aa7f67830094c6b41e1f2975da29bb190c88e59`:
-service A became Healthy with 10.8 GB reserved disk; separate service B on
-the same filesystem stayed Degraded with no backend and the exact "disk
-admission queued" reason. Yielding A admitted B to Healthy; both owned
-systemd-user units stopped inactive/dead with empty control groups. See
-`/tmp/gd-real-capacity-probe.log` (synthetic HTTP, not Unreal).
-
-Pre-readiness-fix canonical-key public-CLI gate (integrated lane+service binary SHA256
-`011c4ba94835500d40910d3dab6096533d245a55f0ea7f72c1112b1450e5e99d`):
-Project `..` and symlink aliases, and Worktree `..` and symlink aliases, were
-rejected before admission. A canonical Project same-key exclusive job then
-yielded its active service before grant, restored its client, fenced restart
-and returned 503 until auto-resume on release. On the same binary, two
-independent services on disjoint Host keys each requested ~60% of available
-RAM: the second had no backend with an explicit "RAM admission queued" reason,
-then became Healthy after the first yielded. These are fake-service CLI probes,
-not a live Unreal editor or authenticated mutating MCP adapter. The earlier
-pre-alias-fix scoped and disk-budget smokes remain useful evidence for those
-individual behaviors but do not establish canonical Project-key safety by
-themselves.
-
-Post-resume-readiness public-CLI gates on freshly rebuilt binary SHA256
-`61ece6c173170b080933c821b81658a3d8ad422b1a5601d9550f8a30c4d7d4ac`:
-- Real systemd-user two-service no-hook exclusive job: both detached backend
-  descendants and delegated subgroups empty before grant, both proxies 503,
-  client restore/restart fenced, both backends healthy after release
-  (`/tmp/gd-two-service-scoped-readiness.log`).
-- Distinct Host keys and disk paths on the same filesystem each reserved
-  ~60% of free space: B had no backend with "disk admission queued" reason,
-  then became Healthy when A yielded; both owned units stopped inactive/dead
-  (`/tmp/gd-real-capacity-probe-readiness.log`, isolated probe
-  `/tmp/gd-real-capacity-probe.py`).
-- Project path aliases rejected before grant, canonical same-key handoff
-  retained (`/tmp/gd-alias-readiness.log`).
-- Stopped-supervisor resume kept `resume_pending` and journalled an error
-  until recovery (`/tmp/gd-failed-resume-readiness.log`). More importantly,
-  an ACKed Resume followed by failed backend health left `resume_pending`
-  and a readiness error, with the yield token removed; after health returned,
-  recovery cleared pending without a second Resume
-  (`/tmp/gd-ack-unhealthy-readiness2.log`).
-
-These are fake HTTP services and pinned local binaries, not a live Unreal editor.
-The earlier SHA `011c4ba9…` gates do not establish the newer resume-readiness
-semantics.
-
-Shared-client real CLI gate on synthetic HTTP with the systemd-user manager:
-the former `scripts/gamedev_shared_service_probe.py` (now
-`shared_clients_restore_before_an_exclusive_and_failed_restores_fence_it` in
-`crates/borg-cli/tests/lane_services.rs`) passed against
-newly built `gamedev/services-shared` CLI SHA256
-`7904ca9704209d4ea7424d29ebdc6e66332cc4ae9d8529dc9de87bbe78834939`.
-Two independent owners held distinct IDs; the third was denied at
-`max_clients=2`; releasing A restored only A, leaving B healthy. After A
-reacquired, a no-hook exclusive Host-key job observed both remaining clients
-restored, old backend PID gone, and proxy 503 **before** grant. After release
-the service resumed Healthy with a new backend PID. The owned test unit
-stopped inactive/dead with empty control group; see
-`/tmp/gd-shared-client-cli.log`. With the optional
-`--restore-failure-recovery` probe flag, an injected second-owner callback
-failure kept Stop/Yield fenced, and after repair a matching owner/lease-ID
-release cleared the client before Stop (`/tmp/gd-shared-recovery-cli.log`).
-The CLI is a trusted local operator interface, not session-derived owner
-authentication or real Unreal/Postgres mutation fencing.
+See [regression gates](benchmark.md) and
+`crates/borg-cli/tests/lane_services.rs`. Synthetic backends exercise protocol
+and lifecycle contracts, not live Unreal editor parity. Cross-journal host RAM
+admission is implemented in `crates/borg-lanes/src/host_admission.rs` alongside
+the local journal admission checks.

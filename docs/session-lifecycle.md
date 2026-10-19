@@ -1,8 +1,8 @@
 # Session lifecycle
 
 Borg separates a durable session from any TUI or GUI displaying it. Each local
-interactive session has one detached host process that owns the provider app
-server, turn execution, tools, and subagents. Frontends are viewers and command
+interactive session has one detached host process that owns provider model
+access, turn execution, tools, and subagents. Frontends are viewers and command
 clients; they are not the lifetime owner.
 
 ## Closing and attaching views
@@ -18,7 +18,7 @@ stop or interrupt controls when the intent is to stop work.
 
 Only one process may own a session journal at a time. Borg uses the session
 writer lease and control socket to discover an existing owner instead of
-starting a second provider app server. A stale owner can be recovered from the
+starting a second execution owner. A stale owner can be recovered from the
 durable journal.
 
 ## Idle shutdown
@@ -41,7 +41,8 @@ bounded command lifetime and do not create this detached interactive host.
 
 ## Storage and recovery
 
-Session events are stored under Borg's data directory, separately from
+Session events are stored in PostgreSQL (a managed cluster under `$BORG_HOME/pgdata`
+by default, or the server selected by `BORG_SESSIONS_URL`), separately from
 configuration in `$XDG_CONFIG_HOME/borg` (normally `~/.config/borg`). A viewer
 can reconnect after a frontend crash. If a host itself crashes, the current
 provider call may fail, but the durable session remains available and Borg can

@@ -382,7 +382,8 @@ deltas and redundant provider wire telemetry may still be coalesced or omitted;
 the guarantee is a replayable semantic execution record, not a packet capture.
 
 `query_history` exposes one provider-neutral read contract to native models,
-Codex/Claude/OpenCode MCP lanes, Blu workflows, and the persistent Python bridge:
+the OpenCode non-Go/Grok/Muse compatibility MCP lanes, Blu workflows, and
+the persistent Python bridge. Claude and Codex use Borg’s native loop only:
 
 - empty `text`: exact event-id, typed actor/kind, and inclusive sequence-range
   reads over canonical rows;

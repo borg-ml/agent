@@ -31,11 +31,11 @@ checks content signatures before delivery. It reads only the files explicitly
 selected. With no image channel and no explicit target, it fails rather than
 printing image data into the transcript.
 
-## Verification
+## Showing images to the user
 
-The real CLI and native process manager transported a real PNG byte-for-byte
-while leaving only a short JSON descriptor in stdout. A running-session check
-also delivered the Abundance equipment screenshot to the model as actual pixels:
-the selected Equipment tab, central unpublished-model panel, and right-hand
-inventory/socket telemetry were visually identified. This verifies transport;
-it is not acceptance of that application UI.
+`show_image({"paths":["/absolute/path/capture.png"],"caption":"Optional caption"})`
+posts a visible assistant message, rather than returning pixels only to the model.
+It copies one to four PNG, JPEG, GIF or WebP files (at most 20 MiB each) into the
+session attachment store, so the message does not depend on temporary source files.
+Relative paths resolve against the session shell directory. The tool requires an
+active turn and a session attachment store.

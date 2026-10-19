@@ -28,6 +28,16 @@ host on this machine, after the session/host executor is restarted with the new
 settings. It is limited to 16 KiB. Changing this setting does not rewrite the
 prompt of a running session.
 
+## Project guidance and compaction
+
+Borg loads applicable ancestor `AGENTS.md` and `CLAUDE.md` files. Identical
+contents in both files in one directory are included once. Nested guidance
+reached during tool work is re-read and restated on each request, bounded to
+256 KiB with an omission notice; it is not just a one-time tool-result hint.
+After mid-turn compaction Borg restates instruction slots and the current plan.
+An unfinished session goal is included on every turn, including ordinary user
+turns, and survives compaction through the harness context slot.
+
 ## Shell language diagnostics
 
 Borg already routes shell files to `bash-language-server start`. Install the

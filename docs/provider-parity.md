@@ -1,46 +1,26 @@
 # Provider parity contract
 
-Borg keeps provider-specific wire protocols behind one durable session contract.
-The target ownership boundary is defined in
-[Provider ownership](provider-ownership.md). The table below describes today's
-execution paths, including the external agent runtimes still being reduced.
+Borg exposes one durable session contract across provider-specific model
+protocols. Claude and Codex are native HTTP/SSE routes, not CLI/SDK agent runtimes.
+See [Provider ownership](provider-ownership.md) for access and billing boundaries.
 
-Codex no longer runs an app server: the app-server adapters were removed, so the
-Codex column below records the historical transport rather than a current path.
-Codex now executes on the native harness and direct model transport like the
-other native lanes.
-Parity is checked at the boundaries where regressions matter:
+Parity is checked at meaningful boundaries:
 
-| Contract | Codex app server | Claude Agent SDK | Native harness |
-| --- | --- | --- | --- |
-| Borg goal/plan/LSP/settings/plugin tools | external MCP catalog | external MCP catalog | `borg tools` / `borg call` over the dispatcher |
-| Tool call/result normalization | `ChatStreamEvent` mapper | `ChatStreamEvent` mapper | one shell-first `exec` boundary |
-| Steering | active-turn control | active-turn control | active model-round control |
-| Queue/recovery | durable session actor | durable session actor | durable session actor + replay |
-| Usage/context projection | normalized provider usage | normalized provider usage | normalized model usage |
-| Compaction boundary | provider phase events | provider/session compaction path | native summary + replay boundary |
+- Borg tools, permissions and approved execution use the same dispatcher.
+- Steering, interruption, queue admission and recovery belong to the session actor.
+- Text, reasoning, tool-input progress, complete calls and results are normalized
+  without inventing progress a transport cannot expose.
+- Usage distinguishes uncached input, cache reads, cache writes and output;
+  reasoning is part of output, not an additional token charge.
+- Compaction preserves the journal, tool pairing, recent evidence and durable
+  continuation state. Failure does not justify selective history loss.
+- Authentication, entitlement and account-bound replay fail explicitly rather
+  than switching models, billing or agent loops without authorization.
 
-The tests deliberately use representative protocol fixtures and the durable
-session actor, rather than asserting that each provider emits a non-empty string.
-Provider adapter tests verify that equivalent MCP calls become the same
-`ToolCall`/`ToolResult` shape and that Codex/Claude usage is projected into the
-same billing buckets. Session tests verify that all active-turn lanes share
-steering and queue semantics, while recovery/replay tests exercise FIFO queue
-admission, compaction summaries, and native tool-round boundaries. Catalog
-tests ensure the same Borg control plane is available whether tools are
-transported over MCP or reached through the session-scoped Borg CLI. Live
-provider smoke tests remain opt-in and are not required for the deterministic parity
-suite because they depend on credentials, network availability, and mutable
-provider behavior.
-
-The focused regression commands are:
-
-```text
-cargo test -p borg-provider provider::chat_stream::tests::codex_and_claude_normalize_mcp_tool_lifecycle_identically
-cargo test -p borg-provider provider::chat_stream::tests::codex_and_claude_usage_maps_share_billing_buckets
-cargo test -p borg-remote subagents::tests::every_execution_lane_exposes_the_same_borg_control_plane
-cargo test -p borg-remote session::tests::active_provider_steer_uses_turn_control_across_provider_lanes
-```
+Deterministic adapter and session tests protect wire translation and durable
+invariants. Credentialed smoke tests additionally check real login, streaming,
+tool continuation, cancellation, restart and warm-cache behavior. A successful
+small smoke is not proof of subscription-quota savings or long-context parity.
 
 ## Runtime supervision
 
@@ -66,9 +46,3 @@ failure is reported rather than leaving the turn indefinitely running.
 Dropping a subscription stream cancels the entire provider invocation, including
 handshakes and nested runtime tasks. The CLI sleep-prevention setting also covers
 active children when the parent is idle; disabling the setting still wins.
-
-The deterministic subprocess regression needs no credentials or network:
-
-```text
-cargo test -p borg-provider --features subscription-adapters --test subscription_cancellation
-```

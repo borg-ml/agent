@@ -55,9 +55,10 @@ for each.
 
 ## Performance boundary
 
-Session ingestion and projection are frontend-neutral. `borg-ui` incrementally
-reduces durable and live events into shared session state, timeline entries,
-goals, plans, and agent snapshots on a worker thread. Timeline entries and
+Session ingestion and projection are frontend-neutral. `borg-view::TranscriptCore`
+provides shared event interpretation; `borg-ui` adapts that semantic state and
+incrementally projects durable and live events into shared session state,
+timeline entries, goals, plans, and agent snapshots on a worker thread. Timeline entries and
 history are shared by `Arc`, so a live update does not clone the full transcript
 or perform projection work on the window thread.
 

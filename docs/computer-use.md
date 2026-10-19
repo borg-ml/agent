@@ -1,4 +1,4 @@
-# Computer use: Linux preview
+# Computer use
 
 This is a **partial implementation**, not cross-platform completion. Borg owns
 approval, session lifetime, native-helper transport and code-mode clients.
@@ -160,7 +160,7 @@ glxgears over X11 rendering on the GPU, GTK typing and clicks, an SDL3 app in
 relative mouse mode receiving exact deltas, ✓ and é typed into SDL3 and GTK,
 and the human's focused window, pointer and input devices unchanged.
 
-### Linux input backend (implemented, test-only verification)
+### Linux input backend
 
 `computer_use/linux/input.rs` injects through a Borg-owned evdev uinput device
 ("Borg virtual input": keys, mouse buttons, wheel and an absolute pointer axis)
@@ -283,8 +283,6 @@ envelopes, argument validation) was dry-run under PowerShell 7.6 on Linux with
 the Windows-only calls stubbed. **Not yet exercised on a real Windows host**;
 treat as unverified.
 
-Still missing: Windows real-host verification;
-keyboard/pointer injection, scrolling and dragging; isolated window capture;
-full cross-provider image/desktop task verification; installation and broadcast
-verification.
+Windows still requires real-host verification. The implemented operations above
+are not a claim of full cross-provider desktop-task acceptance.
 Installing a binary does not upgrade an already-running Borg process.
