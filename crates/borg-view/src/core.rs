@@ -947,7 +947,20 @@ impl TranscriptCore {
             }
             _ => false,
         };
-        if provider_advanced && !starts_prepared_action {
+        // Text the model wrote before a tool call can be journaled after the
+        // process has started. Until the call's own ToolStarted arrives the
+        // response has not moved past it, so that text must not background it.
+        let preparing_foreground = !matches!(&event.kind, SessionEventKind::ToolStarted { .. })
+            && self.foreground_tool.as_deref().is_some_and(|id| {
+                self.preparing_tools
+                    .values()
+                    .any(|preparing| preparing == id)
+                    || self
+                        .unkeyed_preparing_tools
+                        .iter()
+                        .any(|preparing| preparing == id)
+            });
+        if provider_advanced && !starts_prepared_action && !preparing_foreground {
             self.background_foreground_process();
         }
         let completed_turn = match &event.kind {

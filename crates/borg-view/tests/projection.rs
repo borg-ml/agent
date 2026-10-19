@@ -1753,3 +1753,63 @@ fn checkpoint_stays_within_budget_after_many_finished_processes() {
     }
     assert!(reducer.checkpoint().unwrap().len() < SNAPSHOT_BYTES / 4);
 }
+
+// Blue means backgrounded. The text the model wrote before a tool call can be
+// journaled after the process has already started; that is the same response, not
+// the model moving on, so a command it is still waiting for must stay foreground.
+#[test]
+fn late_message_of_the_same_response_does_not_background_a_running_command() {
+    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    let session = Uuid::new_v4();
+    let mut core = TranscriptCore::default();
+    let tool_state = |core: &TranscriptCore| {
+        (0..core.order.len())
+            .find_map(|index| match &core.order[index] {
+                TranscriptEntry::Tool { execution, .. } => Some(execution.clone()),
+                _ => None,
+            })
+            .expect("tool row")
+    };
+    core.apply(&SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: borg_agent_runtime::CodingProvider::Codex,
+            kind: "action/preparing".into(),
+            payload: serde_json::json!({"label": "command", "tool_call_id": "call-1"}),
+        },
+    ));
+    core.apply(&SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::RuntimeProcessStarted {
+            process_id: Uuid::new_v4(),
+            pid: 42,
+            command: "sleep 30".into(),
+            cwd: ".".into(),
+        },
+    ));
+    assert!(!tool_state(&core).is_backgrounded(), "after process start");
+    core.apply(&message(
+        session,
+        3,
+        Uuid::new_v4(),
+        EventActor::Assistant,
+        "Running it now.",
+        MessageStatus::Complete,
+    ));
+    assert!(!tool_state(&core).is_backgrounded(), "after late message");
+    core.apply(&SessionEvent::new(
+        session,
+        4,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "call-1".into(),
+            name: "exec".into(),
+            input: serde_json::json!({"cmd": "sleep 30"}),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    let execution = tool_state(&core);
+    assert!(!execution.is_backgrounded() && !execution.is_terminal());
+}
