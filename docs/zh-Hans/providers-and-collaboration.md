@@ -2,13 +2,15 @@
 
 Borg 支持 Codex、Claude、OpenCode、Kimi、OpenRouter 和已配置的
 OpenAI-compatible 提供商。实际可用状态取决于本机安装与认证；运行
-`borg capabilities` 查看不会泄露密钥的状态摘要。
+`borg capabilities` 查看不会泄露密钥的状态摘要，运行 `borg login` 查看各提供商的
+连接状态。`borg login claude` 登录 Borg 自己的 Claude 账户（`~/.borg/claude`），
+与 Claude Code 相互独立。
 
 子代理和持久 peer 属于同一持久会话。团队菜单显示每个代理的产品模型名称
 （例如 `Opus 5`）、推理强度、状态以及累计 token 用量。用量列已经表示 token，
 因此不会在每行重复显示 `ctx`。上下文窗口剩余量是另一项独立指标。
 
-关闭一个界面不会关闭提供商应用服务器或子代理；它们由会话宿主管理。有关
+关闭一个界面不会停止正在运行的任务或子代理；它们由会话宿主管理。有关
 连接、恢复和空闲退出，请阅读[会话生命周期](session-lifecycle.md)。英文规范文档：
 
 - [提供商对等性](../provider-parity.md)

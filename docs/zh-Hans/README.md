@@ -17,15 +17,20 @@ Windows PowerShell：
 irm https://borg.ml/install.ps1 | iex
 ```
 
-常用命令：
+## 快速开始
 
 ```sh
-borg                 # 启动交互会话
-borg resume          # 恢复已有会话
-borg gui             # 启动原生 GUI
-borg capabilities    # 查看运行能力
-borg extensions list # 查看扩展
+borg login codex      # 或：claude、opencode、openrouter……
+borg                  # 在当前目录启动会话
+borg resume           # 恢复最近的会话
+borg doctor           # 检查存储与提供商状态
 ```
+
+不带参数运行 `borg login` 会列出所有提供商及其连接状态；在会话中，`/login`
+切换连接，`/model` 切换模型。`borg login claude` 通过浏览器登录 Borg 自己的
+账户（`~/.borg/claude`），与 Claude Code 的登录相互独立。API 密钥保存在
+`~/.borg/credentials.json`。完整的提供商列表见
+[英文 README](../../README.md#connecting-providers)。
 
 ## 语言设置
 
@@ -41,7 +46,7 @@ UTF-16 组合文本范围。
 ## 会话不会随窗口退出
 
 每个本地交互会话由一个独立的后台宿主进程拥有。关闭某个 TUI 或 GUI 只会
-断开该界面，不会终止正在运行的模型调用、应用服务器或子代理。另一个界面
+断开该界面，不会终止正在运行的模型调用或子代理。另一个界面
 可以继续连接同一持久会话。
 
 当会话处于就绪状态、没有待处理提示且没有任何界面连接时，宿主等待五分钟
@@ -50,10 +55,8 @@ UTF-16 组合文本范围。
 
 ## 配置
 
-```sh
-cp configs/agent.example.toml ~/.config/borg/agent.toml
-cp configs/editor.example.toml ~/.config/borg/editor.toml
-```
+运行 `borg config init` 生成带注释的 `agent.toml`，`borg config path` 显示其
+位置。示例文件位于仓库的 [`configs/`](../../configs/) 目录。
 
 - `agent.toml`：提供商、能力、MCP、别名、按键和团队设置。
 - `editor.toml`：界面语言、终端显示和交互偏好。

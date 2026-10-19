@@ -18,8 +18,21 @@ Windows PowerShell:
 irm https://borg.ml/install.ps1 | iex
 ```
 
-Los comandos principales son `borg`, `borg resume`, `borg gui`,
-`borg capabilities` y `borg extensions list`.
+## Primeros pasos
+
+```sh
+borg login codex      # o: claude, opencode, openrouter...
+borg                  # inicia una sesión en el directorio actual
+borg resume           # retoma la última sesión
+borg doctor           # comprueba el almacenamiento y los proveedores
+```
+
+`borg login` sin argumentos muestra todos los proveedores y si están
+conectados; dentro de una sesión, `/login` cambia de conexión y `/model` de
+modelo. `borg login claude` inicia sesión en el navegador con un acceso propio
+de Borg (`~/.borg/claude`), separado del de Claude Code. Las claves de API se
+guardan en `~/.borg/credentials.json`. La tabla completa de proveedores está en
+el [README en inglés](../../README.md#connecting-providers).
 
 ## Idioma de la interfaz
 
@@ -39,8 +52,8 @@ traducen.
 ## Ciclo de vida de las sesiones
 
 Cada sesión interactiva pertenece a un proceso anfitrión independiente. Cerrar
-una TUI o GUI solo desconecta esa vista; no detiene una solicitud activa, el
-servidor del proveedor ni los subagentes. Otra interfaz puede conectarse a la
+una TUI o GUI solo desconecta esa vista; no detiene una solicitud activa ni los
+subagentes. Otra interfaz puede conectarse a la
 misma sesión persistente.
 
 Un anfitrión preparado, sin mensajes pendientes ni interfaces conectadas, se
