@@ -3008,6 +3008,11 @@ fn effort_is_optional(provider: Option<CodingProvider>, model: Option<&str>) -> 
     model.is_some_and(|model| borg_provider::gateway_effort_is_optional(model, &entries))
 }
 
+/// Pre-build syntax highlighting assets off the startup path.
+pub fn warm_syntax_highlighting() {
+    rendering::warm_syntax_assets();
+}
+
 impl BorgTerminal {
     pub fn fallback_requested() -> bool {
         !rich_terminal_supported(
@@ -9026,13 +9031,25 @@ impl BorgTerminal {
         // Frozen to the last committed frame during an input-only redraw so the
         // committed-snapshot lookup below is keyed to the width that snapshot
         // was actually rendered at.
-        let full_transcript_width = transcript_frame_width(
-            content_width,
-            input_fast_path,
-            self.last_committed_viewport_render
-                .as_ref()
-                .map(|(width, ..)| *width),
-        );
+        // A cold draw (first paint of a resumed thread, or after a cache
+        // reset) would render the whole transcript at the gutterless width and
+        // then again with the scrollbar gutter once it overflows. A thread
+        // that fills the screen is the common case, so start there; a short
+        // one only re-renders a few rows.
+        let cold_render = !input_fast_path
+            && self.transcript_render_cache.is_none()
+            && self.transcript_full_render_cache.is_none();
+        let full_transcript_width = if cold_render {
+            transcript_width_with_gutter(content_width)
+        } else {
+            transcript_frame_width(
+                content_width,
+                input_fast_path,
+                self.last_committed_viewport_render
+                    .as_ref()
+                    .map(|(width, ..)| *width),
+            )
+        };
         if !input_fast_path {
             // This draw replaces both snapshots. Releasing them first leaves the
             // transcript sole owner of its last render, so it can redraw only

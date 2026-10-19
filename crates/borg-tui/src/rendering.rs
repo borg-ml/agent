@@ -574,6 +574,17 @@ fn syntax_lines(language: &str, source: &str, width: usize, wrap: bool) -> Vec<L
     output
 }
 
+/// Building the syntax set re-compresses every context and takes long enough
+/// to stall the first paint of a resumed thread that shows code or a diff.
+/// Start it on a background thread so it overlaps startup I/O.
+pub(crate) fn warm_syntax_assets() {
+    let _ = std::thread::Builder::new()
+        .name("syntax-warmup".into())
+        .spawn(|| {
+            syntax_assets();
+        });
+}
+
 fn syntax_assets() -> (&'static SyntaxSet, &'static Theme) {
     static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
     static THEMES: OnceLock<ThemeSet> = OnceLock::new();

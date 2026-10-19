@@ -2224,6 +2224,9 @@ async fn run_local_agent_session(
         && !args.gui_owner
         && args.session_host.is_none()
         && !BorgTerminal::fallback_requested();
+    if interactive_store_open {
+        borg_tui::warm_syntax_highlighting();
+    }
     let store_open_started = std::time::Instant::now();
     // The backend is chosen once, here, from BORG_SESSIONS_URL. The factory
     // resolves every satellite tier up front and fails if one is missing, so a
@@ -2914,12 +2917,14 @@ async fn run_local_agent_session(
         terminal.set_local_file_links(true);
         terminal.set_configured_model_entries(agent_config.configured_model_entries());
         terminal.set_extension_commands(extension_catalog.api_snapshot().commands);
+        let seed_started = std::time::Instant::now();
         terminal.seed_team_roster(&team_snapshots);
         terminal.seed_history(&history);
         terminal.seed_session_state(&display_session_state);
         // Bring back whatever the composer was holding when this session was
         // last closed. A fresh session has no sidecar, so this is a no-op there.
         terminal.restore_composer_draft();
+        let seed_ms = seed_started.elapsed().as_millis() as u64;
         if let Some(notice) = startup_update_notice.as_deref() {
             terminal.set_notice(notice);
         } else if let Some(notice) = retry_notice.as_deref() {
@@ -3041,12 +3046,16 @@ async fn run_local_agent_session(
                 }
             }
         }
+        let draw_started = std::time::Instant::now();
         terminal.draw()?;
+        let draw_ms = draw_started.elapsed().as_millis() as u64;
         tracing::info!(
             %session_id,
             store_open_ms,
             provider_probe_ms,
             history_ms,
+            seed_ms,
+            draw_ms,
             first_paint_ms = startup_started.elapsed().as_millis() as u64,
             bootstrap_events = history.len(),
             "interactive session reached first paint"
