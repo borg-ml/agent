@@ -1059,6 +1059,19 @@ async fn serve_agent_tool_connection<S>(
     }
 }
 
+/// An execution-policy flag (`async`, `blocking`). Tools reached without a
+/// provider-side schema (routed by name, e.g. `await_watchers`) can carry it
+/// as the string "true" / "false" instead of a JSON boolean.
+fn policy_flag(value: Option<Value>, name: &str) -> Result<bool> {
+    match value {
+        None | Some(Value::Bool(false)) => Ok(false),
+        Some(Value::Bool(true)) => Ok(true),
+        Some(Value::String(text)) if text.eq_ignore_ascii_case("true") => Ok(true),
+        Some(Value::String(text)) if text.eq_ignore_ascii_case("false") => Ok(false),
+        Some(_) => bail!("{name} must be a boolean"),
+    }
+}
+
 impl AgentToolDispatcher {
     // The dispatcher deliberately receives each independently disableable
     // service explicitly at its construction boundary.
@@ -2540,19 +2553,13 @@ impl AgentToolDispatcher {
             let asynchronous = arguments
                 .as_object_mut()
                 .and_then(|args| args.remove("async"));
-            let immediate = match asynchronous {
-                None | Some(Value::Bool(false)) => false,
-                Some(Value::Bool(true)) => true,
-                Some(_) => bail!("async must be a boolean"),
-            };
-            let blocking = match arguments
-                .as_object_mut()
-                .and_then(|args| args.remove("blocking"))
-            {
-                None | Some(Value::Bool(false)) => false,
-                Some(Value::Bool(true)) => true,
-                Some(_) => bail!("blocking must be a boolean"),
-            };
+            let immediate = policy_flag(asynchronous, "async")?;
+            let blocking = policy_flag(
+                arguments
+                    .as_object_mut()
+                    .and_then(|args| args.remove("blocking")),
+                "blocking",
+            )?;
             ensure!(
                 !(immediate && blocking),
                 "async and blocking cannot both be true"
@@ -11038,6 +11045,21 @@ struct RuntimeExecArgs {
 #[cfg(test)]
 mod exec_args_tests {
     use super::*;
+
+    #[test]
+    fn policy_flags_accept_booleans_and_boolean_strings() {
+        use serde_json::json;
+        assert!(!super::policy_flag(None, "blocking").unwrap());
+        assert!(super::policy_flag(Some(json!(true)), "blocking").unwrap());
+        assert!(!super::policy_flag(Some(json!(false)), "async").unwrap());
+        // Routed tools without a provider-side schema send strings.
+        assert!(super::policy_flag(Some(json!("true")), "blocking").unwrap());
+        assert!(super::policy_flag(Some(json!("TRUE")), "async").unwrap());
+        assert!(!super::policy_flag(Some(json!("false")), "blocking").unwrap());
+        let err = super::policy_flag(Some(json!("yes")), "blocking").unwrap_err();
+        assert!(err.to_string().contains("blocking must be a boolean"));
+        assert!(super::policy_flag(Some(json!(1)), "async").is_err());
+    }
 
     /// A model reaching for `command` instead of `cmd` failed the whole call
     /// with serde's `unknown field` text. The intent is unambiguous, so the
