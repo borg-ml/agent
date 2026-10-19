@@ -788,16 +788,15 @@ impl TranscriptCore {
             }
             SessionEventKind::ReasoningBlockDelta { reasoning_id, .. }
             | SessionEventKind::ReasoningBlockSnapshot { reasoning_id, .. }
-            | SessionEventKind::ReasoningBlockCompleted { reasoning_id } => {
+            | SessionEventKind::ReasoningBlockCompleted { reasoning_id }
                 if self
                     .reasoning_blocks
                     .get(reasoning_id)
                     .and_then(|index| self.order.get(*index))
                     .and_then(TranscriptEntry::execution)
-                    .is_none_or(Execution::is_terminal)
-                {
-                    return None;
-                }
+                    .is_none_or(Execution::is_terminal) =>
+            {
+                return None;
             }
             _ => {}
         }

@@ -733,7 +733,7 @@ pub fn context_compaction_progress_summary(kind: &str, payload: &serde_json::Val
         .get("context_window_source")
         .and_then(serde_json::Value::as_str)
         == Some("refusal");
-    let progress_summary = if started
+    if started
         && refused
         && let Some(tokens) = payload
             .get("context_tokens_before")
@@ -766,6 +766,5 @@ pub fn context_compaction_progress_summary(kind: &str, payload: &serde_json::Val
         )
     } else {
         progress_summary.to_string()
-    };
-    progress_summary
+    }
 }
