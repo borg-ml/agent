@@ -2130,7 +2130,43 @@ impl AgentToolDispatcher {
         )
         .await?;
         appendix.push_str(&crate::imported_memory::prompt_appendix(&self.runtime_root).await?);
+        appendix.push_str(&self.reached_guidance_appendix());
         Ok(appendix)
+    }
+
+    /// Nested AGENTS.md/CLAUDE.md files the session has already reached,
+    /// re-read and restated on every request. They first arrive attached to a
+    /// tool result, which is history: compaction could summarize them away,
+    /// and `announced_guidance` would then never offer them again. Carrying
+    /// them in the instructions keeps them in context like the root chain.
+    fn reached_guidance_appendix(&self) -> String {
+        const MAX_REACHED_GUIDANCE_BYTES: usize = 256 * 1024;
+        let mut directories = self
+            .announced_guidance
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        directories.sort();
+        let mut blocks = String::new();
+        for directory in directories {
+            for (path, content) in
+                crate::native_context::guidance_files(&directory).unwrap_or_default()
+            {
+                let block = crate::native_context::guidance_block(&path, &content);
+                if blocks.len().saturating_add(block.len()) > MAX_REACHED_GUIDANCE_BYTES {
+                    blocks.push_str(&format!(
+                        "\n\nProject guidance at {} was omitted: nested guidance exceeds {} KiB. Read it directly when working there.",
+                        path.display(),
+                        MAX_REACHED_GUIDANCE_BYTES / 1024
+                    ));
+                    continue;
+                }
+                blocks.push_str(&block);
+            }
+        }
+        blocks
     }
 
     fn is_director(&self) -> bool {

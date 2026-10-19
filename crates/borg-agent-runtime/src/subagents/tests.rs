@@ -11872,3 +11872,44 @@ async fn queued_human_prompt_wakes_idle_and_stopped_child_without_resuming_pause
     coordinator.stop_all().await;
     scratch.discard().await;
 }
+
+// Nested AGENTS.md first arrives on a tool result, which compaction can drop;
+// the instructions must keep restating it so it is never lost for good.
+#[tokio::test]
+async fn reached_nested_guidance_stays_in_the_instructions() {
+    let directory = tempdir().unwrap();
+    let nested = directory.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join("AGENTS.md"), "nested rule").unwrap();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        Uuid::new_v4(),
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    assert!(!dispatcher.reached_guidance_appendix().contains("nested rule"));
+    let first = dispatcher
+        .call("exec", json!({"cmd": "ls nested", "blocking": true}))
+        .await
+        .unwrap();
+    assert!(first["project_guidance"].as_str().unwrap().contains("nested rule"));
+    let second = dispatcher
+        .call("exec", json!({"cmd": "ls nested", "blocking": true}))
+        .await
+        .unwrap();
+    assert!(second.get("project_guidance").is_none());
+    assert!(dispatcher.reached_guidance_appendix().contains("nested rule"));
+}
