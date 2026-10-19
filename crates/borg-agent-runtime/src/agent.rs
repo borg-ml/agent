@@ -401,6 +401,17 @@ pub trait AgentTurnExecutor: Send + Sync {
         provider.uses_native_harness()
     }
 
+    /// When an idle session on this route should compact before its prompt
+    /// cache expires, and the smallest context worth it. `None` disables it.
+    fn idle_compaction(
+        &self,
+        _provider: CodingProvider,
+        _model: &str,
+        _effort: Option<&str>,
+    ) -> Option<IdleCompaction> {
+        None
+    }
+
     async fn execute(
         &self,
         turn: AgentTurn,
@@ -517,6 +528,7 @@ pub struct LocalAgentTurnExecutor {
     /// Controller-supplied provider access for this session. Empty for
     /// host-local execution, where credentials come from the host environment.
     provider_context: crate::RuntimeProviderContext,
+    idle_compaction_min_context_tokens: Option<u64>,
     #[cfg(feature = "profiling")]
     profiler: Option<Arc<crate::RuntimeProfiler>>,
 }
@@ -541,6 +553,7 @@ impl Default for LocalAgentTurnExecutor {
             subscription_pools: Arc::new(SubscriptionPoolRegistry::for_host()),
             web_search,
             provider_context: crate::RuntimeProviderContext::default(),
+            idle_compaction_min_context_tokens: None,
             #[cfg(feature = "profiling")]
             profiler: None,
         }
@@ -863,6 +876,22 @@ fn subscription_lifecycle_key(
     format!("borg-{}-{digest}", turn.provider.catalog_backend())
 }
 
+/// Compact an idle session `after` this long without a model request, when its
+/// context holds at least `min_context_tokens`. The cache it would otherwise
+/// re-read in full on the next turn expires shortly after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleCompaction {
+    pub after: std::time::Duration,
+    pub min_context_tokens: u64,
+}
+
+/// Only a cache that outlives a short break is worth compacting for: on a
+/// five-minute lifetime this would compact whenever someone stepped away.
+const IDLE_COMPACTION_MIN_CACHE_LIFETIME: std::time::Duration =
+    std::time::Duration::from_secs(3600);
+/// Compact at ninety percent of the cache lifetime, inside the window.
+const IDLE_COMPACTION_PERCENT_OF_LIFETIME: f64 = 0.9;
+
 #[derive(Debug, Clone, Default)]
 pub struct LocalAgentSettings {
     pub approval_reviewer_model: Option<String>,
@@ -878,6 +907,10 @@ pub struct LocalAgentSettings {
     pub compaction: borg_core::compaction::CompactionBudgetPolicy,
     /// `[warming] mode`. `BORG_CACHE_WARMING` still overrides it per process.
     pub warming: borg_core::warming::CacheWarmingMode,
+    /// `[compaction] idle_min_context_tokens`: compact an idle session before
+    /// its prompt cache expires once its context is at least this large.
+    /// `None` disables idle compaction.
+    pub idle_compaction_min_context_tokens: Option<u64>,
     /// User-scoped instructions appended to the coding prompt on local turns.
     pub prompt_append: String,
 }
@@ -893,6 +926,7 @@ impl LocalAgentTurnExecutor {
         Self {
             native_harness: NativeHarness::with_settings(&settings),
             prompt_append: settings.prompt_append,
+            idle_compaction_min_context_tokens: settings.idle_compaction_min_context_tokens,
             ..Self::default()
         }
     }
@@ -908,6 +942,7 @@ impl LocalAgentTurnExecutor {
         Self {
             native_harness: NativeHarness::with_model_gateway(gateway, &settings),
             prompt_append: settings.prompt_append,
+            idle_compaction_min_context_tokens: settings.idle_compaction_min_context_tokens,
             ..Self::default()
         }
     }
@@ -1178,6 +1213,27 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         provider.uses_native_harness()
             || matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
             || (self.opencode_session_native && provider == CodingProvider::OpenCode)
+    }
+
+    fn idle_compaction(
+        &self,
+        provider: CodingProvider,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Option<IdleCompaction> {
+        let min_context_tokens = self.idle_compaction_min_context_tokens?;
+        if !self.uses_native_harness(provider) {
+            return None;
+        }
+        let lifetime = self
+            .native_harness
+            .with_provider_context(provider, &self.provider_context)
+            .ok()?
+            .prompt_cache_lifetime(provider, model, effort)?;
+        (lifetime >= IDLE_COMPACTION_MIN_CACHE_LIFETIME).then(|| IdleCompaction {
+            after: lifetime.mul_f64(IDLE_COMPACTION_PERCENT_OF_LIFETIME),
+            min_context_tokens,
+        })
     }
 
     fn web_search_provider(&self) -> Option<Arc<dyn borg_search::WebSearchProvider>> {

@@ -175,6 +175,16 @@ check_interval_hours = 24
 # reserve_tokens = 40000
 # keep_recent_tokens = 250000
 
+# A session left idle is compacted shortly before its prompt cache expires, so
+# the next turn reads a short summary instead of re-reading the whole context
+# uncached. It runs only on routes whose cache lasts an hour (a Claude
+# subscription), after 90% of that hour, for a top-level session whose context
+# is at least `idle_min_context_tokens`. Subagents are never idle-compacted.
+#
+# [compaction]
+# idle_before_cache_expiry = true
+# idle_min_context_tokens = 200000
+
 # Prompt cache warming keeps an expensive prefix alive so a long tool run does
 # not pay to rebuild it. "streaming" refreshes across a run and is the default;
 # "idle" keeps refreshing while you are away, so it is opt-in; "off" disables

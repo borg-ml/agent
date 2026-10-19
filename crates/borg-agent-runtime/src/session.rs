@@ -2182,6 +2182,216 @@ pub(crate) async fn run_agent_session_with_store_and_writer_and_team(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Compact the native conversation now and journal the boundary, as the
+/// automatic compaction before a turn does. Returns whether it compacted; a
+/// failure is journaled and the history is kept whole.
+#[allow(clippy::too_many_arguments)]
+async fn compact_native_context_now(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    launch: &LaunchSession,
+    executor: &dyn AgentTurnExecutor,
+    dispatcher: &crate::AgentToolDispatcher,
+    usage_message_id: Option<Uuid>,
+    trigger: &str,
+    status_detail: &str,
+    context_tokens: u64,
+    context_window_tokens: u64,
+) -> Result<bool> {
+    let operation_id = Uuid::new_v4();
+    record(
+        journal,
+        events,
+        session_id,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Running,
+            lifecycle: Some(SubagentLifecycle::Running),
+            detail: Some(status_detail.to_string()),
+        },
+    )
+    .await?;
+    record(
+        journal,
+        events,
+        session_id,
+        SessionEventKind::ProviderEvent {
+            provider: launch.provider,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({
+                        "operation_id": operation_id,
+                "status": "started",
+                "summary": "Compacting context…",
+                "automatic": true,
+                "trigger": trigger,
+            }),
+        },
+    )
+    .await?;
+    run_before_compaction_hook(
+        journal,
+        events,
+        session_id,
+        dispatcher,
+        launch.provider,
+        launch.model.as_deref(),
+        "automatic",
+        Some(trigger),
+    )
+    .await?;
+    journal.ensure_complete_context(session_id).await?;
+    let result = async {
+        let conversation = native_conversation_with_historical_images(
+            journal.context_events(),
+            launch.provider,
+            &launch.cwd,
+        )
+        .await?;
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let compaction = executor.compact_native(
+            crate::ModelAccessContext {
+                session_id,
+                store: dispatcher.session_store(),
+                provider_context: launch.capabilities.runtime_provider_context.clone(),
+                parent_session_id: dispatcher.parent_session_id().await,
+                request_prefix: native_request_prefix(journal.context_events()),
+            },
+            launch.provider,
+            launch
+                .model
+                .as_deref()
+                .context("native context compaction requires a model")?,
+            launch.effort.as_deref(),
+            launch.fast.unwrap_or(false),
+            launch.ultrafast.unwrap_or(false),
+            conversation,
+            Some(context_window_tokens),
+            Some(progress_tx),
+        );
+        tokio::pin!(compaction);
+        loop {
+            tokio::select! {
+                biased;
+                Some(progress) = progress_rx.recv() => {
+                    record(
+                        journal,
+                        events,
+                        session_id,
+                        SessionEventKind::ProviderEvent {
+                            provider: launch.provider,
+                            kind: "context_compaction".to_string(),
+                            payload: serde_json::json!({
+                        "operation_id": operation_id,
+                                "status": "progress",
+                                "summary": format!(
+                                    "Compacting context: {}/{} passes complete",
+                                    progress.completed_passes,
+                                    progress.total_passes,
+                                ),
+                                "automatic": true,
+                                "trigger": trigger,
+                                "completed_passes": progress.completed_passes,
+                                "total_passes": progress.total_passes,
+                                "pass_duration_ms": progress.pass_duration_ms,
+                            }),
+                        },
+                    )
+                    .await?;
+                }
+                result = &mut compaction => break result,
+            }
+        }
+    }
+    .await;
+    match result {
+        Ok(compaction) => {
+            record(
+                journal,
+                events,
+                session_id,
+                native_usage_event(&compaction.usage, usage_message_id),
+            )
+            .await?;
+            record(
+                journal,
+                events,
+                session_id,
+                SessionEventKind::ProviderEvent {
+                    provider: launch.provider,
+                    kind: "context_compaction".to_string(),
+                    payload: serde_json::json!({
+                        "operation_id": operation_id,
+                        "status": "completed",
+                        "summary": compaction.summary,
+                        "native": true,
+                        "automatic": true,
+                        "trigger": trigger,
+                        "context_tokens_before": context_tokens,
+                        "effective_context_window_tokens": context_window_tokens,
+                        "remaining_percent_threshold": (trigger == "context_threshold")
+                            .then_some(AUTO_COMPACT_REMAINING_PERCENT),
+                        "provider_duration_ms": compaction.usage.duration_ms,
+                        "input_tokens": compaction.usage.input_tokens,
+                        "output_tokens": compaction.usage.output_tokens,
+                    }),
+                },
+            )
+            .await?;
+            record(
+                journal,
+                events,
+                session_id,
+                SessionEventKind::ContextWindowUpdated {
+                    context_tokens: 0,
+                    context_window_tokens,
+                },
+            )
+            .await?;
+            Ok(true)
+        }
+        Err(error) => {
+            if let Some(partial) = error.downcast_ref::<crate::agent::PartialCompactionUsage>() {
+                record(
+                    journal,
+                    events,
+                    session_id,
+                    native_usage_event(&partial.usage, usage_message_id),
+                )
+                .await?;
+            }
+            let message = format!(
+                "Automatic context compaction failed; continuing without discarding history: {error:#}"
+            );
+            record(
+                journal,
+                events,
+                session_id,
+                SessionEventKind::ProviderEvent {
+                    provider: launch.provider,
+                    kind: "context_compaction_failed".to_string(),
+                    payload: serde_json::json!({
+                        "operation_id": operation_id,
+                        "automatic": true,
+                        "trigger": trigger,
+                        "context_tokens_before": context_tokens,
+                        "effective_context_window_tokens": context_window_tokens,
+                        "error": message,
+                    }),
+                },
+            )
+            .await?;
+            record(
+                journal,
+                events,
+                session_id,
+                SessionEventKind::Error { message },
+            )
+            .await?;
+            Ok(false)
+        }
+    }
+}
+
 async fn run_before_compaction_hook(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
@@ -2578,6 +2788,9 @@ async fn run_agent_session_store_kernel_inner(
     validate_session_state(session_id, &state)?;
     let mut provider_context_usage_valid = fresh;
     let mut native_context_usage = fresh.then_some(state.usage.context_tokens).flatten();
+    // When the last model request settled, which starts its prompt cache's
+    // lifetime. Cleared once an idle compaction has been tried for it.
+    let mut last_model_usage_at: Option<tokio::time::Instant> = None;
     let mut resumed_native_context_tokens =
         restored_native_context_tokens(journal.context_events(), launch.provider);
     let resumed_context_generation = state.context_generation;
@@ -3313,6 +3526,19 @@ async fn run_agent_session_store_kernel_inner(
                 let silence_remaining = watches
                     .silence_remaining(crate::watch::YIELD_SILENCE_BOUND)
                     .await;
+                // Subagents are excluded: a finished child may never be
+                // resumed, and compacting each one would spend usage for nothing.
+                let idle_compaction_at = idle_compaction_deadline(
+                    executor.as_ref(),
+                    &launch,
+                    last_model_usage_at,
+                    provider_context_usage_valid
+                        .then_some(native_context_usage)
+                        .flatten(),
+                    pending.is_empty()
+                        && retry_not_before.is_none()
+                        && dispatcher.parent_session_id().await.is_none(),
+                );
                 let command = tokio::select! {
                     biased;
 
@@ -3339,6 +3565,36 @@ async fn run_agent_session_store_kernel_inner(
                                                     batch: Vec::new(),
                                                 })
                                         });
+                                    }
+                                    _ = tokio::time::sleep_until(idle_compaction_at.unwrap_or_else(tokio::time::Instant::now)), if idle_compaction_at.is_some() => {
+                                        // One attempt per idle stretch: a failed compaction
+                                        // keeps the history and must not retry in a loop.
+                                        last_model_usage_at = None;
+                                        let context_window_tokens = journal
+                                            .state(session_id)
+                                            .await?
+                                            .usage
+                                            .context_window_tokens
+                                            .unwrap_or_default();
+                                        if compact_native_context_now(
+                                            &mut journal,
+                                            &events,
+                                            session_id,
+                                            &launch,
+                                            executor.as_ref(),
+                                            &dispatcher,
+                                            None,
+                                            "cache_expiry",
+                                            "Compacting idle context before its prompt cache expires",
+                                            native_context_usage.unwrap_or_default(),
+                                            context_window_tokens,
+                                        )
+                                        .await?
+                                        {
+                                            native_context_usage = None;
+                                            provider_context_usage_valid = false;
+                                        }
+                                        continue 'session;
                                     }
                                     command = next_host_command(&mut deferred_commands, &mut commands) => command,
                                     _ = watches.changed.notified() => {
@@ -4841,200 +5097,23 @@ async fn run_agent_session_store_kernel_inner(
             let mut state = journal.state(session_id).await?;
             state.usage.context_tokens = native_context_usage;
             if provider_context_usage_valid && native_auto_compaction_needed(&state) {
-                let operation_id = Uuid::new_v4();
-                let context_tokens = state.usage.context_tokens.unwrap_or_default();
-                let context_window_tokens = state.usage.context_window_tokens.unwrap_or_default();
-                record(
+                let compacted = compact_native_context_now(
                     &mut journal,
                     &events,
                     session_id,
-                    SessionEventKind::StatusChanged {
-                        status: SessionStatus::Running,
-                        lifecycle: Some(SubagentLifecycle::Running),
-                        detail: Some("Automatically compacting context".to_string()),
-                    },
-                )
-                .await?;
-                record(
-                    &mut journal,
-                    &events,
-                    session_id,
-                    SessionEventKind::ProviderEvent {
-                        provider: launch.provider,
-                        kind: "context_compaction".to_string(),
-                        payload: serde_json::json!({
-                                    "operation_id": operation_id,
-                            "status": "started",
-                            "summary": "Compacting context…",
-                            "automatic": true,
-                            "trigger": "context_threshold",
-                        }),
-                    },
-                )
-                .await?;
-                run_before_compaction_hook(
-                    &mut journal,
-                    &events,
-                    session_id,
+                    &launch,
+                    executor.as_ref(),
                     &dispatcher,
-                    launch.provider,
-                    launch.model.as_deref(),
-                    "automatic",
-                    Some("context_threshold"),
+                    Some(prompt.message_id),
+                    "context_threshold",
+                    "Automatically compacting context",
+                    state.usage.context_tokens.unwrap_or_default(),
+                    state.usage.context_window_tokens.unwrap_or_default(),
                 )
                 .await?;
-                journal.ensure_complete_context(session_id).await?;
-                let result = async {
-                    let conversation = native_conversation_with_historical_images(
-                        journal.context_events(),
-                        launch.provider,
-                        &launch.cwd,
-                    )
-                    .await?;
-                    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-                    let compaction = executor.compact_native(
-                        crate::ModelAccessContext {
-                            session_id,
-                            store: dispatcher.session_store(),
-                            provider_context: launch.capabilities.runtime_provider_context.clone(),
-                            parent_session_id: dispatcher.parent_session_id().await,
-                            request_prefix: native_request_prefix(journal.context_events()),
-                        },
-                        launch.provider,
-                        launch
-                            .model
-                            .as_deref()
-                            .context("native context compaction requires a model")?,
-                        launch.effort.as_deref(),
-                        launch.fast.unwrap_or(false),
-                        launch.ultrafast.unwrap_or(false),
-                        conversation,
-                        Some(context_window_tokens),
-                        Some(progress_tx),
-                    );
-                    tokio::pin!(compaction);
-                    loop {
-                        tokio::select! {
-                            biased;
-                            Some(progress) = progress_rx.recv() => {
-                                record(
-                                    &mut journal,
-                                    &events,
-                                    session_id,
-                                    SessionEventKind::ProviderEvent {
-                                        provider: launch.provider,
-                                        kind: "context_compaction".to_string(),
-                                        payload: serde_json::json!({
-                                    "operation_id": operation_id,
-                                            "status": "progress",
-                                            "summary": format!(
-                                                "Compacting context: {}/{} passes complete",
-                                                progress.completed_passes,
-                                                progress.total_passes,
-                                            ),
-                                            "automatic": true,
-                                            "trigger": "context_threshold",
-                                            "completed_passes": progress.completed_passes,
-                                            "total_passes": progress.total_passes,
-                                            "pass_duration_ms": progress.pass_duration_ms,
-                                        }),
-                                    },
-                                )
-                                .await?;
-                            }
-                            result = &mut compaction => break result,
-                        }
-                    }
-                }
-                .await;
-                match result {
-                    Ok(compaction) => {
-                        record(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            native_usage_event(&compaction.usage, Some(prompt.message_id)),
-                        )
-                        .await?;
-                        record(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            SessionEventKind::ProviderEvent {
-                                provider: launch.provider,
-                                kind: "context_compaction".to_string(),
-                                payload: serde_json::json!({
-                                    "operation_id": operation_id,
-                                    "status": "completed",
-                                    "summary": compaction.summary,
-                                    "native": true,
-                                    "automatic": true,
-                                    "trigger": "context_threshold",
-                                    "context_tokens_before": context_tokens,
-                                    "effective_context_window_tokens": context_window_tokens,
-                                    "remaining_percent_threshold":
-                                        AUTO_COMPACT_REMAINING_PERCENT,
-                                    "provider_duration_ms": compaction.usage.duration_ms,
-                                    "input_tokens": compaction.usage.input_tokens,
-                                    "output_tokens": compaction.usage.output_tokens,
-                                }),
-                            },
-                        )
-                        .await?;
-                        native_context_usage = None;
-                        provider_context_usage_valid = false;
-                        record(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            SessionEventKind::ContextWindowUpdated {
-                                context_tokens: 0,
-                                context_window_tokens,
-                            },
-                        )
-                        .await?;
-                    }
-                    Err(error) => {
-                        if let Some(partial) =
-                            error.downcast_ref::<crate::agent::PartialCompactionUsage>()
-                        {
-                            record(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                native_usage_event(&partial.usage, Some(prompt.message_id)),
-                            )
-                            .await?;
-                        }
-                        let message = format!(
-                            "Automatic context compaction failed; continuing without discarding history: {error:#}"
-                        );
-                        record(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            SessionEventKind::ProviderEvent {
-                                provider: launch.provider,
-                                kind: "context_compaction_failed".to_string(),
-                                payload: serde_json::json!({
-                                    "operation_id": operation_id,
-                                    "automatic": true,
-                                    "trigger": "context_threshold",
-                                    "context_tokens_before": context_tokens,
-                                    "effective_context_window_tokens": context_window_tokens,
-                                    "error": message,
-                                }),
-                            },
-                        )
-                        .await?;
-                        record(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            SessionEventKind::Error { message },
-                        )
-                        .await?;
-                    }
+                if compacted {
+                    native_context_usage = None;
+                    provider_context_usage_valid = false;
                 }
             }
         }
@@ -5759,6 +5838,7 @@ async fn run_agent_session_store_kernel_inner(
                         let usage = goal_token_usage(&kind, &mut native_goal_usage);
                         if let SessionEventKind::UsageUpdated { context_tokens, .. } = &kind {
                             native_context_usage = *context_tokens;
+                            last_model_usage_at = Some(tokio::time::Instant::now());
                         } else if matches!(&kind, SessionEventKind::ProviderEvent { kind, payload, .. }
                             if kind == NATIVE_CONTEXT_EDIT_EVENT || (kind == "context_compaction" || kind == "context_microcompaction")
                                 && payload.get("status").and_then(Value::as_str) == Some("completed")) {
@@ -7574,6 +7654,7 @@ async fn run_agent_session_store_kernel_inner(
                     let usage = goal_token_usage(&kind, &mut native_goal_usage);
                     if let SessionEventKind::UsageUpdated { context_tokens, .. } = &kind {
                         native_context_usage = *context_tokens;
+                        last_model_usage_at = Some(tokio::time::Instant::now());
                     } else if matches!(&kind, SessionEventKind::ProviderEvent { kind, payload, .. }
                         if kind == NATIVE_CONTEXT_EDIT_EVENT || (kind == "context_compaction" || kind == "context_microcompaction")
                             && payload.get("status").and_then(Value::as_str) == Some("completed")) {
@@ -8916,6 +8997,25 @@ fn is_interrupted_turn_error(error: &str) -> bool {
 }
 
 const AUTO_COMPACT_REMAINING_PERCENT: u64 = 5;
+
+/// When an idle session should compact before its prompt cache expires: the
+/// route's lifetime after the last model request, once the context is large
+/// enough that re-reading it uncached would cost more than a summary.
+fn idle_compaction_deadline(
+    executor: &dyn AgentTurnExecutor,
+    launch: &LaunchSession,
+    last_model_usage_at: Option<tokio::time::Instant>,
+    context_tokens: Option<u64>,
+    idle: bool,
+) -> Option<tokio::time::Instant> {
+    let last = last_model_usage_at.filter(|_| idle)?;
+    let policy = executor.idle_compaction(
+        launch.provider,
+        launch.model.as_deref()?,
+        launch.effort.as_deref(),
+    )?;
+    (context_tokens? >= policy.min_context_tokens).then(|| last + policy.after)
+}
 
 fn native_auto_compaction_needed(state: &SessionState) -> bool {
     let (Some(context_tokens), Some(context_window_tokens)) = (

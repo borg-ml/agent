@@ -25274,3 +25274,143 @@ async fn deferred_provider_run_keeps_journal_and_delivery_order() {
     drop((store, journal));
     scratch.discard().await;
 }
+
+// A session left idle past its prompt cache deadline compacts once, so the next
+// turn does not re-read the whole context uncached.
+#[tokio::test(flavor = "current_thread")]
+async fn idle_session_compacts_once_before_its_prompt_cache_expires() {
+    struct IdleExecutor(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for IdleExecutor {
+        fn uses_native_harness(&self, _: CodingProvider) -> bool {
+            true
+        }
+
+        fn idle_compaction(
+            &self,
+            _: CodingProvider,
+            _: &str,
+            _: Option<&str>,
+        ) -> Option<crate::agent::IdleCompaction> {
+            Some(crate::agent::IdleCompaction {
+                after: Duration::from_millis(200),
+                min_context_tokens: 1_000,
+            })
+        }
+
+        async fn execute(
+            &self,
+            _: AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            _: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            events
+                .send(SessionEventKind::UsageUpdated {
+                    provider_duration_ms: 1,
+                    turn_id: None,
+                    provider_context_reused: None,
+                    input_tokens: 5_000,
+                    output_tokens: 10,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    total_tokens: 5_010,
+                    cost_microusd: None,
+                    cost_basis: String::new(),
+                    cost_usd: None,
+                    context_tokens: Some(5_000),
+                    context_window_tokens: Some(1_000_000),
+                })
+                .await?;
+            Ok(AgentTurnResult {
+                provider_session_id: None,
+                final_text: "done".into(),
+            })
+        }
+
+        async fn compact_native(
+            &self,
+            _: crate::ModelAccessContext,
+            _: CodingProvider,
+            _: &str,
+            _: Option<&str>,
+            _: bool,
+            _: bool,
+            _: Vec<borg_provider::provider::ModelMessage>,
+            _: Option<u64>,
+            _: Option<mpsc::UnboundedSender<crate::NativeCompactionProgress>>,
+        ) -> Result<crate::AgentCompaction> {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            Ok(crate::AgentCompaction {
+                summary: "summary".into(),
+                usage: ProviderCallUsage::default(),
+                provider_session_id: None,
+            })
+        }
+    }
+
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let executor = Arc::new(IdleExecutor(AtomicUsize::new(0)));
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        let store = Arc::clone(&store);
+        let executor = Arc::clone(&executor);
+        async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd,
+                    provider: CodingProvider::Claude,
+                    model: Some("claude-test".into()),
+                    effort: None,
+                    fast: Some(false),
+                    ultrafast: None,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                    name: None,
+                    initial_prompt: Some("do the work".into()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                store,
+            )
+            .await
+        }
+    });
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+            .await
+            .expect("the idle session compacts")
+            .expect("session remains attached");
+        if let SessionEventKind::ProviderEvent { kind, payload, .. } = event.kind
+            && kind == "context_compaction"
+            && payload["status"] == "completed"
+        {
+            assert_eq!(payload["trigger"], "cache_expiry");
+            break;
+        }
+    }
+    // Long past a second deadline: one attempt per idle stretch.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(executor.0.load(Ordering::Acquire), 1);
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+    scratch.discard().await;
+}

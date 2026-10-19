@@ -443,6 +443,20 @@ impl NativeHarness {
         next
     }
 
+    /// How long the provider keeps this route's prompt cache, when known.
+    pub(crate) fn prompt_cache_lifetime(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Option<Duration> {
+        Arc::clone(&self.model_client)
+            .prompt_cache_refresh()?
+            .refresh_support(provider, model, effort)
+            .ok()
+            .map(|support| support.cache_lifetime)
+    }
+
     pub(crate) fn with_provider_context(
         &self,
         provider: crate::CodingProvider,

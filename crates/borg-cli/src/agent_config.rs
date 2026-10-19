@@ -445,13 +445,35 @@ pub(crate) struct UpdateConfig {
 /// 1M-token window holds back 150k tokens from every turn. A budget here
 /// overrides either number in absolute tokens for one exact `provider/model`
 /// pair, leaving the other on its percentage default.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub(crate) struct CompactionConfig {
     /// Keyed by the same `provider/model` alias Borg uses everywhere else,
     /// for example `claude/claude-opus-5-5` or
     /// `open_router/anthropic/claude-opus-5`.
     pub(crate) budgets: BTreeMap<String, CompactionBudgetOverride>,
+    /// Compact an idle session shortly before a one-hour prompt cache expires,
+    /// so the next turn does not re-read the whole context uncached.
+    pub(crate) idle_before_cache_expiry: bool,
+    /// The smallest context idle compaction is worth spending a summary on.
+    pub(crate) idle_min_context_tokens: u64,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            budgets: BTreeMap::new(),
+            idle_before_cache_expiry: true,
+            idle_min_context_tokens: 200_000,
+        }
+    }
+}
+
+impl CompactionConfig {
+    fn idle_compaction_min_context_tokens(&self) -> Option<u64> {
+        self.idle_before_cache_expiry
+            .then_some(self.idle_min_context_tokens)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -1083,6 +1105,9 @@ impl AgentConfig {
             harness: self.capabilities.harness,
             compaction: self.compaction_budget_policy()?,
             warming: self.warming.mode,
+            idle_compaction_min_context_tokens: self
+                .compaction
+                .idle_compaction_min_context_tokens(),
             prompt_append: self.prompt.append.clone(),
         })
     }
@@ -1101,6 +1126,9 @@ impl AgentConfig {
         Ok(borg_remote::LocalAgentSettings {
             compaction: self.compaction_budget_policy()?,
             warming: self.warming.mode,
+            idle_compaction_min_context_tokens: self
+                .compaction
+                .idle_compaction_min_context_tokens(),
             ..Default::default()
         })
     }
