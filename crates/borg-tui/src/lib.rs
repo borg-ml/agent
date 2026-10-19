@@ -18502,7 +18502,10 @@ fn agents_status_label(active_agents: usize, waiting_agents: usize) -> Option<St
     match (total, active_agents) {
         (0, _) => None,
         (_, 0) => Some(format!("{total} waiting")),
-        _ => Some(format!("{total} subagent{}", if total == 1 { "" } else { "s" })),
+        _ => Some(format!(
+            "{total} subagent{}",
+            if total == 1 { "" } else { "s" }
+        )),
     }
 }
 

@@ -75,17 +75,29 @@ fn public_event(event: &SessionEvent) -> Option<Value> {
             let mut fields = serde_json::Map::new();
             fields.insert("type".into(), json!(kind));
             for key in [
-                "operation_id", "status", "trigger", "automatic", "native",
-                "context_tokens_before", "context_tokens_after",
-                "effective_context_window_tokens", "completed_passes", "total_passes",
-                "pass_duration_ms", "tokens_saved", "history_preserved",
+                "operation_id",
+                "status",
+                "trigger",
+                "automatic",
+                "native",
+                "context_tokens_before",
+                "context_tokens_after",
+                "effective_context_window_tokens",
+                "completed_passes",
+                "total_passes",
+                "pass_duration_ms",
+                "tokens_saved",
+                "history_preserved",
             ] {
                 if let Some(value) = payload.get(key) {
                     fields.insert(key.into(), value.clone());
                 }
             }
             if let Some(error) = payload["error"].as_str() {
-                fields.insert("error".into(), json!(crate::secret_scrub::scrub_secrets(error)));
+                fields.insert(
+                    "error".into(),
+                    json!(crate::secret_scrub::scrub_secrets(error)),
+                );
             }
             Value::Object(fields)
         }

@@ -1321,7 +1321,10 @@ async fn journal_process_output(
         .await
         {
             {
-                let mut status = entry.status.lock().expect("native process status lock poisoned");
+                let mut status = entry
+                    .status
+                    .lock()
+                    .expect("native process status lock poisoned");
                 if status.error.is_none() {
                     status.error = Some(format!("failed to journal process output: {error}"));
                 }

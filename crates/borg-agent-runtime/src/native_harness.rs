@@ -77,7 +77,8 @@ const COMPACTION_ATTEMPT_LIMIT: Duration = Duration::from_millis(200);
 #[cfg(not(test))]
 const COMPACTION_RETRY_BACKOFF: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(10)];
 #[cfg(test)]
-const COMPACTION_RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(1), Duration::from_millis(1)];
+const COMPACTION_RETRY_BACKOFF: [Duration; 2] =
+    [Duration::from_millis(1), Duration::from_millis(1)];
 /// How often streamed output is reported, so the turn watchdog and the
 /// transcript see a working compaction without a row per delta.
 const COMPACTION_LIVENESS_INTERVAL: Duration = Duration::from_secs(15);
@@ -2333,14 +2334,23 @@ impl NativeHarness {
                     ..prefix.clone()
                 };
                 let effort = turn.effort.as_deref();
-                match drive_compaction_call(turn.provider, Some((events, operation_id)), |progress| {
-                    let request = ModelTurnRequest {
-                        request_id: Some(format!("compact:{}", Uuid::new_v4())),
-                        ..request.clone()
-                    };
-                    self.model_client
-                        .provider_compaction(turn.provider, model, effort, request, Some(progress))
-                })
+                match drive_compaction_call(
+                    turn.provider,
+                    Some((events, operation_id)),
+                    |progress| {
+                        let request = ModelTurnRequest {
+                            request_id: Some(format!("compact:{}", Uuid::new_v4())),
+                            ..request.clone()
+                        };
+                        self.model_client.provider_compaction(
+                            turn.provider,
+                            model,
+                            effort,
+                            request,
+                            Some(progress),
+                        )
+                    },
+                )
                 .await
                 {
                     Ok(ModelCompactionResult::Unsupported { .. }) => {}
@@ -6295,11 +6305,17 @@ mod tests {
         let mut phases = Vec::new();
         while let Some(SessionEventKind::ProviderEvent { payload, .. }) = received.recv().await {
             assert_eq!(payload["status"], "progress");
-            phases.push((payload["phase"].as_str().unwrap().to_string(), payload["attempt"].clone()));
+            phases.push((
+                payload["phase"].as_str().unwrap().to_string(),
+                payload["attempt"].clone(),
+            ));
         }
         assert_eq!(
             phases,
-            [("retrying".to_string(), json!(1)), ("streaming".to_string(), json!(2))]
+            [
+                ("retrying".to_string(), json!(1)),
+                ("streaming".to_string(), json!(2))
+            ]
         );
     }
 

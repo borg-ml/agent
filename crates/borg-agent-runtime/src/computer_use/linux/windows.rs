@@ -936,14 +936,25 @@ pub(super) fn locate_window(window: &Rgb, desktop: &Rgb, alpha: Option<&[u8]>) -
 /// Whether the window pixels around window-local `point` are hidden on the
 /// desktop by another surface (a panel, notification or other window): the
 /// located window can match overall while a bar covers the strip being clicked.
-pub(super) fn point_covered(window: &Rgb, desktop: &Rgb, origin: (i64, i64), point: (i64, i64)) -> bool {
+pub(super) fn point_covered(
+    window: &Rgb,
+    desktop: &Rgb,
+    origin: (i64, i64),
+    point: (i64, i64),
+) -> bool {
     let (mut differ, mut total) = (0usize, 0usize);
     for dy in -4..=4 {
         for dx in -4..=4 {
             let (wx, wy) = (point.0 + dx, point.1 + dy);
             let (sx, sy) = (origin.0 + wx, origin.1 + wy);
-            if wx < 0 || wy < 0 || wx as usize >= window.width || wy as usize >= window.height
-                || sx < 0 || sy < 0 || sx as usize >= desktop.width || sy as usize >= desktop.height
+            if wx < 0
+                || wy < 0
+                || wx as usize >= window.width
+                || wy as usize >= window.height
+                || sx < 0
+                || sy < 0
+                || sx as usize >= desktop.width
+                || sy as usize >= desktop.height
             {
                 continue;
             }
