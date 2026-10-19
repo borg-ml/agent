@@ -205,7 +205,9 @@ pub async fn persist_text(
     let (mut offset, mut generation) = prior
         .map(|(bytes, generation)| (bytes as usize, generation))
         .unwrap_or((0, uuid::Uuid::new_v4()));
-    if replace || offset > text.len() {
+    // A stored length that is not a boundary of this text means it is not an
+    // append of what was stored; replace it like any other non-append.
+    if replace || offset > text.len() || !text.is_char_boundary(offset) {
         offset = 0;
         generation = uuid::Uuid::new_v4();
     }
@@ -351,6 +353,29 @@ mod tests {
             .unwrap();
         assert_eq!(new, b"xxxx");
         assert_eq!(total, 4);
+        drop(store);
+        scratch.discard().await;
+    }
+
+    // A rewrite that is not an append can leave the stored length inside a
+    // character of the new text; that must replace, not fail every later commit.
+    #[tokio::test]
+    async fn non_append_text_splitting_a_character_replaces_instead_of_failing() {
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        initialize_text_fields(store.pool()).await.unwrap();
+        for (revision, text) in [("1", "λa"), ("2", "ééé")] {
+            let mut tx = store.pool().begin().await.unwrap();
+            persist_text(&mut tx, "scope", "row", "message", revision, text, false)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let (bytes, total) =
+            field_page_at(store.pool(), "scope", "row", "message", Some("2"), 0, 64)
+                .await
+                .unwrap();
+        assert_eq!(bytes, "ééé".as_bytes());
+        assert_eq!(total, 6);
         drop(store);
         scratch.discard().await;
     }
