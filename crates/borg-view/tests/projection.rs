@@ -1713,3 +1713,43 @@ fn compaction_operation_retries_preserve_clock_and_old_events_cannot_touch_curre
     assert_eq!(core.order.identities[3], (historical, 0));
     assert!(core.order[3].execution().unwrap().is_terminal());
 }
+
+// The checkpoint is a fixed budget: a session that has run many commands must keep
+// checkpointing, or its projection silently stops persisting.
+#[test]
+fn checkpoint_stays_within_budget_after_many_finished_processes() {
+    use borg_agent_runtime::RuntimeProcessStatus;
+    let session = Uuid::new_v4();
+    let mut reducer = ViewReducer::new(session, "epoch".into());
+    for index in 0..400_u64 {
+        let process_id = Uuid::new_v4();
+        reducer.apply(SessionEvent::new(
+            session,
+            index * 2 + 1,
+            SessionEventKind::RuntimeProcessStarted {
+                process_id,
+                pid: 42,
+                command: "x".repeat(14_000),
+                cwd: ".".into(),
+            },
+        ));
+        reducer.apply(SessionEvent::new(
+            session,
+            index * 2 + 2,
+            SessionEventKind::RuntimeProcessCompleted {
+                process_id,
+                pid: 42,
+                status: RuntimeProcessStatus::Exited,
+                exit_code: Some(0),
+                timed_out: false,
+                stdout: String::new(),
+                stderr: String::new(),
+                stdout_omitted_bytes: 0,
+                stderr_omitted_bytes: 0,
+                error: None,
+                changes: Vec::new(),
+            },
+        ));
+    }
+    assert!(reducer.checkpoint().unwrap().len() < SNAPSHOT_BYTES / 4);
+}

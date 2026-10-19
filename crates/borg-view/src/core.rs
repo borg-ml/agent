@@ -174,6 +174,12 @@ pub struct ModelRequestDisplay {
     pub output_tokens: Option<u64>,
 }
 
+/// Finished processes stay only so a later poll or result can still name the
+/// command it belongs to. The checkpoint is a fixed-size budget, so keep the
+/// most recent few and a bounded command preview, not every process ever run.
+const FINISHED_PROCESS_LIMIT: usize = 64;
+const FINISHED_PROCESS_COMMAND_CHARS: usize = 1_000;
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeProcessProjection {
     pub command: String,
@@ -302,6 +308,8 @@ pub struct TranscriptCore {
     pub compaction_entries: HashMap<Uuid, usize>,
     pub agent_message_senders: HashSet<Uuid>,
     pub runtime_processes: HashMap<Uuid, RuntimeProcessProjection>,
+    #[serde(default)]
+    pub finished_process_order: std::collections::VecDeque<Uuid>,
     pub poll_processes: HashMap<Uuid, Vec<String>>,
     pub provider_backgrounds: HashMap<String, ProviderBackgroundProjection>,
     pub provider_followups: HashMap<String, String>,
@@ -382,6 +390,7 @@ impl Default for TranscriptCore {
             compaction_entries: HashMap::new(),
             agent_message_senders: HashSet::new(),
             runtime_processes: HashMap::new(),
+            finished_process_order: Default::default(),
             poll_processes: HashMap::new(),
             provider_backgrounds: HashMap::new(),
             provider_followups: HashMap::new(),
@@ -2259,7 +2268,11 @@ impl TranscriptCore {
                     .and_then(|process| process.tool_index);
                 if let Some(process) = self.runtime_processes.get_mut(process_id) {
                     process.running = false;
+                    if !self.finished_process_order.contains(process_id) {
+                        self.finished_process_order.push_back(*process_id);
+                    }
                 }
+                self.prune_finished_processes();
                 if let Some(tool_index) = tool_index
                     && !self
                         .runtime_processes
@@ -2556,6 +2569,7 @@ impl TranscriptCore {
                 removed_entry = self.remove_message(*message_id);
                 self.queued_messages.remove(message_id);
                 self.queued_message_sequences.remove(message_id);
+                let mut row_created = false;
                 if self.remember_agent_message(*message_id) {
                     self.agent_message_senders.insert(*sender_id);
 
@@ -2591,7 +2605,14 @@ impl TranscriptCore {
                             ),
                             expanded: !from_peer,
                         });
+                        row_created = true;
                     }
+                }
+                // observe_meta recorded the source before knowing whether a row
+                // exists; a hidden child report has none, so nothing would ever
+                // evict its entry.
+                if !row_created {
+                    self.team_report_sources.remove(&event.id);
                 }
             }
             SessionEventKind::SubagentActivity {
@@ -3380,6 +3401,38 @@ impl TranscriptCore {
                 {
                     request.last_received_at = Some(Utc::now());
                 }
+            }
+        }
+    }
+
+    /// Keep the finished-process record within its fixed budget. Also run on
+    /// checkpoint restore, so a session whose saved state already outgrew the
+    /// budget recovers instead of failing every later commit.
+    pub fn prune_dead_report_sources(&mut self) {
+        let rows = self
+            .order
+            .identities
+            .iter()
+            .map(|(event_id, _)| *event_id)
+            .collect::<HashSet<_>>();
+        self.team_report_sources
+            .retain(|event_id, _| rows.contains(event_id));
+    }
+
+    pub fn prune_finished_processes(&mut self) {
+        while self.finished_process_order.len() > FINISHED_PROCESS_LIMIT {
+            self.finished_process_order.pop_front();
+        }
+        let finished = &self.finished_process_order;
+        self.runtime_processes
+            .retain(|id, process| process.running || finished.contains(id));
+        for process in self.runtime_processes.values_mut().filter(|p| !p.running) {
+            if let Some((end, _)) = process
+                .command
+                .char_indices()
+                .nth(FINISHED_PROCESS_COMMAND_CHARS)
+            {
+                process.command.truncate(end);
             }
         }
     }

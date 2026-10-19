@@ -395,6 +395,9 @@ impl ViewReducer {
             saved.core.order.entries.len() == saved.core.order.identities.len(),
             "invalid checkpoint identities"
         );
+        let mut saved = saved;
+        saved.core.prune_finished_processes();
+        saved.core.prune_dead_report_sources();
         let mut reducer = Self {
             core: saved.core,
             cursor: saved.cursor,
