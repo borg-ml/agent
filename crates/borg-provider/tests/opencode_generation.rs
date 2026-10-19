@@ -95,7 +95,6 @@ async fn opencode_generates_before_complete_arguments_and_finishes() -> anyhow::
         });
         let request = ChatStreamRequest {
             prompt: "Run pwd.".into(),
-            lifecycle_key: None,
             owner_session_id: None,
             client_user_message_id: None,
             attachments: vec![],
@@ -113,11 +112,9 @@ async fn opencode_generates_before_complete_arguments_and_finishes() -> anyhow::
             git_credentials: vec![],
             working_directory: Some(root.path().into()),
             session_id: None,
-            fork_turn_id: None,
             provider_channel: ProviderChannel::Direct,
             persist_session: Some(false),
             web_search_allowed: false,
-            resume_unavailable_prompt: None,
         };
         let mut events = run_opencode_local_chat_stream(request, permission);
         let mut generations = 0;

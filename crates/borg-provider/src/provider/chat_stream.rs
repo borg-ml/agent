@@ -18,7 +18,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
-use tokio::sync::mpsc;
 
 #[path = "opencode_stream.rs"]
 mod opencode_stream;
@@ -269,31 +268,6 @@ pub enum ChatStreamEvent {
     },
 }
 
-#[derive(Debug)]
-pub enum ChatStreamControl {
-    Steer {
-        client_user_message_id: Option<String>,
-        text: String,
-        attachments: Vec<PathBuf>,
-        admission: SteerAdmission,
-        /// Human input: providers that can should end the running turn after
-        /// the tool in flight and answer this message next (Claude Code's
-        /// priority `now`), instead of folding it into the current task.
-        preempt: bool,
-        ack: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
-    },
-    Approval {
-        approval_id: String,
-        decision: ChatApprovalDecision,
-        edited_input: Option<String>,
-    },
-    ProviderInteractionResponse {
-        interaction_id: String,
-        response: Value,
-    },
-    Interrupt,
-}
-
 const STEER_PENDING: u8 = 0;
 const STEER_ACCEPTED: u8 = 1;
 const STEER_RECALLED: u8 = 2;
@@ -338,13 +312,6 @@ impl SteerAdmission {
     pub fn is_recalled(&self) -> bool {
         self.0.load(Ordering::Acquire) == STEER_RECALLED
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatApprovalDecision {
-    ApproveOnce,
-    ApproveSession,
-    Reject,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,10 +363,6 @@ impl fmt::Debug for ChatGitCredential {
 #[derive(Debug, Clone)]
 pub struct ChatStreamRequest {
     pub prompt: String,
-    /// Stable identity for the provider-native conversation configuration.
-    /// The prompt is deliberately excluded: a healthy pooled process receives
-    /// only the new user delta after its first full replay.
-    pub lifecycle_key: Option<String>,
     pub owner_session_id: Option<String>,
     pub client_user_message_id: Option<String>,
     pub attachments: Vec<PathBuf>,
@@ -417,13 +380,9 @@ pub struct ChatStreamRequest {
     pub git_credentials: Vec<ChatGitCredential>,
     pub working_directory: Option<PathBuf>,
     pub session_id: Option<String>,
-    /// When set with `session_id`, fork that persisted Codex thread through
-    /// this completed turn instead of resuming an uncertain tail.
-    pub fork_turn_id: Option<String>,
     pub provider_channel: ProviderChannel,
     pub persist_session: Option<bool>,
     pub web_search_allowed: bool,
-    pub resume_unavailable_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -768,54 +727,6 @@ fn parse_codex_rate_limit_window(value: Option<&Value>) -> Result<Option<CodexRa
         window_duration_mins: seconds.div_ceil(60),
         resets_at: value.get("reset_at").and_then(Value::as_i64),
     }))
-}
-
-/// Compatibility marker for callers of the retired Claude Code pool.
-/// Claude turns require Borg's native harness; this type owns no runtime.
-#[derive(Clone, Default)]
-pub struct ClaudeSubscriptionPool {
-    _private: (),
-}
-
-/// Retired compatibility entrypoint. Use Borg's native harness for Claude turns.
-pub fn run_claude_chat_stream(_request: ChatStreamRequest) -> mpsc::Receiver<ChatStreamEvent> {
-    claude_native_harness_required()
-}
-
-/// Retired compatibility entrypoint. Use Borg's native harness for Claude turns.
-pub fn run_claude_chat_stream_with_control(
-    _request: ChatStreamRequest,
-    _controls: Option<mpsc::Receiver<ChatStreamControl>>,
-) -> mpsc::Receiver<ChatStreamEvent> {
-    claude_native_harness_required()
-}
-
-/// Retired compatibility entrypoint. Use Borg's native harness for Claude turns.
-pub fn run_claude_local_chat_stream(
-    _request: ChatStreamRequest,
-    _controls: Option<mpsc::Receiver<ChatStreamControl>>,
-    _permission: LocalAgentPermission,
-) -> mpsc::Receiver<ChatStreamEvent> {
-    claude_native_harness_required()
-}
-
-/// Retired compatibility entrypoint. Use Borg's native harness for Claude turns.
-pub fn run_claude_local_chat_stream_pooled(
-    _request: ChatStreamRequest,
-    _controls: Option<mpsc::Receiver<ChatStreamControl>>,
-    _permission: LocalAgentPermission,
-    _pool: ClaudeSubscriptionPool,
-) -> mpsc::Receiver<ChatStreamEvent> {
-    claude_native_harness_required()
-}
-
-fn claude_native_harness_required() -> mpsc::Receiver<ChatStreamEvent> {
-    let (events, receiver) = mpsc::channel(1);
-    let _ = events.try_send(ChatStreamEvent::Failed {
-        error: "Claude turns require Borg native harness".to_string(),
-        kind: ProviderErrorKind::Fatal,
-    });
-    receiver
 }
 
 #[cfg(test)]

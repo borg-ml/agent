@@ -30,16 +30,13 @@ pub use claude_model::ClaudeModelProvider;
 pub use codex_model::CodexModelProvider;
 
 pub use chat_stream::{
-    ChatApprovalDecision, ChatGitCredential, ChatProviderAuth, ChatStreamControl, ChatStreamEvent,
-    ChatStreamRequest, ClaudeAccountRateLimits, ClaudeRateLimitWindow, ClaudeSubscriptionPool,
-    CodexAccountRateLimits, CodexRateLimitWindow, LocalAgentPermission, ProviderErrorKind,
-    ProviderStreamError, SteerAdmission, classify_provider_error,
-    claude_native_account_verification_failed_recently, read_claude_account_rate_limits,
-    read_claude_subscription_status, read_codex_account_rate_limits,
-    read_codex_subscription_status, resolve_opencode_model, run_claude_chat_stream,
-    run_claude_chat_stream_with_control, run_claude_local_chat_stream,
-    run_claude_local_chat_stream_pooled, run_grok_local_chat_stream, run_muse_local_chat_stream,
-    run_opencode_local_chat_stream,
+    ChatGitCredential, ChatProviderAuth, ChatStreamEvent, ChatStreamRequest,
+    ClaudeAccountRateLimits, ClaudeRateLimitWindow, CodexAccountRateLimits, CodexRateLimitWindow,
+    LocalAgentPermission, ProviderErrorKind, ProviderStreamError, SteerAdmission,
+    classify_provider_error, claude_native_account_verification_failed_recently,
+    read_claude_account_rate_limits, read_claude_subscription_status,
+    read_codex_account_rate_limits, read_codex_subscription_status, resolve_opencode_model,
+    run_grok_local_chat_stream, run_muse_local_chat_stream, run_opencode_local_chat_stream,
 };
 pub use model_turn::{
     ModelCompactionResult, ModelFunctionCall, ModelInputAttachment, ModelMessage, ModelToolCall,

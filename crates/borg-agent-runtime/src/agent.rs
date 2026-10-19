@@ -1,31 +1,22 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use borg_provider::provider::{
-    ChatApprovalDecision, ChatStreamControl, ChatStreamEvent, ChatStreamRequest,
-    ClaudeSubscriptionPool, LocalAgentPermission, ProviderStreamError, SteerAdmission,
-    run_claude_chat_stream_with_control, run_claude_local_chat_stream,
-    run_claude_local_chat_stream_pooled, run_grok_local_chat_stream, run_muse_local_chat_stream,
-    run_opencode_local_chat_stream,
+    ChatStreamEvent, ChatStreamRequest, LocalAgentPermission, ProviderStreamError, SteerAdmission,
+    run_grok_local_chat_stream, run_muse_local_chat_stream, run_opencode_local_chat_stream,
 };
 use borg_provider::{ProviderCallUsage, ProviderChannel};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
     CodingProvider, EventActor, HarnessMode, MessageStatus, PermissionMode, ResponseLanguage,
     SessionEventKind, SessionStatus, WorkflowRuntime, native_harness::NativeHarness,
 };
-
-#[path = "host_claude_pool.rs"]
-mod host_claude_pool;
-use host_claude_pool::{HostClaudePoolRegistry, HostIdleLease};
 
 pub(crate) const CODING_SYSTEM_PROMPT: &str = "\
 You are Borg, a practical agent working in the user's local project. \
@@ -124,33 +115,6 @@ separate action-summary narration item.";
 /// never be resumed. Bump this whenever the provider-facing behavioral
 /// contract changes in a way that stale native context could preserve.
 pub(crate) const PROVIDER_CONTEXT_CONTRACT_VERSION: u32 = 1;
-const MAX_IDLE_CLAUDE_POOLS: usize = host_claude_pool::MAX_IDLE_POOLS;
-/// Claude Code writes a subscriber's prompt cache with a one-hour lifetime.
-/// An idle process released sooner discards a warm cache: the next turn
-/// replays the journal as one new message and rewrites the whole history.
-/// Memory stays bounded by the idle cap, not by this lifetime.
-const CLAUDE_POOL_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
-const CLAUDE_POOL_REAP_INTERVAL: Duration = Duration::from_secs(3);
-
-/// A Claude turn built as a delta assumes the pooled process still holds the
-/// whole conversation. Claude sessions are not resumable from disk here, so
-/// when the pool could not append (its lifecycle key changed, or the previous
-/// turn left it unhealthy) sending that delta to a fresh process would start
-/// the model with no history at all. Fail before the provider runs; the
-/// session replays the durable journal and retries.
-fn claude_delta_needs_replay(
-    provider: CodingProvider,
-    reused: bool,
-    provider_session_id: Option<&str>,
-    prompt: &str,
-    prompt_delta: &str,
-) -> bool {
-    provider == CodingProvider::Claude
-        && !reused
-        && provider_session_id.is_some()
-        && prompt == prompt_delta
-}
-
 fn provider_native_orchestration_tool(name: &str) -> bool {
     matches!(
         name,
@@ -523,7 +487,6 @@ pub struct LocalAgentTurnExecutor {
     opencode_session_native: bool,
     runtime_extensions: Arc<RwLock<RuntimeExtensions>>,
     runtime_extension_loader: Option<RuntimeExtensionLoader>,
-    subscription_pools: Arc<SubscriptionPoolRegistry>,
     web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
     /// Controller-supplied provider access for this session. Empty for
     /// host-local execution, where credentials come from the host environment.
@@ -550,7 +513,6 @@ impl Default for LocalAgentTurnExecutor {
             opencode_session_native: false,
             runtime_extensions: Arc::new(RwLock::new(RuntimeExtensions::default())),
             runtime_extension_loader: None,
-            subscription_pools: Arc::new(SubscriptionPoolRegistry::for_host()),
             web_search,
             provider_context: crate::RuntimeProviderContext::default(),
             idle_compaction_min_context_tokens: None,
@@ -578,302 +540,16 @@ struct RuntimeExtensions {
     api: crate::ExtensionApiSnapshot,
 }
 
-#[derive(Default)]
-struct SubscriptionPoolRegistry {
-    slots: Arc<Mutex<HashMap<Uuid, SubscriptionPoolSlot>>>,
-    idle_reaper_running: Arc<AtomicBool>,
-    host_registry: Option<Arc<HostClaudePoolRegistry>>,
-}
-
-struct SubscriptionPoolSlot {
-    provider: CodingProvider,
-    lifecycle_key: String,
-    context_generation: u64,
-    epoch: u64,
-    healthy: bool,
-    idle_since: Option<Instant>,
-    host_lease: Option<HostIdleLease>,
-    pool: ClaudeSubscriptionPool,
-}
-
-struct PreparedSubscriptionTurn {
-    prompt: String,
-    lifecycle_key: String,
-    pool: ClaudeSubscriptionPool,
-    reused: bool,
-    resume_unavailable_prompt: Option<String>,
-}
-
-struct SubscriptionTurnInput {
-    context_generation: u64,
-    provider: CodingProvider,
-    prompt: String,
-    prompt_delta: String,
-    lifecycle_key: String,
-}
-
-impl SubscriptionPoolRegistry {
-    fn for_host() -> Self {
-        #[cfg(test)]
-        {
-            Self::default()
-        }
-        #[cfg(not(test))]
-        Self {
-            host_registry: Some(Arc::new(HostClaudePoolRegistry::for_host())),
-            ..Self::default()
-        }
-    }
-
-    async fn prepare(
-        &self,
-        session_id: Uuid,
-        input: SubscriptionTurnInput,
-    ) -> PreparedSubscriptionTurn {
-        let SubscriptionTurnInput {
-            context_generation,
-            provider,
-            prompt,
-            prompt_delta,
-            lifecycle_key,
-        } = input;
-        let mut slots = self.slots.lock().await;
-        assert_eq!(provider, CodingProvider::Claude);
-        let slot = slots
-            .entry(session_id)
-            .or_insert_with(|| SubscriptionPoolSlot {
-                provider: CodingProvider::Claude,
-                lifecycle_key: String::new(),
-                context_generation,
-                epoch: 0,
-                healthy: false,
-                idle_since: None,
-                host_lease: None,
-                pool: ClaudeSubscriptionPool::default(),
-            });
-        let lease_allowed = if slot.healthy {
-            match (self.host_registry.as_ref(), slot.host_lease.as_ref()) {
-                (Some(registry), Some(lease)) => match registry.allowed_tokens() {
-                    Ok(tokens) => tokens.contains(&lease.token),
-                    Err(error) => {
-                        tracing::warn!(%session_id, %error, "Claude idle lease check failed; replaying journal");
-                        false
-                    }
-                },
-                (Some(_), None) => false,
-                (None, _) => true,
-            }
-        } else {
-            false
-        };
-        if slot.healthy && !lease_allowed {
-            slot.healthy = false;
-            slot.pool = ClaudeSubscriptionPool::default();
-        }
-        let append = slot.provider == provider
-            && slot.healthy
-            && slot.context_generation == context_generation
-            && slot.lifecycle_key == lifecycle_key;
-        // If execution is aborted, replay the journal on the next turn.
-        slot.healthy = false;
-        slot.idle_since = None;
-        let prior_lease = slot.host_lease.take();
-        if !append {
-            slot.epoch = slot.epoch.saturating_add(1);
-            slot.provider = provider;
-            slot.lifecycle_key = lifecycle_key.clone();
-            slot.context_generation = context_generation;
-            slot.healthy = false;
-        }
-        let resume_unavailable_prompt = (append && prompt != prompt_delta).then(|| prompt.clone());
-        let effective_key = format!("{lifecycle_key}#epoch={}", slot.epoch);
-        let prepared = PreparedSubscriptionTurn {
-            prompt: if append { prompt_delta } else { prompt.clone() },
-            lifecycle_key: effective_key,
-            pool: slot.pool.clone(),
-            reused: append,
-            resume_unavailable_prompt,
-        };
-        drop(slots);
-        drop(prior_lease);
-        prepared
-    }
-
-    async fn mark(&self, session_id: Uuid, provider: CodingProvider, healthy: bool) {
-        let mut slots = self.slots.lock().await;
-        let Some(slot) = slots
-            .get_mut(&session_id)
-            .filter(|slot| slot.provider == provider)
-        else {
-            return;
-        };
-        let host_lease = if healthy {
-            match self.host_registry.as_ref() {
-                Some(registry) => match registry.register(session_id) {
-                    Ok(lease) => Some(lease),
-                    Err(error) => {
-                        tracing::warn!(%session_id, %error, "Claude idle lease unavailable; releasing pooled process");
-                        None
-                    }
-                },
-                None => None,
-            }
-        } else {
-            None
-        };
-        let healthy = healthy && (self.host_registry.is_none() || host_lease.is_some());
-        slot.healthy = healthy;
-        slot.idle_since = healthy.then(Instant::now);
-        let prior_lease = std::mem::replace(&mut slot.host_lease, host_lease);
-        if !healthy {
-            slot.epoch = slot.epoch.saturating_add(1);
-            slot.pool = ClaudeSubscriptionPool::default();
-        }
-        let mut idle = slots
-            .iter()
-            .filter_map(|(session_id, slot)| slot.idle_since.map(|since| (*session_id, since)))
-            .collect::<Vec<_>>();
-        idle.sort_by_key(|(_, since)| *since);
-        let excess = idle.len().saturating_sub(MAX_IDLE_CLAUDE_POOLS);
-        let evicted = idle
-            .into_iter()
-            .take(excess)
-            .filter_map(|(session_id, _)| slots.remove(&session_id))
-            .collect::<Vec<_>>();
-        drop(slots);
-        drop(prior_lease);
-        drop(evicted);
-        if healthy && !self.idle_reaper_running.swap(true, Ordering::AcqRel) {
-            let slots = Arc::downgrade(&self.slots);
-            let running = Arc::downgrade(&self.idle_reaper_running);
-            let host_registry = self.host_registry.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(CLAUDE_POOL_REAP_INTERVAL).await;
-                    let (Some(slots), Some(running)) = (slots.upgrade(), running.upgrade()) else {
-                        break;
-                    };
-                    let mut slots = slots.lock().await;
-                    let allowed = host_registry
-                        .as_ref()
-                        .map(|registry| registry.allowed_tokens());
-                    if let Some(Err(error)) = allowed.as_ref() {
-                        tracing::warn!(%error, "Claude idle lease check failed; releasing pooled processes");
-                    }
-                    let now = Instant::now();
-                    let expired = slots
-                        .iter()
-                        .filter_map(|(session_id, slot)| {
-                            let since = slot.idle_since?;
-                            let revoked = match &allowed {
-                                Some(Ok(tokens)) => slot
-                                    .host_lease
-                                    .as_ref()
-                                    .is_none_or(|lease| !tokens.contains(&lease.token)),
-                                Some(Err(_)) => true,
-                                None => false,
-                            };
-                            let stale =
-                                now.duration_since(since) >= CLAUDE_POOL_IDLE_TTL || revoked;
-                            stale.then_some(*session_id)
-                        })
-                        .collect::<Vec<_>>();
-                    let evicted = expired
-                        .into_iter()
-                        .filter_map(|session_id| slots.remove(&session_id))
-                        .collect::<Vec<_>>();
-                    let has_idle = slots.values().any(|slot| slot.idle_since.is_some());
-                    if !has_idle {
-                        running.store(false, Ordering::Release);
-                    }
-                    drop(slots);
-                    drop(evicted);
-                    if !has_idle {
-                        break;
-                    }
-                }
-            });
-        }
-    }
-}
-
-/// Model/effort as they contribute to the pool lifecycle key. Claude applies
-/// model and effort changes to a live process (`set_model` /
-/// `apply_flag_settings`), keeping its conversation, so they must not split
-/// the slot.
-fn lifecycle_model_material<'a>(
-    provider: CodingProvider,
-    model: Option<&'a str>,
-    effort: Option<&'a str>,
-) -> (Option<&'a str>, Option<&'a str>) {
-    if provider == CodingProvider::Claude {
-        (None, None)
-    } else {
-        (model, effort)
-    }
-}
-
 /// Append the turn's volatile context to a request's system prompt. Callers
 /// derive the subscription lifecycle key before this runs: the key must cover
 /// only the material a pooled process cannot absorb, and this section is
 /// deliberately not part of it (see `AgentTurn::volatile_system_prompt_appendix`).
-fn append_volatile_system_prompt(request: &mut ChatStreamRequest, turn: &AgentTurn) {
-    if turn.volatile_system_prompt_appendix.is_empty() {
+fn append_volatile_system_prompt(request: &mut ChatStreamRequest, appendix: &str) {
+    if appendix.is_empty() {
         return;
     }
     request.system_prompt.push_str("\n\n");
-    request
-        .system_prompt
-        .push_str(&turn.volatile_system_prompt_appendix);
-}
-
-fn subscription_lifecycle_key(
-    turn: &AgentTurn,
-    request: &ChatStreamRequest,
-    permission: PermissionMode,
-) -> String {
-    let mcp_servers = request
-        .mcp_external_servers
-        .iter()
-        .map(|server| {
-            serde_json::json!({
-                "name": server.name,
-                "command": server.command,
-                "args": server.args,
-                "env": server.env,
-                "allowed_tools": server.allowed_tools,
-            })
-        })
-        .collect::<Vec<_>>();
-    let (model, effort) = lifecycle_model_material(
-        turn.provider,
-        request.model.as_deref(),
-        request.effort.as_deref(),
-    );
-    let material = serde_json::json!({
-        "version": 3,
-        "session_id": turn.session_id,
-        "context_generation": turn.context_generation,
-        "provider": turn.provider.catalog_backend(),
-        "model": model,
-        "effort": effort,
-        "fast": request.fast,
-        "permission": format!("{permission:?}"),
-        "cwd": request.working_directory.as_ref().map(|path| path.to_string_lossy()),
-        "system_prompt": request.system_prompt,
-        "output_schema": request.output_schema,
-        "mcp_servers": mcp_servers,
-        "provider_channel": request.provider_channel.as_str(),
-        "web_search_allowed": request.web_search_allowed,
-    });
-    let digest = Sha256::digest(
-        serde_json::to_vec(&material).expect("subscription lifecycle material is serializable"),
-    );
-    let digest = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("borg-{}-{digest}", turn.provider.catalog_backend())
+    request.system_prompt.push_str(appendix);
 }
 
 /// Compact an idle session `after` this long without a model request, when its
@@ -1354,11 +1030,9 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 run_borg_provider_turn(
                     turn,
                     events,
-                    controls,
                     BorgProviderTurnRuntime {
                         request_template,
                         local: true,
-                        subscription_pools: Some(Arc::clone(&self.subscription_pools)),
                         #[cfg(feature = "profiling")]
                         profiler: self.profiler.clone(),
                     },
@@ -1494,11 +1168,9 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         let task = tokio::spawn(run_borg_provider_turn(
             turn,
             provider_events_tx,
-            None,
             BorgProviderTurnRuntime {
                 request_template: None,
                 local: true,
-                subscription_pools: None,
                 #[cfg(feature = "profiling")]
                 profiler: None,
             },
@@ -1548,27 +1220,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
     }
 
     async fn stop_session(&self, session_id: Uuid) -> Result<()> {
-        self.subscription_pools
-            .slots
-            .lock()
-            .await
-            .remove(&session_id);
         self.native_harness.stop_session(session_id).await
-    }
-
-    async fn release_provider_context(
-        &self,
-        session_id: Uuid,
-        provider: CodingProvider,
-    ) -> Result<()> {
-        if provider == CodingProvider::Claude {
-            self.subscription_pools
-                .slots
-                .lock()
-                .await
-                .remove(&session_id);
-        }
-        Ok(())
     }
 }
 
@@ -1607,7 +1259,6 @@ pub async fn run_agent_turn_controlled(
 struct BorgProviderTurnRuntime {
     request_template: Option<ChatStreamRequest>,
     local: bool,
-    subscription_pools: Option<Arc<SubscriptionPoolRegistry>>,
     #[cfg(feature = "profiling")]
     profiler: Option<Arc<crate::RuntimeProfiler>>,
 }
@@ -1627,7 +1278,6 @@ fn direct_chat_stream_request(
     };
     ChatStreamRequest {
         prompt: append_prompt_context(&turn.prompt, prompt_context),
-        lifecycle_key: None,
         owner_session_id: Some(turn.session_id.to_string()),
         client_user_message_id: Some(turn.message_id.to_string()),
         attachments: turn.attachments.clone(),
@@ -1652,11 +1302,9 @@ fn direct_chat_stream_request(
         git_credentials: Vec::new(),
         working_directory: Some(turn.cwd.clone()),
         session_id: None,
-        fork_turn_id: None,
         provider_channel: ProviderChannel::Direct,
         persist_session: Some(false),
         web_search_allowed: true,
-        resume_unavailable_prompt: None,
     }
 }
 
@@ -1696,23 +1344,7 @@ fn append_prompt_context(prompt: &str, context: &str) -> String {
 
 #[cfg(test)]
 mod prompt_context_tests {
-    use super::{CodingProvider, append_prompt_context, lifecycle_model_material};
-
-    #[test]
-    fn claude_model_and_effort_switch_in_place_so_they_do_not_split_the_pool() {
-        assert_eq!(
-            lifecycle_model_material(
-                CodingProvider::Claude,
-                Some("claude-fable-5-1"),
-                Some("max")
-            ),
-            (None, None)
-        );
-        assert_eq!(
-            lifecycle_model_material(CodingProvider::Codex, Some("gpt-6-astra"), Some("high")),
-            (Some("gpt-6-astra"), Some("high"))
-        );
-    }
+    use super::append_prompt_context;
 
     #[test]
     fn mutable_context_is_appended_after_the_existing_prompt() {
@@ -1728,14 +1360,12 @@ mod prompt_context_tests {
 async fn run_borg_provider_turn(
     turn: AgentTurn,
     events: mpsc::Sender<SessionEventKind>,
-    controls: Option<mpsc::Receiver<AgentTurnControl>>,
     runtime: BorgProviderTurnRuntime,
     tools_enabled: bool,
 ) -> Result<AgentTurnResult> {
     let BorgProviderTurnRuntime {
         request_template,
         local,
-        subscription_pools,
         #[cfg(feature = "profiling")]
         profiler,
     } = runtime;
@@ -1746,7 +1376,7 @@ async fn run_borg_provider_turn(
     let provider_turn_started = Instant::now();
     let ttft_session_id = turn.session_id;
     let ttft_message_id = turn.message_id;
-    let pool_turn = turn.clone();
+    let volatile_appendix = turn.volatile_system_prompt_appendix.clone();
     let response_language_instruction = turn.response_language.instruction();
     let prompt_context = if tools_enabled
         && matches!(
@@ -1805,9 +1435,7 @@ async fn run_borg_provider_turn(
             // would silently omit durable Borg tool events or duplicate the
             // locally reconstructed prefix.
             request.session_id = None;
-            request.fork_turn_id = None;
             request.persist_session = Some(false);
-            request.resume_unavailable_prompt = None;
             if tools_enabled {
                 request
                     .mcp_external_servers
@@ -1831,82 +1459,8 @@ async fn run_borg_provider_turn(
         ),
     };
     let permission = local_permission(turn.permission_mode);
-    let pool_invocation = if local
-        && turn.provider == CodingProvider::Claude
-        && let Some(registry) = subscription_pools.as_ref()
-    {
-        let lifecycle_key = subscription_lifecycle_key(&pool_turn, &request, turn.permission_mode);
-        let prepared = registry
-            .prepare(
-                turn.session_id,
-                SubscriptionTurnInput {
-                    context_generation: turn.context_generation,
-                    provider: turn.provider,
-                    prompt: append_prompt_context(
-                        &turn.prompt,
-                        prompt_context.as_deref().unwrap_or_default(),
-                    ),
-                    prompt_delta: append_prompt_context(
-                        &turn.prompt_delta,
-                        prompt_context.as_deref().unwrap_or_default(),
-                    ),
-                    lifecycle_key,
-                },
-            )
-            .await;
-        if claude_delta_needs_replay(
-            turn.provider,
-            prepared.reused,
-            turn.provider_session_id.as_deref(),
-            &turn.prompt,
-            &turn.prompt_delta,
-        ) {
-            registry.mark(turn.session_id, turn.provider, false).await;
-            tracing::warn!(
-                session_id = %turn.session_id,
-                "pooled Claude process cannot be appended to; refusing to start a fresh process with a delta-only prompt"
-            );
-            anyhow::bail!(
-                "durable thread recovery unavailable: the pooled Claude process for this session was replaced before this turn could append to it; Borg is replaying the canonical journal"
-            );
-        }
-        request.prompt = prepared.prompt.clone();
-        request.lifecycle_key = Some(prepared.lifecycle_key.clone());
-        request.session_id = None;
-        request.fork_turn_id = None;
-        request.resume_unavailable_prompt = prepared.resume_unavailable_prompt.clone();
-        Some((Arc::clone(registry), prepared))
-    } else {
-        None
-    };
-    // Only now, with the lifecycle key derived, does the volatile context join
-    // the prompt a fresh process would be started with.
-    append_volatile_system_prompt(&mut request, &pool_turn);
-    let pooled_claude = pool_invocation
-        .as_ref()
-        .map(|(_, prepared)| prepared.pool.clone());
-    let interrupted = Arc::new(AtomicBool::new(false));
+    append_volatile_system_prompt(&mut request, &volatile_appendix);
     let mut stream = match turn.provider {
-        CodingProvider::Claude if local => {
-            if let Some(pool) = pooled_claude {
-                run_claude_local_chat_stream_pooled(
-                    request,
-                    map_controls(controls, Arc::clone(&interrupted)),
-                    permission,
-                    pool,
-                )
-            } else {
-                run_claude_local_chat_stream(
-                    request,
-                    map_controls(controls, Arc::clone(&interrupted)),
-                    permission,
-                )
-            }
-        }
-        CodingProvider::Claude => run_claude_chat_stream_with_control(
-            request,
-            map_controls(controls, Arc::clone(&interrupted)),
-        ),
         CodingProvider::OpenCode if local => run_opencode_local_chat_stream(request, permission),
         CodingProvider::OpenCode => {
             bail!("OpenCode execution is only supported on an enrolled host")
@@ -2451,9 +2005,7 @@ async fn run_borg_provider_turn(
                         SessionEventKind::UsageUpdated {
                             provider_duration_ms: usage.duration_ms,
                             turn_id: Some(turn.message_id),
-                            provider_context_reused: pool_invocation
-                                .as_ref()
-                                .map(|(_, prepared)| prepared.reused),
+                            provider_context_reused: None,
                             input_tokens: usage.input_tokens,
                             output_tokens: usage.output_tokens,
                             cached_input_tokens: usage.cached_input_tokens,
@@ -2472,27 +2024,20 @@ async fn run_borg_provider_turn(
                 // message id for the final segment. Complete the current
                 // segment independently of earlier narration; otherwise its
                 // last in-progress snapshot survives the terminal boundary.
-                let terminal_text = match terminal_assistant_text(
-                    &final_output,
-                    &text,
-                    completed_segment,
-                    interrupted.load(Ordering::Acquire),
-                ) {
-                    Ok(text) => text,
-                    Err(error) => {
-                        if let Some((registry, _)) = pool_invocation.as_ref() {
-                            registry.mark(turn.session_id, turn.provider, false).await;
+                let terminal_text =
+                    match terminal_assistant_text(&final_output, &text, completed_segment) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            send(
+                                &events,
+                                SessionEventKind::Error {
+                                    message: error.to_string(),
+                                },
+                            )
+                            .await;
+                            return Err(error);
                         }
-                        send(
-                            &events,
-                            SessionEventKind::Error {
-                                message: error.to_string(),
-                            },
-                        )
-                        .await;
-                        return Err(error);
-                    }
-                };
+                    };
                 if let Some(terminal_text) = terminal_text {
                     text = terminal_text.clone();
                     send(
@@ -2515,9 +2060,6 @@ async fn run_borg_provider_turn(
                 pending_reasoning.clear();
                 if text.len() != emitted_text_len {
                     send_live_assistant_text(&events, assistant_message_id, &text).await;
-                }
-                if let Some((registry, _)) = pool_invocation.as_ref() {
-                    registry.mark(turn.session_id, turn.provider, false).await;
                 }
                 let error = user_facing_provider_error(turn.provider, &error);
                 send(
@@ -2545,9 +2087,6 @@ async fn run_borg_provider_turn(
         send_live_assistant_text(&events, assistant_message_id, &text).await;
     }
     if let Err(error) = require_provider_stream_terminal(terminal_seen) {
-        if let Some((registry, _)) = pool_invocation.as_ref() {
-            registry.mark(turn.session_id, turn.provider, false).await;
-        }
         send(
             &events,
             SessionEventKind::Error {
@@ -2556,15 +2095,6 @@ async fn run_borg_provider_turn(
         )
         .await;
         return Err(error);
-    }
-    if let Some((registry, _)) = pool_invocation.as_ref() {
-        registry
-            .mark(
-                turn.session_id,
-                turn.provider,
-                !interrupted.load(Ordering::Acquire),
-            )
-            .await;
     }
     send(
         &events,
@@ -2848,7 +2378,6 @@ fn terminal_assistant_text(
     final_output: &str,
     current_text: &str,
     completed_segment: bool,
-    interrupted: bool,
 ) -> Result<Option<String>> {
     let text = if completed_segment {
         // `final_output` is the provider's aggregate answer. Narration has
@@ -2862,7 +2391,7 @@ fn terminal_assistant_text(
     };
     if text.trim().is_empty() {
         anyhow::ensure!(
-            completed_segment || interrupted,
+            completed_segment,
             "provider completed without a visible response (empty result)"
         );
         Ok(None)
@@ -2958,90 +2487,6 @@ fn user_facing_provider_error(provider: CodingProvider, error: &str) -> String {
             .to_string();
     }
     error.to_string()
-}
-
-fn map_controls(
-    controls: Option<mpsc::Receiver<AgentTurnControl>>,
-    interrupted: Arc<AtomicBool>,
-) -> Option<mpsc::Receiver<ChatStreamControl>> {
-    controls.map(|mut controls| {
-        let (tx, rx) = mpsc::channel(32);
-        tokio::spawn(async move {
-            while let Some(control) = controls.recv().await {
-                let delivered = match control {
-                    AgentTurnControl::Steer {
-                        message_id,
-                        text,
-                        attachments,
-                        admission,
-                        preempt,
-                        ack,
-                        ..
-                    } => {
-                        match tx
-                            .send(ChatStreamControl::Steer {
-                                client_user_message_id: Some(message_id.to_string()),
-                                text,
-                                attachments,
-                                admission,
-                                preempt,
-                                ack,
-                            })
-                            .await
-                        {
-                            Ok(()) => true,
-                            Err(error) => {
-                                if let ChatStreamControl::Steer { ack, .. } = error.0 {
-                                    let _ = ack.send(Err(
-                                        "provider turn ended before the steer was delivered"
-                                            .to_string(),
-                                    ));
-                                }
-                                false
-                            }
-                        }
-                    }
-                    AgentTurnControl::Approval {
-                        approval_id,
-                        resolution,
-                    } => {
-                        let decision = match resolution.decision {
-                            crate::ApprovalDecision::AllowOnce => ChatApprovalDecision::ApproveOnce,
-                            crate::ApprovalDecision::AllowSession => {
-                                ChatApprovalDecision::ApproveSession
-                            }
-                            crate::ApprovalDecision::Deny => ChatApprovalDecision::Reject,
-                        };
-                        tx.send(ChatStreamControl::Approval {
-                            approval_id,
-                            decision,
-                            edited_input: resolution.edited_input,
-                        })
-                        .await
-                        .is_ok()
-                    }
-                    AgentTurnControl::ProviderInteractionResponse {
-                        interaction_id,
-                        response,
-                    } => tx
-                        .send(ChatStreamControl::ProviderInteractionResponse {
-                            interaction_id,
-                            response,
-                        })
-                        .await
-                        .is_ok(),
-                    AgentTurnControl::Interrupt => {
-                        interrupted.store(true, Ordering::Release);
-                        tx.send(ChatStreamControl::Interrupt).await.is_ok()
-                    }
-                };
-                if !delivered {
-                    break;
-                }
-            }
-        });
-        rx
-    })
 }
 
 fn local_permission(permission: PermissionMode) -> LocalAgentPermission {
@@ -3140,93 +2585,6 @@ mod tests {
         );
         assert_eq!(request.persist_session, Some(false));
         assert!(request.provider_auth.is_none());
-    }
-
-    #[tokio::test]
-    async fn volatile_system_prompt_context_never_changes_the_pool_lifecycle_key() {
-        use super::{
-            append_volatile_system_prompt, direct_chat_stream_request, subscription_lifecycle_key,
-        };
-        let cwd = std::env::temp_dir();
-        let turn = lifecycle_test_turn(&cwd);
-        let mut request = direct_chat_stream_request(&turn, true, "");
-        let key = subscription_lifecycle_key(&turn, &request, turn.permission_mode);
-        assert!(!request.system_prompt.contains("usage: 5-hour"));
-        append_volatile_system_prompt(&mut request, &turn);
-        assert!(
-            request
-                .system_prompt
-                .ends_with("extension context\n\nusage: 5-hour 65% left"),
-            "a fresh process still receives the volatile context"
-        );
-
-        // A refreshed usage snapshot must append to the same pooled process
-        // instead of replacing it and replaying the canonical journal.
-        let mut refreshed = turn.clone();
-        refreshed.volatile_system_prompt_appendix = "usage: 5-hour 40% left".to_string();
-        let refreshed_request = direct_chat_stream_request(&refreshed, true, "");
-        assert_eq!(
-            subscription_lifecycle_key(&refreshed, &refreshed_request, refreshed.permission_mode),
-            key
-        );
-
-        // Stable runtime context still needs a fresh process.
-        let mut reconfigured = turn.clone();
-        reconfigured.system_prompt_appendix = "different extension context".to_string();
-        let reconfigured_request = direct_chat_stream_request(&reconfigured, true, "");
-        assert_ne!(
-            subscription_lifecycle_key(
-                &reconfigured,
-                &reconfigured_request,
-                reconfigured.permission_mode
-            ),
-            key
-        );
-    }
-
-    #[test]
-    fn delta_only_claude_turn_refuses_a_fresh_pooled_process() {
-        use super::claude_delta_needs_replay;
-        use crate::CodingProvider;
-        // Reuse assumed by the session but the pool could not append.
-        assert!(claude_delta_needs_replay(
-            CodingProvider::Claude,
-            false,
-            Some("s"),
-            "delta",
-            "delta"
-        ));
-        // A healthy append is fine.
-        assert!(!claude_delta_needs_replay(
-            CodingProvider::Claude,
-            true,
-            Some("s"),
-            "delta",
-            "delta"
-        ));
-        // A cold turn already carries the full replay.
-        assert!(!claude_delta_needs_replay(
-            CodingProvider::Claude,
-            false,
-            None,
-            "replay+delta",
-            "delta"
-        ));
-        assert!(!claude_delta_needs_replay(
-            CodingProvider::Claude,
-            false,
-            Some("s"),
-            "replay+delta",
-            "delta"
-        ));
-        // Codex resumes from its own durable checkpoint instead.
-        assert!(!claude_delta_needs_replay(
-            CodingProvider::Codex,
-            false,
-            Some("s"),
-            "delta",
-            "delta"
-        ));
     }
 
     use super::*;
@@ -3541,237 +2899,6 @@ mod tests {
         assert_eq!(snapshot.workflows[0].extension_id, "reloaded");
     }
 
-    #[tokio::test]
-    async fn subscription_pool_replays_after_failure_and_appends_only_when_healthy() {
-        let registry = SubscriptionPoolRegistry::default();
-        let session_id = Uuid::new_v4();
-        let first = registry
-            .prepare(
-                session_id,
-                SubscriptionTurnInput {
-                    context_generation: 0,
-                    provider: CodingProvider::Claude,
-                    prompt: "canonical history + first".to_string(),
-                    prompt_delta: "<borg-message>first</borg-message>".to_string(),
-                    lifecycle_key: "stable-config".to_string(),
-                },
-            )
-            .await;
-        assert_eq!(first.prompt, "canonical history + first");
-        registry
-            .mark(session_id, CodingProvider::Claude, true)
-            .await;
-
-        let appended = registry
-            .prepare(
-                session_id,
-                SubscriptionTurnInput {
-                    context_generation: 0,
-                    provider: CodingProvider::Claude,
-                    prompt: "canonical history + first + second".to_string(),
-                    prompt_delta: "<borg-message>second</borg-message>".to_string(),
-                    lifecycle_key: "stable-config".to_string(),
-                },
-            )
-            .await;
-        assert_eq!(appended.prompt, "<borg-message>second</borg-message>");
-
-        registry
-            .mark(session_id, CodingProvider::Claude, false)
-            .await;
-        let replay = registry
-            .prepare(
-                session_id,
-                SubscriptionTurnInput {
-                    context_generation: 0,
-                    provider: CodingProvider::Claude,
-                    prompt: "canonical history + first + second + third".to_string(),
-                    prompt_delta: "<borg-message>third</borg-message>".to_string(),
-                    lifecycle_key: "stable-config".to_string(),
-                },
-            )
-            .await;
-        assert_eq!(replay.prompt, "canonical history + first + second + third");
-        assert_ne!(appended.lifecycle_key, replay.lifecycle_key);
-    }
-
-    #[tokio::test]
-    async fn idle_claude_pools_are_bounded_and_evicted_sessions_replay() {
-        let registry = SubscriptionPoolRegistry::default();
-        let mut sessions = Vec::new();
-        for _ in 0..=MAX_IDLE_CLAUDE_POOLS {
-            let session_id = Uuid::new_v4();
-            registry
-                .prepare(
-                    session_id,
-                    SubscriptionTurnInput {
-                        context_generation: 0,
-                        provider: CodingProvider::Claude,
-                        prompt: "canonical history + first".to_string(),
-                        prompt_delta: "first".to_string(),
-                        lifecycle_key: "stable-config".to_string(),
-                    },
-                )
-                .await;
-            registry
-                .mark(session_id, CodingProvider::Claude, true)
-                .await;
-            sessions.push(session_id);
-        }
-
-        let slots = registry.slots.lock().await;
-        assert_eq!(slots.len(), MAX_IDLE_CLAUDE_POOLS);
-        assert!(!slots.contains_key(&sessions[0]));
-        drop(slots);
-
-        let replay = registry
-            .prepare(
-                sessions[0],
-                SubscriptionTurnInput {
-                    context_generation: 0,
-                    provider: CodingProvider::Claude,
-                    prompt: "canonical history + second".to_string(),
-                    prompt_delta: "second".to_string(),
-                    lifecycle_key: "stable-config".to_string(),
-                },
-            )
-            .await;
-        assert!(!replay.reused);
-        assert_eq!(replay.prompt, "canonical history + second");
-    }
-
-    #[tokio::test]
-    async fn host_eviction_replays_before_the_owner_reaper_runs() {
-        let directory = tempfile::tempdir().unwrap();
-        let first = SubscriptionPoolRegistry {
-            host_registry: Some(Arc::new(HostClaudePoolRegistry::new(
-                directory.path().to_path_buf(),
-            ))),
-            ..SubscriptionPoolRegistry::default()
-        };
-        let second = SubscriptionPoolRegistry {
-            host_registry: Some(Arc::new(HostClaudePoolRegistry::new(
-                directory.path().to_path_buf(),
-            ))),
-            ..SubscriptionPoolRegistry::default()
-        };
-        let first_session = Uuid::new_v4();
-        first
-            .prepare(
-                first_session,
-                SubscriptionTurnInput {
-                    context_generation: 0,
-                    provider: CodingProvider::Claude,
-                    prompt: "canonical history + first".to_string(),
-                    prompt_delta: "first".to_string(),
-                    lifecycle_key: "stable-config".to_string(),
-                },
-            )
-            .await;
-        first
-            .mark(first_session, CodingProvider::Claude, true)
-            .await;
-        for _ in 0..MAX_IDLE_CLAUDE_POOLS {
-            let session_id = Uuid::new_v4();
-            second
-                .prepare(
-                    session_id,
-                    SubscriptionTurnInput {
-                        context_generation: 0,
-                        provider: CodingProvider::Claude,
-                        prompt: "first".to_string(),
-                        prompt_delta: "first".to_string(),
-                        lifecycle_key: "stable-config".to_string(),
-                    },
-                )
-                .await;
-            second.mark(session_id, CodingProvider::Claude, true).await;
-        }
-
-        let replay = first
-            .prepare(
-                first_session,
-                SubscriptionTurnInput {
-                    context_generation: 0,
-                    provider: CodingProvider::Claude,
-                    prompt: "canonical history + second".to_string(),
-                    prompt_delta: "second".to_string(),
-                    lifecycle_key: "stable-config".to_string(),
-                },
-            )
-            .await;
-        assert!(!replay.reused);
-        assert_eq!(replay.prompt, "canonical history + second");
-    }
-
-    #[tokio::test]
-    async fn unavailable_host_lease_discards_the_idle_claude_pool() {
-        let directory = tempfile::tempdir().unwrap();
-        let blocked = directory.path().join("not-a-directory");
-        std::fs::write(&blocked, b"blocked").unwrap();
-        let registry = SubscriptionPoolRegistry {
-            host_registry: Some(Arc::new(HostClaudePoolRegistry::new(blocked))),
-            ..SubscriptionPoolRegistry::default()
-        };
-        let session_id = Uuid::new_v4();
-        registry
-            .prepare(
-                session_id,
-                SubscriptionTurnInput {
-                    context_generation: 0,
-                    provider: CodingProvider::Claude,
-                    prompt: "first".to_string(),
-                    prompt_delta: "first".to_string(),
-                    lifecycle_key: "stable-config".to_string(),
-                },
-            )
-            .await;
-        registry
-            .mark(session_id, CodingProvider::Claude, true)
-            .await;
-        assert!(!registry.slots.lock().await[&session_id].healthy);
-    }
-
-    #[tokio::test]
-    async fn pending_steer_acknowledgement_does_not_block_interrupt() {
-        let (control_tx, control_rx) = mpsc::channel(4);
-        let interrupted = Arc::new(AtomicBool::new(false));
-        let mut provider_controls =
-            map_controls(Some(control_rx), Arc::clone(&interrupted)).expect("mapped controls");
-        let (ack, acknowledgement) = tokio::sync::oneshot::channel();
-        let admission = SteerAdmission::pending();
-
-        control_tx
-            .send(AgentTurnControl::Steer {
-                message_id: Uuid::new_v4(),
-                text: "additional context".to_string(),
-                attachments: Vec::new(),
-                admission,
-                preempt: true,
-                human: true,
-                ack,
-            })
-            .await
-            .unwrap();
-        let provider_ack = match provider_controls.recv().await {
-            Some(ChatStreamControl::Steer { admission, ack, .. }) => {
-                assert!(admission.accept());
-                ack
-            }
-            other => panic!("expected provider steer, got {other:?}"),
-        };
-
-        control_tx.send(AgentTurnControl::Interrupt).await.unwrap();
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(1), provider_controls.recv()).await,
-            Ok(Some(ChatStreamControl::Interrupt))
-        ));
-        assert!(interrupted.load(Ordering::Acquire));
-
-        provider_ack.send(Ok(())).unwrap();
-        assert!(matches!(acknowledgement.await, Ok(Ok(()))));
-    }
-
     #[test]
     fn transient_codex_telemetry_does_not_enter_the_durable_session_stream() {
         for kind in [
@@ -4030,28 +3157,27 @@ mod tests {
     #[test]
     fn terminal_result_completes_the_current_segment_after_narration() {
         assert_eq!(
-            terminal_assistant_text("aggregate response", "partial response", true, false).unwrap(),
+            terminal_assistant_text("aggregate response", "partial response", true).unwrap(),
             Some("partial response".to_string())
         );
         assert_eq!(
-            terminal_assistant_text("aggregate response", "", true, false).unwrap(),
+            terminal_assistant_text("aggregate response", "", true).unwrap(),
             None
         );
         assert_eq!(
-            terminal_assistant_text("final response", "partial response", false, false).unwrap(),
+            terminal_assistant_text("final response", "partial response", false).unwrap(),
             Some("final response".to_string())
         );
         assert_eq!(
-            terminal_assistant_text("", "partial response", false, false).unwrap(),
+            terminal_assistant_text("", "partial response", false).unwrap(),
             Some("partial response".to_string())
         );
         assert_eq!(
-            terminal_assistant_text("", "", false, false)
+            terminal_assistant_text("", "", false)
                 .unwrap_err()
                 .to_string(),
             "provider completed without a visible response (empty result)"
         );
-        assert_eq!(terminal_assistant_text("", "", false, true).unwrap(), None);
     }
 }
 
