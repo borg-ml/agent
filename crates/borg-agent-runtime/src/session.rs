@@ -2181,7 +2181,6 @@ pub(crate) async fn run_agent_session_with_store_and_writer_and_team(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Compact the native conversation now and journal the boundary, as the
 /// automatic compaction before a turn does. Returns whether it compacted; a
 /// failure is journaled and the history is kept whole.
@@ -2392,6 +2391,7 @@ async fn compact_native_context_now(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_before_compaction_hook(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
