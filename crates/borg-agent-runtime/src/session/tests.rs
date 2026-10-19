@@ -10,6 +10,12 @@ use borg_provider::ProviderCallUsage;
 
 use super::*;
 
+/// How long a test waits for something that must happen. A hang guard, not a
+/// latency budget: a positive wait returns as soon as the event arrives, and
+/// the full suite runs in parallel on loaded machines where a session actor can
+/// take seconds to start.
+const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A real, decodable PNG.
 ///
 /// Image attachments are decoded before they reach a provider now, so a
@@ -767,7 +773,7 @@ async fn aborting_session_cancels_its_provider_turn_and_action_heartbeat() {
         )
         .await
     });
-    tokio::time::timeout(Duration::from_secs(5), started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, started.notified())
         .await
         .unwrap();
     let before = postgres
@@ -778,7 +784,7 @@ async fn aborting_session_cancels_its_provider_turn_and_action_heartbeat() {
     assert!(before.lease_token.is_some());
     actor.abort();
     assert!(actor.await.unwrap_err().is_cancelled());
-    tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, dropped.notified())
         .await
         .expect("aborting the actor must also drop its pending provider execution");
     assert!(
@@ -936,7 +942,7 @@ async fn session_generation_waits_on_silence_and_resumes_without_exposing_fragme
         .send(HostCommand::Stop { session_id })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), actor)
+    tokio::time::timeout(EVENT_TIMEOUT, actor)
         .await
         .unwrap()
         .unwrap()
@@ -1562,7 +1568,7 @@ async fn pending_prompt_admission_does_not_wait_for_workspace_repair() {
     );
     assert_eq!(*blocked_repair, 0);
     drop(blocked_repair);
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(EVENT_TIMEOUT, async {
         while *projection.projected_sequence.lock().await < queued.sequence {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -2942,7 +2948,7 @@ async fn empty_provider_response_retries_without_losing_user_prompt() {
     let mut completed = 0;
     let mut retry_error_was_rendered = false;
     while completed < 2 {
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("automatic retry is bounded")
             .expect("session remains attached");
@@ -3062,7 +3068,7 @@ async fn usage_limited_prompt_resumes_automatically_after_the_retry_delay() {
 
     let mut completions = 0;
     while completions < 2 {
-        let event = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("usage-limit retry completes")
             .expect("session remains attached");
@@ -3182,7 +3188,7 @@ async fn in_flight_usage_limit_does_not_park_a_new_route() {
                 .await
             }
         });
-        let (first, fail_first) = tokio::time::timeout(Duration::from_secs(5), turns.recv())
+        let (first, fail_first) = tokio::time::timeout(EVENT_TIMEOUT, turns.recv())
             .await
             .unwrap()
             .unwrap();
@@ -3211,7 +3217,7 @@ async fn in_flight_usage_limit_does_not_park_a_new_route() {
             })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(EVENT_TIMEOUT, async {
             while let Some(event) = event_rx.recv().await {
                 match event.kind {
                     SessionEventKind::SessionConfigured {
@@ -3243,7 +3249,7 @@ async fn in_flight_usage_limit_does_not_park_a_new_route() {
             .unwrap();
         fail_first.send(true).unwrap();
         next_turn_completion(&mut event_rx, "old route reports its usage limit").await;
-        let (retry, finish_retry) = tokio::time::timeout(Duration::from_secs(5), turns.recv())
+        let (retry, finish_retry) = tokio::time::timeout(EVENT_TIMEOUT, turns.recv())
             .await
             .expect("new route must not inherit the old route's hour-long wait")
             .unwrap();
@@ -3252,7 +3258,7 @@ async fn in_flight_usage_limit_does_not_park_a_new_route() {
         assert_eq!(retry.effort.as_deref(), Some("high"));
         finish_retry.send(false).unwrap();
         next_turn_completion(&mut event_rx, "preserved work finishes on the new route").await;
-        let (fresh, finish_fresh) = tokio::time::timeout(Duration::from_secs(5), turns.recv())
+        let (fresh, finish_fresh) = tokio::time::timeout(EVENT_TIMEOUT, turns.recv())
             .await
             .expect("fresh director task is admitted without a usage wait")
             .unwrap();
@@ -3486,7 +3492,7 @@ async fn usage_limit_after_side_effects_continues_instead_of_replaying_the_promp
     let mut continuation_message_id = None;
     let mut checkpoint = None;
     while completions < 2 {
-        let Some(event) = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        let Some(event) = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("continuation turn completes")
         else {
@@ -3766,7 +3772,7 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
                     .await
                     .unwrap();
                 loop {
-                    let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                    let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
                         .await
                         .unwrap()
                         .unwrap();
@@ -3866,7 +3872,7 @@ async fn queued_retry_can_be_recalled_while_waiting_without_later_delivery() {
     });
 
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -3887,7 +3893,7 @@ async fn queued_retry_can_be_recalled_while_waiting_without_later_delivery() {
         .await
         .unwrap();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("idle retry recall is acknowledged")
             .unwrap();
@@ -3962,7 +3968,7 @@ async fn ready_is_emitted_only_after_all_queued_turn_events_are_complete() {
         .await
     });
 
-    tokio::time::timeout(Duration::from_secs(1), first_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, first_started.notified())
         .await
         .expect("first turn starts");
     command_tx
@@ -3979,7 +3985,7 @@ async fn ready_is_emitted_only_after_all_queued_turn_events_are_complete() {
 
     let mut observed = Vec::new();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("queued event arrives")
             .expect("session event stream remains open");
@@ -4005,7 +4011,7 @@ async fn ready_is_emitted_only_after_all_queued_turn_events_are_complete() {
         < 2
     {
         observed.push(
-            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
                 .await
                 .expect("turn event arrives")
                 .expect("session event stream remains open")
@@ -4014,7 +4020,7 @@ async fn ready_is_emitted_only_after_all_queued_turn_events_are_complete() {
     }
     // The first Ready may be preceded by the launch plan projection it settles.
     loop {
-        let kind = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        let kind = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("canonical ready event arrives")
             .expect("session event stream remains open")
@@ -4263,7 +4269,7 @@ async fn intermediate_narration_does_not_start_provider_drain_timeout() {
 
     let mut observed = Vec::new();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("delayed consultation remains live");
         let Some(event) = event else {
@@ -4352,7 +4358,7 @@ async fn executor_ready_has_a_bounded_provider_drain() {
 
     let mut observed = Vec::new();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("provider drain timeout is bounded")
             .expect("session remains attached");
@@ -4476,7 +4482,7 @@ async fn idle_immediate_input_is_persisted_as_queue_before_turn_admission() {
 
     let mut in_progress_delivery = None;
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("idle prompt reaches a terminal turn boundary")
             .expect("session remains attached");
@@ -4576,7 +4582,7 @@ async fn stopping_an_active_turn_marks_its_prompt_failed() {
         .await
         .unwrap();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("prompt enters the active turn")
             .expect("session remains open");
@@ -4735,7 +4741,7 @@ async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
         .send(HostCommand::Stop { session_id })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), actor)
+    tokio::time::timeout(EVENT_TIMEOUT, actor)
         .await
         .expect("detached projection cannot wedge the actor")
         .unwrap()
@@ -4820,7 +4826,7 @@ async fn all_queued_prompts_can_be_recalled_at_the_turn_completion_boundary() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), first_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, first_started.notified())
         .await
         .expect("first turn starts");
     for (message_id, text) in queued_message_ids
@@ -4841,7 +4847,7 @@ async fn all_queued_prompts_can_be_recalled_at_the_turn_completion_boundary() {
     }
     let mut queued = Vec::new();
     while queued.len() < queued_message_ids.len() {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("queued event arrives")
             .expect("session event stream remains open");
@@ -4867,7 +4873,7 @@ async fn all_queued_prompts_can_be_recalled_at_the_turn_completion_boundary() {
         .unwrap();
     let mut recalled = Vec::new();
     while recalled.len() < queued_message_ids.len() {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("recall event arrives")
             .expect("session event stream remains open");
@@ -4990,7 +4996,7 @@ async fn recalled_queue_prompt_is_not_started_after_the_pre_turn_handoff() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), first_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, first_started.notified())
         .await
         .expect("first turn starts");
     command_tx
@@ -5004,12 +5010,12 @@ async fn recalled_queue_prompt_is_not_started_after_the_pre_turn_handoff() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), queued_ready.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, queued_ready.notified())
         .await
         .expect("queued prompt is durable before the turn ends");
     release_first.notify_one();
 
-    tokio::time::timeout(Duration::from_secs(1), handoff_ready.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, handoff_ready.notified())
         .await
         .expect("queued prompt reaches the pre-turn handoff");
     command_tx
@@ -5020,7 +5026,7 @@ async fn recalled_queue_prompt_is_not_started_after_the_pre_turn_handoff() {
         .await
         .unwrap();
     release_handoff.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), recalled_seen.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, recalled_seen.notified())
         .await
         .expect("recall is durable before provider admission");
 
@@ -5121,7 +5127,7 @@ async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() 
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), first_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, first_started.notified())
         .await
         .expect("first turn starts");
 
@@ -5140,7 +5146,7 @@ async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() 
     }
     let mut queued = Vec::new();
     while queued.len() < queued_message_ids.len() {
-        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("queued event arrives")
             .expect("session event stream remains open");
@@ -5158,7 +5164,7 @@ async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() 
     // Releasing the first turn must batch all queue-mode prompts at the
     // natural boundary. They are one provider input, in FIFO text order.
     release_first.notify_one();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(EVENT_TIMEOUT, async {
         loop {
             if turns.lock().unwrap().len() == 2 {
                 break;
@@ -5293,7 +5299,7 @@ async fn assert_interrupted_fifo(
             .await
             .unwrap();
     }
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .expect("first turn starts");
     command_tx
@@ -5304,7 +5310,7 @@ async fn assert_interrupted_fifo(
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .expect("queued turn starts after interruption");
     command_tx
@@ -5502,7 +5508,7 @@ async fn legacy_user_stop_does_not_block_background_wake_after_actor_restart() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .expect("legacy stop replay must not block a background wake");
     command_tx
@@ -5592,7 +5598,7 @@ async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, started.notified())
         .await
         .expect("provider starts");
     while event_rx.try_recv().is_ok() {}
@@ -5607,7 +5613,7 @@ async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
 
     let mut before_cleanup = Vec::new();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("cancelling is visible while cleanup remains blocked")
             .expect("session remains open");
@@ -5641,7 +5647,7 @@ async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
     release_cleanup.notify_one();
     let mut saw_turn_completed = false;
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("terminal event after cleanup")
             .expect("session remains open");
@@ -5759,7 +5765,7 @@ async fn an_unresponsive_cleanup_answers_escape_on_a_human_bound() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, started.notified())
         .await
         .expect("provider starts");
 
@@ -5768,7 +5774,7 @@ async fn an_unresponsive_cleanup_answers_escape_on_a_human_bound() {
         .send(HostCommand::Interrupt { session_id })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), cleanup_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, cleanup_started.notified())
         .await
         .expect("interrupt enters provider cleanup");
 
@@ -5801,7 +5807,7 @@ async fn an_unresponsive_cleanup_answers_escape_on_a_human_bound() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, started.notified())
         .await
         .expect("a successor turn still starts after an unresponsive cleanup");
 
@@ -6016,7 +6022,7 @@ async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
         .await
         .expect("first turn starts");
     let image = PathBuf::from("/tmp/steered-image.png");
@@ -6031,10 +6037,10 @@ async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), steer_seen.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, steer_seen.notified())
         .await
         .expect("provider receives the multimodal steer");
-    tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
         .await
         .expect("rejected steer starts as the next queued turn");
     command_tx
@@ -6130,7 +6136,7 @@ async fn assert_native_steer_settlement(marker_first: bool, fold: bool) {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
         .await
         .expect("first turn starts");
     command_tx
@@ -6144,7 +6150,7 @@ async fn assert_native_steer_settlement(marker_first: bool, fold: bool) {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), steer_handled.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, steer_handled.notified())
         .await
         .expect("provider handles the steer");
     command_tx
@@ -6155,7 +6161,7 @@ async fn assert_native_steer_settlement(marker_first: bool, fold: bool) {
         // The requeued steer opens the next turn on its own. Waiting for that
         // turn rather than stopping into it is what makes "delivered, not
         // lost" an observation instead of a race.
-        tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
+        tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
             .await
             .expect("the requeued steer is delivered on the next turn");
     }
@@ -6412,7 +6418,7 @@ async fn accepted_codex_steer_is_settled_before_turn_is_interrupted() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
         .await
         .expect("first turn starts");
     command_tx
@@ -6426,7 +6432,7 @@ async fn accepted_codex_steer_is_settled_before_turn_is_interrupted() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), steer_accepted.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, steer_accepted.notified())
         .await
         .expect("provider accepts steer transport");
 
@@ -6436,7 +6442,7 @@ async fn accepted_codex_steer_is_settled_before_turn_is_interrupted() {
         .await
         .unwrap();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("interrupted steer status arrives")
             .expect("session remains open");
@@ -6537,7 +6543,7 @@ async fn accepted_claude_steer_is_settled_before_turn_is_interrupted() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
         .await
         .expect("first turn starts");
     command_tx
@@ -6551,7 +6557,7 @@ async fn accepted_claude_steer_is_settled_before_turn_is_interrupted() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), steer_accepted.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, steer_accepted.notified())
         .await
         .expect("Claude accepts steer transport");
 
@@ -6561,7 +6567,7 @@ async fn accepted_claude_steer_is_settled_before_turn_is_interrupted() {
         .await
         .unwrap();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("interrupted Claude steer status arrives")
             .expect("session remains open");
@@ -6666,7 +6672,7 @@ async fn rejected_codex_steer_retries_at_the_next_tool_boundary() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
         .await
         .expect("first turn starts");
     command_tx
@@ -6680,7 +6686,7 @@ async fn rejected_codex_steer_retries_at_the_next_tool_boundary() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), first_attempt_rejected.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, first_attempt_rejected.notified())
         .await
         .expect("first steer attempt is rejected");
 
@@ -6705,7 +6711,7 @@ async fn rejected_codex_steer_retries_at_the_next_tool_boundary() {
     );
 
     release_tool_boundary.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), retry_accepted.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, retry_accepted.notified())
         .await
         .expect("steer retries when the tool completes");
     command_tx
@@ -6713,7 +6719,7 @@ async fn rejected_codex_steer_retries_at_the_next_tool_boundary() {
         .await
         .unwrap();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("interrupted retry event arrives")
             .expect("session remains open");
@@ -6773,7 +6779,7 @@ async fn compaction_defers_steers_preserves_next_attachments_and_respects_stop()
         }
     }
     async fn next<T>(rx: &mut mpsc::Receiver<T>) -> T {
-        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        tokio::time::timeout(EVENT_TIMEOUT, rx.recv())
             .await
             .expect("session makes progress")
             .expect("channel remains open")
@@ -7047,7 +7053,7 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
         .await
         .expect("first turn starts");
     let followup_id = Uuid::new_v4();
@@ -7062,7 +7068,7 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), steer_seen.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, steer_seen.notified())
         .await
         .expect("provider receives steer");
     let mut transitions = Vec::new();
@@ -7071,11 +7077,11 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
         .send(HostCommand::Interrupt { session_id })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
         .await
         .expect("unacknowledged steer falls back to the FIFO");
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("the FIFO turn reaches a terminal boundary")
             .expect("session remains open");
@@ -7194,7 +7200,7 @@ async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
             })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), turn_started.notified())
+        tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
             .await
             .expect("first turn starts");
 
@@ -7218,7 +7224,7 @@ async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
                 .await
                 .unwrap();
         }
-        tokio::time::timeout(Duration::from_secs(10), steer_seen.notified())
+        tokio::time::timeout(EVENT_TIMEOUT, steer_seen.notified())
             .await
             .expect("provider has received the unacknowledged steer");
 
@@ -7237,7 +7243,7 @@ async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
         };
         let mut seen = Vec::new();
         while !expected.is_empty() {
-            let event = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+            let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
                 .await
                 .unwrap_or_else(|_| {
                     panic!(
@@ -7874,11 +7880,11 @@ async fn durably_preadmitted_prompt_executes_once_after_actor_handoff() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .expect("preadmitted prompt reaches the executor");
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("preadmitted prompt completes")
             .expect("session remains open");
@@ -8071,7 +8077,7 @@ async fn an_autonomy_job_runs_through_the_session_turn_boundary() {
         }
     });
 
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(EVENT_TIMEOUT, async {
         loop {
             if autonomy
                 .get(job.job_id)
@@ -8163,7 +8169,7 @@ async fn a_blu_workflow_job_runs_without_blocking_the_session_actor() {
         }
     });
 
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(EVENT_TIMEOUT, async {
         loop {
             if autonomy
                 .get(job.job_id)
@@ -8451,7 +8457,7 @@ async fn initial_mixed_provider_peer_starts_with_isolated_provider_configuration
         .await
     });
 
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(EVENT_TIMEOUT, async {
         loop {
             if seen.lock().unwrap().len() >= 2 {
                 break;
@@ -8548,7 +8554,7 @@ async fn model_consultation_dispatches_a_freeform_briefing_to_an_isolated_provid
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .expect("main executor received the consultation result");
 
@@ -8660,7 +8666,7 @@ async fn resuming_an_idle_goal_emits_starting_before_running() {
     });
 
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("idle session reaches Ready");
         let Some(event) = event else {
@@ -8688,7 +8694,7 @@ async fn resuming_an_idle_goal_emits_starting_before_running() {
 
     let mut statuses = Vec::new();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("resumed goal starts a turn")
             .expect("session event stream remains open");
@@ -8803,7 +8809,7 @@ async fn resuming_a_goal_mid_turn_activates_the_goal() {
 
     // The pre-stop prompt opens a turn that the hung executor never finishes.
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("the queued prompt starts a turn")
             .expect("session event stream remains open");
@@ -8826,7 +8832,7 @@ async fn resuming_a_goal_mid_turn_activates_the_goal() {
         .await
         .unwrap();
 
-    let resumed = tokio::time::timeout(Duration::from_secs(2), async {
+    let resumed = tokio::time::timeout(EVENT_TIMEOUT, async {
         loop {
             let Some(event) = event_rx.recv().await else {
                 panic!("session event stream closed before the goal resumed");
@@ -8994,7 +9000,7 @@ async fn fresh_human_input_resumes_a_parked_goal_only_when_opted_in() {
                 }
             }
         }).await.expect("fresh prompt is admitted");
-            let state = tokio::time::timeout(Duration::from_secs(5), async {
+            let state = tokio::time::timeout(EVENT_TIMEOUT, async {
                 loop {
                     let state = store.state(session_id).await.unwrap();
                     if !resumes
@@ -10701,7 +10707,7 @@ async fn resumed_session_drains_unresolved_input_and_preserves_last_context_usag
         }
     });
 
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(EVENT_TIMEOUT, async {
         loop {
             let event = event_rx.recv().await.expect("session remains live");
             if matches!(
@@ -10746,7 +10752,7 @@ async fn resumed_session_drains_unresolved_input_and_preserves_last_context_usag
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(EVENT_TIMEOUT, async {
         loop {
             let event = event_rx.recv().await.expect("session remains live");
             if matches!(
@@ -11289,7 +11295,7 @@ async fn a_resumed_turn_that_hits_a_usage_limit_checkpoints_as_a_continuation() 
 
     let mut checkpoint = None;
     while checkpoint.is_none() {
-        let Some(event) = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+        let Some(event) = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("the resumed turn checkpoints when it hits the usage limit")
         else {
@@ -14180,7 +14186,7 @@ async fn reusable_subscription_pool_does_not_compact_large_durable_replay() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .expect("first pooled turn completes");
 
@@ -14198,7 +14204,7 @@ async fn reusable_subscription_pool_does_not_compact_large_durable_replay() {
 
     let mut provider_input_compacted = false;
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("second pooled turn remains live")
             .expect("session remains open");
@@ -14292,7 +14298,7 @@ async fn resumed_provider_turn_receives_team_messages_that_wake_an_idle_root() {
     let mut wait_for = async |mut done: Box<dyn FnMut(&SessionEventKind) -> bool>| {
         let mut prompts = Vec::new();
         loop {
-            let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
                 .await
                 .expect("session makes progress")
                 .expect("session remains open");
@@ -14628,7 +14634,7 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .expect("resumed turn starts without compaction");
     command_tx
@@ -14793,7 +14799,7 @@ async fn crash_resume_forks_the_last_completed_codex_turn_before_replaying_input
         .await
     });
 
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .expect("recovered turn starts from the provider checkpoint");
     command_tx
@@ -15002,7 +15008,7 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
         .await
     });
 
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .expect("recovered turn starts without another compaction");
     command_tx
@@ -15099,7 +15105,7 @@ async fn acknowledged_codex_escape_does_not_compact_a_reusable_large_context() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .expect("large first turn starts");
 
@@ -15114,7 +15120,7 @@ async fn acknowledged_codex_escape_does_not_compact_a_reusable_large_context() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .expect("interruptible turn starts");
     command_tx
@@ -15123,7 +15129,7 @@ async fn acknowledged_codex_escape_does_not_compact_a_reusable_large_context() {
         .unwrap();
 
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("interrupted turn reaches its durable boundary")
             .expect("session remains attached");
@@ -15147,7 +15153,7 @@ async fn acknowledged_codex_escape_does_not_compact_a_reusable_large_context() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .expect("corrected turn starts without compaction");
 
@@ -15327,7 +15333,7 @@ async fn borg_tool_approvals_route_and_cancel_without_provider_controls() {
             .await
         });
         let (approval_id, request_event) = loop {
-            let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -15380,7 +15386,7 @@ async fn borg_tool_approvals_route_and_cancel_without_provider_controls() {
                 .await
                 .unwrap();
             assert!(
-                tokio::time::timeout(Duration::from_secs(5), receipt)
+                tokio::time::timeout(EVENT_TIMEOUT, receipt)
                     .await
                     .unwrap()
                     .unwrap()
@@ -15428,7 +15434,7 @@ async fn borg_tool_approvals_route_and_cancel_without_provider_controls() {
         }
         let mut resolved = false;
         loop {
-            let event = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+            let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -16761,7 +16767,7 @@ async fn monitor_event_wakes_an_idle_session_without_an_active_goal() {
 
     let mut completions = 0;
     while completions < 2 {
-        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("watch notification wakes idle agent")
             .expect("session remains attached");
@@ -16950,7 +16956,7 @@ async fn native_connection_retries_preserve_work_without_repeating_admitted_inpu
     });
     let mut completed = Vec::new();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("native retries settle")
             .expect("session remains attached");
@@ -17057,7 +17063,7 @@ async fn connection_retry_with_queued_followup_continues_completed_work() {
 
     let mut completed = HashSet::new();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("batched connection retry completes")
             .expect("session remains attached");
@@ -17155,7 +17161,7 @@ async fn escape_cancels_connection_retry_without_losing_the_prompt() {
     });
 
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -17412,13 +17418,13 @@ async fn imported_relay_message_wakes_the_actor_as_system_provenance() {
 
     // The actor owns its own coordinator, so the durable root inbox tick is
     // what discovers the imported delivery. No host command is involved.
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .expect("the imported relay message reaches the provider");
 
     let mut observed_statuses = Vec::new();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("the imported relay turn completes")
             .expect("session remains attached");
@@ -18816,7 +18822,7 @@ impl AgentTurnExecutor for TurnEndsWithSteerInFlightExecutor {
         // Take the steer and end the turn without acknowledging it. Dropping
         // `ack` is exactly what a provider process does when its turn finishes
         // before the steer is merged.
-        match tokio::time::timeout(Duration::from_secs(5), controls.recv()).await {
+        match tokio::time::timeout(EVENT_TIMEOUT, controls.recv()).await {
             Ok(Some(AgentTurnControl::Steer { ack, .. })) => {
                 drop(ack);
                 self.steer_taken.notify_one();
@@ -18892,7 +18898,7 @@ async fn steer_in_flight_when_the_turn_ends_starts_a_new_turn() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), first_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, first_started.notified())
         .await
         .expect("the first turn starts");
 
@@ -18907,13 +18913,13 @@ async fn steer_in_flight_when_the_turn_ends_starts_a_new_turn() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), steer_taken.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, steer_taken.notified())
         .await
         .expect("the provider takes the steer");
 
     // The steer was never acknowledged, so it must be promoted into a new turn
     // instead of sitting in `pending_steers` while the session goes ready.
-    tokio::time::timeout(Duration::from_secs(5), second_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, second_started.notified())
         .await
         .expect("an unacknowledged steer starts a new turn instead of being dropped");
 
@@ -19825,7 +19831,7 @@ async fn assert_watcher_yield_blocks_automatic_turns(queue_reports: bool) {
             })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(EVENT_TIMEOUT, async {
             while let Some(event) = event_rx.recv().await {
                 if matches!(event.kind, SessionEventKind::Message { message_id, status: MessageStatus::Complete, .. } if message_id == late_report) {
                     break;
@@ -20351,12 +20357,12 @@ async fn assert_immediate_interrupt(control_backlog: usize) {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, started.notified())
         .await
         .expect("the silent turn starts");
 
     if control_backlog > 0 {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(EVENT_TIMEOUT, async {
             let full = saturated.notified();
             tokio::pin!(full);
             for i in 0..128 {
@@ -20398,7 +20404,7 @@ async fn assert_immediate_interrupt(control_backlog: usize) {
     let mut saw_turn_completed = false;
     let mut saw_failed_prompt = false;
     while boundary_at.is_none() {
-        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("a silent provider still reaches a terminal boundary")
             .expect("session remains open");
@@ -20602,7 +20608,7 @@ async fn child_activity_after_a_lag_survives_an_untracked_descendant() {
             ),
         })
         .unwrap();
-    let ready = tokio::time::timeout(Duration::from_secs(10), async {
+    let ready = tokio::time::timeout(EVENT_TIMEOUT, async {
         while let Some(activity) = forwarded_rx.recv().await {
             if let SubagentActivity::SessionEvent { event, .. } = activity
                 && event.session_id == child
@@ -20849,7 +20855,7 @@ async fn a_human_steer_ends_a_blocking_wait_agent() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
         .await
         .expect("turn starts");
     command_tx
@@ -20972,14 +20978,14 @@ async fn followup_after_interrupt_starts_another_turn() {
         delivery: PromptDelivery::Steer,
     };
     command_tx.send(team_prompt("first task")).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
         .await
         .expect("the first task runs");
     command_tx
         .send(HostCommand::Interrupt { session_id })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), cleanup_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, cleanup_started.notified())
         .await
         .expect("interruption enters cleanup");
     tokio::time::timeout(Duration::from_secs(5), turn_dropped.notified())
@@ -20997,7 +21003,7 @@ async fn followup_after_interrupt_starts_another_turn() {
         "the follow-up cannot execute while cleanup is blocked"
     );
     release_cleanup.notify_one();
-    tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
         .await
         .expect("the interrupting parent's follow-up starts a turn");
     assert_eq!(executor.cleanup_calls.load(Ordering::Acquire), 1);
@@ -21076,11 +21082,11 @@ async fn escape_keeps_a_prompt_the_model_already_acted_on_delivered() {
             })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), turn_started.notified())
+        tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
             .await
             .expect("turn starts");
         if emit_output {
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(EVENT_TIMEOUT, async {
                 while let Some(event) = event_rx.recv().await {
                     if matches!(
                         &event.kind,
@@ -21101,7 +21107,7 @@ async fn escape_keeps_a_prompt_the_model_already_acted_on_delivered() {
             .send(HostCommand::Interrupt { session_id })
             .await
             .unwrap();
-        let status = tokio::time::timeout(Duration::from_secs(10), async {
+        let status = tokio::time::timeout(EVENT_TIMEOUT, async {
             let mut status = None;
             while let Some(event) = event_rx.recv().await {
                 match event.kind {
@@ -21613,7 +21619,7 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .expect("resumed turn starts without compaction");
     command_tx
@@ -21627,7 +21633,7 @@ async fn native_context_checkpoint_reaches_resumed_turn_after_interruption() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .unwrap();
     command_tx
@@ -22008,7 +22014,7 @@ async fn private_workspace_plan_migrates_once_and_refreshes_while_idle_across_re
             )
             .await
         });
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(EVENT_TIMEOUT, async {
             loop {
                 let event = event_rx.recv().await.expect("actor ready event");
                 if matches!(
@@ -22053,7 +22059,7 @@ async fn private_workspace_plan_migrates_once_and_refreshes_while_idle_across_re
             )
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(EVENT_TIMEOUT, async {
             loop {
                 let event = event_rx.recv().await.expect("idle projection refresh");
                 if matches!(&event.kind, SessionEventKind::PlanProjected { items, .. } if items.len()==1 && items[0].status==status) { break; }
@@ -22465,7 +22471,7 @@ async fn viewer_resume_projects_work_without_granting_write_or_losing_deferred_l
         )
         .await
     });
-    let notice = tokio::time::timeout(Duration::from_secs(10), async {
+    let notice = tokio::time::timeout(EVENT_TIMEOUT, async {
         let mut notice = false;
         loop {
             let event = event_rx.recv().await.expect("viewer actor remains available");
@@ -22487,7 +22493,7 @@ async fn viewer_resume_projects_work_without_granting_write_or_losing_deferred_l
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(EVENT_TIMEOUT, async {
         loop {
             let event = event_rx.recv().await.expect("rejected command does not stop actor");
             if matches!(&event.kind, SessionEventKind::Error { message } if message.contains("Todo update rejected")) { break; }
@@ -22830,11 +22836,11 @@ async fn blocked_plan_collector_actor(update_plan: bool) {
         )
         .await
     });
-    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, entered.notified())
         .await
         .expect("real maintenance collector reaches its barrier");
     provider_release.notify_one();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(EVENT_TIMEOUT, async {
         let mut markers = HashSet::new();
         while markers.len() < 2 {
             let event = event_rx.recv().await.expect("actor remains available");
@@ -22858,7 +22864,7 @@ async fn blocked_plan_collector_actor(update_plan: bool) {
         2
     );
 
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(EVENT_TIMEOUT, async {
         loop {
             let event = event_rx.recv().await.expect("watchdog remains available");
             if matches!(&event.kind, SessionEventKind::StatusChanged { detail: Some(detail), .. }
@@ -22881,7 +22887,7 @@ async fn blocked_plan_collector_actor(update_plan: bool) {
             })
             .await
             .unwrap();
-        let (revision, sequence) = tokio::time::timeout(Duration::from_secs(5), async {
+        let (revision, sequence) = tokio::time::timeout(EVENT_TIMEOUT, async {
             loop {
                 let event = event_rx.recv().await.expect("direct plan update is served");
                 if let SessionEventKind::PlanProjected {
@@ -22910,7 +22916,7 @@ async fn blocked_plan_collector_actor(update_plan: bool) {
             .send(HostCommand::Interrupt { session_id })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(EVENT_TIMEOUT, async {
             loop {
                 let event = event_rx
                     .recv()
@@ -22929,7 +22935,7 @@ async fn blocked_plan_collector_actor(update_plan: bool) {
         })
         .await
         .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), next_entered.notified())
+        tokio::time::timeout(EVENT_TIMEOUT, next_entered.notified())
             .await
             .expect("stale collector was consumed and a fresh collection started");
         let later = store.events_after(session_id, sequence, 512).await.unwrap();
@@ -22945,7 +22951,7 @@ async fn blocked_plan_collector_actor(update_plan: bool) {
         .send(HostCommand::Stop { session_id })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), actor)
+    tokio::time::timeout(EVENT_TIMEOUT, actor)
         .await
         .expect("Stop is not queued behind the collector")
         .unwrap()
@@ -23119,7 +23125,7 @@ async fn peer_receipts_survive_disabled_subagents_stop_and_replay() {
                 .await
                 .unwrap();
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(EVENT_TIMEOUT, async {
             loop {
                 let event = event_rx
                     .recv()
@@ -23169,7 +23175,7 @@ async fn peer_receipts_survive_disabled_subagents_stop_and_replay() {
                 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(EVENT_TIMEOUT, async {
                 loop {
                     let event = event_rx.recv().await.unwrap();
                     if matches!(event.kind, SessionEventKind::TurnCompleted { .. }) {
@@ -23211,7 +23217,7 @@ async fn peer_receipts_survive_disabled_subagents_stop_and_replay() {
                 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(EVENT_TIMEOUT, async {
                 let mut received = false;
                 let mut completed = false;
                 while !received || !completed {
@@ -23246,7 +23252,7 @@ async fn peer_receipts_survive_disabled_subagents_stop_and_replay() {
             .send(HostCommand::Stop { session_id })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), actor)
+        tokio::time::timeout(EVENT_TIMEOUT, actor)
             .await
             .unwrap()
             .unwrap()
@@ -23279,7 +23285,7 @@ async fn team_harness_projection_repair_rearms_after_a_completed_pass() {
     let store: Arc<dyn SessionStore> = store;
     let mut task = None;
     start_workspace_projection_repair(&mut task, Some(&projection), &store, session_id);
-    tokio::time::timeout(Duration::from_secs(5), task.as_mut().unwrap())
+    tokio::time::timeout(EVENT_TIMEOUT, task.as_mut().unwrap())
         .await
         .unwrap()
         .unwrap();
@@ -23311,7 +23317,7 @@ async fn team_harness_projection_repair_rearms_after_a_completed_pass() {
         crate::DeliveryState::Pending
     );
     start_workspace_projection_repair(&mut task, Some(&projection), &store, session_id);
-    tokio::time::timeout(Duration::from_secs(5), task.as_mut().unwrap())
+    tokio::time::timeout(EVENT_TIMEOUT, task.as_mut().unwrap())
         .await
         .unwrap()
         .unwrap();
@@ -23352,7 +23358,7 @@ async fn team_harness_projection_repair_rearms_after_a_completed_pass() {
         .await
         .unwrap();
     start_workspace_projection_repair(&mut task, Some(&projection), &store, session_id);
-    tokio::time::timeout(Duration::from_secs(5), task.as_mut().unwrap())
+    tokio::time::timeout(EVENT_TIMEOUT, task.as_mut().unwrap())
         .await
         .unwrap()
         .unwrap();
@@ -23830,7 +23836,7 @@ async fn interrupt_during_completion_wait_preserves_the_next_turn() {
         .await
         .unwrap();
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), started.recv())
+        tokio::time::timeout(EVENT_TIMEOUT, started.recv())
             .await
             .unwrap(),
         Some(fresh)
@@ -24616,7 +24622,7 @@ async fn reverted_session_waits_for_a_message_before_continuing_its_goal() {
         }
     });
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("the reverted session settles");
         let Some(event) = event else {
@@ -24649,7 +24655,7 @@ async fn reverted_session_waits_for_a_message_before_continuing_its_goal() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
         .await
         .expect("the user's message starts the next turn");
     actor.abort();
@@ -24727,7 +24733,7 @@ async fn promote_moves_live_authority_and_restores_without_moving_session_state(
             .unwrap(),
         )
         .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(EVENT_TIMEOUT, async {
             loop {
                 if team.get(successor.session_id).await.unwrap().status
                     == crate::SubagentStatus::Ready
@@ -24753,7 +24759,7 @@ async fn promote_moves_live_authority_and_restores_without_moving_session_state(
                 .await
                 .unwrap();
             team.stop(&successor.task_name).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(EVENT_TIMEOUT, async {
                 while team.get(successor.session_id).await.unwrap().status
                     != crate::SubagentStatus::Stopped
                 {
@@ -25073,7 +25079,7 @@ async fn promote_moves_live_authority_and_restores_without_moving_session_state(
             Some("medium")
         );
         team.stop(&sibling.task_name).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(EVENT_TIMEOUT, async {
             while team.get(sibling.session_id).await.unwrap().status
                 != crate::SubagentStatus::Stopped
             {
@@ -25392,7 +25398,7 @@ async fn idle_session_compacts_once_before_its_prompt_cache_expires() {
         }
     });
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+        let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("the idle session compacts")
             .expect("session remains attached");
