@@ -1396,13 +1396,26 @@ pub async fn login_provider_with_output(
 ) -> Result<()> {
     #[cfg(feature = "subscription-adapters")]
     if provider == CodingProvider::Claude {
-        let authority = borg_provider::claude_subscription::AuthAuthority::resolve(None)?;
+        // Sign in to a Borg-owned login rather than Claude Code's: two
+        // programs refreshing one login invalidate each other's tokens. The
+        // selection is saved only once the sign-in succeeded, so an abandoned
+        // login leaves the working one in place.
+        let directory = match borg_provider::credentials::claude_subscription_config_dir()? {
+            Some(directory) => directory,
+            None => borg_provider::credentials::default_claude_subscription_config_dir()
+                .context("cannot locate a home directory for the Claude login")?,
+        };
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("create {}", directory.display()))?;
+        let authority =
+            borg_provider::claude_subscription::AuthAuthority::resolve(Some(&directory))?;
         let login = borg_provider::claude_subscription::begin_browser_login(authority).await?;
         on_output(&format!(
             "Open {} to connect your Claude subscription (expires in 10 minutes).",
             login.authorize_url()
         ));
         login.complete().await?;
+        borg_provider::credentials::set_claude_subscription_config_dir(&directory)?;
         if let Some(cache) = PROVIDER_CAPABILITIES_CACHE.get() {
             cache.lock().await.clear();
         }

@@ -180,8 +180,9 @@ pub fn set_openai_auth_mode(mode: OpenAiAuthMode) -> Result<PathBuf> {
     )
 }
 
-pub fn openai_subscription_auth_file() -> Result<Option<PathBuf>> {
-    if let Some(path) = crate::env::nonempty_var("BORG_OPENAI_AUTH_FILE") {
+/// A path setting: the environment variable wins, the store is the fallback.
+fn stored_path(env_var: &str, storage_key: &str) -> Result<Option<PathBuf>> {
+    if let Some(path) = crate::env::nonempty_var(env_var) {
         return Ok(Some(PathBuf::from(path)));
     }
     let Some(path) = credentials_path() else {
@@ -189,8 +190,30 @@ pub fn openai_subscription_auth_file() -> Result<Option<PathBuf>> {
     };
     Ok(read_credentials(&path)?
         .keys
-        .get("openai_subscription_auth_file")
+        .get(storage_key)
         .map(PathBuf::from))
+}
+
+pub fn openai_subscription_auth_file() -> Result<Option<PathBuf>> {
+    stored_path("BORG_OPENAI_AUTH_FILE", "openai_subscription_auth_file")
+}
+
+/// The Claude config directory Borg signs in to, when Borg owns one instead
+/// of sharing Claude Code's.
+pub fn claude_subscription_config_dir() -> Result<Option<PathBuf>> {
+    stored_path("BORG_CLAUDE_CONFIG_DIR", "claude_subscription_config_dir")
+}
+
+pub fn set_claude_subscription_config_dir(path: &Path) -> Result<PathBuf> {
+    store_value(
+        "claude_subscription_config_dir",
+        path.to_str().context("Claude config path must be UTF-8")?,
+    )
+}
+
+/// Where `borg login claude` keeps a Borg-owned Claude login.
+pub fn default_claude_subscription_config_dir() -> Option<PathBuf> {
+    credentials_dir().map(|dir| dir.join("claude"))
 }
 
 pub fn set_openai_subscription_auth_file(path: &Path) -> Result<PathBuf> {

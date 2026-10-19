@@ -67,7 +67,12 @@ impl AuthAuthority {
     }
 
     /// Default discovery only. Controllers should persist and reuse the returned selection.
+    /// A Borg-owned login selected with `borg login claude` comes first, so
+    /// Borg does not share (and race) Claude Code's refreshing credentials.
     pub fn discover() -> Result<Self> {
+        if let Some(directory) = crate::credentials::claude_subscription_config_dir()? {
+            return Self::resolve(Some(&directory));
+        }
         let home = std::env::var_os("HOME")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
