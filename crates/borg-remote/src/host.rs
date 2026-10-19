@@ -4497,6 +4497,16 @@ async fn persist_launch_metadata_as(
         // Replay the original decision even if time-dependent validation changed.
         rejection = Some(rejected_launch.reason);
         metadata = existing.clone();
+    } else if local_mirror
+        && let Some(existing) = existing.as_ref().filter(|m| host_launch_is_local_mirror(m))
+    {
+        // A terminal owner registers again on every start, with whatever model,
+        // effort and capabilities it runs with now. The admitted launch is
+        // immutable, so keep it and only renew ownership; offering the current
+        // settings as a "different launch" stopped the mirror for any session
+        // whose settings had changed since it was created.
+        metadata = existing.clone();
+        rejection = None;
     } else if existing.as_ref() != Some(&metadata)
         && let Some(reason) = rejection.as_ref()
     {
@@ -7658,6 +7668,40 @@ mod tests {
             extension_skill_roots: Vec::new(),
             team_policy: None,
         }
+    }
+
+    // A terminal owner re-registers on every start with its current settings. That
+    // must keep the admitted launch rather than stop the mirror as a "different
+    // launch request", which silently drops the session from remote.
+    #[tokio::test]
+    async fn local_mirror_reregistration_keeps_admitted_launch_when_settings_change() {
+        let root = tempdir().unwrap();
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(postgres);
+        let config = test_config(root.path());
+        let id = Uuid::new_v4();
+        let first = bootstrap_test_launch(root.path());
+        persist_launch_metadata_as(&config, store.as_ref(), id, &first, None, true)
+            .await
+            .unwrap();
+        let changed = LaunchSession {
+            request_id: Uuid::new_v4(),
+            model: Some("another-model".into()),
+            effort: Some("high".into()),
+            ..first.clone()
+        };
+        let rejection =
+            persist_launch_metadata_as(&config, store.as_ref(), id, &changed, None, true)
+                .await
+                .unwrap();
+        assert!(rejection.is_none());
+        let stored = store.load_host_launch_metadata(id).await.unwrap().unwrap();
+        assert_eq!(
+            stored["request"]["request_id"],
+            first.request_id.to_string()
+        );
+        drop(store);
+        scratch.discard().await;
     }
 
     #[tokio::test]
