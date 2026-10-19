@@ -3154,14 +3154,30 @@ impl AgentToolDispatcher {
                 )
             }
             "list_watchers" => {
-                let _: NoArgs = serde_json::from_value(arguments)?;
-                Ok(serde_json::to_value(
-                    self.watches
-                        .as_ref()
-                        .context("watchers are unavailable for this session")?
-                        .list()
-                        .await,
-                )?)
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Args {
+                    #[serde(default)]
+                    watch_ids: Vec<Uuid>,
+                }
+                let args: Args = serde_json::from_value(arguments)?;
+                let watches = self
+                    .watches
+                    .as_ref()
+                    .context("watchers are unavailable for this session")?;
+                // A session's finished watchers accumulate with their full
+                // output; listing them all floods the context. Results come
+                // only for the watchers asked for by id.
+                let listed = if args.watch_ids.is_empty() {
+                    let mut listed = watches.list().await;
+                    for info in &mut listed {
+                        info.result = None;
+                    }
+                    listed
+                } else {
+                    watches.list_for(&args.watch_ids).await
+                };
+                Ok(serde_json::to_value(listed)?)
             }
             "stop_watcher" => {
                 #[derive(Deserialize)]
@@ -10213,9 +10229,17 @@ pub fn agent_tool_specs_for_surface(
         ),
         tool(
             "list_watchers",
-            "List this session's background watchers and whether they are running.",
+            "List this session's background watchers and whether they are running. Pass watch_ids to get those watchers' results (output, exit code, errors); without it only their status is listed.",
             json!({
-                "type": "object", "properties": {}, "additionalProperties": false
+                "type": "object",
+                "properties": {
+                    "watch_ids": {
+                        "type": "array",
+                        "items": { "type": "string", "format": "uuid" },
+                        "description": "Watchers whose results to return."
+                    }
+                },
+                "additionalProperties": false
             }),
         ),
         tool(

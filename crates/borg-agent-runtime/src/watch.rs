@@ -521,7 +521,7 @@ impl Watches {
         cancel_on_drop.disarm();
         Ok(json!({
             "running": true, "background": true, "watch_id": watch_id,
-            "message": "Job continues in the background. Use list_watchers to retrieve its result, await_watchers to wait, or stop_watcher to cancel. Do not repeat the call."
+            "message": "Job continues in the background. Use list_watchers with its watch_id to retrieve its result, await_watchers to wait, or stop_watcher to cancel. Do not repeat the call."
         }))
     }
 
@@ -1039,10 +1039,10 @@ fn completion_notice(label: &str, tool: &str, job: Uuid) -> String {
         // The tool returns once the child starts; the child's own outcome
         // arrives through wait_agent, never through this notice.
         format!(
-            "Watcher event: {label} ({job}) returned: the child agent was started and keeps working. Its identity is in list_watchers; wait for its result with wait_agent."
+            "Watcher event: {label} ({job}) returned: the child agent was started and keeps working. Its identity is in list_watchers {{\"watch_ids\":[\"{job}\"]}}; wait for its result with wait_agent."
         )
     } else {
-        format!("Watcher event: {label} ({job}) finished. Retrieve its result with list_watchers.")
+        format!("Watcher event: {label} ({job}) finished. Retrieve its result with list_watchers {{\"watch_ids\":[\"{job}\"]}}.")
     }
 }
 

@@ -89,28 +89,15 @@ to exit and its MCP port to close. The core still tears down the tracked
 cgroup after the hook returns, so an unresponsive editor cannot run forever.
 The PID file is not a lease and cannot authorize external stop actions.
 `editor start|status|restart|yield|resume|stop|lease|release` forward to the
-integrating `borg lane service` CLI. A disposable **fake** editor with an MCP
-initialize endpoint reached Healthy through the exact combined lanes-owner
-binary (SHA256 `4022be198a99…`) using this adapter's `editor start/status/stop`
-entrypoints. Its unfenced front proxy denied POST with 403; the real graceful
-hook sent `QUIT_EDITOR` to the fake backend and stop closed all private ports.
-This does **not** validate a real Unreal editor. The architect's
-`docs/gamedev/integration.md` reports a passing real-systemd two-service,
-no-hook scoped descendant gate on that same binary, clearing the earlier
-stale-binary fail-open. A later public CLI probe found a **Project
-path-alias fail-open** on that old binary. A newly rebuilt combined binary,
-SHA256 `011c4ba9…`, independently rejected aliased Project/Worktree keys and
-passed a canonical Project service handoff; the final integrated binary must
-repeat this gate. The adapter canonicalizes its project path and rejects
-conflicting UBT project arguments. On separate pinned binaries, targeted
-core probes also passed failing post-hook quarantine (`011c4ba9…`),
-stopped-supervisor and ACK-then-unhealthy resume recovery plus same-device
-disk capacity (`61ece6c1…`). **Foreign client leases do not atomically delay
-exclusive preemption:** the selected v0 model MCP policy rejects all
-model-facing exclusive templates and disables model-facing restart without an
-atomic caller-lease check. Session-derived model MCP owner fencing,
-final integrated-binary regression and real Unreal parity remain blockers.
-These targeted passes do not enable non-spec exclusive runs.
+integrating `borg lane service` CLI. The adapter canonicalizes its project
+path and rejects conflicting UBT project arguments.
+
+Status: the service lifecycle has been exercised only against a fake editor
+with an MCP initialize endpoint; a real Unreal editor is not yet validated.
+Foreign client leases do not atomically delay exclusive preemption, so the
+model MCP policy rejects model-facing exclusive templates and disables
+model-facing restart. Session-derived model MCP owner fencing and real Unreal
+parity remain open, and exclusive runs outside the service spec stay disabled.
 Do not use the live shared project's editor or its port.
 
 The stock
