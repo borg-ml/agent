@@ -418,7 +418,7 @@ async fn shell_jobs_retrieve_output_and_cancel_the_owned_process() {
         .call(
             "exec",
             json!({
-                "cmd": "cd nested; read -r line; printf '%s' \"$line\"", "async": true
+                "cmd": "cd nested; printf '%s' '{\"media_type\":\"image/png\",\"data_base64\":\"AAAA\"}' > \"$BORG_ATTACHMENT_SPOOL/image.tmp\"; mv \"$BORG_ATTACHMENT_SPOOL/image.tmp\" \"$BORG_ATTACHMENT_SPOOL/image.json\"; printf '%s' \"$BORG_ATTACHMENT_SPOOL/image.json\" > spool-path; printf ready; read -r line; printf '%s' \"$line\"", "async": true
             }),
         )
         .await
@@ -429,8 +429,22 @@ async fn shell_jobs_retrieve_output_and_cancel_the_owned_process() {
         "one command has one identity"
     );
     assert_eq!(watches.list().await.len(), 1, "one command has one watcher");
-    // An immediate background handle must already accept stdin, without
-    // waiting for a process output event to prove startup has completed.
+    // Let the watcher drain an image while the command is still waiting for
+    // stdin. The terminal snapshot cannot recover an already drained image.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(path) = std::fs::read_to_string(nested.join("spool-path"))
+                && !path.is_empty()
+                && !Path::new(&path).exists()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the watcher must drain the image before the command exits");
+    // Complete the command only after its image left the spool.
     dispatcher
         .call(
             "exec",
@@ -444,7 +458,11 @@ async fn shell_jobs_retrieve_output_and_cancel_the_owned_process() {
             let info = watches.list_for(&[job]).await.pop().unwrap();
             if !info.running {
                 let output = &info.result.unwrap()["output"];
-                assert_eq!(output["stdout"], "job-finished");
+                assert_eq!(output["stdout"], "readyjob-finished");
+                let (_, images) =
+                    crate::native_harness::split_tool_result_attachments(output.to_string());
+                assert_eq!(images.len(), 1, "a running snapshot's image was lost");
+                assert_eq!(images[0].data_base64, "AAAA");
                 assert_eq!(output["cwd"], nested.to_string_lossy().as_ref());
                 break;
             }

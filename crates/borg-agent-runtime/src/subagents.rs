@@ -1641,9 +1641,18 @@ impl AgentToolDispatcher {
                     .context("running shell has no process id")?,
             )?;
             let owner = self.actor_session_id;
+            let attachment_key = crate::native_harness::TOOL_RESULT_ATTACHMENTS_KEY;
+            let initial_attachments = result[attachment_key]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let initial_errors = result["attachment_errors"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             let execution = async move {
-                let mut attachments = Vec::new();
-                let mut attachment_errors = Vec::new();
+                let mut attachments = initial_attachments;
+                let mut attachment_errors = initial_errors;
                 loop {
                     let snapshot = execution_provider
                         .write_stdin(crate::ExecutionStdinRequest {
@@ -1657,14 +1666,16 @@ impl AgentToolDispatcher {
                         .await?;
                     let running = snapshot.running;
                     let mut outcome = serde_json::to_value(snapshot)?;
-                    if let Some(images) = outcome["attachments"].as_array() {
+                    if let Some(images) = outcome[attachment_key].as_array() {
                         attachments.extend(images.iter().cloned());
                     }
                     if let Some(errors) = outcome["attachment_errors"].as_array() {
                         attachment_errors.extend(errors.iter().cloned());
                     }
                     if !running {
-                        outcome["attachments"] = Value::Array(attachments);
+                        if !attachments.is_empty() {
+                            outcome[attachment_key] = Value::Array(attachments);
+                        }
                         outcome["attachment_errors"] = Value::Array(attachment_errors);
                         drop_command_echo(&mut outcome);
                         return Ok::<Value, anyhow::Error>(outcome);

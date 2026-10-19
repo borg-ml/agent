@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.17.1)
 
+- Preserve images emitted before a shell command exits, including synchronous
+  exec calls collected through a watcher, instead of intermittently losing
+  `borg image` and screenshot attachments.
+
 - Make context compaction recover from dead provider connections. Compaction
   requests now report streamed output, so a slow but working compaction stays
   alive and visible. A lost connection is retried up to three attempts with
