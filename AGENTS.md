@@ -18,6 +18,11 @@
 - Keep simple changes small and direct. Do not add slop: speculative
   abstractions, helper layers, comments, fixtures, scaffolding, or code that
   does not materially support the requested behavior.
+- Delete dead code as soon as you find it, without asking: retired or
+  compatibility stubs, entry points that only return "use X instead", types
+  and fields nothing reads, and machinery that only served a removed route.
+  Remove them together with their tests and docs in the same change rather
+  than leaving them for a later cleanup.
 - Do not add tests reflexively because a line changed or a bug was mentioned.
   Add one only when it is useful and warranted by a concrete failure mode.
 - A warranted test protects a meaningful product contract, public interface,
