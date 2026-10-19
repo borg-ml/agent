@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.17.1)
+## Unreleased (since 0.18.0)
+
+## 0.18.0 (2026-10-19)
 
 - Load a user-wide `~/.borg/AGENTS.md` (or `CLAUDE.md`) in every session, ahead
   of the project's own guidance, like Codex's `~/.codex/AGENTS.md` and Claude
