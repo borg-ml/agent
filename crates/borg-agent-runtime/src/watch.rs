@@ -1042,7 +1042,9 @@ fn completion_notice(label: &str, tool: &str, job: Uuid) -> String {
             "Watcher event: {label} ({job}) returned: the child agent was started and keeps working. Its identity is in list_watchers {{\"watch_ids\":[\"{job}\"]}}; wait for its result with wait_agent."
         )
     } else {
-        format!("Watcher event: {label} ({job}) finished. Retrieve its result with list_watchers {{\"watch_ids\":[\"{job}\"]}}.")
+        format!(
+            "Watcher event: {label} ({job}) finished. Retrieve its result with list_watchers {{\"watch_ids\":[\"{job}\"]}}."
+        )
     }
 }
 
