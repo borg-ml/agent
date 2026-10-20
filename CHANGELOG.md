@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.18.0)
+## Unreleased (since 0.18.1)
+
+## 0.18.1 (2026-10-20)
 
 - Show recent, live cross-instance collaborators in the terminal footer without
   changing child ownership or granting controls. Clear the indicator when work stops.
