@@ -696,6 +696,8 @@ impl CodexModelProvider {
                 "reasoning": body["reasoning"], "text": body.get("text"),
                 "stream_options": body.get("stream_options"),
                 "responses_lite": capabilities.as_ref().is_some_and(|c| c.use_responses_lite),
+                "supports_reasoning_effort_updates": capabilities.as_ref().is_some_and(|c| c.supports_reasoning_effort_updates),
+                "configuration_update_count": body["input"].as_array().map(|input| input.iter().filter(|item| item["type"] == "configuration_update").count()),
                 "raw_context_window_tokens": capabilities.as_ref().and_then(|c| c.context_window.or(c.max_context_window)).or(context_window),
                 "max_context_window_tokens": capabilities.as_ref().and_then(|c| c.max_context_window),
                 "effective_context_window_tokens": context_window,
@@ -867,7 +869,8 @@ impl CodexModelProvider {
         } else {
             self.wire_effort()
         };
-        let mut applied_effort = None;
+        // The top-level reasoning field already applies the baseline.
+        let mut applied_effort = Some(baseline);
         for message in &request.messages {
             match message {
                 ModelMessage::System { content } => instructions.push(content.as_str()),
@@ -2425,6 +2428,68 @@ mod tests {
         assert!(
             matches!(&request.messages[4], ModelMessage::Assistant { provider_state: Some(ModelProviderState::OpenAiResponses { effective_effort: Some(effort), .. }), .. } if effort == "high")
         );
+    }
+
+    #[test]
+    fn unchanged_effort_replays_compaction_without_a_configuration_update() {
+        let capabilities: ModelCapabilities = serde_json::from_value(json!({
+            "slug":"gpt-6.1-sol", "supported_reasoning_levels":[],
+            "use_responses_lite":true, "supports_reasoning_effort_updates":true,
+            "default_reasoning_summary":"none",
+        }))
+        .unwrap();
+        let provider = CodexModelProvider {
+            model: "gpt-6.1-sol".into(),
+            effort: "high".into(),
+        };
+        let request = ModelTurnRequest {
+            messages: vec![
+                ModelMessage::System {
+                    content: "stable instructions".into(),
+                },
+                ModelMessage::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    tool_calls: vec![],
+                    provider_state: Some(ModelProviderState::OpenAiResponses {
+                        output: vec![
+                            json!({"type":"compaction","encrypted_content":"opaque-continuation"}),
+                        ],
+                        account_identity: Some("account".into()),
+                        request_model: Some("gpt-6.1-sol".into()),
+                        request_effort: Some("high".into()),
+                        effective_effort: Some("high".into()),
+                    }),
+                },
+                ModelMessage::user("continue approved work"),
+            ],
+            tools: vec![],
+            request_id: None,
+            session_id: Some("session".into()),
+            prompt_cache_key: Some("cache".into()),
+            turn_routing: Default::default(),
+            fast: false,
+            ultrafast: false,
+            output_schema: None,
+        };
+        let body = provider
+            .request_body_with_capabilities(&request, Some(&capabilities), true)
+            .unwrap();
+        assert_eq!(body["model"], "gpt-6.1-sol");
+        assert_eq!(
+            body["reasoning"],
+            json!({"effort":"high","context":"all_turns"})
+        );
+        assert_eq!(body["input"][2]["type"], "compaction");
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "configuration_update")
+        );
+        assert!(body.get("service_tier").is_none());
     }
 
     #[test]
