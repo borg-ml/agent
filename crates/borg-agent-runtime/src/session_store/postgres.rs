@@ -348,7 +348,7 @@ impl PostgresSessionStore {
     /// workspace membership and `/broadcast` are scoped to one OS user on one
     /// machine, and a shared journal widens them to everyone who can reach the
     /// database.
-    fn owner_fingerprint() -> (String, String) {
+    fn owner_fingerprint() -> Result<(String, String)> {
         let host = std::env::var("HOSTNAME")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -361,8 +361,35 @@ impl PostgresSessionStore {
             .unwrap_or_else(|| "unknown-host".to_string());
         let user = std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "unknown-user".to_string());
-        (format!("{user}@{host}"), format!("{user} on {host}"))
+            .ok()
+            .filter(|user| !user.trim().is_empty())
+            .or_else(|| {
+                #[cfg(unix)]
+                unsafe {
+                    let mut record: libc::passwd = std::mem::zeroed();
+                    let mut result = std::ptr::null_mut();
+                    let mut buffer = vec![0u8; 16 * 1024];
+                    if libc::getpwuid_r(
+                        libc::geteuid(),
+                        &mut record,
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                        &mut result,
+                    ) == 0
+                        && !result.is_null()
+                        && !record.pw_name.is_null()
+                    {
+                        return Some(
+                            std::ffi::CStr::from_ptr(record.pw_name)
+                                .to_string_lossy()
+                                .into_owned(),
+                        );
+                    }
+                }
+                None
+            })
+            .context("cannot determine the OS user for journal ownership")?;
+        Ok((format!("{user}@{host}"), format!("{user} on {host}")))
     }
 
     /// Record this process as an owner, and refuse a journal that silently
@@ -374,7 +401,7 @@ impl PostgresSessionStore {
     /// boundary: every participant in that database can see and address every
     /// other. SQLite could not be shared by accident; a connection string can.
     pub async fn ensure_single_owner(&self) -> Result<()> {
-        let (fingerprint, display) = Self::owner_fingerprint();
+        let (fingerprint, display) = Self::owner_fingerprint()?;
         sqlx::query(
             "insert into borg_journal_owners (fingerprint, display) values ($1, $2) \
              on conflict (fingerprint) do update set last_seen = now()",

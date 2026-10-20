@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.18.0)
 
+- Resolve journal ownership from the OS when username environment variables are
+  missing, rather than registering a false owner that blocks session startup.
+
 - Apply Codex reasoning-effort transitions after native compaction so continuing
   a compacted session does not fail with HTTP 400.
 
