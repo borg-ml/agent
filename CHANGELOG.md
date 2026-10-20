@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.18.1)
+## Unreleased (since 0.18.2)
+
+## 0.18.2 (2026-10-20)
 
 - Update TLS certificate verification and bundled roots to reject distrusted
   emSign intermediates. Use the operating system certificate store for
