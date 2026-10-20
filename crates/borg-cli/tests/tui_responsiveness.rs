@@ -70,10 +70,18 @@ fn live_tui_input_latency_under_storage_pressure() {
         .wait_for_screen_text("full access", Duration::from_secs(10))
         .expect("wait for the status line before pointer probes");
 
+    let first_key_latency = terminal
+        .type_and_measure("Ж", Duration::from_secs(2))
+        .expect("the first enhanced key must paint during streaming");
+    terminal.write_all_retry(b"\x03").expect("clear first key");
+    terminal
+        .wait_for_absence("Ж", Duration::from_secs(2))
+        .expect("first-key clear painted");
+
     let hover_latency = terminal
         .hover_and_measure(
             "full access",
-            "left click change permissions",
+            "click change permissions",
             Duration::from_secs(2),
         )
         .expect("measure pointer hover paint");
@@ -158,7 +166,7 @@ fn live_tui_input_latency_under_storage_pressure() {
     let max = *samples.last().expect("latency samples");
     let pressure_delta = io_pressure_after.saturating_sub(io_pressure_before);
     eprintln!(
-        "live TUI/storage profile: active_cpu={:.1}% samples={} input_p50={p50:?} input_p95={p95:?} input_max={max:?} hover={hover_latency:?} click={click_latency:?} wheel={wheel_latency:?} pressure_bytes={} io_full_stall={:?}",
+        "live TUI/storage profile: active_cpu={:.1}% samples={} input_p50={p50:?} input_p95={p95:?} input_max={max:?} first_key={first_key_latency:?} hover={hover_latency:?} click={click_latency:?} wheel={wheel_latency:?} pressure_bytes={} io_full_stall={:?}",
         cpu_ratio * 100.0,
         samples.len(),
         written,
@@ -180,6 +188,7 @@ fn live_tui_input_latency_under_storage_pressure() {
         "input-to-paint max exceeded {INPUT_MAX_SLO:?}: {max:?}"
     );
     for (interaction, latency) in [
+        ("first key", first_key_latency),
         ("hover", hover_latency),
         ("click", click_latency),
         ("wheel", wheel_latency),
@@ -189,6 +198,41 @@ fn live_tui_input_latency_under_storage_pressure() {
             "{interaction}-to-paint latency exceeded {MOUSE_INPUT_SLO:?}: {latency:?}"
         );
     }
+}
+
+#[test]
+#[ignore = "requires an isolated live TUI and streaming provider"]
+fn unanswered_graphics_detection_preserves_first_click() {
+    let runtime = tempfile::tempdir().expect("isolated Borg runtime");
+    let borg_home = runtime.path().join("borg-home");
+    let config_home = runtime.path().join("config");
+    fs::create_dir_all(config_home.join("borg")).expect("config root");
+    fs::write(
+        config_home.join("borg/agent.toml"),
+        "[updates]\nauto_install = false\n",
+    )
+    .expect("disable updates");
+    let (endpoint, stream_started, server, _) = spawn_streaming_provider(true);
+    let executable = std::env::var("BORG_TUI_STRESS_EXE")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_borg").to_string());
+    let mut terminal = PtyChild::spawn(
+        &executable,
+        runtime.path(),
+        &borg_home,
+        &config_home,
+        &endpoint,
+    )
+    .expect("start isolated Borg TUI");
+    stream_started
+        .recv_timeout(Duration::from_secs(10))
+        .expect("provider started");
+    terminal
+        .wait_for_screen_text("full access", Duration::from_secs(10))
+        .expect("first frame painted without any terminal capability replies");
+    terminal
+        .click_and_measure("full access", "Choose access", Duration::from_secs(2))
+        .expect("the first click must reach the UI, not a leftover stdin probe");
+    server.join().expect("streaming-provider worker");
 }
 
 #[test]
@@ -472,7 +516,7 @@ fn live_attached_session_interaction_latency() {
     let hover_latency = terminal
         .hover_and_measure(
             "full access",
-            "left click change permissions",
+            "click change permissions",
             Duration::from_secs(2),
         )
         .expect("measure live pointer hover paint");
@@ -917,7 +961,8 @@ impl PtyChild {
             .env("BORG_TUI", "1")
             .env("BORG_TUI_SCREEN", "alternate")
             .env("BORG_TUI_FPS", "165")
-            .env("BORG_IMAGE_PROTOCOL", "off")
+            .env_remove("BORG_IMAGE_PROTOCOL")
+            .env("TERM_PROGRAM", "ghostty")
             .env("TERM", "xterm-256color")
             .env("BORG_OPENAI_COMPATIBLE_BASE_URL", endpoint)
             .env("BORG_OPENAI_COMPATIBLE_MODEL", "tui-stress-model")
@@ -954,8 +999,8 @@ impl PtyChild {
         let size = libc::winsize {
             ws_row: PTY_ROWS as u16,
             ws_col: PTY_COLS as u16,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: (PTY_COLS * 10) as u16,
+            ws_ypixel: (PTY_ROWS * 20) as u16,
         };
         // SAFETY: openpty initializes both descriptors and only reads the winsize value.
         if unsafe {
@@ -1046,8 +1091,8 @@ impl PtyChild {
         let size = libc::winsize {
             ws_row: rows as u16,
             ws_col: cols as u16,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: (cols * 10) as u16,
+            ws_ypixel: (rows * 20) as u16,
         };
         // SAFETY: ioctl only reads the winsize and updates this live PTY.
         if unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &size) } == -1 {
@@ -1114,7 +1159,15 @@ impl PtyChild {
 
     fn type_and_measure(&mut self, marker: &str, timeout: Duration) -> io::Result<Duration> {
         let started = Instant::now();
-        self.write_all_retry(marker.as_bytes())?;
+        // Match enhanced terminals: every key has a press and release report.
+        let input = marker
+            .chars()
+            .map(|character| {
+                let code = character as u32;
+                format!("\x1b[{code};1:1u\x1b[{code};1:3u")
+            })
+            .collect::<String>();
+        self.write_all_retry(input.as_bytes())?;
         let deadline = started + timeout;
         let mut output = Vec::new();
         while Instant::now() < deadline {
@@ -1164,7 +1217,10 @@ impl PtyChild {
         }
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("TUI did not paint {expected} after hovering {label}"),
+            format!(
+                "TUI did not paint {expected} after hovering {label}; screen={:?}",
+                self.screen.text()
+            ),
         ))
     }
 
@@ -1192,7 +1248,10 @@ impl PtyChild {
         }
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("TUI did not paint {expected} after clicking {label}"),
+            format!(
+                "TUI did not paint {expected} after clicking {label}; screen={:?}",
+                self.screen.text()
+            ),
         ))
     }
 

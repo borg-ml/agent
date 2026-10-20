@@ -169,10 +169,12 @@ this option. It applies to both live events and replayed history.
 
 Attachments render as real images when the terminal supports a graphics
 protocol (Kitty, Sixel, or iTerm2 — Ghostty, Kitty, WezTerm, iTerm2); Borg
-probes for it once at startup. Other terminals keep the half-block glyph
-preview. Set `BORG_IMAGE_PROTOCOL=halfblocks` to skip the probe and force the
-glyph fallback, or `kitty`, `sixel`, or `iterm2` to force a protocol when the
-probe misses a terminal that does support one.
+uses terminal environment hints and reported pixel dimensions, without reading
+keyboard or mouse input to detect capabilities. Other terminals, including
+connections that do not report pixel dimensions, keep the half-block glyph
+preview. Set `BORG_IMAGE_PROTOCOL=halfblocks` to force glyphs, or `kitty`,
+`sixel`, or `iterm2` to select a protocol explicitly when pixel dimensions are
+available.
 
 ## Reasoning effort
 

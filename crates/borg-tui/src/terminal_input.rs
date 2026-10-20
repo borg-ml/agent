@@ -6,7 +6,6 @@ use crossterm::event::{
 };
 use futures_util::{Stream, StreamExt};
 
-const PRIORITY_EVENT_CHANNEL_CAPACITY: usize = 64;
 const VISUAL_EVENT_CHANNEL_CAPACITY: usize = 32;
 const WHEEL_FLUSH_INTERVAL: Duration = Duration::from_millis(4);
 const POINTER_MOVE_FLUSH_INTERVAL: Duration = Duration::from_millis(8);
@@ -101,7 +100,7 @@ impl TerminalInputEvent {
 }
 
 pub(super) struct TerminalInput {
-    priority_events: tokio::sync::mpsc::Receiver<io::Result<Event>>,
+    priority_events: tokio::sync::mpsc::UnboundedReceiver<io::Result<Event>>,
     visual_events: tokio::sync::mpsc::Receiver<io::Result<Event>>,
     wheel_events: tokio::sync::mpsc::Receiver<WheelBurst>,
     deferred_visual: Option<io::Result<Event>>,
@@ -113,8 +112,9 @@ pub(super) struct TerminalInput {
 
 impl TerminalInput {
     pub(super) fn spawn() -> Self {
-        let (priority_tx, priority_events) =
-            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        // Never backpressure terminal reads behind rendering. The tty has a
+        // finite input buffer; pausing reads can discard keys and clicks.
+        let (priority_tx, priority_events) = tokio::sync::mpsc::unbounded_channel();
         let (visual_tx, visual_events) = tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (wheel_tx, wheel_events) = tokio::sync::mpsc::channel(1);
         let pump = tokio::spawn(async move {
@@ -130,6 +130,10 @@ impl TerminalInput {
             wheel_closed: false,
             pump: Some(pump),
         }
+    }
+
+    pub(super) fn has_pending_input(&self) -> bool {
+        !self.priority_events.is_empty()
     }
 
     pub(super) async fn next_event(&mut self) -> Option<io::Result<TerminalInputEvent>> {
@@ -349,7 +353,7 @@ fn flush_pending_visuals(
 
 async fn pump_terminal_events<S>(
     mut events: S,
-    priority_tx: tokio::sync::mpsc::Sender<io::Result<Event>>,
+    priority_tx: tokio::sync::mpsc::UnboundedSender<io::Result<Event>>,
     visual_tx: tokio::sync::mpsc::Sender<io::Result<Event>>,
     wheel_tx: tokio::sync::mpsc::Sender<WheelBurst>,
 ) where
@@ -449,7 +453,7 @@ async fn pump_terminal_events<S>(
                     ) {
                         return;
                     }
-                    if priority_tx.send(event).await.is_err() {
+                    if priority_tx.send(event).is_err() {
                         return;
                     }
                 }
@@ -587,9 +591,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stalled_ui_does_not_stop_terminal_reads_or_lose_typing() {
+        let (priority_tx, mut priority_events) = tokio::sync::mpsc::unbounded_channel();
+        let (visual_tx, _visual_events) = tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
+        let (wheel_tx, _wheel_events) = tokio::sync::mpsc::channel(1);
+        let expected: Vec<_> = "typing under load 0123456789 "
+            .repeat(128)
+            .chars()
+            .flat_map(|character| {
+                [KeyEventKind::Press, KeyEventKind::Release].map(|kind| {
+                    let mut key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+                    key.kind = kind;
+                    Event::Key(key)
+                })
+            })
+            .chain([
+                Event::Paste("pasted text".into()),
+                Event::Mouse(wheel_mouse(MouseEventKind::Down(
+                    crossterm::event::MouseButton::Left,
+                ))),
+                Event::Mouse(wheel_mouse(MouseEventKind::Up(
+                    crossterm::event::MouseButton::Left,
+                ))),
+            ])
+            .collect();
+
+        // No consumer runs until all terminal input has been read.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            pump_terminal_events(
+                futures_util::stream::iter(expected.iter().cloned().map(Ok)),
+                priority_tx,
+                visual_tx,
+                wheel_tx,
+            ),
+        )
+        .await
+        .expect("a busy UI must not stop draining terminal input");
+
+        let mut received = Vec::new();
+        while let Some(event) = priority_events.recv().await {
+            received.push(event.unwrap());
+        }
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
     async fn wheel_flood_stays_out_of_the_discrete_input_queue() {
-        let (priority_tx, mut priority_events) =
-            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, mut priority_events) = tokio::sync::mpsc::unbounded_channel();
         let (visual_tx, _visual_events) = tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (wheel_tx, mut wheel_events) = tokio::sync::mpsc::channel(1);
         let events = (0..100_000)
@@ -629,8 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn keyboard_events_bypass_a_full_visual_queue() {
-        let (priority_tx, mut priority_events) =
-            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, mut priority_events) = tokio::sync::mpsc::unbounded_channel();
         let (visual_tx, _visual_events) = tokio::sync::mpsc::channel(1);
         visual_tx.send(Ok(Event::Resize(80, 24))).await.unwrap();
         let (wheel_tx, _wheel_events) = tokio::sync::mpsc::channel(1);
@@ -656,8 +704,7 @@ mod tests {
 
     #[tokio::test]
     async fn pointer_motion_cannot_queue_a_wheel_gesture_behind_stale_coordinates() {
-        let (priority_tx, _priority_events) =
-            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, _priority_events) = tokio::sync::mpsc::unbounded_channel();
         let (visual_tx, mut visual_events) =
             tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (wheel_tx, mut wheel_events) = tokio::sync::mpsc::channel(1);
@@ -703,8 +750,7 @@ mod tests {
 
     #[tokio::test]
     async fn resize_burst_keeps_only_the_latest_dimensions() {
-        let (priority_tx, mut priority_events) =
-            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, mut priority_events) = tokio::sync::mpsc::unbounded_channel();
         let (visual_tx, mut visual_events) =
             tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (wheel_tx, _wheel_events) = tokio::sync::mpsc::channel(1);
@@ -739,8 +785,7 @@ mod tests {
 
     #[tokio::test]
     async fn drag_burst_keeps_the_latest_pointer_position_before_release() {
-        let (priority_tx, mut priority_events) =
-            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, mut priority_events) = tokio::sync::mpsc::unbounded_channel();
         let (visual_tx, mut visual_events) =
             tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (wheel_tx, _wheel_events) = tokio::sync::mpsc::channel(1);
@@ -792,8 +837,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_resize_frames_collapse_before_the_renderer_sees_them() {
-        let (priority_tx, priority_events) =
-            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, priority_events) = tokio::sync::mpsc::unbounded_channel();
         let (visual_tx, visual_events) = tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (_wheel_tx, wheel_events) = tokio::sync::mpsc::channel(1);
         for width in 1..=20 {
@@ -804,7 +848,6 @@ mod tests {
                 KeyCode::Char('x'),
                 KeyModifiers::NONE,
             ))))
-            .await
             .unwrap();
         drop(priority_tx);
         drop(visual_tx);
@@ -841,8 +884,7 @@ mod tests {
 
     #[tokio::test]
     async fn discrete_input_takes_priority_over_pending_wheel_motion() {
-        let (priority_tx, priority_events) =
-            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, priority_events) = tokio::sync::mpsc::unbounded_channel();
         let (_visual_tx, visual_events) = tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (wheel_tx, wheel_events) = tokio::sync::mpsc::channel(1);
         priority_tx
@@ -850,7 +892,6 @@ mod tests {
                 KeyCode::Char('x'),
                 KeyModifiers::NONE,
             ))))
-            .await
             .unwrap();
         wheel_tx
             .send(WheelBurst {
@@ -901,8 +942,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        let (_priority_tx, priority_events) =
-            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (_priority_tx, priority_events) = tokio::sync::mpsc::unbounded_channel();
         let (_visual_tx, visual_events) = tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (_wheel_tx, wheel_events) = tokio::sync::mpsc::channel(1);
         let mut input = TerminalInput {

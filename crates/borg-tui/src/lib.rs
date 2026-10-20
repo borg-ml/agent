@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 
 use ratatui_image::{
     Resize,
-    picker::{Picker as ImagePicker, ProtocolType, cap_parser::QueryStdioOptions},
+    picker::{Picker as ImagePicker, ProtocolType},
     sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
 use std::process::Command;
@@ -3101,8 +3101,7 @@ impl BorgTerminal {
             )
         )
         .is_ok();
-        // Query before the input thread takes stdin: the probe reads the
-        // terminal's reply itself.
+        // Image detection must never create another stdin reader.
         let image_picker = detect_image_picker();
         let mut transcript = root_transcript_from_environment();
         // The preview resolution is the tile geometry, and the tile is sized in
@@ -3482,6 +3481,11 @@ impl BorgTerminal {
         self.pending_transcript_anchor = None;
         self.event_redraw_needed = true;
         Ok(())
+    }
+
+    /// Discrete input waiting behind the current UI operation.
+    pub fn has_pending_input(&self) -> bool {
+        self.input.has_pending_input()
     }
 
     pub async fn next_event(&mut self) -> Option<io::Result<TerminalInputEvent>> {
@@ -18611,9 +18615,8 @@ fn image_preview_cell(picker: Option<&ImagePicker>) -> Option<(u16, u16)> {
     (cell.width > 0 && cell.height > 0).then_some((cell.width, cell.height))
 }
 
-/// Probe the terminal for a graphics protocol. `BORG_IMAGE_PROTOCOL=halfblocks`
-/// (or `off`) skips the probe and keeps glyph previews; `kitty`, `sixel`, or
-/// `iterm2` force a protocol for a terminal whose reply the probe missed.
+/// Select graphics without querying stdin: a timed-out capability probe can
+/// leave a blocked reader behind that steals the next key or mouse report.
 fn detect_image_picker() -> Option<ImagePicker> {
     let requested = std::env::var("BORG_IMAGE_PROTOCOL")
         .ok()
@@ -18624,25 +18627,47 @@ fn detect_image_picker() -> Option<ImagePicker> {
     ) {
         return None;
     }
-    // The window only elapses when the terminal does not answer, so a longer
-    // one costs nothing on a healthy terminal and keeps a busy machine from
-    // silently falling back to glyph previews.
-    let options = QueryStdioOptions {
-        timeout: Duration::from_secs(4),
-        ..QueryStdioOptions::default()
-    };
-    let mut picker = ImagePicker::from_query_stdio_with_options(options).ok()?;
-    if let Some(protocol) = requested.as_deref().and_then(|value| match value {
-        "kitty" => Some(ProtocolType::Kitty),
-        "sixel" => Some(ProtocolType::Sixel),
-        "iterm2" | "iterm" => Some(ProtocolType::Iterm2),
-        _ => None,
-    }) {
+    let size = crossterm::terminal::window_size().ok()?;
+    let cell = image_cell_from_window_size(size)?;
+    // This is the library's only constructor for known cell geometry that
+    // does not start its detached, blocking stdin probe.
+    #[allow(deprecated)]
+    let mut picker = ImagePicker::from_fontsize(cell.into());
+    if let Some(protocol) = image_protocol_override(
+        requested.as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+    ) {
         picker.set_protocol_type(protocol);
     }
-    // Opaque padding hides stale half-block glyphs beneath terminal graphics.
     if let Color::Rgb(red, green, blue) = MESSAGE_BG {
         picker.set_background_color(Some(image::Rgba([red, green, blue, 255])));
     }
     (picker.protocol_type() != ProtocolType::Halfblocks).then_some(picker)
+}
+
+fn image_cell_from_window_size(size: crossterm::terminal::WindowSize) -> Option<(u16, u16)> {
+    let width = size.width.checked_div(size.columns)?;
+    let height = size.height.checked_div(size.rows)?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn image_protocol_override(
+    requested: Option<&str>,
+    term: Option<&str>,
+    program: Option<&str>,
+) -> Option<ProtocolType> {
+    match requested {
+        Some("kitty") => Some(ProtocolType::Kitty),
+        Some("sixel") => Some(ProtocolType::Sixel),
+        Some("iterm2" | "iterm") => Some(ProtocolType::Iterm2),
+        _ => match (term, program) {
+            (_, Some("WezTerm" | "iTerm.app")) => Some(ProtocolType::Iterm2),
+            (Some("xterm-ghostty" | "xterm-kitty"), _) | (_, Some("ghostty" | "kitty")) => {
+                Some(ProtocolType::Kitty)
+            }
+            (Some("foot" | "foot-extra" | "xterm-sixel"), _) => Some(ProtocolType::Sixel),
+            _ => None,
+        },
+    }
 }

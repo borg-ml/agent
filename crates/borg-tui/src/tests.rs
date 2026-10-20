@@ -22114,3 +22114,41 @@ fn background_action_animates_until_settled_without_losing_failure_style() {
             .any(|span| span.style.fg == Some(Color::Red))
     }));
 }
+
+#[test]
+fn graphics_detection_uses_reported_geometry_and_explicit_protocols() {
+    let size = |rows, columns, width, height| crossterm::terminal::WindowSize {
+        rows,
+        columns,
+        width,
+        height,
+    };
+    assert_eq!(
+        image_cell_from_window_size(size(68, 127, 1272, 1430)),
+        Some((10, 21))
+    );
+    for missing in [
+        size(0, 127, 1272, 1430),
+        size(68, 0, 1272, 1430),
+        size(68, 127, 0, 0),
+        size(68, 127, 100, 40),
+    ] {
+        assert_eq!(image_cell_from_window_size(missing), None);
+    }
+    assert_eq!(
+        image_protocol_override(None, Some("xterm-ghostty"), None),
+        Some(ProtocolType::Kitty)
+    );
+    assert_eq!(
+        image_protocol_override(None, Some("xterm-kitty"), Some("WezTerm")),
+        Some(ProtocolType::Iterm2)
+    );
+    assert_eq!(
+        image_protocol_override(Some("sixel"), Some("xterm-ghostty"), None),
+        Some(ProtocolType::Sixel)
+    );
+    assert_eq!(
+        image_protocol_override(None, Some("tmux-256color"), Some("tmux")),
+        None
+    );
+}

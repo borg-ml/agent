@@ -3299,6 +3299,11 @@ async fn run_local_agent_session(
         }
     }
     'session: loop {
+        // Drain input before starting background transcript work. Keep cheap
+        // interaction frames schedulable even while draining a large backlog.
+        let input_pending = terminal
+            .as_ref()
+            .is_some_and(BorgTerminal::has_pending_input);
         tokio::select! {
             result = async {
                 lid_sleep_auth_task
@@ -4037,7 +4042,7 @@ async fn run_local_agent_session(
                 tui_timing.observe_key_paint();
                 interaction_dirty = false;
             }
-            _ = render_tick.tick(), if terminal.is_some() && terminal_dirty => {
+            _ = render_tick.tick(), if terminal.is_some() && terminal_dirty && !input_pending => {
                 if tool_started_frame_hold_until
                     .is_some_and(|until| tokio::time::Instant::now() < until)
                 {
@@ -4095,7 +4100,7 @@ async fn run_local_agent_session(
                 }
                 terminal_dirty = terminal.has_pending_scroll_frame();
             }
-            _ = activity_tick.tick(), if !streaming_frame_pending
+            _ = activity_tick.tick(), if !input_pending && !streaming_frame_pending
                 && last_stream_text_at.is_none_or(|at| at.elapsed() >= STREAM_BURST_IDLE_GAP)
                 && terminal.as_ref().is_some_and(|terminal| {
                 terminal_needs_activity_tick(status)
@@ -4112,7 +4117,7 @@ async fn run_local_agent_session(
                 terminal.draw_for_activity()?;
                 interaction_dirty = false;
             }
-            _ = tool_timer_tick.tick(), if !streaming_frame_pending
+            _ = tool_timer_tick.tick(), if !input_pending && !streaming_frame_pending
                 && last_stream_text_at.is_none_or(|at| at.elapsed() >= STREAM_BURST_IDLE_GAP)
                 && terminal.as_ref().is_some_and(BorgTerminal::has_running_tool) => {
                 let terminal = terminal.as_mut().expect("terminal");
@@ -4121,7 +4126,7 @@ async fn run_local_agent_session(
                     interaction_dirty = false;
                 }
             }
-            _ = idle_tick.tick(), if !streaming_frame_pending
+            _ = idle_tick.tick(), if !input_pending && !streaming_frame_pending
                 && last_stream_text_at.is_none_or(|at| at.elapsed() >= STREAM_BURST_IDLE_GAP)
                 && terminal.as_ref().is_some_and(|terminal| {
                 terminal_needs_idle_tick(
@@ -4365,7 +4370,7 @@ async fn run_local_agent_session(
                 }
                 pull_ready_session_events(&mut queued_session_events, &mut session_events);
                 queued_session_events.pop_front()
-            }, if projection_gap_repair_task.is_none()
+            }, if !input_pending && projection_gap_repair_task.is_none()
                 && (session_event_stream_open || !queued_session_events.is_empty()) => {
                 let drain_started = std::time::Instant::now();
                 let mut drained = 0;
@@ -4656,7 +4661,7 @@ async fn run_local_agent_session(
                         immediate_frame_deferred |= terminal_dirty
                             && queued_events > 0
                             && session_event_needs_immediate_frame(&event.kind);
-                        if terminal_dirty && queued_events == 0 && session_event_needs_immediate_frame(&event.kind) {
+                        if terminal_dirty && queued_events == 0 && !terminal.has_pending_input() && session_event_needs_immediate_frame(&event.kind) {
                             if render_frame_interval <= ACTIVITY_FRAME_INTERVAL {
                                 let draw_started = std::time::Instant::now();
                                 terminal.draw()?;
@@ -4801,6 +4806,9 @@ async fn run_local_agent_session(
                         );
                     }
                     drained += 1;
+                    if terminal.as_ref().is_some_and(BorgTerminal::has_pending_input) {
+                        break;
+                    }
                     let Some(next) = next_ready_session_event(
                         &mut queued_session_events,
                         &mut session_events,

@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.18.0)
 
+- Stop image-capability detection from leaving a timed-out stdin reader that
+  can swallow the first keystroke or click. Select image previews from terminal
+  hints and pixel geometry without competing with the input reader.
+
+- Keep draining terminal keys, pastes, and clicks while the UI is busy, and
+  process queued input before background transcript updates and repaints.
+
 - Prefetch conversation history as soon as you scroll up, keep loading through
   hidden or cleaned-up event pages, and preserve the reading position when
   older rows arrive. Keep roster-only agent refreshes out of the conversation.
