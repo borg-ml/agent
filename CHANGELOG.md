@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.18.0)
 
+- Show recent, live cross-instance collaborators in the terminal footer without
+  changing child ownership or granting controls. Clear the indicator when work stops.
+- Keep running background jobs alive across passive Ready-state UI handoffs and
+  noninteractive completion; refuse owned-session switches while jobs are active.
+  Explicit Stop and `borg update --force` still stop the worker intentionally.
+
 - Show explicit incoming child-agent and peer messages, expanded by default,
   in live conversation and replay. Keep routine lifecycle updates separate.
 

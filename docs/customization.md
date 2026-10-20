@@ -157,6 +157,11 @@ background windows. Replayed session history never produces alerts.
 
 ## Subagent messages
 
+The footer also shows active collaborators from recent agent messages that
+are not already represented in the cached child roster. Their
+status is refreshed from live local session owners; this read-only indicator
+does not make them children or grant parent controls.
+
 The parent/director transcript shows explicit incoming child and peer messages
 expanded by default. Automatic child-transcript mirrors and ordinary lifecycle
 status rows stay out of the conversation; current lifecycle indicators stay in

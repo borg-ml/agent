@@ -1589,6 +1589,24 @@ impl Transcript {
         self.cache_diagnostics.status(now, &signature)
     }
 
+    fn collaborator_candidates(&self, session_id: Uuid) -> Vec<(Uuid, String)> {
+        let mut seen = HashSet::new();
+        self.order.iter().zip(&self.order.identities).rev()
+            .filter_map(|(entry, (event_id, _))| {
+                if !matches!(entry, TranscriptEntry::Action { kind: TranscriptActionKind::Agent, .. }) {
+                    return None;
+                }
+                let (_, sender, name) = self.team_report_sources.get(event_id)?;
+                if *sender == session_id || self.subagent_snapshots.contains_key(sender)
+                    || self.pruned_settled_children.contains(sender) || !seen.insert(*sender) {
+                    return None;
+                }
+                Some((*sender, name.clone()))
+            })
+            .take(16)
+            .collect()
+    }
+
     fn active_subagent_count(&self) -> usize {
         self.subagents
             .values()

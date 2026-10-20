@@ -265,6 +265,21 @@ fn statusline_names_active_workers_as_subagents() {
     assert_eq!(agents_status_label(0, 0), None);
     assert_eq!(agents_status_label(1, 0).as_deref(), Some("1 subagent"));
     assert_eq!(agents_status_label(2, 0).as_deref(), Some("2 subagents"));
+    let mut collaborators = vec![CollaboratorActivity {
+        name: "investigator".into(),
+        status: SessionStatus::Running,
+    }];
+    assert_eq!(
+        collaborator_status_label(&collaborators).as_deref(),
+        Some("↔ 1 collaborator active: investigator")
+    );
+    collaborators[0].status = SessionStatus::Ready;
+    assert_eq!(
+        collaborator_status_label(&collaborators).as_deref(),
+        Some("↔ 1 collaborator waiting: investigator")
+    );
+    collaborators[0].status = SessionStatus::Stopped;
+    assert_eq!(collaborator_status_label(&collaborators), None);
 }
 
 #[test]
@@ -601,6 +616,10 @@ fn resumed_history_keeps_child_and_peer_messages_in_order() {
         TranscriptEntry::Action { label, expanded: true, .. } if label == "Peer"
     ));
     assert!(transcript.subagent_snapshots.contains_key(&child));
+    assert_eq!(
+        transcript.collaborator_candidates(root),
+        vec![(peer, "worker".into())]
+    );
 }
 
 #[test]
@@ -19797,6 +19816,13 @@ fn incoming_agent_messages_are_visible_without_subagent_opt_in() {
         let mut transcript = Transcript::default();
         assert!(!transcript.show_subagent_messages);
         transcript.apply(&peer);
+        // A receipt with no cached roster entry still supplies a read-only
+        // activity candidate, even when the sender is a recorded child.
+        assert_eq!(transcript.collaborator_candidates(session_id).len(), 1);
+        assert!(
+            transcript.subagent_snapshots.is_empty(),
+            "a receipt must not invent child ownership"
+        );
         // The sender and complete message are visible by default.
         let single = transcript
             .lines(100)

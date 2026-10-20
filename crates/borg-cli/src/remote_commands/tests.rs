@@ -2174,21 +2174,34 @@ fn compaction_does_not_change_active_input_delivery() {
 
 #[test]
 fn session_switch_distinguishes_owner_shutdown_from_viewer_detach() {
+    assert!(
+        LocalSessionAccess::Owned
+            .switch(SessionStatus::Ready, true)
+            .unwrap_err()
+            .to_string()
+            .contains("Background jobs")
+    );
     assert_eq!(
         LocalSessionAccess::Attached
-            .switch(SessionStatus::Running)
+            .switch(SessionStatus::Ready, true)
+            .unwrap(),
+        SessionSwitch::DetachViewer
+    );
+    assert_eq!(
+        LocalSessionAccess::Attached
+            .switch(SessionStatus::Running, false)
             .unwrap(),
         SessionSwitch::DetachViewer
     );
     assert_eq!(
         LocalSessionAccess::Owned
-            .switch(SessionStatus::Ready)
+            .switch(SessionStatus::Ready, false)
             .unwrap(),
         SessionSwitch::StopOwnedSession
     );
     assert!(
         LocalSessionAccess::Owned
-            .switch(SessionStatus::Running)
+            .switch(SessionStatus::Running, false)
             .unwrap_err()
             .to_string()
             .contains("Interrupt the current turn")
@@ -2803,6 +2816,7 @@ async fn resume_switch_rejects_remote_owned_session_before_stopping_current() {
         &target.to_string(),
         LocalSessionAccess::Owned,
         SessionStatus::Stopped,
+        false,
     )
     .await
     .expect_err("remote-owned sessions must not tear down the active TUI");
@@ -3984,12 +3998,29 @@ fn detached_host_remains_alive_for_children_prompts_processes_watches_and_viewer
         ..Default::default()
     };
     assert!(session_host_is_idle(&state, false, false, false));
+    assert!(passive_owner_stop_is_safe(
+        SessionStatus::Ready,
+        &state,
+        false
+    ));
+    assert!(!passive_owner_stop_is_safe(
+        SessionStatus::Ready,
+        &state,
+        true
+    ));
+    assert!(collaborator_activity("investigator", &state).is_none());
     assert!(!session_host_is_idle(&state, false, true, false));
     assert!(!session_host_is_idle(&state, true, false, false));
     assert!(!session_host_is_idle(&state, false, false, true));
     state.active_processes.insert(Uuid::new_v4());
     assert!(!session_host_is_idle(&state, false, false, false));
     assert!(!stale_local_owner_can_handoff(&state, false));
+    assert!(!passive_owner_stop_is_safe(
+        SessionStatus::Ready,
+        &state,
+        false
+    ));
+    assert!(collaborator_activity("investigator", &state).is_some());
     state.active_processes.clear();
     state.watches.push(borg_remote::WatchSummary {
         watch_id: Uuid::new_v4(),
@@ -4002,6 +4033,12 @@ fn detached_host_remains_alive_for_children_prompts_processes_watches_and_viewer
     });
     assert!(!session_host_is_idle(&state, false, false, false));
     assert!(!stale_local_owner_can_handoff(&state, false));
+    assert!(!passive_owner_stop_is_safe(
+        SessionStatus::Ready,
+        &state,
+        false
+    ));
+    assert!(collaborator_activity("investigator", &state).is_some());
     state.watches[0].running = false;
     assert!(session_host_is_idle(&state, false, false, false));
     for status in [
@@ -4011,6 +4048,8 @@ fn detached_host_remains_alive_for_children_prompts_processes_watches_and_viewer
     ] {
         state.status = Some(status);
         assert!(!session_host_is_idle(&state, false, false, false));
+        assert!(!passive_owner_stop_is_safe(status, &state, false));
+        assert!(collaborator_activity("investigator", &state).is_some());
     }
 }
 

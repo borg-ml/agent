@@ -1653,6 +1653,12 @@ impl GitStatusCache {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollaboratorActivity {
+    pub name: String,
+    pub status: SessionStatus,
+}
+
 pub struct BorgTerminal {
     session_id: Uuid,
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -1675,6 +1681,7 @@ pub struct BorgTerminal {
     child_queued_prompts: HashMap<Uuid, Vec<PendingPromptProjection>>,
     child_requeue_cursors: HashMap<Uuid, Option<usize>>,
     child_statuses: HashMap<Uuid, SessionStatus>,
+    collaborators: Vec<CollaboratorActivity>,
     child_activity_clocks: HashMap<Uuid, ActivityClock>,
     child_pending_approvals: HashSet<Uuid>,
     /// Startup recovery can publish child-state corrections after the root
@@ -3127,6 +3134,7 @@ impl BorgTerminal {
             child_queued_prompts: HashMap::new(),
             child_requeue_cursors: HashMap::new(),
             child_statuses: HashMap::new(),
+            collaborators: Vec::new(),
             child_activity_clocks: HashMap::new(),
             child_pending_approvals: HashSet::new(),
             suppress_bootstrap_subagent_activity: true,
@@ -5296,6 +5304,22 @@ impl BorgTerminal {
 
     /// The children this view currently tracks, for resyncing their status
     /// against each child's own journal.
+    /// Activity candidates are read-only and never establish or change child ownership.
+    pub fn collaborator_candidates(&self) -> Vec<(Uuid, String)> {
+        self.director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript)
+            .collaborator_candidates(self.session_id)
+    }
+
+    pub fn sync_collaborator_activity(&mut self, collaborators: Vec<CollaboratorActivity>) -> bool {
+        if self.collaborators == collaborators {
+            return false;
+        }
+        self.collaborators = collaborators;
+        true
+    }
+
     pub fn team_roster_snapshots(&self) -> Vec<SubagentSnapshot> {
         self.director_transcript
             .as_deref()
@@ -10527,6 +10551,10 @@ impl BorgTerminal {
                     agents_status,
                     agents_status_text_style(hovered),
                 ));
+            }
+            if let Some(collaborators) = collaborator_status_label(&self.collaborators) {
+                status_spans.push(Span::styled(STATUS_SEPARATOR, Style::default().fg(Color::Gray)));
+                status_spans.push(Span::styled(collaborators, Style::default().fg(SUBAGENT_PURPLE)));
             }
             let goal_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             // The separator is rendered unstyled, so the hover target is the
@@ -18500,6 +18528,51 @@ fn history_loading_line() -> Line<'static> {
         ),
         Span::styled("Loading thread history…", Style::default().fg(Color::Gray)),
     ])
+}
+
+fn collaborator_status_label(collaborators: &[CollaboratorActivity]) -> Option<String> {
+    let active = collaborators
+        .iter()
+        .filter(|agent| {
+            matches!(
+                agent.status,
+                SessionStatus::Starting | SessionStatus::Running
+            )
+        })
+        .count();
+    let waiting = collaborators
+        .iter()
+        .filter(|agent| {
+            matches!(
+                agent.status,
+                SessionStatus::Ready | SessionStatus::WaitingForApproval
+            )
+        })
+        .count();
+    let total = active + waiting;
+    if total == 0 {
+        return None;
+    }
+    let state = if active > 0 { "active" } else { "waiting" };
+    let mut label = format!(
+        "↔ {total} collaborator{} {state}",
+        if total == 1 { "" } else { "s" }
+    );
+    if total == 1
+        && let Some(agent) = collaborators.iter().find(|agent| {
+            matches!(
+                agent.status,
+                SessionStatus::Starting
+                    | SessionStatus::Running
+                    | SessionStatus::Ready
+                    | SessionStatus::WaitingForApproval
+            )
+        })
+    {
+        label.push_str(": ");
+        label.push_str(&truncate_table_cell(&agent.name, 24));
+    }
+    Some(label)
 }
 
 /// Waiting children are parked on their own work, so they count toward the
