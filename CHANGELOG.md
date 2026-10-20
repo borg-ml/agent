@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.18.0)
 
+- Avoid redundant Codex reasoning-effort updates when the request already uses
+  that effort, while preserving real historical effort transitions.
+
 - Retain known indexed Codex error field paths so rejected request forms can be
   diagnosed without logging private content or unknown parameter values.
 
