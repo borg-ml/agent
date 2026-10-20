@@ -471,6 +471,9 @@ pub fn reasoning_preview(source: &str) -> String {
         return title.chars().take(MAX_CHARS).collect();
     }
     let text = paragraph.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return String::new();
+    }
     let mut sentences = Vec::new();
     let mut start = 0;
     for (index, character) in text.char_indices() {
@@ -2593,10 +2596,13 @@ impl TranscriptCore {
                     // instance talking to this thread; it must always be
                     // visible so the user can see what the agent is replying to.
                     // Ownership is recorded on the receipt; only journals
-                    // that predate it fall back to the bounded child cache.
+                    // that predate it fall back to retained or compacted child IDs.
                     let from_peer = match from_child {
                         Some(from_child) => !from_child,
-                        None => !self.subagent_snapshots.contains_key(sender_id),
+                        None => {
+                            !self.subagent_snapshots.contains_key(sender_id)
+                                && !self.pruned_settled_children.contains(sender_id)
+                        }
                     };
                     if from_peer {
                         self.order.push(TranscriptEntry::Action {
@@ -4315,6 +4321,16 @@ impl TranscriptCore {
         let Some(agent) = self.effective_subagent_snapshot(child_id) else {
             return;
         };
+        // Ordinary lifecycle updates belong in the roster, not the conversation.
+        let create_missing = create_missing
+            && (self.show_subagent_messages
+                || matches!(
+                    agent.lifecycle(),
+                    SubagentLifecycle::Failed | SubagentLifecycle::WaitingForApproval
+                ));
+        if !create_missing && !self.subagent_entries.contains_key(&child_id) {
+            return;
+        }
         let Some((label, detail, body, state)) =
             subagent_action_projection(SubagentActivityKind::Updated, &agent, None)
         else {
@@ -4349,7 +4365,8 @@ impl TranscriptCore {
                 }
                 return;
             }
-        } else if !create_missing {
+        }
+        if !create_missing {
             return;
         }
         self.subagent_entries.insert(child_id, self.order.len());

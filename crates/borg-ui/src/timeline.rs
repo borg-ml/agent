@@ -384,7 +384,7 @@ mod tests {
     // report boundary or stale delivery could contradict the roster. Type
     // checks cannot protect this live/replay and privacy contract.
     #[test]
-    fn worker_cards_follow_shared_lifecycle_and_keep_reports_private_in_live_and_replay() {
+    fn worker_status_stays_in_roster_until_attention_is_needed_live_and_replay() {
         use borg_remote::{
             SubagentActivityKind, SubagentLifecycle, SubagentSourceCursor, SubagentStatus,
             SubagentUsage,
@@ -491,13 +491,24 @@ mod tests {
             live.push(&event);
             events.push(event);
             let replay = project_timeline(&events);
-            assert_eq!(live.entries.len(), 1);
-            assert_eq!(live.entries[0].as_ref(), &replay[0]);
-            let card = &live.entries[0];
-            assert_eq!(card.id, format!("{}:0", events[0].id));
-            assert_eq!(card.target_session_id, Some(child));
-            assert_eq!((card.running, card.failed), (running, failed));
-            assert!(card.body.is_empty());
+            assert_eq!(live.entries.len(), usize::from(failed));
+            assert_eq!(
+                live.entries.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+                replay.iter().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                live.core
+                    .effective_subagent_snapshot(child)
+                    .unwrap()
+                    .lifecycle(),
+                lifecycle
+            );
+            if let Some(card) = live.entries.first() {
+                assert_eq!(card.id, format!("{}:0", events.last().unwrap().id));
+                assert_eq!(card.target_session_id, Some(child));
+                assert_eq!((card.running, card.failed), (running, failed));
+                assert!(card.body.is_empty());
+            }
         }
         let current = Arc::clone(&live.entries[0]);
         let mut stale = events[0].clone();

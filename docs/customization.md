@@ -157,9 +157,10 @@ background windows. Replayed session history never produces alerts.
 
 ## Subagent messages
 
-The parent/director transcript hides subagent messages and report bodies by
-default. Lifecycle indicators, approval and failure details remain visible,
-and focused child transcripts retain their full conversations.
+The parent/director transcript hides subagent messages, report bodies, and
+ordinary lifecycle status rows by default. Current lifecycle indicators stay
+in the roster; approvals and failures remain visible in the conversation.
+Focused child transcripts retain their full conversations.
 
 Launch with `BORG_TUI_SHOW_SUBAGENT_MESSAGES=1 borg` to show subagent messages
 in the parent transcript too. The values `true`, `yes`, and `on` also enable

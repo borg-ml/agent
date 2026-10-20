@@ -13027,11 +13027,6 @@ fn replace_root_transcript_history(
     } else {
         &*transcript
     };
-    let reconciled_subagents = previous
-        .subagent_snapshots
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
     let reconciled_usage = previous.session_usage.clone();
     let display_events = transcript_history_in_display_order(events);
     let mut replacement = fresh_transcript_like(previous);
@@ -13043,7 +13038,8 @@ fn replace_root_transcript_history(
     }
     replacement.agent_plans = previous.agent_plans.clone();
     replacement.reserve_history(display_events.len());
-    for agent in &reconciled_subagents {
+    replacement.pruned_settled_children = previous.pruned_settled_children.clone();
+    for agent in previous.subagent_snapshots.values() {
         replacement.upsert_subagent_snapshot(agent);
     }
     for event in &display_events {
@@ -13090,19 +13086,13 @@ fn replace_root_transcript_history(
         }
     }
     replacement.session_usage = reconciled_usage;
-    // Older-page hydration rebuilds the root transcript. It may contain the
-    // parent's last pre-crash Running mirror even though child hydration has
-    // already reconciled that child to Ready/Stopped. Historical rows may
-    // expand the transcript, but may never regress a newer roster snapshot.
-    for agent in reconciled_subagents {
-        let should_preserve = replacement
-            .subagent_snapshots
-            .get(&agent.session_id)
-            .is_none_or(|historical| agent.updated_at >= historical.updated_at);
-        if should_preserve {
-            replacement.upsert_subagent_snapshot(&agent);
-        }
-    }
+    // Paging changes conversation rows, not the live roster. Preserve both
+    // retained snapshots and compacted inactive IDs, including child overlays.
+    replacement.subagent_snapshots = previous.subagent_snapshots.clone();
+    replacement.subagents = previous.subagents.clone();
+    replacement.pruned_settled_children = previous.pruned_settled_children.clone();
+    replacement.child_meta_refs = previous.child_meta_refs.clone();
+    replacement.agent_names = previous.agent_names.clone();
     if child_is_focused {
         *director_transcript = Some(Box::new(replacement));
         false

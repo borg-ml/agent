@@ -400,6 +400,116 @@ fn older_root_history_hides_agent_cards_and_preserves_authoritative_roster_state
 }
 
 #[test]
+fn paging_history_keeps_the_full_inactive_roster_without_status_spam() {
+    let root = Uuid::new_v4();
+    let now = Utc::now();
+    let agents = (0..172)
+        .map(|index| SubagentSnapshot {
+            lifecycle: Some(borg_remote::SubagentLifecycle::Dormant),
+            source: Some(borg_remote::SubagentSourceCursor {
+                child_sequence: 2,
+                revision: 2,
+            }),
+            desktop: false,
+            session_id: Uuid::new_v4(),
+            parent_session_id: root,
+            task_name: format!("/root/worker_{index}"),
+            status: SubagentStatus::Ready,
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+            ultrafast: false,
+            cwd: PathBuf::from("/workspace"),
+            created_at: now,
+            updated_at: now + chrono::Duration::seconds(index),
+            detail: Some("Paused with the parent session; follow up to wake".into()),
+            final_text: None,
+            usage: Default::default(),
+            interrupted_by: None,
+        })
+        .collect::<Vec<_>>();
+    for child_focused in [false, true] {
+        let mut current = Transcript::default();
+        for agent in &agents {
+            current.upsert_subagent_snapshot(agent);
+        }
+        current.prune_child_metadata();
+        assert_eq!(current.subagent_snapshots.len(), 64);
+        assert_eq!(current.inactive_subagent_count(), 172);
+        let pruned = current.pruned_settled_children.clone();
+        let mut old = agents[0].clone();
+        assert!(pruned.contains(&old.session_id));
+        old.status = SubagentStatus::Running;
+        old.lifecycle = Some(borg_remote::SubagentLifecycle::Running);
+        old.source = Some(borg_remote::SubagentSourceCursor {
+            child_sequence: 1,
+            revision: 1,
+        });
+        let history = [
+            SessionEvent::new(
+                root,
+                1,
+                SessionEventKind::SubagentActivity {
+                    activity: SubagentActivityKind::Started,
+                    agent: old,
+                    event: None,
+                },
+            ),
+            SessionEvent::new(
+                root,
+                2,
+                SessionEventKind::AgentMessageReceived {
+                    message_id: Uuid::new_v4(),
+                    sender_id: agents[0].session_id,
+                    sender_name: "worker_0".into(),
+                    text: "private child report".into(),
+                    from_child: None,
+                },
+            ),
+            SessionEvent::new(
+                root,
+                3,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: "actual conversation".into(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ),
+        ];
+        let (mut displayed, mut director) = if child_focused {
+            (new_child_transcript(), Some(Box::new(current)))
+        } else {
+            (current, None)
+        };
+        for _ in 0..3 {
+            replace_root_transcript_history(&mut displayed, &mut director, child_focused, &history);
+            let root_view = director.as_deref_mut().unwrap_or(&mut displayed);
+            assert_eq!(root_view.inactive_subagent_count(), 172);
+            assert_eq!(root_view.active_subagent_count(), 0);
+            assert_eq!(root_view.pruned_settled_children, pruned);
+            assert_eq!(root_view.order.len(), 1);
+            for agent in &agents {
+                root_view.apply(&SessionEvent::new(
+                    root,
+                    0,
+                    SessionEventKind::SubagentActivity {
+                        activity: SubagentActivityKind::Updated,
+                        agent: agent.clone(),
+                        event: None,
+                    },
+                ));
+                assert_eq!(root_view.inactive_subagent_count(), 172);
+                assert_eq!(root_view.order.len(), 1);
+            }
+        }
+    }
+}
+
+#[test]
 fn resumed_history_with_roster_hides_child_reports_and_keeps_peers_in_order() {
     let root = Uuid::new_v4();
     let child = Uuid::new_v4();
@@ -9152,7 +9262,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
 }
 
 #[test]
-fn subagent_activity_keeps_one_summary_without_embedded_child_bodies() {
+fn ordinary_subagent_status_stays_in_roster_without_embedded_child_bodies() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
     let now = chrono::Utc::now();
@@ -9209,7 +9319,7 @@ fn subagent_activity_keeps_one_summary_without_embedded_child_bodies() {
         ))),
     ));
 
-    assert_eq!(transcript.order.len(), 1);
+    assert!(transcript.order.is_empty());
     assert_eq!(transcript.active_subagent_count(), 1);
     assert_eq!(
         transcript.subagent_snapshots[&child_id].task_name,
@@ -9237,7 +9347,7 @@ fn subagent_activity_keeps_one_summary_without_embedded_child_bodies() {
     transcript.apply(&receipt);
 
     // No explicit received-message row is added, yet delivery/dedup tracking runs.
-    assert_eq!(transcript.order.len(), 1);
+    assert!(transcript.order.is_empty());
     assert!(transcript.agent_messages.contains(&receipt_id));
     assert!(transcript.agent_message_senders.contains(&child_id));
 
@@ -9248,10 +9358,10 @@ fn subagent_activity_keeps_one_summary_without_embedded_child_bodies() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(!rendered.contains("Found the renderer issue"), "{rendered}");
-    assert!(rendered.contains("working"), "{rendered}");
+    assert!(!rendered.contains("working"), "{rendered}");
 
     transcript.apply(&activity(4, SubagentActivityKind::Completed, None));
-    assert_eq!(transcript.order.len(), 1);
+    assert!(transcript.order.is_empty());
     assert_eq!(transcript.active_subagent_count(), 0);
     assert_eq!(
         transcript.subagent_snapshots[&child_id].status,
@@ -9268,7 +9378,7 @@ fn subagent_activity_keeps_one_summary_without_embedded_child_bodies() {
     assert!(fresh_transcript_like(&child).show_subagent_messages);
     assert!(!fresh_transcript_like(&transcript).show_subagent_messages);
 
-    for kind in [
+    for (index, kind) in [
         SessionEventKind::ApprovalRequested {
             approval_id: "approval".to_string(),
             title: "Review command".to_string(),
@@ -9280,21 +9390,29 @@ fn subagent_activity_keeps_one_summary_without_embedded_child_bodies() {
             status: SessionStatus::Ready,
             detail: Some("turn failed: Needs your attention".to_string()),
         },
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         transcript.apply(&activity(
-            4,
+            5 + index as u64,
             SubagentActivityKind::Updated,
-            Some(Box::new(SessionEvent::new(child_id, 2, kind))),
+            Some(Box::new(SessionEvent::new(
+                child_id,
+                2 + index as u64,
+                kind,
+            ))),
         ));
         assert!(matches!(
             &transcript.order[0],
-            TranscriptEntry::Action { body: None, .. }
+            TranscriptEntry::Action { body: None, execution, .. }
+                if execution.state() == if index == 0 { TranscriptActionState::Waiting } else { TranscriptActionState::Failed }
         ));
     }
 }
 
 #[test]
-fn ready_subagent_status_is_a_single_body_free_summary() {
+fn ready_subagent_status_stays_in_the_roster() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
     let now = Utc::now();
@@ -9368,11 +9486,7 @@ fn ready_subagent_status_is_a_single_body_free_summary() {
     );
     transcript.apply(&ready);
 
-    assert_eq!(transcript.order.len(), 1);
-    assert!(matches!(
-        &transcript.order[0],
-        TranscriptEntry::Action { body: None, .. }
-    ));
+    assert!(transcript.order.is_empty());
     assert_eq!(transcript.active_subagent_count(), 0);
     assert_eq!(
         transcript.subagent_snapshots[&child_id].status,
@@ -14791,6 +14905,33 @@ fn sticky_tool_run_header_row_covers_only_overflowing_boxes() {
 #[test]
 fn singleton_reasoning_stays_solo_beside_a_styled_expandable_wait_group() {
     let session_id = Uuid::new_v4();
+    let mut empty = Transcript::default();
+    let reasoning_id = Uuid::new_v4();
+    empty.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ReasoningBlockStarted { reasoning_id },
+    ));
+    empty.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ReasoningBlockSnapshot {
+            reasoning_id,
+            text: " \n".into(),
+        },
+    ));
+    empty.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ReasoningBlockCompleted { reasoning_id },
+    ));
+    let empty_rows = empty.lines(100);
+    let completed = empty_rows
+        .iter()
+        .find(|row| row.to_string().contains("Reasoned"))
+        .unwrap()
+        .to_string();
+    assert!(!completed.contains('…'), "{completed}");
     let mut transcript = Transcript::default();
     transcript.apply(&SessionEvent::new(
         session_id,

@@ -1344,7 +1344,7 @@ mod tests {
     // Regression: bootstrap recovery may be newer than a bounded transcript,
     // and a later-delivered stale activity must not roll either surface back.
     #[test]
-    fn canonical_root_roster_repairs_bounded_cards_without_stale_rollback() {
+    fn canonical_root_roster_stays_current_without_lifecycle_cards() {
         use borg_remote::{SubagentLifecycle, SubagentSourceCursor};
         let root = Uuid::new_v4();
         let child = Uuid::new_v4();
@@ -1373,14 +1373,10 @@ mod tests {
         let mut timeline = TimelineProjector::from_events(&[old.clone()]);
         timeline.seed_subagents(&team_agents(&team));
         let entries = timeline.into_entries();
-        assert_eq!(entries.len(), 2);
         assert!(
-            !entries[0].running,
-            "the completed execution stays terminal"
+            entries.is_empty(),
+            "roster recovery must not create conversation cards"
         );
-        assert!(entries[1].running);
-        assert_ne!(entries[0].id, entries[1].id);
-        assert_eq!(entries[1].target_session_id, Some(child));
         assert_eq!(
             team_agents(&team)[0].lifecycle(),
             SubagentLifecycle::Running

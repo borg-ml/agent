@@ -361,6 +361,7 @@ fn worker_lifecycle_is_independent_of_reports_and_stale_deliveries() {
         )
     };
     let mut live = ViewReducer::new(parent, "live".into());
+    live.core.show_subagent_messages = true;
     let mut history = vec![event(1, &agent, None)];
     live.apply(history[0].clone());
     agent.source = Some(SubagentSourceCursor {
@@ -443,6 +444,7 @@ fn worker_lifecycle_is_independent_of_reports_and_stale_deliveries() {
         } if execution.state() == borg_view::entry::ExecutionState::Waiting
     ));
     let mut replay = ViewReducer::new(parent, "replay".into());
+    replay.core.show_subagent_messages = true;
     for event in history {
         replay.apply(event);
     }

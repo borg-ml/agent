@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.18.0)
 
+- Remove the empty ellipsis placeholder after completed “Reasoned” rows.
+
+- Keep the inactive-agent count stable while paging conversation history,
+  including teams larger than the bounded roster cache. Keep ordinary agent
+  status updates out of the conversation; approvals and failures remain visible.
+
 - Stop image-capability detection from leaving a timed-out stdin reader that
   can swallow the first keystroke or click. Select image previews from terminal
   hints and pixel geometry without competing with the input reader.
