@@ -463,7 +463,7 @@ fn paging_history_keeps_the_full_inactive_roster_without_status_spam() {
                     message_id: Uuid::new_v4(),
                     sender_id: agents[0].session_id,
                     sender_name: "worker_0".into(),
-                    text: "private child report".into(),
+                    text: "child response".into(),
                     from_child: None,
                 },
             ),
@@ -491,7 +491,7 @@ fn paging_history_keeps_the_full_inactive_roster_without_status_spam() {
             assert_eq!(root_view.inactive_subagent_count(), 172);
             assert_eq!(root_view.active_subagent_count(), 0);
             assert_eq!(root_view.pruned_settled_children, pruned);
-            assert_eq!(root_view.order.len(), 1);
+            assert_eq!(root_view.order.len(), 2);
             for agent in &agents {
                 root_view.apply(&SessionEvent::new(
                     root,
@@ -503,14 +503,14 @@ fn paging_history_keeps_the_full_inactive_roster_without_status_spam() {
                     },
                 ));
                 assert_eq!(root_view.inactive_subagent_count(), 172);
-                assert_eq!(root_view.order.len(), 1);
+                assert_eq!(root_view.order.len(), 2);
             }
         }
     }
 }
 
 #[test]
-fn resumed_history_with_roster_hides_child_reports_and_keeps_peers_in_order() {
+fn resumed_history_keeps_child_and_peer_messages_in_order() {
     let root = Uuid::new_v4();
     let child = Uuid::new_v4();
     let peer = Uuid::new_v4();
@@ -591,10 +591,14 @@ fn resumed_history_with_roster_hides_child_reports_and_keeps_peers_in_order() {
             _ => "other",
         })
         .collect::<Vec<_>>();
-    assert_eq!(visible, ["before", "peer report", "after"]);
+    assert_eq!(visible, ["before", "child report", "peer report", "after"]);
     assert!(matches!(
         &transcript.order[1],
-        TranscriptEntry::Action { label, .. } if label == "Peer"
+        TranscriptEntry::Action { label, expanded: true, .. } if label == "Agent"
+    ));
+    assert!(matches!(
+        &transcript.order[2],
+        TranscriptEntry::Action { label, expanded: true, .. } if label == "Peer"
     ));
     assert!(transcript.subagent_snapshots.contains_key(&child));
 }
@@ -9202,7 +9206,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
             },
         ))),
     ));
-    assert_eq!(transcript.order.len(), 1);
+    assert_eq!(transcript.order.len(), 2);
     assert!(matches!(
         &transcript.order[0],
         TranscriptEntry::Action {
@@ -9227,7 +9231,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
     agent.final_text = Some("Found the renderer issue.\nExtra detail".to_string());
     transcript.apply(&activity(6, SubagentActivityKind::Completed, &agent, None));
 
-    assert_eq!(transcript.order.len(), 1);
+    assert_eq!(transcript.order.len(), 2);
     assert_eq!(transcript.active_subagent_count(), 0);
     assert_eq!(transcript.subagents[&child_id], SubagentStatus::Ready);
     assert_eq!(
@@ -9252,7 +9256,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert_eq!(rendered.matches("Found the renderer issue.").count(), 0);
+    assert_eq!(rendered.matches("Found the renderer issue.").count(), 1);
     assert!(
         transcript.subagent_snapshots[&child_id]
             .final_text
@@ -9346,8 +9350,8 @@ fn ordinary_subagent_status_stays_in_roster_without_embedded_child_bodies() {
     );
     transcript.apply(&receipt);
 
-    // No explicit received-message row is added, yet delivery/dedup tracking runs.
-    assert!(transcript.order.is_empty());
+    // The explicit receipt is visible without mirroring the child transcript.
+    assert_eq!(transcript.order.len(), 1);
     assert!(transcript.agent_messages.contains(&receipt_id));
     assert!(transcript.agent_message_senders.contains(&child_id));
 
@@ -9357,11 +9361,15 @@ fn ordinary_subagent_status_stays_in_roster_without_embedded_child_bodies() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(!rendered.contains("Found the renderer issue"), "{rendered}");
+    assert!(rendered.contains("Found the renderer issue."), "{rendered}");
+    assert!(
+        !rendered.contains("without another user prompt"),
+        "{rendered}"
+    );
     assert!(!rendered.contains("working"), "{rendered}");
 
     transcript.apply(&activity(4, SubagentActivityKind::Completed, None));
-    assert!(transcript.order.is_empty());
+    assert_eq!(transcript.order.len(), 1);
     assert_eq!(transcript.active_subagent_count(), 0);
     assert_eq!(
         transcript.subagent_snapshots[&child_id].status,
@@ -9403,8 +9411,9 @@ fn ordinary_subagent_status_stays_in_roster_without_embedded_child_bodies() {
                 kind,
             ))),
         ));
+        assert_eq!(transcript.order.len(), 2);
         assert!(matches!(
-            &transcript.order[0],
+            &transcript.order[1],
             TranscriptEntry::Action { body: None, execution, .. }
                 if execution.state() == if index == 0 { TranscriptActionState::Waiting } else { TranscriptActionState::Failed }
         ));
@@ -19765,9 +19774,15 @@ fn reasoning_started_provider_event_changes_the_transcript() {
 }
 
 #[test]
-fn peer_agent_message_is_visible_without_subagent_opt_in() {
-    let session_id = Uuid::new_v4();
-    let peer = SessionEvent::new(
+fn incoming_agent_messages_are_visible_without_subagent_opt_in() {
+    for from_child in [Some(true), Some(false), None] {
+        let label = if from_child == Some(true) {
+            "Agent"
+        } else {
+            "Peer"
+        };
+        let session_id = Uuid::new_v4();
+        let peer = SessionEvent::new(
         session_id,
         1,
         SessionEventKind::AgentMessageReceived {
@@ -19775,81 +19790,83 @@ fn peer_agent_message_is_visible_without_subagent_opt_in() {
             sender_id: Uuid::new_v4(),
             sender_name: "agent".to_string(),
             text: "From session 94a66b94: steer orphaning confirmed.\nSecond line\nThird line\nREPORT_END".to_string(),
-            from_child: None,
+            from_child,
         },
     );
-    // Default transcript: child subagent reports are hidden ...
-    let mut transcript = Transcript::default();
-    assert!(!transcript.show_subagent_messages);
-    transcript.apply(&peer);
-    // Single-line by default: the row carries the message's first line.
-    let single = transcript
-        .lines(100)
-        .into_iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>();
-    assert!(
-        single
-            .iter()
-            .any(|line| line.contains("↙ Peer") && line.contains("steer orphaning")),
-        "{single:?}"
-    );
-    transcript.wrap_action_rows = true;
-    let rendered = transcript
-        .lines(100)
-        .into_iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    // ... but a message from a sender that is not one of our children is a
-    // peer Borg instance and always renders.
-    assert!(rendered.contains("Peer"), "{rendered}");
-    assert!(rendered.contains("steer orphaning confirmed"), "{rendered}");
-    assert!(!rendered.contains("REPORT_END"), "{rendered}");
-    assert!(
-        !rendered.contains("click to open full screen"),
-        "{rendered}"
-    );
-    assert_eq!(
-        transcript.entry_click_hint(0),
-        Some("click open full screen")
-    );
-    assert!(
-        transcript.order[0]
-            .copy_text_owned()
-            .unwrap()
-            .contains("REPORT_END")
-    );
-    transcript.tool_click_behavior = ToolClickBehavior::Inline;
-    let render = |transcript: &Transcript| {
-        transcript
+        // Explicit receipts are visible without enabling automatic lifecycle cards.
+        let mut transcript = Transcript::default();
+        assert!(!transcript.show_subagent_messages);
+        transcript.apply(&peer);
+        // The sender and complete message are visible by default.
+        let single = transcript
             .lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            single
+                .iter()
+                .any(|line| line.contains(&format!("↙ {label}"))),
+            "{single:?}"
+        );
+        transcript.wrap_action_rows = true;
+        let rendered = transcript
+            .lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains(label), "{rendered}");
+        assert!(rendered.contains("steer orphaning confirmed"), "{rendered}");
+        assert!(rendered.contains("REPORT_END"), "{rendered}");
+        assert!(
+            !rendered.contains("click to open full screen"),
+            "{rendered}"
+        );
+        assert_eq!(
+            transcript.entry_click_hint(0),
+            Some("click open full screen")
+        );
+        assert!(
+            transcript.order[0]
+                .copy_text_owned()
+                .unwrap()
+                .contains("REPORT_END")
+        );
+        transcript.tool_click_behavior = ToolClickBehavior::Inline;
+        let render = |transcript: &Transcript| {
+            transcript
+                .lines(100)
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(transcript.entry_click_hint(0), Some("click collapse"));
+        transcript.toggle_action_expansion(0);
+        assert!(!render(&transcript).contains("REPORT_END"));
+        assert_eq!(transcript.entry_click_hint(0), Some("click expand"));
+        transcript.toggle_action_expansion(0);
+        let expanded = render(&transcript);
+        assert!(expanded.contains("REPORT_END"));
+        assert!(!expanded.contains("click to"), "{expanded}");
+        assert_eq!(transcript.entry_click_hint(0), Some("click collapse"));
+        transcript.tool_click_behavior = ToolClickBehavior::Fullscreen;
+        assert_eq!(
+            transcript.entry_click_hint(0),
+            Some("click open full screen")
+        );
+        transcript.toggle_action_expansion(0);
+        let focused = transcript
+            .render_tool_for_cache(0, 100, 40)
+            .0
             .iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
-            .join(" ")
-    };
-    assert_eq!(transcript.entry_click_hint(0), Some("click expand"));
-    transcript.toggle_action_expansion(0);
-    let expanded = render(&transcript);
-    assert!(expanded.contains("REPORT_END"));
-    assert!(!expanded.contains("click to"), "{expanded}");
-    assert_eq!(transcript.entry_click_hint(0), Some("click collapse"));
-    transcript.tool_click_behavior = ToolClickBehavior::Fullscreen;
-    assert_eq!(
-        transcript.entry_click_hint(0),
-        Some("click open full screen")
-    );
-    transcript.toggle_action_expansion(0);
-    let focused = transcript
-        .render_tool_for_cache(0, 100, 40)
-        .0
-        .iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-    assert!(focused.contains("REPORT_END"));
-    assert!(!focused.contains("click to"));
+            .join(" ");
+        assert!(focused.contains("REPORT_END"));
+        assert!(!focused.contains("click to"));
+    }
 }
 
 #[test]

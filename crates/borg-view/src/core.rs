@@ -2590,13 +2590,8 @@ impl TranscriptCore {
                 if self.remember_agent_message(*message_id) {
                     self.agent_message_senders.insert(*sender_id);
 
-                    // Child subagent reports are opt-in (they are summarised
-                    // by the parent turn). A message from a sender that is
-                    // not one of this session's children is a peer Borg
-                    // instance talking to this thread; it must always be
-                    // visible so the user can see what the agent is replying to.
-                    // Ownership is recorded on the receipt; only journals
-                    // that predate it fall back to retained or compacted child IDs.
+                    // Explicit receipts are conversation messages, not automatic
+                    // child-transcript mirrors. Ownership labels them, never hides them.
                     let from_peer = match from_child {
                         Some(from_child) => !from_child,
                         None => {
@@ -2604,33 +2599,29 @@ impl TranscriptCore {
                                 && !self.pruned_settled_children.contains(sender_id)
                         }
                     };
-                    if from_peer {
-                        self.order.push(TranscriptEntry::Action {
-                            source_session_id: None,
-                            kind: TranscriptActionKind::Agent,
-                            label: if from_peer { "Peer" } else { "Agent" }.to_string(),
-                            detail: if sender_name.trim().is_empty() {
-                                self.agent_names
-                                    .get(sender_id)
-                                    .cloned()
-                                    .unwrap_or_else(|| "agent".to_string())
-                            } else {
-                                sender_name.clone()
-                            },
-                            body: Some(text.clone()),
-                            time: local_event_time(event),
-                            execution: Execution::new(
-                                event.created_at,
-                                TranscriptActionState::Received,
-                            ),
-                            expanded: !from_peer,
-                        });
-                        row_created = true;
-                    }
+                    self.order.push(TranscriptEntry::Action {
+                        source_session_id: None,
+                        kind: TranscriptActionKind::Agent,
+                        label: if from_peer { "Peer" } else { "Agent" }.to_string(),
+                        detail: if sender_name.trim().is_empty() {
+                            self.agent_names
+                                .get(sender_id)
+                                .cloned()
+                                .unwrap_or_else(|| "agent".to_string())
+                        } else {
+                            sender_name.clone()
+                        },
+                        body: Some(text.clone()),
+                        time: local_event_time(event),
+                        execution: Execution::new(
+                            event.created_at,
+                            TranscriptActionState::Received,
+                        ),
+                        expanded: true,
+                    });
+                    row_created = true;
                 }
-                // observe_meta recorded the source before knowing whether a row
-                // exists; a hidden child report has none, so nothing would ever
-                // evict its entry.
+                // Duplicate receipts have no new row to own their source metadata.
                 if !row_created {
                     self.team_report_sources.remove(&event.id);
                 }

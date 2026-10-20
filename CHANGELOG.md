@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.18.0)
 
+- Show explicit incoming child-agent and peer messages, expanded by default,
+  in live conversation and replay. Keep routine lifecycle updates separate.
+
 - Remove the empty ellipsis placeholder after completed “Reasoned” rows.
 
 - Keep the inactive-agent count stable while paging conversation history,

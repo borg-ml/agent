@@ -519,7 +519,7 @@ mod tests {
         assert!(Arc::ptr_eq(&current, &live.entries[0]));
 
         for (from_child, text) in [
-            (true, "private child receipt"),
+            (true, "visible child receipt"),
             (false, "**visible peer report**"),
         ] {
             let event = SessionEvent::new(
@@ -538,10 +538,11 @@ mod tests {
         }
         let replay = project_timeline(&events);
         assert_eq!(live.into_entries(), replay);
-        assert_eq!(replay.len(), 2);
-        assert_eq!(replay[1].body, "**visible peer report**");
-        assert!(replay[1].rich_body.is_some());
-        assert_eq!(replay[1].target_session_id, None);
+        assert_eq!(replay.len(), 3);
+        assert_eq!(replay[1].body, "visible child receipt");
+        assert_eq!(replay[2].body, "**visible peer report**");
+        assert!(replay[2].rich_body.is_some());
+        assert_eq!(replay[2].target_session_id, None);
 
         // The root roster is still shown when focusing a child, but siblings
         // are peers, not that child's private subagents (including old receipts).

@@ -287,11 +287,10 @@ fn parent_has_one_child_summary_and_source_scoped_approval_without_child_bodies(
     );
 }
 
-/// A child report must stay private even when the reducer no longer holds
-/// the child's snapshot (bounded cache eviction or a cold replay that starts
-/// after the child was spawned); only a genuine peer message becomes visible.
+/// Explicit child and peer receipts remain visible even when the child's
+/// snapshot is absent after bounded eviction or cold replay.
 #[test]
-fn recorded_child_ownership_hides_reports_from_uncached_children() {
+fn explicit_child_and_peer_messages_show_without_cached_children() {
     let parent = Uuid::new_v4();
     let mut reducer = ViewReducer::new(parent, "epoch".into());
     let receipt = |sequence, text: &str, from_child| {
@@ -307,10 +306,10 @@ fn recorded_child_ownership_hides_reports_from_uncached_children() {
             },
         )
     };
-    reducer.apply(receipt(1, "PRIVATE CHILD REPORT", true));
+    reducer.apply(receipt(1, "visible child report", true));
     reducer.apply(receipt(2, "visible peer note", false));
     let snapshot = serde_json::to_string(&reducer.snapshot()).unwrap();
-    assert!(!snapshot.contains("PRIVATE CHILD REPORT"));
+    assert!(snapshot.contains("visible child report"));
     assert!(snapshot.contains("visible peer note"));
 }
 
