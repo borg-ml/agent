@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.18.0)
 
+- Skip full process-journal replay when a restored session has no active
+  processes, avoiding provider-startup timeouts in long-lived sessions.
+
 - Resolve journal ownership from the OS when username environment variables are
   missing, rather than registering a false owner that blocks session startup.
 

@@ -736,6 +736,9 @@ impl ProcessManager {
         session_id: Uuid,
         store: std::sync::Arc<dyn crate::SessionStore>,
     ) -> Result<()> {
+        if store.state(session_id).await?.active_processes.is_empty() {
+            return Ok(());
+        }
         let processes = replay_process_events(&store.read(session_id).await?);
         for process in processes.into_values().filter(|process| !process.completed) {
             if self.has_process(session_id, process.process_id) {
