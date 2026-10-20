@@ -7358,6 +7358,12 @@ impl BorgTerminal {
                     && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
                     && let Some(index) = self.hovered_tool
                 {
+                    if let Some(tool_call_id) = self.transcript.foreground_action_id(index) {
+                        return Ok(UiAction::BackgroundAction {
+                            target: self.focused_child.unwrap_or(self.session_id),
+                            tool_call_id,
+                        });
+                    }
                     let payloads = self.transcript.tool_payloads(index);
                     if payloads.is_empty() {
                         return Ok(self
@@ -8201,12 +8207,6 @@ impl BorgTerminal {
                 self.invalidate_transcript_render_cache();
             }
             PendingTranscriptClick::Tool { index, run } => {
-                if let Some(tool_call_id) = self.transcript.foreground_action_id(index) {
-                    return UiAction::BackgroundAction {
-                        target: self.focused_child.unwrap_or(self.session_id),
-                        tool_call_id,
-                    };
-                }
                 if self.open_message_thread(index) {
                     return UiAction::None;
                 }
@@ -9348,7 +9348,7 @@ impl BorgTerminal {
                         .as_deref()
                         .unwrap_or(&self.transcript);
                     if self.transcript.foreground_action_id(index).is_some() {
-                        Some("click send to background")
+                        Some("click inspect · right-click send to background")
                     } else if message_thread_target(
                         &self.transcript,
                         index,
@@ -16007,11 +16007,12 @@ fn finish_text_selection(
         selection.dragging = false;
         selection.autoscroll = 0;
     }
-    let click = empty.then(|| pending_click.take()).flatten();
-    if empty {
+    // A drag clears the pending click, so one that survives to release was a
+    // click even if live output moved the text under a still pointer.
+    let click = pending_click.take();
+    if empty || click.is_some() {
         *selection = None;
     }
-    *pending_click = None;
     click
 }
 

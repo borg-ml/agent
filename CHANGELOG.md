@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.18.2)
 
+- Left-click on a running action now opens it like any other action;
+  right-click sends it to the background. Clicks no longer get lost when new
+  output scrolls the conversation between press and release.
+
 ## 0.18.2 (2026-10-20)
 
 - Update TLS certificate verification and bundled roots to reject distrusted

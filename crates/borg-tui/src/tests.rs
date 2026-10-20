@@ -17101,7 +17101,17 @@ fn click_release_runs_the_deferred_action_but_drag_release_keeps_selection() {
         autoscroll: -1,
         pointer: Position::new(5, 8),
     });
+    // Live output can move the text under a pointer that never dragged.
+    let mut moved_selection = drag_selection;
     let mut pending_click = Some(PendingTranscriptClick::Message(2));
+    assert!(matches!(
+        finish_text_selection(&mut moved_selection, &mut pending_click),
+        Some(PendingTranscriptClick::Message(2))
+    ));
+    assert!(moved_selection.is_none());
+
+    // A drag clears the pending click before release.
+    let mut pending_click = None;
     assert!(finish_text_selection(&mut drag_selection, &mut pending_click).is_none());
     let selection = drag_selection.expect("non-empty selection remains");
     assert!(!selection.dragging);
@@ -21711,7 +21721,7 @@ async fn deferred_child_history_loads_on_focus_pages_back_and_keeps_live_events(
 
 #[tokio::test]
 #[ignore = "requires a PTY"]
-async fn running_action_click_backgrounds_once_and_completed_click_inspects() {
+async fn running_action_right_click_backgrounds_and_left_click_inspects() {
     let session = Uuid::new_v4();
     let directory = tempfile::tempdir().unwrap();
     let mut terminal = BorgTerminal::enter(
@@ -21722,6 +21732,19 @@ async fn running_action_click_backgrounds_once_and_completed_click_inspects() {
     )
     .unwrap();
     terminal.set_tool_click_behavior(ToolClickBehavior::Fullscreen);
+    // Enough history that the transcript follows its tail and new output scrolls rows.
+    terminal.apply_session_event(&SessionEvent::new(
+        session,
+        0,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: (0..200).map(|line| format!("line {line}\n\n")).collect(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    ));
     terminal.apply_session_event(&SessionEvent::new(
         session,
         1,
@@ -21734,13 +21757,60 @@ async fn running_action_click_backgrounds_once_and_completed_click_inspects() {
         },
     ));
     let index = terminal.transcript.tools["action"];
-    assert!(
-        matches!(terminal.run_pending_transcript_click(PendingTranscriptClick::Tool { index, run: None }), UiAction::BackgroundAction { target, tool_call_id } if target == session && tool_call_id == "action")
-    );
+    terminal.draw().unwrap();
+    let area = |terminal: &BorgTerminal| {
+        terminal
+            .tool_hit_areas
+            .iter()
+            .find(|(_, tool)| *tool == index)
+            .expect("the running action has a hit area")
+            .0
+    };
+    let mouse = |terminal: &mut BorgTerminal, area: Rect, kind| {
+        terminal
+            .handle_event(TerminalInputEvent {
+                event: Event::Mouse(MouseEvent {
+                    kind,
+                    column: area.x + 1,
+                    row: area.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                scroll_repetitions: 1,
+            })
+            .unwrap()
+    };
+    let pressed = area(&terminal);
+    mouse(&mut terminal, pressed, MouseEventKind::Down(MouseButton::Left));
+    // Output arriving between press and release must not turn the click into a selection.
+    terminal.apply_session_event(&SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "live output\nmore\nlines".into(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    ));
+    terminal.draw().unwrap();
+    assert!(matches!(
+        mouse(&mut terminal, pressed, MouseEventKind::Up(MouseButton::Left)),
+        UiAction::None
+    ));
+    assert!(terminal.is_inspecting_action());
+    terminal.close_tool_inspector();
+    terminal.draw().unwrap();
+    let row = area(&terminal);
+    assert!(matches!(
+        mouse(&mut terminal, row, MouseEventKind::Down(MouseButton::Right)),
+        UiAction::BackgroundAction { target, tool_call_id } if target == session && tool_call_id == "action"
+    ));
     let job = Uuid::new_v4();
     let completion = SessionEvent::new(
         session,
-        2,
+        3,
         SessionEventKind::ToolCompleted {
             tool_call_id: "action".into(),
             output: serde_json::json!({"running":true,"background":true,"watch_id":job})
@@ -21776,7 +21846,7 @@ async fn running_action_click_backgrounds_once_and_completed_click_inspects() {
     };
     terminal.apply_session_event(&SessionEvent::new(
         session,
-        3,
+        4,
         SessionEventKind::WatchesChanged {
             watches: vec![watch],
         },
