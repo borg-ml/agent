@@ -1348,13 +1348,13 @@ fn subscription_failure_message(
     if let Some(status) = status {
         message.push_str(&format!(" HTTP {}.", status.as_u16()));
     }
-    // Fixed tokens identify a rejected field without copying backend message
+    // Schema-known paths identify a rejected field without copying backend message
     // text, which may contain user content or account-specific details.
     let code = known_or_other(
         error["code"].as_str().or_else(|| error["type"].as_str()),
         &KNOWN_ERROR_CODES,
     );
-    let param = known_or_other(error["param"].as_str(), &KNOWN_ERROR_PARAMS);
+    let param = safe_error_param(error["param"].as_str());
     if code != "unknown" || param != "unknown" {
         message.push_str(&format!(" Provider error: code={code}, param={param}."));
         // The provider names the offending field in its own message, and
@@ -1904,6 +1904,116 @@ const KNOWN_ERROR_PARAMS: [&str; 15] = [
     "stream",
     "reasoning.summary",
 ];
+
+/// Keep schema-known request paths, never provider-supplied values or keys.
+fn safe_error_param(value: Option<&str>) -> &str {
+    let Some(param) = value else { return "unknown" };
+    if KNOWN_ERROR_PARAMS.contains(&param)
+        || matches!(param, "text.verbosity" | "reasoning.context")
+    {
+        return param;
+    }
+    let Some(mut path) = param
+        .strip_prefix("input")
+        .filter(|rest| rest.starts_with('['))
+    else {
+        return "other";
+    };
+    if param.len() > 160 {
+        return "other";
+    }
+    while !path.is_empty() {
+        if let Some(index) = path.strip_prefix('[') {
+            let Some(end) = index.find(']') else {
+                return "other";
+            };
+            if end == 0 || end > 6 || !index[..end].bytes().all(|b| b.is_ascii_digit()) {
+                return "other";
+            }
+            path = &index[end + 1..];
+        } else if let Some(field) = path.strip_prefix('.') {
+            let end = field.find(['.', '[']).unwrap_or(field.len());
+            if !matches!(
+                &field[..end],
+                "type"
+                    | "role"
+                    | "content"
+                    | "text"
+                    | "image_url"
+                    | "detail"
+                    | "encrypted_content"
+                    | "summary"
+                    | "status"
+                    | "id"
+                    | "call_id"
+                    | "name"
+                    | "arguments"
+                    | "output"
+                    | "reasoning"
+                    | "effort"
+                    | "tools"
+                    | "parameters"
+                    | "description"
+                    | "format"
+                    | "verbosity"
+            ) {
+                return "other";
+            }
+            path = &field[end..];
+        } else {
+            return "other";
+        }
+    }
+    param
+}
+
+#[cfg(test)]
+mod safe_error_param_tests {
+    use super::safe_error_param;
+
+    #[test]
+    fn failure_reports_the_indexed_field_but_not_the_rejected_value() {
+        let error = serde_json::json!({"code":"unsupported_value", "param":"input[3].type",
+            "message":"Unsupported value: 'private-account-content'."});
+        let message = super::subscription_failure_message(
+            Some(&error),
+            Some(reqwest::StatusCode::BAD_REQUEST),
+            None,
+        );
+        assert!(message.contains("code=unsupported_value, param=input[3].type"));
+        assert!(!message.contains("private-account-content"));
+    }
+
+    #[test]
+    fn indexed_schema_fields_survive_without_exposing_unknown_keys_or_values() {
+        for path in [
+            "input[3].type",
+            "input[12].content[0].type",
+            "input[0].encrypted_content",
+            "text.verbosity",
+            "reasoning.context",
+            "reasoning.effort",
+        ] {
+            assert_eq!(safe_error_param(Some(path)), path);
+        }
+        for unsafe_path in [
+            "private-account",
+            "input[0].private_account",
+            "input[secret].type",
+            "input[0].type: private-token",
+            "input[0].",
+            "input[0]private",
+            "input[].type",
+        ] {
+            assert_eq!(safe_error_param(Some(unsafe_path)), "other");
+        }
+        assert_eq!(
+            safe_error_param(Some(&format!("input{}", "[0]".repeat(60)))),
+            "other"
+        );
+        assert_eq!(safe_error_param(None), "unknown");
+    }
+}
 
 /// Reduce a backend string to a known token. Unrecognised values collapse to
 /// `other` and missing ones to `unknown`, so no backend-controlled text ever
