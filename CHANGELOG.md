@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.18.0)
 
+- Fix PostgreSQL pool maintenance spinning indefinitely after an idle-counter
+  race, which could peg CPU cores and prevent retired session hosts from exiting.
+
 ## 0.18.0 (2026-10-19)
 
 - Load a user-wide `~/.borg/AGENTS.md` (or `CLAUDE.md`) in every session, ahead
