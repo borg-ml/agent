@@ -46,6 +46,5 @@ allow = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-git = [
-    "https://github.com/blulang/blu.git",
-    "https://github.com/borg-ml/claude-agents.git",
+    "https://github.com/launchbadge/sqlx",
 ]

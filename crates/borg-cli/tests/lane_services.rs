@@ -723,8 +723,11 @@ fn kill_supervisor_mid_restart(
     defer: &ResourceKey,
     occupy_first_port: bool,
 ) -> (ServiceSpec, PathBuf, String, u16) {
-    let ports = free_ports(3);
-    let occupied = occupy_first_port.then(|| TcpListener::bind(("127.0.0.1", ports[1])).unwrap());
+    let occupied = occupy_first_port.then(|| TcpListener::bind("127.0.0.1:0").unwrap());
+    let mut ports = free_ports(3);
+    if let Some(listener) = &occupied {
+        ports[1] = listener.local_addr().unwrap().port();
+    }
     let slot = unique(&format!("{id}-slot"));
     f.capacity(&slot, 1);
     let slow = f.root().join(format!("{id}-start-delay"));

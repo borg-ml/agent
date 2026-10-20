@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.18.1)
 
+- Update TLS certificate verification and bundled roots to reject distrusted
+  emSign intermediates. Use the operating system certificate store for
+  collaboration relay WebSockets.
+- Restore release verification by allowing the pinned SQLx source and keeping
+  the restart test’s deliberately occupied port reserved.
+
 ## 0.18.1 (2026-10-20)
 
 - Show recent, live cross-instance collaborators in the terminal footer without
