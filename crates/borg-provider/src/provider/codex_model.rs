@@ -907,16 +907,7 @@ impl CodexModelProvider {
                     tool_calls,
                     ..
                 } => {
-                    if effort_updates
-                        && request_model.as_deref() == Some(&self.model)
-                        && let Some(effort) = effective_effort.as_deref()
-                        && Some(effort) != applied_effort
-                    {
-                        input.push(
-                            json!({"type":"configuration_update","reasoning":{"effort":effort}}),
-                        );
-                        applied_effort = Some(effort);
-                    }
+                    let output_start = input.len();
                     // Configuration is authored from Borg's durable request
                     // metadata, never from an assistant's output items.
                     input.extend(
@@ -933,6 +924,25 @@ impl CodexModelProvider {
                             })
                             .cloned(),
                     );
+                    if effort_updates
+                        && request_model.as_deref() == Some(&self.model)
+                        && let Some(effort) = effective_effort.as_deref()
+                        && Some(effort) != applied_effort
+                    {
+                        // Compaction supersedes earlier configuration. Apply a
+                        // required effort transition after it, not before it.
+                        let update_index = if output.iter().any(|item| item["type"] == "compaction")
+                        {
+                            input.len()
+                        } else {
+                            output_start
+                        };
+                        input.insert(
+                            update_index,
+                            json!({"type":"configuration_update","reasoning":{"effort":effort}}),
+                        );
+                        applied_effort = Some(effort);
+                    }
                 }
                 ModelMessage::Assistant {
                     content,
@@ -2431,7 +2441,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_effort_replays_compaction_without_a_configuration_update() {
+    fn compaction_replay_preserves_effort_and_orders_required_updates_after_it() {
         let capabilities: ModelCapabilities = serde_json::from_value(json!({
             "slug":"gpt-6.1-sol", "supported_reasoning_levels":[],
             "use_responses_lite":true, "supports_reasoning_effort_updates":true,
@@ -2490,6 +2500,42 @@ mod tests {
                 .all(|item| item["type"] != "configuration_update")
         );
         assert!(body.get("service_tier").is_none());
+
+        let mut changed = request;
+        if let ModelMessage::Assistant {
+            provider_state:
+                Some(ModelProviderState::OpenAiResponses {
+                    effective_effort, ..
+                }),
+            ..
+        } = &mut changed.messages[1]
+        {
+            *effective_effort = Some("xhigh".into());
+        }
+        let provider = CodexModelProvider {
+            effort: "xhigh".into(),
+            ..provider
+        };
+        let body = provider
+            .request_body_with_capabilities(&changed, Some(&capabilities), true)
+            .unwrap();
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["input"][2]["type"], "compaction");
+        assert_eq!(
+            body["input"][3],
+            json!({
+                "type":"configuration_update", "reasoning":{"effort":"xhigh"}
+            })
+        );
+        assert_eq!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "configuration_update")
+                .count(),
+            1
+        );
     }
 
     #[test]

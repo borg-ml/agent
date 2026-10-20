@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.18.0)
 
+- Apply Codex reasoning-effort transitions after native compaction so continuing
+  a compacted session does not fail with HTTP 400.
+
 - Avoid redundant Codex reasoning-effort updates when the request already uses
   that effort, while preserving real historical effort transitions.
 
