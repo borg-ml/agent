@@ -9481,18 +9481,23 @@ fn merge_tui_history_page(history: &mut Vec<SessionEvent>, older: Vec<SessionEve
 async fn older_tui_history(
     store: &dyn SessionStore,
     session_id: Uuid,
-    before_sequence: u64,
+    mut before_sequence: u64,
 ) -> Result<Vec<SessionEvent>> {
-    let Some(after_sequence) = older_tui_history_after(before_sequence) else {
-        return Ok(Vec::new());
-    };
-    let limit = older_tui_history_limit(before_sequence, after_sequence);
-    Ok(store
-        .events_after(session_id, after_sequence, limit)
-        .await?
-        .into_iter()
-        .filter(|event| event.sequence < before_sequence)
-        .collect())
+    while let Some(after_sequence) = older_tui_history_after(before_sequence) {
+        let limit = older_tui_history_limit(before_sequence, after_sequence);
+        let older = store
+            .events_after(session_id, after_sequence, limit)
+            .await?
+            .into_iter()
+            .filter(|event| event.sequence < before_sequence)
+            .collect::<Vec<_>>();
+        if !older.is_empty() {
+            return Ok(older);
+        }
+        // Journal cleanup can leave whole sequence windows empty.
+        before_sequence = after_sequence.saturating_add(1);
+    }
+    Ok(Vec::new())
 }
 
 /// One older page of a child's own events; inherited parent events are the
@@ -9500,22 +9505,29 @@ async fn older_tui_history(
 async fn older_child_history(
     store: &dyn SessionStore,
     child_id: Uuid,
-    before_sequence: u64,
+    mut before_sequence: u64,
 ) -> Result<Vec<SessionEvent>> {
     let inherited = store.inherited_event_count(child_id).await?;
-    let after = inherited.max(before_sequence.saturating_sub(CHILD_HISTORY_TAIL_EVENTS as u64 + 1));
-    let limit = usize::try_from(before_sequence.saturating_sub(after.saturating_add(1)))
-        .unwrap_or(CHILD_HISTORY_TAIL_EVENTS)
-        .min(CHILD_HISTORY_TAIL_EVENTS);
-    if limit == 0 {
-        return Ok(Vec::new());
+    loop {
+        let after =
+            inherited.max(before_sequence.saturating_sub(CHILD_HISTORY_TAIL_EVENTS as u64 + 1));
+        let limit = usize::try_from(before_sequence.saturating_sub(after.saturating_add(1)))
+            .unwrap_or(CHILD_HISTORY_TAIL_EVENTS)
+            .min(CHILD_HISTORY_TAIL_EVENTS);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let older = store
+            .events_after(child_id, after, limit)
+            .await?
+            .into_iter()
+            .filter(|event| event.sequence < before_sequence)
+            .collect::<Vec<_>>();
+        if !older.is_empty() {
+            return Ok(older);
+        }
+        before_sequence = after.saturating_add(1);
     }
-    Ok(store
-        .events_after(child_id, after, limit)
-        .await?
-        .into_iter()
-        .filter(|event| event.sequence < before_sequence)
-        .collect())
 }
 
 fn older_tui_history_after(before_sequence: u64) -> Option<u64> {

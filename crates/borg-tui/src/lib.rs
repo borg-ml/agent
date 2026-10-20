@@ -3602,7 +3602,6 @@ impl BorgTerminal {
     }
 
     pub fn replace_history(&mut self, events: &[SessionEvent]) {
-        let previous_height = self.rendered_transcript_height;
         let inspector_anchor = self.action_inspector_anchor();
         let replaced_displayed = replace_root_transcript_history(
             &mut self.transcript,
@@ -3625,14 +3624,13 @@ impl BorgTerminal {
         self.rewind_targets = rewind_targets_from_history(events);
         self.text_selection = None;
         self.pending_transcript_click = None;
-        self.pending_scroll_anchor_height = Some(previous_height);
+        // Prepending leaves the existing rows at the same distance from the tail.
+        self.pending_scroll_anchor_height = None;
         self.invalidate_transcript_render_cache();
     }
 
-    /// Consume one explicit upward-navigation request once the loaded
-    /// transcript is near its oldest edge. Ordinary redraw/activity ticks
-    /// must never hydrate historical pages behind a user who is following the
-    /// live tail.
+    /// Prefetch on upward navigation, then keep paging near the oldest edge.
+    /// Pages containing only hidden events must not require another scroll.
     pub fn take_history_page_request(&mut self) -> bool {
         // An open action inspector holds a transcript index, and hydrating an
         // older page rebuilds `order` from a longer event list, renumbering
@@ -3642,9 +3640,13 @@ impl BorgTerminal {
             self.history_page_requested = false;
             return false;
         }
+        if self.history_page_loading {
+            return false;
+        }
         let viewport_height = self.transcript_viewport_area.map_or(12, |area| area.height);
         let should_load = should_load_history_page(
             self.history_page_requested,
+            self.transcript.follow_tail,
             self.scroll_from_bottom,
             self.transcript_scroll_max,
             usize::from(viewport_height),
@@ -4308,8 +4310,8 @@ impl BorgTerminal {
             )
         {
             // The first live lifecycle boundary ends startup recovery. Any
-            // child activity after it is a real update from this run and may
-            // appear as a root action card.
+            // child events after it may appear as root action cards, while
+            // snapshot-only roster refreshes remain metadata.
             self.suppress_bootstrap_subagent_activity = false;
         }
         let suppress_root_subagent_activity = should_suppress_root_subagent_activity(
@@ -5251,6 +5253,7 @@ impl BorgTerminal {
         let viewport_height = self.transcript_viewport_area.map_or(12, |area| area.height);
         if !should_load_history_page(
             self.history_page_requested,
+            self.transcript.follow_tail,
             self.scroll_from_bottom,
             self.transcript_scroll_max,
             usize::from(viewport_height),
@@ -5270,12 +5273,13 @@ impl BorgTerminal {
         let Some((_, current)) = self.child_history_events.remove(&child_id) else {
             return;
         };
-        let previous_height = self.rendered_transcript_height;
+        let follow_tail = self.transcript.follow_tail;
         let mut events = older;
         events.extend(current);
         self.seed_child_history(child_id, &events);
         if self.focused_child == Some(child_id) {
-            self.pending_scroll_anchor_height = Some(previous_height);
+            self.transcript.follow_tail = follow_tail;
+            self.pending_scroll_anchor_height = None;
         }
     }
 
@@ -7942,13 +7946,14 @@ impl BorgTerminal {
     pub fn advance_scroll_frame(&mut self) {
         self.advance_nested_scroll_frame();
         let scroll_was_active = self.scroll_motion.is_active();
+        let scrolling_up = self.scroll_motion.remaining_lines > 0;
         self.scroll_from_bottom = self.scroll_motion.advance_at(
             self.scroll_from_bottom,
             self.transcript_scroll_max,
             Instant::now(),
         );
         if scroll_was_active {
-            self.transcript.follow_tail = self.scroll_from_bottom == 0;
+            self.transcript.follow_tail = self.scroll_from_bottom == 0 && !scrolling_up;
         }
         let selection_autoscroll = self
             .text_selection
@@ -11594,7 +11599,7 @@ impl BorgTerminal {
         self.scroll_from_bottom = restored_scroll_from_bottom
             .unwrap_or(self.scroll_from_bottom)
             .min(next_scroll_max);
-        if self.scroll_from_bottom == 0 {
+        if self.scroll_from_bottom == 0 && next_scroll_max > 0 {
             self.transcript.follow_tail = true;
         }
         Ok(())
@@ -14688,7 +14693,12 @@ fn should_suppress_root_subagent_activity(
     bootstrap_recovery_pending: bool,
     kind: &SessionEventKind,
 ) -> bool {
-    bootstrap_recovery_pending && matches!(kind, SessionEventKind::SubagentActivity { .. })
+    matches!(
+        kind,
+        SessionEventKind::SubagentActivity { activity, event, .. }
+            if bootstrap_recovery_pending
+                || (*activity == SubagentActivityKind::Updated && event.is_none())
+    )
 }
 
 pub fn subagent_activity_summary(
@@ -16214,13 +16224,15 @@ fn should_preserve_transcript_viewport(follow_tail: bool) -> bool {
 
 fn should_load_history_page(
     explicitly_requested: bool,
+    follow_tail: bool,
     scroll_from_bottom: usize,
     scroll_max: usize,
     viewport_height: usize,
 ) -> bool {
     explicitly_requested
-        && scroll_max.saturating_sub(scroll_from_bottom.min(scroll_max))
-            <= viewport_height.saturating_mul(2)
+        || (!follow_tail
+            && scroll_max.saturating_sub(scroll_from_bottom.min(scroll_max))
+                <= viewport_height.saturating_mul(2))
 }
 
 fn transcript_viewport_anchor(

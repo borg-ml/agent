@@ -490,7 +490,7 @@ fn resumed_history_with_roster_hides_child_reports_and_keeps_peers_in_order() {
 }
 
 #[test]
-fn bootstrap_subagent_recovery_updates_do_not_become_root_cards() {
+fn subagent_recovery_and_roster_refreshes_do_not_become_root_cards() {
     let agent = SubagentSnapshot {
         lifecycle: None,
         source: None,
@@ -514,7 +514,7 @@ fn bootstrap_subagent_recovery_updates_do_not_become_root_cards() {
     };
     let recovery = SessionEventKind::SubagentActivity {
         activity: SubagentActivityKind::Completed,
-        agent,
+        agent: agent.clone(),
         event: None,
     };
 
@@ -528,6 +528,24 @@ fn bootstrap_subagent_recovery_updates_do_not_become_root_cards() {
             detail: None,
         },
     ));
+    let mut refresh = SessionEventKind::SubagentActivity {
+        activity: SubagentActivityKind::Updated,
+        agent,
+        event: None,
+    };
+    assert!(should_suppress_root_subagent_activity(false, &refresh));
+    if let SessionEventKind::SubagentActivity { agent, event, .. } = &mut refresh {
+        *event = Some(Box::new(SessionEvent::new(
+            agent.session_id,
+            1,
+            SessionEventKind::StatusChanged {
+                lifecycle: None,
+                status: SessionStatus::Running,
+                detail: None,
+            },
+        )));
+    }
+    assert!(!should_suppress_root_subagent_activity(false, &refresh));
 }
 
 #[test]
@@ -11567,12 +11585,77 @@ fn internal_team_delivery_stays_out_of_pending_input_and_user_history() {
 }
 
 #[test]
-fn historical_pages_require_explicit_upward_navigation() {
-    assert!(!should_load_history_page(false, 100, 100, 24));
-    assert!(!should_load_history_page(false, 0, 0, 24));
-    assert!(!should_load_history_page(true, 0, 1_000, 24));
-    assert!(should_load_history_page(true, 960, 1_000, 24));
-    assert!(should_load_history_page(true, 0, 0, 24));
+fn historical_pages_prefetch_on_scroll_and_continue_through_hidden_pages() {
+    assert!(!should_load_history_page(false, true, 0, 1_000, 24));
+    assert!(!should_load_history_page(false, true, 0, 0, 24));
+    assert!(should_load_history_page(true, true, 0, 1_000, 24));
+    assert!(should_load_history_page(false, false, 960, 1_000, 24));
+    assert!(should_load_history_page(false, false, 0, 0, 24));
+    assert!(!should_load_history_page(false, false, 100, 1_000, 24));
+}
+
+// Exercise the actual viewport lifecycle: invisible pages must keep loading,
+// but a visible prepend must leave the reader on the same rows.
+#[tokio::test]
+#[ignore = "requires a PTY; run under script with a sized terminal"]
+async fn history_paging_crosses_hidden_pages_and_preserves_the_viewport() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = composer_test_terminal(&directory);
+    let session = terminal.session_id;
+    let message = |sequence, text: String| {
+        SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text,
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        )
+    };
+    let mut history = vec![message(1_000, "latest reply".into())];
+    terminal.seed_history(&history);
+    terminal.draw().unwrap();
+    assert_eq!(terminal.transcript_scroll_max, 0);
+    assert!(!terminal.take_history_page_request());
+
+    terminal.queue_wheel_scroll(3);
+    terminal.advance_scroll_frame();
+    assert!(terminal.take_history_page_request());
+    terminal.set_history_page_loading(true);
+    assert!(!terminal.take_history_page_request());
+    history.insert(
+        0,
+        SessionEvent::new(session, 999, SessionEventKind::ReasoningCompleted),
+    );
+    terminal.replace_history(&history);
+    terminal.draw().unwrap();
+    terminal.set_history_page_loading(false);
+    assert!(
+        terminal.take_history_page_request(),
+        "a hidden page must not strand the reader"
+    );
+
+    history.insert(0, message(998, "older conversation row\n".repeat(100)));
+    terminal.replace_history(&history);
+    terminal.draw().unwrap();
+    terminal.scroll_from_bottom = terminal.transcript_scroll_max;
+    terminal.transcript.follow_tail = false;
+    let offset = terminal.scroll_from_bottom;
+    history.insert(0, message(997, "oldest conversation row\n".repeat(100)));
+    terminal.replace_history(&history);
+    terminal.draw().unwrap();
+    assert_eq!(
+        terminal.scroll_from_bottom, offset,
+        "prepending must not move the existing rows"
+    );
+    assert!(
+        !terminal.take_history_page_request(),
+        "stop prefetching once the viewport has enough older rows"
+    );
 }
 
 #[test]
@@ -21412,7 +21495,10 @@ async fn deferred_child_history_loads_on_focus_pages_back_and_keeps_live_events(
         Some(child.session_id)
     );
     assert_eq!(terminal.take_child_history_request(), None);
-    terminal.seed_child_history(child.session_id, &[message(2, older_id, "older history")]);
+    terminal.seed_child_history(
+        child.session_id,
+        &[message(2, older_id, &"older history\n".repeat(100))],
+    );
     assert!(terminal.transcript.messages.contains_key(&older_id));
     assert!(terminal.transcript.messages.contains_key(&live_id));
     // Scrolling back prepends an older page without dropping live rows.
@@ -21426,7 +21512,14 @@ async fn deferred_child_history_loads_on_focus_pages_back_and_keeps_live_events(
             event: Some(Box::new(message(4, later_id, "live after load"))),
         },
     ));
+    terminal.draw().unwrap();
+    terminal.scroll_from_bottom = terminal.transcript_scroll_max;
+    terminal.transcript.follow_tail = false;
+    let offset = terminal.scroll_from_bottom;
     terminal.prepend_child_history(child.session_id, vec![message(1, oldest_id, "oldest page")]);
+    terminal.draw().unwrap();
+    assert!(!terminal.transcript.follow_tail);
+    assert_eq!(terminal.scroll_from_bottom, offset);
     for id in [oldest_id, older_id, live_id, later_id] {
         assert!(terminal.transcript.messages.contains_key(&id));
     }

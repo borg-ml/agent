@@ -970,6 +970,45 @@ async fn older_history_pages_preserve_prompt_admission_order() {
     scratch.discard().await;
 }
 
+// Cleanup removes legacy journal rows without renumbering the remaining
+// events. An empty numbered window is not the beginning of the conversation.
+#[tokio::test]
+async fn older_history_pages_cross_cleaned_up_sequence_gaps() {
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
+    let session = Uuid::new_v4();
+    store.create_session(session).await.unwrap();
+    let mut before = 0;
+    for _ in 0..RICH_TUI_HISTORY_PAGE_SIZE * 2 + 2 {
+        before = store
+            .append(SessionEvent::new(
+                session,
+                0,
+                SessionEventKind::Error {
+                    message: "saved row".into(),
+                },
+            ))
+            .await
+            .unwrap()
+            .sequence;
+    }
+    sqlx::query(
+        "delete from session_events where session_id = $1 and sequence > 1 and sequence < $2",
+    )
+    .bind(session)
+    .bind(before as i64)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    for page in [
+        older_tui_history(&store, session, before).await.unwrap(),
+        older_child_history(&store, session, before).await.unwrap(),
+    ] {
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].sequence, 1);
+    }
+    scratch.discard().await;
+}
+
 #[test]
 fn older_history_pages_merge_around_a_checkpoint_without_duplicate_rows() {
     let session_id = Uuid::new_v4();

@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.18.0)
 
+- Prefetch conversation history as soon as you scroll up, keep loading through
+  hidden or cleaned-up event pages, and preserve the reading position when
+  older rows arrive. Keep roster-only agent refreshes out of the conversation.
+
 - Skip full process-journal replay when a restored session has no active
   processes, avoiding provider-startup timeouts in long-lived sessions.
 
