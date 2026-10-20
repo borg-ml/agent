@@ -27,6 +27,10 @@ Git comparison.
 - Fix PostgreSQL pool maintenance spinning indefinitely after an idle-counter
   race, which could peg CPU cores and prevent retired session hosts from exiting.
 
+- Keep workspace diagnostic scans out of nested `.worktrees` checkouts so
+  inactive copies cannot consume the scan budget before the active project.
+  Explicitly requested worktree roots remain supported.
+
 ## 0.18.0 (2026-10-19)
 
 - Load a user-wide `~/.borg/AGENTS.md` (or `CLAUDE.md`) in every session, ahead

@@ -2254,6 +2254,7 @@ fn ignored_workspace_directory(path: &Path) -> bool {
         path.file_name().and_then(|name| name.to_str()),
         Some(
             ".git"
+                | ".worktrees"
                 | ".hg"
                 | ".svn"
                 | "target"
@@ -2732,6 +2733,30 @@ mod tests {
 
         drop(workspace);
         assert!(lsp_client_reap_reason(&key, Duration::ZERO).is_some());
+    }
+
+    // Nested checkout sources can consume the whole scan budget before any
+    // active project source is checked. An explicit worktree root is different.
+    #[tokio::test]
+    async fn workspace_discovery_excludes_nested_worktrees_but_accepts_an_explicit_one() {
+        let root = tempfile::tempdir().expect("workspace");
+        let current = root.path().join("src/lib.rs");
+        let worktree = root.path().join(".worktrees/archive");
+        let archived = worktree.join("src/lib.rs");
+        for source in [&current, &archived] {
+            tokio::fs::create_dir_all(source.parent().expect("source parent"))
+                .await
+                .expect("source directory");
+            tokio::fs::write(source, "fn example() {}\n")
+                .await
+                .expect("source");
+        }
+        let scan = discover_workspace_documents(root.path(), &["rs"]).await;
+        assert_eq!(scan.paths, vec![current]);
+        assert!(!scan.truncated);
+        let explicit = discover_workspace_documents(&worktree, &["rs"]).await;
+        assert_eq!(explicit.paths, vec![archived]);
+        assert!(!explicit.truncated);
     }
 
     /// Each member crate of a Cargo workspace used to resolve as its own
