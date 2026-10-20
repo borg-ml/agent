@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.18.0)
 
+- Retain known indexed Codex error field paths so rejected request forms can be
+  diagnosed without logging private content or unknown parameter values.
+
 - Fix PostgreSQL pool maintenance spinning indefinitely after an idle-counter
   race, which could peg CPU cores and prevent retired session hosts from exiting.
 
