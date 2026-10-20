@@ -65,7 +65,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
 sha2 = "0.11.0"
-sqlx = { version = "0.9.0", default-features = false, features = ["chrono", "json", "postgres", "runtime-tokio", "tls-rustls", "uuid"] }
+# SQLx 0.9.0 can underflow num_idle and wedge pool maintenance; pin its upstream fix.
+sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d69947065085f46b58767a50b3d8e25", default-features = false, features = ["chrono", "json", "postgres", "runtime-tokio", "tls-rustls", "uuid"] }
 tar = "0.4"
 tempfile = "3.27.0"
 toml = "1.1.4"
