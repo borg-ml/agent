@@ -54,14 +54,67 @@ fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     configure_allocator();
     spawn_allocator_trim();
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         // The session/store/SQLx poll chain can exceed Tokio's default 2 MiB
         // worker stack while admitting a prompt (observed on SessionConfigured).
         .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
-        .context("could not start the Borg async runtime")?
-        .block_on(run())
+        .context("could not start the Borg async runtime")?;
+    spawn_runtime_watchdog(runtime.handle().clone());
+    runtime.block_on(run())
+}
+
+/// Report when the async runtime stops running timer-woken tasks.
+///
+/// WHY: a session host once froze for 20 minutes with every thread idle: child
+/// exits went unreaped, the model stream unread and the turn watchdog silent,
+/// until an interrupt woke it. Nothing inside the runtime can report that, so a
+/// plain thread probes it and saves thread stacks for diagnosis.
+fn spawn_runtime_watchdog(handle: tokio::runtime::Handle) {
+    use std::time::{Duration, Instant};
+    const STALL: Duration = Duration::from_secs(30);
+    let _ = std::thread::Builder::new()
+        .name("runtime-watchdog".to_string())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                let sent = Instant::now();
+                handle.spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    let _ = tx.send(());
+                });
+                match rx.recv_timeout(STALL) {
+                    Ok(()) => continue,
+                    // The runtime is shutting down and dropped the probe.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                let dump = log_dir().join(format!(
+                    "runtime-stall-{}.txt",
+                    chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+                ));
+                let stacks = std::process::Command::new("eu-stack")
+                    .args(["-p", &std::process::id().to_string()])
+                    .output()
+                    .map(|output| [output.stdout, output.stderr].concat())
+                    .unwrap_or_else(|error| format!("eu-stack unavailable: {error}").into_bytes());
+                let _ = fs::write(&dump, stacks);
+                tracing::error!(
+                    stalled_ms = sent.elapsed().as_millis() as u64,
+                    dump = %dump.display(),
+                    "async runtime stopped running timer tasks"
+                );
+                if rx.recv().is_err() {
+                    return;
+                }
+                tracing::warn!(
+                    stalled_ms = sent.elapsed().as_millis() as u64,
+                    "async runtime resumed after a stall"
+                );
+            }
+        });
 }
 
 /// Cap glibc's per-thread allocator arenas before any worker thread exists.
@@ -612,15 +665,19 @@ fn print_capabilities(args: CapabilitiesArgs) -> Result<()> {
     Ok(())
 }
 
-fn log_writer() -> BoxMakeWriter {
-    let borg_home = std::env::var_os("BORG_HOME")
+fn log_dir() -> std::path::PathBuf {
+    std::env::var_os("BORG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".borg"))
         })
         .or_else(|| dirs::home_dir().map(|home| home.join(".borg")))
-        .unwrap_or_else(|| std::path::PathBuf::from(".borg"));
-    let log_dir = borg_home.join("logs");
+        .unwrap_or_else(|| std::path::PathBuf::from(".borg"))
+        .join("logs")
+}
+
+fn log_writer() -> BoxMakeWriter {
+    let log_dir = log_dir();
     let file = fs::create_dir_all(&log_dir).and_then(|()| {
         OpenOptions::new()
             .create(true)

@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.18.2)
 
+- Log an error and save thread stacks to `~/.borg/logs/runtime-stall-*.txt`
+  when Borg's async runtime stops running timer-woken tasks for 30 seconds.
 - Show agent and peer messages as one line like other actions, previewing
   the message's first line; click to expand the full text.
 - Left-click on a running action now opens it like any other action;
