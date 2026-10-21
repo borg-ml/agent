@@ -1,4 +1,3 @@
-use borg_view::grouping::is_subagent_activity_text;
 #[cfg(test)]
 use borg_view::projection_helpers::{
     borg_control_tool_output_view, borg_lsp_diagnostics_view, number_message_attachments,
@@ -1874,7 +1873,6 @@ pub struct BorgTerminal {
     active_turn_followup: bool,
     child_active_turn_followups: HashSet<Uuid>,
     replaying_history: bool,
-    history_page_requested: bool,
     history_page_loading: bool,
     picker: Option<Picker>,
     /// Model the user picked from a provider that still needs credentials;
@@ -3299,7 +3297,6 @@ impl BorgTerminal {
             active_turn_followup: false,
             child_active_turn_followups: HashSet::new(),
             replaying_history: false,
-            history_page_requested: false,
             history_page_loading: false,
             picker: None,
             pending_auth_model: None,
@@ -3472,7 +3469,6 @@ impl BorgTerminal {
         self.active_turn_followup = false;
         self.child_active_turn_followups.clear();
         self.replaying_history = false;
-        self.history_page_requested = false;
         self.history_page_loading = false;
         self.picker = None;
         self.pending_auth_model = None;
@@ -3549,7 +3545,6 @@ impl BorgTerminal {
         // animate an older viewport position.
         self.scroll_from_bottom = 0;
         self.scroll_motion.cancel();
-        self.history_page_requested = false;
         self.history_page_loading = false;
         self.pending_scroll_anchor_height = None;
         self.pending_transcript_anchor = None;
@@ -3641,7 +3636,7 @@ impl BorgTerminal {
         self.invalidate_transcript_render_cache();
     }
 
-    /// Prefetch on upward navigation, then keep paging near the oldest edge.
+    /// Page in older history only when the viewport is near the oldest loaded edge.
     /// Pages containing only hidden events must not require another scroll.
     pub fn take_history_page_request(&mut self) -> bool {
         // An open action inspector holds a transcript index, and hydrating an
@@ -3649,7 +3644,6 @@ impl BorgTerminal {
         // every entry. Defer paging until the inspector closes rather than let
         // the focused action silently become a different one.
         if self.focused_child.is_some() || self.focused_tool.is_some() {
-            self.history_page_requested = false;
             return false;
         }
         if self.history_page_loading {
@@ -3657,15 +3651,12 @@ impl BorgTerminal {
         }
         let viewport_height = self.transcript_viewport_area.map_or(12, |area| area.height);
         let should_load = should_load_history_page(
-            self.history_page_requested,
             self.transcript.follow_tail,
             self.scroll_from_bottom,
             self.transcript_scroll_max,
             usize::from(viewport_height),
         );
-        if should_load {
-            self.history_page_requested = false;
-        }
+        if should_load {}
         should_load
     }
 
@@ -5264,7 +5255,6 @@ impl BorgTerminal {
         let start = self.child_history_events.get(&child_id)?.0;
         let viewport_height = self.transcript_viewport_area.map_or(12, |area| area.height);
         if !should_load_history_page(
-            self.history_page_requested,
             self.transcript.follow_tail,
             self.scroll_from_bottom,
             self.transcript_scroll_max,
@@ -5272,7 +5262,6 @@ impl BorgTerminal {
         ) {
             return None;
         }
-        self.history_page_requested = false;
         Some((child_id, start))
     }
 
@@ -7833,11 +7822,10 @@ impl BorgTerminal {
                                     ),
                                 )
                             });
-                            let nested_scrolled = self.scroll_drag_selection(
+                            self.scroll_drag_selection(
                                 wheel_scroll_distance(viewport_height, scroll_repetitions),
                                 nested,
                             );
-                            self.history_page_requested = !nested_scrolled;
                             return Ok(UiAction::None);
                         }
                         if let Some((start, max_offset)) = hovered_tool_run {
@@ -7849,7 +7837,6 @@ impl BorgTerminal {
                                 -nested_wheel_scroll_distance(terminal_height, scroll_repetitions),
                             );
                         } else {
-                            self.history_page_requested = self.focused_tool.is_none();
                             let viewport_height =
                                 self.transcript_viewport_area.map_or(1, |area| area.height);
                             self.queue_wheel_scroll(wheel_scroll_distance(
@@ -7888,10 +7875,8 @@ impl BorgTerminal {
                                 -wheel_scroll_distance(viewport_height, scroll_repetitions),
                                 nested,
                             );
-                            self.history_page_requested = false;
                             return Ok(UiAction::None);
                         }
-                        self.history_page_requested = false;
                         if let Some((start, max_offset)) = hovered_tool_run {
                             let terminal_height =
                                 self.terminal.size().map(|size| size.height).unwrap_or(1);
@@ -8044,7 +8029,6 @@ impl BorgTerminal {
                 .saturating_mul(wheel_scroll_lines(viewport_height) as usize)
                 .div_ceil(nested_wheel_scroll_lines(terminal_height) as usize);
             let lines = isize::try_from(lines).unwrap_or(isize::MAX);
-            self.history_page_requested = handoff < 0 && self.focused_tool.is_none();
             if handoff < 0 {
                 self.transcript.follow_tail = false;
             }
@@ -8071,7 +8055,6 @@ impl BorgTerminal {
         if self.image_picker.is_some() {
             self.image_scroll_settles_at = Some(Instant::now() + Duration::from_millis(75));
         }
-        self.history_page_requested = lines > 0 && self.focused_tool.is_none();
         if lines > 0 {
             self.transcript.follow_tail = false;
         } else if lines < 0 && self.scroll_from_bottom == 0 {
@@ -8527,7 +8510,6 @@ impl BorgTerminal {
             .min(self.transcript_scroll_max);
         self.scroll_from_bottom = self.transcript_scroll_max.saturating_sub(scroll_start);
         self.transcript.follow_tail = false;
-        self.history_page_requested = false;
         self.thread_find = Some(ThreadFindState {
             pattern: pattern.clone(),
             row,
@@ -12301,13 +12283,11 @@ impl BorgTerminal {
             });
         }
         if self.keymap.matches(KeyAction::ScrollUp, &key) {
-            self.history_page_requested = self.focused_tool.is_none();
             self.transcript.follow_tail = false;
             self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(8);
             return Ok(UiAction::None);
         }
         if self.keymap.matches(KeyAction::ScrollDown, &key) {
-            self.history_page_requested = false;
             self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(8);
             self.transcript.follow_tail = self.scroll_from_bottom == 0;
             return Ok(UiAction::None);
@@ -16246,16 +16226,14 @@ fn should_preserve_transcript_viewport(follow_tail: bool) -> bool {
 }
 
 fn should_load_history_page(
-    explicitly_requested: bool,
     follow_tail: bool,
     scroll_from_bottom: usize,
     scroll_max: usize,
     viewport_height: usize,
 ) -> bool {
-    explicitly_requested
-        || (!follow_tail
-            && scroll_max.saturating_sub(scroll_from_bottom.min(scroll_max))
-                <= viewport_height.saturating_mul(2))
+    !follow_tail
+        && scroll_max.saturating_sub(scroll_from_bottom.min(scroll_max))
+            <= viewport_height.saturating_mul(2)
 }
 
 fn transcript_viewport_anchor(

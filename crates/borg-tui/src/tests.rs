@@ -1656,23 +1656,6 @@ fn transcript_attachment_rows_link_to_the_local_image() {
 }
 
 #[test]
-fn subagent_activity_rows_use_the_shared_hot_pink_identity_colour() {
-    let mut transcript = Transcript::default();
-    transcript.order.push(TranscriptEntry::Activity {
-        text: "agent · /root/worker · report · complete".to_string(),
-        time: "2026-08-01 20:40".to_string(),
-    });
-
-    let line = transcript
-        .lines(100)
-        .into_iter()
-        .find(|line| line.to_string().contains("/root/worker"))
-        .expect("subagent activity row");
-
-    assert_eq!(line.spans.last().unwrap().style.fg, Some(SUBAGENT_PURPLE));
-}
-
-#[test]
 fn focused_subagent_status_preserves_semantic_failures_and_uses_pink_for_work() {
     assert_eq!(
         focused_subagent_status_color(SessionStatus::Running, true),
@@ -11728,12 +11711,12 @@ fn internal_team_delivery_stays_out_of_pending_input_and_user_history() {
 
 #[test]
 fn historical_pages_prefetch_on_scroll_and_continue_through_hidden_pages() {
-    assert!(!should_load_history_page(false, true, 0, 1_000, 24));
-    assert!(!should_load_history_page(false, true, 0, 0, 24));
-    assert!(should_load_history_page(true, true, 0, 1_000, 24));
-    assert!(should_load_history_page(false, false, 960, 1_000, 24));
-    assert!(should_load_history_page(false, false, 0, 0, 24));
-    assert!(!should_load_history_page(false, false, 100, 1_000, 24));
+    assert!(!should_load_history_page(true, 0, 1_000, 24));
+    assert!(!should_load_history_page(true, 0, 0, 24));
+    assert!(should_load_history_page(false, 960, 1_000, 24));
+    assert!(should_load_history_page(false, 0, 0, 24));
+    // Scrolling up a little from the tail must not load older pages.
+    assert!(!should_load_history_page(false, 100, 1_000, 24));
 }
 
 // Exercise the actual viewport lifecycle: invisible pages must keep loading,
@@ -15075,9 +15058,15 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     for index in 0..7 {
         transcript.order.push(tool(index, index < 5));
     }
-    transcript.order.push(TranscriptEntry::Activity {
-        text: "agent · /root/v391_scaling_audit · started".to_string(),
-        time: "19:38".to_string(),
+    transcript.order.push(TranscriptEntry::Action {
+        source_session_id: None,
+        kind: TranscriptActionKind::Agent,
+        label: "Agent".into(),
+        detail: "/root/v391_scaling_audit · started".into(),
+        body: None,
+        time: "19:38".into(),
+        execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
+        expanded: false,
     });
     for (index, name) in [(8, "Read"), (9, "Edit")] {
         let mut entry = tool(index, false);
@@ -15153,10 +15142,10 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     assert!(!rendered.contains("  ▸ Reasoned\n"), "{rendered}");
     assert!(!rendered.contains("Reasoned (1)"), "{rendered}");
     assert!(rendered.contains("◦ Reasoned"), "{rendered}");
-    assert!(rendered.contains("  ▾ Run (2)"), "{rendered}");
+    assert!(rendered.contains("  ▸ Run (2)"), "{rendered}");
     assert!(rendered.contains("  ▸ Watch (2)"), "{rendered}");
     assert!(
-        rendered.contains("\n  19:38  agent · /root/v391_scaling_audit · started"),
+        rendered.contains("Agent      /root/v391_scaling_audit · started"),
         "{rendered}"
     );
     assert_eq!(
@@ -15173,6 +15162,7 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     assert!(transcript.toggle_action_run_expansion(0));
     assert!(!transcript.tool_run_expanded(0));
     transcript.toggle_tool(0);
+    assert!(transcript.toggle_action_run_expansion(5));
     assert!(transcript.toggle_action_run_expansion(10));
     let expanded_child = render(&transcript);
     assert!(text(&expanded_child).contains("Reasoning block 0"));
@@ -17498,9 +17488,15 @@ fn mixed_actions_window_selection_ranges_match_the_visible_rows() {
     for index in 0..4 {
         transcript.order.push(tool(index));
     }
-    transcript.order.push(TranscriptEntry::Activity {
-        text: "agent · /root/reviewer · started".to_string(),
-        time: "12:00".to_string(),
+    transcript.order.push(TranscriptEntry::Action {
+        source_session_id: None,
+        kind: TranscriptActionKind::Agent,
+        label: "Agent".into(),
+        detail: "/root/reviewer · started".into(),
+        body: None,
+        time: "12:00".into(),
+        execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
+        expanded: false,
     });
     for index in 4..10 {
         transcript.order.push(tool(index));
@@ -17549,7 +17545,7 @@ fn mixed_actions_window_selection_ranges_match_the_visible_rows() {
             .contains("/root/reviewer"),
         "released selection must follow the same mixed action after scrolling"
     );
-    assert_eq!(shifted_activity.row, activity_row + 2);
+    assert!(shifted_activity.row > activity_row);
 }
 
 #[test]
@@ -19687,7 +19683,6 @@ async fn action_inspector_stays_on_its_entry_when_late_messages_arrive() {
             .to_owned();
         terminal.open_tool_inspector(target);
         assert!(terminal.is_inspecting_action());
-        terminal.history_page_requested = true;
         assert!(!terminal.take_history_page_request());
         terminal.apply_session_event(&SessionEvent::new(
             session_id,

@@ -215,7 +215,45 @@ impl Execution {
     }
 }
 
+/// What a row is, independent of how a frontend draws it. Every frontend rule
+/// about grouping, spacing and folding keys on this class rather than on the
+/// storage variant, so a new kind of row cannot grow its own rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryClass {
+    /// A chat message.
+    Turn,
+    /// A standalone titled block: plan, goal, info, compaction, system note.
+    Card,
+    /// Work that runs and finishes: tool calls and agent, watch, approval,
+    /// provider-interaction and error rows. Consecutive operations form a run.
+    Operation,
+}
+
 impl TranscriptEntry {
+    pub fn class(&self) -> EntryClass {
+        match self {
+            Self::Message { .. } => EntryClass::Turn,
+            Self::Tool { .. } | Self::Action { .. } => EntryClass::Operation,
+            Self::Activity { .. }
+            | Self::Plan { .. }
+            | Self::Goal { .. }
+            | Self::Info { .. }
+            | Self::Compaction { .. } => EntryClass::Card,
+        }
+    }
+
+    pub fn is_operation(&self) -> bool {
+        self.class() == EntryClass::Operation
+    }
+
+    /// An operation that has not reached a terminal state.
+    pub fn is_live_operation(&self) -> bool {
+        self.is_operation()
+            && self
+                .execution()
+                .is_some_and(|execution| !execution.is_terminal())
+    }
+
     pub fn execution(&self) -> Option<&Execution> {
         match self {
             Self::Message { execution, .. }

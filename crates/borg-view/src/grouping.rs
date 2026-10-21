@@ -197,53 +197,24 @@ pub fn same_action_type(left: &TranscriptEntry, right: &TranscriptEntry) -> bool
     }
 }
 
+/// A run is every maximal sequence of consecutive operations.
 pub fn tool_run_windows(entries: &[TranscriptEntry]) -> Vec<Option<ToolRunWindow>> {
     let mut windows = vec![None; entries.len()];
     let mut index = 0;
     while index < entries.len() {
-        if !matches!(
-            entries[index],
-            TranscriptEntry::Tool { .. }
-                | TranscriptEntry::Action {
-                    kind: TranscriptActionKind::Agent,
-                    ..
-                }
-        ) {
-            index += 1;
-            continue;
-        }
         let start = index;
-        while index < entries.len() {
-            if matches!(
-                entries[index],
-                TranscriptEntry::Tool { .. } | TranscriptEntry::Action { .. }
-            ) {
-                index += 1;
-                continue;
-            }
-            if action_run_bridge(&entries[index])
-                && entries[index + 1..]
-                    .iter()
-                    .find(|entry| !action_run_bridge(entry))
-                    .is_some_and(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
-            {
-                index += 1;
-                continue;
-            }
-            break;
+        while index < entries.len() && entries[index].is_operation() {
+            index += 1;
         }
         let total = index - start;
-        if total <= TOOL_RUN_BOX_THRESHOLD {
-            continue;
+        if total > TOOL_RUN_BOX_THRESHOLD {
+            windows[start..index].fill(Some(ToolRunWindow {
+                start,
+                end: index,
+                total,
+            }));
         }
-        let window = ToolRunWindow {
-            start,
-            end: index,
-            total,
-        };
-        for slot in &mut windows[start..index] {
-            *slot = Some(window);
-        }
+        index = index.max(start + 1);
     }
     windows
 }
@@ -275,18 +246,4 @@ pub fn action_run_windows(
         }
     }
     windows
-}
-
-pub fn action_run_bridge(entry: &TranscriptEntry) -> bool {
-    matches!(
-        entry,
-        TranscriptEntry::Action {
-            kind: TranscriptActionKind::Agent,
-            ..
-        }
-    ) || matches!(entry, TranscriptEntry::Activity { text, .. } if is_subagent_activity_text(text))
-}
-
-pub fn is_subagent_activity_text(text: &str) -> bool {
-    text.starts_with("agent · ") || text.starts_with("Message agent · ")
 }

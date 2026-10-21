@@ -1397,13 +1397,10 @@ impl Transcript {
         while let Some(entry) = self.order.get(end)
             && same_action_type(first, entry)
         {
-            live |= matches!(entry, TranscriptEntry::Tool { execution, .. } | TranscriptEntry::Action { execution, .. } if !execution.is_terminal());
+            live |= entry.is_live_operation();
             end += 1;
         }
-        let next_is_action = matches!(
-            self.order.get(end),
-            Some(TranscriptEntry::Tool { .. } | TranscriptEntry::Action { .. })
-        );
+        let next_is_action = self.order.get(end).is_some_and(TranscriptEntry::is_operation);
         if end - start >= 5 {
             return live;
         }
@@ -2648,7 +2645,7 @@ impl Transcript {
                 let summary_entry = self.order[window.start..window.end]
                     .iter()
                     .find(|entry| {
-                        matches!(entry, TranscriptEntry::Tool { execution, .. } | TranscriptEntry::Action { execution, .. } if !execution.is_terminal())
+                        entry.is_live_operation()
                     })
                     .unwrap_or(entry);
                 let label = match summary_entry {
@@ -3057,8 +3054,6 @@ impl Transcript {
                     let prefix = "  ";
                     let activity_color = if text == USER_INTERRUPT_ACTIVITY {
                         Color::LightRed
-                    } else if is_subagent_activity_text(text) {
-                        SUBAGENT_PURPLE
                     } else {
                         Color::DarkGray
                     };
@@ -3166,10 +3161,10 @@ impl Transcript {
                     // Close a run of tool and action rows with the same gap a tool
                     // row leaves, and none between rows of the run.
                     let next_in_run = focused_tool.is_none()
-                        && matches!(
-                            self.order.get(index + 1),
-                            Some(TranscriptEntry::Tool { .. } | TranscriptEntry::Action { .. })
-                        );
+                        && self
+                            .order
+                            .get(index + 1)
+                            .is_some_and(TranscriptEntry::is_operation);
                     if tool_window.is_none()
                         && !next_in_run
                         && lines
@@ -3450,10 +3445,10 @@ impl Transcript {
                     let agent_action = is_subagent_tool(source_name) || is_subagent_tool(name);
                     // Tool and action rows (Watch, Peer) form one uniform run.
                     let next_is_tool = focused_tool.is_none()
-                        && matches!(
-                            self.order.get(index + 1),
-                            Some(TranscriptEntry::Tool { .. } | TranscriptEntry::Action { .. })
-                        );
+                        && self
+                            .order
+                            .get(index + 1)
+                            .is_some_and(TranscriptEntry::is_operation);
                     let time = display_local_time(time, &today_prefix);
                     let is_reasoning = matches!(
                         code_view.as_ref(),
