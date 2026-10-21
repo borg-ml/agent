@@ -1757,6 +1757,7 @@ impl TranscriptCore {
                     tool_index.is_some_and(|index| self.tool_has_live_process(index));
                 if let Some(index) = tool_index
                     && let Some(Operation {
+                        kind,
                         execution,
                         source: source_name,
                         label: name,
@@ -1929,7 +1930,7 @@ impl TranscriptCore {
                                 })
                                 .map(|text| {
                                     OperationView::new(
-                                        if is_subagent_tool(source_name) {
+                                        if *kind == OperationKind::Delegation {
                                             "subagent"
                                         } else {
                                             "command"
@@ -3954,7 +3955,7 @@ impl TranscriptCore {
         self.upsert_running_tool(
             event,
             &tool_call_id,
-            "action_preparing",
+            OperationKind::PREPARATION_SOURCE,
             &serde_json::json!({"label": label}),
             None,
         );

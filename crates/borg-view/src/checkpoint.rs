@@ -228,17 +228,10 @@ fn migrate_operation_rows(value: &mut serde_json::Value) -> Result<()> {
                 let source = take("source_name");
                 let label = take("name");
                 let named = |value: &Value| value.as_str().unwrap_or_default().to_string();
-                let kind = match named(&source).as_str() {
-                    "reasoning" => "Reasoning",
-                    "action_preparing" => "Preparation",
-                    source
-                        if borg_agent_runtime::is_subagent_tool(source)
-                            || borg_agent_runtime::is_subagent_tool(&named(&label)) =>
-                    {
-                        "Delegation"
-                    }
-                    _ => "Tool",
-                };
+                let kind = serde_json::to_value(crate::entry::OperationKind::for_call(
+                    &named(&source),
+                    &named(&label),
+                ))?;
                 json!({
                     "kind": kind, "source": source, "label": label,
                     "detail": take("detail"), "input": take("code_view"),

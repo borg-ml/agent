@@ -142,6 +142,249 @@ impl Transcript {
     }
 }
 
+/// What an operation row needs to know about its surroundings to present itself.
+struct OperationLookContext {
+    index: usize,
+    focused_tool: Option<usize>,
+    hovered_tool: Option<usize>,
+    render_time: DateTime<Utc>,
+}
+
+/// How one operation row presents itself. This is where kinds differ: a call
+/// shows its verb, outcome and elapsed time; a lifecycle row its event.
+struct OperationLook {
+    glyph: &'static str,
+    name: String,
+    detail: String,
+    suffix: Option<String>,
+    right: Option<String>,
+    gutter_style: Style,
+    glyph_style: Style,
+    name_style: Style,
+    background_verb: bool,
+    background_suffix: bool,
+    /// A call's running clock, kept so the renderer can tick it.
+    elapsed: Option<String>,
+}
+
+struct OperationBodyContext {
+    width: usize,
+    nested: bool,
+    /// The full-screen inspector is open on this row.
+    focused: bool,
+    /// The inspector is open on some row.
+    focused_tool_open: bool,
+}
+
+impl Transcript {
+    fn operation_look(
+        &self,
+        entry: &TranscriptEntry,
+        operation: &Operation,
+        context: OperationLookContext,
+    ) -> OperationLook {
+        let Operation {
+            kind,
+            label,
+            detail,
+            input,
+            outcome,
+            execution,
+            expanded,
+            ..
+        } = operation;
+        if !kind.is_call() {
+            let style = Style::default().fg(transcript_action_color(*kind, execution.state()));
+            // A single-line row still says what the message is about.
+            let suffix = (!self.wrap_action_rows
+                && *kind == OperationKind::Agent
+                && !*expanded
+                && context.focused_tool.is_none())
+            .then(|| {
+                operation
+                    .body()
+                    .and_then(|body| body.lines().find(|line| !line.trim().is_empty()))
+                    .map(|line| line.trim().to_string())
+            })
+            .flatten();
+            return OperationLook {
+                glyph: transcript_action_glyph(execution.state()),
+                name: label.clone(),
+                detail: detail.clone(),
+                suffix,
+                right: None,
+                gutter_style: Style::default().fg(Color::DarkGray),
+                glyph_style: style,
+                name_style: style,
+                background_verb: false,
+                background_suffix: false,
+                elapsed: None,
+            };
+        }
+        let is_reasoning = *kind == OperationKind::Reasoning;
+        let is_instant = tool_action_is_instant(
+            label,
+            input.as_ref().map(|view| view.language.as_str()),
+        );
+        let failed = execution.is_failed();
+        let glyph = if failed {
+            "!"
+        } else if execution.is_interrupted() {
+            "■"
+        } else if execution.is_backgrounded() {
+            "↗"
+        } else if execution.is_terminal()
+            && (!is_instant || is_command_tool(&operation.source))
+        {
+            tool_kind_marker(*kind, label)
+        } else {
+            "◇"
+        };
+        let gutter_style = if context.hovered_tool == Some(context.index) {
+            Style::default().fg(Color::Gray)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let glyph_style = if failed || execution.is_interrupted() {
+            Style::default().fg(Color::Red)
+        } else if execution.is_backgrounded() {
+            Style::default().fg(USER_LABEL_BLUE)
+        } else {
+            gutter_style
+        };
+        let suffix = if execution.is_interrupted() {
+            Some("user interrupted")
+        } else if execution.is_backgrounded() {
+            Some("Running in background")
+        } else {
+            None
+        };
+        let name = if is_reasoning {
+            label.clone()
+        } else {
+            tool_lifecycle_label(label, execution.is_terminal() && !execution.is_backgrounded())
+                .into_owned()
+        };
+        // The body already spells out a command or a diff; for anything else
+        // the header is the only place that says what ran.
+        let body_states_action = input
+            .as_ref()
+            .is_some_and(|view| view.language == "command" || is_diff_language(&view.language));
+        let detail = if detail.is_empty()
+            || (context.focused_tool == Some(context.index) && body_states_action)
+        {
+            String::new()
+        } else {
+            detail.clone()
+        };
+        let elapsed = format_tool_elapsed_at(
+            execution.started_at(),
+            execution.completed_at(),
+            context.render_time,
+        );
+        let right = match (outcome.as_deref(), elapsed.as_deref()) {
+            (Some(outcome), Some(elapsed)) => Some(format!("{outcome}  {elapsed}")),
+            (Some(outcome), None) => Some(outcome.to_string()),
+            (None, elapsed) => elapsed.map(str::to_string),
+        };
+        OperationLook {
+            glyph,
+            name,
+            detail,
+            suffix: suffix.map(str::to_string),
+            right,
+            gutter_style,
+            glyph_style,
+            name_style: action_label_style(entry),
+            background_verb: execution.is_backgrounded() && !is_reasoning,
+            background_suffix: execution.is_backgrounded(),
+            elapsed,
+        }
+    }
+
+    /// The lines under an operation's header: a call's input and output, or a
+    /// lifecycle row's message.
+    fn operation_body_lines(
+        &self,
+        index: usize,
+        operation: &Operation,
+        context: OperationBodyContext,
+    ) -> Vec<Line<'static>> {
+        let Operation {
+            kind,
+            source,
+            label,
+            input,
+            output,
+            execution,
+            expanded,
+            ..
+        } = operation;
+        let mut lines = Vec::new();
+        let (width, nested, focused) = (context.width, context.nested, context.focused);
+        if !kind.is_call() {
+            let shown = *expanded
+                || focused
+                || (self.wrap_action_rows && *kind == OperationKind::Agent);
+            let Some(view) = output.as_ref().filter(|view| shown && !view.is_blank()) else {
+                return lines;
+            };
+            lines = self.operation_view_lines(
+                index,
+                (&view.language, &view.text),
+                width,
+                nested,
+                OperationViewMode {
+                    output: false,
+                    focused,
+                    cacheable: false,
+                },
+            );
+            if !expanded && !context.focused_tool_open {
+                clip_body_lines(&mut lines, body_gutter(nested), 3);
+            }
+            return lines;
+        }
+        let shows_body = execution.is_terminal()
+            || !is_edit_tool(source, label)
+            || input
+                .as_ref()
+                .is_some_and(|view| is_diff_language(&view.language));
+        if !(shows_body
+            && (*expanded || focused)
+            && tool_has_expandable_body(source, input.as_ref(), output.as_ref()))
+        {
+            return lines;
+        }
+        let cacheable = execution.is_terminal() && *kind != OperationKind::Delegation;
+        for (is_output, view) in [(false, input), (true, output)] {
+            let Some(view) = view else {
+                continue;
+            };
+            let start = lines.len();
+            lines.extend(self.operation_view_lines(
+                index,
+                (&view.language, &view.text),
+                width,
+                nested,
+                OperationViewMode {
+                    output: is_output,
+                    focused,
+                    cacheable,
+                },
+            ));
+            if focused && !is_output && view.language == "command" {
+                for line in &mut lines[start..] {
+                    for span in line.spans.iter_mut().skip(1) {
+                        span.style = span.style.fg(USER_LABEL_BLUE);
+                    }
+                }
+            }
+        }
+        lines
+    }
+}
+
 /// Keep a collapsed body to `max` rows, ending in an ellipsis.
 fn clip_body_lines(lines: &mut Vec<Line<'static>>, gutter: &'static str, max: usize) {
     if lines.len() > max {
@@ -164,13 +407,27 @@ struct RowClose {
     index: usize,
     /// First line of the row, as clicks and selections see it.
     start: usize,
-    /// First line the hover tint covers.
-    hover_from: usize,
-    hovered: bool,
+    hover: Hover,
     /// Rows inside a run are selected by their visible slice, not by text offset.
     nested: bool,
     /// Whether a blank line follows the row.
     gap: bool,
+}
+
+/// How much of a row the hover tint covers, starting at its first line.
+#[derive(Clone, Copy)]
+enum Hover {
+    Off,
+    /// The whole row.
+    Row,
+    /// The lines before this one: a call's summary, not its body.
+    Until(usize),
+}
+
+impl Hover {
+    fn row(hovered: bool) -> Self {
+        if hovered { Self::Row } else { Self::Off }
+    }
 }
 
 fn close_row(
@@ -180,8 +437,13 @@ fn close_row(
     width: usize,
     close: RowClose,
 ) {
-    if close.hovered {
-        for line in &mut lines[close.hover_from..] {
+    let tinted = match close.hover {
+        Hover::Off => None,
+        Hover::Row => Some(close.start..lines.len()),
+        Hover::Until(end) => Some(close.start..end),
+    };
+    if let Some(range) = tinted {
+        for line in &mut lines[range] {
             apply_line_background(line, width, MESSAGE_HOVER_BG);
         }
     }
@@ -3223,86 +3485,75 @@ impl Transcript {
                         RowClose {
                             index,
                             start: entry_start,
-                            hover_from: entry_start,
-                            hovered: hovered_entry == Some(index),
+                            hover: Hover::row(hovered_entry == Some(index)),
                             nested: false,
                             gap: true,
                         },
                     );
                 }
-                TranscriptEntry::Operation(
-                    operation @ Operation {
-                        kind,
-                        label,
-                        detail,
-                        time,
-                        execution,
-                        expanded,
-                        ..
-                    },
-                ) if !kind.is_call() => {
-                    let time = if tool_window.is_some() {
+                TranscriptEntry::Operation(operation) => {
+                    let nested = tool_window.is_some();
+                    let focused = focused_tool == Some(index);
+                    let call = operation.kind.is_call();
+                    let look = self.operation_look(
+                        entry,
+                        operation,
+                        OperationLookContext {
+                            index,
+                            focused_tool,
+                            hovered_tool,
+                            render_time,
+                        },
+                    );
+                    if call {
+                        if operation.execution.completed_at().is_none() {
+                            trace.clock_rows.push(index);
+                        }
+                        if !operation.execution.is_terminal() {
+                            running_tool_elapsed.push((index, look.elapsed.clone()));
+                        }
+                    }
+                    let time = if nested {
                         String::new()
                     } else {
-                        format!("{}  ", display_local_time(time, &today_prefix))
+                        format!("{}  ", display_local_time(&operation.time, &today_prefix))
                     };
-                    let prefix = "  ";
-                    let glyph = transcript_action_glyph(execution.state());
-                    let color = transcript_action_color(*kind, execution.state());
-                    // A single-line row still says what the message is about.
-                    let preview = (!self.wrap_action_rows
-                        && *kind == OperationKind::Agent
-                        && !*expanded
-                        && focused_tool.is_none())
-                    .then(|| {
-                        operation
-                            .body()
-                            .and_then(|body| body.lines().find(|line| !line.trim().is_empty()))
-                            .map(str::trim)
-                    })
-                    .flatten();
-                    let action_start = lines.len();
-                    let style = Style::default().fg(color);
                     lines.extend(operation_header_lines(
                         &OperationHeader {
                             time: &time,
-                            glyph,
-                            name: label,
-                            detail,
-                            suffix: preview,
-                            right: None,
-                            gutter_style: Style::default().fg(Color::DarkGray),
-                            glyph_style: style,
-                            name_style: style,
-                            background_verb: false,
-                            background_suffix: false,
+                            glyph: look.glyph,
+                            name: &look.name,
+                            detail: &look.detail,
+                            suffix: look.suffix.as_deref(),
+                            right: look.right.as_deref(),
+                            gutter_style: look.gutter_style,
+                            glyph_style: look.glyph_style,
+                            name_style: look.name_style,
+                            background_verb: look.background_verb,
+                            background_suffix: look.background_suffix,
                         },
-                        prefix,
+                        "  ",
                         width,
                         self.wrap_action_rows,
                     ));
-                    if (*expanded
-                        || focused_tool == Some(index)
-                        || (self.wrap_action_rows && *kind == OperationKind::Agent))
-                        && let Some(body) = operation.body().filter(|body| !body.trim().is_empty())
-                    {
-                        let nested = tool_window.is_some();
-                        let mut body_lines = self.operation_view_lines(
-                            index,
-                            ("text", body),
+                    // A call's hover tints its summary only; a lifecycle
+                    // row's tints its message too.
+                    let summary_end = lines.len();
+                    lines.extend(self.operation_body_lines(
+                        index,
+                        operation,
+                        OperationBodyContext {
                             width,
                             nested,
-                            OperationViewMode {
-                                output: false,
-                                focused: focused_tool == Some(index),
-                                cacheable: false,
-                            },
-                        );
-                        if !expanded && focused_tool.is_none() {
-                            clip_body_lines(&mut body_lines, body_gutter(nested), 3);
-                        }
-                        lines.extend(body_lines);
-                    }
+                            focused,
+                            focused_tool_open: focused_tool.is_some(),
+                        },
+                    ));
+                    let hovered = if call {
+                        hovered_tool == Some(index)
+                    } else {
+                        hovered_entry == Some(index)
+                    };
                     // A run of operations closes with one gap, none between its rows.
                     let next_in_run = focused_tool.is_none()
                         && self
@@ -3311,16 +3562,19 @@ impl Transcript {
                             .is_some_and(TranscriptEntry::is_operation);
                     close_row(
                         lines,
-                        entry_rows,
+                        if call { tool_rows } else { entry_rows },
                         selection_rows,
                         width,
                         RowClose {
                             index,
                             start: entry_start,
-                            hover_from: action_start,
-                            hovered: hovered_entry == Some(index),
-                            nested: tool_window.is_some(),
-                            gap: tool_window.is_none()
+                            hover: match (hovered, call) {
+                                (false, _) => Hover::Off,
+                                (true, true) => Hover::Until(summary_end),
+                                (true, false) => Hover::Row,
+                            },
+                            nested,
+                            gap: !nested
                                 && !next_in_run
                                 && lines
                                     .last()
@@ -3429,8 +3683,7 @@ impl Transcript {
                         RowClose {
                             index,
                             start: entry_start,
-                            hover_from: entry_start,
-                            hovered: hovered_entry == Some(index),
+                            hover: Hover::row(hovered_entry == Some(index)),
                             nested: false,
                             gap: true,
                         },
@@ -3468,8 +3721,7 @@ impl Transcript {
                         RowClose {
                             index,
                             start: entry_start,
-                            hover_from: entry_start,
-                            hovered: hovered_entry == Some(index),
+                            hover: Hover::row(hovered_entry == Some(index)),
                             nested: false,
                             gap: true,
                         },
@@ -3495,8 +3747,7 @@ impl Transcript {
                         RowClose {
                             index,
                             start: entry_start,
-                            hover_from: entry_start,
-                            hovered: hovered_entry == Some(index),
+                            hover: Hover::row(hovered_entry == Some(index)),
                             nested: false,
                             gap: true,
                         },
@@ -3552,197 +3803,9 @@ impl Transcript {
                         RowClose {
                             index,
                             start: entry_start,
-                            hover_from: entry_start,
-                            hovered: hovered_entry == Some(index),
+                            hover: Hover::row(hovered_entry == Some(index)),
                             nested: false,
                             gap: true,
-                        },
-                    );
-                }
-                TranscriptEntry::Operation(Operation {
-                    kind,
-                    source: source_name,
-                    label: name,
-                    detail,
-                    input: code_view,
-                    output: output_view,
-                    time,
-                    execution,
-                    expanded,
-                    outcome,
-                    ..
-                }) => {
-                    let agent_action = *kind == OperationKind::Delegation;
-                    // Tool and action rows (Watch, Peer) form one uniform run.
-                    let next_is_tool = focused_tool.is_none()
-                        && self
-                            .order
-                            .get(index + 1)
-                            .is_some_and(TranscriptEntry::is_operation);
-                    let time = display_local_time(time, &today_prefix);
-                    let is_reasoning = *kind == OperationKind::Reasoning;
-                    let expandable = tool_has_expandable_body(
-                        source_name,
-                        code_view.as_ref(),
-                        output_view.as_ref(),
-                    );
-                    let is_instant = tool_action_is_instant(
-                        name,
-                        code_view.as_ref().map(|OperationView { language, .. }| language.as_str()),
-                    );
-                    let summary_start = lines.len();
-                    let failed = execution.is_failed();
-                    let glyph = if failed {
-                        "!"
-                    } else if execution.is_interrupted() {
-                        "■"
-                    } else if execution.is_backgrounded() {
-                        "↗"
-                    } else if execution.is_terminal()
-                        && (!is_instant || is_command_tool(source_name))
-                    {
-                        tool_kind_marker(*kind, name)
-                    } else {
-                        "◇"
-                    };
-                    let gutter_style = if hovered_tool == Some(index) {
-                        Style::default().fg(Color::Gray)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    };
-                    let style = if failed || execution.is_interrupted() {
-                        Style::default().fg(Color::Red)
-                    } else if execution.is_backgrounded() {
-                        Style::default().fg(USER_LABEL_BLUE)
-                    } else {
-                        gutter_style
-                    };
-                    let name_style = action_label_style(entry);
-                    let is_edit = is_edit_tool(source_name, name);
-                    let lifecycle = if execution.is_interrupted() {
-                        Some("user interrupted")
-                    } else if execution.is_backgrounded() {
-                        Some("Running in background")
-                    } else {
-                        None
-                    };
-                    let lifecycle_complete =
-                        execution.is_terminal() && !execution.is_backgrounded();
-                    let display_name = if is_reasoning {
-                        Cow::Borrowed(name.as_str())
-                    } else {
-                        tool_lifecycle_label(name, lifecycle_complete)
-                    };
-                    let show_tool_body = execution.is_terminal()
-                        || !is_edit
-                        || code_view
-                            .as_ref()
-                            .is_some_and(|OperationView { language, .. }| is_diff_language(language));
-                    let display_detail = detail;
-                    // Inside a group the header carries the time.
-                    let time = if tool_window.is_some() {
-                        String::new()
-                    } else {
-                        format!("{time}  ")
-                    };
-                    // The detail view's body already spells out a command or a diff; for
-                    // anything else the header is the only place that says what ran.
-                    let body_states_action = code_view.as_ref().is_some_and(|OperationView { language, .. }| {
-                        language == "command" || is_diff_language(language)
-                    });
-                    let prefix = "  ";
-                    let elapsed = format_tool_elapsed_at(
-                        execution.started_at(),
-                        execution.completed_at(),
-                        render_time,
-                    );
-                    let right = match (outcome.as_deref(), elapsed.as_deref()) {
-                        (Some(outcome), Some(elapsed)) => Some(format!("{outcome}  {elapsed}")),
-                        (Some(outcome), None) => Some(outcome.to_string()),
-                        (None, elapsed) => elapsed.map(str::to_string),
-                    };
-                    if execution.completed_at().is_none() {
-                        trace.clock_rows.push(index);
-                    }
-                    if !execution.is_terminal() {
-                        running_tool_elapsed.push((index, elapsed.clone()));
-                    }
-                    let header_detail = if display_detail.is_empty()
-                        || (focused_tool == Some(index) && body_states_action)
-                    {
-                        ""
-                    } else {
-                        display_detail.as_str()
-                    };
-                    lines.extend(operation_header_lines(
-                        &OperationHeader {
-                            time: &time,
-                            glyph,
-                            name: display_name.as_ref(),
-                            detail: header_detail,
-                            suffix: lifecycle,
-                            right: right.as_deref(),
-                            gutter_style,
-                            glyph_style: style,
-                            name_style,
-                            background_verb: execution.is_backgrounded() && !is_reasoning,
-                            background_suffix: execution.is_backgrounded(),
-                        },
-                        prefix,
-                        width,
-                        self.wrap_action_rows,
-                    ));
-                    if hovered_tool == Some(index) {
-                        for line in &mut lines[summary_start..] {
-                            apply_line_background(line, width, MESSAGE_HOVER_BG);
-                        }
-                    }
-                    let body_expanded = *expanded || focused_tool == Some(index);
-                    if show_tool_body && body_expanded && expandable {
-                        let focused = focused_tool == Some(index);
-                        let cacheable = execution.is_terminal() && !agent_action;
-                        for (output, view) in [(false, code_view), (true, output_view)] {
-                            let Some(OperationView { language, text: source }) = view else {
-                                continue;
-                            };
-                            let body_start = lines.len();
-                            lines.extend(self.operation_view_lines(
-                                index,
-                                (language, source),
-                                width,
-                                tool_window.is_some(),
-                                OperationViewMode {
-                                    output,
-                                    focused,
-                                    cacheable,
-                                },
-                            ));
-                            if focused && !output && language == "command" {
-                                for line in &mut lines[body_start..] {
-                                    for span in line.spans.iter_mut().skip(1) {
-                                        span.style = span.style.fg(USER_LABEL_BLUE);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // The summary was tinted above; the body is not part of the hover.
-                    close_row(
-                        lines,
-                        tool_rows,
-                        selection_rows,
-                        width,
-                        RowClose {
-                            index,
-                            start: summary_start,
-                            hover_from: summary_start,
-                            hovered: false,
-                            nested: tool_window.is_some(),
-                            gap: tool_window.is_none()
-                                && !next_is_tool
-                                && lines
-                                    .last()
-                                    .is_none_or(|line| !line_is_unstyled_blank(line)),
                         },
                     );
                 }
@@ -4588,10 +4651,10 @@ mod parallel_preparation_tests {
         assert!(transcript.order.iter().all(|entry| matches!(
             entry,
             TranscriptEntry::Operation(Operation {
-                source: source_name,
+                kind: OperationKind::Preparation,
                 execution,
                 ..
-            }) if !execution.is_terminal() && source_name == "action_preparing"
+            }) if !execution.is_terminal()
         )));
 
         for (sequence, tool_call_id, name, input) in [
@@ -4626,10 +4689,10 @@ mod parallel_preparation_tests {
         assert!(transcript.order.iter().all(|entry| matches!(
             entry,
             TranscriptEntry::Operation(Operation {
-                source: source_name,
+                kind,
                 execution,
                 ..
-            }) if !execution.is_terminal() && source_name != "action_preparing"
+            }) if !execution.is_terminal() && *kind != OperationKind::Preparation
         )));
     }
 }
