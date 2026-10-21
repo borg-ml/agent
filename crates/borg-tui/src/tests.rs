@@ -1,5 +1,5 @@
 use super::*;
-use borg_view::entry::{Execution, ExecutionState, Operation, OperationKind};
+use borg_view::entry::{Execution, ExecutionState, Operation, OperationKind, OperationView};
 
 /// A poll of a running command added a row reading "Read output" over the
 /// command it was already showing, and the rows stacked with every check. The
@@ -106,7 +106,7 @@ fn polling_a_running_command_does_not_add_a_row_of_its_own() {
     // so it is asserted on the entry rather than on the rendered lines.
     let origin = transcript.order.iter().find_map(|entry| match entry {
         TranscriptEntry::Operation(Operation {
-            input: Some((_, command)),
+            input: Some(OperationView { text: command, .. }),
             output: output_view,
             ..
         }) if command.contains("cargo test") => Some(output_view.clone()),
@@ -115,7 +115,7 @@ fn polling_a_running_command_does_not_add_a_row_of_its_own() {
     assert!(
         origin
             .clone()
-            .and_then(|view| view.map(|(_, text)| text))
+            .and_then(|view| view.map(|OperationView { text, .. }| text))
             .is_some_and(|text| text.contains("test result: ok")),
         "the command's row must still receive the output: {origin:?}"
     );
@@ -601,7 +601,7 @@ fn resumed_history_keeps_child_and_peer_messages_in_order() {
         .map(|entry| match entry {
             TranscriptEntry::Message { text, .. } => text.as_str(),
             TranscriptEntry::Operation(Operation {
-                output: Some((_, body)),
+                output: Some(OperationView { text: body, .. }),
                 ..
             }) => body.as_str(),
             _ => "other",
@@ -2585,7 +2585,7 @@ fn completed_file_creation_replaces_null_diff_placeholder() {
         transcript.order.last(),
         Some(TranscriptEntry::Operation(Operation {
             label: name,
-            input: Some((language, text)),
+            input: Some(OperationView { language, text }),
             expanded: true,
             ..
         })) if name == "Create file"
@@ -2627,7 +2627,7 @@ fn completed_tool_keeps_output_in_the_expandable_body_and_summarizes_the_header(
         transcript.order.last(),
         Some(TranscriptEntry::Operation(Operation {
             detail,
-            output: Some((language, body)),
+            output: Some(OperationView { language, text: body }),
             expanded: false,
             ..
         })) if detail == "2 lines" && language == "text" && body.contains("src/other.rs")
@@ -2712,22 +2712,22 @@ fn command_changes_become_a_separate_replay_stable_edit_action() {
         &transcript.order[0],
         TranscriptEntry::Operation(Operation {
             label: name,
-            input: Some((language, command)),
-            output: Some((_, output)),
+            input: Some(OperationView { language, text: command }),
+            output: Some(OperationView { text: output, .. }),
             ..
         }) if name == "Run" && language == "command" && command == "python3 rewrite.py"
             && output.contains("rewrote src/lib.rs") && !output.contains("@@ -1")
     ));
     assert!(matches!(
         &transcript.order[2],
-        TranscriptEntry::Operation(Operation { input: Some((_, command)), .. })
+        TranscriptEntry::Operation(Operation { input: Some(OperationView { text: command, .. }), .. })
             if command == "cargo check"
     ));
     assert!(matches!(
         &transcript.order[1],
         TranscriptEntry::Operation(Operation {
             label: name,
-            input: Some((language, diff)),
+            input: Some(OperationView { language, text: diff }),
             expanded: true,
             ..
         }) if name == "Edit" && language == "diff:rs" && diff.contains("+new")
@@ -2740,7 +2740,7 @@ fn command_changes_become_a_separate_replay_stable_edit_action() {
     assert_eq!(replay.order.len(), 3);
     assert!(matches!(
         &replay.order[1],
-        TranscriptEntry::Operation(Operation { label: name, input: Some((_, diff)), .. })
+        TranscriptEntry::Operation(Operation { label: name, input: Some(OperationView { text: diff, .. }), .. })
             if name == "Edit" && diff.contains("+new")
     ));
 }
@@ -2802,7 +2802,7 @@ fn deferred_command_change_hydrates_its_edit_action() {
         &transcript.order[1],
         TranscriptEntry::Operation(Operation {
             label: name,
-            input: Some((language, _)),
+            input: Some(OperationView { language, .. }),
             payload_refs,
             expanded: false,
             ..
@@ -2816,7 +2816,7 @@ fn deferred_command_change_hydrates_its_edit_action() {
     assert!(matches!(
         &transcript.order[1],
         TranscriptEntry::Operation(Operation {
-            input: Some((language, diff)),
+            input: Some(OperationView { language, text: diff }),
             payload_refs,
             expanded: true,
             ..
@@ -2902,7 +2902,7 @@ fn background_process_change_and_terminal_poll_share_one_edit_action() {
     assert_eq!(transcript.order.len(), 3);
     assert!(matches!(
         &transcript.order[1],
-        TranscriptEntry::Operation(Operation { label: name, input: Some((_, diff)), .. })
+        TranscriptEntry::Operation(Operation { label: name, input: Some(OperationView { text: diff, .. }), .. })
             if name == "Edit" && diff.contains("+new")
     ));
     assert_eq!(transcript.tools.get("read"), Some(&2));
@@ -2967,13 +2967,22 @@ fn tool_copy_uses_output_and_keeps_edit_diffs_copyable() {
     };
 
     let command = tool(
-        Some(("command".to_string(), "git status".to_string())),
-        Some(("text".to_string(), " M src/main.rs".to_string())),
+        Some(OperationView::new(
+            "command".to_string(),
+            "git status".to_string(),
+        )),
+        Some(OperationView::new(
+            "text".to_string(),
+            " M src/main.rs".to_string(),
+        )),
     );
     assert_eq!(command.copy_text_owned().as_deref(), Some(" M src/main.rs"));
 
     let edit = tool(
-        Some(("diff:rs".to_string(), "@@ -1 +1 @@\n-old\n+new".to_string())),
+        Some(OperationView::new(
+            "diff:rs".to_string(),
+            "@@ -1 +1 @@\n-old\n+new".to_string(),
+        )),
         None,
     );
     assert_eq!(
@@ -2989,8 +2998,14 @@ fn tool_hover_hint_names_the_copy_target() {
         source: "functions.exec_command".to_string(),
         label: "Run command".to_string(),
         detail: "git status".to_string(),
-        input: Some(("command".to_string(), "git status".to_string())),
-        output: Some(("text".to_string(), " M src/main.rs".to_string())),
+        input: Some(OperationView::new(
+            "command".to_string(),
+            "git status".to_string(),
+        )),
+        output: Some(OperationView::new(
+            "text".to_string(),
+            " M src/main.rs".to_string(),
+        )),
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
         execution: Execution::new(Utc::now(), ExecutionState::Complete),
@@ -3011,7 +3026,10 @@ fn tool_hover_hint_names_the_copy_target() {
         ..
     })) = transcript.order.get_mut(0)
     {
-        *code_view = Some(("diff:rs".to_string(), "@@ -1 +1 @@\n-old\n+new".to_string()));
+        *code_view = Some(OperationView::new(
+            "diff:rs".to_string(),
+            "@@ -1 +1 @@\n-old\n+new".to_string(),
+        ));
         *output_view = None;
     }
     assert_eq!(
@@ -3059,7 +3077,7 @@ fn native_edit_file_keeps_the_replacement_diff_after_its_mutation_receipt() {
     assert!(matches!(
         transcript.order.last(),
         Some(TranscriptEntry::Operation(Operation {
-            input: Some((language, text)),
+            input: Some(OperationView { language, text }),
             output: None,
             expanded: true,
             ..
@@ -6165,7 +6183,7 @@ fn deferred_tool_input_loads_when_the_card_is_expanded() {
     assert!(matches!(
         transcript.order.first(),
         Some(TranscriptEntry::Operation(Operation {
-            input: Some((language, source)),
+            input: Some(OperationView { language, text: source }),
             payload_refs,
             expanded: true,
             ..
@@ -6219,7 +6237,7 @@ fn deferred_edit_output_rehydrates_as_a_copyable_diff() {
     assert!(matches!(
         transcript.order.first(),
         Some(TranscriptEntry::Operation(Operation {
-            input: Some((language, body)),
+            input: Some(OperationView { language, text: body }),
             output: None,
             payload_refs,
             ..
@@ -6775,7 +6793,7 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
     assert!(
         matches!(
             &with_diff.order[0],
-            TranscriptEntry::Operation(Operation { input: Some((language, _)), .. })
+            TranscriptEntry::Operation(Operation { input: Some(OperationView { language, .. }), .. })
                 if is_diff_language(language)
         ),
         "the fixture must actually produce a diff body"
@@ -9397,7 +9415,7 @@ fn ordinary_subagent_status_stays_in_roster_without_embedded_child_bodies() {
     child.apply(&receipt);
     assert!(child.order.iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Operation(Operation { output: Some((_, body)), .. })
+        TranscriptEntry::Operation(Operation { output: Some(OperationView { text: body, .. }), .. })
             if body == "Found the renderer issue."
     )));
     assert!(fresh_transcript_like(&child).show_subagent_messages);
@@ -9592,7 +9610,10 @@ fn typed_agent_action_has_an_expandable_report_and_structured_copy() {
         kind: OperationKind::Agent,
         label: "Agent".to_string(),
         detail: "/root/review · report ready".to_string(),
-        output: Some(("text".to_string(), "First line\nSecond line".to_string())),
+        output: Some(OperationView::new(
+            "text".to_string(),
+            "First line\nSecond line".to_string(),
+        )),
         time: "12:00".to_string(),
         execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
@@ -11558,7 +11579,7 @@ fn agent_receipt_replaces_user_projection_in_either_arrival_order() {
             TranscriptEntry::Operation(Operation {
                 kind: OperationKind::Agent,
                 detail,
-                output: Some((_, body)),
+                output: Some(OperationView { text: body, .. }),
                 ..
             }) if detail == "reviewer" && body == "review result"
         ));
@@ -13930,7 +13951,10 @@ fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
             source: "reasoning".to_string(),
             label: "Reasoning".to_string(),
             detail: String::new(),
-            input: Some(("reasoning".to_string(), text.to_string())),
+            input: Some(OperationView::new(
+                "reasoning".to_string(),
+                text.to_string(),
+            )),
             output: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
@@ -14168,7 +14192,10 @@ fn boxed_thinking_rows_keep_one_edge_separator_without_duplicates() {
             source: "reasoning".to_string(),
             label: "Reasoning".to_string(),
             detail: String::new(),
-            input: Some(("reasoning".to_string(), format!("thought {index}"))),
+            input: Some(OperationView::new(
+                "reasoning".to_string(),
+                format!("thought {index}"),
+            )),
             output: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
@@ -14232,10 +14259,9 @@ fn peer_reports_and_errors_keep_one_continuous_neutral_actions_gutter() {
                 kind: OperationKind::Agent,
                 label: label.into(),
                 detail: "abundance".into(),
-                output: Some((
-                    "text".to_string(),
-                    "A report with enough text to wrap over multiple lines in the actions group."
-                        .into(),
+                output: Some(OperationView::new(
+                    "text",
+                    "A report with enough text to wrap over multiple lines in the actions group.",
                 )),
                 time: "12:00".into(),
                 execution: Execution::new(Utc::now(), ExecutionState::Complete),
@@ -14921,7 +14947,10 @@ fn focused_tool_inspector_isolates_one_tool_and_forces_its_live_body_open() {
         source: "Run".to_string(),
         label: "Run".to_string(),
         detail: "unrelated-tool".to_string(),
-        input: Some(("text".to_string(), "unrelated body".to_string())),
+        input: Some(OperationView::new(
+            "text".to_string(),
+            "unrelated body".to_string(),
+        )),
         output: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
@@ -14940,7 +14969,7 @@ fn focused_tool_inspector_isolates_one_tool_and_forces_its_live_body_open() {
         source: "Edit".to_string(),
         label: "Edit".to_string(),
         detail: "config.toml".to_string(),
-        input: Some((
+        input: Some(OperationView::new(
             "diff:toml".to_string(),
             "@@ -1 +1 @@\n-enabled = false\n+enabled = true".to_string(),
         )),
@@ -15117,7 +15146,8 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
             source: if reasoning { "reasoning" } else { "Run" }.to_string(),
             label: if reasoning { "Reasoned" } else { "Run" }.to_string(),
             detail: format!("call-{index}"),
-            input: reasoning.then(|| ("reasoning".to_string(), format!("Reasoning block {index}"))),
+            input: reasoning
+                .then(|| OperationView::new("reasoning", format!("Reasoning block {index}"))),
             output: None,
             payload_refs: Vec::new(),
             time: "19:38".to_string(),
@@ -15521,7 +15551,7 @@ fn tall_expanded_tool_transcript() -> Transcript {
         source: "Edit".to_string(),
         label: "Edit".to_string(),
         detail: "very-tall.rs".to_string(),
-        input: Some((
+        input: Some(OperationView::new(
             "command".to_string(),
             (0..240)
                 .map(|line| format!("+changed line {line}"))
@@ -15599,8 +15629,11 @@ fn keyboard_collapse_of_tall_output_uses_the_same_reflow_anchor() {
         .iter_mut()
         .find(|entry| matches!(entry, TranscriptEntry::Operation(Operation { .. })))
     {
-        *code_view = Some(("text".to_string(), "command input".to_string()));
-        *output_view = Some((
+        *code_view = Some(OperationView::new(
+            "text".to_string(),
+            "command input".to_string(),
+        ));
+        *output_view = Some(OperationView::new(
             "text".to_string(),
             (0..240)
                 .map(|line| format!("output line {line}"))
@@ -15647,7 +15680,7 @@ fn line_scrolling_preserves_expanded_actions() {
             source: "Edit".to_string(),
             label: "Edit".to_string(),
             detail: format!("file-{index}.rs"),
-            input: Some((
+            input: Some(OperationView::new(
                 "diff:rs".to_string(),
                 (0..12)
                     .map(|line| format!("+changed-{line}"))
@@ -15698,7 +15731,7 @@ fn scrolled_action_viewport_pins_the_current_tool_header() {
             source: "Edit".to_string(),
             label: "Edit".to_string(),
             detail: format!("file-{index}.rs"),
-            input: Some((
+            input: Some(OperationView::new(
                 "diff:rs".to_string(),
                 (0..20)
                     .map(|line| format!("+changed-{line}"))
@@ -15738,7 +15771,10 @@ fn expanding_an_action_preserves_the_current_line_anchor() {
             source: "Edit".to_string(),
             label: "Edit".to_string(),
             detail: format!("file-{index}.rs"),
-            input: Some(("diff:rs".to_string(), "+first\n+second\n+third".to_string())),
+            input: Some(OperationView::new(
+                "diff:rs".to_string(),
+                "+first\n+second\n+third".to_string(),
+            )),
             output: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
@@ -15837,7 +15873,7 @@ fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
         &transcript.order[0],
         TranscriptEntry::Operation(Operation {
             label: name,
-            input: Some((language, source)),
+            input: Some(OperationView { language, text: source }),
             execution,
             expanded: false,
             ..
@@ -15900,7 +15936,7 @@ fn reasoning_lifecycle_events_show_reasoning_without_a_text_delta() {
         &transcript.order[0],
         TranscriptEntry::Operation(Operation {
             label: name,
-            input: Some((language, source)),
+            input: Some(OperationView { language, text: source }),
             execution,
             expanded: false,
             ..
@@ -16058,7 +16094,7 @@ fn completed_reasoning_blocks_stay_terminal_within_a_request() {
     for (index, expected) in [(24, "First final summary"), (25, "Second final summary")] {
         assert!(
             matches!(&transcript.order[index], TranscriptEntry::Operation(Operation {
-            input: Some((_, text)), execution, ..
+            input: Some(OperationView { text, .. }), execution, ..
         }) if execution.is_terminal() && text == expected)
         );
     }
@@ -16134,7 +16170,7 @@ fn cumulative_reasoning_snapshots_replace_the_live_prefix() {
     assert!(matches!(
         &transcript.order[0],
         TranscriptEntry::Operation(Operation {
-            input: Some((language, source)),
+            input: Some(OperationView { language, text: source }),
             ..
         }) if language == "reasoning"
             && source == "Considering code modifications\nI’m checking the repository"
@@ -16527,7 +16563,10 @@ fn interrupted_tools_update_in_place_with_explicit_user_cause() {
         source: "Run".to_string(),
         label: "Run".to_string(),
         detail: "cargo check".to_string(),
-        input: Some(("bash".to_string(), "cargo check".to_string())),
+        input: Some(OperationView::new(
+            "bash".to_string(),
+            "cargo check".to_string(),
+        )),
         output: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
@@ -17758,7 +17797,7 @@ fn released_selection_follows_expanded_tool_text_during_nested_scroll() {
             source: "Edit".to_string(),
             label: "Edit".to_string(),
             detail: format!("file-{index}.rs"),
-            input: Some((
+            input: Some(OperationView::new(
                 "command".to_string(),
                 (0..24)
                     .map(|line| format!("+changed-{line}"))
@@ -18098,7 +18137,9 @@ fn provider_background_handle_drives_shell_status_and_full_output() {
     };
     assert!(!execution.is_backgrounded());
     assert_eq!(
-        output_view.as_ref().map(|(_, output)| output.as_str()),
+        output_view
+            .as_ref()
+            .map(|OperationView { text: output, .. }| output.as_str()),
         Some("first line\nsecond line\nlast line")
     );
     let fullscreen = transcript.render_tool_for_cache(0, 100, 8).0;
@@ -18226,9 +18267,12 @@ fn exec_poll_completion_renders_command_and_readable_output() {
         };
         assert_eq!(
             code_view,
-            &Some(("command".into(), "git push origin main".into()))
+            &Some(OperationView::new("command", "git push origin main"))
         );
-        let (language, output) = output_view.as_ref().unwrap();
+        let OperationView {
+            language,
+            text: output,
+        } = output_view.as_ref().unwrap();
         assert_eq!(language, "text");
         assert!(output.contains("first line\nsecond line\n"));
         assert!(output.contains("remote message"));
@@ -18309,7 +18353,7 @@ fn fullscreen_non_tool_details_expand_without_mutating_inline_state() {
         kind: OperationKind::Agent,
         label: "Agent".into(),
         detail: "summary".into(),
-        output: Some(("text".to_string(), "preview\nACTION_BODY".into())),
+        output: Some(OperationView::new("text", "preview\nACTION_BODY")),
         time: "12:00".into(),
         execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
@@ -18418,7 +18462,7 @@ fn diff_backgrounds_cover_edit_and_inline_viewport_edges_without_changing_copy()
                     },
                 ));
                 let TranscriptEntry::Operation(Operation {
-                    input: Some((_, source)),
+                    input: Some(OperationView { text: source, .. }),
                     ..
                 }) = &transcript.order[0]
                 else {
@@ -18714,7 +18758,7 @@ async fn timeline_detail_click_policy_applies_to_every_expandable_entry() {
             kind: OperationKind::Agent,
             label: "Agent".into(),
             detail: "detail".into(),
-            output: Some(("text".to_string(), "ACTION_BODY".into())),
+            output: Some(OperationView::new("text", "ACTION_BODY")),
             time: "12:00".into(),
             execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
@@ -19260,7 +19304,7 @@ fn live_reasoning_preview_appends_repeated_deltas_without_snapshot_duplication()
     fn reasoning_text(transcript: &Transcript) -> &str {
         match transcript.order.first() {
             Some(TranscriptEntry::Operation(Operation {
-                input: Some((_, source)),
+                input: Some(OperationView { text: source, .. }),
                 ..
             })) => source,
             _ => panic!("expected one reasoning row"),
@@ -19311,7 +19355,7 @@ fn reasoning_snapshot_repairs_a_dropped_live_preview() {
     fn reasoning_text(transcript: &Transcript) -> &str {
         match &transcript.order[0] {
             TranscriptEntry::Operation(Operation {
-                input: Some((_, source)),
+                input: Some(OperationView { text: source, .. }),
                 ..
             }) => source,
             _ => panic!("expected a reasoning row"),
@@ -19413,7 +19457,7 @@ fn subagent_actions_render_names_without_changing_routing_targets() {
         assert!(!named.contains(&child_id.to_string()));
         assert!(!named.contains("session:"));
         assert!(
-            matches!(&transcript.order[index], TranscriptEntry::Operation(Operation { input: Some((_, input)), .. })
+            matches!(&transcript.order[index], TranscriptEntry::Operation(Operation { input: Some(OperationView { text: input, .. }), .. })
             if input.contains(&target)),
             "routing metadata must stay untouched"
         );
@@ -19462,7 +19506,7 @@ fn completed_action_identity_survives_late_start_and_update_events() {
         assert_eq!(transcript.tools["selected"], selected);
         assert_eq!(transcript.order.len(), 1);
         assert!(matches!(&transcript.order[selected],
-            TranscriptEntry::Operation(Operation { execution, expanded: true, output: Some((_, output)), .. })
+            TranscriptEntry::Operation(Operation { execution, expanded: true, output: Some(OperationView { text: output, .. }), .. })
                 if execution.is_terminal() && output == "original result"));
     }
 }
@@ -19558,7 +19602,7 @@ async fn action_inspector_keeps_identity_across_history_reprojection() {
     );
     assert!(matches!(
         &terminal.transcript.order[terminal.focused_tool.unwrap()],
-        TranscriptEntry::Operation(Operation { execution, output: Some((_, output)), .. })
+        TranscriptEntry::Operation(Operation { execution, output: Some(OperationView { text: output, .. }), .. })
             if execution.is_terminal() && output.contains("selected result")
     ));
     history.retain(|event| {
@@ -20679,7 +20723,7 @@ fn team_broadcast_timeline_updates_one_durable_row_across_replay_and_insertion()
     transcript.apply(&update(3, 0));
     assert!(
         matches!(&transcript.order[2], TranscriptEntry::Operation(Operation {
-        label, detail, execution, output: Some((_, body)), ..
+        label, detail, execution, output: Some(OperationView { text: body, .. }), ..
     })  if matches!(execution.state(), ExecutionState::Waiting) && label == "Team" && detail == "sent · 0/2 acknowledged" && body == "Please report status")
     );
     // A late user prompt is inserted ahead of the assistant and team rows.

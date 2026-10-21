@@ -630,7 +630,7 @@ impl TranscriptCore {
         }
         if let Some(Operation {
             kind: OperationKind::Reasoning,
-            input: Some((_, source)),
+            input: Some(OperationView { text: source, .. }),
             detail,
             ..
         }) = self.order.call_mut(index)
@@ -684,7 +684,7 @@ impl TranscriptCore {
             && let Some(Operation {
                 execution,
                 kind: OperationKind::Reasoning,
-                input: Some((_, source)),
+                input: Some(OperationView { text: source, .. }),
                 detail,
                 ..
             }) = self.order.call_mut(index)
@@ -709,7 +709,7 @@ impl TranscriptCore {
         if let Some(index) = self.active_reasoning
             && let Some(Operation {
                 kind: OperationKind::Reasoning,
-                input: Some((_, source)),
+                input: Some(OperationView { text: source, .. }),
                 detail,
                 ..
             }) = self.order.call_mut(index)
@@ -735,7 +735,7 @@ impl TranscriptCore {
             && let Some(Operation {
                 execution,
                 kind: OperationKind::Reasoning,
-                input: Some((_, source)),
+                input: Some(OperationView { text: source, .. }),
                 detail,
                 ..
             }) = self.order.call_mut(index)
@@ -1780,8 +1780,8 @@ impl TranscriptCore {
                     // The command, when the completion does not repeat it.
                     let started_input = code_view
                         .as_ref()
-                        .filter(|(language, _)| language == "command")
-                        .map(|(_, command)| serde_json::json!({ "cmd": command }));
+                        .filter(|OperationView { language, .. }| language == "command")
+                        .map(|OperationView { text: command, .. }| serde_json::json!({ "cmd": command }));
                     let completion_presentation = project_tool_presentation(
                         source_name,
                         input
@@ -1838,7 +1838,8 @@ impl TranscriptCore {
                                 value.as_object().is_none_or(|object| !object.is_empty())
                             }))
                     {
-                        *code_view = Some((body.language.clone(), body.text.clone()));
+                        *code_view =
+                            Some(OperationView::new(body.language.clone(), body.text.clone()));
                     }
                     // Keep the result summary on the tool header when the
                     // input had no useful detail (for example `git status`),
@@ -1853,7 +1854,7 @@ impl TranscriptCore {
                     }
                     let input_is_diff = code_view
                         .as_ref()
-                        .is_some_and(|(language, _)| is_diff_language(language));
+                        .is_some_and(|OperationView { language, .. }| is_diff_language(language));
                     if completion_presentation.category == ToolPresentationCategory::Edit {
                         if let Some(body) = completion_presentation
                             .output
@@ -1861,7 +1862,7 @@ impl TranscriptCore {
                         {
                             *name = completion_presentation.label;
                             *detail = completion_presentation.detail;
-                            *code_view = Some((body.language, body.text));
+                            *code_view = Some(body.into());
                             *output_view = None;
                             *expanded = expand_edits;
                         } else if let Some(body) = completion_presentation
@@ -1874,7 +1875,7 @@ impl TranscriptCore {
                             // JSON preview with the parsed diff.
                             *name = completion_presentation.label;
                             *detail = completion_presentation.detail;
-                            *code_view = Some((body.language, body.text));
+                            *code_view = Some(body.into());
                             *output_view = None;
                             *expanded = expand_edits;
                         } else if input_is_diff && !*is_error {
@@ -1888,9 +1889,13 @@ impl TranscriptCore {
                             *output_view = if is_mcp_resource_probe(source_name) {
                                 None
                             } else if *is_error && !run_output.trim().is_empty() {
-                                Some(("text".to_string(), run_output.trim_end().to_string()))
+                                Some(OperationView::new(
+                                    "text".to_string(),
+                                    run_output.trim_end().to_string(),
+                                ))
                             } else {
                                 tool_output_code_view(source_name, &run_output)
+                                    .map(OperationView::from)
                             };
                         }
                     } else {
@@ -1905,7 +1910,10 @@ impl TranscriptCore {
                                     .as_ref()
                                     .is_none_or(|body| body.language != "text")
                             {
-                                Some(("text".to_string(), run_output.trim_end().to_string()))
+                                Some(OperationView::new(
+                                    "text".to_string(),
+                                    run_output.trim_end().to_string(),
+                                ))
                             } else {
                                 borg_control_tool_output_view(
                                     source_name,
@@ -1920,17 +1928,19 @@ impl TranscriptCore {
                                     )
                                 })
                                 .map(|text| {
-                                    (
+                                    OperationView::new(
                                         if is_subagent_tool(source_name) {
                                             "subagent"
                                         } else {
                                             "command"
-                                        }
-                                        .to_string(),
+                                        },
                                         text,
                                     )
                                 })
-                                .or_else(|| tool_output_code_view(source_name, &run_output))
+                                .or_else(|| {
+                                    tool_output_code_view(source_name, &run_output)
+                                        .map(OperationView::from)
+                                })
                             };
                         }
                     }
@@ -1940,7 +1950,10 @@ impl TranscriptCore {
                         && let Some(process) = decoded_session_id(output)
                             .and_then(|id| self.runtime_processes.get(&id))
                     {
-                        *code_view = Some(("command".to_string(), process.command.clone()));
+                        *code_view = Some(OperationView::new(
+                            "command".to_string(),
+                            process.command.clone(),
+                        ));
                     }
                     let _ = name;
                 }
@@ -1989,7 +2002,7 @@ impl TranscriptCore {
                 {
                     let output = tool_process_output_text(output);
                     if !output.trim().is_empty() {
-                        *output_view = Some(("text".to_string(), output));
+                        *output_view = Some(OperationView::new("text".to_string(), output));
                     }
                     execution.transition(ExecutionState::Complete, event.created_at);
                 }
@@ -2316,7 +2329,7 @@ impl TranscriptCore {
                         .collect::<Vec<_>>()
                         .join("\n");
                     if !output.trim().is_empty() {
-                        *output_view = Some(("text".to_string(), output));
+                        *output_view = Some(OperationView::new("text".to_string(), output));
                     }
                     execution.transition(process_state, event.created_at);
                 }
@@ -2850,7 +2863,7 @@ impl TranscriptCore {
         if let Some(Operation {
             execution,
             kind: OperationKind::Reasoning,
-            input: Some((_, source)),
+            input: Some(OperationView { text: source, .. }),
             detail,
             label: name,
             expanded,
@@ -2892,7 +2905,7 @@ impl TranscriptCore {
     fn hydrate_reasoning_payload(&mut self, index: usize, text: &str) {
         if let Some(Operation {
             kind: OperationKind::Reasoning,
-            input: Some((_, source)),
+            input: Some(OperationView { text: source, .. }),
             ..
         }) = self.order.call_mut(index)
         {
@@ -3970,12 +3983,12 @@ impl TranscriptCore {
         {
             if code_view
                 .as_ref()
-                .is_some_and(|(language, _)| is_diff_language(language))
+                .is_some_and(|OperationView { language, .. }| is_diff_language(language))
                 && !is_diff_language(&body.language)
             {
                 return true;
             }
-            *code_view = Some((body.language.clone(), body.text.clone()));
+            *code_view = Some(OperationView::new(body.language.clone(), body.text.clone()));
             payload_refs.clear();
             *expanded = is_diff_language(&body.language)
                 && self.diff_expansion != DiffExpansionPolicy::Collapsed;
@@ -4020,7 +4033,7 @@ impl TranscriptCore {
         self.order.insert(
             index,
             TranscriptEntry::Operation(Operation {
-                input: Some((body.language, body.text)),
+                input: Some(body.into()),
                 payload_refs,
                 expanded,
                 ..Operation::tool(
@@ -4104,7 +4117,7 @@ impl TranscriptCore {
             .map(String::as_str)
             .or_else(|| match self.order.call(index)? {
                 Operation {
-                    output: Some((_, text)),
+                    output: Some(OperationView { text, .. }),
                     ..
                 } => Some(text.as_str()),
                 _ => None,
@@ -4164,14 +4177,16 @@ impl TranscriptCore {
                     })
             })
             .unwrap_or(presentation.detail);
-        let code_view = presentation.input.map(|body| (body.language, body.text));
+        let code_view = presentation.input.map(OperationView::from);
         let is_edit_diff = matches!(
             code_view.as_ref(),
-            Some((language, _)) if is_diff_language(language)
+            Some(OperationView { language, .. }) if is_diff_language(language)
         );
         let rich_ui = tool_has_rich_ui(
             &display_name,
-            code_view.as_ref().map(|(language, _)| language.as_str()),
+            code_view
+                .as_ref()
+                .map(|OperationView { language, .. }| language.as_str()),
         );
         let existing_tool = self.tools.get(tool_call_id).copied();
         if self.diff_expansion == DiffExpansionPolicy::UntilNextAction
@@ -4326,7 +4341,7 @@ impl TranscriptCore {
                     *old_label = label;
                     *old_detail = detail;
                     *expanded &= body.is_some();
-                    *old_body = body.map(|text| ("text".to_string(), text));
+                    *old_body = body.map(|text| OperationView::new("text", text));
                     *old_time = time;
                 }
                 return;

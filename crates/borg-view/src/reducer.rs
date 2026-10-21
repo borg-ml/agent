@@ -6,7 +6,7 @@ use borg_agent_runtime::{
 use uuid::Uuid;
 
 use crate::core::TranscriptCore;
-use crate::entry::{Operation, OperationKind, TranscriptEntry};
+use crate::entry::{Operation, OperationKind, OperationView, TranscriptEntry};
 use crate::grouping::is_reasoning_entry;
 use crate::wire::*;
 
@@ -333,7 +333,10 @@ impl ViewReducer {
                     sender_id: sender_id.to_string(),
                     sender_name: sender_name.clone(),
                     message_id: message_id.to_string(),
-                    text: preview(body.as_ref().map_or("", |(_, text)| text.as_str())),
+                    text: preview(
+                        body.as_ref()
+                            .map_or("", |OperationView { text, .. }| text.as_str()),
+                    ),
                 },
             });
         }
@@ -399,10 +402,12 @@ impl ViewReducer {
                 ..
             }) if kind.is_call() => {
                 let status = execution.lifecycle();
-                if let Some((language, patch)) = code_view
-                    .as_ref()
-                    .filter(|(language, _)| borg_agent_runtime::is_diff_language(language))
-                {
+                if let Some(OperationView {
+                    language,
+                    text: patch,
+                }) = code_view.as_ref().filter(|OperationView { language, .. }| {
+                    borg_agent_runtime::is_diff_language(language)
+                }) {
                     (
                         RowKind::Diff,
                         time.clone(),
@@ -430,7 +435,7 @@ impl ViewReducer {
                         RowBody::Reasoning {
                             text: (code_view
                                 .as_ref()
-                                .map(|(_, text)| text.as_str())
+                                .map(|OperationView { text, .. }| text.as_str())
                                 .unwrap_or(""))
                             .to_string(),
                             status,
@@ -444,8 +449,12 @@ impl ViewReducer {
                             source_name: source_name.clone(),
                             name: name.clone(),
                             detail: preview(detail),
-                            input: code_view.as_ref().map(|(_, text)| preview(text)),
-                            output_preview: output_view.as_ref().map(|(_, text)| preview(text)),
+                            input: code_view
+                                .as_ref()
+                                .map(|OperationView { text, .. }| preview(text)),
+                            output_preview: output_view
+                                .as_ref()
+                                .map(|OperationView { text, .. }| preview(text)),
                             assets: payload_refs
                                 .iter()
                                 .filter(|p| {
@@ -739,17 +748,17 @@ fn entry_text(entry: &TranscriptEntry) -> (Option<TextField>, Option<&str>) {
         TranscriptEntry::Message { text, .. } => (Some(TextField::Message), Some(text)),
         TranscriptEntry::Operation(Operation {
             kind: OperationKind::Reasoning,
-            input: Some((_, text)),
+            input: Some(OperationView { text, .. }),
             ..
         }) => (Some(TextField::Reasoning), Some(text)),
         TranscriptEntry::Operation(Operation {
             kind,
-            output: Some((_, text)),
+            output: Some(OperationView { text, .. }),
             ..
         }) if kind.is_call() => (Some(TextField::ToolOutput), Some(text)),
         TranscriptEntry::Operation(Operation {
             kind,
-            input: Some((_, text)),
+            input: Some(OperationView { text, .. }),
             ..
         }) if kind.is_call() => (Some(TextField::ToolInput), Some(text)),
         _ => (None, None),
@@ -789,7 +798,9 @@ fn action_row(entry: &TranscriptEntry) -> ActionRow {
             },
             label: label.clone(),
             detail: preview(detail),
-            body: body.as_ref().map(|(_, text)| preview(text)),
+            body: body
+                .as_ref()
+                .map(|OperationView { text, .. }| preview(text)),
             status: execution.lifecycle(),
         },
         TranscriptEntry::Plan {

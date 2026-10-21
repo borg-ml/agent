@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use borg_remote::{EventActor, MessageStatus, SessionEvent, SubagentLifecycle, SubagentSnapshot};
 use borg_view::core::{RenderInvalidation, TranscriptCore};
-use borg_view::entry::{Operation, OperationKind, TranscriptEntry};
+use borg_view::entry::{Operation, OperationKind, OperationView, TranscriptEntry};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -241,9 +241,9 @@ impl TimelineProjector {
                 };
                 entry.title.clone_from(&operation.label);
                 entry.detail = (!operation.detail.is_empty()).then(|| operation.detail.clone());
-                let text = |view: &Option<(String, String)>| {
+                let text = |view: &Option<OperationView>| {
                     view.as_ref()
-                        .map(|(_, text)| text.clone())
+                        .map(|view| view.text.clone())
                         .unwrap_or_default()
                 };
                 entry.body = match operation.kind {
@@ -257,7 +257,7 @@ impl TimelineProjector {
                                 .output
                                 .as_ref()
                                 .or(operation.input.as_ref())
-                                .map(|(_, text)| text.clone())
+                                .map(|view| view.text.clone())
                                 .unwrap_or_default()
                         }),
                     _ => text(&operation.output),

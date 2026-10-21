@@ -2,7 +2,7 @@ use borg_view::core::*;
 #[cfg(test)]
 use borg_view::entry::Execution;
 use borg_view::entry::{
-    ExecutionState, Operation, OperationKind, ToolRunWindow, TranscriptEntry,
+    ExecutionState, Operation, OperationKind, OperationView, ToolRunWindow, TranscriptEntry,
 };
 use borg_view::grouping::{is_reasoning_entry, same_action_type};
 use borg_view::semantics::command_output_without_changes;
@@ -693,14 +693,14 @@ fn tool_kind_marker(kind: OperationKind, name: &str) -> &'static str {
 
 fn tool_has_expandable_body(
     source_name: &str,
-    code_view: Option<&(String, String)>,
-    output_view: Option<&(String, String)>,
+    code_view: Option<&OperationView>,
+    output_view: Option<&OperationView>,
 ) -> bool {
     !is_mcp_resource_probe(source_name)
         && [code_view, output_view]
             .into_iter()
             .flatten()
-            .any(|(_, body)| !body.trim().is_empty())
+            .any(|view| !view.is_blank())
 }
 
 /// Queued prompts and a reply whose first block is still held have no row.
@@ -1356,23 +1356,23 @@ impl Transcript {
         } = self.order.call(index)?;
         if code_view
             .as_ref()
-            .is_some_and(|(language, body)| is_diff_language(language) && !body.trim().is_empty())
+            .is_some_and(|OperationView { language, text: body }| is_diff_language(language) && !body.trim().is_empty())
         {
             Some("click inspect · right-click copy diff")
         } else if output_view
             .as_ref()
-            .is_some_and(|(_, body)| !body.trim().is_empty())
+            .is_some_and(|OperationView { text: body, .. }| !body.trim().is_empty())
         {
             Some("click inspect · right-click copy output")
         } else if *kind == OperationKind::Reasoning
             && code_view
                 .as_ref()
-                .is_some_and(|(_, body)| !body.trim().is_empty())
+                .is_some_and(|OperationView { text: body, .. }| !body.trim().is_empty())
         {
             Some("click inspect · right-click copy thinking")
         } else if code_view
             .as_ref()
-            .is_some_and(|(_, body)| !body.trim().is_empty())
+            .is_some_and(|OperationView { text: body, .. }| !body.trim().is_empty())
         {
             Some("click inspect · right-click copy tool call")
         } else if !detail.trim().is_empty() {
@@ -1413,7 +1413,7 @@ impl Transcript {
                 let presentation = project_tool_presentation(source_name, &input, None, false);
                 *name = presentation.label;
                 *detail = presentation.detail;
-                *code_view = presentation.input.map(|body| (body.language, body.text));
+                *code_view = presentation.input.map(OperationView::from);
             }
             SessionPayloadKind::ToolOutput => {
                 let output =
@@ -1437,14 +1437,14 @@ impl Transcript {
                 if let Some(body) = edit_diff {
                     *name = hydrated_presentation.label;
                     *detail = hydrated_presentation.detail;
-                    *code_view = Some((body.language, body.text));
+                    *code_view = Some(body.into());
                     *output_view = None;
                 } else {
                     if let Some(body) = hydrated_presentation
                         .input
                         .filter(|body| body.language == "command")
                     {
-                        *code_view = Some((body.language, body.text));
+                        *code_view = Some(body.into());
                     }
                     *output_view = if is_mcp_resource_probe(source_name) {
                         None
@@ -1455,9 +1455,9 @@ impl Transcript {
                             .as_ref()
                             .is_none_or(|body| body.language != "text")
                     {
-                        Some(("text".to_string(), run_output.trim_end().to_string()))
+                        Some(OperationView::new("text".to_string(), run_output.trim_end().to_string()))
                     } else {
-                        tool_output_code_view(source_name, &run_output)
+                        tool_output_code_view(source_name, &run_output).map(OperationView::from)
                     };
                 }
             }
@@ -1469,7 +1469,7 @@ impl Transcript {
                 if presentation.category != ToolPresentationCategory::Edit
                     && let Some(body) = presentation.input
                 {
-                    *code_view = Some((body.language, body.text));
+                    *code_view = Some(body.into());
                 }
                 if name == "Search web"
                     && let Some(query) = web_search_query(&input)
@@ -1638,7 +1638,7 @@ impl Transcript {
         self.diff_expansion = policy;
         for entry in self.order.iter_mut() {
             if let Some(Operation {
-                input: Some((language, _)),
+                input: Some(OperationView { language, .. }),
                 expanded,
                 ..
             }) = entry.call_mut()
@@ -1655,7 +1655,7 @@ impl Transcript {
             if let Some(Operation {
                 kind,
                 label: name,
-                input: Some((language, _)),
+                input: Some(OperationView { language, .. }),
                 expanded,
                 ..
             }) = entry.call_mut()
@@ -2176,7 +2176,7 @@ impl Transcript {
                 ..
             }) if !execution.is_terminal() && (execution.is_backgrounded() || !tool_action_is_instant(
                 name,
-                code_view.as_ref().map(|(language, _)| language.as_str()),
+                code_view.as_ref().map(|OperationView { language, .. }| language.as_str()),
             ))
         )
     }
@@ -2748,7 +2748,7 @@ impl Transcript {
                 }) = display_entry.to_mut().call_mut()
             {
                 *detail = self.subagent_display_text(detail);
-                for (_, body) in code_view.iter_mut().chain(output_view.iter_mut()) {
+                for OperationView { text: body, .. } in code_view.iter_mut().chain(output_view.iter_mut()) {
                     *body = self.subagent_display_text(body);
                 }
             }
@@ -2759,7 +2759,7 @@ impl Transcript {
                     display_entry.to_mut().lifecycle_mut()
             {
                 *detail = self.subagent_display_text(detail);
-                if let Some((_, body)) = output {
+                if let Some(OperationView { text: body, .. }) = output {
                     *body = self.subagent_display_text(body);
                 }
             }
@@ -3588,7 +3588,7 @@ impl Transcript {
                     );
                     let is_instant = tool_action_is_instant(
                         name,
-                        code_view.as_ref().map(|(language, _)| language.as_str()),
+                        code_view.as_ref().map(|OperationView { language, .. }| language.as_str()),
                     );
                     let summary_start = lines.len();
                     let failed = execution.is_failed();
@@ -3637,7 +3637,7 @@ impl Transcript {
                         || !is_edit
                         || code_view
                             .as_ref()
-                            .is_some_and(|(language, _)| is_diff_language(language));
+                            .is_some_and(|OperationView { language, .. }| is_diff_language(language));
                     let display_detail = detail;
                     // Inside a group the header carries the time.
                     let time = if tool_window.is_some() {
@@ -3647,7 +3647,7 @@ impl Transcript {
                     };
                     // The detail view's body already spells out a command or a diff; for
                     // anything else the header is the only place that says what ran.
-                    let body_states_action = code_view.as_ref().is_some_and(|(language, _)| {
+                    let body_states_action = code_view.as_ref().is_some_and(|OperationView { language, .. }| {
                         language == "command" || is_diff_language(language)
                     });
                     let prefix = "  ";
@@ -3702,7 +3702,7 @@ impl Transcript {
                         let focused = focused_tool == Some(index);
                         let cacheable = execution.is_terminal() && !agent_action;
                         for (output, view) in [(false, code_view), (true, output_view)] {
-                            let Some((language, source)) = view else {
+                            let Some(OperationView { language, text: source }) = view else {
                                 continue;
                             };
                             let body_start = lines.len();
@@ -4278,7 +4278,7 @@ mod parallel_preparation_tests {
         ));
         assert_eq!(transcript.order.len(), 1);
         assert!(matches!(&transcript.order[0], TranscriptEntry::Operation(Operation {
-            input: Some((_, text)), execution, ..
+            input: Some(OperationView { text, .. }), execution, ..
         }) if execution.is_terminal() && text == "Checking replay safely"));
     }
 
@@ -4316,7 +4316,7 @@ mod parallel_preparation_tests {
         transcript.apply_history(&snapshot(3, "Checking the persisted order.", true));
         assert_eq!(transcript.order.len(), 2);
         assert!(matches!(&transcript.order[0], TranscriptEntry::Operation(Operation {
-            input: Some((language, text)), execution, ..
+            input: Some(OperationView { language, text }), execution, ..
         }) if execution.is_terminal() && language == "reasoning" && text == "Checking the persisted order."));
         assert!(matches!(
             &transcript.order[1],
@@ -4503,7 +4503,7 @@ mod parallel_preparation_tests {
         assert!(matches!(
             &transcript.order[0],
             TranscriptEntry::Operation(Operation {
-                input: Some((_, body)),
+                input: Some(OperationView { text: body, .. }),
                 ..
             }) if body == source
         ));
@@ -4531,7 +4531,7 @@ mod parallel_preparation_tests {
 
         let Some(TranscriptEntry::Operation(Operation {
             detail,
-            input: Some((_, source)),
+            input: Some(OperationView { text: source, .. }),
             ..
         })) = transcript.order.first()
         else {
@@ -4792,13 +4792,13 @@ mod model_request_tests {
                 source: source_name, output: None, ..
             }) if source_name == "read_file"));
             assert!(matches!(&transcript.order[1], TranscriptEntry::Operation(Operation {
-                output: Some((_, output)), ..
+                output: Some(OperationView { text: output, .. }), ..
             }) if output.contains("+unowned")));
             return;
         }
         let index = transcript.command_edit_rows["edit"];
         assert!(matches!(&transcript.order[index], TranscriptEntry::Operation(Operation {
-            input: Some((language, diff)), ..
+            input: Some(OperationView { language, text: diff }), ..
         }) if language == "diff:rs" && diff.contains("+new") && !diff.contains("test output")));
         assert_eq!(transcript.command_edit_rows.len(), 1);
     }

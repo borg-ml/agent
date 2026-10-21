@@ -13298,7 +13298,10 @@ fn message_thread_target(
     }
     let Operation {
         source: source_name,
-        input: Some((language, input)),
+        input: Some(OperationView {
+            language,
+            text: input,
+        }),
         ..
     } = transcript.order.call(index)?
     else {
@@ -15259,21 +15262,26 @@ impl TranscriptEntryRenderer for TranscriptEntry {
                 // a deferred payload is still being fetched.
                 code_view
                     .as_ref()
-                    .filter(|(language, body)| {
-                        is_diff_language(language) && !body.trim().is_empty()
-                    })
-                    .map(|(_, body)| body.clone())
+                    .filter(
+                        |OperationView {
+                             language,
+                             text: body,
+                         }| {
+                            is_diff_language(language) && !body.trim().is_empty()
+                        },
+                    )
+                    .map(|OperationView { text: body, .. }| body.clone())
                     .or_else(|| {
                         output_view
                             .as_ref()
-                            .filter(|(_, body)| !body.trim().is_empty())
-                            .map(|(_, body)| body.clone())
+                            .filter(|OperationView { text: body, .. }| !body.trim().is_empty())
+                            .map(|OperationView { text: body, .. }| body.clone())
                     })
                     .or_else(|| {
                         code_view
                             .as_ref()
-                            .filter(|(_, body)| !body.trim().is_empty())
-                            .map(|(_, body)| body.clone())
+                            .filter(|OperationView { text: body, .. }| !body.trim().is_empty())
+                            .map(|OperationView { text: body, .. }| body.clone())
                     })
                     .or_else(|| (!detail.trim().is_empty()).then(|| detail.clone()))
             }

@@ -98,7 +98,47 @@ impl OperationKind {
     }
 }
 
-pub type OperationView = (String, String);
+/// A block of text with the language it should be drawn as: `command`, a
+/// diff such as `diff:rs`, `json`, `reasoning` or plain `text`.
+///
+/// Saved as a `[language, text]` pair, the format checkpoints already use.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "(String, String)", into = "(String, String)")]
+pub struct OperationView {
+    pub language: String,
+    pub text: String,
+}
+
+impl From<(String, String)> for OperationView {
+    fn from((language, text): (String, String)) -> Self {
+        Self { language, text }
+    }
+}
+
+impl From<borg_agent_runtime::ToolPresentationBody> for OperationView {
+    fn from(body: borg_agent_runtime::ToolPresentationBody) -> Self {
+        Self::new(body.language, body.text)
+    }
+}
+
+impl From<OperationView> for (String, String) {
+    fn from(view: OperationView) -> Self {
+        (view.language, view.text)
+    }
+}
+
+impl OperationView {
+    pub fn new(language: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            language: language.into(),
+            text: text.into(),
+        }
+    }
+
+    pub fn is_blank(&self) -> bool {
+        self.text.trim().is_empty()
+    }
+}
 
 /// One operation row. Tool calls and lifecycle rows share every field; the
 /// ones a kind does not use stay empty.
@@ -189,7 +229,7 @@ impl Operation {
             time.into(),
             execution,
         );
-        row.input = Some(("reasoning".into(), text));
+        row.input = Some(OperationView::new("reasoning", text));
         row
     }
 
@@ -211,7 +251,7 @@ impl Operation {
             time.into(),
             execution,
         );
-        row.output = body.map(|text| ("text".into(), text));
+        row.output = body.map(|text| OperationView::new("text", text));
         row
     }
 
@@ -222,7 +262,7 @@ impl Operation {
 
     /// A lifecycle row's message.
     pub fn body(&self) -> Option<&str> {
-        self.output.as_ref().map(|(_, text)| text.as_str())
+        self.output.as_ref().map(|view| view.text.as_str())
     }
 }
 

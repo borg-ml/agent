@@ -1301,7 +1301,7 @@ fn archived_reasoning_hydrates_payload_without_changing_terminal_receipt() {
     assert_eq!(core.order.identities[0], identity);
     assert_eq!(core.order.len(), 1);
     assert!(
-        matches!(&core.order[0], TranscriptEntry::Operation(Operation { input: Some((_, text)), .. }) if text == "canonical full reasoning text")
+        matches!(&core.order[0], TranscriptEntry::Operation(Operation { input: Some(borg_view::entry::OperationView { text, .. }), .. }) if text == "canonical full reasoning text")
     );
 }
 

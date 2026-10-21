@@ -1,7 +1,7 @@
 use crate::{
     ViewReducer,
     core::TranscriptCore,
-    entry::{Operation, TranscriptEntry},
+    entry::{Operation, OperationView, TranscriptEntry},
     wire::{Cursor, SNAPSHOT_BYTES},
 };
 use anyhow::{Context, Result, ensure};
@@ -316,10 +316,10 @@ impl ViewReducer {
             match entry {
                 TranscriptEntry::Message { text, .. } => add(Message, text),
                 TranscriptEntry::Operation(Operation { input, output, .. }) => {
-                    if let Some((_, text)) = input {
+                    if let Some(OperationView { text, .. }) = input {
                         add(OperationInput, text)
                     }
-                    if let Some((_, text)) = output {
+                    if let Some(OperationView { text, .. }) = output {
                         add(OperationOutput, text)
                     }
                 }
@@ -382,10 +382,10 @@ impl ViewReducer {
             match entry {
                 TranscriptEntry::Message { text, .. } => take(CheckpointTextField::Message, text),
                 TranscriptEntry::Operation(Operation { input, output, .. }) => {
-                    if let Some((_, text)) = input {
+                    if let Some(OperationView { text, .. }) = input {
                         take(CheckpointTextField::OperationInput, text)
                     }
-                    if let Some((_, text)) = output {
+                    if let Some(OperationView { text, .. }) = output {
                         take(CheckpointTextField::OperationOutput, text)
                     }
                 }
@@ -531,14 +531,14 @@ impl ViewReducer {
             (TranscriptEntry::Message { text, .. }, Message) => text,
             (
                 TranscriptEntry::Operation(Operation {
-                    input: Some((_, text)),
+                    input: Some(OperationView { text, .. }),
                     ..
                 }),
                 OperationInput,
             ) => text,
             (
                 TranscriptEntry::Operation(Operation {
-                    output: Some((_, text)),
+                    output: Some(OperationView { text, .. }),
                     ..
                 }),
                 OperationOutput,
@@ -556,7 +556,7 @@ impl ViewReducer {
 #[cfg(test)]
 mod operation_migration_tests {
     use super::*;
-    use crate::entry::OperationKind;
+    use crate::entry::{OperationKind, OperationView};
     use serde_json::json;
 
     // Saved v2 checkpoints hold `Tool` and `Action` rows; the types cannot
@@ -629,8 +629,8 @@ mod operation_migration_tests {
             ),
             ("exec", "Run", Some("ok"), Some("/tmp"))
         );
-        assert_eq!(run.input, Some(("command".into(), "ls".into())));
-        assert_eq!(run.output, Some(("text".into(), "out".into())));
+        assert_eq!(run.input, Some(OperationView::new("command", "ls")));
+        assert_eq!(run.output, Some(OperationView::new("text", "out")));
         let agent = operations[4];
         assert_eq!(agent.origin, Some(owner));
         assert_eq!(agent.body(), Some("report"));
