@@ -6,7 +6,7 @@ use borg_agent_runtime::{
 use uuid::Uuid;
 
 use crate::core::TranscriptCore;
-use crate::entry::TranscriptEntry;
+use crate::entry::{Operation, OperationKind, TranscriptEntry};
 use crate::grouping::is_reasoning_entry;
 use crate::wire::*;
 
@@ -311,7 +311,9 @@ impl ViewReducer {
         let entry = self.core.order.get(index)?;
         if let Some((message_id, sender_id, sender_name)) =
             self.core.team_report_sources.get(&event_id)
-            && let TranscriptEntry::Action { body, time, .. } = entry
+            && let TranscriptEntry::Operation(Operation {
+                output: body, time, ..
+            }) = entry
         {
             return Some(Row {
                 id: id.clone(),
@@ -331,7 +333,7 @@ impl ViewReducer {
                     sender_id: sender_id.to_string(),
                     sender_name: sender_name.clone(),
                     message_id: message_id.to_string(),
-                    text: preview(body.as_deref().unwrap_or("")),
+                    text: preview(body.as_ref().map_or("", |(_, text)| text.as_str())),
                 },
             });
         }
@@ -382,19 +384,20 @@ impl ViewReducer {
                     },
                 )
             }
-            TranscriptEntry::Tool {
-                source_name,
-                name,
+            TranscriptEntry::Operation(Operation {
+                kind,
+                source: source_name,
+                label: name,
                 detail,
-                code_view,
-                output_view,
+                input: code_view,
+                output: output_view,
                 payload_refs,
                 time,
                 execution,
                 outcome,
                 cwd,
                 ..
-            } => {
+            }) if kind.is_call() => {
                 let status = execution.lifecycle();
                 if let Some((language, patch)) = code_view
                     .as_ref()
@@ -469,13 +472,13 @@ impl ViewReducer {
                     )
                 }
             }
-            TranscriptEntry::Action {
+            TranscriptEntry::Operation(Operation {
                 label,
                 detail,
                 time,
                 execution,
                 ..
-            } => (
+            }) => (
                 RowKind::ActionGroup,
                 time.clone(),
                 RowBody::ActionGroup {
@@ -547,7 +550,9 @@ impl ViewReducer {
             text_state: entry_text(entry).1.map(|text| RowTextState {
                 field: entry_text(entry).0.expect("text field"),
                 bytes: text.len().to_string(),
-                asset: if matches!(entry, TranscriptEntry::Tool { .. }) && text.len() > 4096 {
+                asset: if matches!(entry, TranscriptEntry::Operation(Operation { .. }))
+                    && text.len() > 4096
+                {
                     Some(
                         crate::assets::TextAssetAddress {
                             row_id: id.clone(),
@@ -604,7 +609,7 @@ impl ViewReducer {
             let status = if self.core.order[window.start..window.end].iter().any(|row| {
                 matches!(
                     row,
-                    TranscriptEntry::Tool { execution, .. } if !execution.is_terminal()
+                    TranscriptEntry::Operation(Operation { execution, .. }) if !execution.is_terminal()
                 )
             }) {
                 Lifecycle::Running
@@ -639,9 +644,8 @@ impl ViewReducer {
     fn evict_settled_rows(&mut self) {
         while self.core.order.len() > 128 {
             let Some(index) = self.core.order.iter().position(|entry| match entry {
-                TranscriptEntry::Tool { execution, .. } => execution.is_terminal(),
-                TranscriptEntry::Message { execution, .. } => execution.is_terminal(),
-                TranscriptEntry::Action { execution, .. }
+                TranscriptEntry::Operation(Operation { execution, .. })
+                | TranscriptEntry::Message { execution, .. }
                 | TranscriptEntry::Compaction { execution, .. } => execution.is_terminal(),
                 _ => true,
             }) else {
@@ -733,18 +737,21 @@ impl ViewReducer {
 fn entry_text(entry: &TranscriptEntry) -> (Option<TextField>, Option<&str>) {
     match entry {
         TranscriptEntry::Message { text, .. } => (Some(TextField::Message), Some(text)),
-        TranscriptEntry::Tool {
-            code_view: Some((language, text)),
+        TranscriptEntry::Operation(Operation {
+            kind: OperationKind::Reasoning,
+            input: Some((_, text)),
             ..
-        } if language == "reasoning" => (Some(TextField::Reasoning), Some(text)),
-        TranscriptEntry::Tool {
-            output_view: Some((_, text)),
+        }) => (Some(TextField::Reasoning), Some(text)),
+        TranscriptEntry::Operation(Operation {
+            kind,
+            output: Some((_, text)),
             ..
-        } => (Some(TextField::ToolOutput), Some(text)),
-        TranscriptEntry::Tool {
-            code_view: Some((_, text)),
+        }) if kind.is_call() => (Some(TextField::ToolOutput), Some(text)),
+        TranscriptEntry::Operation(Operation {
+            kind,
+            input: Some((_, text)),
             ..
-        } => (Some(TextField::ToolInput), Some(text)),
+        }) if kind.is_call() => (Some(TextField::ToolInput), Some(text)),
         _ => (None, None),
     }
 }
@@ -757,28 +764,32 @@ fn preview(text: &str) -> String {
 }
 fn action_row(entry: &TranscriptEntry) -> ActionRow {
     match entry {
-        TranscriptEntry::Action {
-            source_session_id,
+        TranscriptEntry::Operation(Operation {
+            origin: source_session_id,
             kind,
             label,
             detail,
-            body,
+            output: body,
             execution,
             ..
-        } => ActionRow::Lifecycle {
+        }) => ActionRow::Lifecycle {
             target_session_id: source_session_id.map(|id| id.to_string()),
             kind: match kind {
-                crate::entry::TranscriptActionKind::Agent => ActionKind::Agent,
-                crate::entry::TranscriptActionKind::Watch => ActionKind::Watch,
-                crate::entry::TranscriptActionKind::Approval => ActionKind::Approval,
-                crate::entry::TranscriptActionKind::ProviderInteraction => {
-                    ActionKind::ProviderInteraction
+                crate::entry::OperationKind::Agent => ActionKind::Agent,
+                crate::entry::OperationKind::Watch => ActionKind::Watch,
+                crate::entry::OperationKind::Approval => ActionKind::Approval,
+                crate::entry::OperationKind::ProviderInteraction => ActionKind::ProviderInteraction,
+                crate::entry::OperationKind::Error => ActionKind::Error,
+                crate::entry::OperationKind::Tool
+                | crate::entry::OperationKind::Delegation
+                | crate::entry::OperationKind::Preparation
+                | crate::entry::OperationKind::Reasoning => {
+                    unreachable!("typed action projection")
                 }
-                crate::entry::TranscriptActionKind::Error => ActionKind::Error,
             },
             label: label.clone(),
             detail: preview(detail),
-            body: body.as_ref().map(|text| preview(text)),
+            body: body.as_ref().map(|(_, text)| preview(text)),
             status: execution.lifecycle(),
         },
         TranscriptEntry::Plan {

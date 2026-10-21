@@ -9,6 +9,8 @@ Git comparison.
   when Borg's async runtime stops running timer-woken tasks for 30 seconds.
 - Show agent and peer messages as one line like other actions, previewing
   the message's first line; click to expand the full text.
+- Tool calls and agent, watch, approval and error rows are now one typed
+  operation row. Saved view checkpoints upgrade to the new format on load.
 - Scrolling up a little no longer loads older history; it now loads only
   when you are near the oldest loaded message.
 - Every run of consecutive tool, agent, watch, approval and error rows now

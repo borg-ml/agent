@@ -3,8 +3,7 @@ use std::sync::Arc;
 
 use borg_remote::{EventActor, MessageStatus, SessionEvent, SubagentLifecycle, SubagentSnapshot};
 use borg_view::core::{RenderInvalidation, TranscriptCore};
-use borg_view::entry::{TranscriptActionKind, TranscriptEntry};
-use borg_view::wire::Lifecycle;
+use borg_view::entry::{Operation, OperationKind, TranscriptEntry};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -167,9 +166,10 @@ impl TimelineProjector {
 
     fn child_id(&self, index: usize) -> Option<Uuid> {
         match self.core.order.get(index)? {
-            TranscriptEntry::Action {
-                source_session_id, ..
-            } => *source_session_id,
+            TranscriptEntry::Operation(Operation {
+                origin: source_session_id,
+                ..
+            }) => *source_session_id,
             _ => None,
         }
     }
@@ -226,73 +226,45 @@ impl TimelineProjector {
                 entry.failed = execution.is_failed();
                 time
             }
-            TranscriptEntry::Tool {
-                name,
-                detail,
-                code_view,
-                output_view,
-                time,
-                execution,
-                ..
-            } => {
-                let reasoning = code_view
-                    .as_ref()
-                    .is_some_and(|(language, _)| language == "reasoning");
-                entry.kind = if reasoning {
-                    TimelineKind::Reasoning
-                } else {
-                    TimelineKind::Tool
+            TranscriptEntry::Operation(operation) => {
+                entry.kind = match operation.kind {
+                    OperationKind::Reasoning => TimelineKind::Reasoning,
+                    OperationKind::Tool
+                    | OperationKind::Delegation
+                    | OperationKind::Preparation => TimelineKind::Tool,
+                    OperationKind::Agent => TimelineKind::Subagent,
+                    OperationKind::Approval | OperationKind::ProviderInteraction => {
+                        TimelineKind::Approval
+                    }
+                    OperationKind::Error => TimelineKind::Error,
+                    OperationKind::Watch => TimelineKind::Status,
                 };
-                entry.title.clone_from(name);
-                entry.detail = (!detail.is_empty()).then(|| detail.clone());
-                entry.body = if reasoning {
-                    code_view
-                        .as_ref()
+                entry.title.clone_from(&operation.label);
+                entry.detail = (!operation.detail.is_empty()).then(|| operation.detail.clone());
+                let text = |view: &Option<(String, String)>| {
+                    view.as_ref()
                         .map(|(_, text)| text.clone())
                         .unwrap_or_default()
-                } else {
-                    self.core
+                };
+                entry.body = match operation.kind {
+                    OperationKind::Reasoning => text(&operation.input),
+                    kind if kind.is_call() => self
+                        .core
                         .tool_inspection_text(index)
                         .map(str::to_owned)
                         .unwrap_or_else(|| {
-                            output_view
+                            operation
+                                .output
                                 .as_ref()
-                                .or(code_view.as_ref())
+                                .or(operation.input.as_ref())
                                 .map(|(_, text)| text.clone())
                                 .unwrap_or_default()
-                        })
+                        }),
+                    _ => text(&operation.output),
                 };
-                let lifecycle = execution.lifecycle();
-                entry.running = matches!(
-                    lifecycle,
-                    Lifecycle::Running | Lifecycle::Backgrounded | Lifecycle::Waiting
-                );
-                entry.failed = lifecycle == Lifecycle::Failed;
-                time
-            }
-            TranscriptEntry::Action {
-                kind,
-                label,
-                detail,
-                body,
-                time,
-                execution,
-                ..
-            } => {
-                entry.kind = match kind {
-                    TranscriptActionKind::Agent => TimelineKind::Subagent,
-                    TranscriptActionKind::Approval | TranscriptActionKind::ProviderInteraction => {
-                        TimelineKind::Approval
-                    }
-                    TranscriptActionKind::Error => TimelineKind::Error,
-                    TranscriptActionKind::Watch => TimelineKind::Status,
-                };
-                entry.title.clone_from(label);
-                entry.detail = (!detail.is_empty()).then(|| detail.clone());
-                entry.body = body.clone().unwrap_or_default();
-                entry.running = !execution.is_terminal();
-                entry.failed = execution.is_failed();
-                time
+                entry.running = !operation.execution.is_terminal();
+                entry.failed = operation.execution.is_failed();
+                &operation.time
             }
             TranscriptEntry::Activity { text, time } => {
                 entry.title = "Status".into();

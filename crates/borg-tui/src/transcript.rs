@@ -1,9 +1,8 @@
 use borg_view::core::*;
 #[cfg(test)]
 use borg_view::entry::Execution;
-use borg_view::entry::ExecutionState;
 use borg_view::entry::{
-    ToolRunWindow, TranscriptActionKind, TranscriptActionState, TranscriptEntry,
+    ExecutionState, Operation, OperationKind, ToolRunWindow, TranscriptEntry,
 };
 use borg_view::grouping::{is_reasoning_entry, same_action_type};
 use borg_view::semantics::command_output_without_changes;
@@ -514,7 +513,7 @@ struct RenderResume {
 /// The part of an entry's rows that follows the render clock.
 fn render_clock_key(entry: &TranscriptEntry, now: DateTime<Utc>) -> Option<String> {
     match entry {
-        TranscriptEntry::Tool { execution, .. } => {
+        TranscriptEntry::Operation(Operation { kind, execution, .. }) if kind.is_call() => {
             format_tool_elapsed_at(execution.started_at(), execution.completed_at(), now)
         }
         TranscriptEntry::Goal { goal, .. } => format_elapsed_duration(goal_live_seconds(goal, now)),
@@ -523,12 +522,12 @@ fn render_clock_key(entry: &TranscriptEntry, now: DateTime<Utc>) -> Option<Strin
 }
 
 fn format_tool_group_elapsed_at(entries: &[TranscriptEntry], now: DateTime<Utc>) -> Option<String> {
-    let times = entries.iter().filter_map(|entry| match entry {
-        TranscriptEntry::Tool { execution, .. } => Some((
+    let times = entries.iter().filter_map(|entry| {
+        let execution = &entry.call()?.execution;
+        Some((
             execution.started_at(),
             execution.completed_at().unwrap_or(now),
-        )),
-        _ => None,
+        ))
     });
     let started_at = times.clone().map(|(start, _)| start).min()?;
     let ended_at = times.map(|(_, end)| end).max()?;
@@ -592,21 +591,16 @@ fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: 
     let mut time = None;
     let mut cwd = None;
     for entry in entries {
-        match entry {
-            TranscriptEntry::Tool {
-                time: row_time,
-                cwd: row_cwd,
-                ..
-            } => {
-                time.get_or_insert(row_time.as_str());
-                if row_cwd.is_some() {
-                    cwd = row_cwd.as_deref();
-                }
+        if let TranscriptEntry::Operation(Operation {
+            time: row_time,
+            cwd: row_cwd,
+            ..
+        }) = entry
+        {
+            time.get_or_insert(row_time.as_str());
+            if row_cwd.is_some() {
+                cwd = row_cwd.as_deref();
             }
-            TranscriptEntry::Action { time: row_time, .. } => {
-                time.get_or_insert(row_time.as_str());
-            }
-            _ => {}
         }
     }
     let mut parts: Vec<String> = Vec::new();
@@ -632,43 +626,31 @@ fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: 
 const TOOL_WINDOW_HEADER_INDENT: &str = "▾ ";
 
 fn action_label_style(entry: &TranscriptEntry) -> Style {
-    match entry {
-        TranscriptEntry::Tool {
-            name, execution, ..
-        } => {
-            if is_reasoning_entry(entry) {
-                Style::default()
-                    .fg(Color::Gray)
-                    .add_modifier(Modifier::BOLD | Modifier::ITALIC)
-            } else if matches!(
-                execution.lifecycle(),
-                borg_view::wire::Lifecycle::Failed | borg_view::wire::Lifecycle::Stopped
-            ) {
-                Style::default()
-                    .fg(Color::LightRed)
-                    .add_modifier(Modifier::BOLD)
-            } else if execution.is_backgrounded() {
-                Style::default()
-                    .fg(USER_LABEL_BLUE)
-                    .add_modifier(Modifier::BOLD)
-            } else if is_subagent_tool(name)
-                || matches!(entry, TranscriptEntry::Tool { source_name, .. } if is_subagent_tool(source_name))
-            {
-                Style::default()
-                    .fg(SUBAGENT_PURPLE)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
-            }
-        }
-        TranscriptEntry::Action {
-            kind, execution, ..
-        } => Style::default().fg(transcript_action_color(*kind, execution.state())),
-        _ => Style::default()
+    let Some(operation) = entry.operation() else {
+        return Style::default()
             .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
+            .add_modifier(Modifier::BOLD);
+    };
+    let execution = &operation.execution;
+    if !operation.kind.is_call() {
+        return Style::default().fg(transcript_action_color(operation.kind, execution.state()));
+    }
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    if operation.kind == OperationKind::Reasoning {
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD | Modifier::ITALIC)
+    } else if matches!(
+        execution.lifecycle(),
+        borg_view::wire::Lifecycle::Failed | borg_view::wire::Lifecycle::Stopped
+    ) {
+        bold.fg(Color::LightRed)
+    } else if execution.is_backgrounded() {
+        bold.fg(USER_LABEL_BLUE)
+    } else if operation.kind == OperationKind::Delegation {
+        bold.fg(SUBAGENT_PURPLE)
+    } else {
+        bold.fg(Color::White)
     }
 }
 
@@ -694,12 +676,11 @@ fn tool_window_header(
 }
 
 /// A finished row's marker: what kind of work it was, at a glance.
-fn tool_kind_marker(name: &str, is_reasoning: bool) -> &'static str {
-    if is_reasoning {
-        return "◦";
-    }
-    if is_subagent_tool(name) {
-        return "◆";
+fn tool_kind_marker(kind: OperationKind, name: &str) -> &'static str {
+    match kind {
+        OperationKind::Reasoning => return "◦",
+        OperationKind::Delegation => return "◆",
+        _ => {}
     }
     match name.split(' ').next().unwrap_or(name) {
         "Read" | "List" | "View" | "Open" | "Inspect" => "≡",
@@ -1194,12 +1175,9 @@ impl Transcript {
 
     fn inspector_heading(&self, index: usize) -> Option<(&str, bool)> {
         match self.order.get(index)? {
-            TranscriptEntry::Tool {
-                name, execution, ..
-            } => Some((name, execution.is_terminal())),
-            TranscriptEntry::Action {
+            TranscriptEntry::Operation(Operation {
                 label, execution, ..
-            } => Some((label, execution.is_terminal())),
+            }) => Some((label, execution.is_terminal())),
             TranscriptEntry::Plan { .. } => Some(("Plan", true)),
             TranscriptEntry::Compaction { execution, .. } => {
                 Some(("Compaction", execution.is_terminal()))
@@ -1209,19 +1187,17 @@ impl Transcript {
     }
 
     fn action_is_expandable(&self, index: usize) -> bool {
-        matches!(
-            self.order.get(index),
-            Some(TranscriptEntry::Action {
-                body: Some(body), ..
-            }) if !body.trim().is_empty()
-        )
+        self.order
+            .lifecycle(index)
+            .and_then(Operation::body)
+            .is_some_and(|body| !body.trim().is_empty())
     }
 
     fn toggle_action_expansion(&mut self, index: usize) {
-        if let Some(TranscriptEntry::Action { expanded, body, .. }) = self.order.get_mut(index)
-            && body.as_deref().is_some_and(|body| !body.trim().is_empty())
+        if let Some(operation) = self.order.lifecycle_mut(index)
+            && operation.body().is_some_and(|body| !body.trim().is_empty())
         {
-            *expanded = !*expanded;
+            operation.expanded = !operation.expanded;
         }
     }
 
@@ -1250,11 +1226,11 @@ impl Transcript {
 
     fn tool_is_expandable(&self, index: usize) -> bool {
         matches!(
-            self.order.get(index),
-            Some(TranscriptEntry::Tool {
-                source_name,
-                code_view,
-                output_view,
+            self.order.call(index),
+            Some(Operation {
+                source: source_name,
+                input: code_view,
+                output: output_view,
                 ..
             }) if tool_has_expandable_body(source_name, code_view.as_ref(), output_view.as_ref())
         )
@@ -1264,11 +1240,11 @@ impl Transcript {
         if !self.tool_is_expandable(index) {
             return Vec::new();
         }
-        if let Some(TranscriptEntry::Tool {
+        if let Some(Operation {
             expanded,
             payload_refs,
             ..
-        }) = self.order.get_mut(index)
+        }) = self.order.call_mut(index)
         {
             *expanded = !*expanded;
             if *expanded {
@@ -1280,14 +1256,14 @@ impl Transcript {
 
     fn tool_is_expanded(&self, index: usize) -> bool {
         matches!(
-            self.order.get(index),
-            Some(TranscriptEntry::Tool { expanded: true, .. })
+            self.order.call(index),
+            Some(Operation { expanded: true, .. })
         ) && self.tool_is_expandable(index)
     }
 
     fn tool_payloads(&self, index: usize) -> Vec<SessionPayloadRef> {
-        match self.order.get(index) {
-            Some(TranscriptEntry::Tool { payload_refs, .. }) => payload_refs.clone(),
+        match self.order.call(index) {
+            Some(Operation { payload_refs, .. }) => payload_refs.clone(),
             _ => Vec::new(),
         }
     }
@@ -1298,8 +1274,9 @@ impl Transcript {
     /// Footer hint for a clickable non-tool row; rows carry no inline hint.
     fn entry_click_hint(&self, index: usize) -> Option<&'static str> {
         match self.order.get(index)? {
-            TranscriptEntry::Action { body, expanded, .. }
-                if body.as_deref().is_some_and(|body| !body.trim().is_empty()) =>
+            TranscriptEntry::Operation(operation @ Operation { expanded, .. })
+                if !operation.kind.is_call()
+                    && operation.body().is_some_and(|body| !body.trim().is_empty()) =>
             {
                 Some(
                     if self.tool_click_behavior == ToolClickBehavior::Fullscreen {
@@ -1343,21 +1320,15 @@ impl Transcript {
     }
 
     fn foreground_action_id(&self, index: usize) -> Option<String> {
-        let TranscriptEntry::Tool {
+        let Operation {
+            kind,
             execution,
-            code_view,
             ..
-        } = self.order.get(index)?
-        else {
-            return None;
-        };
+        } = self.order.call(index)?;
         if execution.is_terminal() || execution.is_backgrounded() {
             return None;
         }
-        if code_view
-            .as_ref()
-            .is_some_and(|(language, _)| language == "reasoning")
-        {
+        if *kind == OperationKind::Reasoning {
             return None;
         }
         let id = self
@@ -1376,15 +1347,13 @@ impl Transcript {
     }
 
     fn tool_copy_hint(&self, index: usize) -> Option<&'static str> {
-        let TranscriptEntry::Tool {
-            code_view,
-            output_view,
+        let Operation {
+            kind,
+            input: code_view,
+            output: output_view,
             detail,
             ..
-        } = self.order.get(index)?
-        else {
-            return None;
-        };
+        } = self.order.call(index)?;
         if code_view
             .as_ref()
             .is_some_and(|(language, body)| is_diff_language(language) && !body.trim().is_empty())
@@ -1395,9 +1364,10 @@ impl Transcript {
             .is_some_and(|(_, body)| !body.trim().is_empty())
         {
             Some("click inspect · right-click copy output")
-        } else if code_view
-            .as_ref()
-            .is_some_and(|(language, body)| language == "reasoning" && !body.trim().is_empty())
+        } else if *kind == OperationKind::Reasoning
+            && code_view
+                .as_ref()
+                .is_some_and(|(_, body)| !body.trim().is_empty())
         {
             Some("click inspect · right-click copy thinking")
         } else if code_view
@@ -1414,24 +1384,24 @@ impl Transcript {
 
     fn hydrate_payload(&mut self, payload: &SessionPayloadRef, bytes: Vec<u8>) -> Result<()> {
         let Some(index) = self.order.iter().position(|entry| {
-            matches!(
-                entry,
-                TranscriptEntry::Tool { payload_refs, .. }
-                    if payload_refs.iter().any(|candidate| candidate.id == payload.id)
-            )
+            entry.call().is_some_and(|call| {
+                call.payload_refs
+                    .iter()
+                    .any(|candidate| candidate.id == payload.id)
+            })
         }) else {
             return Ok(());
         };
-        let Some(TranscriptEntry::Tool {
-            source_name,
-            name,
+        let Some(Operation {
+            source: source_name,
+            label: name,
             detail,
-            code_view,
-            output_view,
+            input: code_view,
+            output: output_view,
             execution,
             payload_refs,
             ..
-        }) = self.order.get_mut(index)
+        }) = self.order.call_mut(index)
         else {
             return Ok(());
         };
@@ -1517,9 +1487,9 @@ impl Transcript {
             && let Some(tool_call_id) = self.tools.iter().find_map(|(tool_call_id, tool_index)| {
                 (*tool_index == index).then(|| tool_call_id.clone())
             })
-            && let Some(TranscriptEntry::Tool {
+            && let Some(Operation {
                 time, execution, ..
-            }) = self.order.get(index)
+            }) = self.order.call(index)
             && let Some(completed_at) = execution.completed_at()
         {
             let time = time.clone();
@@ -1614,7 +1584,7 @@ impl Transcript {
     }
 
     fn tool_run_start_containing(&self, index: usize) -> Option<usize> {
-        if !matches!(self.order.get(index), Some(TranscriptEntry::Tool { .. })) {
+        if self.order.call(index).is_none() {
             return None;
         }
         self.tool_run_windows()[index].map(|window| window.start)
@@ -1667,11 +1637,11 @@ impl Transcript {
     fn set_diff_expansion(&mut self, policy: DiffExpansionPolicy) {
         self.diff_expansion = policy;
         for entry in self.order.iter_mut() {
-            if let TranscriptEntry::Tool {
-                code_view: Some((language, _)),
+            if let Some(Operation {
+                input: Some((language, _)),
                 expanded,
                 ..
-            } = entry
+            }) = entry.call_mut()
                 && is_diff_language(language)
             {
                 *expanded = policy != DiffExpansionPolicy::Collapsed;
@@ -1682,14 +1652,15 @@ impl Transcript {
     fn set_auto_expand_tools(&mut self, enabled: bool) {
         self.auto_expand_tools = enabled;
         for entry in self.order.iter_mut() {
-            if let TranscriptEntry::Tool {
-                name,
-                code_view: Some((language, _)),
+            if let Some(Operation {
+                kind,
+                label: name,
+                input: Some((language, _)),
                 expanded,
                 ..
-            } = entry
+            }) = entry.call_mut()
                 && !is_diff_language(language)
-                && language != "reasoning"
+                && *kind != OperationKind::Reasoning
                 && !tool_has_rich_ui(name, Some(language))
             {
                 *expanded = enabled;
@@ -1700,7 +1671,7 @@ impl Transcript {
     fn set_auto_expand_thinking(&mut self, enabled: bool) {
         self.auto_expand_thinking = enabled;
         if let Some(index) = self.active_reasoning
-            && let Some(TranscriptEntry::Tool { expanded, .. }) = self.order.get_mut(index)
+            && let Some(Operation { expanded, .. }) = self.order.call_mut(index)
         {
             *expanded = enabled;
         }
@@ -1794,7 +1765,7 @@ impl Transcript {
         let mut seen = HashSet::new();
         self.order.iter().zip(&self.order.identities).rev()
             .filter_map(|(entry, (event_id, _))| {
-                if !matches!(entry, TranscriptEntry::Action { kind: TranscriptActionKind::Agent, .. }) {
+                if !matches!(entry, TranscriptEntry::Operation(Operation { kind: OperationKind::Agent, .. })) {
                     return None;
                 }
                 let (_, sender, name) = self.team_report_sources.get(event_id)?;
@@ -1992,13 +1963,13 @@ impl Transcript {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, entry)| match entry {
-                    TranscriptEntry::Tool {
-                        source_name,
-                        name,
+                    TranscriptEntry::Operation(Operation {
+                        source: source_name,
+                        label: name,
                         detail,
                         execution,
                         ..
-                    } if execution.is_backgrounded()
+                    }) if execution.is_backgrounded()
                         && tool_can_start_background_process(source_name)
                         && !self
                             .provider_backgrounds
@@ -2165,20 +2136,16 @@ impl Transcript {
         // single-entry viewport refresh cannot update both; use the renderer.
         let windows = self.tool_run_windows();
         if indices.iter().any(|index| {
-            matches!(
-                self.order.get(*index),
-                Some(TranscriptEntry::Tool {
-                    execution,
-                    ..
-                }) if !execution.is_terminal()
-            ) && windows.get(*index).is_some_and(Option::is_some)
+            self.order
+                .call(*index)
+                .is_some_and(|call| !call.execution.is_terminal()) && windows.get(*index).is_some_and(Option::is_some)
         }) {
             return Vec::new();
         }
         indices
             .into_iter()
-            .filter_map(|index| match self.order.get(index) {
-                Some(TranscriptEntry::Tool { execution, .. }) if !execution.is_terminal() => {
+            .filter_map(|index| match self.order.call(index) {
+                Some(Operation { execution, .. }) if !execution.is_terminal() => {
                     Some((
                         index,
                         format_tool_elapsed_at(
@@ -2194,19 +2161,17 @@ impl Transcript {
     }
 
     fn has_running_tool(&self) -> bool {
-        self.order.iter().any(|entry| {
-            matches!(entry,
-                TranscriptEntry::Tool { execution,  .. } if !execution.is_terminal()
-            )
-        })
+        self.order
+            .iter()
+            .any(|entry| entry.call().is_some_and(|call| !call.execution.is_terminal()))
     }
 
     fn tool_activity_is_running(&self, index: usize) -> bool {
         matches!(
-            self.order.get(index),
-            Some(TranscriptEntry::Tool {
-                name,
-                code_view,
+            self.order.call(index),
+            Some(Operation {
+                label: name,
+                input: code_view,
                 execution,
                 ..
             }) if !execution.is_terminal() && (execution.is_backgrounded() || !tool_action_is_instant(
@@ -2369,18 +2334,10 @@ impl Transcript {
     /// started and is still running. Folding either would hide the only place
     /// that work is visible.
     fn window_has_unfinished_work(&self, window: &ToolRunWindow) -> bool {
-        if self.order[window.start..window.end].iter().any(|entry| {
-            matches!(
-                entry,
-                TranscriptEntry::Tool { execution,  .. } if !execution.is_terminal()
-            ) || matches!(
-                entry,
-                TranscriptEntry::Action {
-                    execution,
-                    ..
-                }
-             if !execution.is_terminal())
-        }) {
+        if self.order[window.start..window.end]
+            .iter()
+            .any(TranscriptEntry::is_live_operation)
+        {
             return true;
         }
         self.runtime_processes.values().any(|process| {
@@ -2592,8 +2549,7 @@ impl Transcript {
             return false;
         };
         if cached.width() != current.width()
-            || (matches!(&self.order[index], TranscriptEntry::Tool { .. })
-                && width <= current.width().max(8) + 6)
+            || (self.order.call(index).is_some() && width <= current.width().max(8) + 6)
         {
             return false;
         }
@@ -2781,30 +2737,29 @@ impl Transcript {
                 continue;
             }
             let mut display_entry = Cow::Borrowed(entry);
-            if let TranscriptEntry::Tool {
-                source_name, name, ..
-            } = entry
-                && (is_subagent_tool(source_name) || is_subagent_tool(name))
-                && let TranscriptEntry::Tool {
+            if entry
+                .call()
+                .is_some_and(|call| call.kind == OperationKind::Delegation)
+                && let Some(Operation {
                     detail,
-                    code_view,
-                    output_view,
+                    input: code_view,
+                    output: output_view,
                     ..
-                } = display_entry.to_mut()
+                }) = display_entry.to_mut().call_mut()
             {
                 *detail = self.subagent_display_text(detail);
                 for (_, body) in code_view.iter_mut().chain(output_view.iter_mut()) {
                     *body = self.subagent_display_text(body);
                 }
             }
-            if let TranscriptEntry::Action {
-                kind: TranscriptActionKind::Agent,
-                ..
-            } = entry
-                && let TranscriptEntry::Action { detail, body, .. } = display_entry.to_mut()
+            if entry
+                .lifecycle()
+                .is_some_and(|row| row.kind == OperationKind::Agent)
+                && let Some(Operation { detail, output, .. }) =
+                    display_entry.to_mut().lifecycle_mut()
             {
                 *detail = self.subagent_display_text(detail);
-                if let Some(body) = body {
+                if let Some((_, body)) = output {
                     *body = self.subagent_display_text(body);
                 }
             }
@@ -2848,11 +2803,9 @@ impl Transcript {
                         entry.is_live_operation()
                     })
                     .unwrap_or(entry);
-                let label = match summary_entry {
-                    TranscriptEntry::Tool { name, .. } => name,
-                    TranscriptEntry::Action { label, .. } => label,
-                    _ => unreachable!(),
-                };
+                let label = summary_entry
+                    .operation()
+                    .map_or("", |operation| operation.label.as_str());
                 let summary = format!("{label} ({})", window.total);
                 let row = lines.len();
                 lines.push(tool_window_header(
@@ -2867,21 +2820,17 @@ impl Transcript {
                 ));
                 let timer_entry = (window.start..window.end)
                     .find(|index| {
-                        matches!(
-                            &self.order[*index],
-                            TranscriptEntry::Tool {
-                                execution,
-                                ..
-                            } if execution.completed_at().is_none()
-                        )
+                        self.order
+                            .call(*index)
+                            .is_some_and(|call| call.execution.completed_at().is_none())
                     })
                     .or_else(|| {
-                        (window.start..window.end).rev().find(|index| {
-                            matches!(&self.order[*index], TranscriptEntry::Tool { .. })
-                        })
+                        (window.start..window.end)
+                            .rev()
+                            .find(|index| self.order.call(*index).is_some())
                     });
                 if let Some(timer) = timer_entry
-                    && let TranscriptEntry::Tool { execution, .. } = &self.order[timer]
+                    && let Some(Operation { execution, .. }) = self.order.call(timer)
                 {
                     if execution.completed_at().is_none() {
                         trace.clock_rows.push(timer);
@@ -3281,16 +3230,17 @@ impl Transcript {
                         },
                     );
                 }
-                TranscriptEntry::Action {
-                    kind,
-                    label,
-                    detail,
-                    body,
-                    time,
-                    execution,
-                    expanded,
-                    ..
-                } => {
+                TranscriptEntry::Operation(
+                    operation @ Operation {
+                        kind,
+                        label,
+                        detail,
+                        time,
+                        execution,
+                        expanded,
+                        ..
+                    },
+                ) if !kind.is_call() => {
                     let time = if tool_window.is_some() {
                         String::new()
                     } else {
@@ -3301,11 +3251,12 @@ impl Transcript {
                     let color = transcript_action_color(*kind, execution.state());
                     // A single-line row still says what the message is about.
                     let preview = (!self.wrap_action_rows
-                        && *kind == TranscriptActionKind::Agent
+                        && *kind == OperationKind::Agent
                         && !*expanded
                         && focused_tool.is_none())
                     .then(|| {
-                        body.as_deref()
+                        operation
+                            .body()
                             .and_then(|body| body.lines().find(|line| !line.trim().is_empty()))
                             .map(str::trim)
                     })
@@ -3332,8 +3283,8 @@ impl Transcript {
                     ));
                     if (*expanded
                         || focused_tool == Some(index)
-                        || (self.wrap_action_rows && *kind == TranscriptActionKind::Agent))
-                        && let Some(body) = body.as_deref().filter(|body| !body.trim().is_empty())
+                        || (self.wrap_action_rows && *kind == OperationKind::Agent))
+                        && let Some(body) = operation.body().filter(|body| !body.trim().is_empty())
                     {
                         let nested = tool_window.is_some();
                         let mut body_lines = self.operation_view_lines(
@@ -3608,19 +3559,20 @@ impl Transcript {
                         },
                     );
                 }
-                TranscriptEntry::Tool {
-                    source_name,
-                    name,
+                TranscriptEntry::Operation(Operation {
+                    kind,
+                    source: source_name,
+                    label: name,
                     detail,
-                    code_view,
-                    output_view,
+                    input: code_view,
+                    output: output_view,
                     time,
                     execution,
                     expanded,
                     outcome,
                     ..
-                } => {
-                    let agent_action = is_subagent_tool(source_name) || is_subagent_tool(name);
+                }) => {
+                    let agent_action = *kind == OperationKind::Delegation;
                     // Tool and action rows (Watch, Peer) form one uniform run.
                     let next_is_tool = focused_tool.is_none()
                         && self
@@ -3628,10 +3580,7 @@ impl Transcript {
                             .get(index + 1)
                             .is_some_and(TranscriptEntry::is_operation);
                     let time = display_local_time(time, &today_prefix);
-                    let is_reasoning = matches!(
-                        code_view.as_ref(),
-                        Some((language, _)) if language == "reasoning"
-                    );
+                    let is_reasoning = *kind == OperationKind::Reasoning;
                     let expandable = tool_has_expandable_body(
                         source_name,
                         code_view.as_ref(),
@@ -3652,7 +3601,7 @@ impl Transcript {
                     } else if execution.is_terminal()
                         && (!is_instant || is_command_tool(source_name))
                     {
-                        tool_kind_marker(name, is_reasoning)
+                        tool_kind_marker(*kind, name)
                     } else {
                         "◇"
                     };
@@ -3932,25 +3881,21 @@ impl Transcript {
                 .then(|| {
                     self.order[window.start..window.end]
                         .iter()
-                        .filter_map(|entry| match entry {
-                            TranscriptEntry::Tool { execution, .. } => execution
+                        .filter_map(|entry| match entry.operation()? {
+                            call if call.kind.is_call() => call
+                                .execution
                                 .completed_at()
                                 .map(|time| canonical_local_time(time.with_timezone(&Local))),
-                            TranscriptEntry::Action { time, .. } => Some(time.clone()),
-                            _ => None,
+                            lifecycle => Some(lifecycle.time.clone()),
                         })
                         .max()
                 })
                 .flatten()
                 .map(|time| format!("done at {}", display_local_time(&time, &today_prefix)));
                 if let Some(timer) = (window.start..window.end).find(|index| {
-                    matches!(
-                        &self.order[*index],
-                        TranscriptEntry::Tool {
-                            execution,
-                            ..
-                        } if execution.completed_at().is_none()
-                    )
+                    self.order
+                        .call(*index)
+                        .is_some_and(|call| call.execution.completed_at().is_none())
                 }) {
                     trace.clock_rows.push(timer);
                     trace.clock_groups.push(window);
@@ -4332,9 +4277,9 @@ mod parallel_preparation_tests {
             },
         ));
         assert_eq!(transcript.order.len(), 1);
-        assert!(matches!(&transcript.order[0], TranscriptEntry::Tool {
-            code_view: Some((_, text)), execution, ..
-        } if execution.is_terminal() && text == "Checking replay safely"));
+        assert!(matches!(&transcript.order[0], TranscriptEntry::Operation(Operation {
+            input: Some((_, text)), execution, ..
+        }) if execution.is_terminal() && text == "Checking replay safely"));
     }
 
     #[test]
@@ -4370,9 +4315,9 @@ mod parallel_preparation_tests {
         ));
         transcript.apply_history(&snapshot(3, "Checking the persisted order.", true));
         assert_eq!(transcript.order.len(), 2);
-        assert!(matches!(&transcript.order[0], TranscriptEntry::Tool {
-            code_view: Some((language, text)), execution, ..
-        } if execution.is_terminal() && language == "reasoning" && text == "Checking the persisted order."));
+        assert!(matches!(&transcript.order[0], TranscriptEntry::Operation(Operation {
+            input: Some((language, text)), execution, ..
+        }) if execution.is_terminal() && language == "reasoning" && text == "Checking the persisted order."));
         assert!(matches!(
             &transcript.order[1],
             TranscriptEntry::Message { .. }
@@ -4396,12 +4341,12 @@ mod parallel_preparation_tests {
                     }
                     for index in 0..3 {
                         if kind == "exec" || (kind == "mixed" && index < 2) {
-                            let TranscriptEntry::Tool {
-                                source_name,
-                                name,
-                                code_view,
+                            let TranscriptEntry::Operation(Operation {
+                                source: source_name,
+                                label: name,
+                                input: code_view,
                                 ..
-                            } = &mut transcript.order[index]
+                            }) = &mut transcript.order[index]
                             else {
                                 unreachable!()
                             };
@@ -4415,16 +4360,15 @@ mod parallel_preparation_tests {
                         transcript.tools.insert("live".into(), 2);
                     }
                     if nested {
-                        transcript.order.push(TranscriptEntry::Action {
-                            source_session_id: None,
-                            kind: TranscriptActionKind::Watch,
+                        transcript.order.push(TranscriptEntry::Operation(Operation {
+                            origin: None,
+                            kind: OperationKind::Watch,
                             label: "Watch".into(),
                             detail: "finished".into(),
-                            body: None,
+                            output: None,
                             time: "19:38".into(),
-                            execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
-                            expanded: false,
-                        });
+                            execution: Execution::new(Utc::now(), ExecutionState::Complete),
+                            expanded: false, source: String::new(), input: None, payload_refs: Vec::new(), outcome: None, cwd: None,}));
                     }
                     transcript.action_run_expansions.insert(0, expanded);
                     transcript.order.push(TranscriptEntry::Info {
@@ -4486,9 +4430,9 @@ mod parallel_preparation_tests {
                     // Completion delivery can arrive after the clock advanced;
                     // the latest completion timestamp, not the last row, wins.
                     transcript.active_reasoning = None;
-                    let TranscriptEntry::Tool {
-                        name, execution, ..
-                    } = &mut transcript.order[2]
+                    let TranscriptEntry::Operation(Operation {
+                        label: name, execution, ..
+                    }) = &mut transcript.order[2]
                     else {
                         unreachable!()
                     };
@@ -4558,10 +4502,10 @@ mod parallel_preparation_tests {
         assert_eq!(expanded.matches("Awaiting session expiry.").count(), 2);
         assert!(matches!(
             &transcript.order[0],
-            TranscriptEntry::Tool {
-                code_view: Some((_, body)),
+            TranscriptEntry::Operation(Operation {
+                input: Some((_, body)),
                 ..
-            } if body == source
+            }) if body == source
         ));
     }
 
@@ -4585,11 +4529,11 @@ mod parallel_preparation_tests {
             },
         ));
 
-        let Some(TranscriptEntry::Tool {
+        let Some(TranscriptEntry::Operation(Operation {
             detail,
-            code_view: Some((_, source)),
+            input: Some((_, source)),
             ..
-        }) = transcript.order.first()
+        })) = transcript.order.first()
         else {
             panic!("expected Thinking row");
         };
@@ -4643,11 +4587,11 @@ mod parallel_preparation_tests {
         assert_eq!(transcript.order.len(), 2);
         assert!(transcript.order.iter().all(|entry| matches!(
             entry,
-            TranscriptEntry::Tool {
-                source_name,
+            TranscriptEntry::Operation(Operation {
+                source: source_name,
                 execution,
                 ..
-            } if !execution.is_terminal() && source_name == "action_preparing"
+            }) if !execution.is_terminal() && source_name == "action_preparing"
         )));
 
         for (sequence, tool_call_id, name, input) in [
@@ -4681,11 +4625,11 @@ mod parallel_preparation_tests {
         assert_ne!(transcript.tools["tool-a"], transcript.tools["tool-b"]);
         assert!(transcript.order.iter().all(|entry| matches!(
             entry,
-            TranscriptEntry::Tool {
-                source_name,
+            TranscriptEntry::Operation(Operation {
+                source: source_name,
                 execution,
                 ..
-            } if !execution.is_terminal() && source_name != "action_preparing"
+            }) if !execution.is_terminal() && source_name != "action_preparing"
         )));
     }
 }
@@ -4844,18 +4788,18 @@ mod model_request_tests {
         if !has_changes {
             assert!(transcript.command_edit_rows.is_empty());
             assert_eq!(transcript.order.len(), 2);
-            assert!(matches!(&transcript.order[0], TranscriptEntry::Tool {
-                source_name, output_view: None, ..
-            } if source_name == "read_file"));
-            assert!(matches!(&transcript.order[1], TranscriptEntry::Tool {
-                output_view: Some((_, output)), ..
-            } if output.contains("+unowned")));
+            assert!(matches!(&transcript.order[0], TranscriptEntry::Operation(Operation {
+                source: source_name, output: None, ..
+            }) if source_name == "read_file"));
+            assert!(matches!(&transcript.order[1], TranscriptEntry::Operation(Operation {
+                output: Some((_, output)), ..
+            }) if output.contains("+unowned")));
             return;
         }
         let index = transcript.command_edit_rows["edit"];
-        assert!(matches!(&transcript.order[index], TranscriptEntry::Tool {
-            code_view: Some((language, diff)), ..
-        } if language == "diff:rs" && diff.contains("+new") && !diff.contains("test output")));
+        assert!(matches!(&transcript.order[index], TranscriptEntry::Operation(Operation {
+            input: Some((language, diff)), ..
+        }) if language == "diff:rs" && diff.contains("+new") && !diff.contains("test output")));
         assert_eq!(transcript.command_edit_rows.len(), 1);
     }
 }

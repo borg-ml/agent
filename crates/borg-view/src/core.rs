@@ -56,6 +56,26 @@ impl TranscriptEntries {
         self.entries.get_mut(index)
     }
 
+    /// The tool-style call at `index`, if that row is one.
+    pub fn call(&self, index: usize) -> Option<&Operation> {
+        self.entries.get(index)?.call()
+    }
+
+    pub fn call_mut(&mut self, index: usize) -> Option<&mut Operation> {
+        self.entries.get(index)?.call()?;
+        self.get_mut(index)?.call_mut()
+    }
+
+    /// The lifecycle row at `index`, if that row is one.
+    pub fn lifecycle(&self, index: usize) -> Option<&Operation> {
+        self.entries.get(index)?.lifecycle()
+    }
+
+    pub fn lifecycle_mut(&mut self, index: usize) -> Option<&mut Operation> {
+        self.entries.get(index)?.lifecycle()?;
+        self.get_mut(index)?.lifecycle_mut()
+    }
+
     pub fn last_mut(&mut self) -> Option<&mut TranscriptEntry> {
         self.mark_changed(self.entries.len().saturating_sub(1));
         self.invalidations
@@ -608,12 +628,12 @@ impl TranscriptCore {
         {
             return;
         }
-        if let Some(TranscriptEntry::Tool {
-            code_view: Some((language, source)),
+        if let Some(Operation {
+            kind: OperationKind::Reasoning,
+            input: Some((_, source)),
             detail,
             ..
-        }) = self.order.get_mut(index)
-            && language == "reasoning"
+        }) = self.order.call_mut(index)
         {
             if snapshot {
                 Self::merge_reasoning_snapshot(source, text);
@@ -639,12 +659,12 @@ impl TranscriptCore {
         {
             return;
         }
-        if let Some(TranscriptEntry::Tool {
+        if let Some(Operation {
             execution,
-            name,
+            label: name,
             expanded,
             ..
-        }) = self.order.get_mut(index)
+        }) = self.order.call_mut(index)
         {
             execution.transition(ExecutionState::Complete, at);
             *name = "Reasoned".to_string();
@@ -661,13 +681,13 @@ impl TranscriptCore {
             return;
         }
         if let Some(index) = self.active_reasoning
-            && let Some(TranscriptEntry::Tool {
+            && let Some(Operation {
                 execution,
-                code_view: Some((language, source)),
+                kind: OperationKind::Reasoning,
+                input: Some((_, source)),
                 detail,
                 ..
-            }) = self.order.get_mut(index)
-            && language == "reasoning"
+            }) = self.order.call_mut(index)
             && !execution.is_terminal()
         {
             if self.reasoning_has_preview {
@@ -687,12 +707,12 @@ impl TranscriptCore {
         }
         self.start_reasoning(started_at, time);
         if let Some(index) = self.active_reasoning
-            && let Some(TranscriptEntry::Tool {
-                code_view: Some((language, source)),
+            && let Some(Operation {
+                kind: OperationKind::Reasoning,
+                input: Some((_, source)),
                 detail,
                 ..
-            }) = self.order.get_mut(index)
-            && language == "reasoning"
+            }) = self.order.call_mut(index)
         {
             Self::merge_reasoning_snapshot(source, text);
             *detail = reasoning_preview(source);
@@ -712,13 +732,13 @@ impl TranscriptCore {
             self.start_reasoning(started_at, time);
         }
         if let Some(index) = self.active_reasoning
-            && let Some(TranscriptEntry::Tool {
+            && let Some(Operation {
                 execution,
-                code_view: Some((language, source)),
+                kind: OperationKind::Reasoning,
+                input: Some((_, source)),
                 detail,
                 ..
-            }) = self.order.get_mut(index)
-            && language == "reasoning"
+            }) = self.order.call_mut(index)
             && !execution.is_terminal()
         {
             source.push_str(delta);
@@ -907,8 +927,7 @@ impl TranscriptCore {
                             .get(index)
                             .and_then(TranscriptEntry::execution)
                             .is_some_and(|execution| !execution.is_terminal())
-                        && let Some(TranscriptEntry::Tool { execution, .. }) =
-                            self.order.get_mut(index)
+                        && let Some(Operation { execution, .. }) = self.order.call_mut(index)
                         && (!execution.is_terminal() || execution.is_backgrounded())
                     {
                         execution.transition(
@@ -1311,19 +1330,15 @@ impl TranscriptCore {
                 {
                     if *status != MessageStatus::Queued && self.remember_watch_message(*message_id)
                     {
-                        self.order.push(TranscriptEntry::Action {
-                            source_session_id: None,
-                            kind: TranscriptActionKind::Watch,
-                            label: "Watch".to_string(),
-                            detail: label,
-                            body: Some(body),
-                            time: local_event_time(event),
-                            execution: Execution::new(
-                                event.created_at,
-                                TranscriptActionState::Complete,
-                            ),
-                            expanded: false,
-                        });
+                        self.order
+                            .push(TranscriptEntry::Operation(Operation::lifecycle(
+                                OperationKind::Watch,
+                                "Watch",
+                                label,
+                                Some(body),
+                                local_event_time(event),
+                                Execution::new(event.created_at, ExecutionState::Complete),
+                            )));
                     }
                     return removed_entry;
                 }
@@ -1668,9 +1683,14 @@ impl TranscriptCore {
                 input_ref,
                 ..
             } => {
-                if self.tools.get(tool_call_id).and_then(|index| self.order.get(*index))
-                    .is_some_and(|row| matches!(row, TranscriptEntry::Tool { execution, .. } if execution.is_terminal()))
-                { return None; }
+                if self
+                    .tools
+                    .get(tool_call_id)
+                    .and_then(|index| self.order.call(*index))
+                    .is_some_and(|row| row.execution.is_terminal())
+                {
+                    return None;
+                }
                 self.complete_preparing_tool(tool_call_id);
                 if self.foreground_tool.as_deref() == Some(tool_call_id) {
                     self.foreground_tool = None;
@@ -1682,19 +1702,13 @@ impl TranscriptCore {
                     }
                     let index = self.order.len();
                     self.tools.insert(tool_call_id.clone(), index);
-                    self.order.push(TranscriptEntry::Tool {
-                        source_name: "tool".into(),
-                        name: "Completed tool".into(),
-                        detail: String::new(),
-                        code_view: None,
-                        output_view: None,
-                        payload_refs: Vec::new(),
-                        time: local_event_time(event),
-                        execution: Execution::new(event.created_at, ExecutionState::Running),
-                        expanded: false,
-                        outcome: None,
-                        cwd: None,
-                    });
+                    self.order.push(TranscriptEntry::Operation(Operation::tool(
+                        "tool",
+                        "Completed tool",
+                        "",
+                        local_event_time(event),
+                        Execution::new(event.created_at, ExecutionState::Running),
+                    )));
                     Some(index)
                 });
                 if self.retain_tool_inspection
@@ -1705,15 +1719,8 @@ impl TranscriptCore {
                         .insert(format!("{id}:{ordinal}"), output.clone());
                 }
                 let (source_name_for_process, command_for_process) = tool_index
-                    .and_then(|index| self.order.get(index))
-                    .and_then(|entry| match entry {
-                        TranscriptEntry::Tool {
-                            source_name,
-                            detail,
-                            ..
-                        } => Some((source_name.clone(), detail.clone())),
-                        _ => None,
-                    })
+                    .and_then(|index| self.order.call(index))
+                    .map(|call| (call.source.clone(), call.detail.clone()))
                     .unwrap_or_default();
                 let command_edit = command_edit_presentation(&source_name_for_process, output);
                 let deferred_command_edit = command_edit
@@ -1749,19 +1756,19 @@ impl TranscriptCore {
                 let has_live_process =
                     tool_index.is_some_and(|index| self.tool_has_live_process(index));
                 if let Some(index) = tool_index
-                    && let TranscriptEntry::Tool {
+                    && let Some(Operation {
                         execution,
-                        source_name,
-                        name,
+                        source: source_name,
+                        label: name,
                         detail,
-                        code_view,
-                        output_view,
+                        input: code_view,
+                        output: output_view,
                         expanded,
                         payload_refs,
                         outcome,
                         cwd,
                         ..
-                    } = &mut self.order[index]
+                    }) = self.order.call_mut(index)
                 {
                     payload_refs.extend(output_ref.iter().cloned());
                     payload_refs.extend(input_ref.iter().cloned());
@@ -1955,7 +1962,7 @@ impl TranscriptCore {
                         .iter()
                         .find(|watch| watch.watch_id.to_string() == *handle && !watch.running);
                     if let Some(watch) = finished {
-                        if let TranscriptEntry::Tool { execution, .. } = &mut self.order[index] {
+                        if let Some(Operation { execution, .. }) = self.order.call_mut(index) {
                             execution.transition(
                                 ExecutionState::Complete,
                                 watch.last_event_at.unwrap_or(event.created_at),
@@ -1973,11 +1980,11 @@ impl TranscriptCore {
                 if reported_background_handle.is_none()
                     && let Some(handle) = followup_handle
                     && let Some(process) = self.provider_backgrounds.remove(&handle)
-                    && let Some(TranscriptEntry::Tool {
+                    && let Some(Operation {
                         execution,
-                        output_view,
+                        output: output_view,
                         ..
-                    }) = self.order.get_mut(process.tool_index)
+                    }) = self.order.call_mut(process.tool_index)
                     && !execution.is_terminal()
                 {
                     let output = tool_process_output_text(output);
@@ -1996,9 +2003,7 @@ impl TranscriptCore {
                             .entry(process_id)
                             .or_default()
                             .push(tool_call_id.clone());
-                    } else if let Some(TranscriptEntry::Tool { execution, .. }) =
-                        self.order.get_mut(index)
-                    {
+                    } else if let Some(Operation { execution, .. }) = self.order.call_mut(index) {
                         // A late poll event must not revive an exited process.
                         execution.transition(ExecutionState::Complete, event.created_at);
                     }
@@ -2052,16 +2057,15 @@ impl TranscriptCore {
                 }
                 self.interaction_entries.insert(key, self.order.len());
                 self.finish_reasoning(event.created_at);
-                self.order.push(TranscriptEntry::Action {
-                    source_session_id: None,
-                    kind: TranscriptActionKind::Approval,
-                    label: "Approval".to_string(),
-                    detail: format_action_detail(title, detail),
-                    body: (!detail.trim().is_empty()).then(|| detail.clone()),
-                    time: local_event_time(event),
-                    execution: Execution::new(event.created_at, TranscriptActionState::Waiting),
-                    expanded: false,
-                })
+                self.order
+                    .push(TranscriptEntry::Operation(Operation::lifecycle(
+                        OperationKind::Approval,
+                        "Approval",
+                        format_action_detail(title, detail),
+                        (!detail.trim().is_empty()).then(|| detail.clone()),
+                        local_event_time(event),
+                        Execution::new(event.created_at, ExecutionState::Waiting),
+                    )))
             }
             SessionEventKind::ProviderInteractionRequested {
                 interaction_id,
@@ -2077,20 +2081,19 @@ impl TranscriptCore {
                 }
                 self.interaction_entries.insert(key, self.order.len());
                 let options = provider_interaction_options(payload);
-                self.order.push(TranscriptEntry::Action {
-                    source_session_id: None,
-                    kind: TranscriptActionKind::ProviderInteraction,
-                    label: "Input needed".to_string(),
-                    detail: if options.is_empty() {
-                        format_action_detail(title, detail)
-                    } else {
-                        format!("{} · {options}", format_action_detail(title, detail))
-                    },
-                    body: (!detail.trim().is_empty()).then(|| detail.clone()),
-                    time: local_event_time(event),
-                    execution: Execution::new(event.created_at, TranscriptActionState::Waiting),
-                    expanded: false,
-                })
+                self.order
+                    .push(TranscriptEntry::Operation(Operation::lifecycle(
+                        OperationKind::ProviderInteraction,
+                        "Input needed",
+                        if options.is_empty() {
+                            format_action_detail(title, detail)
+                        } else {
+                            format!("{} · {options}", format_action_detail(title, detail))
+                        },
+                        (!detail.trim().is_empty()).then(|| detail.clone()),
+                        local_event_time(event),
+                        Execution::new(event.created_at, ExecutionState::Waiting),
+                    )))
             }
             SessionEventKind::ApprovalResolved {
                 approval_id,
@@ -2120,8 +2123,8 @@ impl TranscriptCore {
                     if let Some(process) = self
                         .provider_backgrounds
                         .remove(&watch.watch_id.to_string())
-                        && let Some(TranscriptEntry::Tool { execution, .. }) =
-                            self.order.get_mut(process.tool_index)
+                        && let Some(Operation { execution, .. }) =
+                            self.order.call_mut(process.tool_index)
                     {
                         execution.transition(
                             ExecutionState::Complete,
@@ -2144,8 +2147,8 @@ impl TranscriptCore {
                                 self.tool_parents.remove(&child);
                                 parents.push(child.clone());
                                 if let Some(index) = self.tools.get(&child)
-                                    && let Some(TranscriptEntry::Tool { execution, .. }) =
-                                        self.order.get_mut(*index)
+                                    && let Some(Operation { execution, .. }) =
+                                        self.order.call_mut(*index)
                                 {
                                     execution.transition(
                                         ExecutionState::Complete,
@@ -2300,11 +2303,11 @@ impl TranscriptCore {
                         .get(tool_index)
                         .and_then(TranscriptEntry::execution)
                         .is_some_and(|execution| !execution.is_terminal())
-                    && let Some(TranscriptEntry::Tool {
+                    && let Some(Operation {
                         execution,
-                        output_view,
+                        output: output_view,
                         ..
-                    }) = self.order.get_mut(tool_index)
+                    }) = self.order.call_mut(tool_index)
                     && !execution.is_terminal()
                 {
                     let output = [stdout.as_str(), stderr.as_str()]
@@ -2325,8 +2328,7 @@ impl TranscriptCore {
                                 .get(index)
                                 .and_then(TranscriptEntry::execution)
                                 .is_some_and(|execution| !execution.is_terminal())
-                            && let Some(TranscriptEntry::Tool { execution, .. }) =
-                                self.order.get_mut(index)
+                            && let Some(Operation { execution, .. }) = self.order.call_mut(index)
                         {
                             execution.transition(process_state, event.created_at);
                         }
@@ -2535,9 +2537,9 @@ impl TranscriptCore {
                 };
                 let state =
                     if *steered || usize::try_from(*acknowledged).unwrap_or(usize::MAX) >= total {
-                        TranscriptActionState::Complete
+                        ExecutionState::Complete
                     } else {
-                        TranscriptActionState::Waiting
+                        ExecutionState::Waiting
                     };
                 if let Some(index) = self.team_broadcast_entries.get(message_id).copied() {
                     if self
@@ -2548,12 +2550,12 @@ impl TranscriptCore {
                     {
                         return None;
                     }
-                    if let Some(TranscriptEntry::Action {
+                    if let Some(Operation {
                         detail: row_detail,
                         execution,
                         time: row_time,
                         ..
-                    }) = self.order.get_mut(index)
+                    }) = self.order.lifecycle_mut(index)
                     {
                         if !execution.transition(state, event.created_at) {
                             return None;
@@ -2563,16 +2565,17 @@ impl TranscriptCore {
                     }
                 } else {
                     let index = self.order.len();
-                    self.order.push(TranscriptEntry::Action {
-                        source_session_id: None,
-                        kind: TranscriptActionKind::Agent,
-                        label: "Team".to_string(),
-                        detail,
-                        body: Some(text.clone()),
-                        time: local_event_time(event),
-                        execution: Execution::new(event.created_at, state),
+                    self.order.push(TranscriptEntry::Operation(Operation {
                         expanded: true,
-                    });
+                        ..Operation::lifecycle(
+                            OperationKind::Agent,
+                            "Team",
+                            detail,
+                            Some(text.clone()),
+                            local_event_time(event),
+                            Execution::new(event.created_at, state),
+                        )
+                    }));
                     self.team_broadcast_entries.insert(*message_id, index);
                 }
             }
@@ -2599,26 +2602,22 @@ impl TranscriptCore {
                                 && !self.pruned_settled_children.contains(sender_id)
                         }
                     };
-                    self.order.push(TranscriptEntry::Action {
-                        source_session_id: None,
-                        kind: TranscriptActionKind::Agent,
-                        label: if from_peer { "Peer" } else { "Agent" }.to_string(),
-                        detail: if sender_name.trim().is_empty() {
-                            self.agent_names
-                                .get(sender_id)
-                                .cloned()
-                                .unwrap_or_else(|| "agent".to_string())
-                        } else {
-                            sender_name.clone()
-                        },
-                        body: Some(text.clone()),
-                        time: local_event_time(event),
-                        execution: Execution::new(
-                            event.created_at,
-                            TranscriptActionState::Received,
-                        ),
-                        expanded: false,
-                    });
+                    self.order
+                        .push(TranscriptEntry::Operation(Operation::lifecycle(
+                            OperationKind::Agent,
+                            if from_peer { "Peer" } else { "Agent" },
+                            if sender_name.trim().is_empty() {
+                                self.agent_names
+                                    .get(sender_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| "agent".to_string())
+                            } else {
+                                sender_name.clone()
+                            },
+                            Some(text.clone()),
+                            local_event_time(event),
+                            Execution::new(event.created_at, ExecutionState::Received),
+                        )));
                     row_created = true;
                 }
                 // Duplicate receipts have no new row to own their source metadata.
@@ -2640,16 +2639,15 @@ impl TranscriptCore {
             }
             SessionEventKind::Error { message } => {
                 self.finish_reasoning(event.created_at);
-                self.order.push(TranscriptEntry::Action {
-                    source_session_id: None,
-                    kind: TranscriptActionKind::Error,
-                    label: "Error".to_string(),
-                    detail: compact_text(message, 180),
-                    body: Some(message.clone()),
-                    time: local_event_time(event),
-                    execution: Execution::new(event.created_at, TranscriptActionState::Failed),
-                    expanded: false,
-                })
+                self.order
+                    .push(TranscriptEntry::Operation(Operation::lifecycle(
+                        OperationKind::Error,
+                        "Error",
+                        compact_text(message, 180),
+                        Some(message.clone()),
+                        local_event_time(event),
+                        Execution::new(event.created_at, ExecutionState::Failed),
+                    )))
             }
             _ => {}
         }
@@ -2816,19 +2814,14 @@ impl TranscriptCore {
             let mut execution = Execution::new(started_at(), ExecutionState::Running);
             execution.transition(ExecutionState::Complete, event.created_at);
             let index = self.order.len();
-            self.order.push(TranscriptEntry::Tool {
-                source_name: "reasoning".into(),
-                name: "Reasoned".into(),
-                detail: reasoning_preview(text),
-                code_view: Some(("reasoning".into(), text.into())),
-                output_view: None,
-                payload_refs: Vec::new(),
-                time: started_at().to_rfc3339(),
-                execution,
-                expanded: false,
-                outcome: None,
-                cwd: None,
-            });
+            self.order
+                .push(TranscriptEntry::Operation(Operation::reasoning(
+                    "Reasoned",
+                    reasoning_preview(text),
+                    text.into(),
+                    started_at().to_rfc3339(),
+                    execution,
+                )));
             self.order.identities[index] = (id, 0);
             self.reasoning_blocks.insert(id, index);
             return;
@@ -2854,15 +2847,15 @@ impl TranscriptCore {
             }
             return;
         }
-        if let Some(TranscriptEntry::Tool {
+        if let Some(Operation {
             execution,
-            code_view: Some((language, source)),
+            kind: OperationKind::Reasoning,
+            input: Some((_, source)),
             detail,
-            name,
+            label: name,
             expanded,
             ..
-        }) = self.order.get_mut(index)
-            && language == "reasoning"
+        }) = self.order.call_mut(index)
         {
             if finalized {
                 source.clear();
@@ -2897,11 +2890,11 @@ impl TranscriptCore {
     // Canonical archived content can arrive after the execution boundary. This
     // loads the stored payload only; it cannot alter the receipt or its clock.
     fn hydrate_reasoning_payload(&mut self, index: usize, text: &str) {
-        if let Some(TranscriptEntry::Tool {
-            code_view: Some((language, source)),
+        if let Some(Operation {
+            kind: OperationKind::Reasoning,
+            input: Some((_, source)),
             ..
-        }) = self.order.get_mut(index)
-            && language == "reasoning"
+        }) = self.order.call_mut(index)
         {
             source.clear();
             source.push_str(text);
@@ -2927,7 +2920,7 @@ impl TranscriptCore {
             return;
         }
         self.foreground_tool = None;
-        if let Some(TranscriptEntry::Tool { execution, .. }) = self.order.get_mut(index)
+        if let Some(Operation { execution, .. }) = self.order.call_mut(index)
             && !execution.is_terminal()
             && !execution.is_failed()
             && !execution.is_interrupted()
@@ -2946,7 +2939,7 @@ impl TranscriptCore {
                 .get(index)
                 .and_then(TranscriptEntry::execution)
                 .is_some_and(|execution| !execution.is_terminal())
-            && let Some(TranscriptEntry::Tool { execution, .. }) = self.order.get_mut(index)
+            && let Some(Operation { execution, .. }) = self.order.call_mut(index)
         {
             execution.transition(ExecutionState::Stopped, completed_at);
         }
@@ -2959,7 +2952,7 @@ impl TranscriptCore {
                 .get(*index)
                 .and_then(TranscriptEntry::execution)
                 .is_some_and(|execution| !execution.is_terminal())
-            && let Some(TranscriptEntry::Action { execution, .. }) = self.order.get_mut(*index)
+            && let Some(Operation { execution, .. }) = self.order.lifecycle_mut(*index)
         {
             execution.transition(state, at);
         }
@@ -2999,8 +2992,8 @@ impl TranscriptCore {
     }
 
     pub fn collapse_previous_edit(&mut self) {
-        if let Some(TranscriptEntry::Tool { expanded, .. }) =
-            self.last_edit.and_then(|index| self.order.get_mut(index))
+        if let Some(Operation { expanded, .. }) =
+            self.last_edit.and_then(|index| self.order.call_mut(index))
         {
             *expanded = false;
         }
@@ -3019,30 +3012,26 @@ impl TranscriptCore {
         {
             return;
         }
-        if let Some(TranscriptEntry::Tool {
-            source_name,
-            name,
-            detail,
-            code_view,
-            execution,
-            ..
-        }) = self.order.get_mut(tool_index)
-            && source_name == "action_preparing"
-            && !execution.is_terminal()
+        if let Some(operation) = self.order.call_mut(tool_index)
+            && operation.kind == OperationKind::Preparation
+            && !operation.execution.is_terminal()
         {
-            *source_name = "action".to_string();
+            operation.source = "action".to_string();
+            operation.reclassify();
             // The preparation's `{"label": ...}` only repeats the title; the
             // real input, if it ever arrives, replaces it on completion.
-            *code_view = None;
-            if !detail.is_empty() {
-                *name = format!("Run {detail}");
-                detail.clear();
+            operation.input = None;
+            if !operation.detail.is_empty() {
+                operation.label = format!("Run {}", operation.detail);
+                operation.detail.clear();
             } else {
-                let label = name
+                let label = operation
+                    .label
                     .strip_prefix("Generate ")
-                    .or_else(|| name.strip_prefix("Prepare "))
-                    .unwrap_or("command");
-                *name = format!("Run {label}");
+                    .or_else(|| operation.label.strip_prefix("Prepare "))
+                    .unwrap_or("command")
+                    .to_string();
+                operation.label = format!("Run {label}");
             }
         }
     }
@@ -3105,7 +3094,7 @@ impl TranscriptCore {
         {
             return;
         }
-        if let Some(TranscriptEntry::Tool { execution, .. }) = self.order.get_mut(index) {
+        if let Some(Operation { execution, .. }) = self.order.call_mut(index) {
             execution.transition(ExecutionState::Complete, completed_at);
         }
     }
@@ -3123,12 +3112,12 @@ impl TranscriptCore {
         {
             return;
         }
-        if let Some(TranscriptEntry::Tool {
+        if let Some(Operation {
             execution,
-            name,
+            label: name,
             expanded,
             ..
-        }) = self.order.get_mut(index)
+        }) = self.order.call_mut(index)
             && !execution.is_terminal()
         {
             // The row reads Reasoning while it runs and Reasoned once it ends,
@@ -3174,14 +3163,16 @@ impl TranscriptCore {
         self.unkeyed_preparing_tools.clear();
         let active_background_tools = self.live_process_tool_indices();
         for index in 0..self.order.len() {
-            if !matches!(&self.order[index], TranscriptEntry::Tool { execution, .. } if !execution.is_terminal())
+            if !self
+                .order
+                .call(index)
+                .is_some_and(|call| !call.execution.is_terminal())
             {
                 continue;
             }
-            let entry = self.order.get_mut(index).expect("filtered entry");
-            if let TranscriptEntry::Tool {
+            if let Some(Operation {
                 execution, detail, ..
-            } = entry
+            }) = self.order.call_mut(index)
                 && !execution.is_terminal()
             {
                 execution.transition(
@@ -3293,12 +3284,14 @@ impl TranscriptCore {
         self.unkeyed_preparing_tools.clear();
         let active_background_tools = self.live_process_tool_indices();
         for index in 0..self.order.len() {
-            if !matches!(&self.order[index], TranscriptEntry::Tool { execution, .. } if !execution.is_terminal())
+            if !self
+                .order
+                .call(index)
+                .is_some_and(|call| !call.execution.is_terminal())
             {
                 continue;
             }
-            let entry = self.order.get_mut(index).expect("filtered entry");
-            if let TranscriptEntry::Tool { execution, .. } = entry
+            if let Some(Operation { execution, .. }) = self.order.call_mut(index)
                 && !execution.is_terminal()
             {
                 execution.transition(
@@ -3730,20 +3723,15 @@ impl TranscriptCore {
             .as_deref()
             .and_then(|tool_call_id| self.tools.get(tool_call_id).copied());
         for index in 0..self.order.len() {
-            if !matches!(&self.order[index], TranscriptEntry::Tool { source_name, execution, .. } if source_name == "action_preparing" && !execution.is_terminal())
-            {
-                continue;
-            }
-            let entry = self.order.get_mut(index).expect("filtered entry");
-            let TranscriptEntry::Tool {
+            let Some(Operation {
+                kind: OperationKind::Preparation,
                 execution,
-                source_name,
                 ..
-            } = entry
+            }) = self.order.call_mut(index)
             else {
                 continue;
             };
-            if source_name != "action_preparing" || execution.is_terminal() {
+            if execution.is_terminal() {
                 continue;
             }
             execution.transition(ExecutionState::Stopped, completed_at);
@@ -3762,30 +3750,28 @@ impl TranscriptCore {
         }
         if let Some(index) = self.active_reasoning {
             if matches!(
-                self.order.get(index),
-                Some(TranscriptEntry::Tool { execution,
-                    code_view: Some((language, _)),
+                self.order.call(index),
+                Some(Operation {
+                    kind: OperationKind::Reasoning,
+                    execution,
                     ..
-                }) if language == "reasoning" && !execution.is_terminal()
+                }) if !execution.is_terminal()
             ) {
                 return;
             }
             self.active_reasoning = None;
         }
         let index = self.order.len();
-        self.order.push(TranscriptEntry::Tool {
-            source_name: "reasoning".to_string(),
-            name: "Reasoning".to_string(),
-            detail: String::new(),
-            code_view: Some(("reasoning".to_string(), String::new())),
-            output_view: None,
-            payload_refs: Vec::new(),
-            time,
-            execution: Execution::new(started_at, ExecutionState::Running),
+        self.order.push(TranscriptEntry::Operation(Operation {
             expanded: self.auto_expand_thinking,
-            outcome: None,
-            cwd: None,
-        });
+            ..Operation::reasoning(
+                "Reasoning",
+                "",
+                String::new(),
+                time,
+                Execution::new(started_at, ExecutionState::Running),
+            )
+        }));
         self.active_reasoning = Some(index);
         self.reasoning_has_preview = false;
     }
@@ -3847,16 +3833,16 @@ impl TranscriptCore {
         let Some(index) = self.tools.get(&preparing_id).copied() else {
             return;
         };
-        let Some(TranscriptEntry::Tool {
-            source_name,
-            name,
+        let Some(Operation {
+            kind: OperationKind::Preparation,
+            label: name,
             execution,
             ..
-        }) = self.order.get_mut(index)
+        }) = self.order.call_mut(index)
         else {
             return;
         };
-        if source_name != "action_preparing" || execution.is_terminal() {
+        if execution.is_terminal() {
             return;
         }
         *name = if waiting {
@@ -3910,13 +3896,13 @@ impl TranscriptCore {
                             .and_then(|index| self.order.get(*index))
                             .is_some_and(|entry| {
                                 matches!(
-                                    entry,
-                                    TranscriptEntry::Tool {
-                                        source_name,
-                                        name,
+                                    entry.call(),
+                                    Some(Operation {
+                                        kind: OperationKind::Preparation,
+                                        label: name,
                                         execution,
                                         ..
-                                    } if !execution.is_terminal() && source_name == "action_preparing"
+                                    }) if !execution.is_terminal()
                                         && (name == "Generate" || name == "Wait for provider")
                                 )
                             })
@@ -3975,12 +3961,12 @@ impl TranscriptCore {
         let Some(body) = &edit.input else {
             return false;
         };
-        if let Some(TranscriptEntry::Tool {
-            code_view,
+        if let Some(Operation {
+            input: code_view,
             payload_refs,
             expanded,
             ..
-        }) = self.order.get_mut(index)
+        }) = self.order.call_mut(index)
         {
             if code_view
                 .as_ref()
@@ -4033,19 +4019,18 @@ impl TranscriptCore {
         }
         self.order.insert(
             index,
-            TranscriptEntry::Tool {
-                source_name: "command_edit".to_string(),
-                name: edit.label,
-                detail: edit.detail,
-                code_view: Some((body.language, body.text)),
-                output_view: None,
+            TranscriptEntry::Operation(Operation {
+                input: Some((body.language, body.text)),
                 payload_refs,
-                time,
-                execution: Execution::new(completed_at, ExecutionState::Complete),
                 expanded,
-                outcome: None,
-                cwd: None,
-            },
+                ..Operation::tool(
+                    "command_edit",
+                    edit.label,
+                    edit.detail,
+                    time,
+                    Execution::new(completed_at, ExecutionState::Complete),
+                )
+            }),
         );
         self.command_edit_rows
             .insert(tool_call_id.to_string(), index);
@@ -4117,9 +4102,9 @@ impl TranscriptCore {
         self.tool_inspection_outputs
             .get(&format!("{id}:{ordinal}"))
             .map(String::as_str)
-            .or_else(|| match self.order.get(index)? {
-                TranscriptEntry::Tool {
-                    output_view: Some((_, text)),
+            .or_else(|| match self.order.call(index)? {
+                Operation {
+                    output: Some((_, text)),
                     ..
                 } => Some(text.as_str()),
                 _ => None,
@@ -4147,7 +4132,7 @@ impl TranscriptCore {
             return;
         }
         if let Some(index) = self.tools.get(tool_call_id).copied()
-            && let Some(TranscriptEntry::Tool { execution, .. }) = self.order.get(index)
+            && let Some(Operation { execution, .. }) = self.order.call(index)
             && execution.is_terminal()
         {
             // Tool call IDs name executions, not reusable tool entities.
@@ -4198,31 +4183,21 @@ impl TranscriptCore {
             && ((is_edit_diff && self.diff_expansion != DiffExpansionPolicy::Collapsed)
                 || (!is_edit_diff && code_view.is_some() && (rich_ui || self.auto_expand_tools)));
         if let Some(tool_index) = self.tools.get(tool_call_id).copied()
-            && let Some(TranscriptEntry::Tool {
-                execution,
-                source_name: stored_source_name,
-                name: stored_name,
-                detail: stored_detail,
-                code_view: stored_code_view,
-                output_view: stored_output_view,
-                payload_refs: stored_payload_refs,
-                expanded: stored_expanded,
-                cwd: stored_cwd,
-                ..
-            }) = self.order.get_mut(tool_index)
-            && !execution.is_terminal()
+            && let Some(operation) = self.order.call_mut(tool_index)
+            && !operation.execution.is_terminal()
         {
-            *stored_cwd = cwd.clone();
-            if !execution.is_backgrounded() {
+            operation.cwd = cwd.clone();
+            if !operation.execution.is_backgrounded() {
                 self.foreground_tool = Some(tool_call_id.to_string());
             }
-            *stored_source_name = name.to_string();
-            *stored_name = display_name;
-            *stored_detail = detail;
-            *stored_code_view = code_view;
-            *stored_output_view = None;
-            *stored_payload_refs = input_ref.cloned().into_iter().collect();
-            *stored_expanded = expanded;
+            operation.source = name.to_string();
+            operation.label = display_name;
+            operation.detail = detail;
+            operation.input = code_view;
+            operation.output = None;
+            operation.payload_refs = input_ref.cloned().into_iter().collect();
+            operation.expanded = expanded;
+            operation.reclassify();
             if is_edit_diff {
                 self.last_edit = Some(tool_index);
             }
@@ -4231,19 +4206,19 @@ impl TranscriptCore {
         self.foreground_tool = Some(tool_call_id.to_string());
         let tool_index = self.order.len();
         self.tools.insert(tool_call_id.to_string(), tool_index);
-        self.order.push(TranscriptEntry::Tool {
-            source_name: name.to_string(),
-            name: display_name,
-            detail,
-            code_view,
-            output_view: None,
+        self.order.push(TranscriptEntry::Operation(Operation {
+            input: code_view,
             payload_refs: input_ref.cloned().into_iter().collect(),
-            time: local_event_time(event),
-            execution: Execution::new(event.created_at, ExecutionState::Running),
             expanded,
-            outcome: None,
             cwd,
-        });
+            ..Operation::tool(
+                name,
+                display_name,
+                detail,
+                local_event_time(event),
+                Execution::new(event.created_at, ExecutionState::Running),
+            )
+        }));
         if is_edit_diff {
             self.last_edit = Some(tool_index);
         }
@@ -4329,7 +4304,7 @@ impl TranscriptCore {
         };
         let time = agent.updated_at.to_rfc3339();
         if let Some(index) = self.subagent_entries.get(&child_id).copied() {
-            let Some(TranscriptEntry::Action { execution, .. }) = self.order.get(index) else {
+            let Some(Operation { execution, .. }) = self.order.lifecycle(index) else {
                 return;
             };
             if execution.is_terminal() {
@@ -4337,21 +4312,21 @@ impl TranscriptCore {
                     return;
                 }
             } else {
-                if let Some(TranscriptEntry::Action {
+                if let Some(Operation {
                     execution,
                     label: old_label,
                     detail: old_detail,
-                    body: old_body,
+                    output: old_body,
                     time: old_time,
                     expanded,
                     ..
-                }) = self.order.get_mut(index)
+                }) = self.order.lifecycle_mut(index)
                 {
                     execution.transition(state, agent.updated_at);
                     *old_label = label;
                     *old_detail = detail;
                     *expanded &= body.is_some();
-                    *old_body = body;
+                    *old_body = body.map(|text| ("text".to_string(), text));
                     *old_time = time;
                 }
                 return;
@@ -4361,16 +4336,17 @@ impl TranscriptCore {
             return;
         }
         self.subagent_entries.insert(child_id, self.order.len());
-        self.order.push(TranscriptEntry::Action {
-            source_session_id: Some(child_id),
-            kind: TranscriptActionKind::Agent,
-            label,
-            detail,
-            body,
-            time,
-            execution: Execution::new(agent.updated_at, state),
-            expanded: false,
-        });
+        self.order.push(TranscriptEntry::Operation(
+            Operation::lifecycle(
+                OperationKind::Agent,
+                label,
+                detail,
+                body,
+                time,
+                Execution::new(agent.updated_at, state),
+            )
+            .with_origin(Some(child_id)),
+        ));
     }
 
     pub fn effective_subagent_snapshot(&self, child_id: Uuid) -> Option<SubagentSnapshot> {
@@ -4402,8 +4378,8 @@ pub fn transcript_entry_is_turn_output(entry: &TranscriptEntry) -> bool {
         TranscriptEntry::Message {
             actor: EventActor::Assistant,
             ..
-        } | TranscriptEntry::Tool { .. }
-    )
+        }
+    ) || entry.call().is_some()
 }
 
 impl TranscriptCore {

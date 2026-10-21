@@ -20,22 +20,9 @@ pub enum TranscriptEntry {
         text: String,
         time: String,
     },
-    /// A durable, typed lifecycle row.  Agent/approval/provider-interaction
-    /// rows used to be flattened into strings and later reparsed to decide
-    /// colour, grouping, and state.  Keep the semantic fields together so a
-    /// updates can advance a live execution without manufacturing duplicate
-    /// transcript text; terminal executions remain immutable.
-    Action {
-        #[serde(default)]
-        source_session_id: Option<uuid::Uuid>,
-        kind: TranscriptActionKind,
-        label: String,
-        detail: String,
-        body: Option<String>,
-        time: String,
-        execution: Execution,
-        expanded: bool,
-    },
+    /// Work that runs and finishes: a tool call, reasoning, or an agent,
+    /// watch, approval, provider-interaction or error lifecycle row.
+    Operation(Operation),
     Plan {
         items: Vec<PlanItem>,
         /// The plan this update replaced, kept so the collapsed card can show
@@ -60,25 +47,21 @@ pub enum TranscriptEntry {
         expanded: bool,
         execution: Execution,
     },
-    Tool {
-        source_name: String,
-        name: String,
-        detail: String,
-        code_view: Option<(String, String)>,
-        output_view: Option<(String, String)>,
-        payload_refs: Vec<SessionPayloadRef>,
-        time: String,
-        execution: Execution,
-        expanded: bool,
-        /// A command's result in a few words: matches, exit status, tests.
-        outcome: Option<String>,
-        /// Where a command ran; shown once on its group's header.
-        cwd: Option<String>,
-    },
 }
 
+/// What an operation is. Every frontend rule about colour, glyph, grouping
+/// and body handling keys on this, never on a tool's name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TranscriptActionKind {
+pub enum OperationKind {
+    /// An executed tool call.
+    Tool,
+    /// A tool call that manages subagents (spawn, message, wait).
+    Delegation,
+    /// A tool call still being generated, or a wait on the provider.
+    Preparation,
+    /// A model reasoning block.
+    Reasoning,
+    /// A subagent lifecycle or report.
     Agent,
     Watch,
     Approval,
@@ -86,7 +69,162 @@ pub enum TranscriptActionKind {
     Error,
 }
 
-pub type TranscriptActionState = ExecutionState;
+impl OperationKind {
+    /// Source names that are protocol markers rather than real tools.
+    pub const PREPARATION_SOURCE: &'static str = "action_preparing";
+    pub const REASONING_SOURCE: &'static str = "reasoning";
+
+    /// Classify a tool-style row from what produced it.
+    pub fn for_call(source: &str, label: &str) -> Self {
+        match source {
+            Self::PREPARATION_SOURCE => Self::Preparation,
+            Self::REASONING_SOURCE => Self::Reasoning,
+            _ if borg_agent_runtime::is_subagent_tool(source)
+                || borg_agent_runtime::is_subagent_tool(label) =>
+            {
+                Self::Delegation
+            }
+            _ => Self::Tool,
+        }
+    }
+
+    /// Rows that stand for one tool-style call, named by their source. The
+    /// rest are lifecycle rows that stand for an event.
+    pub fn is_call(self) -> bool {
+        matches!(
+            self,
+            Self::Tool | Self::Delegation | Self::Preparation | Self::Reasoning
+        )
+    }
+}
+
+pub type OperationView = (String, String);
+
+/// One operation row. Tool calls and lifecycle rows share every field; the
+/// ones a kind does not use stay empty.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct Operation {
+    pub kind: OperationKind,
+    /// The tool or synthetic source that produced the row; empty for lifecycle kinds.
+    pub source: String,
+    /// The display verb or title, such as "Run" or "Watch".
+    pub label: String,
+    pub detail: String,
+    /// What was asked: a command, a diff, a reasoning block.
+    pub input: Option<OperationView>,
+    /// What came back, or a lifecycle row's message.
+    pub output: Option<OperationView>,
+    pub payload_refs: Vec<SessionPayloadRef>,
+    /// A command's result in a few words: matches, exit status, tests.
+    pub outcome: Option<String>,
+    /// Where a command ran; shown once on its group's header.
+    pub cwd: Option<String>,
+    /// The session this row is about, for agent rows.
+    #[serde(default)]
+    pub origin: Option<uuid::Uuid>,
+    pub time: String,
+    pub execution: Execution,
+    pub expanded: bool,
+}
+
+impl Operation {
+    fn new(
+        kind: OperationKind,
+        source: String,
+        label: String,
+        detail: String,
+        time: String,
+        execution: Execution,
+    ) -> Self {
+        Self {
+            kind,
+            source,
+            label,
+            detail,
+            input: None,
+            output: None,
+            payload_refs: Vec::new(),
+            outcome: None,
+            cwd: None,
+            origin: None,
+            time,
+            execution,
+            expanded: false,
+        }
+    }
+
+    /// A tool-style call; its kind follows from its source.
+    pub fn tool(
+        source: impl Into<String>,
+        label: impl Into<String>,
+        detail: impl Into<String>,
+        time: impl Into<String>,
+        execution: Execution,
+    ) -> Self {
+        let (source, label) = (source.into(), label.into());
+        let kind = OperationKind::for_call(&source, &label);
+        Self::new(kind, source, label, detail.into(), time.into(), execution)
+    }
+
+    /// Re-derive the kind after the source or label changed, as when a
+    /// generated call turns into a running tool.
+    pub fn reclassify(&mut self) {
+        if self.kind.is_call() {
+            self.kind = OperationKind::for_call(&self.source, &self.label);
+        }
+    }
+
+    pub fn reasoning(
+        label: impl Into<String>,
+        detail: impl Into<String>,
+        text: String,
+        time: impl Into<String>,
+        execution: Execution,
+    ) -> Self {
+        let mut row = Self::new(
+            OperationKind::Reasoning,
+            OperationKind::REASONING_SOURCE.into(),
+            label.into(),
+            detail.into(),
+            time.into(),
+            execution,
+        );
+        row.input = Some(("reasoning".into(), text));
+        row
+    }
+
+    /// A lifecycle row: an agent, watch, approval, provider interaction or error.
+    pub fn lifecycle(
+        kind: OperationKind,
+        label: impl Into<String>,
+        detail: impl Into<String>,
+        body: Option<String>,
+        time: impl Into<String>,
+        execution: Execution,
+    ) -> Self {
+        debug_assert!(!kind.is_call());
+        let mut row = Self::new(
+            kind,
+            String::new(),
+            label.into(),
+            detail.into(),
+            time.into(),
+            execution,
+        );
+        row.output = body.map(|text| ("text".into(), text));
+        row
+    }
+
+    pub fn with_origin(mut self, origin: Option<uuid::Uuid>) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// A lifecycle row's message.
+    pub fn body(&self) -> Option<&str> {
+        self.output.as_ref().map(|(_, text)| text.as_str())
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolRunWindow {
@@ -233,13 +371,49 @@ impl TranscriptEntry {
     pub fn class(&self) -> EntryClass {
         match self {
             Self::Message { .. } => EntryClass::Turn,
-            Self::Tool { .. } | Self::Action { .. } => EntryClass::Operation,
+            Self::Operation(_) => EntryClass::Operation,
             Self::Activity { .. }
             | Self::Plan { .. }
             | Self::Goal { .. }
             | Self::Info { .. }
             | Self::Compaction { .. } => EntryClass::Card,
         }
+    }
+
+    pub fn operation(&self) -> Option<&Operation> {
+        match self {
+            Self::Operation(operation) => Some(operation),
+            _ => None,
+        }
+    }
+
+    pub fn operation_mut(&mut self) -> Option<&mut Operation> {
+        match self {
+            Self::Operation(operation) => Some(operation),
+            _ => None,
+        }
+    }
+
+    /// A tool-style call row, as opposed to a lifecycle row.
+    pub fn call(&self) -> Option<&Operation> {
+        self.operation()
+            .filter(|operation| operation.kind.is_call())
+    }
+
+    pub fn call_mut(&mut self) -> Option<&mut Operation> {
+        self.operation_mut()
+            .filter(|operation| operation.kind.is_call())
+    }
+
+    /// An agent, watch, approval, provider-interaction or error row.
+    pub fn lifecycle(&self) -> Option<&Operation> {
+        self.operation()
+            .filter(|operation| !operation.kind.is_call())
+    }
+
+    pub fn lifecycle_mut(&mut self) -> Option<&mut Operation> {
+        self.operation_mut()
+            .filter(|operation| !operation.kind.is_call())
     }
 
     pub fn is_operation(&self) -> bool {
@@ -256,10 +430,8 @@ impl TranscriptEntry {
 
     pub fn execution(&self) -> Option<&Execution> {
         match self {
-            Self::Message { execution, .. }
-            | Self::Action { execution, .. }
-            | Self::Compaction { execution, .. }
-            | Self::Tool { execution, .. } => Some(execution),
+            Self::Message { execution, .. } | Self::Compaction { execution, .. } => Some(execution),
+            Self::Operation(operation) => Some(&operation.execution),
             _ => None,
         }
     }

@@ -1,5 +1,5 @@
 use super::*;
-use borg_view::entry::{Execution, ExecutionState};
+use borg_view::entry::{Execution, ExecutionState, Operation, OperationKind};
 
 /// A poll of a running command added a row reading "Read output" over the
 /// command it was already showing, and the rows stacked with every check. The
@@ -105,11 +105,11 @@ fn polling_a_running_command_does_not_add_a_row_of_its_own() {
     // The output belongs to the command's row, collapsed rather than printed,
     // so it is asserted on the entry rather than on the rendered lines.
     let origin = transcript.order.iter().find_map(|entry| match entry {
-        TranscriptEntry::Tool {
-            code_view: Some((_, command)),
-            output_view,
+        TranscriptEntry::Operation(Operation {
+            input: Some((_, command)),
+            output: output_view,
             ..
-        } if command.contains("cargo test") => Some(output_view.clone()),
+        }) if command.contains("cargo test") => Some(output_view.clone()),
         _ => None,
     });
     assert!(
@@ -600,20 +600,21 @@ fn resumed_history_keeps_child_and_peer_messages_in_order() {
         .iter()
         .map(|entry| match entry {
             TranscriptEntry::Message { text, .. } => text.as_str(),
-            TranscriptEntry::Action {
-                body: Some(body), ..
-            } => body.as_str(),
+            TranscriptEntry::Operation(Operation {
+                output: Some((_, body)),
+                ..
+            }) => body.as_str(),
             _ => "other",
         })
         .collect::<Vec<_>>();
     assert_eq!(visible, ["before", "child report", "peer report", "after"]);
     assert!(matches!(
         &transcript.order[1],
-        TranscriptEntry::Action { label, expanded: false, .. } if label == "Agent"
+        TranscriptEntry::Operation(Operation { label, expanded: false, .. }) if label == "Agent"
     ));
     assert!(matches!(
         &transcript.order[2],
-        TranscriptEntry::Action { label, expanded: false, .. } if label == "Peer"
+        TranscriptEntry::Operation(Operation { label, expanded: false, .. }) if label == "Peer"
     ));
     assert!(transcript.subagent_snapshots.contains_key(&child));
     assert_eq!(
@@ -1250,10 +1251,10 @@ fn child_history_merge_keeps_live_reasoning_before_its_completion() {
     }
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool {
+        Some(TranscriptEntry::Operation(Operation {
             execution,
             ..
-        }) if execution.completed_at().is_some()
+        })) if execution.completed_at().is_some()
     ));
 }
 
@@ -2582,12 +2583,12 @@ fn completed_file_creation_replaces_null_diff_placeholder() {
 
     assert!(matches!(
         transcript.order.last(),
-        Some(TranscriptEntry::Tool {
-            name,
-            code_view: Some((language, text)),
+        Some(TranscriptEntry::Operation(Operation {
+            label: name,
+            input: Some((language, text)),
             expanded: true,
             ..
-        }) if name == "Create file"
+        })) if name == "Create file"
             && language == "diff:rs"
             && text.contains("+fn main() {}")
     ));
@@ -2624,12 +2625,12 @@ fn completed_tool_keeps_output_in_the_expandable_body_and_summarizes_the_header(
 
     assert!(matches!(
         transcript.order.last(),
-        Some(TranscriptEntry::Tool {
+        Some(TranscriptEntry::Operation(Operation {
             detail,
-            output_view: Some((language, body)),
+            output: Some((language, body)),
             expanded: false,
             ..
-        }) if detail == "2 lines" && language == "text" && body.contains("src/other.rs")
+        })) if detail == "2 lines" && language == "text" && body.contains("src/other.rs")
     ));
     let collapsed = transcript.lines(100);
     assert!(
@@ -2709,27 +2710,27 @@ fn command_changes_become_a_separate_replay_stable_edit_action() {
     assert_eq!(transcript.tools.get("later"), Some(&2));
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool {
-            name,
-            code_view: Some((language, command)),
-            output_view: Some((_, output)),
+        TranscriptEntry::Operation(Operation {
+            label: name,
+            input: Some((language, command)),
+            output: Some((_, output)),
             ..
-        } if name == "Run" && language == "command" && command == "python3 rewrite.py"
+        }) if name == "Run" && language == "command" && command == "python3 rewrite.py"
             && output.contains("rewrote src/lib.rs") && !output.contains("@@ -1")
     ));
     assert!(matches!(
         &transcript.order[2],
-        TranscriptEntry::Tool { code_view: Some((_, command)), .. }
+        TranscriptEntry::Operation(Operation { input: Some((_, command)), .. })
             if command == "cargo check"
     ));
     assert!(matches!(
         &transcript.order[1],
-        TranscriptEntry::Tool {
-            name,
-            code_view: Some((language, diff)),
+        TranscriptEntry::Operation(Operation {
+            label: name,
+            input: Some((language, diff)),
             expanded: true,
             ..
-        } if name == "Edit" && language == "diff:rs" && diff.contains("+new")
+        }) if name == "Edit" && language == "diff:rs" && diff.contains("+new")
     ));
 
     let mut replay = Transcript::default();
@@ -2739,7 +2740,7 @@ fn command_changes_become_a_separate_replay_stable_edit_action() {
     assert_eq!(replay.order.len(), 3);
     assert!(matches!(
         &replay.order[1],
-        TranscriptEntry::Tool { name, code_view: Some((_, diff)), .. }
+        TranscriptEntry::Operation(Operation { label: name, input: Some((_, diff)), .. })
             if name == "Edit" && diff.contains("+new")
     ));
 }
@@ -2799,13 +2800,13 @@ fn deferred_command_change_hydrates_its_edit_action() {
     ));
     assert!(matches!(
         &transcript.order[1],
-        TranscriptEntry::Tool {
-            name,
-            code_view: Some((language, _)),
+        TranscriptEntry::Operation(Operation {
+            label: name,
+            input: Some((language, _)),
             payload_refs,
             expanded: false,
             ..
-        } if name == "Edit" && language == "text" && payload_refs == std::slice::from_ref(&payload)
+        }) if name == "Edit" && language == "text" && payload_refs == std::slice::from_ref(&payload)
     ));
 
     transcript
@@ -2814,12 +2815,12 @@ fn deferred_command_change_hydrates_its_edit_action() {
     assert_eq!(transcript.order.len(), 2);
     assert!(matches!(
         &transcript.order[1],
-        TranscriptEntry::Tool {
-            code_view: Some((language, diff)),
+        TranscriptEntry::Operation(Operation {
+            input: Some((language, diff)),
             payload_refs,
             expanded: true,
             ..
-        } if language == "diff:rs" && diff.contains("+new") && payload_refs.is_empty()
+        }) if language == "diff:rs" && diff.contains("+new") && payload_refs.is_empty()
     ));
 }
 
@@ -2901,7 +2902,7 @@ fn background_process_change_and_terminal_poll_share_one_edit_action() {
     assert_eq!(transcript.order.len(), 3);
     assert!(matches!(
         &transcript.order[1],
-        TranscriptEntry::Tool { name, code_view: Some((_, diff)), .. }
+        TranscriptEntry::Operation(Operation { label: name, input: Some((_, diff)), .. })
             if name == "Edit" && diff.contains("+new")
     ));
     assert_eq!(transcript.tools.get("read"), Some(&2));
@@ -2947,18 +2948,22 @@ fn background_process_change_and_terminal_poll_share_one_edit_action() {
 
 #[test]
 fn tool_copy_uses_output_and_keeps_edit_diffs_copyable() {
-    let tool = |code_view, output_view| TranscriptEntry::Tool {
-        source_name: "functions.exec_command".to_string(),
-        name: "Run command".to_string(),
-        detail: "git status".to_string(),
-        code_view,
-        output_view,
-        payload_refs: Vec::new(),
-        time: "12:00".to_string(),
-        execution: Execution::new(Utc::now(), ExecutionState::Complete),
-        expanded: false,
-        outcome: None,
-        cwd: None,
+    let tool = |code_view, output_view| {
+        TranscriptEntry::Operation(Operation {
+            source: "functions.exec_command".to_string(),
+            label: "Run command".to_string(),
+            detail: "git status".to_string(),
+            input: code_view,
+            output: output_view,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
+            expanded: false,
+            outcome: None,
+            cwd: None,
+            kind: OperationKind::Tool,
+            origin: None,
+        })
     };
 
     let command = tool(
@@ -2980,29 +2985,31 @@ fn tool_copy_uses_output_and_keeps_edit_diffs_copyable() {
 #[test]
 fn tool_hover_hint_names_the_copy_target() {
     let mut transcript = Transcript::default();
-    transcript.order.push(TranscriptEntry::Tool {
-        source_name: "functions.exec_command".to_string(),
-        name: "Run command".to_string(),
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        source: "functions.exec_command".to_string(),
+        label: "Run command".to_string(),
         detail: "git status".to_string(),
-        code_view: Some(("command".to_string(), "git status".to_string())),
-        output_view: Some(("text".to_string(), " M src/main.rs".to_string())),
+        input: Some(("command".to_string(), "git status".to_string())),
+        output: Some(("text".to_string(), " M src/main.rs".to_string())),
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
         execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
         outcome: None,
         cwd: None,
-    });
+        kind: OperationKind::Tool,
+        origin: None,
+    }));
     assert_eq!(
         transcript.tool_copy_hint(0),
         Some("click inspect · right-click copy output")
     );
 
-    if let Some(TranscriptEntry::Tool {
-        code_view,
-        output_view,
+    if let Some(TranscriptEntry::Operation(Operation {
+        input: code_view,
+        output: output_view,
         ..
-    }) = transcript.order.get_mut(0)
+    })) = transcript.order.get_mut(0)
     {
         *code_view = Some(("diff:rs".to_string(), "@@ -1 +1 @@\n-old\n+new".to_string()));
         *output_view = None;
@@ -3051,12 +3058,12 @@ fn native_edit_file_keeps_the_replacement_diff_after_its_mutation_receipt() {
 
     assert!(matches!(
         transcript.order.last(),
-        Some(TranscriptEntry::Tool {
-            code_view: Some((language, text)),
-            output_view: None,
+        Some(TranscriptEntry::Operation(Operation {
+            input: Some((language, text)),
+            output: None,
             expanded: true,
             ..
-        }) if language == "diff:rs"
+        })) if language == "diff:rs"
             && text.contains("-old line")
             && text.contains("+new line")
     ));
@@ -3715,15 +3722,15 @@ fn late_completion_does_not_consume_new_action_preparation() {
     assert_eq!(transcript.order.len(), 2);
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool { execution, .. }) if execution.is_terminal()
+        Some(TranscriptEntry::Operation(Operation { execution, .. })) if execution.is_terminal()
     ));
     assert!(matches!(
         transcript.order.get(1),
-        Some(TranscriptEntry::Tool {
-            source_name,
+        Some(TranscriptEntry::Operation(Operation {
+            source: source_name,
             execution,
             ..
-        }) if !execution.is_terminal() && source_name == "action_preparing"
+        })) if !execution.is_terminal() && source_name == "action_preparing"
     ));
     assert!(transcript.has_running_tool());
     let rendered = transcript
@@ -3758,7 +3765,7 @@ fn consecutive_unmatched_action_preparations_preserve_audit_rows() {
     assert_eq!(transcript.order.len(), 2);
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool { execution, .. }) if execution.is_terminal()
+        Some(TranscriptEntry::Operation(Operation { execution, .. })) if execution.is_terminal()
     ));
     let rendered = transcript
         .lines(100)
@@ -3820,11 +3827,11 @@ fn matching_tool_action_updates_refine_one_live_card() {
     assert_eq!(transcript.order.len(), 1);
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool {
+        TranscriptEntry::Operation(Operation {
             time,
             execution,
             ..
-        } if time == &started_time && execution.started_at() == started_at
+        }) if time == &started_time && execution.started_at() == started_at
     ));
     let rendered = transcript
         .lines(100)
@@ -3865,11 +3872,11 @@ fn unkeyed_action_label_refines_the_generic_live_card() {
     assert_eq!(transcript.order.len(), 1);
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool {
-            name,
+        TranscriptEntry::Operation(Operation {
+            label: name,
             execution,
             ..
-        } if !execution.is_terminal() && name == "Generate edit session retry policy" && execution.started_at() == started_at
+        }) if !execution.is_terminal() && name == "Generate edit session retry policy" && execution.started_at() == started_at
     ));
 }
 
@@ -3913,10 +3920,10 @@ fn generation_status_hides_action_description_and_preserves_the_card() {
         assert_eq!(transcript.order.len(), 1);
         assert!(matches!(
             &transcript.order[0],
-            TranscriptEntry::Tool {
+            TranscriptEntry::Operation(Operation {
                 execution,
                 ..
-            } if !execution.is_terminal() && execution.started_at() == started_at
+            }) if !execution.is_terminal() && execution.started_at() == started_at
         ));
         let rendered = transcript
             .lines(100)
@@ -3961,10 +3968,10 @@ fn provider_progress_keeps_an_unbacked_tool_in_the_foreground() {
     assert_eq!(transcript.foreground_tool.as_deref(), Some("command-1"));
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool {
+        Some(TranscriptEntry::Operation(Operation {
             execution,
             ..
-        }) if !execution.is_terminal() && !execution.is_backgrounded()
+        })) if !execution.is_terminal() && !execution.is_backgrounded()
     ));
     assert_eq!(transcript.shell_status(), None);
 }
@@ -4008,17 +4015,17 @@ fn preparing_a_new_action_does_not_invent_a_background_process() {
     assert_eq!(transcript.order.len(), 2);
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool {
+        Some(TranscriptEntry::Operation(Operation {
             execution,
             ..
-        }) if !execution.is_terminal() && !execution.is_backgrounded()
+        })) if !execution.is_terminal() && !execution.is_backgrounded()
     ));
     assert!(matches!(
         transcript.order.get(1),
-        Some(TranscriptEntry::Tool {
+        Some(TranscriptEntry::Operation(Operation {
             execution,
             ..
-        }) if !execution.is_terminal() && !execution.is_backgrounded()
+        })) if !execution.is_terminal() && !execution.is_backgrounded()
     ));
     assert_eq!(transcript.foreground_tool.as_deref(), Some("command-2"));
 }
@@ -4602,20 +4609,20 @@ fn cancelling_a_labeled_preparation_by_id_retires_only_that_row_as_not_run() {
     assert!(
         matches!(
             &transcript.order[0],
-            TranscriptEntry::Tool {
+            TranscriptEntry::Operation(Operation {
                 execution,
                 ..
-            } if execution.is_terminal() && execution.is_interrupted() && !execution.is_failed()
+            }) if execution.is_terminal() && execution.is_interrupted() && !execution.is_failed()
         ),
         "the named preparation must retire as cancelled, not as a finished action"
     );
     assert!(
         matches!(
             &transcript.order[1],
-            TranscriptEntry::Tool {
+            TranscriptEntry::Operation(Operation {
                 execution,
                 ..
-            } if !execution.is_terminal()
+            }) if !execution.is_terminal()
         ),
         "cancelling one preparation must not retire the other"
     );
@@ -4695,7 +4702,7 @@ fn action_status_updates_refresh_cached_transcript_text() {
             assert!(text.contains(expected), "{kind}: {text}");
             assert_eq!(transcript.order.len(), 1);
             assert!(
-                matches!(&transcript.order[0], TranscriptEntry::Tool { execution, .. } if execution.started_at() == render_time)
+                matches!(&transcript.order[0], TranscriptEntry::Operation(Operation { execution, .. }) if execution.started_at() == render_time)
             );
         }
     }
@@ -4707,19 +4714,21 @@ fn background_tool_elapsed_cache_tick_also_changes_each_second() {
         .unwrap()
         .with_timezone(&Utc);
     let mut transcript = Transcript::default();
-    transcript.order.push(TranscriptEntry::Tool {
-        source_name: "Run".to_string(),
-        name: "Run".to_string(),
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        source: "Run".to_string(),
+        label: "Run".to_string(),
         detail: "sleep 1".to_string(),
-        code_view: None,
-        output_view: None,
+        input: None,
+        output: None,
         payload_refs: Vec::new(),
         time: "10:00".to_string(),
         execution: Execution::new(started_at, ExecutionState::Backgrounded),
         expanded: false,
         outcome: None,
         cwd: None,
-    });
+        kind: OperationKind::Tool,
+        origin: None,
+    }));
     transcript.tools.insert("background".to_string(), 0);
 
     assert_ne!(
@@ -4752,14 +4761,14 @@ fn a_new_edit_or_message_collapses_the_previous_diff() {
 
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool {
+        Some(TranscriptEntry::Operation(Operation {
             expanded: false,
             ..
-        })
+        }))
     ));
     assert!(matches!(
         transcript.order.get(1),
-        Some(TranscriptEntry::Tool { expanded: true, .. })
+        Some(TranscriptEntry::Operation(Operation { expanded: true, .. }))
     ));
 
     transcript.apply(&SessionEvent::new(
@@ -4776,10 +4785,10 @@ fn a_new_edit_or_message_collapses_the_previous_diff() {
     ));
     assert!(matches!(
         transcript.order.get(1),
-        Some(TranscriptEntry::Tool {
+        Some(TranscriptEntry::Operation(Operation {
             expanded: false,
             ..
-        })
+        }))
     ));
 }
 
@@ -5242,7 +5251,13 @@ fn incremental_transcript_render_matches_a_full_render_through_a_live_session() 
         .order
         .iter()
         .position(|entry| {
-            matches!(entry, TranscriptEntry::Tool { code_view: Some((language, _)), .. } if language == "reasoning")
+            matches!(
+                entry,
+                TranscriptEntry::Operation(Operation {
+                    kind: OperationKind::Reasoning,
+                    ..
+                })
+            )
         })
         .unwrap();
     type Interaction<'a> = (&'static str, Box<dyn Fn(&mut Transcript) + 'a>);
@@ -6138,10 +6153,10 @@ fn deferred_tool_input_loads_when_the_card_is_expanded() {
 
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool {
+        Some(TranscriptEntry::Operation(Operation {
             expanded: false,
             ..
-        })
+        }))
     ));
     assert_eq!(transcript.toggle_tool(0)[0].id, payload.id);
     transcript
@@ -6149,12 +6164,12 @@ fn deferred_tool_input_loads_when_the_card_is_expanded() {
         .unwrap();
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool {
-            code_view: Some((language, source)),
+        Some(TranscriptEntry::Operation(Operation {
+            input: Some((language, source)),
             payload_refs,
             expanded: true,
             ..
-        }) if language.starts_with("diff")
+        })) if language.starts_with("diff")
             && source.contains("+new")
             && payload_refs.is_empty()
     ));
@@ -6203,12 +6218,12 @@ fn deferred_edit_output_rehydrates_as_a_copyable_diff() {
 
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool {
-            code_view: Some((language, body)),
-            output_view: None,
+        Some(TranscriptEntry::Operation(Operation {
+            input: Some((language, body)),
+            output: None,
             payload_refs,
             ..
-        }) if language == "diff:rs"
+        })) if language == "diff:rs"
             && body.contains("-old")
             && body.contains("+new")
             && payload_refs.is_empty()
@@ -6752,7 +6767,7 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
         with_diff
             .order
             .iter()
-            .filter(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
+            .filter(|entry| matches!(entry, TranscriptEntry::Operation(Operation { .. })))
             .count(),
         1,
         "streamed snapshots must update one pending tool row"
@@ -6760,7 +6775,7 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
     assert!(
         matches!(
             &with_diff.order[0],
-            TranscriptEntry::Tool { code_view: Some((language, _)), .. }
+            TranscriptEntry::Operation(Operation { input: Some((language, _)), .. })
                 if is_diff_language(language)
         ),
         "the fixture must actually produce a diff body"
@@ -6896,7 +6911,7 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
         transcript
             .order
             .iter()
-            .filter(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
+            .filter(|entry| matches!(entry, TranscriptEntry::Operation(Operation { .. })))
             .count(),
         1
     );
@@ -6920,7 +6935,7 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
         transcript
             .order
             .iter()
-            .filter(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
+            .filter(|entry| matches!(entry, TranscriptEntry::Operation(Operation { .. })))
             .count(),
         1
     );
@@ -7933,7 +7948,7 @@ fn diff_expansion_policy_controls_action_lifetime() {
         },
     );
     let edit_expanded = |transcript: &Transcript| match &transcript.order[0] {
-        TranscriptEntry::Tool { expanded, .. } => *expanded,
+        TranscriptEntry::Operation(Operation { expanded, .. }) => *expanded,
         _ => panic!("first transcript entry should be an edit tool"),
     };
 
@@ -9159,14 +9174,14 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
     ));
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Action {
-            kind: TranscriptActionKind::Agent,
+        TranscriptEntry::Operation(Operation {
+            kind: OperationKind::Agent,
             label,
             detail,
-            body: None,
+            output: None,
             execution,
             ..
-        }  if matches!(execution.state(), TranscriptActionState::Running) && label == "Agent"
+        })  if matches!(execution.state(), ExecutionState::Running) && label == "Agent"
             && detail == "inspect_ui · working"
 
     ));
@@ -9190,7 +9205,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
     ));
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Action { body: None, .. }
+        TranscriptEntry::Operation(Operation { output: None, .. })
     ));
     agent.status = SubagentStatus::WaitingForApproval;
     transcript.apply(&activity(
@@ -9211,14 +9226,14 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
     assert_eq!(transcript.order.len(), 2);
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Action {
-            kind: TranscriptActionKind::Agent,
+        TranscriptEntry::Operation(Operation {
+            kind: OperationKind::Agent,
             label,
             detail,
             execution,
-            body: None,
+            output: None,
             ..
-        }  if matches!(execution.state(), TranscriptActionState::Waiting) && label == "Agent"
+        })  if matches!(execution.state(), ExecutionState::Waiting) && label == "Agent"
             && detail == "inspect_ui · waiting for approval · Run focused tests?"
 
     ));
@@ -9242,14 +9257,14 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
     );
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Action {
-            kind: TranscriptActionKind::Agent,
+        TranscriptEntry::Operation(Operation {
+            kind: OperationKind::Agent,
             label,
             detail,
-            body: None,
+            output: None,
             execution,
             ..
-        }  if matches!(execution.state(), TranscriptActionState::Complete) && label == "Agent"
+        })  if matches!(execution.state(), ExecutionState::Complete) && label == "Agent"
             && detail == "inspect_ui · ready · waiting for input"
     ));
     let rendered = transcript
@@ -9382,7 +9397,7 @@ fn ordinary_subagent_status_stays_in_roster_without_embedded_child_bodies() {
     child.apply(&receipt);
     assert!(child.order.iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Action { body: Some(body), .. }
+        TranscriptEntry::Operation(Operation { output: Some((_, body)), .. })
             if body == "Found the renderer issue."
     )));
     assert!(fresh_transcript_like(&child).show_subagent_messages);
@@ -9416,8 +9431,8 @@ fn ordinary_subagent_status_stays_in_roster_without_embedded_child_bodies() {
         assert_eq!(transcript.order.len(), 2);
         assert!(matches!(
             &transcript.order[1],
-            TranscriptEntry::Action { body: None, execution, .. }
-                if execution.state() == if index == 0 { TranscriptActionState::Waiting } else { TranscriptActionState::Failed }
+            TranscriptEntry::Operation(Operation { output: None, execution, .. })
+                if execution.state() == if index == 0 { ExecutionState::Waiting } else { ExecutionState::Failed }
         ));
     }
 }
@@ -9561,27 +9576,32 @@ fn ready_subagent_with_provider_isolation_is_shown_as_a_failed_turn() {
     ));
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Action {
+        TranscriptEntry::Operation(Operation {
             detail,
             execution,
             ..
-        }  if matches!(execution.state(), TranscriptActionState::Failed) && detail.starts_with("/root/audit · failed")
+        })  if matches!(execution.state(), ExecutionState::Failed) && detail.starts_with("/root/audit · failed")
     ));
 }
 
 #[test]
 fn typed_agent_action_has_an_expandable_report_and_structured_copy() {
     let mut transcript = Transcript::default();
-    transcript.order.push(TranscriptEntry::Action {
-        source_session_id: None,
-        kind: TranscriptActionKind::Agent,
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        origin: None,
+        kind: OperationKind::Agent,
         label: "Agent".to_string(),
         detail: "/root/review · report ready".to_string(),
-        body: Some("First line\nSecond line".to_string()),
+        output: Some(("text".to_string(), "First line\nSecond line".to_string())),
         time: "12:00".to_string(),
-        execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
-    });
+        source: String::new(),
+        input: None,
+        payload_refs: Vec::new(),
+        outcome: None,
+        cwd: None,
+    }));
 
     let collapsed = transcript
         .lines(100)
@@ -11283,19 +11303,21 @@ fn redirected_reply_is_marked_as_redirected_not_user_interrupted() {
     }
     // A real tool that is genuinely running across the boundary. The sweep
     // retires preparations, and must leave work that actually started alone.
-    transcript.order.push(TranscriptEntry::Tool {
-        source_name: "Run".to_string(),
-        name: "Run command".to_string(),
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        source: "Run".to_string(),
+        label: "Run command".to_string(),
         detail: "cargo test".to_string(),
-        code_view: None,
-        output_view: None,
+        input: None,
+        output: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
         execution: Execution::new(Utc::now(), ExecutionState::Running),
         expanded: false,
         outcome: None,
         cwd: None,
-    });
+        kind: OperationKind::Tool,
+        origin: None,
+    }));
     transcript.apply(&SessionEvent::new(
         session_id,
         4,
@@ -11312,7 +11334,7 @@ fn redirected_reply_is_marked_as_redirected_not_user_interrupted() {
             text: "New direction".into(),
         },
     ));
-    assert!(!transcript.order.iter().any(|entry| matches!(entry, TranscriptEntry::Tool { source_name, execution, .. } if !execution.is_terminal() && source_name == "action_preparing")));
+    assert!(!transcript.order.iter().any(|entry| matches!(entry, TranscriptEntry::Operation(Operation { source: source_name, execution, .. }) if !execution.is_terminal() && source_name == "action_preparing")));
     let rendered = transcript
         .lines(100)
         .into_iter()
@@ -11345,11 +11367,11 @@ fn redirected_reply_is_marked_as_redirected_not_user_interrupted() {
     assert!(
         transcript.order.iter().any(|entry| matches!(
             entry,
-            TranscriptEntry::Tool {
-                source_name,
+            TranscriptEntry::Operation(Operation {
+                source: source_name,
                 execution,
                 ..
-            } if execution.is_terminal() && execution.is_interrupted() && source_name == "action_preparing"
+            }) if execution.is_terminal() && execution.is_interrupted() && source_name == "action_preparing"
         )),
         "a swept preparation must read as not run, not as a finished action"
     );
@@ -11357,11 +11379,11 @@ fn redirected_reply_is_marked_as_redirected_not_user_interrupted() {
     assert!(
         transcript.order.iter().any(|entry| matches!(
             entry,
-            TranscriptEntry::Tool {
-                source_name,
+            TranscriptEntry::Operation(Operation {
+                source: source_name,
                 execution,
                 ..
-            } if !execution.is_terminal() && !execution.is_interrupted() && source_name == "Run"
+            }) if !execution.is_terminal() && !execution.is_interrupted() && source_name == "Run"
         )),
         "a running tool must survive a sweep that only retires preparations"
     );
@@ -11533,12 +11555,12 @@ fn agent_receipt_replaces_user_projection_in_either_arrival_order() {
         assert_eq!(transcript.order.len(), 1);
         assert!(matches!(
             &transcript.order[0],
-            TranscriptEntry::Action {
-                kind: TranscriptActionKind::Agent,
+            TranscriptEntry::Operation(Operation {
+                kind: OperationKind::Agent,
                 detail,
-                body: Some(body),
+                output: Some((_, body)),
                 ..
-            } if detail == "reviewer" && body == "review result"
+            }) if detail == "reviewer" && body == "review result"
         ));
         let lines = transcript.lines(100);
         let sender = lines
@@ -12399,7 +12421,7 @@ fn recovered_idle_session_stops_orphaned_tool_spinner() {
     assert!(!transcript.has_running_tool());
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool { execution, .. }) if execution.is_terminal()
+        Some(TranscriptEntry::Operation(Operation { execution, .. })) if execution.is_terminal()
     ));
 }
 
@@ -12999,15 +13021,15 @@ fn mcp_resource_readiness_failures_are_static_and_compact() {
 
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool {
-            name,
+        Some(TranscriptEntry::Operation(Operation {
+            label: name,
             detail,
-            code_view: None,
-            output_view: None,
+            input: None,
+            output: None,
             execution,
             expanded: false,
             ..
-        }) if execution.is_failed() && execution.is_terminal() && name == "Borg agent · List MCP resources"
+        })) if execution.is_failed() && execution.is_terminal() && name == "Borg agent · List MCP resources"
             && detail == "MCP server not ready"
     ));
     assert!(!transcript.tool_is_expandable(0));
@@ -13627,19 +13649,21 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
-    transcript.order.push(TranscriptEntry::Tool {
-        source_name: "command_execution".to_string(),
-        name: "command_execution".to_string(),
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        source: "command_execution".to_string(),
+        label: "command_execution".to_string(),
         detail: "done".to_string(),
-        code_view: None,
-        output_view: None,
+        input: None,
+        output: None,
         payload_refs: Vec::new(),
         time: "12:01".to_string(),
         execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
         outcome: None,
         cwd: None,
-    });
+        kind: OperationKind::Tool,
+        origin: None,
+    }));
     transcript.order.push(TranscriptEntry::Message {
         actor: EventActor::Assistant,
         text: "answer".to_string(),
@@ -13651,19 +13675,21 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         execution: Execution::new(Utc::now(), ExecutionState::Complete),
         redirected: false,
     });
-    transcript.order.push(TranscriptEntry::Tool {
-        source_name: "command_execution".to_string(),
-        name: "command_execution".to_string(),
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        source: "command_execution".to_string(),
+        label: "command_execution".to_string(),
         detail: "done".to_string(),
-        code_view: None,
-        output_view: None,
+        input: None,
+        output: None,
         payload_refs: Vec::new(),
         time: "12:03".to_string(),
         execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
         outcome: None,
         cwd: None,
-    });
+        kind: OperationKind::Tool,
+        origin: None,
+    }));
     transcript.order.push(TranscriptEntry::Plan {
         items: vec![PlanItem {
             id: Uuid::new_v4(),
@@ -13769,18 +13795,22 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
 #[test]
 fn adjacent_tool_calls_are_compact_but_leave_gap_before_following_message() {
     let mut transcript = Transcript::default();
-    let tool = |name: &str| TranscriptEntry::Tool {
-        source_name: "command_execution".to_string(),
-        name: name.to_string(),
-        detail: "done".to_string(),
-        code_view: None,
-        output_view: None,
-        payload_refs: Vec::new(),
-        time: "12:00".to_string(),
-        execution: Execution::new(Utc::now(), ExecutionState::Complete),
-        expanded: false,
-        outcome: None,
-        cwd: None,
+    let tool = |name: &str| {
+        TranscriptEntry::Operation(Operation {
+            source: "command_execution".to_string(),
+            label: name.to_string(),
+            detail: "done".to_string(),
+            input: None,
+            output: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
+            expanded: false,
+            outcome: None,
+            cwd: None,
+            kind: OperationKind::Tool,
+            origin: None,
+        })
     };
     transcript.order.push(tool("Read"));
     transcript.order.push(tool("Run Git operations"));
@@ -13836,19 +13866,21 @@ fn message_tool_message_edges_have_one_separator_row_each() {
     transcript
         .order
         .push(message(EventActor::User, "request", "12:00"));
-    transcript.order.push(TranscriptEntry::Tool {
-        source_name: "command_execution".to_string(),
-        name: "Read".to_string(),
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        source: "command_execution".to_string(),
+        label: "Read".to_string(),
         detail: "done".to_string(),
-        code_view: None,
-        output_view: None,
+        input: None,
+        output: None,
         payload_refs: Vec::new(),
         time: "12:01".to_string(),
         execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
         outcome: None,
         cwd: None,
-    });
+        kind: OperationKind::Tool,
+        origin: None,
+    }));
     transcript
         .order
         .push(message(EventActor::Assistant, "answer", "12:02"));
@@ -13893,18 +13925,22 @@ fn message_tool_message_edges_have_one_separator_row_each() {
 #[test]
 fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
     let mut transcript = Transcript::default();
-    let thinking = |text: &str| TranscriptEntry::Tool {
-        source_name: "reasoning".to_string(),
-        name: "Reasoning".to_string(),
-        detail: String::new(),
-        code_view: Some(("reasoning".to_string(), text.to_string())),
-        output_view: None,
-        payload_refs: Vec::new(),
-        time: "12:00".to_string(),
-        execution: Execution::new(Utc::now(), ExecutionState::Complete),
-        expanded: true,
-        outcome: None,
-        cwd: None,
+    let thinking = |text: &str| {
+        TranscriptEntry::Operation(Operation {
+            source: "reasoning".to_string(),
+            label: "Reasoning".to_string(),
+            detail: String::new(),
+            input: Some(("reasoning".to_string(), text.to_string())),
+            output: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
+            expanded: true,
+            outcome: None,
+            cwd: None,
+            kind: OperationKind::Reasoning,
+            origin: None,
+        })
     };
     transcript.order.push(thinking("first"));
     transcript.order.push(thinking("second"));
@@ -13943,26 +13979,30 @@ fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
 
 #[test]
 fn running_actions_keep_edge_spacing_in_compact_and_boxed_runs() {
-    let tool = |name: String, complete: bool| TranscriptEntry::Tool {
-        source_name: "command_execution".to_string(),
-        name,
-        detail: String::new(),
-        code_view: None,
-        output_view: None,
-        payload_refs: Vec::new(),
-        time: "12:00".to_string(),
-        execution: Execution::new(
-            Utc::now(),
-            if complete {
-                ExecutionState::Complete
-            } else {
-                ExecutionState::Running
-            },
-        ),
+    let tool = |name: String, complete: bool| {
+        TranscriptEntry::Operation(Operation {
+            source: "command_execution".to_string(),
+            label: name,
+            detail: String::new(),
+            input: None,
+            output: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            execution: Execution::new(
+                Utc::now(),
+                if complete {
+                    ExecutionState::Complete
+                } else {
+                    ExecutionState::Running
+                },
+            ),
 
-        expanded: false,
-        outcome: None,
-        cwd: None,
+            expanded: false,
+            outcome: None,
+            cwd: None,
+            kind: OperationKind::Tool,
+            origin: None,
+        })
     };
 
     let mut compact = Transcript::default();
@@ -14033,14 +14073,14 @@ fn provider_progress_does_not_invent_a_background_process() {
     let tool = transcript
         .order
         .iter()
-        .find(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
+        .find(|entry| matches!(entry, TranscriptEntry::Operation(Operation { .. })))
         .expect("tool entry");
     assert!(matches!(
         tool,
-        TranscriptEntry::Tool {
+        TranscriptEntry::Operation(Operation {
             execution,
             ..
-        } if !execution.is_terminal() && !execution.is_backgrounded()
+        }) if !execution.is_terminal() && !execution.is_backgrounded()
     ));
     assert_eq!(transcript.shell_status(), None);
     assert!(transcript.active_shell_rows().is_empty());
@@ -14123,21 +14163,23 @@ fn turn_completion_clears_unbacked_background_tool_state() {
 #[test]
 fn boxed_thinking_rows_keep_one_edge_separator_without_duplicates() {
     let mut transcript = Transcript::default();
-    transcript
-        .order
-        .extend((0..9).map(|index| TranscriptEntry::Tool {
-            source_name: "reasoning".to_string(),
-            name: "Reasoning".to_string(),
+    transcript.order.extend((0..9).map(|index| {
+        TranscriptEntry::Operation(Operation {
+            source: "reasoning".to_string(),
+            label: "Reasoning".to_string(),
             detail: String::new(),
-            code_view: Some(("reasoning".to_string(), format!("thought {index}"))),
-            output_view: None,
+            input: Some(("reasoning".to_string(), format!("thought {index}"))),
+            output: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
             execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: true,
             outcome: None,
             cwd: None,
-        }));
+            kind: OperationKind::Reasoning,
+            origin: None,
+        })
+    }));
 
     let lines = transcript
         .render_with_tool_run_viewport(80, 40, None, None, None)
@@ -14152,18 +14194,17 @@ fn boxed_thinking_rows_keep_one_edge_separator_without_duplicates() {
 #[test]
 fn peer_reports_and_errors_keep_one_continuous_neutral_actions_gutter() {
     let mut transcript = Transcript::default();
-    transcript
-        .order
-        .extend((0..9).map(|index| TranscriptEntry::Tool {
-            source_name: "command_execution".to_string(),
-            name: if index == 4 {
+    transcript.order.extend((0..9).map(|index| {
+        TranscriptEntry::Operation(Operation {
+            source: "command_execution".to_string(),
+            label: if index == 4 {
                 "Run failed".to_string()
             } else {
                 format!("Read {index}")
             },
             detail: String::new(),
-            code_view: None,
-            output_view: None,
+            input: None,
+            output: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
             execution: Execution::new(
@@ -14178,24 +14219,33 @@ fn peer_reports_and_errors_keep_one_continuous_neutral_actions_gutter() {
             expanded: false,
             outcome: None,
             cwd: None,
-        }));
+            kind: OperationKind::Tool,
+            origin: None,
+        })
+    }));
 
     for label in ["Peer one", "Peer two"] {
         transcript.order.insert(
             4,
-            TranscriptEntry::Action {
-                source_session_id: None,
-                kind: TranscriptActionKind::Agent,
+            TranscriptEntry::Operation(Operation {
+                origin: None,
+                kind: OperationKind::Agent,
                 label: label.into(),
                 detail: "abundance".into(),
-                body: Some(
+                output: Some((
+                    "text".to_string(),
                     "A report with enough text to wrap over multiple lines in the actions group."
                         .into(),
-                ),
+                )),
                 time: "12:00".into(),
-                execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
+                execution: Execution::new(Utc::now(), ExecutionState::Complete),
                 expanded: true,
-            },
+                source: String::new(),
+                input: None,
+                payload_refs: Vec::new(),
+                outcome: None,
+                cwd: None,
+            }),
         );
     }
     let lines = transcript
@@ -14422,19 +14472,21 @@ fn coalesced_nested_wheel_bursts_preserve_height_scaled_distance() {
 fn long_tool_runs_show_eight_lines_and_scroll_independently() {
     let mut transcript = Transcript::default();
     for index in 0..20 {
-        transcript.order.push(TranscriptEntry::Tool {
-            source_name: "Run".to_string(),
-            name: "Run".to_string(),
+        transcript.order.push(TranscriptEntry::Operation(Operation {
+            source: "Run".to_string(),
+            label: "Run".to_string(),
             detail: format!("call-{index}"),
-            code_view: None,
-            output_view: None,
+            input: None,
+            output: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
             execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
             outcome: None,
             cwd: None,
-        });
+            kind: OperationKind::Tool,
+            origin: None,
+        }));
     }
 
     assert!(transcript.toggle_action_run_expansion(0));
@@ -14467,19 +14519,21 @@ fn long_tool_runs_show_eight_lines_and_scroll_independently() {
 fn actions_accordion_hides_expand_hint_when_all_rows_already_fit() {
     let mut transcript = Transcript::default();
     for index in 0..9 {
-        transcript.order.push(TranscriptEntry::Tool {
-            source_name: "Run".to_string(),
-            name: "Run".to_string(),
+        transcript.order.push(TranscriptEntry::Operation(Operation {
+            source: "Run".to_string(),
+            label: "Run".to_string(),
             detail: format!("call-{index}"),
-            code_view: None,
-            output_view: None,
+            input: None,
+            output: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
             execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
             outcome: None,
             cwd: None,
-        });
+            kind: OperationKind::Tool,
+            origin: None,
+        }));
     }
 
     let rendered = transcript
@@ -14499,26 +14553,30 @@ fn actions_accordion_hides_expand_hint_when_all_rows_already_fit() {
 /// it - and unlike a finished group, there is no summary to stand in for it.
 #[test]
 fn a_group_with_a_running_command_stays_unfolded() {
-    let tool = |detail: &str, name: &str, backgrounded: bool| TranscriptEntry::Tool {
-        source_name: "exec".to_string(),
-        name: name.to_string(),
-        detail: detail.to_string(),
-        code_view: None,
-        output_view: None,
-        payload_refs: Vec::new(),
-        time: "12:00".to_string(),
-        execution: Execution::new(
-            Utc::now(),
-            if backgrounded {
-                ExecutionState::Backgrounded
-            } else {
-                ExecutionState::Complete
-            },
-        ),
+    let tool = |detail: &str, name: &str, backgrounded: bool| {
+        TranscriptEntry::Operation(Operation {
+            source: "exec".to_string(),
+            label: name.to_string(),
+            detail: detail.to_string(),
+            input: None,
+            output: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            execution: Execution::new(
+                Utc::now(),
+                if backgrounded {
+                    ExecutionState::Backgrounded
+                } else {
+                    ExecutionState::Complete
+                },
+            ),
 
-        expanded: false,
-        outcome: None,
-        cwd: Some("/srv/ore-cues".to_string()),
+            expanded: false,
+            outcome: None,
+            cwd: Some("/srv/ore-cues".to_string()),
+            kind: OperationKind::Tool,
+            origin: None,
+        })
     };
     let mut transcript = Transcript::default();
     // The long command, in a group of its own, still running.
@@ -14656,18 +14714,22 @@ fn history_paging_preserves_manually_expanded_action_groups_and_offsets() {
 
 #[test]
 fn a_finished_action_group_folds_to_its_summary_until_clicked() {
-    let tool = |detail: &str, name: &str, cwd: Option<&str>| TranscriptEntry::Tool {
-        source_name: "exec".to_string(),
-        name: name.to_string(),
-        detail: detail.to_string(),
-        code_view: None,
-        output_view: None,
-        payload_refs: Vec::new(),
-        time: "12:00".to_string(),
-        execution: Execution::new(Utc::now(), ExecutionState::Complete),
-        expanded: false,
-        outcome: Some("3 matches".to_string()),
-        cwd: cwd.map(str::to_string),
+    let tool = |detail: &str, name: &str, cwd: Option<&str>| {
+        TranscriptEntry::Operation(Operation {
+            source: "exec".to_string(),
+            label: name.to_string(),
+            detail: detail.to_string(),
+            input: None,
+            output: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
+            expanded: false,
+            outcome: Some("3 matches".to_string()),
+            cwd: cwd.map(str::to_string),
+            kind: OperationKind::Tool,
+            origin: None,
+        })
     };
     let mut transcript = Transcript::default();
     transcript
@@ -14722,28 +14784,32 @@ fn a_finished_action_group_folds_to_its_summary_until_clicked() {
 
 #[test]
 fn a_group_held_open_by_unfinished_work_stays_open_until_a_new_message_ends_it() {
-    let tool = |detail: &str, complete: bool, backgrounded: bool| TranscriptEntry::Tool {
-        source_name: "exec".to_string(),
-        name: "Run".to_string(),
-        detail: detail.to_string(),
-        code_view: None,
-        output_view: None,
-        payload_refs: Vec::new(),
-        time: "12:00".to_string(),
-        execution: Execution::new(
-            Utc::now(),
-            if backgrounded {
-                ExecutionState::Backgrounded
-            } else if complete {
-                ExecutionState::Complete
-            } else {
-                ExecutionState::Running
-            },
-        ),
+    let tool = |detail: &str, complete: bool, backgrounded: bool| {
+        TranscriptEntry::Operation(Operation {
+            source: "exec".to_string(),
+            label: "Run".to_string(),
+            detail: detail.to_string(),
+            input: None,
+            output: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            execution: Execution::new(
+                Utc::now(),
+                if backgrounded {
+                    ExecutionState::Backgrounded
+                } else if complete {
+                    ExecutionState::Complete
+                } else {
+                    ExecutionState::Running
+                },
+            ),
 
-        expanded: false,
-        outcome: None,
-        cwd: None,
+            expanded: false,
+            outcome: None,
+            cwd: None,
+            kind: OperationKind::Tool,
+            origin: None,
+        })
     };
     let mut transcript = Transcript::default();
     transcript.order.push(tool("first-step", true, false));
@@ -14763,7 +14829,9 @@ fn a_group_held_open_by_unfinished_work_stays_open_until_a_new_message_ends_it()
     assert!(running.contains("long-build"), "{running}");
     assert!(running.contains("▾"), "{running}");
 
-    if let Some(TranscriptEntry::Tool { execution, .. }) = transcript.order.get_mut(1) {
+    if let Some(TranscriptEntry::Operation(Operation { execution, .. })) =
+        transcript.order.get_mut(1)
+    {
         execution.transition(ExecutionState::Complete, Utc::now());
     }
 
@@ -14796,19 +14864,21 @@ fn a_group_held_open_by_unfinished_work_stays_open_until_a_new_message_ends_it()
 fn expanded_tool_run_shows_every_action_and_collapses_again() {
     let mut transcript = Transcript::default();
     for index in 0..20 {
-        transcript.order.push(TranscriptEntry::Tool {
-            source_name: "Run".to_string(),
-            name: "Run".to_string(),
+        transcript.order.push(TranscriptEntry::Operation(Operation {
+            source: "Run".to_string(),
+            label: "Run".to_string(),
             detail: format!("call-{index}"),
-            code_view: None,
-            output_view: None,
+            input: None,
+            output: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
             execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
             outcome: None,
             cwd: None,
-        });
+            kind: OperationKind::Tool,
+            origin: None,
+        }));
     }
     let render = |transcript: &Transcript| {
         transcript
@@ -14847,12 +14917,12 @@ fn focused_tool_inspector_isolates_one_tool_and_forces_its_live_body_open() {
         text: "conversation context that must stay hidden".to_string(),
         time: "12:00".to_string(),
     });
-    transcript.order.push(TranscriptEntry::Tool {
-        source_name: "Run".to_string(),
-        name: "Run".to_string(),
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        source: "Run".to_string(),
+        label: "Run".to_string(),
         detail: "unrelated-tool".to_string(),
-        code_view: Some(("text".to_string(), "unrelated body".to_string())),
-        output_view: None,
+        input: Some(("text".to_string(), "unrelated body".to_string())),
+        output: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
         execution: {
@@ -14863,23 +14933,27 @@ fn focused_tool_inspector_isolates_one_tool_and_forces_its_live_body_open() {
         expanded: false,
         outcome: None,
         cwd: None,
-    });
-    transcript.order.push(TranscriptEntry::Tool {
-        source_name: "Edit".to_string(),
-        name: "Edit".to_string(),
+        kind: OperationKind::Tool,
+        origin: None,
+    }));
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        source: "Edit".to_string(),
+        label: "Edit".to_string(),
         detail: "config.toml".to_string(),
-        code_view: Some((
+        input: Some((
             "diff:toml".to_string(),
             "@@ -1 +1 @@\n-enabled = false\n+enabled = true".to_string(),
         )),
-        output_view: None,
+        output: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
         execution: Execution::new(started_at, ExecutionState::Running),
         expanded: false,
         outcome: None,
         cwd: None,
-    });
+        kind: OperationKind::Tool,
+        origin: None,
+    }));
 
     let (lines, tool_rows, ..) = transcript.render_tool_for_cache(2, 100, 24);
     let rendered = lines
@@ -15038,43 +15112,56 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     let mut transcript = Transcript::default();
     assert!(!transcript.show_action_done_at);
     let completed_at = Utc::now();
-    let tool = |index, reasoning| TranscriptEntry::Tool {
-        source_name: if reasoning { "reasoning" } else { "Run" }.to_string(),
-        name: if reasoning { "Reasoned" } else { "Run" }.to_string(),
-        detail: format!("call-{index}"),
-        code_view: reasoning.then(|| ("reasoning".to_string(), format!("Reasoning block {index}"))),
-        output_view: None,
-        payload_refs: Vec::new(),
-        time: "19:38".to_string(),
-        execution: {
-            let mut execution = Execution::new(Utc::now(), ExecutionState::Running);
-            execution.transition(ExecutionState::Complete, completed_at);
-            execution
-        },
-        expanded: false,
-        outcome: None,
-        cwd: None,
+    let tool = |index, reasoning| {
+        TranscriptEntry::Operation(Operation {
+            source: if reasoning { "reasoning" } else { "Run" }.to_string(),
+            label: if reasoning { "Reasoned" } else { "Run" }.to_string(),
+            detail: format!("call-{index}"),
+            input: reasoning.then(|| ("reasoning".to_string(), format!("Reasoning block {index}"))),
+            output: None,
+            payload_refs: Vec::new(),
+            time: "19:38".to_string(),
+            execution: {
+                let mut execution = Execution::new(Utc::now(), ExecutionState::Running);
+                execution.transition(ExecutionState::Complete, completed_at);
+                execution
+            },
+            expanded: false,
+            outcome: None,
+            cwd: None,
+            kind: if reasoning {
+                OperationKind::Reasoning
+            } else {
+                OperationKind::Tool
+            },
+            origin: None,
+        })
     };
     for index in 0..7 {
         transcript.order.push(tool(index, index < 5));
     }
-    transcript.order.push(TranscriptEntry::Action {
-        source_session_id: None,
-        kind: TranscriptActionKind::Agent,
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        origin: None,
+        kind: OperationKind::Agent,
         label: "Agent".into(),
         detail: "/root/v391_scaling_audit · started".into(),
-        body: None,
+        output: None,
         time: "19:38".into(),
-        execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
-    });
+        source: String::new(),
+        input: None,
+        payload_refs: Vec::new(),
+        outcome: None,
+        cwd: None,
+    }));
     for (index, name) in [(8, "Read"), (9, "Edit")] {
         let mut entry = tool(index, false);
-        if let TranscriptEntry::Tool {
-            source_name,
-            name: label,
+        if let TranscriptEntry::Operation(Operation {
+            source: source_name,
+            label: label,
             ..
-        } = &mut entry
+        }) = &mut entry
         {
             *source_name = "capability".into();
             *label = name.into();
@@ -15082,16 +15169,21 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
         transcript.order.push(entry);
     }
     for index in 10..12 {
-        transcript.order.push(TranscriptEntry::Action {
-            source_session_id: None,
-            kind: TranscriptActionKind::Watch,
+        transcript.order.push(TranscriptEntry::Operation(Operation {
+            origin: None,
+            kind: OperationKind::Watch,
             label: "Watch".into(),
             detail: format!("watch-{index}"),
-            body: None,
+            output: None,
             time: "19:38".into(),
-            execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
-        });
+            source: String::new(),
+            input: None,
+            payload_refs: Vec::new(),
+            outcome: None,
+            cwd: None,
+        }));
     }
     transcript.order.push(tool(12, true));
     transcript.order.push(tool(13, false));
@@ -15211,8 +15303,8 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     assert!(folded_parent.1.is_empty());
     assert!(folded_parent.6.iter().all(|range| range.entry >= 14));
     let mut running_action = transcript.order.remove(10);
-    if let TranscriptEntry::Action { execution, .. } = &mut running_action {
-        *execution = Execution::new(Utc::now(), TranscriptActionState::Running);
+    if let TranscriptEntry::Operation(Operation { execution, .. }) = &mut running_action {
+        *execution = Execution::new(Utc::now(), ExecutionState::Running);
     }
     transcript.order.insert(10, running_action);
     assert_ne!(transcript.order.identities[10], identities[10]);
@@ -15220,8 +15312,10 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     let running = text(&render(&transcript));
     assert!(running.contains("▾ 19:38 · 14 actions"));
     assert!(!running.contains("done at"), "{running}");
-    if let TranscriptEntry::Action { execution, .. } = transcript.order.get_mut(10).unwrap() {
-        execution.transition(TranscriptActionState::Complete, Utc::now());
+    if let TranscriptEntry::Operation(Operation { execution, .. }) =
+        transcript.order.get_mut(10).unwrap()
+    {
+        execution.transition(ExecutionState::Complete, Utc::now());
     }
     assert!(transcript.action_run_expanded(0));
     assert!(transcript.toggle_tool_run_expansion(0));
@@ -15273,19 +15367,21 @@ fn active_turn_action_group_closes_after_completed_reply() {
         ..Transcript::default()
     };
     for _ in 0..4 {
-        transcript.order.push(TranscriptEntry::Tool {
-            source_name: "Run".into(),
-            name: "Run".into(),
+        transcript.order.push(TranscriptEntry::Operation(Operation {
+            source: "Run".into(),
+            label: "Run".into(),
             detail: "task".into(),
-            code_view: None,
-            output_view: None,
+            input: None,
+            output: None,
             payload_refs: Vec::new(),
             time: "19:38".into(),
             execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
             outcome: None,
             cwd: None,
-        });
+            kind: OperationKind::Tool,
+            origin: None,
+        }));
     }
     transcript.order.push(TranscriptEntry::Message {
         actor: EventActor::Assistant,
@@ -15310,19 +15406,21 @@ fn active_turn_action_group_closes_after_completed_reply() {
 fn tool_run_scroll_only_consumes_wheel_events_while_it_can_move() {
     let mut transcript = Transcript::default();
     for index in 0..20 {
-        transcript.order.push(TranscriptEntry::Tool {
-            source_name: "Run".to_string(),
-            name: "Run".to_string(),
+        transcript.order.push(TranscriptEntry::Operation(Operation {
+            source: "Run".to_string(),
+            label: "Run".to_string(),
             detail: format!("call-{index}"),
-            code_view: None,
-            output_view: None,
+            input: None,
+            output: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
             execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
             outcome: None,
             cwd: None,
-        });
+            kind: OperationKind::Tool,
+            origin: None,
+        }));
     }
 
     assert!(!transcript.scroll_tool_run(0, 12, 3));
@@ -15419,25 +15517,27 @@ fn tall_expanded_tool_transcript() -> Transcript {
             time: "12:00".to_string(),
         });
     }
-    transcript.order.push(TranscriptEntry::Tool {
-        source_name: "Edit".to_string(),
-        name: "Edit".to_string(),
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        source: "Edit".to_string(),
+        label: "Edit".to_string(),
         detail: "very-tall.rs".to_string(),
-        code_view: Some((
+        input: Some((
             "command".to_string(),
             (0..240)
                 .map(|line| format!("+changed line {line}"))
                 .collect::<Vec<_>>()
                 .join("\n"),
         )),
-        output_view: None,
+        output: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
         execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: true,
         outcome: None,
         cwd: None,
-    });
+        kind: OperationKind::Tool,
+        origin: None,
+    }));
     for index in 0..20 {
         transcript.order.push(TranscriptEntry::Activity {
             text: format!("after tool {index}"),
@@ -15466,7 +15566,7 @@ fn mouse_collapse_of_tall_tool_keeps_the_tool_header_at_the_anchor_row() {
     let tool_index = transcript
         .order
         .iter()
-        .position(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
+        .position(|entry| matches!(entry, TranscriptEntry::Operation(Operation { .. })))
         .unwrap();
     assert_eq!(anchor.collapsed_tool_header, Some(tool_index));
 
@@ -15490,14 +15590,14 @@ fn mouse_collapse_of_tall_tool_keeps_the_tool_header_at_the_anchor_row() {
 #[test]
 fn keyboard_collapse_of_tall_output_uses_the_same_reflow_anchor() {
     let mut transcript = tall_expanded_tool_transcript();
-    if let Some(TranscriptEntry::Tool {
-        code_view,
-        output_view,
+    if let Some(TranscriptEntry::Operation(Operation {
+        input: code_view,
+        output: output_view,
         ..
-    }) = transcript
+    })) = transcript
         .order
         .iter_mut()
-        .find(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
+        .find(|entry| matches!(entry, TranscriptEntry::Operation(Operation { .. })))
     {
         *code_view = Some(("text".to_string(), "command input".to_string()));
         *output_view = Some((
@@ -15543,25 +15643,27 @@ fn keyboard_collapse_of_tall_output_uses_the_same_reflow_anchor() {
 fn line_scrolling_preserves_expanded_actions() {
     let mut transcript = Transcript::default();
     for index in 0..9 {
-        transcript.order.push(TranscriptEntry::Tool {
-            source_name: "Edit".to_string(),
-            name: "Edit".to_string(),
+        transcript.order.push(TranscriptEntry::Operation(Operation {
+            source: "Edit".to_string(),
+            label: "Edit".to_string(),
             detail: format!("file-{index}.rs"),
-            code_view: Some((
+            input: Some((
                 "diff:rs".to_string(),
                 (0..12)
                     .map(|line| format!("+changed-{line}"))
                     .collect::<Vec<_>>()
                     .join("\n"),
             )),
-            output_view: None,
+            output: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
             execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: index == 8,
             outcome: None,
             cwd: None,
-        });
+            kind: OperationKind::Tool,
+            origin: None,
+        }));
     }
 
     assert!(transcript.toggle_action_run_expansion(0));
@@ -15570,14 +15672,14 @@ fn line_scrolling_preserves_expanded_actions() {
     assert!(max_offset > DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT);
     assert!(matches!(
         &transcript.order[8],
-        TranscriptEntry::Tool { expanded: true, .. }
+        TranscriptEntry::Operation(Operation { expanded: true, .. })
     ));
     assert!(!render.0.iter().any(|line| line.to_string() == "  ↓ more"));
 
     assert!(transcript.scroll_tool_run(0, max_offset, -3));
     assert!(matches!(
         &transcript.order[8],
-        TranscriptEntry::Tool { expanded: true, .. }
+        TranscriptEntry::Operation(Operation { expanded: true, .. })
     ));
     let rendered = transcript
         .lines(100)
@@ -15592,25 +15694,27 @@ fn line_scrolling_preserves_expanded_actions() {
 fn scrolled_action_viewport_pins_the_current_tool_header() {
     let mut transcript = Transcript::default();
     for index in 0..9 {
-        transcript.order.push(TranscriptEntry::Tool {
-            source_name: "Edit".to_string(),
-            name: "Edit".to_string(),
+        transcript.order.push(TranscriptEntry::Operation(Operation {
+            source: "Edit".to_string(),
+            label: "Edit".to_string(),
             detail: format!("file-{index}.rs"),
-            code_view: Some((
+            input: Some((
                 "diff:rs".to_string(),
                 (0..20)
                     .map(|line| format!("+changed-{line}"))
                     .collect::<Vec<_>>()
                     .join("\n"),
             )),
-            output_view: None,
+            output: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
             execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: index == 8,
             outcome: None,
             cwd: None,
-        });
+            kind: OperationKind::Tool,
+            origin: None,
+        }));
     }
 
     assert!(transcript.toggle_action_run_expansion(0));
@@ -15630,19 +15734,21 @@ fn scrolled_action_viewport_pins_the_current_tool_header() {
 fn expanding_an_action_preserves_the_current_line_anchor() {
     let mut transcript = Transcript::default();
     for index in 0..9 {
-        transcript.order.push(TranscriptEntry::Tool {
-            source_name: "Edit".to_string(),
-            name: "Edit".to_string(),
+        transcript.order.push(TranscriptEntry::Operation(Operation {
+            source: "Edit".to_string(),
+            label: "Edit".to_string(),
             detail: format!("file-{index}.rs"),
-            code_view: Some(("diff:rs".to_string(), "+first\n+second\n+third".to_string())),
-            output_view: None,
+            input: Some(("diff:rs".to_string(), "+first\n+second\n+third".to_string())),
+            output: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
             execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
             outcome: None,
             cwd: None,
-        });
+            kind: OperationKind::Tool,
+            origin: None,
+        }));
     }
 
     assert!(transcript.toggle_action_run_expansion(0));
@@ -15667,25 +15773,25 @@ fn thinking_stays_collapsed_while_streaming_unless_auto_expand_is_enabled() {
     ));
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool {
+        TranscriptEntry::Operation(Operation {
             execution,
             expanded: false,
             ..
-        } if !execution.is_terminal()
+        }) if !execution.is_terminal()
     ));
 
     transcript.set_auto_expand_thinking(true);
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool { expanded: true, .. }
+        TranscriptEntry::Operation(Operation { expanded: true, .. })
     ));
     transcript.set_auto_expand_thinking(false);
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool {
+        TranscriptEntry::Operation(Operation {
             expanded: false,
             ..
-        }
+        })
     ));
 
     let mut opted_in = Transcript::default();
@@ -15699,11 +15805,11 @@ fn thinking_stays_collapsed_while_streaming_unless_auto_expand_is_enabled() {
     ));
     assert!(matches!(
         &opted_in.order[0],
-        TranscriptEntry::Tool {
+        TranscriptEntry::Operation(Operation {
             execution,
             expanded: true,
             ..
-        } if !execution.is_terminal()
+        }) if !execution.is_terminal()
     ));
 }
 
@@ -15729,13 +15835,13 @@ fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
     assert_eq!(transcript.order.len(), 1);
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool {
-            name,
-            code_view: Some((language, source)),
+        TranscriptEntry::Operation(Operation {
+            label: name,
+            input: Some((language, source)),
             execution,
             expanded: false,
             ..
-        } if !execution.is_terminal() && name == "Reasoning"
+        }) if !execution.is_terminal() && name == "Reasoning"
             && language == "reasoning"
             && source == "Checking the source"
     ));
@@ -15763,16 +15869,16 @@ fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
     ));
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool {
+        TranscriptEntry::Operation(Operation {
             execution,
             expanded: false,
             ..
-        } if execution.is_terminal()
+        }) if execution.is_terminal()
     ));
     transcript.toggle_tool(0);
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool { expanded: true, .. }
+        TranscriptEntry::Operation(Operation { expanded: true, .. })
     ));
 }
 
@@ -15792,13 +15898,13 @@ fn reasoning_lifecycle_events_show_reasoning_without_a_text_delta() {
 
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool {
-            name,
-            code_view: Some((language, source)),
+        TranscriptEntry::Operation(Operation {
+            label: name,
+            input: Some((language, source)),
             execution,
             expanded: false,
             ..
-        } if !execution.is_terminal() && name == "Reasoning" && language == "reasoning" && source.is_empty()
+        }) if !execution.is_terminal() && name == "Reasoning" && language == "reasoning" && source.is_empty()
     ));
 
     transcript.apply(&SessionEvent::new(
@@ -15812,12 +15918,12 @@ fn reasoning_lifecycle_events_show_reasoning_without_a_text_delta() {
     ));
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool {
-            name,
+        TranscriptEntry::Operation(Operation {
+            label: name,
             execution,
             expanded: false,
             ..
-        } if execution.is_terminal() && name == "Reasoned"
+        }) if execution.is_terminal() && name == "Reasoned"
     ));
     let rendered = transcript
         .lines(100)
@@ -15857,10 +15963,10 @@ fn completed_reasoning_blocks_stay_terminal_within_a_request() {
         assert_eq!(transcript.order.len(), index as usize + 1);
         assert!(matches!(
             &transcript.order[index as usize],
-            TranscriptEntry::Tool {
+            TranscriptEntry::Operation(Operation {
                 execution,
                 ..
-            } if !execution.is_terminal() && execution.completed_at().is_none()
+            }) if !execution.is_terminal() && execution.completed_at().is_none()
         ));
         apply(
             &mut transcript,
@@ -15868,14 +15974,14 @@ fn completed_reasoning_blocks_stay_terminal_within_a_request() {
             SessionEventKind::ReasoningCompleted,
         );
         for (closed, row) in transcript.order.iter().enumerate() {
-            assert!(matches!(row, TranscriptEntry::Tool {
+            assert!(matches!(row, TranscriptEntry::Operation(Operation {
                 execution,  ..
-            } if execution.is_terminal() && execution.completed_at().unwrap() == started_at + chrono::Duration::seconds((closed as i64 + 1) * 5)));
+            }) if execution.is_terminal() && execution.completed_at().unwrap() == started_at + chrono::Duration::seconds((closed as i64 + 1) * 5)));
         }
     }
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool { execution,  .. }
+        TranscriptEntry::Operation(Operation { execution,  .. })
             if execution.started_at() == started_at + chrono::Duration::seconds(1)
                 && execution.completed_at().unwrap() == started_at + chrono::Duration::seconds(5)
     ));
@@ -15950,9 +16056,11 @@ fn completed_reasoning_blocks_stay_terminal_within_a_request() {
     }
     assert_eq!(transcript.order.len(), 26);
     for (index, expected) in [(24, "First final summary"), (25, "Second final summary")] {
-        assert!(matches!(&transcript.order[index], TranscriptEntry::Tool {
-            code_view: Some((_, text)), execution, ..
-        } if execution.is_terminal() && text == expected));
+        assert!(
+            matches!(&transcript.order[index], TranscriptEntry::Operation(Operation {
+            input: Some((_, text)), execution, ..
+        }) if execution.is_terminal() && text == expected)
+        );
     }
 }
 
@@ -16025,10 +16133,10 @@ fn cumulative_reasoning_snapshots_replace_the_live_prefix() {
 
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool {
-            code_view: Some((language, source)),
+        TranscriptEntry::Operation(Operation {
+            input: Some((language, source)),
             ..
-        } if language == "reasoning"
+        }) if language == "reasoning"
             && source == "Considering code modifications\nI’m checking the repository"
     ));
 }
@@ -16066,7 +16174,7 @@ fn reasoning_completion_freezes_thinking_duration_before_a_delayed_tool() {
     tool.created_at = tool_started_at;
     transcript.apply(&tool);
 
-    let TranscriptEntry::Tool { execution, .. } = &transcript.order[0] else {
+    let TranscriptEntry::Operation(Operation { execution, .. }) = &transcript.order[0] else {
         panic!("expected completed thinking card");
     };
     assert_eq!(execution.started_at(), started_at);
@@ -16415,28 +16523,30 @@ fn upserting_a_plan_preserves_its_expansion_state() {
 #[test]
 fn interrupted_tools_update_in_place_with_explicit_user_cause() {
     let mut transcript = Transcript::default();
-    transcript.order.push(TranscriptEntry::Tool {
-        source_name: "Run".to_string(),
-        name: "Run".to_string(),
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        source: "Run".to_string(),
+        label: "Run".to_string(),
         detail: "cargo check".to_string(),
-        code_view: Some(("bash".to_string(), "cargo check".to_string())),
-        output_view: None,
+        input: Some(("bash".to_string(), "cargo check".to_string())),
+        output: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
         execution: Execution::new(Utc::now(), ExecutionState::Running),
         expanded: false,
         outcome: None,
         cwd: None,
-    });
+        kind: OperationKind::Tool,
+        origin: None,
+    }));
 
     transcript.mark_running_tools_user_interrupted(Utc::now());
 
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool {
+        Some(TranscriptEntry::Operation(Operation {
             execution,
             ..
-        }) if execution.is_terminal() && execution.is_interrupted()
+        })) if execution.is_terminal() && execution.is_interrupted()
     ));
     assert!(
         transcript
@@ -16474,10 +16584,10 @@ fn turn_completion_settles_unresolved_foreground_tools() {
 
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool {
+        Some(TranscriptEntry::Operation(Operation {
             execution,
             ..
-        }) if execution.is_terminal() && !execution.is_failed() && !execution.is_interrupted()
+        })) if execution.is_terminal() && !execution.is_failed() && !execution.is_interrupted()
     ));
     let rendered = transcript
         .lines(100)
@@ -16528,7 +16638,7 @@ fn completed_web_search_updates_the_started_card_with_the_late_query() {
 
     assert!(matches!(
         transcript.order.first(),
-        Some(TranscriptEntry::Tool { name, detail, execution, .. })
+        Some(TranscriptEntry::Operation(Operation { label: name, detail, execution, .. }))
             if execution.is_terminal() && name == "Search web" && detail == "“Borg Agent queue”"
     ));
     let completed = transcript
@@ -17423,18 +17533,22 @@ fn selection_points_resolve_through_accordion_body_offsets() {
 
 #[test]
 fn selection_anchors_follow_content_when_the_actions_window_shifts() {
-    let tool = |index: usize| TranscriptEntry::Tool {
-        source_name: "Run".to_string(),
-        name: "Run".to_string(),
-        detail: format!("call-{index}"),
-        code_view: None,
-        output_view: None,
-        payload_refs: Vec::new(),
-        time: "12:00".to_string(),
-        execution: Execution::new(Utc::now(), ExecutionState::Complete),
-        expanded: false,
-        outcome: None,
-        cwd: None,
+    let tool = |index: usize| {
+        TranscriptEntry::Operation(Operation {
+            source: "Run".to_string(),
+            label: "Run".to_string(),
+            detail: format!("call-{index}"),
+            input: None,
+            output: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
+            expanded: false,
+            outcome: None,
+            cwd: None,
+            kind: OperationKind::Tool,
+            origin: None,
+        })
     };
     let mut transcript = Transcript::default();
     for index in 0..20 {
@@ -17471,33 +17585,42 @@ fn selection_anchors_follow_content_when_the_actions_window_shifts() {
 
 #[test]
 fn mixed_actions_window_selection_ranges_match_the_visible_rows() {
-    let tool = |index: usize| TranscriptEntry::Tool {
-        source_name: "Run".to_string(),
-        name: "Run".to_string(),
-        detail: format!("call-{index}"),
-        code_view: None,
-        output_view: None,
-        payload_refs: Vec::new(),
-        time: "12:00".to_string(),
-        execution: Execution::new(Utc::now(), ExecutionState::Complete),
-        expanded: false,
-        outcome: None,
-        cwd: None,
+    let tool = |index: usize| {
+        TranscriptEntry::Operation(Operation {
+            source: "Run".to_string(),
+            label: "Run".to_string(),
+            detail: format!("call-{index}"),
+            input: None,
+            output: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
+            expanded: false,
+            outcome: None,
+            cwd: None,
+            kind: OperationKind::Tool,
+            origin: None,
+        })
     };
     let mut transcript = Transcript::default();
     for index in 0..4 {
         transcript.order.push(tool(index));
     }
-    transcript.order.push(TranscriptEntry::Action {
-        source_session_id: None,
-        kind: TranscriptActionKind::Agent,
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        origin: None,
+        kind: OperationKind::Agent,
         label: "Agent".into(),
         detail: "/root/reviewer · started".into(),
-        body: None,
+        output: None,
         time: "12:00".into(),
-        execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
-    });
+        source: String::new(),
+        input: None,
+        payload_refs: Vec::new(),
+        outcome: None,
+        cwd: None,
+    }));
     for index in 4..10 {
         transcript.order.push(tool(index));
     }
@@ -17552,19 +17675,21 @@ fn mixed_actions_window_selection_ranges_match_the_visible_rows() {
 fn drag_selection_stays_live_when_wheel_scroll_hides_its_action_anchor() {
     let mut transcript = Transcript::default();
     for index in 0..20 {
-        transcript.order.push(TranscriptEntry::Tool {
-            source_name: "Run".to_string(),
-            name: "Run".to_string(),
+        transcript.order.push(TranscriptEntry::Operation(Operation {
+            source: "Run".to_string(),
+            label: "Run".to_string(),
             detail: format!("call-{index}"),
-            code_view: None,
-            output_view: None,
+            input: None,
+            output: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
             execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: false,
             outcome: None,
             cwd: None,
-        });
+            kind: OperationKind::Tool,
+            origin: None,
+        }));
     }
 
     assert!(transcript.toggle_action_run_expansion(0));
@@ -17629,25 +17754,27 @@ fn drag_selection_stays_live_when_wheel_scroll_hides_its_action_anchor() {
 fn released_selection_follows_expanded_tool_text_during_nested_scroll() {
     let mut transcript = Transcript::default();
     for index in 0..9 {
-        transcript.order.push(TranscriptEntry::Tool {
-            source_name: "Edit".to_string(),
-            name: "Edit".to_string(),
+        transcript.order.push(TranscriptEntry::Operation(Operation {
+            source: "Edit".to_string(),
+            label: "Edit".to_string(),
             detail: format!("file-{index}.rs"),
-            code_view: Some((
+            input: Some((
                 "command".to_string(),
                 (0..24)
                     .map(|line| format!("+changed-{line}"))
                     .collect::<Vec<_>>()
                     .join("\n"),
             )),
-            output_view: None,
+            output: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
             execution: Execution::new(Utc::now(), ExecutionState::Complete),
             expanded: index == 8,
             outcome: None,
             cwd: None,
-        });
+            kind: OperationKind::Tool,
+            origin: None,
+        }));
     }
 
     assert!(transcript.toggle_action_run_expansion(0));
@@ -17798,7 +17925,7 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
     assert!(
         transcript.order.iter().any(|entry| matches!(
             entry,
-            TranscriptEntry::Tool { detail, .. } if detail == "cargo test"
+            TranscriptEntry::Operation(Operation { detail, .. }) if detail == "cargo test"
         )),
         "the command's row must still name the command"
     );
@@ -17961,11 +18088,11 @@ fn provider_background_handle_drives_shell_status_and_full_output() {
     ));
 
     assert_eq!(transcript.shell_status(), None);
-    let TranscriptEntry::Tool {
-        output_view,
+    let TranscriptEntry::Operation(Operation {
+        output: output_view,
         execution,
         ..
-    } = &transcript.order[0]
+    }) = &transcript.order[0]
     else {
         panic!("originating command tool");
     };
@@ -18088,12 +18215,12 @@ fn exec_poll_completion_renders_command_and_readable_output() {
                 .hydrate_payload(&payload, output.into_bytes())
                 .unwrap();
         }
-        let Some(TranscriptEntry::Tool {
-            code_view,
-            output_view,
+        let Some(TranscriptEntry::Operation(Operation {
+            input: code_view,
+            output: output_view,
             expanded,
             ..
-        }) = transcript.order.get_mut(0)
+        })) = transcript.order.get_mut(0)
         else {
             panic!("poll remains a tool card");
         };
@@ -18177,16 +18304,21 @@ fn fullscreen_message_details_preserve_long_json_and_control_text() {
 #[test]
 fn fullscreen_non_tool_details_expand_without_mutating_inline_state() {
     let mut transcript = Transcript::default();
-    transcript.order.push(TranscriptEntry::Action {
-        source_session_id: None,
-        kind: TranscriptActionKind::Agent,
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        origin: None,
+        kind: OperationKind::Agent,
         label: "Agent".into(),
         detail: "summary".into(),
-        body: Some("preview\nACTION_BODY".into()),
+        output: Some(("text".to_string(), "preview\nACTION_BODY".into())),
         time: "12:00".into(),
-        execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
-    });
+        source: String::new(),
+        input: None,
+        payload_refs: Vec::new(),
+        outcome: None,
+        cwd: None,
+    }));
     transcript.order.push(TranscriptEntry::Plan {
         items: (0..20)
             .map(|index| PlanItem {
@@ -18285,10 +18417,10 @@ fn diff_backgrounds_cover_edit_and_inline_viewport_edges_without_changing_copy()
                         parent_tool_call_id: None,
                     },
                 ));
-                let TranscriptEntry::Tool {
-                    code_view: Some((_, source)),
+                let TranscriptEntry::Operation(Operation {
+                    input: Some((_, source)),
                     ..
-                } = &transcript.order[0]
+                }) = &transcript.order[0]
                 else {
                     panic!("native edit must project its replacement diff");
                 };
@@ -18569,19 +18701,29 @@ async fn timeline_detail_click_policy_applies_to_every_expandable_entry() {
             parent_tool_call_id: None,
         },
     ));
-    if let TranscriptEntry::Tool { expanded, .. } = &mut terminal.transcript.order[0] {
+    if let TranscriptEntry::Operation(Operation { expanded, .. }) =
+        &mut terminal.transcript.order[0]
+    {
         *expanded = false;
     }
-    terminal.transcript.order.push(TranscriptEntry::Action {
-        source_session_id: None,
-        kind: TranscriptActionKind::Agent,
-        label: "Agent".into(),
-        detail: "detail".into(),
-        body: Some("ACTION_BODY".into()),
-        time: "12:00".into(),
-        execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
-        expanded: false,
-    });
+    terminal
+        .transcript
+        .order
+        .push(TranscriptEntry::Operation(Operation {
+            origin: None,
+            kind: OperationKind::Agent,
+            label: "Agent".into(),
+            detail: "detail".into(),
+            output: Some(("text".to_string(), "ACTION_BODY".into())),
+            time: "12:00".into(),
+            execution: Execution::new(Utc::now(), ExecutionState::Complete),
+            expanded: false,
+            source: String::new(),
+            input: None,
+            payload_refs: Vec::new(),
+            outcome: None,
+            cwd: None,
+        }));
     terminal.transcript.order.push(TranscriptEntry::Plan {
         items: (0..20)
             .map(|index| PlanItem {
@@ -18622,8 +18764,7 @@ async fn timeline_detail_click_policy_applies_to_every_expandable_entry() {
                 ToolClickBehavior::Inline => {
                     assert!(terminal.focused_tool.is_none());
                     let expanded = match &terminal.transcript.order[index] {
-                        TranscriptEntry::Tool { expanded, .. }
-                        | TranscriptEntry::Action { expanded, .. }
+                        TranscriptEntry::Operation(Operation { expanded, .. })
                         | TranscriptEntry::Plan { expanded, .. }
                         | TranscriptEntry::Compaction { expanded, .. } => *expanded,
                         _ => unreachable!(),
@@ -18669,10 +18810,10 @@ fn spinning_tool_rows(transcript: &Transcript) -> usize {
         .filter(|entry| {
             matches!(
                 entry,
-                TranscriptEntry::Tool {
+                TranscriptEntry::Operation(Operation {
                     execution,
                     ..
-                } if !execution.is_terminal()
+                }) if !execution.is_terminal()
             )
         })
         .count()
@@ -19118,10 +19259,10 @@ fn live_reasoning_preview_appends_repeated_deltas_without_snapshot_duplication()
     };
     fn reasoning_text(transcript: &Transcript) -> &str {
         match transcript.order.first() {
-            Some(TranscriptEntry::Tool {
-                code_view: Some((_, source)),
+            Some(TranscriptEntry::Operation(Operation {
+                input: Some((_, source)),
                 ..
-            }) => source,
+            })) => source,
             _ => panic!("expected one reasoning row"),
         }
     }
@@ -19169,10 +19310,10 @@ fn reasoning_snapshot_repairs_a_dropped_live_preview() {
     };
     fn reasoning_text(transcript: &Transcript) -> &str {
         match &transcript.order[0] {
-            TranscriptEntry::Tool {
-                code_view: Some((_, source)),
+            TranscriptEntry::Operation(Operation {
+                input: Some((_, source)),
                 ..
-            } => source,
+            }) => source,
             _ => panic!("expected a reasoning row"),
         }
     }
@@ -19272,7 +19413,7 @@ fn subagent_actions_render_names_without_changing_routing_targets() {
         assert!(!named.contains(&child_id.to_string()));
         assert!(!named.contains("session:"));
         assert!(
-            matches!(&transcript.order[index], TranscriptEntry::Tool { code_view: Some((_, input)), .. }
+            matches!(&transcript.order[index], TranscriptEntry::Operation(Operation { input: Some((_, input)), .. })
             if input.contains(&target)),
             "routing metadata must stay untouched"
         );
@@ -19321,7 +19462,7 @@ fn completed_action_identity_survives_late_start_and_update_events() {
         assert_eq!(transcript.tools["selected"], selected);
         assert_eq!(transcript.order.len(), 1);
         assert!(matches!(&transcript.order[selected],
-            TranscriptEntry::Tool { execution, expanded: true, output_view: Some((_, output)), .. }
+            TranscriptEntry::Operation(Operation { execution, expanded: true, output: Some((_, output)), .. })
                 if execution.is_terminal() && output == "original result"));
     }
 }
@@ -19417,7 +19558,7 @@ async fn action_inspector_keeps_identity_across_history_reprojection() {
     );
     assert!(matches!(
         &terminal.transcript.order[terminal.focused_tool.unwrap()],
-        TranscriptEntry::Tool { execution, output_view: Some((_, output)), .. }
+        TranscriptEntry::Operation(Operation { execution, output: Some((_, output)), .. })
             if execution.is_terminal() && output.contains("selected result")
     ));
     history.retain(|event| {
@@ -19576,7 +19717,7 @@ async fn action_inspector_stays_on_its_tool_when_plan_or_goal_moves() {
             );
             assert!(matches!(
                 terminal.transcript.order[terminal.focused_tool.unwrap()],
-                TranscriptEntry::Tool { .. }
+                TranscriptEntry::Operation(Operation { .. })
             ));
             terminal.shutdown().await;
         }
@@ -19751,7 +19892,7 @@ fn empty_reasoning_row_is_not_expandable_or_hinted() {
     }
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool { name, execution, .. } if execution.is_terminal() && name == "Reasoned"
+        TranscriptEntry::Operation(Operation { label: name, execution, .. }) if execution.is_terminal() && name == "Reasoned"
     ));
     assert_eq!(transcript.tool_copy_hint(0), None);
     assert!(!transcript.tool_is_expandable(0));
@@ -20401,16 +20542,21 @@ fn watch_rows_sit_in_the_action_run_without_extra_spacing() {
         }
     };
     tool(&mut transcript, "first", 1);
-    transcript.order.push(TranscriptEntry::Action {
-        source_session_id: None,
-        kind: TranscriptActionKind::Agent,
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        origin: None,
+        kind: OperationKind::Agent,
         label: "Watch".to_string(),
         detail: "agent events".to_string(),
-        body: None,
+        output: None,
         time: "2026-09-25 13:40".to_string(),
-        execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
+        execution: Execution::new(Utc::now(), ExecutionState::Complete),
         expanded: false,
-    });
+        source: String::new(),
+        input: None,
+        payload_refs: Vec::new(),
+        outcome: None,
+        cwd: None,
+    }));
     tool(&mut transcript, "second", 3);
     let lines = transcript
         .lines(100)
@@ -20531,26 +20677,32 @@ fn team_broadcast_timeline_updates_one_durable_row_across_replay_and_insertion()
     transcript.apply(&message(1, EventActor::User, "First prompt"));
     transcript.apply(&message(2, EventActor::Assistant, "First reply"));
     transcript.apply(&update(3, 0));
-    assert!(matches!(&transcript.order[2], TranscriptEntry::Action {
-        label, detail, execution, body: Some(body), ..
-    }  if matches!(execution.state(), TranscriptActionState::Waiting) && label == "Team" && detail == "sent · 0/2 acknowledged" && body == "Please report status"));
+    assert!(
+        matches!(&transcript.order[2], TranscriptEntry::Operation(Operation {
+        label, detail, execution, output: Some((_, body)), ..
+    })  if matches!(execution.state(), ExecutionState::Waiting) && label == "Team" && detail == "sent · 0/2 acknowledged" && body == "Please report status")
+    );
     // A late user prompt is inserted ahead of the assistant and team rows.
     transcript.apply(&message(4, EventActor::User, "Second prompt"));
     assert_eq!(transcript.team_broadcast_entries[&message_id], 3);
     transcript.apply(&update(5, 1));
     transcript.apply(&update(6, 2));
     assert_eq!(transcript.order.len(), 4);
-    assert!(matches!(&transcript.order[3], TranscriptEntry::Action {
+    assert!(
+        matches!(&transcript.order[3], TranscriptEntry::Operation(Operation {
         detail, execution, ..
-    }  if matches!(execution.state(), TranscriptActionState::Complete) && detail == "sent · 2/2 acknowledged"));
+    })  if matches!(execution.state(), ExecutionState::Complete) && detail == "sent · 2/2 acknowledged")
+    );
     let mut replay = Transcript::default();
     for n in 1..=3 {
         replay.apply_history(&update(n, (n - 1) as u32));
     }
     assert_eq!(replay.order.len(), 1);
-    assert!(matches!(&replay.order[0], TranscriptEntry::Action {
+    assert!(
+        matches!(&replay.order[0], TranscriptEntry::Operation(Operation {
         detail, execution, ..
-    }  if matches!(execution.state(), TranscriptActionState::Complete) && detail == "sent · 2/2 acknowledged"));
+    })  if matches!(execution.state(), ExecutionState::Complete) && detail == "sent · 2/2 acknowledged")
+    );
 }
 
 #[test]
@@ -20980,17 +21132,17 @@ fn replay_parent_cancellation_settles_nested_wait_not_parallel_tool() {
     ));
     assert!(matches!(
         &transcript.order[transcript.tools["wait"]],
-        TranscriptEntry::Tool {
+        TranscriptEntry::Operation(Operation {
             execution,
             ..
-        } if execution.is_terminal() && execution.is_failed()
+        }) if execution.is_terminal() && execution.is_failed()
     ));
     assert!(matches!(
         &transcript.order[transcript.tools["parallel"]],
-        TranscriptEntry::Tool {
+        TranscriptEntry::Operation(Operation {
             execution,
             ..
-        } if !execution.is_terminal()
+        }) if !execution.is_terminal()
     ));
 }
 
@@ -21271,16 +21423,21 @@ fn message_cards_resolve_team_threads_after_replay() {
         }
     }
     let mut transcript = Transcript::default();
-    let row = TranscriptEntry::Action {
-        kind: TranscriptActionKind::Agent,
-        source_session_id: Some(child),
+    let row = TranscriptEntry::Operation(Operation {
+        kind: OperationKind::Agent,
+        origin: Some(child),
         label: "Agent".into(),
         detail: "worker".into(),
-        body: None,
+        output: None,
         time: "12:00".into(),
         execution: Execution::new(now, ExecutionState::Complete),
         expanded: false,
-    };
+        source: String::new(),
+        input: None,
+        payload_refs: Vec::new(),
+        outcome: None,
+        cwd: None,
+    });
     transcript.order.push(row.clone());
     transcript.order.push(row);
     transcript.subagent_entries.insert(child, 1);
@@ -21859,10 +22016,10 @@ async fn running_action_right_click_backgrounds_and_left_click_inspects() {
     terminal.apply_session_event(&completion);
     assert!(matches!(
         &terminal.transcript.order[index],
-        TranscriptEntry::Tool {
+        TranscriptEntry::Operation(Operation {
             execution,
             ..
-        } if execution.is_backgrounded()
+        }) if execution.is_backgrounded()
     ));
     assert!(matches!(
         terminal.run_pending_transcript_click(PendingTranscriptClick::Tool { index, run: None }),
@@ -21887,19 +22044,19 @@ async fn running_action_right_click_backgrounds_and_left_click_inspects() {
     ));
     assert!(matches!(
         &terminal.transcript.order[index],
-        TranscriptEntry::Tool {
+        TranscriptEntry::Operation(Operation {
             execution,
             ..
-        } if execution.is_terminal() && !execution.is_backgrounded()
+        }) if execution.is_terminal() && !execution.is_backgrounded()
     ));
     // Late delivery of the initial background receipt must not resurrect a finished job.
     terminal.apply_session_event(&completion);
     assert!(matches!(
         &terminal.transcript.order[index],
-        TranscriptEntry::Tool {
+        TranscriptEntry::Operation(Operation {
             execution,
             ..
-        } if execution.is_terminal() && !execution.is_backgrounded()
+        }) if execution.is_terminal() && !execution.is_backgrounded()
     ));
 }
 
@@ -22328,19 +22485,21 @@ async fn escape_and_running_button_reach_the_same_interrupt() {
 #[test]
 fn background_action_animates_until_settled_without_losing_failure_style() {
     let mut transcript = Transcript::default();
-    transcript.order.push(TranscriptEntry::Tool {
-        source_name: "exec".into(),
-        name: "Run".into(),
+    transcript.order.push(TranscriptEntry::Operation(Operation {
+        source: "exec".into(),
+        label: "Run".into(),
         detail: "build".into(),
-        code_view: None,
-        output_view: None,
+        input: None,
+        output: None,
         payload_refs: Vec::new(),
         time: "12:00".into(),
         execution: Execution::new(Utc::now(), ExecutionState::Backgrounded),
         expanded: false,
         outcome: None,
         cwd: None,
-    });
+        kind: OperationKind::Tool,
+        origin: None,
+    }));
     assert!(transcript.has_running_tool());
     assert!(transcript.tool_activity_is_running(0));
     let mut header = transcript
@@ -22373,7 +22532,7 @@ fn background_action_animates_until_settled_without_losing_failure_style() {
     assert!(next_header.to_string().contains("⠙"));
     assert_ne!(header.to_string(), next_header.to_string());
     let failed_row = transcript.order[0].clone();
-    if let TranscriptEntry::Tool { execution, .. } = &mut transcript.order[0] {
+    if let TranscriptEntry::Operation(Operation { execution, .. }) = &mut transcript.order[0] {
         execution.transition(ExecutionState::Complete, Utc::now());
     }
     assert!(!transcript.has_running_tool());
@@ -22392,7 +22551,7 @@ fn background_action_animates_until_settled_without_losing_failure_style() {
     );
     let mut failed_transcript = Transcript::default();
     let mut failed_row = failed_row;
-    if let TranscriptEntry::Tool { execution, .. } = &mut failed_row {
+    if let TranscriptEntry::Operation(Operation { execution, .. }) = &mut failed_row {
         execution.transition(ExecutionState::Failed, Utc::now());
     }
     failed_transcript.order.push(failed_row);

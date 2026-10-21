@@ -51,7 +51,7 @@ use borg_remote::{
     SessionEvent, SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef,
     SessionState, SessionStatus, SubagentActivityKind, SubagentSnapshot, SubagentStatus,
     ToolPresentationCategory, WatchSummary, command_edit_presentation, compact_text,
-    is_command_tool, is_diff_language, is_edit_tool, is_mcp_resource_probe, is_subagent_tool,
+    is_command_tool, is_diff_language, is_edit_tool, is_mcp_resource_probe,
     project_tool_presentation, tool_action_is_instant, tool_can_start_background_process,
     tool_has_rich_ui, tool_output_code_view, web_search_query,
 };
@@ -5549,10 +5549,10 @@ impl BorgTerminal {
         if is_reasoning_entry(entry)
             || matches!(
                 entry,
-                TranscriptEntry::Action {
-                    source_session_id: Some(_),
+                TranscriptEntry::Operation(Operation {
+                    origin: Some(_),
                     ..
-                }
+                })
             )
         {
             return Some(ActionInspectorAnchor::Entry(identity));
@@ -5643,10 +5643,7 @@ impl BorgTerminal {
         };
         // A tool row with nothing to show (an empty Thinking window, a probe
         // with no body) has no inspector; treat the click as a no-op.
-        if matches!(
-            self.transcript.order.get(index),
-            Some(TranscriptEntry::Tool { .. })
-        ) && !self.transcript.tool_is_expandable(index)
+        if self.transcript.order.call(index).is_some() && !self.transcript.tool_is_expandable(index)
         {
             return Vec::new();
         }
@@ -7077,7 +7074,9 @@ impl BorgTerminal {
             Some(TranscriptEntry::Goal { .. }) => ("Goal actions", vec!["Copy goal"]),
             Some(TranscriptEntry::Plan { .. }) => ("Plan actions", vec!["Copy todo list"]),
             Some(TranscriptEntry::Info { .. }) => ("Card actions", vec!["Copy details"]),
-            Some(TranscriptEntry::Action { .. }) => ("Action details", vec!["Copy action"]),
+            Some(TranscriptEntry::Operation(Operation { kind, .. })) if !kind.is_call() => {
+                ("Action details", vec!["Copy action"])
+            }
             Some(TranscriptEntry::Compaction {
                 execution,
                 summary,
@@ -13287,10 +13286,9 @@ fn message_thread_target(
     director_id: Uuid,
     agents: &HashMap<Uuid, SubagentSnapshot>,
 ) -> Option<TeamRosterTarget> {
-    if let Some(TranscriptEntry::Action {
-        source_session_id: Some(id),
-        ..
-    }) = transcript.order.get(index)
+    if let Some(TranscriptEntry::Operation(Operation {
+        origin: Some(id), ..
+    })) = transcript.order.get(index)
     {
         return Some(if *id == director_id {
             TeamRosterTarget::Director
@@ -13298,11 +13296,11 @@ fn message_thread_target(
             TeamRosterTarget::Child(*id)
         });
     }
-    let TranscriptEntry::Tool {
-        source_name,
-        code_view: Some((language, input)),
+    let Operation {
+        source: source_name,
+        input: Some((language, input)),
         ..
-    } = transcript.order.get(index)?
+    } = transcript.order.call(index)?
     else {
         return None;
     };
@@ -14575,30 +14573,34 @@ fn focused_subagent_status_color(status: SessionStatus, focused_subagent: bool) 
     }
 }
 
-fn transcript_action_glyph(state: TranscriptActionState) -> &'static str {
+fn transcript_action_glyph(state: ExecutionState) -> &'static str {
     match state {
-        TranscriptActionState::Running => "◇",
-        TranscriptActionState::Backgrounded => "↗",
-        TranscriptActionState::Waiting => "?",
-        TranscriptActionState::Complete => "✓",
-        TranscriptActionState::Received => "↙",
-        TranscriptActionState::Stopped => "■",
-        TranscriptActionState::Failed => "!",
+        ExecutionState::Running => "◇",
+        ExecutionState::Backgrounded => "↗",
+        ExecutionState::Waiting => "?",
+        ExecutionState::Complete => "✓",
+        ExecutionState::Received => "↙",
+        ExecutionState::Stopped => "■",
+        ExecutionState::Failed => "!",
     }
 }
 
-fn transcript_action_color(kind: TranscriptActionKind, state: TranscriptActionState) -> Color {
-    if matches!(state, TranscriptActionState::Failed) {
+fn transcript_action_color(kind: OperationKind, state: ExecutionState) -> Color {
+    if matches!(state, ExecutionState::Failed) {
         return Color::LightRed;
     }
-    if matches!(state, TranscriptActionState::Waiting) {
+    if matches!(state, ExecutionState::Waiting) {
         return Color::Yellow;
     }
     match kind {
-        TranscriptActionKind::Agent => SUBAGENT_PURPLE,
-        TranscriptActionKind::Watch => WATCH_PURPLE,
-        TranscriptActionKind::Approval | TranscriptActionKind::ProviderInteraction => Color::Yellow,
-        TranscriptActionKind::Error => Color::LightRed,
+        OperationKind::Agent => SUBAGENT_PURPLE,
+        OperationKind::Watch => WATCH_PURPLE,
+        OperationKind::Approval | OperationKind::ProviderInteraction => Color::Yellow,
+        OperationKind::Error => Color::LightRed,
+        OperationKind::Tool
+        | OperationKind::Delegation
+        | OperationKind::Preparation
+        | OperationKind::Reasoning => Color::White,
     }
 }
 
@@ -15216,23 +15218,6 @@ impl TranscriptEntryRenderer for TranscriptEntry {
             Self::Message { text, .. } | Self::Activity { text, .. } | Self::Info { text, .. } => {
                 Some(markdown_plain_text(text))
             }
-            Self::Action {
-                label,
-                detail,
-                body,
-                ..
-            } => Some(
-                [
-                    (!label.trim().is_empty()).then_some(label.as_str()),
-                    (!detail.trim().is_empty()).then_some(detail.as_str()),
-                    body.as_deref().filter(|body| !body.trim().is_empty()),
-                ]
-                .into_iter()
-                .flatten()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-                .join("\n"),
-            ),
             Self::Plan { items, .. } => Some(
                 items
                     .iter()
@@ -15250,12 +15235,24 @@ impl TranscriptEntryRenderer for TranscriptEntry {
                     .join("\n"),
             ),
             Self::Goal { goal, .. } => Some(goal.objective.clone()),
-            Self::Tool {
+            Self::Operation(operation) if !operation.kind.is_call() => Some(
+                [
+                    (!operation.label.trim().is_empty()).then_some(operation.label.as_str()),
+                    (!operation.detail.trim().is_empty()).then_some(operation.detail.as_str()),
+                    operation.body().filter(|body| !body.trim().is_empty()),
+                ]
+                .into_iter()
+                .flatten()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            ),
+            Self::Operation(Operation {
                 detail,
-                code_view,
-                output_view,
+                input: code_view,
+                output: output_view,
                 ..
-            } => {
+            }) => {
                 // Diffs are the useful copy target for edit calls. For every
                 // other tool, prefer the completed response over the command
                 // that produced it, then fall back to the call summary while

@@ -383,10 +383,10 @@ fn worker_lifecycle_is_independent_of_reports_and_stale_deliveries() {
     ));
     assert!(matches!(
         &live.core.order[0],
-        borg_view::entry::TranscriptEntry::Action {
+        borg_view::entry::TranscriptEntry::Operation(borg_view::entry::Operation {
             execution,
             ..
-        } if execution.state() == borg_view::entry::ExecutionState::Running
+        }) if execution.state() == borg_view::entry::ExecutionState::Running
     ));
 
     let mut stale = agent.clone();
@@ -399,10 +399,10 @@ fn worker_lifecycle_is_independent_of_reports_and_stale_deliveries() {
     assert_eq!(live.core.subagents[&child], SubagentStatus::Running);
     assert!(matches!(
         &live.core.order[0],
-        borg_view::entry::TranscriptEntry::Action {
+        borg_view::entry::TranscriptEntry::Operation(borg_view::entry::Operation {
             execution,
             ..
-        } if execution.state() == borg_view::entry::ExecutionState::Running
+        }) if execution.state() == borg_view::entry::ExecutionState::Running
     ));
 
     let stale_approval = SessionEvent::new(
@@ -437,10 +437,10 @@ fn worker_lifecycle_is_independent_of_reports_and_stale_deliveries() {
     ));
     assert!(matches!(
         &live.core.order[0],
-        borg_view::entry::TranscriptEntry::Action {
+        borg_view::entry::TranscriptEntry::Operation(borg_view::entry::Operation {
             execution,
             ..
-        } if execution.state() == borg_view::entry::ExecutionState::Waiting
+        }) if execution.state() == borg_view::entry::ExecutionState::Waiting
     ));
     let mut replay = ViewReducer::new(parent, "replay".into());
     replay.core.show_subagent_messages = true;
@@ -734,7 +734,10 @@ fn stale_child_metadata_cannot_erase_a_canonical_approval() {
 // Replay must preserve that distinction rather than leaving completed children blue.
 #[test]
 fn nested_background_receipt_waits_for_terminal_completion_live_and_replay() {
-    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    use borg_view::{
+        core::TranscriptCore,
+        entry::{Operation, TranscriptEntry},
+    };
     let session = Uuid::new_v4();
     let watch = Uuid::new_v4();
     let mut events = Vec::new();
@@ -771,7 +774,7 @@ fn nested_background_receipt_waits_for_terminal_completion_live_and_replay() {
     }
     assert!(matches!(
         &live.order[1],
-        TranscriptEntry::Tool { execution, .. } if !execution.is_terminal()
+        TranscriptEntry::Operation(Operation { execution, .. }) if !execution.is_terminal()
     ));
     let settled_watch = SessionEvent::new(
         session,
@@ -795,7 +798,7 @@ fn nested_background_receipt_waits_for_terminal_completion_live_and_replay() {
     watched.apply_history(&settled_watch);
     assert!(watched.order.iter().all(|row| matches!(
         row,
-        TranscriptEntry::Tool { execution, .. } if execution.is_terminal() && !execution.is_failed()
+        TranscriptEntry::Operation(Operation { execution, .. }) if execution.is_terminal() && !execution.is_failed()
     )));
     events.push(SessionEvent::new(
         session,
@@ -818,7 +821,7 @@ fn nested_background_receipt_waits_for_terminal_completion_live_and_replay() {
     for projection in [&live, &replay] {
         assert!(projection.order.iter().all(|row| matches!(
             row,
-            TranscriptEntry::Tool { execution, .. } if execution.is_failed()
+            TranscriptEntry::Operation(Operation { execution, .. }) if execution.is_failed()
         )));
     }
 }
@@ -865,7 +868,10 @@ fn execution_terminal_state_and_clock_are_absorbing() {
 // Late completion used to replace the result/timer; restarting reused the old identity.
 #[test]
 fn terminal_tool_ignores_late_updates_and_new_start_gets_fresh_identity() {
-    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    use borg_view::{
+        core::TranscriptCore,
+        entry::{Operation, TranscriptEntry},
+    };
     let session = Uuid::new_v4();
     let mut core = TranscriptCore::default();
     let start = |sequence| {
@@ -926,7 +932,7 @@ fn terminal_tool_ignores_late_updates_and_new_start_gets_fresh_identity() {
     assert_eq!(core.order.identities[0], identity);
     assert_ne!(core.order.identities[1], identity);
     assert!(
-        matches!(&core.order[1], TranscriptEntry::Tool { execution, .. } if !execution.is_terminal())
+        matches!(&core.order[1], TranscriptEntry::Operation(Operation { execution, .. }) if !execution.is_terminal())
     );
 }
 
@@ -934,7 +940,10 @@ fn terminal_tool_ignores_late_updates_and_new_start_gets_fresh_identity() {
 #[test]
 fn approval_resolution_and_broadcast_completion_are_terminal() {
     use borg_agent_runtime::ApprovalDecision;
-    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    use borg_view::{
+        core::TranscriptCore,
+        entry::{Operation, TranscriptEntry},
+    };
     let session = Uuid::new_v4();
     let mut core = TranscriptCore::default();
     core.apply(&SessionEvent::new(
@@ -957,7 +966,7 @@ fn approval_resolution_and_broadcast_completion_are_terminal() {
     ));
     assert!(core.meta.approvals.is_empty());
     assert!(
-        matches!(&core.order[0], TranscriptEntry::Action { execution, .. } if execution.is_interrupted())
+        matches!(&core.order[0], TranscriptEntry::Operation(Operation { execution, .. }) if execution.is_interrupted())
     );
     let id = Uuid::new_v4();
     let update = |sequence, acknowledged| {
@@ -1029,7 +1038,10 @@ fn message_transport_failure_does_not_reopen_terminal_execution() {
 #[test]
 fn active_process_survives_transport_return_and_interruption_until_exit() {
     use borg_agent_runtime::RuntimeProcessStatus;
-    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    use borg_view::{
+        core::TranscriptCore,
+        entry::{Operation, TranscriptEntry},
+    };
     let session = Uuid::new_v4();
     let process_id = Uuid::new_v4();
     let mut core = TranscriptCore::default();
@@ -1068,7 +1080,7 @@ fn active_process_survives_transport_return_and_interruption_until_exit() {
         },
     ));
     core.mark_running_tools_user_interrupted(chrono::Utc::now());
-    let TranscriptEntry::Tool { execution, .. } = &core.order[0] else {
+    let TranscriptEntry::Operation(Operation { execution, .. }) = &core.order[0] else {
         panic!("missing process tool")
     };
     assert!(execution.is_backgrounded());
@@ -1091,7 +1103,7 @@ fn active_process_survives_transport_return_and_interruption_until_exit() {
         },
     ));
     assert!(
-        matches!(&core.order[0], TranscriptEntry::Tool { execution, .. } if execution.is_failed() && execution.completed_at().is_some())
+        matches!(&core.order[0], TranscriptEntry::Operation(Operation { execution, .. }) if execution.is_failed() && execution.completed_at().is_some())
     );
 }
 
@@ -1146,7 +1158,10 @@ fn live_replay_cannot_resurrect_evicted_executions() {
 // Historical display ordering is not journal ordering, but subsequent live input is.
 #[test]
 fn reordered_history_preserves_earlier_output_and_fences_live_replay() {
-    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    use borg_view::{
+        core::TranscriptCore,
+        entry::{Operation, TranscriptEntry},
+    };
     let session = Uuid::new_v4();
     let mut core = TranscriptCore::default();
     core.apply_history(&message(
@@ -1184,7 +1199,7 @@ fn reordered_history_preserves_earlier_output_and_fences_live_replay() {
     ));
     assert_eq!(core.order.len(), 2);
     assert!(
-        matches!(&core.order[1], TranscriptEntry::Tool { execution, .. } if execution.is_terminal())
+        matches!(&core.order[1], TranscriptEntry::Operation(Operation { execution, .. }) if execution.is_terminal())
     );
     let before = serde_json::to_value(&core.order).unwrap();
     core.apply(&start);
@@ -1239,7 +1254,10 @@ fn closed_turn_rejects_new_reasoning_sources() {
 // Loading canonical archived text is not a new execution or a terminal transition.
 #[test]
 fn archived_reasoning_hydrates_payload_without_changing_terminal_receipt() {
-    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    use borg_view::{
+        core::TranscriptCore,
+        entry::{Operation, TranscriptEntry},
+    };
     let session = Uuid::new_v4();
     let mut core = TranscriptCore::default();
     let snapshot = |sequence, text, complete| {
@@ -1261,14 +1279,14 @@ fn archived_reasoning_hydrates_payload_without_changing_terminal_receipt() {
     ));
     let identity = core.order.identities[0];
     let receipt = |entry: &TranscriptEntry| match entry {
-        TranscriptEntry::Tool {
+        TranscriptEntry::Operation(Operation {
             execution,
-            name,
+            label: name,
             detail,
             time,
             outcome,
             ..
-        } => (
+        }) => (
             execution.clone(),
             name.clone(),
             detail.clone(),
@@ -1283,7 +1301,7 @@ fn archived_reasoning_hydrates_payload_without_changing_terminal_receipt() {
     assert_eq!(core.order.identities[0], identity);
     assert_eq!(core.order.len(), 1);
     assert!(
-        matches!(&core.order[0], TranscriptEntry::Tool { code_view: Some((_, text)), .. } if text == "canonical full reasoning text")
+        matches!(&core.order[0], TranscriptEntry::Operation(Operation { input: Some((_, text)), .. }) if text == "canonical full reasoning text")
     );
 }
 
@@ -1460,7 +1478,7 @@ fn terminal_wire_receipts_do_not_churn_on_unrelated_completion_or_interrupt() {
 // Correlation, not arrival order, owns the reasoning execution being updated.
 #[test]
 fn late_reasoning_block_events_cannot_change_or_finish_another_block() {
-    use borg_view::entry::TranscriptEntry;
+    use borg_view::entry::{Operation, TranscriptEntry};
     let session = Uuid::new_v4();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
@@ -1546,7 +1564,7 @@ fn late_reasoning_block_events_cannot_change_or_finish_another_block() {
         assert_eq!(projection.core.order.identities, vec![(a, 0), (b, 0)]);
         projection.apply(completion.clone());
         assert!(
-            matches!(&projection.core.order[1], TranscriptEntry::Tool { execution, .. }
+            matches!(&projection.core.order[1], TranscriptEntry::Operation(Operation { execution, .. })
             if execution.is_terminal() && execution.completed_at() == Some(completion.created_at))
         );
     }
@@ -1604,7 +1622,10 @@ fn reasoning_recovery_preserves_block_identity_and_start_clock() {
 // A truncated archived block may be shown as history, but must never become active.
 #[test]
 fn unknown_final_reasoning_archive_is_terminal_only_and_does_not_finish_live_block() {
-    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    use borg_view::{
+        core::TranscriptCore,
+        entry::{Operation, TranscriptEntry},
+    };
     let session = Uuid::new_v4();
     let current = Uuid::new_v4();
     let archived = Uuid::new_v4();
@@ -1622,10 +1643,10 @@ fn unknown_final_reasoning_archive_is_terminal_only_and_does_not_finish_live_blo
     }));
     assert_eq!(core.active_reasoning, Some(0));
     assert!(
-        matches!(&core.order[0], TranscriptEntry::Tool { execution, .. } if !execution.is_terminal())
+        matches!(&core.order[0], TranscriptEntry::Operation(Operation { execution, .. }) if !execution.is_terminal())
     );
     assert!(
-        matches!(&core.order[1], TranscriptEntry::Tool { execution, .. } if execution.is_terminal())
+        matches!(&core.order[1], TranscriptEntry::Operation(Operation { execution, .. }) if execution.is_terminal())
     );
     assert_eq!(core.order.identities[1], (archived, 0));
     core.apply(&SessionEvent::new(session, 3, SessionEventKind::ProviderEvent {
@@ -1761,13 +1782,16 @@ fn checkpoint_stays_within_budget_after_many_finished_processes() {
 // the model moving on, so a command it is still waiting for must stay foreground.
 #[test]
 fn late_message_of_the_same_response_does_not_background_a_running_command() {
-    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    use borg_view::{
+        core::TranscriptCore,
+        entry::{Operation, TranscriptEntry},
+    };
     let session = Uuid::new_v4();
     let mut core = TranscriptCore::default();
     let tool_state = |core: &TranscriptCore| {
         (0..core.order.len())
             .find_map(|index| match &core.order[index] {
-                TranscriptEntry::Tool { execution, .. } => Some(execution.clone()),
+                TranscriptEntry::Operation(Operation { execution, .. }) => Some(execution.clone()),
                 _ => None,
             })
             .expect("tool row")

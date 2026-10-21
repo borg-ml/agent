@@ -1,5 +1,5 @@
 //! Transcript grouping authority, extracted from terminal semantics.
-use crate::entry::{ToolRunWindow, TranscriptEntry};
+use crate::entry::{OperationKind, ToolRunWindow, TranscriptEntry};
 use std::borrow::Cow;
 const TOOL_RUN_BOX_THRESHOLD: usize = 1;
 pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
@@ -161,40 +161,26 @@ pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
     )
 }
 pub fn is_reasoning_entry(entry: &TranscriptEntry) -> bool {
-    matches!(entry, TranscriptEntry::Tool { code_view: Some((language, _)), .. } if language == "reasoning")
+    entry
+        .operation()
+        .is_some_and(|operation| operation.kind == OperationKind::Reasoning)
 }
 
+/// Whether two operations are the same sort of work, so a run of them can
+/// fold into one counted row: tool calls by source and verb, lifecycle rows
+/// by title.
 pub fn same_action_type(left: &TranscriptEntry, right: &TranscriptEntry) -> bool {
-    match (left, right) {
-        (
-            TranscriptEntry::Tool {
-                source_name: left_source,
-                name: left_name,
-                ..
-            },
-            TranscriptEntry::Tool {
-                source_name: right_source,
-                name: right_name,
-                ..
-            },
-        ) => {
-            left_source == right_source
-                && tool_lifecycle_label(left_name, true) == tool_lifecycle_label(right_name, true)
+    let (Some(left), Some(right)) = (left.operation(), right.operation()) else {
+        return false;
+    };
+    left.kind == right.kind
+        && if left.kind.is_call() {
+            left.source == right.source
+                && tool_lifecycle_label(&left.label, true)
+                    == tool_lifecycle_label(&right.label, true)
+        } else {
+            left.label == right.label
         }
-        (
-            TranscriptEntry::Action {
-                kind: left_kind,
-                label: left_label,
-                ..
-            },
-            TranscriptEntry::Action {
-                kind: right_kind,
-                label: right_label,
-                ..
-            },
-        ) => left_kind == right_kind && left_label == right_label,
-        _ => false,
-    }
 }
 
 /// A run is every maximal sequence of consecutive operations.

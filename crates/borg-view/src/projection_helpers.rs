@@ -1,5 +1,5 @@
 //! Renderer-independent transcript event semantics.
-use crate::entry::TranscriptActionState;
+use crate::entry::ExecutionState;
 use borg_agent_runtime::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -252,13 +252,13 @@ pub fn subagent_action_projection(
 ) -> Option<SubagentActionProjection> {
     use SubagentLifecycle::*;
     let state = match agent.lifecycle() {
-        Starting | Running => TranscriptActionState::Running,
+        Starting | Running => ExecutionState::Running,
         WaitingOnWatchers | WaitingForApproval | Dormant | DormantInterrupted => {
-            TranscriptActionState::Waiting
+            ExecutionState::Waiting
         }
-        Ready => TranscriptActionState::Complete,
-        Stopped => TranscriptActionState::Stopped,
-        Failed => TranscriptActionState::Failed,
+        Ready => ExecutionState::Complete,
+        Stopped => ExecutionState::Stopped,
+        Failed => ExecutionState::Failed,
     };
     Some((
         "Agent".into(),
@@ -713,7 +713,7 @@ pub fn borg_lsp_workspace_diagnostics_view(output: &str) -> Option<String> {
     Some(rows.join("\n"))
 }
 
-pub type SubagentActionProjection = (String, String, Option<String>, TranscriptActionState);
+pub type SubagentActionProjection = (String, String, Option<String>, ExecutionState);
 
 pub fn context_compaction_progress_summary(kind: &str, payload: &serde_json::Value) -> String {
     let started = context_compaction_started(kind, payload);

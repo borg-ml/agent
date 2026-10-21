@@ -1,7 +1,7 @@
 use crate::{
     ViewReducer,
     core::TranscriptCore,
-    entry::TranscriptEntry,
+    entry::{Operation, TranscriptEntry},
     wire::{Cursor, SNAPSHOT_BYTES},
 };
 use anyhow::{Context, Result, ensure};
@@ -12,9 +12,8 @@ use std::collections::HashMap;
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointTextField {
     Message,
-    ToolInput,
-    ToolOutput,
-    ActionBody,
+    OperationInput,
+    OperationOutput,
     Activity,
     Information,
     Compaction,
@@ -60,7 +59,7 @@ struct Saved {
 fn read_checkpoint(bytes: &[u8]) -> Result<Saved> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
     let version = value.get("version").and_then(serde_json::Value::as_u64);
-    ensure!(matches!(version, Some(1 | 2)), "unknown checkpoint version");
+    ensure!(matches!(version, Some(1..=3)), "unknown checkpoint version");
     if version == Some(1) {
         let child_owners = value
             .pointer("/core/subagent_entries")
@@ -195,9 +194,87 @@ fn read_checkpoint(bytes: &[u8]) -> Result<Saved> {
         }
         value["version"] = serde_json::json!(2);
     }
+    if version != Some(3) {
+        migrate_operation_rows(&mut value)?;
+        value["version"] = serde_json::json!(3);
+    }
     let saved: Saved = serde_json::from_value(value)?;
-    ensure!(saved.version == 2, "unknown checkpoint version");
+    ensure!(saved.version == 3, "unknown checkpoint version");
     Ok(saved)
+}
+
+/// Version 3 stores tool calls and lifecycle rows as one `Operation` row.
+/// Older checkpoints hold them as separate `Tool` and `Action` rows, and name
+/// their saved text fields after those rows.
+fn migrate_operation_rows(value: &mut serde_json::Value) -> Result<()> {
+    use serde_json::{Value, json};
+    if let Some(entries) = value
+        .pointer_mut("/core/order/entries")
+        .and_then(Value::as_array_mut)
+    {
+        for entry in entries {
+            let Some((variant, mut row)) = entry.as_object_mut().and_then(|object| {
+                ["Tool", "Action"]
+                    .into_iter()
+                    .find_map(|variant| object.remove(variant).map(|row| (variant, row)))
+            }) else {
+                continue;
+            };
+            let row = row
+                .as_object_mut()
+                .context("operation row is not an object")?;
+            let mut take = |name: &str| row.remove(name).unwrap_or(Value::Null);
+            let operation = if variant == "Tool" {
+                let source = take("source_name");
+                let label = take("name");
+                let named = |value: &Value| value.as_str().unwrap_or_default().to_string();
+                let kind = match named(&source).as_str() {
+                    "reasoning" => "Reasoning",
+                    "action_preparing" => "Preparation",
+                    source
+                        if borg_agent_runtime::is_subagent_tool(source)
+                            || borg_agent_runtime::is_subagent_tool(&named(&label)) =>
+                    {
+                        "Delegation"
+                    }
+                    _ => "Tool",
+                };
+                json!({
+                    "kind": kind, "source": source, "label": label,
+                    "detail": take("detail"), "input": take("code_view"),
+                    "output": take("output_view"), "payload_refs": take("payload_refs"),
+                    "outcome": take("outcome"), "cwd": take("cwd"), "origin": null,
+                    "time": take("time"), "execution": take("execution"),
+                    "expanded": take("expanded"),
+                })
+            } else {
+                let body = take("body");
+                json!({
+                    "kind": take("kind"), "source": "", "label": take("label"),
+                    "detail": take("detail"), "input": null,
+                    "output": if body.is_null() { Value::Null } else { json!(["text", body]) },
+                    "payload_refs": [], "outcome": null, "cwd": null,
+                    "origin": take("source_session_id"), "time": take("time"),
+                    "execution": take("execution"), "expanded": take("expanded"),
+                })
+            };
+            *entry = json!({ "Operation": operation });
+        }
+    }
+    if let Some(texts) = value.pointer_mut("/texts").and_then(Value::as_array_mut) {
+        for text in texts {
+            if let Some(field) = text.get_mut("field")
+                && let Some(renamed) = match field.as_str() {
+                    Some("tool_input") => Some("operation_input"),
+                    Some("tool_output" | "action_body") => Some("operation_output"),
+                    _ => None,
+                }
+            {
+                *field = json!(renamed);
+            }
+        }
+    }
+    Ok(())
 }
 
 impl ViewReducer {
@@ -238,21 +315,14 @@ impl ViewReducer {
             };
             match entry {
                 TranscriptEntry::Message { text, .. } => add(Message, text),
-                TranscriptEntry::Tool {
-                    code_view,
-                    output_view,
-                    ..
-                } => {
-                    if let Some((_, text)) = code_view {
-                        add(ToolInput, text)
+                TranscriptEntry::Operation(Operation { input, output, .. }) => {
+                    if let Some((_, text)) = input {
+                        add(OperationInput, text)
                     }
-                    if let Some((_, text)) = output_view {
-                        add(ToolOutput, text)
+                    if let Some((_, text)) = output {
+                        add(OperationOutput, text)
                     }
                 }
-                TranscriptEntry::Action {
-                    body: Some(text), ..
-                } => add(ActionBody, text),
                 TranscriptEntry::Activity { text, .. } => add(Activity, text),
                 TranscriptEntry::Info { text, .. } => add(Information, text),
                 TranscriptEntry::Compaction { summary, .. } => add(Compaction, summary),
@@ -311,21 +381,14 @@ impl ViewReducer {
             };
             match entry {
                 TranscriptEntry::Message { text, .. } => take(CheckpointTextField::Message, text),
-                TranscriptEntry::Tool {
-                    code_view,
-                    output_view,
-                    ..
-                } => {
-                    if let Some((_, text)) = code_view {
-                        take(CheckpointTextField::ToolInput, text)
+                TranscriptEntry::Operation(Operation { input, output, .. }) => {
+                    if let Some((_, text)) = input {
+                        take(CheckpointTextField::OperationInput, text)
                     }
-                    if let Some((_, text)) = output_view {
-                        take(CheckpointTextField::ToolOutput, text)
+                    if let Some((_, text)) = output {
+                        take(CheckpointTextField::OperationOutput, text)
                     }
                 }
-                TranscriptEntry::Action {
-                    body: Some(text), ..
-                } => take(CheckpointTextField::ActionBody, text),
                 TranscriptEntry::Activity { text, .. } => take(CheckpointTextField::Activity, text),
                 TranscriptEntry::Info { text, .. } => take(CheckpointTextField::Information, text),
                 TranscriptEntry::Compaction { summary, .. } => {
@@ -359,7 +422,7 @@ impl ViewReducer {
             ));
         }
         let encoded = serde_json::to_vec(&Save {
-            version: 2,
+            version: 3,
             core: &self.core,
             cursor: &self.cursor,
             session_id: &self.session_id,
@@ -467,24 +530,18 @@ impl ViewReducer {
         let value = match (&mut self.core.order.entries[index], &reference.field) {
             (TranscriptEntry::Message { text, .. }, Message) => text,
             (
-                TranscriptEntry::Tool {
-                    code_view: Some((_, text)),
+                TranscriptEntry::Operation(Operation {
+                    input: Some((_, text)),
                     ..
-                },
-                ToolInput,
+                }),
+                OperationInput,
             ) => text,
             (
-                TranscriptEntry::Tool {
-                    output_view: Some((_, text)),
+                TranscriptEntry::Operation(Operation {
+                    output: Some((_, text)),
                     ..
-                },
-                ToolOutput,
-            ) => text,
-            (
-                TranscriptEntry::Action {
-                    body: Some(text), ..
-                },
-                ActionBody,
+                }),
+                OperationOutput,
             ) => text,
             (TranscriptEntry::Activity { text, .. }, Activity) => text,
             (TranscriptEntry::Info { text, .. }, Information) => text,
@@ -493,6 +550,107 @@ impl ViewReducer {
         };
         *value = text;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod operation_migration_tests {
+    use super::*;
+    use crate::entry::OperationKind;
+    use serde_json::json;
+
+    // Saved v2 checkpoints hold `Tool` and `Action` rows; the types cannot
+    // validate that legacy JSON, so pin the mapping onto `Operation` here.
+    #[test]
+    fn version_two_tool_and_action_rows_become_classified_operations() {
+        let execution = json!({"state": "Complete", "started_at": "2026-01-01T00:00:00Z", "completed_at": "2026-01-01T00:00:01Z"});
+        let tool = |source: &str, name: &str| {
+            json!({"Tool": {
+                "source_name": source, "name": name, "detail": "d",
+                "code_view": ["command", "ls"], "output_view": ["text", "out"],
+                "payload_refs": [], "time": "12:00", "execution": execution,
+                "expanded": true, "outcome": "ok", "cwd": "/tmp"
+            }})
+        };
+        let owner = uuid::Uuid::new_v4();
+        let mut value = json!({
+            "core": {"order": {"entries": [
+                tool("exec", "Run"),
+                tool("reasoning", "Reasoned"),
+                tool("action_preparing", "Generate"),
+                tool("spawn_agent", "Spawn agent"),
+                {"Action": {
+                    "kind": "Agent", "label": "Agent", "detail": "worker", "body": "report",
+                    "source_session_id": owner, "time": "12:00",
+                    "execution": execution, "expanded": false
+                }},
+                {"Action": {
+                    "kind": "Watch", "label": "Watch", "detail": "", "body": null,
+                    "source_session_id": null, "time": "12:00",
+                    "execution": execution, "expanded": false
+                }},
+            ]}},
+            "texts": [
+                {"row_id": "a", "revision": "1", "field": "tool_input", "bytes": 1},
+                {"row_id": "a", "revision": "1", "field": "tool_output", "bytes": 1},
+                {"row_id": "b", "revision": "1", "field": "action_body", "bytes": 1},
+                {"row_id": "c", "revision": "1", "field": "message", "bytes": 1},
+            ],
+        });
+        migrate_operation_rows(&mut value).unwrap();
+
+        let entries: Vec<TranscriptEntry> =
+            serde_json::from_value(value["core"]["order"]["entries"].clone()).unwrap();
+        let operations: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.operation().unwrap())
+            .collect();
+        assert_eq!(
+            operations
+                .iter()
+                .map(|operation| operation.kind)
+                .collect::<Vec<_>>(),
+            [
+                OperationKind::Tool,
+                OperationKind::Reasoning,
+                OperationKind::Preparation,
+                OperationKind::Delegation,
+                OperationKind::Agent,
+                OperationKind::Watch,
+            ]
+        );
+        let run = operations[0];
+        assert_eq!(
+            (
+                run.source.as_str(),
+                run.label.as_str(),
+                run.outcome.as_deref(),
+                run.cwd.as_deref()
+            ),
+            ("exec", "Run", Some("ok"), Some("/tmp"))
+        );
+        assert_eq!(run.input, Some(("command".into(), "ls".into())));
+        assert_eq!(run.output, Some(("text".into(), "out".into())));
+        let agent = operations[4];
+        assert_eq!(agent.origin, Some(owner));
+        assert_eq!(agent.body(), Some("report"));
+        assert_eq!(operations[5].output, None);
+
+        let fields: Vec<_> = value["texts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|text| text["field"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "operation_input",
+                "operation_output",
+                "operation_output",
+                "message"
+            ]
+        );
     }
 }
 
@@ -538,7 +696,8 @@ mod lifecycle_migration_tests {
             value["core"]["order"]["identities"] = serde_json::json!([[Uuid::new_v4(), 0]]);
             let bytes = serde_json::to_vec(&value).unwrap();
             let restored = ViewReducer::restore(&bytes, |_| unreachable!()).unwrap();
-            let TranscriptEntry::Tool { execution, .. } = &restored.core.order[0] else {
+            let TranscriptEntry::Operation(Operation { execution, .. }) = &restored.core.order[0]
+            else {
                 panic!("missing tool");
             };
             assert_eq!(execution.state(), expected);
@@ -569,7 +728,8 @@ mod lifecycle_migration_tests {
         value["core"]["order"]["identities"] = serde_json::json!([[Uuid::new_v4(), 0]]);
         let bytes = serde_json::to_vec(&value).unwrap();
         let restored = ViewReducer::restore(&bytes, |_| unreachable!()).unwrap();
-        let TranscriptEntry::Tool { execution, .. } = &restored.core.order[0] else {
+        let TranscriptEntry::Operation(Operation { execution, .. }) = &restored.core.order[0]
+        else {
             panic!("missing tool");
         };
         assert_eq!(execution.completed_at(), Some(start));
@@ -616,15 +776,16 @@ mod lifecycle_migration_tests {
             let restored =
                 ViewReducer::restore(&serde_json::to_vec(&value).unwrap(), |_| unreachable!())
                     .unwrap();
-            let (TranscriptEntry::Action { execution, .. }
+            let (TranscriptEntry::Operation(Operation { execution, .. })
             | TranscriptEntry::Compaction { execution, .. }
             | TranscriptEntry::Message { execution, .. }) = &restored.core.order[0]
             else {
                 panic!("missing action");
             };
-            if let TranscriptEntry::Action {
-                source_session_id, ..
-            } = &restored.core.order[0]
+            if let TranscriptEntry::Operation(Operation {
+                origin: source_session_id,
+                ..
+            }) = &restored.core.order[0]
             {
                 assert_eq!(*source_session_id, owner);
             }
