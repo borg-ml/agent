@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.18.2)
+## Unreleased (since 0.19.0)
+
+## 0.19.0 (2026-10-21)
 
 - Scrolling up a little no longer loads older history; it loads only when you
   are near the oldest loaded message.
