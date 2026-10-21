@@ -79,6 +79,44 @@ fn line_is_unstyled_blank(line: &Line<'static>) -> bool {
     line.spans.is_empty()
 }
 
+/// How one transcript row ends: the shared bookkeeping every row kind does
+/// once its lines are built.
+struct RowClose {
+    index: usize,
+    /// First line of the row, as clicks and selections see it.
+    start: usize,
+    /// First line the hover tint covers.
+    hover_from: usize,
+    hovered: bool,
+    /// Rows inside a run are selected by their visible slice, not by text offset.
+    nested: bool,
+    /// Whether a blank line follows the row.
+    gap: bool,
+}
+
+fn close_row(
+    lines: &mut Vec<Line<'static>>,
+    entry_rows: &mut Vec<RowRange>,
+    selection_rows: &mut Vec<SelectionRowRange>,
+    width: usize,
+    close: RowClose,
+) {
+    if close.hovered {
+        for line in &mut lines[close.hover_from..] {
+            apply_line_background(line, width, MESSAGE_HOVER_BG);
+        }
+    }
+    entry_rows.push((close.index, close.start, lines.len()));
+    selection_rows.push(if close.nested {
+        SelectionRowRange::nested_entry(close.index, close.start, lines.len(), 0)
+    } else {
+        SelectionRowRange::transcript_entry(close.index, close.start, lines.len())
+    });
+    if close.gap {
+        lines.push(Line::default());
+    }
+}
+
 fn message_badge_colors(color: Color) -> (Color, Color) {
     match color {
         Color::Rgb(red, green, blue) => {
@@ -3147,32 +3185,30 @@ impl Transcript {
                             ]));
                         }
                     }
-                    if hovered_entry == Some(index) {
-                        for line in &mut lines[action_start..] {
-                            apply_line_background(line, width, MESSAGE_HOVER_BG);
-                        }
-                    }
-                    entry_rows.push((index, entry_start, lines.len()));
-                    selection_rows.push(if tool_window.is_some() {
-                        SelectionRowRange::nested_entry(index, entry_start, lines.len(), 0)
-                    } else {
-                        SelectionRowRange::transcript_entry(index, entry_start, lines.len())
-                    });
-                    // Close a run of tool and action rows with the same gap a tool
-                    // row leaves, and none between rows of the run.
+                    // A run of operations closes with one gap, none between its rows.
                     let next_in_run = focused_tool.is_none()
                         && self
                             .order
                             .get(index + 1)
                             .is_some_and(TranscriptEntry::is_operation);
-                    if tool_window.is_none()
-                        && !next_in_run
-                        && lines
-                            .last()
-                            .is_none_or(|line| !line_is_unstyled_blank(line))
-                    {
-                        lines.push(Line::default());
-                    }
+                    close_row(
+                        lines,
+                        entry_rows,
+                        selection_rows,
+                        width,
+                        RowClose {
+                            index,
+                            start: entry_start,
+                            hover_from: action_start,
+                            hovered: hovered_entry == Some(index),
+                            nested: tool_window.is_some(),
+                            gap: tool_window.is_none()
+                                && !next_in_run
+                                && lines
+                                    .last()
+                                    .is_none_or(|line| !line_is_unstyled_blank(line)),
+                        },
+                    );
                 }
                 TranscriptEntry::Plan {
                     items,
@@ -3274,18 +3310,20 @@ impl Transcript {
                             Style::default().fg(Color::DarkGray),
                         )));
                     }
-                    if hovered_entry == Some(index) {
-                        for line in &mut lines[entry_start..] {
-                            apply_line_background(line, width, MESSAGE_HOVER_BG);
-                        }
-                    }
-                    entry_rows.push((index, entry_start, lines.len()));
-                    selection_rows.push(SelectionRowRange::transcript_entry(
-                        index,
-                        entry_start,
-                        lines.len(),
-                    ));
-                    lines.push(Line::default());
+                    close_row(
+                        lines,
+                        entry_rows,
+                        selection_rows,
+                        width,
+                        RowClose {
+                            index,
+                            start: entry_start,
+                            hover_from: entry_start,
+                            hovered: hovered_entry == Some(index),
+                            nested: false,
+                            gap: true,
+                        },
+                    );
                 }
                 TranscriptEntry::Goal { goal, time } => {
                     let time = display_local_time(time, &today_prefix);
@@ -3326,18 +3364,20 @@ impl Transcript {
                             Span::styled(line, objective_style),
                         ]));
                     }
-                    if hovered_entry == Some(index) {
-                        for line in &mut lines[entry_start..] {
-                            apply_line_background(line, width, MESSAGE_HOVER_BG);
-                        }
-                    }
-                    entry_rows.push((index, entry_start, lines.len()));
-                    selection_rows.push(SelectionRowRange::transcript_entry(
-                        index,
-                        entry_start,
-                        lines.len(),
-                    ));
-                    lines.push(Line::default());
+                    close_row(
+                        lines,
+                        entry_rows,
+                        selection_rows,
+                        width,
+                        RowClose {
+                            index,
+                            start: entry_start,
+                            hover_from: entry_start,
+                            hovered: hovered_entry == Some(index),
+                            nested: false,
+                            gap: true,
+                        },
+                    );
                 }
                 TranscriptEntry::Info { title, text, time } => {
                     let time = display_local_time(time, &today_prefix);
@@ -3356,18 +3396,20 @@ impl Transcript {
                             Span::styled(line, Style::default().fg(Color::Gray)),
                         ]));
                     }
-                    if hovered_entry == Some(index) {
-                        for line in &mut lines[entry_start..] {
-                            apply_line_background(line, width, MESSAGE_HOVER_BG);
-                        }
-                    }
-                    entry_rows.push((index, entry_start, lines.len()));
-                    selection_rows.push(SelectionRowRange::transcript_entry(
-                        index,
-                        entry_start,
-                        lines.len(),
-                    ));
-                    lines.push(Line::default());
+                    close_row(
+                        lines,
+                        entry_rows,
+                        selection_rows,
+                        width,
+                        RowClose {
+                            index,
+                            start: entry_start,
+                            hover_from: entry_start,
+                            hovered: hovered_entry == Some(index),
+                            nested: false,
+                            gap: true,
+                        },
+                    );
                 }
                 TranscriptEntry::Compaction {
                     summary,
@@ -3417,18 +3459,20 @@ impl Transcript {
                             lines.push(Line::from(spans));
                         }
                     }
-                    if hovered_entry == Some(index) {
-                        for line in &mut lines[entry_start..] {
-                            apply_line_background(line, width, MESSAGE_HOVER_BG);
-                        }
-                    }
-                    entry_rows.push((index, entry_start, lines.len()));
-                    selection_rows.push(SelectionRowRange::transcript_entry(
-                        index,
-                        entry_start,
-                        lines.len(),
-                    ));
-                    lines.push(Line::default());
+                    close_row(
+                        lines,
+                        entry_rows,
+                        selection_rows,
+                        width,
+                        RowClose {
+                            index,
+                            start: entry_start,
+                            hover_from: entry_start,
+                            hovered: hovered_entry == Some(index),
+                            nested: false,
+                            gap: true,
+                        },
+                    );
                 }
                 TranscriptEntry::Tool {
                     source_name,
