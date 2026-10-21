@@ -79,6 +79,25 @@ fn line_is_unstyled_blank(line: &Line<'static>) -> bool {
     line.spans.is_empty()
 }
 
+/// A block's header: an accent bar and title, then dim metadata.
+fn card_header(accent: Color, title: &str, meta: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("▌ {title}"),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(meta, Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+/// A block's wrapped text, indented under its header.
+fn card_text_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    wrap_display(text, width.saturating_sub(4))
+        .into_iter()
+        .map(|line| Line::from(vec![Span::raw("  "), Span::styled(line, style)]))
+        .collect()
+}
+
 /// How one transcript row ends: the shared bookkeeping every row kind does
 /// once its lines are built.
 struct RowClose {
@@ -169,6 +188,88 @@ fn extend_tool_lifecycle_spans(
     if lifecycle_end < text.len() {
         spans.push(Span::styled(text[lifecycle_end..].to_string(), style));
     }
+}
+
+/// The header line(s) of one operation row, shared by tool calls and every
+/// other kind of action so they cannot drift apart.
+struct OperationHeader<'a> {
+    /// Already formatted, with its trailing gap; empty inside a run.
+    time: &'a str,
+    glyph: &'a str,
+    name: &'a str,
+    /// Empty when the header is just the glyph and name.
+    detail: &'a str,
+    /// A trailing ` · note`, such as a lifecycle state or a message preview.
+    suffix: Option<&'a str>,
+    /// Right-aligned outcome and elapsed time.
+    right: Option<&'a str>,
+    gutter_style: Style,
+    glyph_style: Style,
+    name_style: Style,
+    /// Colour the name's verb as background work.
+    background_verb: bool,
+    /// Colour the suffix as background work.
+    background_suffix: bool,
+}
+
+fn operation_header_lines(
+    header: &OperationHeader<'_>,
+    prefix: &str,
+    width: usize,
+    wrap: bool,
+) -> Vec<Line<'static>> {
+    let OperationHeader {
+        time, glyph, name, detail, ..
+    } = *header;
+    let mut summary = if detail.is_empty() {
+        format!("{time}{glyph} {name}")
+    } else {
+        format!("{time}{glyph} {name:<9}  {detail}")
+    };
+    if let Some(suffix) = header.suffix {
+        summary.push_str(&format!(" · {suffix}"));
+    }
+    let mut lines = Vec::new();
+    for (line_index, line) in tool_summary_lines(&summary, header.right, prefix, width, wrap)
+        .into_iter()
+        .enumerate()
+    {
+        let mut spans = vec![Span::styled(prefix.to_string(), header.gutter_style)];
+        let rest = match line.find(name) {
+            Some(name_start) if line_index == 0 => {
+                spans.push(Span::styled(
+                    line[..name_start].to_string(),
+                    header.glyph_style,
+                ));
+                if header.background_verb {
+                    let verb_end = name.find(' ').unwrap_or(name.len());
+                    let (verb, rest) = name.split_at(verb_end);
+                    spans.push(Span::styled(
+                        verb.to_string(),
+                        Style::default()
+                            .fg(BACKGROUND_RUNNING_TEXT)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    if !rest.is_empty() {
+                        spans.push(Span::styled(rest.to_string(), header.name_style));
+                    }
+                } else {
+                    spans.push(Span::styled(name.to_string(), header.name_style));
+                }
+                line[name_start + name.len()..].to_string()
+            }
+            _ => line,
+        };
+        extend_tool_lifecycle_spans(
+            &mut spans,
+            &rest,
+            header.suffix,
+            header.glyph_style,
+            header.background_suffix,
+        );
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 struct Transcript {
@@ -3128,36 +3229,37 @@ impl Transcript {
                     let prefix = "  ";
                     let glyph = transcript_action_glyph(execution.state());
                     let color = transcript_action_color(*kind, execution.state());
-                    let mut summary = if detail.is_empty() {
-                        format!("{time}{glyph} {label}")
-                    } else {
-                        format!("{time}{glyph} {label:<9}  {detail}")
-                    };
                     // A single-line row still says what the message is about.
-                    if !self.wrap_action_rows
+                    let preview = (!self.wrap_action_rows
                         && *kind == TranscriptActionKind::Agent
                         && !*expanded
-                        && focused_tool.is_none()
-                        && let Some(first) = body
-                            .as_deref()
+                        && focused_tool.is_none())
+                    .then(|| {
+                        body.as_deref()
                             .and_then(|body| body.lines().find(|line| !line.trim().is_empty()))
-                    {
-                        summary.push_str(" · ");
-                        summary.push_str(first.trim());
-                    }
+                            .map(str::trim)
+                    })
+                    .flatten();
                     let action_start = lines.len();
-                    for line in tool_summary_lines(
-                        &summary,
-                        None,
+                    let style = Style::default().fg(color);
+                    lines.extend(operation_header_lines(
+                        &OperationHeader {
+                            time: &time,
+                            glyph,
+                            name: label,
+                            detail,
+                            suffix: preview,
+                            right: None,
+                            gutter_style: Style::default().fg(Color::DarkGray),
+                            glyph_style: style,
+                            name_style: style,
+                            background_verb: false,
+                            background_suffix: false,
+                        },
                         prefix,
-                        width.saturating_sub(2),
+                        width,
                         self.wrap_action_rows,
-                    ) {
-                        lines.push(Line::from(vec![
-                            Span::styled(prefix, Style::default().fg(Color::DarkGray)),
-                            Span::styled(line, Style::default().fg(color)),
-                        ]));
-                    }
+                    ));
                     if (*expanded
                         || focused_tool == Some(index)
                         || (self.wrap_action_rows && *kind == TranscriptActionKind::Agent))
@@ -3227,18 +3329,11 @@ impl Transcript {
                     } else {
                         format!(" · {dropped} removed")
                     };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            "▌ Plan",
-                            Style::default()
-                                .fg(TODO_ORANGE)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            format!("  {time}  {done}/{} completed{dropped}", items.len()),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
+                    lines.push(card_header(
+                        TODO_ORANGE,
+                        "Plan",
+                        format!("  {time}  {done}/{} completed{dropped}", items.len()),
+                    ));
                     // Collapsed, the card is a change log: a long plan whose
                     // newest row is its most important one must not hide that
                     // row behind unchanged leading steps.
@@ -3331,26 +3426,16 @@ impl Transcript {
                         trace.clock_rows.push(index);
                     }
                     let live_time = goal_live_seconds(goal, render_time);
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            "▌ Goal",
-                            Style::default()
-                                .fg(TODO_ORANGE)
-                                .add_modifier(Modifier::BOLD),
+                    lines.push(card_header(
+                        TODO_ORANGE,
+                        "Goal",
+                        format_elapsed_duration(live_time).map_or_else(
+                            || format!("  {time}  {}", goal_status_label(goal.status)),
+                            |duration| {
+                                format!("  {time}  {} · {duration}", goal_status_label(goal.status))
+                            },
                         ),
-                        Span::styled(
-                            format_elapsed_duration(live_time).map_or_else(
-                                || format!("  {time}  {}", goal_status_label(goal.status)),
-                                |duration| {
-                                    format!(
-                                        "  {time}  {} · {duration}",
-                                        goal_status_label(goal.status)
-                                    )
-                                },
-                            ),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
+                    ));
                     let objective_style = if goal.status == GoalStatus::Complete {
                         Style::default()
                             .fg(Color::DarkGray)
@@ -3358,12 +3443,7 @@ impl Transcript {
                     } else {
                         Style::default().fg(Color::White)
                     };
-                    for line in wrap_display(&goal.objective, width.saturating_sub(4)) {
-                        lines.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled(line, objective_style),
-                        ]));
-                    }
+                    lines.extend(card_text_lines(&goal.objective, width, objective_style));
                     close_row(
                         lines,
                         entry_rows,
@@ -3381,21 +3461,16 @@ impl Transcript {
                 }
                 TranscriptEntry::Info { title, text, time } => {
                     let time = display_local_time(time, &today_prefix);
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("▌ {}", title.to_ascii_uppercase()),
-                            Style::default()
-                                .fg(Color::LightCyan)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(format!("  {time}"), Style::default().fg(Color::DarkGray)),
-                    ]));
-                    for line in wrap_display(text, width.saturating_sub(4)) {
-                        lines.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled(line, Style::default().fg(Color::Gray)),
-                        ]));
-                    }
+                    lines.push(card_header(
+                        Color::LightCyan,
+                        &title.to_ascii_uppercase(),
+                        format!("  {time}"),
+                    ));
+                    lines.extend(card_text_lines(
+                        text,
+                        width,
+                        Style::default().fg(Color::Gray),
+                    ));
                     close_row(
                         lines,
                         entry_rows,
@@ -3436,17 +3511,11 @@ impl Transcript {
                     } else {
                         String::new()
                     };
-                    lines.push(Line::from(vec![
-                        Span::styled("▌ ", Style::default().fg(BORG_ORANGE)),
-                        Span::styled(
-                            title,
-                            Style::default()
-                                .fg(BORG_ORANGE)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(detail, Style::default().fg(Color::DarkGray)),
-                        Span::styled(format!("  {time}"), Style::default().fg(Color::DarkGray)),
-                    ]));
+                    lines.push(card_header(
+                        BORG_ORANGE,
+                        &title,
+                        format!("{detail}  {time}"),
+                    ));
                     if (*expanded || focused_tool == Some(index)) && expandable {
                         let detail = summary
                             .strip_prefix("Compacted context: ")
@@ -3567,16 +3636,6 @@ impl Transcript {
                     let body_states_action = code_view.as_ref().is_some_and(|(language, _)| {
                         language == "command" || is_diff_language(language)
                     });
-                    let mut summary = if display_detail.is_empty()
-                        || (focused_tool == Some(index) && body_states_action)
-                    {
-                        format!("{time}{glyph} {display_name}")
-                    } else {
-                        format!("{time}{glyph} {display_name:<9}  {display_detail}")
-                    };
-                    if let Some(lifecycle) = lifecycle {
-                        summary.push_str(&format!(" · {lifecycle}"));
-                    }
                     let prefix = "  ";
                     let elapsed = format_tool_elapsed_at(
                         execution.started_at(),
@@ -3594,59 +3653,31 @@ impl Transcript {
                     if !execution.is_terminal() {
                         running_tool_elapsed.push((index, elapsed.clone()));
                     }
-                    for (line_index, line) in tool_summary_lines(
-                        &summary,
-                        right.as_deref(),
+                    let header_detail = if display_detail.is_empty()
+                        || (focused_tool == Some(index) && body_states_action)
+                    {
+                        ""
+                    } else {
+                        display_detail.as_str()
+                    };
+                    lines.extend(operation_header_lines(
+                        &OperationHeader {
+                            time: &time,
+                            glyph,
+                            name: display_name.as_ref(),
+                            detail: header_detail,
+                            suffix: lifecycle,
+                            right: right.as_deref(),
+                            gutter_style,
+                            glyph_style: style,
+                            name_style,
+                            background_verb: execution.is_backgrounded() && !is_reasoning,
+                            background_suffix: execution.is_backgrounded(),
+                        },
                         prefix,
                         width,
                         self.wrap_action_rows,
-                    )
-                    .into_iter()
-                    .enumerate()
-                    {
-                        if line_index == 0
-                            && let Some(name_start) = line.find(display_name.as_ref())
-                        {
-                            let name_end = name_start + display_name.len();
-                            let mut spans = vec![
-                                Span::styled(prefix.to_string(), gutter_style),
-                                Span::styled(line[..name_start].to_string(), style),
-                            ];
-                            if execution.is_backgrounded() && !is_reasoning {
-                                let verb_end = display_name.find(' ').unwrap_or(display_name.len());
-                                let (verb, rest) = display_name.split_at(verb_end);
-                                spans.push(Span::styled(
-                                    verb.to_string(),
-                                    Style::default()
-                                        .fg(BACKGROUND_RUNNING_TEXT)
-                                        .add_modifier(Modifier::BOLD),
-                                ));
-                                if !rest.is_empty() {
-                                    spans.push(Span::styled(rest.to_string(), name_style));
-                                }
-                            } else {
-                                spans.push(Span::styled(display_name.to_string(), name_style));
-                            }
-                            extend_tool_lifecycle_spans(
-                                &mut spans,
-                                &line[name_end..],
-                                lifecycle,
-                                style,
-                                execution.is_backgrounded(),
-                            );
-                            lines.push(Line::from(spans));
-                        } else {
-                            let mut spans = vec![Span::styled(prefix.to_string(), gutter_style)];
-                            extend_tool_lifecycle_spans(
-                                &mut spans,
-                                &line,
-                                lifecycle,
-                                style,
-                                execution.is_backgrounded(),
-                            );
-                            lines.push(Line::from(spans));
-                        }
-                    }
+                    ));
                     if hovered_tool == Some(index) {
                         for line in &mut lines[summary_start..] {
                             apply_line_background(line, width, MESSAGE_HOVER_BG);

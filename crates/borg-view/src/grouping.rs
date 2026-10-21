@@ -1,5 +1,5 @@
 //! Transcript grouping authority, extracted from terminal semantics.
-use crate::entry::{ToolRunWindow, TranscriptActionKind, TranscriptEntry};
+use crate::entry::{ToolRunWindow, TranscriptEntry};
 use std::borrow::Cow;
 const TOOL_RUN_BOX_THRESHOLD: usize = 1;
 pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {

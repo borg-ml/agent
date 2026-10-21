@@ -13,6 +13,9 @@ Git comparison.
   when you are near the oldest loaded message.
 - Every run of consecutive tool, agent, watch, approval and error rows now
   groups the same way, and the old plain-text agent note row is gone.
+- Tool, agent, watch and error rows now share one header renderer, so agent
+  and watch rows use the same width as tool rows; plan, goal, info and
+  compaction cards share one header style.
 - Group consecutive agent messages into a collapsible run even when no tool
   call sits between them.
 - Left-click on a running action now opens it like any other action;
