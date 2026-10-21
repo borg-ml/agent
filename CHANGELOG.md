@@ -5,27 +5,22 @@ Git comparison.
 
 ## Unreleased (since 0.18.2)
 
-- Log an error and save thread stacks to `~/.borg/logs/runtime-stall-*.txt`
-  when Borg's async runtime stops running timer-woken tasks for 30 seconds.
-- Show agent and peer messages as one line like other actions, previewing
-  the message's first line; click to expand the full text.
+- Scrolling up a little no longer loads older history; it loads only when you
+  are near the oldest loaded message.
+- Consecutive agent, watch, approval, error and tool rows now fold into one
+  collapsible run, even when no tool call sits between them, and every kind of
+  row follows the same grouping, spacing and header rules.
+- Agent and peer messages show as one line like other actions, previewing the
+  message's first line; click to expand the full text. Agent and watch rows now
+  use the same width and body style as tool rows, and one-line notes such as
+  "goal cleared" get the same spacing as other blocks.
+- Left-click on a running action opens it like any other action; right-click
+  sends it to the background. Clicks no longer get lost when new output scrolls
+  the conversation between press and release.
 - Tool calls and agent, watch, approval and error rows are now one typed
   operation row. Saved view checkpoints upgrade to the new format on load.
-- Scrolling up a little no longer loads older history; it now loads only
-  when you are near the oldest loaded message.
-- Every run of consecutive tool, agent, watch, approval and error rows now
-  groups the same way, and the old plain-text agent note row is gone.
-- Agent and watch message bodies are drawn by the same renderer as tool
-  output, and one-line notes such as "goal cleared" get the same spacing as
-  other blocks.
-- Tool, agent, watch and error rows now share one header renderer, so agent
-  and watch rows use the same width as tool rows; plan, goal, info and
-  compaction cards share one header style.
-- Group consecutive agent messages into a collapsible run even when no tool
-  call sits between them.
-- Left-click on a running action now opens it like any other action;
-  right-click sends it to the background. Clicks no longer get lost when new
-  output scrolls the conversation between press and release.
+- Log an error and save thread stacks to `~/.borg/logs/runtime-stall-*.txt`
+  when Borg's async runtime stops running timer-woken tasks for 30 seconds.
 
 ## 0.18.2 (2026-10-20)
 
