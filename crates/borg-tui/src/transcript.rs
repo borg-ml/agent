@@ -392,17 +392,21 @@ fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: 
     let mut time = None;
     let mut cwd = None;
     for entry in entries {
-        let TranscriptEntry::Tool {
-            time: row_time,
-            cwd: row_cwd,
-            ..
-        } = entry
-        else {
-            continue;
-        };
-        time.get_or_insert(row_time.as_str());
-        if row_cwd.is_some() {
-            cwd = row_cwd.as_deref();
+        match entry {
+            TranscriptEntry::Tool {
+                time: row_time,
+                cwd: row_cwd,
+                ..
+            } => {
+                time.get_or_insert(row_time.as_str());
+                if row_cwd.is_some() {
+                    cwd = row_cwd.as_deref();
+                }
+            }
+            TranscriptEntry::Action { time: row_time, .. } => {
+                time.get_or_insert(row_time.as_str());
+            }
+            _ => {}
         }
     }
     let mut parts: Vec<String> = Vec::new();

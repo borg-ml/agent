@@ -9,6 +9,8 @@ Git comparison.
   when Borg's async runtime stops running timer-woken tasks for 30 seconds.
 - Show agent and peer messages as one line like other actions, previewing
   the message's first line; click to expand the full text.
+- Group consecutive agent messages into a collapsible run even when no tool
+  call sits between them.
 - Left-click on a running action now opens it like any other action;
   right-click sends it to the background. Clicks no longer get lost when new
   output scrolls the conversation between press and release.

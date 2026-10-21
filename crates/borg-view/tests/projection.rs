@@ -493,7 +493,8 @@ fn worker_lifecycle_is_independent_of_reports_and_stale_deliveries() {
             .iter()
             .all(|row| row.source_session_id == parent.to_string())
     );
-    assert!(snapshot.rows.iter().all(|row| matches!(&row.body, RowBody::ActionGroup { actions, .. }
+    // The two lifecycle receipts form a run, so a group row summarises them.
+    assert!(snapshot.rows.iter().filter(|row| !matches!(&row.body, RowBody::ActionGroup { actions, .. } if actions.is_empty())).all(|row| matches!(&row.body, RowBody::ActionGroup { actions, .. }
         if matches!(&actions[0], borg_view::wire::ActionRow::Lifecycle { target_session_id: Some(target), .. } if target == &child.to_string()))));
     assert_eq!(live.core.subagents[&child], SubagentStatus::Running);
 }

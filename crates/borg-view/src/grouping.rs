@@ -201,7 +201,14 @@ pub fn tool_run_windows(entries: &[TranscriptEntry]) -> Vec<Option<ToolRunWindow
     let mut windows = vec![None; entries.len()];
     let mut index = 0;
     while index < entries.len() {
-        if !matches!(entries[index], TranscriptEntry::Tool { .. }) {
+        if !matches!(
+            entries[index],
+            TranscriptEntry::Tool { .. }
+                | TranscriptEntry::Action {
+                    kind: TranscriptActionKind::Agent,
+                    ..
+                }
+        ) {
             index += 1;
             continue;
         }

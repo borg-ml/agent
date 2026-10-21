@@ -19803,6 +19803,35 @@ fn reasoning_started_provider_event_changes_the_transcript() {
 }
 
 #[test]
+fn consecutive_agent_messages_group_without_a_tool_row() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    for sequence in 1..=4 {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::AgentMessageReceived {
+                message_id: Uuid::new_v4(),
+                sender_id: Uuid::new_v4(),
+                sender_name: format!("worker_{sequence}"),
+                text: format!("Progress {sequence}"),
+                from_child: Some(true),
+            },
+        ));
+    }
+    let windows = transcript.tool_run_windows();
+    assert!(windows.iter().all(Option::is_some));
+    assert_eq!(windows[0].unwrap().total, 4);
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("4 actions"), "{rendered}");
+}
+
+#[test]
 fn incoming_agent_messages_are_visible_without_subagent_opt_in() {
     for from_child in [Some(true), Some(false), None] {
         let label = if from_child == Some(true) {
@@ -19840,11 +19869,16 @@ fn incoming_agent_messages_are_visible_without_subagent_opt_in() {
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
         assert!(
-            single.iter().any(|line| line.contains(&format!("↙ {label}"))
-                && line.contains("steer orphaning confirmed")),
+            single
+                .iter()
+                .any(|line| line.contains(&format!("↙ {label}"))
+                    && line.contains("steer orphaning confirmed")),
             "{single:?}"
         );
-        assert!(!single.iter().any(|line| line.contains("Second line")), "{single:?}");
+        assert!(
+            !single.iter().any(|line| line.contains("Second line")),
+            "{single:?}"
+        );
         transcript.wrap_action_rows = true;
         let rendered = transcript
             .lines(100)
@@ -21777,7 +21811,11 @@ async fn running_action_right_click_backgrounds_and_left_click_inspects() {
             .unwrap()
     };
     let pressed = area(&terminal);
-    mouse(&mut terminal, pressed, MouseEventKind::Down(MouseButton::Left));
+    mouse(
+        &mut terminal,
+        pressed,
+        MouseEventKind::Down(MouseButton::Left),
+    );
     // Output arriving between press and release must not turn the click into a selection.
     terminal.apply_session_event(&SessionEvent::new(
         session,
@@ -21793,7 +21831,11 @@ async fn running_action_right_click_backgrounds_and_left_click_inspects() {
     ));
     terminal.draw().unwrap();
     assert!(matches!(
-        mouse(&mut terminal, pressed, MouseEventKind::Up(MouseButton::Left)),
+        mouse(
+            &mut terminal,
+            pressed,
+            MouseEventKind::Up(MouseButton::Left)
+        ),
         UiAction::None
     ));
     assert!(terminal.is_inspecting_action());
