@@ -4794,6 +4794,12 @@ impl BorgTerminal {
                 child_event.created_at,
             );
         }
+        if matches!(child_event.kind, SessionEventKind::TurnStarted { .. }) {
+            self.child_activity_clocks
+                .entry(child_id)
+                .or_default()
+                .begin_child_turn(child_event.created_at);
+        }
         if self.focused_child == Some(child_id)
             && (matches!(child_event.kind, SessionEventKind::TurnStarted { .. })
                 || matches!(
@@ -5146,6 +5152,17 @@ impl BorgTerminal {
                     status,
                     event.created_at,
                 );
+            }
+            if matches!(event.kind, SessionEventKind::TurnStarted { .. })
+                && matches!(
+                    self.child_statuses.get(&child_id),
+                    Some(SessionStatus::Starting | SessionStatus::Running)
+                )
+            {
+                self.child_activity_clocks
+                    .entry(child_id)
+                    .or_default()
+                    .begin_child_turn(event.created_at);
             }
             update_queued_prompts(
                 self.child_queued_prompts.entry(child_id).or_default(),
@@ -13253,6 +13270,13 @@ impl ActivityClock {
                 .signed_duration_since(started_at)
                 .max(chrono::Duration::zero());
         }
+    }
+
+    /// A child's turn began at `at`. Unlike `restart`, this replaces a start
+    /// time seeded from the child's creation, which may be days old.
+    fn begin_child_turn(&mut self, at: DateTime<Utc>) {
+        self.elapsed = chrono::Duration::zero();
+        self.started_at = Some(at);
     }
 
     fn status_duration(&self, now: DateTime<Utc>) -> Option<String> {

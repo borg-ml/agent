@@ -9,6 +9,9 @@ Git comparison.
   example a 2560x1440 screenshot). The image is re-encoded as JPEG, and scaled
   down only if quality alone cannot fit, so it is delivered to local and remote
   recipients; only an undecodable image or a file over 50 MiB is refused.
+- A subagent's running time in the status bar now counts from its current turn,
+  not from when the subagent was created (it could show weeks for a long-lived
+  agent).
 
 ## 0.19.0 (2026-10-21)
 

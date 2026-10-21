@@ -1900,6 +1900,15 @@ fn a_new_turn_times_from_zero_after_waiting() {
 }
 
 #[test]
+fn a_child_turn_replaces_a_start_time_seeded_from_its_creation() {
+    let now = Utc::now();
+    let mut clock = ActivityClock::default();
+    clock.observe(SessionStatus::Running, now - chrono::Duration::days(43));
+    clock.begin_child_turn(now - chrono::Duration::minutes(3));
+    assert_eq!(clock.status_duration(now).as_deref(), Some("3m"));
+}
+
+#[test]
 fn running_status_retains_total_when_another_run_starts() {
     let started = Utc::now() - chrono::Duration::minutes(8);
     let mut clock = ActivityClock::default();
