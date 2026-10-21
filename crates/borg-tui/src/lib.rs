@@ -3650,14 +3650,12 @@ impl BorgTerminal {
             return false;
         }
         let viewport_height = self.transcript_viewport_area.map_or(12, |area| area.height);
-        let should_load = should_load_history_page(
+        should_load_history_page(
             self.transcript.follow_tail,
             self.scroll_from_bottom,
             self.transcript_scroll_max,
             usize::from(viewport_height),
-        );
-        if should_load {}
-        should_load
+        )
     }
 
     pub fn set_history_page_loading(&mut self, loading: bool) {

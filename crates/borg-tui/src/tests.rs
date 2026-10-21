@@ -15189,7 +15189,7 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
         let mut entry = tool(index, false);
         if let TranscriptEntry::Operation(Operation {
             source: source_name,
-            label: label,
+            label,
             ..
         }) = &mut entry
         {

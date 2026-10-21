@@ -1846,9 +1846,7 @@ impl Transcript {
     }
 
     fn tool_run_start_containing(&self, index: usize) -> Option<usize> {
-        if self.order.call(index).is_none() {
-            return None;
-        }
+        self.order.call(index)?;
         self.tool_run_windows()[index].map(|window| window.start)
     }
 
