@@ -609,11 +609,11 @@ fn resumed_history_keeps_child_and_peer_messages_in_order() {
     assert_eq!(visible, ["before", "child report", "peer report", "after"]);
     assert!(matches!(
         &transcript.order[1],
-        TranscriptEntry::Action { label, expanded: true, .. } if label == "Agent"
+        TranscriptEntry::Action { label, expanded: false, .. } if label == "Agent"
     ));
     assert!(matches!(
         &transcript.order[2],
-        TranscriptEntry::Action { label, expanded: true, .. } if label == "Peer"
+        TranscriptEntry::Action { label, expanded: false, .. } if label == "Peer"
     ));
     assert!(transcript.subagent_snapshots.contains_key(&child));
     assert_eq!(
@@ -18186,7 +18186,7 @@ fn fullscreen_non_tool_details_expand_without_mutating_inline_state() {
         kind: TranscriptActionKind::Agent,
         label: "Agent".into(),
         detail: "summary".into(),
-        body: Some("ACTION_BODY".into()),
+        body: Some("preview\nACTION_BODY".into()),
         time: "12:00".into(),
         execution: Execution::new(Utc::now(), TranscriptActionState::Complete),
         expanded: false,
@@ -19833,18 +19833,18 @@ fn incoming_agent_messages_are_visible_without_subagent_opt_in() {
             transcript.subagent_snapshots.is_empty(),
             "a receipt must not invent child ownership"
         );
-        // The sender and complete message are visible by default.
+        // One line names the sender and previews the message, like other actions.
         let single = transcript
             .lines(100)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
         assert!(
-            single
-                .iter()
-                .any(|line| line.contains(&format!("↙ {label}"))),
+            single.iter().any(|line| line.contains(&format!("↙ {label}"))
+                && line.contains("steer orphaning confirmed")),
             "{single:?}"
         );
+        assert!(!single.iter().any(|line| line.contains("Second line")), "{single:?}");
         transcript.wrap_action_rows = true;
         let rendered = transcript
             .lines(100)
@@ -19854,7 +19854,6 @@ fn incoming_agent_messages_are_visible_without_subagent_opt_in() {
             .join("\n");
         assert!(rendered.contains(label), "{rendered}");
         assert!(rendered.contains("steer orphaning confirmed"), "{rendered}");
-        assert!(rendered.contains("REPORT_END"), "{rendered}");
         assert!(
             !rendered.contains("click to open full screen"),
             "{rendered}"
@@ -19878,8 +19877,6 @@ fn incoming_agent_messages_are_visible_without_subagent_opt_in() {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        assert_eq!(transcript.entry_click_hint(0), Some("click collapse"));
-        transcript.toggle_action_expansion(0);
         assert!(!render(&transcript).contains("REPORT_END"));
         assert_eq!(transcript.entry_click_hint(0), Some("click expand"));
         transcript.toggle_action_expansion(0);

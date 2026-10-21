@@ -2617,7 +2617,7 @@ impl TranscriptCore {
                             event.created_at,
                             TranscriptActionState::Received,
                         ),
-                        expanded: true,
+                        expanded: false,
                     });
                     row_created = true;
                 }

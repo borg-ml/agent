@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.18.2)
 
+- Show agent and peer messages as one line like other actions, previewing
+  the message's first line; click to expand the full text.
 - Left-click on a running action now opens it like any other action;
   right-click sends it to the background. Clicks no longer get lost when new
   output scrolls the conversation between press and release.

@@ -3099,7 +3099,6 @@ impl Transcript {
                     // A single-line row still says what the message is about.
                     if !self.wrap_action_rows
                         && *kind == TranscriptActionKind::Agent
-                        && label == "Peer"
                         && !*expanded
                         && focused_tool.is_none()
                         && let Some(first) = body
@@ -3124,9 +3123,7 @@ impl Transcript {
                     }
                     if (*expanded
                         || focused_tool == Some(index)
-                        || (self.wrap_action_rows
-                            && *kind == TranscriptActionKind::Agent
-                            && label == "Peer"))
+                        || (self.wrap_action_rows && *kind == TranscriptActionKind::Agent))
                         && let Some(body) = body.as_deref().filter(|body| !body.trim().is_empty())
                     {
                         let mut body_lines = wrap_display(
