@@ -98,6 +98,11 @@ fn card_text_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>>
         .collect()
 }
 
+/// The gutter that marks a row's body, indented further inside a run.
+fn body_gutter(nested: bool) -> &'static str {
+    if nested { "    │ " } else { "  │ " }
+}
+
 /// How one transcript row ends: the shared bookkeeping every row kind does
 /// once its lines are built.
 struct RowClose {
@@ -115,7 +120,7 @@ struct RowClose {
 
 fn close_row(
     lines: &mut Vec<Line<'static>>,
-    entry_rows: &mut Vec<RowRange>,
+    rows: &mut Vec<RowRange>,
     selection_rows: &mut Vec<SelectionRowRange>,
     width: usize,
     close: RowClose,
@@ -125,7 +130,7 @@ fn close_row(
             apply_line_background(line, width, MESSAGE_HOVER_BG);
         }
     }
-    entry_rows.push((close.index, close.start, lines.len()));
+    rows.push((close.index, close.start, lines.len()));
     selection_rows.push(if close.nested {
         SelectionRowRange::nested_entry(close.index, close.start, lines.len(), 0)
     } else {
@@ -3276,11 +3281,7 @@ impl Transcript {
                         for line in body_lines {
                             lines.push(Line::from(vec![
                                 Span::styled(
-                                    if tool_window.is_some() {
-                                        "    │ "
-                                    } else {
-                                        "  │ "
-                                    },
+                                    body_gutter(tool_window.is_some()),
                                     Style::default().fg(Color::DarkGray),
                                 ),
                                 Span::styled(line, Style::default().fg(Color::Gray)),
@@ -3523,7 +3524,7 @@ impl Transcript {
                         for line in
                             markdown_lines(detail, width.saturating_sub(6), Some(Color::Gray))
                         {
-                            let mut spans = vec![Span::raw("  │ ")];
+                            let mut spans = vec![Span::raw(body_gutter(false))];
                             spans.extend(line.spans);
                             lines.push(Line::from(spans));
                         }
@@ -3690,11 +3691,7 @@ impl Transcript {
                         && let Some((language, source)) = code_view
                     {
                         let body_start = lines.len();
-                        let body_prefix = if tool_window.is_some() {
-                            "    │ "
-                        } else {
-                            "  │ "
-                        };
+                        let body_prefix = body_gutter(tool_window.is_some());
                         if focused_tool == Some(index) {
                             lines.extend(rendering::tool_detail_lines(
                                 language,
@@ -3752,11 +3749,7 @@ impl Transcript {
                         && expandable
                         && let Some((language, source)) = output_view
                     {
-                        let body_prefix = if tool_window.is_some() {
-                            "    │ "
-                        } else {
-                            "  │ "
-                        };
+                        let body_prefix = body_gutter(tool_window.is_some());
                         if focused_tool == Some(index) {
                             lines.extend(rendering::tool_detail_lines(
                                 language,
@@ -3802,20 +3795,25 @@ impl Transcript {
                             ));
                         }
                     }
-                    tool_rows.push((index, summary_start, lines.len()));
-                    selection_rows.push(if tool_window.is_some() {
-                        SelectionRowRange::nested_entry(index, summary_start, lines.len(), 0)
-                    } else {
-                        SelectionRowRange::transcript_entry(index, summary_start, lines.len())
-                    });
-                    if tool_window.is_none()
-                        && !next_is_tool
-                        && lines
-                            .last()
-                            .is_none_or(|line| !line_is_unstyled_blank(line))
-                    {
-                        lines.push(Line::default());
-                    }
+                    // The summary was tinted above; the body is not part of the hover.
+                    close_row(
+                        lines,
+                        tool_rows,
+                        selection_rows,
+                        width,
+                        RowClose {
+                            index,
+                            start: summary_start,
+                            hover_from: summary_start,
+                            hovered: false,
+                            nested: tool_window.is_some(),
+                            gap: tool_window.is_none()
+                                && !next_is_tool
+                                && lines
+                                    .last()
+                                    .is_none_or(|line| !line_is_unstyled_blank(line)),
+                        },
+                    );
                 }
             }
             if action_window.is_some() {
