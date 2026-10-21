@@ -8086,16 +8086,16 @@ async fn attachment_capture_refuses_non_images_and_oversized_and_overlong_sets()
         "a directory must not be captured as an image"
     );
 
-    // Oversized content is refused before it can reach anyone's context.
-    let oversized = root.path().join("huge.png");
-    let mut big = sample_png();
-    big.resize(MAX_MESSAGE_ATTACHMENT_BYTES as usize + 1, 0);
-    std::fs::write(&oversized, &big).expect("write oversized image");
+    // Bytes that only claim to be an image cannot be fitted and are refused.
+    let corrupt = root.path().join("corrupt.png");
+    let mut garbage = sample_png()[..8].to_vec();
+    garbage.resize(MAX_MESSAGE_ATTACHMENT_BYTES as usize + 1, 0);
+    std::fs::write(&corrupt, &garbage).expect("write corrupt image");
     assert!(
-        capture_message_attachments(root.path(), &[oversized])
+        capture_message_attachments(root.path(), &[corrupt])
             .await
             .is_err(),
-        "an oversized image must be refused"
+        "an undecodable image must be refused"
     );
 
     // More attachments than the channel accepts.
@@ -8111,6 +8111,42 @@ async fn attachment_capture_refuses_non_images_and_oversized_and_overlong_sets()
             .is_err(),
         "more than {MAX_MESSAGE_ATTACHMENTS} attachments must be refused"
     );
+}
+
+/// A screenshot larger than the delivery budget used to be refused outright.
+/// It is delivered instead, fitted, and what is hashed and verified is the
+/// fitted image the recipient actually receives.
+#[tokio::test]
+async fn an_oversized_screenshot_is_fitted_and_delivered_verified() {
+    let root = tempdir().expect("journal root");
+    // Smooth structure plus mild noise: a large PNG that JPEG compresses well,
+    // like a real screenshot.
+    let noise = image::RgbImage::from_fn(2560, 1440, |x, y| {
+        let h = x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503).rotate_left(13);
+        let jitter = |shift: u32| ((h >> shift) & 31) as u8;
+        image::Rgb([
+            (x / 11) as u8 / 2 + jitter(3),
+            (y / 6) as u8 / 2 + jitter(11),
+            ((x + y) / 17) as u8 / 2 + jitter(19),
+        ])
+    });
+    let source = root.path().join("screenshot.png");
+    noise.save(&source).expect("write screenshot");
+    assert!(std::fs::metadata(&source).unwrap().len() > MAX_MESSAGE_ATTACHMENT_BYTES);
+
+    let captured = capture_message_attachments(root.path(), &[source])
+        .await
+        .expect("an oversized screenshot is fitted, not refused");
+    assert_eq!(captured.len(), 1);
+    assert!(captured[0].byte_len <= MAX_MESSAGE_ATTACHMENT_BYTES);
+    assert_eq!(captured[0].media_type, "image/jpeg");
+    assert_eq!(captured[0].name, "screenshot.jpg");
+
+    let bytes = load_message_attachment(root.path(), &captured[0])
+        .await
+        .expect("the fitted blob verifies against its own digest");
+    let delivered = image::load_from_memory(&bytes).expect("delivered bytes decode");
+    assert_eq!((delivered.width(), delivered.height()), (2560, 1440));
 }
 
 /// Journals written before image forwarding must keep replaying. A body that

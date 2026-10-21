@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.19.0)
 
+- `send_message` and `followup_task` no longer refuse images over 4.5 MiB (for
+  example a 2560x1440 screenshot). The image is re-encoded as JPEG, and scaled
+  down only if quality alone cannot fit, so it is delivered to local and remote
+  recipients; only an undecodable image or a file over 50 MiB is refused.
+
 ## 0.19.0 (2026-10-21)
 
 - Scrolling up a little no longer loads older history; it loads only when you

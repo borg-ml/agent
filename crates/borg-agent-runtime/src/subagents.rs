@@ -12538,7 +12538,13 @@ fn lsp_position_schema() -> Value {
 /// Matches what the local image channel already accepts, so a forwarded image
 /// and a directly attached one are refused for the same reasons.
 pub const MAX_MESSAGE_ATTACHMENTS: usize = 4;
+/// The most a delivered image may weigh: what base64-encodes into 6 MiB, the
+/// ceiling of one relay frame and one model tool result. It bounds the bytes
+/// that travel, not the file a sender names: a larger image is fitted under it
+/// at capture instead of being refused.
 pub const MAX_MESSAGE_ATTACHMENT_BYTES: u64 = 6 * 1024 * 1024 / 4 * 3;
+/// The largest source file read for fitting, matching the composer's limit.
+const MAX_MESSAGE_ATTACHMENT_SOURCE_BYTES: u64 = 50 * 1024 * 1024;
 
 /// PNG and JPEG by signature, never by file extension.
 ///
@@ -12569,6 +12575,71 @@ fn attachment_blob_path(journal_root: &Path, attachment: &MessageAttachment) -> 
         attachment.sha256,
         message_attachment_extension(&attachment.media_type)
     ))
+}
+
+/// An image that exceeds the delivery budget, re-encoded to fit it.
+///
+/// The original dimensions and a PNG are kept when they fit; otherwise the
+/// image is flattened to JPEG, and only if quality alone cannot reach the
+/// budget is it scaled down, keeping the aspect ratio. Only an image that
+/// cannot be decoded, or that no size reaches the budget, is refused.
+fn fit_message_attachment(bytes: &[u8]) -> Result<Vec<u8>> {
+    use image::{DynamicImage, ImageDecoder, ImageFormat, imageops::FilterType};
+    use std::io::Cursor;
+
+    let mut decoder = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()?
+        .into_decoder()
+        .context("image cannot be decoded")?;
+    let orientation = decoder.orientation()?;
+    let mut image = DynamicImage::from_decoder(decoder).context("image cannot be decoded")?;
+    image.apply_orientation(orientation);
+    let budget = MAX_MESSAGE_ATTACHMENT_BYTES as usize;
+    let mut png = Vec::new();
+    if image
+        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+        .is_ok()
+        && png.len() <= budget
+    {
+        return Ok(png);
+    }
+    if image.color().has_alpha() {
+        // JPEG has no alpha; composite over white rather than over black.
+        let mut rgba = image.to_rgba8();
+        for pixel in rgba.pixels_mut() {
+            let alpha = u32::from(pixel[3]);
+            for channel in &mut pixel.0[..3] {
+                *channel = ((u32::from(*channel) * alpha + 255 * (255 - alpha)) / 255) as u8;
+            }
+        }
+        image = DynamicImage::ImageRgba8(rgba);
+    }
+
+    let (width, height) = (image.width(), image.height());
+    for scale in [1.0, 0.85, 0.7, 0.55, 0.4, 0.3, 0.2, 0.1] {
+        let candidate = if scale < 1.0 {
+            let width = ((f64::from(width) * scale).round() as u32).max(1);
+            let height = ((f64::from(height) * scale).round() as u32).max(1);
+            DynamicImage::ImageRgb8(
+                image
+                    .resize_exact(width, height, FilterType::Lanczos3)
+                    .to_rgb8(),
+            )
+        } else {
+            DynamicImage::ImageRgb8(image.to_rgb8())
+        };
+        for quality in [92, 85] {
+            let mut jpeg = Vec::new();
+            candidate.write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut Cursor::new(&mut jpeg),
+                quality,
+            ))?;
+            if jpeg.len() <= budget {
+                return Ok(jpeg);
+            }
+        }
+    }
+    bail!("image cannot be reduced to {MAX_MESSAGE_ATTACHMENT_BYTES} bytes")
 }
 
 /// Read the sender's files once and keep the bytes.
@@ -12602,30 +12673,56 @@ async fn capture_message_attachments(
             path.display()
         );
         ensure!(
-            metadata.len() <= MAX_MESSAGE_ATTACHMENT_BYTES,
-            "attachment exceeds {MAX_MESSAGE_ATTACHMENT_BYTES} bytes: {}",
+            metadata.len() <= MAX_MESSAGE_ATTACHMENT_SOURCE_BYTES,
+            "attachment exceeds {MAX_MESSAGE_ATTACHMENT_SOURCE_BYTES} bytes: {}",
             path.display()
         );
-        let bytes = tokio::fs::read(path)
-            .await
-            .with_context(|| format!("failed to read attachment {}", path.display()))?;
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(
+            &mut tokio::io::AsyncReadExt::take(
+                tokio::fs::File::open(path)
+                    .await
+                    .with_context(|| format!("failed to read attachment {}", path.display()))?,
+                MAX_MESSAGE_ATTACHMENT_SOURCE_BYTES + 1,
+            ),
+            &mut bytes,
+        )
+        .await
+        .with_context(|| format!("failed to read attachment {}", path.display()))?;
         // Re-check after reading: the metadata above described the file as it
         // was a moment ago, not necessarily as it was read.
         ensure!(
-            bytes.len() as u64 <= MAX_MESSAGE_ATTACHMENT_BYTES,
-            "attachment exceeds {MAX_MESSAGE_ATTACHMENT_BYTES} bytes: {}",
+            bytes.len() as u64 <= MAX_MESSAGE_ATTACHMENT_SOURCE_BYTES,
+            "attachment exceeds {MAX_MESSAGE_ATTACHMENT_SOURCE_BYTES} bytes: {}",
             path.display()
         );
-        let media_type = message_attachment_media_type(&bytes)
+        let mut media_type = message_attachment_media_type(&bytes)
             .with_context(|| format!("attachment must be PNG or JPEG: {}", path.display()))?;
+        // What is delivered, and so what is hashed and verified, is the fitted
+        // image; the recipient never sees the original.
+        let mut name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        if bytes.len() as u64 > MAX_MESSAGE_ATTACHMENT_BYTES {
+            let original = std::mem::take(&mut bytes);
+            bytes = tokio::task::spawn_blocking(move || fit_message_attachment(&original))
+                .await?
+                .with_context(|| format!("attachment {} is too large to send", path.display()))?;
+            media_type = message_attachment_media_type(&bytes)
+                .context("a fitted image must be PNG or JPEG")?;
+            name = path.file_stem().map(|stem| {
+                format!(
+                    "{}.{}",
+                    stem.to_string_lossy(),
+                    message_attachment_extension(media_type)
+                )
+            });
+        }
         let sha256 = hex::encode(Sha256::digest(&bytes));
         let attachment = MessageAttachment {
-            name: path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| {
-                    format!("{sha256}.{}", message_attachment_extension(media_type))
-                }),
+            name: name.unwrap_or_else(|| {
+                format!("{sha256}.{}", message_attachment_extension(media_type))
+            }),
             media_type: media_type.to_string(),
             byte_len: bytes.len() as u64,
             sha256,
@@ -12802,7 +12899,7 @@ fn message_tool(name: &str, description: &str) -> Value {
                 "attachments": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Up to 4 local PNG/JPEG paths to forward as images. Bytes are captured and verified at send time; the recipient sees pixels, never your path. A recipient on another enrolled machine gets them through the host relay, which verifies them before admission; if the relay cannot carry them, get_message_status reports the delivery failed rather than sending the text alone."
+                    "description": "Up to 4 local PNG/JPEG paths to forward as images. Bytes are captured and verified at send time; an image over 4.5 MiB is re-encoded (JPEG, scaled only if needed) so it is delivered rather than refused, and the recipient sees pixels, never your path. A recipient on another enrolled machine gets them through the host relay, which verifies them before admission; if the relay cannot carry them, get_message_status reports the delivery failed rather than sending the text alone."
                 }
             },
             "required": ["target", "message"],
