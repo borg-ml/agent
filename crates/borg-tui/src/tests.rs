@@ -15511,7 +15511,7 @@ fn keyboard_collapse_of_tall_output_uses_the_same_reflow_anchor() {
     let before = transcript.render(100, None, None, None);
     let viewport_height = 10;
     let scroll_max = before.0.len() - viewport_height;
-    let scroll_from_bottom = scroll_max - 30;
+    let scroll_from_bottom = scroll_max - 50;
     let anchor = transcript_viewport_anchor(
         &before.1,
         &before.4,

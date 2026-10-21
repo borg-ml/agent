@@ -98,6 +98,62 @@ fn card_text_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>>
         .collect()
 }
 
+/// How an operation's body view is drawn.
+struct OperationViewMode {
+    /// The output view rather than the code view (they cache separately).
+    output: bool,
+    /// The full-screen inspector: unclipped and unabbreviated.
+    focused: bool,
+    /// A finished row whose rendered body can be reused.
+    cacheable: bool,
+}
+
+impl Transcript {
+    /// Every operation body, tool or otherwise, is a `(language, text)` view
+    /// drawn here.
+    fn operation_view_lines(
+        &self,
+        index: usize,
+        (language, source): (&str, &str),
+        width: usize,
+        nested: bool,
+        mode: OperationViewMode,
+    ) -> Vec<Line<'static>> {
+        let gutter = body_gutter(nested);
+        if mode.focused {
+            return rendering::tool_detail_lines(language, source, width, gutter);
+        }
+        if !mode.cacheable {
+            return rendering::tool_body_lines(language, source, width, gutter);
+        }
+        let mut cache = self.tool_body_cache.borrow_mut();
+        match cache.lines.entry((index, width, mode.output, nested)) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let rendered = entry
+                    .insert(rendering::tool_body_lines(language, source, width, gutter))
+                    .clone();
+                #[cfg(test)]
+                {
+                    cache.misses += 1;
+                }
+                rendered
+            }
+        }
+    }
+}
+
+/// Keep a collapsed body to `max` rows, ending in an ellipsis.
+fn clip_body_lines(lines: &mut Vec<Line<'static>>, gutter: &'static str, max: usize) {
+    if lines.len() > max {
+        lines.truncate(max);
+        lines[max - 1] = Line::from(vec![
+            Span::styled(gutter, Style::default().fg(Color::DarkGray)),
+            Span::styled("…", Style::default().fg(Color::Gray)),
+        ]);
+    }
+}
+
 /// The gutter that marks a row's body, indented further inside a run.
 fn body_gutter(nested: bool) -> &'static str {
     if nested { "    │ " } else { "  │ " }
@@ -3210,11 +3266,20 @@ impl Transcript {
                             Span::styled(line, Style::default().fg(activity_color)),
                         ]));
                     }
-                    selection_rows.push(if tool_window.is_some() {
-                        SelectionRowRange::nested_entry(index, entry_start, lines.len(), 0)
-                    } else {
-                        SelectionRowRange::transcript_entry(index, entry_start, lines.len())
-                    });
+                    close_row(
+                        lines,
+                        entry_rows,
+                        selection_rows,
+                        width,
+                        RowClose {
+                            index,
+                            start: entry_start,
+                            hover_from: entry_start,
+                            hovered: hovered_entry == Some(index),
+                            nested: false,
+                            gap: true,
+                        },
+                    );
                 }
                 TranscriptEntry::Action {
                     kind,
@@ -3270,23 +3335,22 @@ impl Transcript {
                         || (self.wrap_action_rows && *kind == TranscriptActionKind::Agent))
                         && let Some(body) = body.as_deref().filter(|body| !body.trim().is_empty())
                     {
-                        let mut body_lines = wrap_display(
-                            body,
-                            width.saturating_sub(UnicodeWidthStr::width(prefix) + 6),
+                        let nested = tool_window.is_some();
+                        let mut body_lines = self.operation_view_lines(
+                            index,
+                            ("text", body),
+                            width,
+                            nested,
+                            OperationViewMode {
+                                output: false,
+                                focused: focused_tool == Some(index),
+                                cacheable: false,
+                            },
                         );
-                        if !expanded && focused_tool.is_none() && body_lines.len() > 3 {
-                            body_lines.truncate(3);
-                            body_lines[2] = "…".into();
+                        if !expanded && focused_tool.is_none() {
+                            clip_body_lines(&mut body_lines, body_gutter(nested), 3);
                         }
-                        for line in body_lines {
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    body_gutter(tool_window.is_some()),
-                                    Style::default().fg(Color::DarkGray),
-                                ),
-                                Span::styled(line, Style::default().fg(Color::Gray)),
-                            ]));
-                        }
+                        lines.extend(body_lines);
                     }
                     // A run of operations closes with one gap, none between its rows.
                     let next_in_run = focused_tool.is_none()
@@ -3685,114 +3749,32 @@ impl Transcript {
                         }
                     }
                     let body_expanded = *expanded || focused_tool == Some(index);
-                    if show_tool_body
-                        && body_expanded
-                        && expandable
-                        && let Some((language, source)) = code_view
-                    {
-                        let body_start = lines.len();
-                        let body_prefix = body_gutter(tool_window.is_some());
-                        if focused_tool == Some(index) {
-                            lines.extend(rendering::tool_detail_lines(
-                                language,
-                                source,
-                                width,
-                                body_prefix,
-                            ));
-                        } else if execution.is_terminal() && !agent_action {
-                            let key = (index, width, false, tool_window.is_some());
-                            let mut cache = self.tool_body_cache.borrow_mut();
-                            #[cfg(test)]
-                            let mut missed = false;
-                            let rendered = match cache.lines.entry(key) {
-                                std::collections::hash_map::Entry::Occupied(entry) => {
-                                    entry.get().clone()
-                                }
-                                std::collections::hash_map::Entry::Vacant(entry) => {
-                                    #[cfg(test)]
-                                    {
-                                        missed = true;
-                                    }
-                                    entry
-                                        .insert(rendering::tool_body_lines(
-                                            language,
-                                            source,
-                                            width,
-                                            body_prefix,
-                                        ))
-                                        .clone()
-                                }
+                    if show_tool_body && body_expanded && expandable {
+                        let focused = focused_tool == Some(index);
+                        let cacheable = execution.is_terminal() && !agent_action;
+                        for (output, view) in [(false, code_view), (true, output_view)] {
+                            let Some((language, source)) = view else {
+                                continue;
                             };
-                            #[cfg(test)]
-                            if missed {
-                                cache.misses += 1;
-                            }
-                            lines.extend(rendered);
-                        } else {
-                            lines.extend(rendering::tool_body_lines(
-                                language,
-                                source,
+                            let body_start = lines.len();
+                            lines.extend(self.operation_view_lines(
+                                index,
+                                (language, source),
                                 width,
-                                body_prefix,
+                                tool_window.is_some(),
+                                OperationViewMode {
+                                    output,
+                                    focused,
+                                    cacheable,
+                                },
                             ));
-                        }
-                        if focused_tool == Some(index) && language == "command" {
-                            for line in &mut lines[body_start..] {
-                                for span in line.spans.iter_mut().skip(1) {
-                                    span.style = span.style.fg(USER_LABEL_BLUE);
-                                }
-                            }
-                        }
-                    }
-                    if show_tool_body
-                        && body_expanded
-                        && expandable
-                        && let Some((language, source)) = output_view
-                    {
-                        let body_prefix = body_gutter(tool_window.is_some());
-                        if focused_tool == Some(index) {
-                            lines.extend(rendering::tool_detail_lines(
-                                language,
-                                source,
-                                width,
-                                body_prefix,
-                            ));
-                        } else if execution.is_terminal() && !agent_action {
-                            let key = (index, width, true, tool_window.is_some());
-                            let mut cache = self.tool_body_cache.borrow_mut();
-                            #[cfg(test)]
-                            let mut missed = false;
-                            let rendered = match cache.lines.entry(key) {
-                                std::collections::hash_map::Entry::Occupied(entry) => {
-                                    entry.get().clone()
-                                }
-                                std::collections::hash_map::Entry::Vacant(entry) => {
-                                    #[cfg(test)]
-                                    {
-                                        missed = true;
+                            if focused && !output && language == "command" {
+                                for line in &mut lines[body_start..] {
+                                    for span in line.spans.iter_mut().skip(1) {
+                                        span.style = span.style.fg(USER_LABEL_BLUE);
                                     }
-                                    entry
-                                        .insert(rendering::tool_body_lines(
-                                            language,
-                                            source,
-                                            width,
-                                            body_prefix,
-                                        ))
-                                        .clone()
                                 }
-                            };
-                            #[cfg(test)]
-                            if missed {
-                                cache.misses += 1;
                             }
-                            lines.extend(rendered);
-                        } else {
-                            lines.extend(rendering::tool_body_lines(
-                                language,
-                                source,
-                                width,
-                                body_prefix,
-                            ));
                         }
                     }
                     // The summary was tinted above; the body is not part of the hover.
