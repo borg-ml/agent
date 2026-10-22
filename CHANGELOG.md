@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.1)
 
+- Refuse shell commands with a deleted remembered working directory instead of letting later semicolon-separated commands run in the launcher workspace. Supply an existing explicit workdir to recover after removing a scratch checkout.
+
 - Remove the collaborator-active status indicator and its background polling.
   Messages from other sessions use a distinct purple; local subagent rows
   keep their existing pink.

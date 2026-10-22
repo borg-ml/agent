@@ -1663,7 +1663,7 @@ impl AgentToolDispatcher {
         let (command, shell_directory) = if args.workdir.is_some() {
             (args.cmd, None)
         } else {
-            self.in_shell_directory(args.cmd)
+            self.in_shell_directory(args.cmd)?
         };
         let action_job_id = crate::watch::action_job_id();
         let mut result = serde_json::to_value(
@@ -1842,12 +1842,19 @@ impl AgentToolDispatcher {
     /// Run `command` where the last `cd` left the shell, and remember where a
     /// leading `cd DIR` of its own goes. Returns the command to run and the
     /// directory it starts in, when that is not the workspace root.
-    fn in_shell_directory(&self, command: String) -> (String, Option<PathBuf>) {
+    fn in_shell_directory(&self, command: String) -> Result<(String, Option<PathBuf>)> {
         let mut remembered = self
             .shell_directory
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = remembered.clone();
+        if let Some(directory) = &current {
+            ensure!(
+                directory.is_dir(),
+                "Remembered shell directory {} no longer exists; supply an existing explicit workdir before running commands",
+                directory.display()
+            );
+        }
         let run = match &current {
             Some(directory) => format!(
                 "cd '{}' && {command}",
@@ -1867,10 +1874,10 @@ impl AgentToolDispatcher {
                 && directory.is_dir()
             {
                 *remembered = Some(directory.clone());
-                return (run, Some(directory));
+                return Ok((run, Some(directory)));
             }
         }
-        (run, current)
+        Ok((run, current))
     }
 
     /// The catalog served to a provider CLI over MCP. `workspace_tools` adds
