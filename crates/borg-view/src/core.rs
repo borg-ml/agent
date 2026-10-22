@@ -1958,14 +1958,33 @@ impl TranscriptCore {
                     }
                     let _ = name;
                 }
-                // The process-start event can precede ToolStarted. The returned
+                // The process-start event can precede ToolStarted, and a parallel
+                // call prepared later may hold the foreground then. The returned
                 // process ID, not the foreground tool at launch, identifies its owner.
-                if tool_can_start_background_process(&source_name_for_process)
-                    && let (Some(index), Some(process_id)) =
-                        (tool_index, decoded_session_id(output))
+                let owned_process = tool_can_start_background_process(&source_name_for_process)
+                    .then(|| decoded_session_id(output))
+                    .flatten()
+                    .or_else(|| {
+                        native_followup_process
+                            .is_none()
+                            .then(|| {
+                                output_handle
+                                    .as_deref()
+                                    .and_then(|h| Uuid::parse_str(h).ok())
+                            })
+                            .flatten()
+                    });
+                if let (Some(index), Some(process_id)) = (tool_index, owned_process)
                     && let Some(process) = self.runtime_processes.get_mut(&process_id)
+                    && let Some(previous) = process.tool_index.replace(index)
+                    && previous != index
+                    && !self.tool_has_live_process(previous)
+                    && let Some(Operation { execution, .. }) = self.order.call_mut(previous)
+                    && execution.is_backgrounded()
                 {
-                    process.tool_index = Some(index);
+                    // The previous row only looked backgrounded because it was
+                    // credited with this process.
+                    execution.transition(ExecutionState::Complete, event.created_at);
                 }
                 if let (Some(index), Some(handle)) = (tool_index, output_handle.as_ref()) {
                     let is_native_process = Uuid::parse_str(handle)

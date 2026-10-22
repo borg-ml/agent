@@ -12,6 +12,9 @@ Git comparison.
 - A subagent's running time in the status bar now counts from its current turn,
   not from when the subagent was created (it could show weeks for a long-lived
   agent).
+- A quick call made in the same batch as a `watch` (for example `send_message`)
+  no longer stays on "Running in background" until the watcher exits; the
+  watcher's process now belongs to the watch row.
 
 ## 0.19.0 (2026-10-21)
 

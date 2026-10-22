@@ -18070,6 +18070,97 @@ fn watcher_process_is_counted_as_a_watcher_not_a_shell() {
     );
 }
 
+/// A watch and a send_message prepared in parallel: the watch's process started
+/// while the later-prepared send_message held the foreground, and the instant
+/// send_message row then showed "Running in background" until the watch exited.
+#[test]
+fn a_parallel_call_is_not_credited_with_a_watch_process() {
+    let session_id = Uuid::new_v4();
+    let watch_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    for (sequence, tool_call_id) in [(1, "watch-1"), (2, "send-1")] {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Claude,
+                kind: "action/preparing".into(),
+                payload: serde_json::json!({"label": "command", "tool_call_id": tool_call_id}),
+            },
+        ));
+    }
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::RuntimeProcessStarted {
+            process_id: watch_id,
+            pid: 4242,
+            command: "long pipeline".to_string(),
+            cwd: PathBuf::from("/workspace"),
+        },
+    ));
+    let watch_input = serde_json::json!({"name": "watch", "arguments": {"label": "rerun", "command": "long pipeline"}});
+    let send_input = serde_json::json!({"target": "/root/child", "message": "ack", "wake": false});
+    for (sequence, tool_call_id, name, input) in [
+        (4, "watch-1", "capability", &watch_input),
+        (5, "send-1", "send_message", &send_input),
+    ] {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ToolStarted {
+                tool_call_id: tool_call_id.to_string(),
+                name: name.to_string(),
+                input: input.clone(),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        ));
+    }
+    for (sequence, tool_call_id, input, output) in [
+        (
+            6,
+            "watch-1",
+            &watch_input,
+            serde_json::json!({"watch_id": watch_id, "label": "rerun", "running": true}),
+        ),
+        (
+            7,
+            "send-1",
+            &send_input,
+            serde_json::json!({"message_id": Uuid::new_v4(), "delivery_state": "queued_idle"}),
+        ),
+    ] {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: tool_call_id.to_string(),
+                output: output.to_string(),
+                output_ref: None,
+                is_error: false,
+                input: Some(input.clone()),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        ));
+    }
+    let state = |source: &str| {
+        transcript
+            .order
+            .iter()
+            .find_map(|entry| match entry {
+                TranscriptEntry::Operation(operation) if operation.source == source => {
+                    Some(operation.execution.state())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{source} row"))
+    };
+    assert_eq!(state("send_message"), ExecutionState::Complete);
+    assert_eq!(state("capability"), ExecutionState::Backgrounded);
+}
+
 #[test]
 fn provider_background_handle_drives_shell_status_and_full_output() {
     let session_id = Uuid::new_v4();
