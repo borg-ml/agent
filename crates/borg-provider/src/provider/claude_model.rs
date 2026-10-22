@@ -361,15 +361,14 @@ fn subscription_request_body(
         !disabled || !capabilities.thinking_required,
         "the selected Claude model requires thinking"
     );
-    // Native summaries include both reasoning and between-tool narration.
-    // The connector's native classification, not `type=thinking` alone,
-    // selects the display channel; the signed blocks remain intact for replay.
+    // Summarized display also rewrites between-tool answers, losing details
+    // such as commands. Leave display unset; preserve the signed replay blocks.
     if disabled || !capabilities.thinking {
         body["thinking"] = json!({"type": "disabled"});
     } else if capabilities.adaptive_thinking {
-        body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
+        body["thinking"] = json!({"type": "adaptive"});
     } else {
-        body["thinking"] = json!({"type": "enabled", "budget_tokens": 4096.min(capabilities.default_output_tokens.saturating_sub(1)), "display": "summarized"});
+        body["thinking"] = json!({"type": "enabled", "budget_tokens": 4096.min(capabilities.default_output_tokens.saturating_sub(1))});
     }
     if !disabled && !capabilities.efforts.is_empty() {
         ensure!(
@@ -563,6 +562,7 @@ mod tests {
             Some(PromptCacheRefresh::ONE_TOKEN),
         )
         .unwrap();
+        assert!(original["thinking"].get("display").is_none());
         assert_eq!(warmed["max_tokens"], 1);
         assert_eq!(warmed["thinking"]["type"], "adaptive");
         warmed["max_tokens"] = original["max_tokens"].clone();

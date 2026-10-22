@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.19.1)
 
+- Stop forcing Claude subscription replies into summarized display mode, which
+  could replace a between-tool answer with ‘I have given you the commands’
+  while omitting the commands themselves. Thinking effort and signed replay
+  are unchanged.
+
 - A completed model response no longer hangs at ‘Generating tool call’ when a
   provider retains a progress sender. Buffered progress is drained without
   waiting for background sender handles to close.
