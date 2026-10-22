@@ -115,6 +115,7 @@ const BORG_ORANGE: Color = Color::Rgb(255, 142, 36);
 const BORG_ORANGE_HOVER: Color = Color::Rgb(255, 184, 92);
 const RUNNING_STATUS_PEACH: Color = Color::Rgb(255, 132, 112);
 const SUBAGENT_PURPLE: Color = Color::Rgb(213, 126, 177);
+const PEER_PURPLE: Color = Color::Rgb(167, 139, 250);
 const SUBAGENT_WAITING: Color = Color::Rgb(110, 190, 210);
 const WATCH_PURPLE: Color = Color::Rgb(213, 126, 177);
 const TODO_ORANGE: Color = Color::Rgb(255, 177, 76);
@@ -1654,12 +1655,6 @@ impl GitStatusCache {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CollaboratorActivity {
-    pub name: String,
-    pub status: SessionStatus,
-}
-
 pub struct BorgTerminal {
     session_id: Uuid,
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -1682,7 +1677,6 @@ pub struct BorgTerminal {
     child_queued_prompts: HashMap<Uuid, Vec<PendingPromptProjection>>,
     child_requeue_cursors: HashMap<Uuid, Option<usize>>,
     child_statuses: HashMap<Uuid, SessionStatus>,
-    collaborators: Vec<CollaboratorActivity>,
     child_activity_clocks: HashMap<Uuid, ActivityClock>,
     child_pending_approvals: HashSet<Uuid>,
     /// Startup recovery can publish child-state corrections after the root
@@ -3134,7 +3128,6 @@ impl BorgTerminal {
             child_queued_prompts: HashMap::new(),
             child_requeue_cursors: HashMap::new(),
             child_statuses: HashMap::new(),
-            collaborators: Vec::new(),
             child_activity_clocks: HashMap::new(),
             child_pending_approvals: HashSet::new(),
             suppress_bootstrap_subagent_activity: true,
@@ -5306,24 +5299,6 @@ impl BorgTerminal {
         if !self.hydrated_children.contains(&child_id) {
             self.deferred_child_histories.insert(child_id);
         }
-    }
-
-    /// The children this view currently tracks, for resyncing their status
-    /// against each child's own journal.
-    /// Activity candidates are read-only and never establish or change child ownership.
-    pub fn collaborator_candidates(&self) -> Vec<(Uuid, String)> {
-        self.director_transcript
-            .as_deref()
-            .unwrap_or(&self.transcript)
-            .collaborator_candidates(self.session_id)
-    }
-
-    pub fn sync_collaborator_activity(&mut self, collaborators: Vec<CollaboratorActivity>) -> bool {
-        if self.collaborators == collaborators {
-            return false;
-        }
-        self.collaborators = collaborators;
-        true
     }
 
     pub fn team_roster_snapshots(&self) -> Vec<SubagentSnapshot> {
@@ -10550,10 +10525,6 @@ impl BorgTerminal {
                     agents_status_text_style(hovered),
                 ));
             }
-            if let Some(collaborators) = collaborator_status_label(&self.collaborators) {
-                status_spans.push(Span::styled(STATUS_SEPARATOR, Style::default().fg(Color::Gray)));
-                status_spans.push(Span::styled(collaborators, Style::default().fg(SUBAGENT_PURPLE)));
-            }
             let goal_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             // The separator is rendered unstyled, so the hover target is the
             // value alone.
@@ -14612,7 +14583,8 @@ fn transcript_action_glyph(state: ExecutionState) -> &'static str {
     }
 }
 
-fn transcript_action_color(kind: OperationKind, state: ExecutionState) -> Color {
+fn transcript_action_color(operation: &Operation) -> Color {
+    let (kind, state) = (operation.kind, operation.execution.state());
     if matches!(state, ExecutionState::Failed) {
         return Color::LightRed;
     }
@@ -14620,6 +14592,7 @@ fn transcript_action_color(kind: OperationKind, state: ExecutionState) -> Color 
         return Color::Yellow;
     }
     match kind {
+        OperationKind::Agent if operation.label == "Peer" => PEER_PURPLE,
         OperationKind::Agent => SUBAGENT_PURPLE,
         OperationKind::Watch => WATCH_PURPLE,
         OperationKind::Approval | OperationKind::ProviderInteraction => Color::Yellow,
@@ -18536,51 +18509,6 @@ fn history_loading_line() -> Line<'static> {
         ),
         Span::styled("Loading thread history…", Style::default().fg(Color::Gray)),
     ])
-}
-
-fn collaborator_status_label(collaborators: &[CollaboratorActivity]) -> Option<String> {
-    let active = collaborators
-        .iter()
-        .filter(|agent| {
-            matches!(
-                agent.status,
-                SessionStatus::Starting | SessionStatus::Running
-            )
-        })
-        .count();
-    let waiting = collaborators
-        .iter()
-        .filter(|agent| {
-            matches!(
-                agent.status,
-                SessionStatus::Ready | SessionStatus::WaitingForApproval
-            )
-        })
-        .count();
-    let total = active + waiting;
-    if total == 0 {
-        return None;
-    }
-    let state = if active > 0 { "active" } else { "waiting" };
-    let mut label = format!(
-        "↔ {total} collaborator{} {state}",
-        if total == 1 { "" } else { "s" }
-    );
-    if total == 1
-        && let Some(agent) = collaborators.iter().find(|agent| {
-            matches!(
-                agent.status,
-                SessionStatus::Starting
-                    | SessionStatus::Running
-                    | SessionStatus::Ready
-                    | SessionStatus::WaitingForApproval
-            )
-        })
-    {
-        label.push_str(": ");
-        label.push_str(&truncate_table_cell(&agent.name, 24));
-    }
-    Some(label)
 }
 
 /// Waiting children are parked on their own work, so they count toward the

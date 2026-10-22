@@ -50,7 +50,7 @@ use crate::editor_preferences::{
 };
 use crate::sleep_inhibitor::{LidSleepStatus, SleepInhibitor, authorize_lid_sleep};
 use crate::terminal_ui::{
-    BorgTerminal, CollaboratorActivity, DictationState, ProviderAuthChoice, ResumeSessionOption,
+    BorgTerminal, DictationState, ProviderAuthChoice, ResumeSessionOption,
     TerminalInputEvent, UiAction, dictation_icon_style_for_preference,
     discard_pending_terminal_input, spawn_terminal_io_worker,
 };
@@ -2007,43 +2007,6 @@ fn passive_owner_stop_is_safe(
     status == SessionStatus::Ready && !subagents_working && !root_background_work_is_active(state)
 }
 
-fn collaborator_activity(name: &str, state: &SessionState) -> Option<CollaboratorActivity> {
-    let status = state.status?;
-    (matches!(
-        status,
-        SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval
-    ) || (status == SessionStatus::Ready && root_background_work_is_active(state)))
-    .then(|| CollaboratorActivity {
-        name: name.to_string(),
-        status,
-    })
-}
-
-async fn reconcile_collaborator_activity(
-    store: &dyn SessionStore,
-    sessions_dir: &Path,
-    candidates: &[(Uuid, String)],
-) -> Vec<CollaboratorActivity> {
-    let mut collaborators = Vec::new();
-    for (id, name) in candidates {
-        let owner = store
-            .owning_root_session(*id)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(*id);
-        if !local_session_owner_is_active(sessions_dir, owner).unwrap_or(false) {
-            continue;
-        }
-        if let Ok(state) = store.state(*id).await
-            && let Some(activity) = collaborator_activity(name, &state)
-        {
-            collaborators.push(activity);
-        }
-    }
-    collaborators
-}
-
 fn stale_local_owner_can_handoff(state: &SessionState, subagents_working: bool) -> bool {
     !subagents_working
         && !root_background_work_is_active(state)
@@ -3284,7 +3247,7 @@ async fn run_local_agent_session(
     let mut child_status_tick = tokio::time::interval(std::time::Duration::from_secs(5));
     child_status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut child_status_sync_task: Option<
-        tokio::task::JoinHandle<(Vec<SubagentSnapshot>, Vec<CollaboratorActivity>)>,
+        tokio::task::JoinHandle<Vec<SubagentSnapshot>>,
     > = None;
     let mut shutdown_signal_open = true;
     let mut session_event_stream_open = true;
@@ -3516,10 +3479,8 @@ async fn run_local_agent_session(
                     .await
             }, if child_status_sync_task.is_some() => {
                 child_status_sync_task = None;
-                if let (Ok((agents, collaborators)), Some(terminal)) = (result, terminal.as_mut()) {
-                    let roster_changed = terminal.sync_child_statuses(&agents);
-                    let collaborators_changed = terminal.sync_collaborator_activity(collaborators);
-                    terminal_dirty |= roster_changed || collaborators_changed;
+                if let (Ok(agents), Some(terminal)) = (result, terminal.as_mut()) {
+                    terminal_dirty |= terminal.sync_child_statuses(&agents);
                 }
             }
             _ = child_status_tick.tick(), if interactive && child_status_sync_task.is_none() => {
@@ -3527,17 +3488,13 @@ async fn run_local_agent_session(
                     .as_ref()
                     .map(|terminal| terminal.team_roster_snapshots())
                     .unwrap_or_default();
-                let collaborators = terminal.as_ref().map(BorgTerminal::collaborator_candidates).unwrap_or_default();
-                if !agents.is_empty() || !collaborators.is_empty() {
+                if !agents.is_empty() {
                     let store = Arc::clone(&store);
                     let sessions_dir = sessions_dir.clone();
                     child_status_sync_task = Some(tokio::spawn(async move {
                         reconcile_subagent_snapshots(store.as_ref(), &sessions_dir, &mut agents).await;
-                        let collaborators = reconcile_collaborator_activity(store.as_ref(), &sessions_dir, &collaborators).await;
-                        (agents, collaborators)
+                        agents
                     }));
-                } else if let Some(terminal) = terminal.as_mut() {
-                    terminal_dirty |= terminal.sync_collaborator_activity(Vec::new());
                 }
             }
             result = async {

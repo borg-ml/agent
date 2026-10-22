@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.19.1)
 
+- Remove the collaborator-active status indicator and its background polling.
+  Messages from other sessions use a distinct purple; local subagent rows
+  keep their existing pink.
+
 - Stop forcing Claude subscription replies into summarized display mode, which
   could replace a between-tool answer with ‘I have given you the commands’
   while omitting the commands themselves. Thinking effort and signed replay

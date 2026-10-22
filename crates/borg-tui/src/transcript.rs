@@ -194,7 +194,7 @@ impl Transcript {
             ..
         } = operation;
         if !kind.is_call() {
-            let style = Style::default().fg(transcript_action_color(*kind, execution.state()));
+            let style = Style::default().fg(transcript_action_color(operation));
             // A single-line row still says what the message is about.
             let suffix = (!self.wrap_action_rows
                 && *kind == OperationKind::Agent
@@ -340,6 +340,13 @@ impl Transcript {
                     cacheable: false,
                 },
             );
+            if *kind == OperationKind::Agent && label == "Peer" {
+                for line in &mut lines {
+                    for span in line.spans.iter_mut().skip(1) {
+                        span.style.fg = Some(PEER_PURPLE);
+                    }
+                }
+            }
             if !expanded && !context.focused_tool_open {
                 clip_body_lines(&mut lines, body_gutter(nested), 3);
             }
@@ -895,7 +902,7 @@ fn action_label_style(entry: &TranscriptEntry) -> Style {
     };
     let execution = &operation.execution;
     if !operation.kind.is_call() {
-        return Style::default().fg(transcript_action_color(operation.kind, execution.state()));
+        return Style::default().fg(transcript_action_color(operation));
     }
     let bold = Style::default().add_modifier(Modifier::BOLD);
     if operation.kind == OperationKind::Reasoning {
@@ -2019,24 +2026,6 @@ impl Transcript {
         }
         let signature = self.config.as_ref()?.cache_signature();
         self.cache_diagnostics.status(now, &signature)
-    }
-
-    fn collaborator_candidates(&self, session_id: Uuid) -> Vec<(Uuid, String)> {
-        let mut seen = HashSet::new();
-        self.order.iter().zip(&self.order.identities).rev()
-            .filter_map(|(entry, (event_id, _))| {
-                if !matches!(entry, TranscriptEntry::Operation(Operation { kind: OperationKind::Agent, .. })) {
-                    return None;
-                }
-                let (_, sender, name) = self.team_report_sources.get(event_id)?;
-                if *sender == session_id || self.subagent_snapshots.contains_key(sender)
-                    || self.pruned_settled_children.contains(sender) || !seen.insert(*sender) {
-                    return None;
-                }
-                Some((*sender, name.clone()))
-            })
-            .take(16)
-            .collect()
     }
 
     fn active_subagent_count(&self) -> usize {
