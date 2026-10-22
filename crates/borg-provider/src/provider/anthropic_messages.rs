@@ -746,6 +746,7 @@ pub(crate) struct AnthropicStreamState {
 impl AnthropicStreamState {
     /// Claude's native classifier distinguishes public narration summaries from
     /// reasoning only once the complete block signature has arrived.
+    #[cfg(any(feature = "claude", test))]
     pub(crate) fn claude_summaries() -> Self {
         Self {
             defer_thinking: true,
@@ -754,6 +755,7 @@ impl AnthropicStreamState {
     }
 
     /// Display metadata from the pinned native runtime, never replay content.
+    #[cfg(any(feature = "claude", test))]
     pub(crate) fn set_narration_block_indexes(&mut self, indexes: &Value) {
         let Some(indexes) = indexes.as_array().filter(|_| self.defer_thinking) else {
             self.protocol_error("invalid native narration metadata");

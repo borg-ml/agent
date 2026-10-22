@@ -1496,6 +1496,7 @@ fn fallback_commit_message(stat: &str) -> String {
     }
 }
 
+#[cfg(feature = "subscription-adapters")]
 fn commit_message_prompt(stat: &str, diff: &str) -> String {
     format!(
         "Write a git commit message for the staged changes below. Output ONLY the message:          an imperative subject line of at most 72 characters, then a blank line, then at most          four short bullet points explaining what changed and why. No code fences, no preamble.
@@ -1576,6 +1577,7 @@ fn draft_commit_message(
 }
 
 /// Strip code fences and surrounding whitespace; reject empty drafts.
+#[cfg(any(feature = "subscription-adapters", test))]
 fn clean_commit_message(raw: &str) -> Option<String> {
     let mut lines: Vec<&str> = raw.lines().map(str::trim_end).collect();
     while lines
