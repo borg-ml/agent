@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.19.0)
+## Unreleased (since 0.19.1)
+
+## 0.19.1 (2026-10-22)
 
 - Restore visible GPT reasoning summaries by explicitly requesting detailed
   summaries instead of inheriting a model catalog default that disables them.
