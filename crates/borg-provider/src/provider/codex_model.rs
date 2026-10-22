@@ -114,8 +114,6 @@ struct ModelCapabilities {
     #[serde(default = "default_true")]
     supports_reasoning_summary_parameter: bool,
     #[serde(default)]
-    default_reasoning_summary: Option<String>,
-    #[serde(default)]
     support_verbosity: bool,
     #[serde(default)]
     default_verbosity: Option<String>,
@@ -1014,7 +1012,7 @@ impl CodexModelProvider {
         }
         let mut body = json!({"model": self.model, "instructions": instructions,
             "input": input, "tools": tools, "tool_choice": "auto", "parallel_tool_calls": true,
-            "reasoning": {"effort": baseline, "summary": "auto"},
+            "reasoning": {"effort": baseline, "summary": "detailed"},
             "store": false, "stream": true, "include": ["reasoning.encrypted_content"]});
         if let Some(capabilities) = capabilities {
             if capabilities.use_responses_lite {
@@ -1023,14 +1021,8 @@ impl CodexModelProvider {
                 body["reasoning"]["context"] = json!("all_turns");
                 body["parallel_tool_calls"] = json!(false);
             }
-            let summary = capabilities
-                .default_reasoning_summary
-                .as_deref()
-                .unwrap_or("auto");
-            if !capabilities.supports_reasoning_summary_parameter || summary == "none" {
+            if !capabilities.supports_reasoning_summary_parameter {
                 body["reasoning"].as_object_mut().unwrap().remove("summary");
-            } else {
-                body["reasoning"]["summary"] = json!(summary);
             }
             if capabilities.support_verbosity
                 && let Some(verbosity) = &capabilities.default_verbosity
@@ -2359,7 +2351,7 @@ mod tests {
         );
         assert_eq!(
             first["reasoning"],
-            json!({"effort":"low", "context":"all_turns"})
+            json!({"effort":"low", "context":"all_turns", "summary":"detailed"})
         );
         assert!(
             first.get("stream_options").is_none(),
@@ -2489,7 +2481,7 @@ mod tests {
         assert_eq!(body["model"], "gpt-6.1-sol");
         assert_eq!(
             body["reasoning"],
-            json!({"effort":"high","context":"all_turns"})
+            json!({"effort":"high","context":"all_turns","summary":"detailed"})
         );
         assert_eq!(body["input"][2]["type"], "compaction");
         assert!(
@@ -3470,7 +3462,7 @@ mod tests {
         let body = provider.request_body(&request).unwrap();
         assert_eq!(body["model"], "gpt-6.1-sol");
         assert_eq!(body["reasoning"]["effort"], "max");
-        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
     }
 
     #[test]
@@ -3607,6 +3599,7 @@ mod tests {
                     request.extend_from_slice(&bytes[..n]);
                 }
                 let body: Value = serde_json::from_slice(&request[end..end + len]).unwrap();
+                assert_eq!(body["reasoning"]["summary"], "detailed");
                 assert_eq!(body["store"], false);
                 assert_eq!(body["service_tier"], "priority");
                 assert_eq!(body["prompt_cache_key"], "cache");
@@ -3650,7 +3643,7 @@ mod tests {
             })).unwrap();
             let body = provider.request_body_with_capabilities(&request, Some(&capabilities), true).unwrap();
             assert_eq!(body["parallel_tool_calls"], false);
-            assert!(body["reasoning"].get("summary").is_none());
+            assert_eq!(body["reasoning"]["summary"], "detailed");
             let response = provider.send(&reqwest::Client::new(), &endpoint,
                 &mut access, &account,
                 &request, &body).await.unwrap();

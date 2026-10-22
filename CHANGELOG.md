@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.19.0)
 
+- Restore visible GPT reasoning summaries by explicitly requesting detailed
+  summaries instead of inheriting a model catalog default that disables them.
+
 - `send_message` and `followup_task` no longer refuse images over 4.5 MiB (for
   example a 2560x1440 screenshot). The image is re-encoded as JPEG, and scaled
   down only if quality alone cannot fit, so it is delivered to local and remote
