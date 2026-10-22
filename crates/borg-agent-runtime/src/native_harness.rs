@@ -3923,9 +3923,8 @@ async fn call_model_streaming_with_timeout(
     let mut progress_open = true;
     let mut saw_reasoning_output = false;
     let mut last_provider_output = tokio::time::Instant::now();
-    // A provider may complete the foreground model result while retaining a
-    // progress sender for provider-owned background work. Do not let the
-    // foreground result become a Ready status until that event stream closes.
+    // Completion ends this response's progress stream. Drain buffered events,
+    // but never let a retained sender hold a completed response open.
     let mut completed = None;
     let mut control_applied = false;
     let mut preparing: Vec<Option<String>> = Vec::new();
@@ -3945,6 +3944,7 @@ async fn call_model_streaming_with_timeout(
                     .map(Box::new)
                     .map(NativeModelOutcome::Completed)
                     .map_err(anyhow::Error::new));
+                progress_rx.close();
             }
             control = next_control(context.controls), if !control_applied => match control {
                 Some(AgentTurnControl::Interrupt) => {
@@ -8861,15 +8861,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreground_result_waits_for_provider_progress_to_close() {
+    async fn completed_model_drains_buffered_progress_without_waiting_for_retained_sender() {
         let held_progress = Arc::new(Mutex::new(None));
         let client = HoldingProgressClient {
             held_progress: Arc::clone(&held_progress),
         };
         // Undrained until the turn is released, so it must hold every event the stream emits.
         let (events_tx, mut events_rx) = mpsc::channel(32);
-        let (controls_tx, controls_rx) = mpsc::channel(1);
-        let mut task = tokio::spawn(async move {
+        let (_controls_tx, controls_rx) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
             let mut controls = Some(controls_rx);
             let mut queued_steer = Vec::new();
             let outcome = call_model_streaming_with_timeout(
@@ -8903,49 +8903,17 @@ mod tests {
             (outcome, queued_steer)
         });
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if held_progress.lock().unwrap().is_some() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("provider should retain its progress sender");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut task)
-                .await
-                .is_err(),
-            "foreground completion must not escape while provider progress is live"
-        );
-
-        let (ack, mut received) = tokio::sync::oneshot::channel();
-        controls_tx
-            .send(AgentTurnControl::Steer {
-                message_id: Uuid::new_v4(),
-                text: "new direction".into(),
-                attachments: Vec::new(),
-                admission: borg_provider::provider::SteerAdmission::pending(),
-                preempt: false,
-                human: true,
-                ack,
-            })
-            .await
-            .unwrap();
         let (outcome, queued_steer) = tokio::time::timeout(Duration::from_secs(1), task)
             .await
-            .expect("progress closure should release the turn")
+            .expect("a retained progress sender must not block a completed response")
             .expect("stream task should not panic");
         assert!(
             matches!(outcome.unwrap(), NativeModelOutcome::Completed(result)
             if matches!(&result.message, ModelMessage::Assistant { content: Some(content), .. }
                 if content == "foreground result"))
         );
-        assert_eq!(queued_steer.len(), 1);
-        assert!(!queued_steer[0].admission.is_accepted());
-        assert!(received.try_recv().is_err());
-        held_progress.lock().unwrap().take();
+        assert!(queued_steer.is_empty());
+        assert!(held_progress.lock().unwrap().as_ref().unwrap().is_closed());
         assert!(matches!(
             events_rx.recv().await,
             Some(SessionEventKind::ReasoningBlockStarted { .. })

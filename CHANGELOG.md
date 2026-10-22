@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.19.1)
 
+- A completed model response no longer hangs at ‘Generating tool call’ when a
+  provider retains a progress sender. Buffered progress is drained without
+  waiting for background sender handles to close.
+
 ## 0.19.1 (2026-10-22)
 
 - Restore visible GPT reasoning summaries by explicitly requesting detailed
