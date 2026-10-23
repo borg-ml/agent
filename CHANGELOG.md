@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.19.2)
+## Unreleased (since 0.19.3)
+
+## 0.19.3 (2026-10-23)
 
 - Bound journal row-lock waits and idle transactions to 60 seconds so a stranded
   database writer cannot silently block a session behind its own watchdog.
