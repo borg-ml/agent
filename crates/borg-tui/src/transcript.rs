@@ -2047,10 +2047,9 @@ impl Transcript {
         } else {
             "/root"
         };
-        let host_role = if host_is_director {
-            "main thread"
-        } else {
-            "member"
+        let host_state = match self.meta.status.unwrap_or(SessionStatus::Starting) {
+            SessionStatus::Running => "working",
+            status => self.status_label(status),
         };
         if let Some(config) = self.config.as_ref() {
             let model = config
@@ -2061,11 +2060,9 @@ impl Transcript {
                 name: host_name.to_string(),
                 model: model.to_string(),
                 effort: config.effort.as_deref().unwrap_or("—").to_string(),
-                state: host_role.to_string(),
+                state: host_state.to_string(),
                 lifecycle: None,
-                usage: format_subagent_usage(&self.session_usage)
-                    .trim_start()
-                    .to_string(),
+                usage: format_subagent_usage(&self.session_usage),
                 child_id: None,
             });
         } else {
@@ -2073,7 +2070,7 @@ impl Transcript {
                 name: host_name.to_string(),
                 model: "model pending".to_string(),
                 effort: "—".to_string(),
-                state: host_role.to_string(),
+                state: host_state.to_string(),
                 lifecycle: None,
                 usage: "—".to_string(),
                 child_id: None,
@@ -2114,18 +2111,24 @@ impl Transcript {
             };
             let model = display_subagent_model(&agent);
             let effort = agent.effort.as_deref().unwrap_or("—");
-            let usage = format_subagent_usage(&agent.usage);
-            let usage = usage
-                .trim_start()
-                .strip_prefix("usage ")
-                .unwrap_or(usage.trim_start());
+            let state = match agent.lifecycle() {
+                borg_remote::SubagentLifecycle::Starting => "starting",
+                borg_remote::SubagentLifecycle::Running => "working",
+                borg_remote::SubagentLifecycle::WaitingOnWatchers => "waiting",
+                borg_remote::SubagentLifecycle::Ready => "ready",
+                borg_remote::SubagentLifecycle::WaitingForApproval => "approval",
+                borg_remote::SubagentLifecycle::Dormant
+                | borg_remote::SubagentLifecycle::DormantInterrupted => "paused",
+                borg_remote::SubagentLifecycle::Stopped => "stopped",
+                borg_remote::SubagentLifecycle::Failed => "failed",
+            };
             AgentRosterEntry {
                 name,
                 model,
                 effort: effort.to_string(),
-                state: borg_view::projection_helpers::subagent_lifecycle_detail(&agent),
+                state: state.to_string(),
                 lifecycle: Some(agent.lifecycle()),
-                usage: usage.to_string(),
+                usage: format_subagent_usage(&agent.usage),
                 child_id: Some(agent.session_id),
             }
         }));

@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.19.4)
 
+- Simplify the team table: hide empty speed-mode columns, show concise live
+  states (including the director), and display cost without tokens or billing qualifiers.
+
 ## 0.19.4 (2026-10-23)
 
 - Update `ctutils` to 0.4.4 and Tokio to 1.53.3 to fix RUSTSEC-2026-0385

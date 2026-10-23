@@ -8475,15 +8475,45 @@ fn agents_status_label_counts_only_working_children() {
 }
 
 #[test]
+fn director_roster_tracks_live_state_without_activity_detail() {
+    let mut transcript = Transcript::default();
+    let session_id = Uuid::new_v4();
+    for (index, (status, lifecycle, expected)) in [
+        (SessionStatus::Running, None, "working"),
+        (
+            SessionStatus::Ready,
+            Some(borg_remote::SubagentLifecycle::WaitingOnWatchers),
+            "waiting",
+        ),
+        (SessionStatus::Ready, None, "ready"),
+        (SessionStatus::WaitingForApproval, None, "approval"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            index as u64 + 1,
+            SessionEventKind::StatusChanged {
+                status,
+                lifecycle,
+                detail: Some("activity detail that should not fill the state column".to_string()),
+            },
+        ));
+        assert_eq!(transcript.agent_roster_entries()[0].state, expected);
+    }
+}
+
+#[test]
 fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
     let entries = vec![
         AgentRosterEntry {
             name: "director".to_string(),
             model: "gpt-5.6-sol".to_string(),
             effort: "xhigh".to_string(),
-            state: "main thread".to_string(),
+            state: "working".to_string(),
             lifecycle: None,
-            usage: "472.7m · ~$133.11 (sub eq.)".to_string(),
+            usage: "$133.11".to_string(),
             child_id: None,
         },
         AgentRosterEntry {
@@ -8492,7 +8522,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
             effort: "max".to_string(),
             state: "running".to_string(),
             lifecycle: Some(borg_remote::SubagentLifecycle::Running),
-            usage: "160.8k".to_string(),
+            usage: "—".to_string(),
             child_id: Some(Uuid::new_v4()),
         },
     ];
@@ -8516,16 +8546,9 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
     let model_column = column(&rows[0], "MODEL").expect("model header");
     assert_eq!(column(&rows[1], "gpt-5.6-sol"), Some(model_column));
     assert_eq!(column(&rows[2], "gpt-5.6-luna"), Some(model_column));
-    assert!(rows[0].contains("LIFETIME TOKENS · COST"));
-    let mode_column = rows[0].find("MODE  ").expect("mode header");
-    let state_column = rows[0].find("STATE").expect("state header");
-    assert!(rows[1..].iter().all(|row| {
-        row.chars()
-            .skip(mode_column)
-            .take(state_column - mode_column)
-            .all(|character| character == ' ')
-    }));
-    assert!(rows[1].contains("~$133.11 (sub eq.)"));
+    assert!(rows[0].contains("COST"));
+    assert!(!rows[0].contains("MODE  "));
+    assert!(rows[1].contains("$133.11"));
     assert!(rows.iter().all(|row| row.width() <= 90));
 
     let narrow = team_roster_table_lines(
@@ -8627,7 +8650,8 @@ fn team_roster_mode_cells_render_requested_speed_with_ultrafast_precedence() {
         assert_eq!(mode_cell(&rows[2]), expected);
         assert!(rows[2].starts_with("2 "));
         assert!(rows[2].contains("working"));
-        assert!(rows[2].contains("800.0k · cost unavailable"));
+        assert_eq!(entries[1].usage, "—");
+        assert_eq!(entries[1].state, "working");
         assert_eq!(lines[2].style, team_roster_row_style(true, true));
         assert!(rows.iter().all(|row| row.width() <= 94));
 
@@ -8647,7 +8671,7 @@ fn team_roster_mode_cells_render_requested_speed_with_ultrafast_precedence() {
 }
 
 #[test]
-fn subagent_selector_shows_cumulative_usage_without_a_redundant_unit_suffix() {
+fn subagent_roster_hides_tokens_when_cost_is_unavailable() {
     let usage = borg_remote::SubagentUsage {
         total_tokens: 800_000,
         context_tokens: Some(100_000),
@@ -8655,17 +8679,17 @@ fn subagent_selector_shows_cumulative_usage_without_a_redundant_unit_suffix() {
     };
 
     let label = format_subagent_usage(&usage);
-    assert_eq!(label, "  800.0k · cost unavailable");
+    assert_eq!(label, "—");
     assert_eq!(
         format_subagent_usage(&borg_remote::SubagentUsage {
             context_tokens: Some(84_600),
             ..Default::default()
         }),
-        "  —"
+        "—"
     );
     assert_eq!(
         format_subagent_usage(&borg_remote::SubagentUsage::default()),
-        "  —"
+        "—"
     );
 }
 
@@ -8706,7 +8730,7 @@ fn subagent_roster_shows_full_model_ids() {
 }
 
 #[test]
-fn subagent_subscription_cost_is_marked_as_api_equivalent() {
+fn subagent_roster_cost_omits_billing_qualifiers() {
     let usage = borg_remote::SubagentUsage {
         cost_microusd: Some(1_234_567),
         cost_basis: "subscription_equivalent".to_string(),
@@ -8714,13 +8738,13 @@ fn subagent_subscription_cost_is_marked_as_api_equivalent() {
         ..Default::default()
     };
 
-    assert_eq!(format_subagent_usage(&usage), "  ~$1.23 (sub eq.)");
+    assert_eq!(format_subagent_usage(&usage), "$1.23");
     assert_eq!(
         format_subagent_usage(&borg_remote::SubagentUsage {
             cost_complete: None,
             ..usage
         }),
-        "  ~$1.23 (sub eq., unverified)"
+        "$1.23"
     );
 }
 
@@ -8773,17 +8797,14 @@ fn director_roster_preserves_historical_cost_basis_across_model_switches() {
     ));
     let director = &transcript.agent_roster_entries()[0];
     assert_eq!(director.model, "gpt-6-sol");
-    assert_eq!(director.usage, "474.7m · ~$133.11 (sub eq., partial)");
+    assert_eq!(director.usage, "$133.11");
 
     transcript.apply(&SessionEvent::new(
         session_id,
         2,
         usage(2, Some(500_000), "estimated_from_pricing"),
     ));
-    assert_eq!(
-        transcript.agent_roster_entries()[0].usage,
-        "474.7m · ~$133.61 (mix, partial)"
-    );
+    assert_eq!(transcript.agent_roster_entries()[0].usage, "$133.61");
 
     let mut cache_only = Transcript::default();
     cache_only.apply(&SessionEvent::new(
@@ -8926,7 +8947,7 @@ fn parked_children_show_as_waiting_and_count_as_active() {
     let rows = transcript.agent_roster_entries();
     assert_eq!(rows[1].name, "live");
     assert_eq!(rows[2].name, "builder");
-    assert_eq!(rows[2].state, "waiting on 1 job: cargo build");
+    assert_eq!(rows[2].state, "waiting");
     let (collapsed, header) = visible_team_roster(&rows, false);
     assert_eq!(header, Some(3));
     assert_eq!(collapsed[3].name, "▸ Inactive · 2");
@@ -13452,10 +13473,7 @@ fn projected_session_state_restores_status_config_outside_the_history_tail() {
     assert_eq!(statuses.billing, None);
     assert_eq!(statuses.cwd, format!("{separator}w{separator}borg"));
     assert_eq!(transcript.context_remaining_percent, 77);
-    assert_eq!(
-        transcript.agent_roster_entries()[0].usage,
-        "123.0k · cost unavailable"
-    );
+    assert_eq!(transcript.agent_roster_entries()[0].usage, "—");
 }
 
 #[test]

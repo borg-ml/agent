@@ -13461,7 +13461,7 @@ fn team_roster_table_lines(
         ui_text(language, "EFFORT"),
         ui_text(language, "MODE"),
         ui_text(language, "STATE"),
-        ui_text(language, "LIFETIME TOKENS · COST"),
+        ui_text(language, "COST"),
         columns,
     );
     std::iter::once(Line::from(Span::styled(
@@ -13526,20 +13526,14 @@ fn team_roster_table_columns(
         name: column_width("AGENT", |entry| &entry.name, 34),
         model: column_width("MODEL", |entry| &entry.model, 20),
         effort: Some(column_width("EFFORT", |entry| &entry.effort, 8)),
-        mode: Some(
-            entries
-                .iter()
-                .map(|entry| team_roster_mode(entry, transcript).width())
-                .chain(std::iter::once("MODE".width()))
-                .max()
-                .unwrap_or(4),
-        ),
+        mode: entries
+            .iter()
+            .map(|entry| team_roster_mode(entry, transcript).width())
+            .filter(|width| *width > 0)
+            .max()
+            .map(|width| width.max("MODE".width())),
         state: Some(column_width("STATE", |entry| &entry.state, 17)),
-        usage: Some(column_width(
-            "LIFETIME TOKENS · COST",
-            |entry| &entry.usage,
-            36,
-        )),
+        usage: Some(column_width("COST", |entry| &entry.usage, 36)),
     };
     while roster_columns_width(columns) > width && columns.name > 12 {
         columns.name -= 1;
@@ -14451,48 +14445,14 @@ fn deletes_next_word(key: &KeyEvent) -> bool {
 include!("transcript.rs");
 
 fn format_subagent_usage(usage: &borg_remote::SubagentUsage) -> String {
-    let displayed_tokens = (usage.total_tokens > 0).then_some(usage.total_tokens);
-    if displayed_tokens.is_none() && usage.cost_microusd.is_none() {
-        return "  —".to_string();
-    }
-    let mut parts = Vec::new();
-    if let Some(tokens) = displayed_tokens {
-        parts.push(format_compact_token_total(tokens));
-    }
-    if let Some(cost_microusd) = usage.cost_microusd {
-        let cost = cost_microusd as f64 / 1_000_000.0;
-        let amount = if cost >= 1.0 {
-            format!("{cost:.2}")
-        } else {
-            format!("{cost:.4}")
-        };
-        let (prefix, basis) = match usage.cost_basis.as_str() {
-            "subscription_equivalent" => ("~", "sub eq."),
-            "estimated_from_pricing" => ("~", "est"),
-            "mixed" => ("~", "mix"),
-            "provider_reported" | "provider" => ("", "provider"),
-            _ => ("", "basis unknown"),
-        };
-        let coverage = match usage.cost_complete {
-            Some(true) => "",
-            Some(false) => ", partial",
-            None => ", unverified",
-        };
-        let label = format!("{prefix}${amount} ({basis}{coverage})");
-        parts.push(label);
-    } else if displayed_tokens.is_some() {
-        parts.push("cost unavailable".to_string());
-    }
-    format!("  {}", parts.join(" · "))
-}
-
-fn format_compact_token_total(value: u64) -> String {
-    if value >= 1_000_000 {
-        format!("{:.1}m", value as f64 / 1_000_000.0)
-    } else if value >= 1_000 {
-        format!("{:.1}k", value as f64 / 1_000.0)
+    let Some(cost_microusd) = usage.cost_microusd else {
+        return "—".to_string();
+    };
+    let cost = cost_microusd as f64 / 1_000_000.0;
+    if cost >= 1.0 {
+        format!("${cost:.2}")
     } else {
-        value.to_string()
+        format!("${cost:.4}")
     }
 }
 
