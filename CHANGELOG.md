@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.19.1)
+## Unreleased (since 0.19.2)
+
+## 0.19.2 (2026-10-23)
 
 - Recognize indefinite Codex/GPT subscription cache retention explicitly: preserve
   stable cache keys across resumes without keepalives or expiry-triggered idle
