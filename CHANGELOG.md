@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.19.4)
 
+- Keep the TUI’s background Git status refresh from taking the index lock
+  while a human or another agent is updating the repository.
+
 - Simplify the team table: hide empty speed-mode columns, show concise live
   states (including the director), and display cost without tokens or billing qualifiers.
 

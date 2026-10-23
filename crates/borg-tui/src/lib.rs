@@ -16330,6 +16330,7 @@ fn restore_transcript_viewport_anchor(
 
 fn read_git_worktree_status(cwd: &Path) -> Option<GitWorktreeStatus> {
     let output = Command::new("git")
+        .arg("--no-optional-locks")
         .args(["status", "--porcelain=v1", "--branch"])
         .current_dir(cwd)
         .output()
