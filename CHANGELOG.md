@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.19.1)
 
+- Recover `exec` from a retired scratch directory with an explicit leading absolute
+  `cd`, while still refusing ordinary commands in a missing remembered directory.
+
 - Fix CLI test compilation after removing collaborator status polling by deleting
   stale assertions for the retired helper while keeping host-lifecycle coverage.
 

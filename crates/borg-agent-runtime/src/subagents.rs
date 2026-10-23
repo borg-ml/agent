@@ -1855,6 +1855,18 @@ impl AgentToolDispatcher {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = remembered.clone();
         if let Some(directory) = &current {
+            // A source-only worktree may have been retired since the last
+            // command. An explicit absolute cd is a complete recovery path;
+            // do not prepend the now-missing directory ahead of that command.
+            if !directory.is_dir()
+                && let Some((target, _)) = crate::tool_presentation::split_leading_cd(&command)
+                && Path::new(&target).is_absolute()
+                && let Ok(target) = Path::new(&target).canonicalize()
+                && target.is_dir()
+            {
+                *remembered = Some(target.clone());
+                return Ok((command, Some(target)));
+            }
             ensure!(
                 directory.is_dir(),
                 "Remembered shell directory {} no longer exists; supply an existing explicit workdir before running commands",

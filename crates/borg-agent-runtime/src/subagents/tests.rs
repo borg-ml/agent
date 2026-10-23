@@ -10503,6 +10503,16 @@ async fn team_harness_tool_context_keeps_literal_shell_cd_separate_from_assigned
         dispatcher.call("exec", json!({"cmd":"pwd"})).await.unwrap()["cwd"],
         nested.to_string_lossy().as_ref()
     );
+    // Retiring a scratch checkout must not strand exec: a leading absolute
+    // cd recovers without silently falling back for ordinary relative commands.
+    std::fs::remove_dir(&nested).unwrap();
+    assert!(dispatcher.call("exec", json!({"cmd":"pwd"})).await.is_err());
+    let recovered = dispatcher.call("exec", json!({"cmd":format!("cd '{}' && pwd", directory.path().display())}))
+        .await.unwrap();
+    assert_eq!(recovered["cwd"], directory.path().to_string_lossy().as_ref());
+    assert_eq!(dispatcher.call("exec", json!({"cmd":"pwd"})).await.unwrap()["cwd"],
+        directory.path().to_string_lossy().as_ref());
+
 }
 
 // These tests protect the actual command/socket boundary: fake runtime hosts
