@@ -22361,6 +22361,8 @@ async fn a_prompt_failing_before_any_output_returns_to_the_composer() {
             text: "thinking".to_string(),
         },
     ));
+    // A network retry reannounces the same prompt; it is not a new submission.
+    terminal.apply_session_event(&user(MessageStatus::InProgress));
     terminal.apply_session_event(&user(MessageStatus::Failed));
     assert_eq!(terminal.composer.draft(), None);
     terminal.shutdown().await;

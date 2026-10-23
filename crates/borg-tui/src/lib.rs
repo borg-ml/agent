@@ -1706,6 +1706,7 @@ pub struct BorgTerminal {
     /// The live prompt whose turn has not produced output yet; see
     /// [`Self::return_prompt_failed_before_output`].
     prompt_awaiting_output: Option<Uuid>,
+    prompts_with_output: HashSet<Uuid>,
     keymap: KeyMap,
     ui_language: UiLanguage,
     cwd: PathBuf,
@@ -3150,6 +3151,7 @@ impl BorgTerminal {
             composer_draft_store: ComposerDraftStore::for_session(sessions_dir, session_id),
             persisted_draft: None,
             prompt_awaiting_output: None,
+            prompts_with_output: HashSet::new(),
             keymap,
             ui_language: UiLanguage::Auto,
             cwd,
@@ -3336,6 +3338,7 @@ impl BorgTerminal {
         self.composer_draft_store = ComposerDraftStore::for_session(sessions_dir, session_id);
         self.persisted_draft = None;
         self.prompt_awaiting_output = None;
+        self.prompts_with_output.clear();
         self.keymap = KeyMap::from_config(keybindings)?;
         self.transcript = root_transcript_from_environment();
         self.transcript
@@ -4127,7 +4130,16 @@ impl BorgTerminal {
                 status: MessageStatus::InProgress,
                 ..
             } => {
-                self.prompt_awaiting_output = Some(*message_id);
+                self.prompt_awaiting_output =
+                    (!self.prompts_with_output.contains(message_id)).then_some(*message_id);
+            }
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                status: MessageStatus::Complete,
+                ..
+            } => {
+                self.prompts_with_output.insert(*message_id);
             }
             SessionEventKind::Message {
                 actor: EventActor::Assistant,
@@ -4136,7 +4148,12 @@ impl BorgTerminal {
             | SessionEventKind::ReasoningDelta { .. }
             | SessionEventKind::ReasoningBlockDelta { .. }
             | SessionEventKind::ReasoningBlockSnapshot { .. }
-            | SessionEventKind::ToolStarted { .. } => self.prompt_awaiting_output = None,
+            | SessionEventKind::MessageDelta { .. }
+            | SessionEventKind::ToolStarted { .. } => {
+                if let Some(message_id) = self.prompt_awaiting_output.take() {
+                    self.prompts_with_output.insert(message_id);
+                }
+            }
             SessionEventKind::Message {
                 message_id,
                 actor: EventActor::User,
@@ -4146,7 +4163,7 @@ impl BorgTerminal {
                 ..
             } if self.prompt_awaiting_output == Some(*message_id) => {
                 self.prompt_awaiting_output = None;
-                if event.kind.is_recallable_user_message() {
+                if !self.replaying_history && event.kind.is_recallable_user_message() {
                     self.restore_composer(text.clone(), attachments.clone());
                     self.notice = Some(
                         "The prompt failed before the agent replied; it was returned to the composer"
@@ -4160,6 +4177,7 @@ impl BorgTerminal {
 
     pub fn apply_session_event(&mut self, event: &SessionEvent) -> bool {
         let inspector_anchor = self.action_inspector_anchor();
+        self.return_prompt_failed_before_output(event);
         if !self.replaying_history {
             if self.connection_retry_at.is_some()
                 && matches!(
@@ -4178,7 +4196,6 @@ impl BorgTerminal {
                 self.connection_retry_attempt = None;
                 self.notice = None;
             }
-            self.return_prompt_failed_before_output(event);
             match &event.kind {
                 SessionEventKind::ProviderEvent { kind, payload, .. }
                     if kind == "usage_limit_retry" =>

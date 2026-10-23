@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.19.2)
 
+- Bound journal row-lock waits and idle transactions to 60 seconds so a stranded
+  database writer cannot silently block a session behind its own watchdog.
+- Keep already-answered prompts out of the composer when a later connection
+  retry fails; distinguish exhausted connection retries from provider refusals.
+
 - Fix workspace formatting that blocked release verification for 0.19.2.
 
 ## 0.19.2 (2026-10-23)

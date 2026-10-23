@@ -6108,7 +6108,7 @@ async fn run_agent_session_store_kernel_inner(
                             }
                             let ready_detail = if network_retry_exhausted {
                                 format!(
-                                    "Provider kept refusing · stopped after {} attempts · check the provider status or /model, then resend · your work is saved · last error: {}",
+                                    "Provider connection unavailable · stopped after {} retries · check connectivity or provider status, then resume · your work is saved · last error: {}",
                                     NETWORK_RETRY_MAX_ATTEMPTS,
                                     compact_provider_error(&error)
                                 )

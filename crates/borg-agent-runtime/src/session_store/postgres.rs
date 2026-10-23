@@ -127,6 +127,11 @@ impl PostgresSessionStore {
             .parse::<PgConnectOptions>()
             .with_context(|| format!("invalid Postgres session store URL: {url}"))?
             .application_name("borg-session-journal")
+            // Database waits must not strand the actor behind its own watchdog.
+            .options([
+                ("lock_timeout", "60s"),
+                ("idle_in_transaction_session_timeout", "60s"),
+            ])
             // Statement logging at INFO would echo event bodies into the
             // process log; the journal is the authority for that content.
             .log_statements(tracing::log::LevelFilter::Debug);
@@ -528,6 +533,59 @@ mod tests {
     /// mock would get wrong. Without one they skip rather than fail, so the
     /// suite still runs on a machine with no database.
     use super::testing::{ScratchDatabase, test_url};
+
+    #[tokio::test]
+    async fn journal_connections_bound_stranded_transactions() {
+        use crate::SessionStore;
+
+        let (scratch, store) = testing::session_store().await;
+        let mut blocked = store.pool().acquire().await.unwrap();
+        let lock_timeout: String = sqlx::query_scalar("show lock_timeout")
+            .fetch_one(&mut *blocked)
+            .await
+            .unwrap();
+        let idle_timeout: String = sqlx::query_scalar("show idle_in_transaction_session_timeout")
+            .fetch_one(&mut *blocked)
+            .await
+            .unwrap();
+        assert_eq!(lock_timeout, "1min");
+        assert_eq!(idle_timeout, "1min");
+        let session = uuid::Uuid::new_v4();
+        store.create_session(session).await.unwrap();
+        let mut holder = store.pool().begin().await.unwrap();
+        sqlx::query("select id from sessions where id=$1 for update")
+            .bind(session)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        // Exercise the failure without making this regression wait a minute.
+        sqlx::query("set lock_timeout='50ms'")
+            .execute(&mut *blocked)
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            sqlx::query("select id from sessions where id=$1 for update")
+                .bind(session)
+                .execute(&mut *blocked),
+        )
+        .await
+        .expect("row lock wait must be bounded")
+        .unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("55P03")
+        );
+        holder.rollback().await.unwrap();
+        sqlx::query("select id from sessions where id=$1 for update")
+            .bind(session)
+            .execute(&mut *blocked)
+            .await
+            .unwrap();
+        drop(blocked);
+        store.pool().close().await;
+        scratch.discard().await;
+    }
 
     #[tokio::test]
     async fn idle_sessions_release_connections_and_reconnect() {
