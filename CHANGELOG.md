@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.19.1)
 
+- Fix CLI test compilation after removing collaborator status polling by deleting
+  stale assertions for the retired helper while keeping host-lifecycle coverage.
+
 - Same-instance director messages show `Director` in local-agent pink, including
   focused-child and replayed history views. Purple `Peer` is reserved for
   external instances.

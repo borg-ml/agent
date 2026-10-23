@@ -4008,7 +4008,6 @@ fn detached_host_remains_alive_for_children_prompts_processes_watches_and_viewer
         &state,
         true
     ));
-    assert!(collaborator_activity("investigator", &state).is_none());
     assert!(!session_host_is_idle(&state, false, true, false));
     assert!(!session_host_is_idle(&state, true, false, false));
     assert!(!session_host_is_idle(&state, false, false, true));
@@ -4020,7 +4019,6 @@ fn detached_host_remains_alive_for_children_prompts_processes_watches_and_viewer
         &state,
         false
     ));
-    assert!(collaborator_activity("investigator", &state).is_some());
     state.active_processes.clear();
     state.watches.push(borg_remote::WatchSummary {
         watch_id: Uuid::new_v4(),
@@ -4038,7 +4036,6 @@ fn detached_host_remains_alive_for_children_prompts_processes_watches_and_viewer
         &state,
         false
     ));
-    assert!(collaborator_activity("investigator", &state).is_some());
     state.watches[0].running = false;
     assert!(session_host_is_idle(&state, false, false, false));
     for status in [
@@ -4049,7 +4046,6 @@ fn detached_host_remains_alive_for_children_prompts_processes_watches_and_viewer
         state.status = Some(status);
         assert!(!session_host_is_idle(&state, false, false, false));
         assert!(!passive_owner_stop_is_safe(status, &state, false));
-        assert!(collaborator_activity("investigator", &state).is_some());
     }
 }
 
