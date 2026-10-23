@@ -278,6 +278,12 @@ pub struct TranscriptCore {
     pub usage_by_turn: HashMap<Uuid, crate::wire::Usage>,
     pub usage_turn_order: std::collections::VecDeque<Uuid>,
     pub team_report_sources: HashMap<Uuid, (Uuid, Uuid, String)>,
+    #[serde(default)]
+    pub team_report_roles: HashMap<Uuid, AgentMessageSenderRole>,
+    #[serde(default)]
+    pub message_root_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub local_agent_ids: HashSet<Uuid>,
     pub order: TranscriptEntries,
     pub messages: HashMap<Uuid, usize>,
     pub child_transcript: bool,
@@ -370,6 +376,9 @@ impl Default for TranscriptCore {
             usage_by_turn: HashMap::new(),
             usage_turn_order: Default::default(),
             team_report_sources: HashMap::new(),
+            team_report_roles: HashMap::new(),
+            message_root_session_id: None,
+            local_agent_ids: HashSet::new(),
             order: TranscriptEntries::default(),
             messages: HashMap::new(),
             child_transcript: false,
@@ -2618,6 +2627,7 @@ impl TranscriptCore {
                 sender_name,
                 text,
                 from_child,
+                sender_role,
             } => {
                 removed_entry = self.remove_message(*message_id);
                 self.queued_messages.remove(message_id);
@@ -2626,19 +2636,11 @@ impl TranscriptCore {
                 if self.remember_agent_message(*message_id) {
                     self.agent_message_senders.insert(*sender_id);
 
-                    // Explicit receipts are conversation messages, not automatic
-                    // child-transcript mirrors. Ownership labels them, never hides them.
-                    let from_peer = match from_child {
-                        Some(from_child) => !from_child,
-                        None => {
-                            !self.subagent_snapshots.contains_key(sender_id)
-                                && !self.pruned_settled_children.contains(sender_id)
-                        }
-                    };
+                    let label = self.agent_message_label(*sender_id, *sender_role, *from_child);
                     self.order
                         .push(TranscriptEntry::Operation(Operation::lifecycle(
                             OperationKind::Agent,
-                            if from_peer { "Peer" } else { "Agent" },
+                            label,
                             if sender_name.trim().is_empty() {
                                 self.agent_names
                                     .get(sender_id)
@@ -2656,6 +2658,7 @@ impl TranscriptCore {
                 // Duplicate receipts have no new row to own their source metadata.
                 if !row_created {
                     self.team_report_sources.remove(&event.id);
+                    self.team_report_roles.remove(&event.id);
                 }
             }
             SessionEventKind::SubagentActivity {
@@ -3453,6 +3456,8 @@ impl TranscriptCore {
             .map(|(event_id, _)| *event_id)
             .collect::<HashSet<_>>();
         self.team_report_sources
+            .retain(|event_id, _| rows.contains(event_id));
+        self.team_report_roles
             .retain(|event_id, _| rows.contains(event_id));
     }
 
@@ -4384,6 +4389,95 @@ impl TranscriptCore {
         ));
     }
 
+    /// Older receipts lack a durable role. Give focused overlays the host's
+    /// ownership scope rather than treating every non-descendant as external.
+    pub fn seed_agent_message_scope(
+        &mut self,
+        root: Uuid,
+        director: Option<&TeamDirector>,
+        local_agents: impl IntoIterator<Item = Uuid>,
+    ) {
+        let mut changed = self.message_root_session_id != Some(root);
+        self.message_root_session_id = Some(root);
+        let previous_len = self.local_agent_ids.len();
+        self.local_agent_ids.extend(local_agents);
+        changed |= self.local_agent_ids.len() != previous_len;
+        if let Some(director) = director
+            && self
+                .meta
+                .director
+                .as_ref()
+                .is_none_or(|current| current.epoch.parse::<u64>().unwrap_or(0) < director.epoch)
+        {
+            self.meta.director = Some(director.into());
+            changed = true;
+        }
+        if changed {
+            self.refresh_agent_message_labels();
+        }
+    }
+
+    fn agent_message_label(
+        &self,
+        sender: Uuid,
+        role: Option<AgentMessageSenderRole>,
+        from_child: Option<bool>,
+    ) -> &'static str {
+        if role == Some(AgentMessageSenderRole::Peer) {
+            return "Peer";
+        }
+        let director = self
+            .meta
+            .director
+            .as_ref()
+            .and_then(|director| Uuid::parse_str(&director.session_id).ok())
+            .or(self.message_root_session_id);
+        if director == Some(sender)
+            || (director.is_none() && role == Some(AgentMessageSenderRole::Director))
+        {
+            return "Director";
+        }
+        if role.is_some()
+            || from_child == Some(true)
+            || self.message_root_session_id == Some(sender)
+            || self.local_agent_ids.contains(&sender)
+            || self.agent_names.contains_key(&sender)
+            || self.subagent_snapshots.contains_key(&sender)
+            || self.pruned_settled_children.contains(&sender)
+        {
+            "Agent"
+        } else {
+            "Peer"
+        }
+    }
+
+    fn refresh_agent_message_labels(&mut self) {
+        let updates = self
+            .order
+            .identities
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (event, _))| {
+                let (_, sender, _) = self.team_report_sources.get(event)?;
+                let operation = self.order.lifecycle(index)?;
+                let role = self.team_report_roles.get(event).copied().or_else(|| {
+                    match operation.label.as_str() {
+                        "Director" => Some(AgentMessageSenderRole::Director),
+                        "Agent" => Some(AgentMessageSenderRole::Agent),
+                        _ => None,
+                    }
+                });
+                let label = self.agent_message_label(*sender, role, None);
+                (operation.label != label).then_some((index, label))
+            })
+            .collect::<Vec<_>>();
+        for (index, label) in updates {
+            if let Some(operation) = self.order.lifecycle_mut(index) {
+                operation.label = label.into();
+            }
+        }
+    }
+
     pub fn effective_subagent_snapshot(&self, child_id: Uuid) -> Option<SubagentSnapshot> {
         let child = self.subagent_snapshots.get(&child_id)?.clone();
         self.child_meta_refs
@@ -4463,16 +4557,21 @@ impl TranscriptCore {
                 message_id,
                 sender_id,
                 sender_name,
+                sender_role,
                 ..
             } => {
                 self.team_report_sources
                     .insert(event.id, (*message_id, *sender_id, sender_name.clone()));
+                if let Some(role) = sender_role {
+                    self.team_report_roles.insert(event.id, *role);
+                }
             }
             SessionEventKind::TeamDirectorChanged { director } => {
                 if self.meta.director.as_ref().is_none_or(|current| {
                     current.epoch.parse::<u64>().unwrap_or(0) < director.epoch
                 }) {
                     self.meta.director = Some(director.into());
+                    self.refresh_agent_message_labels();
                 }
             }
             SessionEventKind::StatusChanged {

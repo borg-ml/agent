@@ -6141,6 +6141,7 @@ async fn durable_parent_activity_restores_child_topology() {
             sender_name: "independent reviewer".into(),
             text: "Durable report".into(),
             from_child: None,
+            sender_role: None,
         },
     );
     coordinator.restore_from_events(&[receipt]).await.unwrap();

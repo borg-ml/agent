@@ -1837,6 +1837,16 @@ pub struct TeamDirector {
     pub epoch: u64,
 }
 
+/// Sender's relationship to the receiving instance when a receipt was recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum AgentMessageSenderRole {
+    Director,
+    Agent,
+    Peer,
+}
+
 /// A watch armed by the agent (`watch` tool): a long-running command whose
 /// output lines are delivered to the session as events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -2888,6 +2898,10 @@ pub enum SessionEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         from_child: Option<bool>,
+        /// Durable instance membership and logical authority; absent in older journals.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        sender_role: Option<AgentMessageSenderRole>,
     },
     /// Legacy journal compatibility only; ignored during replay.
     UserStopChanged {

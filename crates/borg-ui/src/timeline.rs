@@ -100,6 +100,20 @@ impl TimelineProjector {
         self.sync_entries();
     }
 
+    pub fn seed_agent_message_scope(
+        &mut self,
+        root: Uuid,
+        director: Option<&borg_remote::TeamDirector>,
+        agents: &[SubagentSnapshot],
+    ) {
+        self.core.seed_agent_message_scope(
+            root,
+            director,
+            agents.iter().map(|agent| agent.session_id),
+        );
+        self.sync_entries();
+    }
+
     pub fn push(&mut self, event: &SessionEvent) {
         self.session_id.get_or_insert(event.session_id);
         self.core.apply(event);
@@ -503,6 +517,7 @@ mod tests {
                     sender_name: "worker".into(),
                     text: text.into(),
                     from_child: Some(from_child),
+                    sender_role: None,
                 },
             );
             live.push(&event);
@@ -534,6 +549,7 @@ mod tests {
                 sender_name: "sibling".into(),
                 text: "visible sibling report".into(),
                 from_child: None,
+                sender_role: None,
             },
         ));
         assert_eq!(focused.entries.len(), 1);

@@ -57,6 +57,7 @@ fn view_authority_live_and_replay_match_terminal_semantic_rows() {
             sender_name: "worker".into(),
             text: "verified report".into(),
             from_child: None,
+            sender_role: None,
         },
         SessionEventKind::Message {
             message_id: reply,

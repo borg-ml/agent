@@ -1254,6 +1254,12 @@ impl AgentToolDispatcher {
         true
     }
 
+    pub(crate) fn background_action(&self, tool_call_id: &str) {
+        if let Some(watches) = &self.watches {
+            watches.background_action(tool_call_id);
+        }
+    }
+
     pub(crate) fn with_watches(mut self, watches: crate::watch::Watches) -> Self {
         self.watches = Some(watches);
         self

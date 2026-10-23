@@ -3074,6 +3074,7 @@ async fn run_agent_session_store_kernel_inner(
             Arc::clone(&journal.store),
             session_id,
             projection.agent_participant_id,
+            subagents.clone(),
             journal.received_agent_messages.clone(),
             receipt_tx,
         )))
@@ -13624,6 +13625,7 @@ async fn collect_agent_message_receipts(
     sessions: Arc<dyn SessionStore>,
     session_id: Uuid,
     recipient_id: Uuid,
+    subagents: Option<SubagentCoordinator>,
     mut seen: HashSet<Uuid>,
     receipts: mpsc::Sender<SessionEventKind>,
 ) {
@@ -13651,6 +13653,28 @@ async fn collect_agent_message_receipts(
                         {
                             let message_id = message.id;
                             let from_child = sessions.is_descendant(session_id, sender.id).await?;
+                            let root = sessions.owning_root_session(session_id).await?;
+                            let sender_root = sessions.owning_root_session(sender.id).await?;
+                            let sender_role = if let Some(root) =
+                                root.filter(|root| Some(*root) == sender_root)
+                            {
+                                let director = if let Some(team) = &subagents {
+                                    team.director().session_id
+                                } else {
+                                    sessions
+                                        .state(root)
+                                        .await?
+                                        .team_director
+                                        .map_or(root, |director| director.session_id)
+                                };
+                                if sender.id == director {
+                                    crate::AgentMessageSenderRole::Director
+                                } else {
+                                    crate::AgentMessageSenderRole::Agent
+                                }
+                            } else {
+                                crate::AgentMessageSenderRole::Peer
+                            };
                             receipts
                                 .send(SessionEventKind::AgentMessageReceived {
                                     message_id,
@@ -13658,6 +13682,7 @@ async fn collect_agent_message_receipts(
                                     sender_name: sender.display_name,
                                     text: message.body.text,
                                     from_child: Some(from_child),
+                                    sender_role: Some(sender_role),
                                 })
                                 .await
                                 .context("receipt actor closed")?;
@@ -13897,6 +13922,11 @@ async fn record_subagent_activity(
                 sender_name: task_name.clone(),
                 text: text.clone(),
                 from_child: Some(true),
+                sender_role: Some(if subagents.is_director(*sender_id) {
+                    crate::AgentMessageSenderRole::Director
+                } else {
+                    crate::AgentMessageSenderRole::Agent
+                }),
             },
         )
         .await?;

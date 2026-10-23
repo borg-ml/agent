@@ -465,6 +465,7 @@ fn paging_history_keeps_the_full_inactive_roster_without_status_spam() {
                     sender_name: "worker_0".into(),
                     text: "child response".into(),
                     from_child: None,
+                    sender_role: None,
                 },
             ),
             SessionEvent::new(
@@ -560,6 +561,7 @@ fn resumed_history_keeps_child_and_peer_messages_in_order() {
                 sender_name: "worker".to_string(),
                 text: text.to_string(),
                 from_child: None,
+                sender_role: None,
             },
         )
     };
@@ -9209,6 +9211,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
             sender_name: agent.task_name.clone(),
             text: "Found the renderer issue.".to_string(),
             from_child: None,
+            sender_role: None,
         },
     ));
     assert!(matches!(
@@ -9371,6 +9374,7 @@ fn ordinary_subagent_status_stays_in_roster_without_embedded_child_bodies() {
             sender_name: "inspect_ui".to_string(),
             text: "Found the renderer issue.".to_string(),
             from_child: None,
+            sender_role: None,
         },
     );
     transcript.apply(&receipt);
@@ -11541,6 +11545,7 @@ fn agent_receipt_replaces_user_projection_in_either_arrival_order() {
             sender_name: "reviewer".to_string(),
             text: "review result".to_string(),
             from_child: None,
+            sender_role: None,
         },
     );
     for (receipt_first, replay) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -11632,6 +11637,7 @@ fn agent_message_is_visible_while_stopped_once_on_replay_and_never_human_pending
             sender_name: "independent reviewer".to_string(),
             text: "The review is ready.\nNo model turn was needed.".to_string(),
             from_child: None,
+            sender_role: None,
         },
     );
     let stopped = SessionEvent::new(
@@ -20077,6 +20083,7 @@ fn consecutive_agent_messages_group_without_a_tool_row() {
                 sender_name: format!("worker_{sequence}"),
                 text: format!("Progress {sequence}"),
                 from_child: Some(true),
+                sender_role: None,
             },
         ));
     }
@@ -20094,12 +20101,15 @@ fn consecutive_agent_messages_group_without_a_tool_row() {
 
 #[test]
 fn incoming_agent_messages_are_visible_without_subagent_opt_in() {
-    for from_child in [Some(true), Some(false), None] {
-        let label = if from_child == Some(true) {
-            "Agent"
-        } else {
-            "Peer"
-        };
+    use borg_remote::AgentMessageSenderRole as Role;
+    for (from_child, sender_role, label) in [
+        (Some(true), None, "Agent"),
+        (Some(false), None, "Peer"),
+        (None, None, "Peer"),
+        (Some(false), Some(Role::Director), "Director"),
+        (Some(false), Some(Role::Agent), "Agent"),
+        (Some(false), Some(Role::Peer), "Peer"),
+    ] {
         let session_id = Uuid::new_v4();
         let peer = SessionEvent::new(
         session_id,
@@ -20110,6 +20120,7 @@ fn incoming_agent_messages_are_visible_without_subagent_opt_in() {
             sender_name: "agent".to_string(),
             text: "From session 94a66b94: steer orphaning confirmed.\nSecond line\nThird line\nREPORT_END".to_string(),
             from_child,
+            sender_role,
         },
     );
         // Explicit receipts are visible without enabling automatic lifecycle cards.
@@ -20120,13 +20131,18 @@ fn incoming_agent_messages_are_visible_without_subagent_opt_in() {
             transcript.subagent_snapshots.is_empty(),
             "a receipt must not invent child ownership"
         );
-        let color = if from_child == Some(true) {
+        let color = if label != "Peer" {
             SUBAGENT_PURPLE
         } else {
             PEER_PURPLE
         };
-        assert!(transcript.lines(100).iter().flat_map(|line| &line.spans).any(|span|
-            span.content.contains(label) && span.style.fg == Some(color)));
+        assert!(
+            transcript
+                .lines(100)
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.content.contains(label) && span.style.fg == Some(color))
+        );
         // One line names the sender and previews the message, like other actions.
         let single = transcript
             .lines(100)
@@ -20181,9 +20197,15 @@ fn incoming_agent_messages_are_visible_without_subagent_opt_in() {
         transcript.toggle_action_expansion(0);
         let expanded = render(&transcript);
         assert!(expanded.contains("REPORT_END"));
-        if from_child != Some(true) {
-            assert!(transcript.lines(100).iter().flat_map(|line| &line.spans).any(|span|
-                span.content.contains("REPORT_END") && span.style.fg == Some(PEER_PURPLE)));
+        if label == "Peer" {
+            assert!(
+                transcript
+                    .lines(100)
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.content.contains("REPORT_END")
+                        && span.style.fg == Some(PEER_PURPLE))
+            );
         }
         assert!(!expanded.contains("click to"), "{expanded}");
         assert_eq!(transcript.entry_click_hint(0), Some("click collapse"));
@@ -22731,4 +22753,55 @@ fn graphics_detection_uses_reported_geometry_and_explicit_protocols() {
         image_protocol_override(None, Some("tmux-256color"), Some("tmux")),
         None
     );
+}
+
+#[test]
+fn focused_child_message_scope_survives_history_rebuild() {
+    let root = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let receipt = SessionEvent::new(
+        child,
+        1,
+        SessionEventKind::AgentMessageReceived {
+            message_id: Uuid::new_v4(),
+            sender_id: root,
+            sender_name: "abundance".into(),
+            text: "director report".into(),
+            from_child: Some(false),
+            sender_role: None,
+        },
+    );
+    let mut host = Transcript::default();
+    host.seed_agent_message_scope(root, None, [child]);
+    let mut children = HashMap::new();
+    let mut parked_host = None;
+    switch_to_child_transcript(&mut host, &mut parked_host, &mut children, child);
+    host.seed_agent_message_scope(root, None, [child]);
+    host.apply(&receipt);
+    // Hydration replaces the focused child, preserving its inherited scope.
+    let mut hydrated = fresh_transcript_like(&host);
+    hydrated.apply_history(&receipt);
+    for transcript in [&host, &hydrated] {
+        let operation = transcript
+            .order
+            .iter()
+            .zip(&transcript.order.identities)
+            .find_map(|(entry, source)| {
+                if source.0 == receipt.id {
+                    entry.lifecycle()
+                } else {
+                    None
+                }
+            })
+            .expect("receipt operation survives child context boundary");
+        assert_eq!(operation.label, "Director");
+        assert!(
+            transcript
+                .lines(100)
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.content.contains("Director")
+                    && span.style.fg == Some(SUBAGENT_PURPLE))
+        );
+    }
 }

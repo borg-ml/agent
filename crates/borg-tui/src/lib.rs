@@ -4644,6 +4644,12 @@ impl BorgTerminal {
         if let SessionEventKind::TeamDirectorChanged { director } = &event.kind {
             self.apply_team_director(director);
         }
+        if matches!(event.kind, SessionEventKind::AgentMessageReceived { .. })
+            || matches!(&event.kind, SessionEventKind::SubagentActivity { event: Some(child), .. }
+                if matches!(child.kind, SessionEventKind::AgentMessageReceived { .. }))
+        {
+            self.sync_agent_message_scopes();
+        }
         projection_changed
     }
 
@@ -4850,6 +4856,30 @@ impl BorgTerminal {
         }
     }
 
+    fn sync_agent_message_scopes(&mut self) {
+        let root = self
+            .director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript);
+        let local_agents = root
+            .agent_names
+            .keys()
+            .copied()
+            .chain(root.subagent_snapshots.keys().copied())
+            .chain(root.pruned_settled_children.iter().copied())
+            .collect::<Vec<_>>();
+        for transcript in std::iter::once(&mut self.transcript)
+            .chain(self.director_transcript.as_deref_mut())
+            .chain(self.child_transcripts.values_mut())
+        {
+            transcript.seed_agent_message_scope(
+                self.session_id,
+                self.team_director.as_ref(),
+                local_agents.iter().copied(),
+            );
+        }
+    }
+
     fn assignment_sender(&self, child_id: Uuid) -> String {
         let director = self
             .director_transcript
@@ -4932,6 +4962,7 @@ impl BorgTerminal {
         }
         self.transcript.assignment_sender = self.assignment_sender(child_id);
         self.focused_child = Some(child_id);
+        self.sync_agent_message_scopes();
         self.sync_child_configuration(child_id);
         self.refresh_configuration_picker();
         self.interrupt_requested = false;
@@ -4975,6 +5006,7 @@ impl BorgTerminal {
             return;
         }
         self.team_director = Some(director.clone());
+        self.sync_agent_message_scopes();
         self.focus_director_transcript();
     }
 
@@ -5215,6 +5247,7 @@ impl BorgTerminal {
         {
             tracing::warn!(%child_id,%error,"could not apply canonical child metadata to parent view");
         }
+        self.sync_agent_message_scopes();
         self.replaying_history = was_replaying;
     }
 
@@ -5370,6 +5403,7 @@ impl BorgTerminal {
         for agent in agents {
             self.sync_child_configuration(agent.session_id);
         }
+        self.sync_agent_message_scopes();
         self.refresh_configuration_picker();
     }
 
@@ -12735,6 +12769,12 @@ impl BorgTerminal {
 fn fresh_transcript_like(previous: &Transcript) -> Transcript {
     Transcript {
         core: TranscriptCore {
+            message_root_session_id: previous.message_root_session_id,
+            local_agent_ids: previous.local_agent_ids.clone(),
+            meta: borg_view::wire::Meta {
+                director: previous.meta.director.clone(),
+                ..Default::default()
+            },
             diff_expansion: previous.diff_expansion,
             auto_expand_tools: previous.auto_expand_tools,
             auto_expand_thinking: previous.auto_expand_thinking,

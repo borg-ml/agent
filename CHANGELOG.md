@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.19.1)
 
+- Same-instance director messages show `Director` in local-agent pink, including
+  focused-child and replayed history views. Purple `Peer` is reserved for
+  external instances.
+
+- Human steering now backgrounds running shell and persistent-runtime actions
+  instead of waiting for them to finish, so the model can reply promptly without
+  cancelling execution or losing its tracked result.
+
 - Refuse shell commands with a deleted remembered working directory instead of letting later semicolon-separated commands run in the launcher workspace. Supply an existing explicit workdir to recover after removing a scratch checkout.
 
 - Remove the collaborator-active status indicator and its background polling.

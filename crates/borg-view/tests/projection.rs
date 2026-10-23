@@ -303,6 +303,7 @@ fn explicit_child_and_peer_messages_show_without_cached_children() {
                 sender_name: "sender".into(),
                 text: text.into(),
                 from_child: Some(from_child),
+                sender_role: None,
             },
         )
     };
@@ -1864,4 +1865,85 @@ fn captionless_assistant_image_stays_in_the_transcript() {
         &snapshot.rows[0].body,
         borg_view::wire::RowBody::Message { attachments, .. } if attachments.len() == 1
     ));
+}
+
+// Receipt roles must survive cold replay without the bounded child cache; older
+// journals instead need the host scope, including an epoch-zero physical root.
+#[test]
+fn message_roles_survive_replay_and_logical_director_promotions() {
+    use borg_agent_runtime::{AgentMessageSenderRole as Role, TeamDirector};
+    use borg_view::core::TranscriptCore;
+    let root = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let sibling = Uuid::new_v4();
+    let uncached = Uuid::new_v4();
+    let external = Uuid::new_v4();
+    let cases = [
+        (root, None, Some(false), "Director"),
+        (sibling, None, None, "Agent"),
+        (uncached, Some(Role::Agent), Some(false), "Agent"),
+        (external, Some(Role::Peer), Some(false), "Peer"),
+    ];
+    for replay in [false, true] {
+        let mut core = TranscriptCore::default();
+        for (index, (sender_id, sender_role, from_child, _)) in cases.iter().enumerate() {
+            let event = SessionEvent::new(
+                child,
+                index as u64 + 1,
+                SessionEventKind::AgentMessageReceived {
+                    message_id: Uuid::new_v4(),
+                    sender_id: *sender_id,
+                    sender_name: "display name is not authority".into(),
+                    text: "report".into(),
+                    from_child: *from_child,
+                    sender_role: *sender_role,
+                },
+            );
+            // Optional role must also decode when omitted by older producers.
+            let event = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+            if replay {
+                core.apply_history(&event);
+            } else {
+                core.apply(&event);
+            }
+        }
+        assert!(core.subagent_snapshots.is_empty());
+        // Scope can arrive after the receipt window; update existing rows too.
+        // An explicit external role beats even a stale/incorrect roster hint.
+        core.seed_agent_message_scope(root, None, [child, sibling, external]);
+        let labels = |core: &TranscriptCore| {
+            core.order
+                .iter()
+                .filter_map(|row| row.lifecycle().map(|operation| operation.label.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(&core),
+            cases.iter().map(|case| case.3).collect::<Vec<_>>()
+        );
+        let promoted = TeamDirector {
+            session_id: sibling,
+            path: "/root/sibling".into(),
+            epoch: 1,
+        };
+        core.apply(&SessionEvent::new(
+            child,
+            5,
+            SessionEventKind::TeamDirectorChanged {
+                director: promoted.clone(),
+            },
+        ));
+        assert_eq!(labels(&core), ["Agent", "Director", "Agent", "Peer"]);
+        // A stale epoch-zero hydration cannot restore physical-root authority.
+        core.seed_agent_message_scope(
+            root,
+            Some(&TeamDirector {
+                session_id: root,
+                path: "/root".into(),
+                epoch: 0,
+            }),
+            [child, sibling],
+        );
+        assert_eq!(labels(&core), ["Agent", "Director", "Agent", "Peer"]);
+    }
 }

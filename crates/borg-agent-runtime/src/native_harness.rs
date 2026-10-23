@@ -4553,8 +4553,8 @@ async fn execute_tool(
                 | "lane_service"
                 | "watch"
         ) && runtime.permission != PermissionMode::FullAccess);
-    // Accepted shell/runtime batches can already have effects. Read steers at
-    // their next boundary instead of killing the batch; Interrupt still cancels.
+    // Accepted shell/runtime batches can already have effects. Steering yields
+    // their foreground wait without killing the batch; Interrupt still cancels.
     let effectful_batch = matches!(
         tool_call.function.name.as_str(),
         "exec" | "exec_command" | "runtime_exec"
@@ -4581,7 +4581,10 @@ async fn execute_tool(
         call_cancel.clone(),
     );
     let (output, is_error, mut steers) =
-        await_tool_with_controls(call, call_cancel, !effectful_batch, controls).await?;
+        await_tool_with_controls(call, call_cancel, !effectful_batch, controls, || {
+            runtime.agent_tools.background_action(&tool_call.id)
+        })
+        .await?;
     carried.append(&mut steers);
     Ok((output, is_error, carried))
 }
@@ -4591,6 +4594,7 @@ async fn await_tool_with_controls(
     call_cancel: Option<CancellationToken>,
     cancel_on_steer: bool,
     controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
+    background_on_steer: impl Fn(),
 ) -> Result<(String, bool, Vec<CapturedSteer>)> {
     let mut cancel_on_drop = call_cancel
         .as_ref()
@@ -4599,6 +4603,7 @@ async fn await_tool_with_controls(
     let mut pending_steer: Vec<CapturedSteer> = Vec::new();
     loop {
         tokio::select! {
+            biased;
             result = &mut call => {
                 // A wait can finish because this same queued steer woke it.
                 // Collect controls before returning the result to the model.
@@ -4639,8 +4644,14 @@ async fn await_tool_with_controls(
                     let Some(captured) = CapturedSteer::from_control(control) else {
                         continue;
                     };
-                    if cancel_on_steer && let Some(cancel) = &call_cancel {
-                        cancel.cancel();
+                    if !captured.admission.is_recalled() && (captured.human || captured.preempt) {
+                        if cancel_on_steer {
+                            if let Some(cancel) = &call_cancel {
+                                cancel.cancel();
+                            }
+                        } else {
+                            background_on_steer();
+                        }
                     }
                     // Held unadmitted until the caller journals it. A turn that
                     // dies here drops the admission with it, and the session
@@ -7242,6 +7253,7 @@ mod tests {
                 Some(call_cancel),
                 false,
                 &mut None,
+                || {},
             )
             .await
         });
@@ -7259,6 +7271,7 @@ mod tests {
             Some(cancel.clone()),
             false,
             &mut None,
+            || {},
         )
         .await
         .unwrap();
@@ -7274,6 +7287,7 @@ mod tests {
             Some(cancel.clone()),
             false,
             &mut None,
+            || {},
         )
         .await
         .unwrap();
@@ -7610,6 +7624,104 @@ mod tests {
         }
     }
 
+    // A human redirect must not wait for a blocking action's deadline, kill
+    // effects already in flight, or report the steer delivered before its fold.
+    #[tokio::test]
+    async fn steering_backgrounds_effectful_actions_without_cancelling_them() {
+        for (human, preempt, recalled) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+            (true, true, true),
+        ] {
+            let (notices, _notice_rx) = mpsc::channel(4);
+            let watches = crate::watch::Watches::new(
+                crate::native_process::ProcessManager::default(),
+                notices,
+                Uuid::new_v4(),
+            );
+            let (finish, finished) = tokio::sync::oneshot::channel();
+            let mut finish = Some(finish);
+            let cancel = CancellationToken::new();
+            let (control_tx, control_rx) = mpsc::channel(1);
+            let mut controls = Some(control_rx);
+            let call = watches.run_action(
+                "blocking-action",
+                "command",
+                "exec",
+                async move { Ok(finished.await?) },
+                cancel.clone(),
+                None,
+            );
+            let mut waiting = Box::pin(await_tool_with_controls(
+                call,
+                Some(cancel.clone()),
+                false,
+                &mut controls,
+                || watches.background_action("blocking-action"),
+            ));
+            assert!(futures::poll!(&mut waiting).is_pending());
+            let admission = borg_provider::provider::SteerAdmission::pending();
+            if recalled {
+                admission.recall();
+            }
+            let (ack, mut acknowledged) = tokio::sync::oneshot::channel();
+            control_tx
+                .send(AgentTurnControl::Steer {
+                    message_id: Uuid::new_v4(),
+                    text: "redirect".into(),
+                    attachments: Vec::new(),
+                    admission: admission.clone(),
+                    human,
+                    preempt,
+                    ack,
+                })
+                .await
+                .unwrap();
+            let redirects = (human || preempt) && !recalled;
+            if !redirects {
+                assert!(futures::poll!(&mut waiting).is_pending());
+                finish
+                    .take()
+                    .unwrap()
+                    .send(json!({"finished":true}))
+                    .unwrap();
+            }
+            let (output, is_error, steers) = tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .expect("steering must yield before execution finishes")
+                .unwrap();
+            assert!(!is_error, "{output}");
+            assert!(!cancel.is_cancelled(), "steering must preserve execution");
+            assert!(!admission.is_accepted());
+            assert!(matches!(
+                acknowledged.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            assert_eq!(steers.len(), 1);
+            let output: Value = serde_json::from_str(&output).unwrap();
+            if redirects {
+                assert_eq!(output["background"], true);
+                let id = serde_json::from_value(output["watch_id"].clone()).unwrap();
+                assert!(watches.list_for(&[id]).await[0].running);
+                finish
+                    .take()
+                    .unwrap()
+                    .send(json!({"finished":true}))
+                    .unwrap();
+                while watches.list_for(&[id]).await[0].running {
+                    watches.changed.notified().await;
+                }
+                assert_eq!(
+                    watches.list_for(&[id]).await[0].result.as_ref().unwrap()["output"]["finished"],
+                    true
+                );
+            } else {
+                assert_eq!(output["finished"], true);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn shell_command_is_cancelled_by_interrupt_but_not_by_steering() {
         // Capacity one: the second send is the happens-before that the
@@ -7624,6 +7736,7 @@ mod tests {
                 Some(call_cancel),
                 false,
                 &mut Some(control_rx),
+                || {},
             )
             .await
         });
@@ -7698,6 +7811,7 @@ mod tests {
                     Some(call_cancel),
                     true,
                     &mut Some(control_rx),
+                    || {},
                 )
                 .await
             });
@@ -12777,7 +12891,7 @@ mod tests {
             Ok(json!({ "reason": "input_pending" }))
         };
         let (output, is_error, captured) =
-            await_tool_with_controls(call, None, false, &mut controls)
+            await_tool_with_controls(call, None, false, &mut controls, || {})
                 .await
                 .unwrap();
         assert_eq!(

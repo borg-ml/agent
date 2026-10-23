@@ -22959,6 +22959,103 @@ async fn blocked_plan_collector_actor(update_plan: bool) {
     scratch.discard().await;
 }
 
+// Non-descendant does not mean external: canonical owners and logical authority
+// determine the durable receipt role, even without a live subagent coordinator.
+#[tokio::test]
+async fn receipt_roles_distinguish_director_sibling_and_external_after_promotion() {
+    use crate::AgentMessageSenderRole as Role;
+    let (scratch, recipient, sessions, workspace, binding, _) = team_delivery_fixture().await;
+    let root = Uuid::new_v4();
+    let sibling = Uuid::new_v4();
+    let external = Uuid::new_v4();
+    sessions.create_session(root).await.unwrap();
+    sessions.create_session(sibling).await.unwrap();
+    sessions
+        .register_child_session(root, recipient)
+        .await
+        .unwrap();
+    sessions
+        .register_child_session(root, sibling)
+        .await
+        .unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    let collector = tokio::spawn(collect_agent_message_receipts(
+        workspace.clone(),
+        sessions.clone(),
+        recipient,
+        binding.participant_id,
+        None,
+        HashSet::new(),
+        tx,
+    ));
+    let private_workspace = Uuid::new_v4();
+    for (index, (sender, expected)) in [
+        (root, Role::Director),
+        (sibling, Role::Agent),
+        (external, Role::Peer),
+        (root, Role::Agent),
+        (sibling, Role::Director),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index == 3 {
+            sessions
+                .append(SessionEvent::new(
+                    root,
+                    0,
+                    SessionEventKind::TeamDirectorChanged {
+                        director: crate::TeamDirector {
+                            session_id: sibling,
+                            path: "/root/sibling".into(),
+                            epoch: 1,
+                        },
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        let id = Uuid::new_v4();
+        workspace
+            .import_relay_message(
+                crate::WorkspaceMessage {
+                    id,
+                    workspace_id: private_workspace,
+                    author_id: sender,
+                    thread_id: None,
+                    reply_to_message_id: None,
+                    body: crate::WorkspaceMessageBody {
+                        text: "report".into(),
+                        mentions: Vec::new(),
+                        attachments: Vec::new(),
+                    },
+                    audience: crate::Audience::Direct {
+                        participant: binding.participant_id,
+                    },
+                    created_at: Utc::now(),
+                },
+                "display name is not authority",
+                binding.participant_id,
+                crate::DeliveryMode::Notify,
+            )
+            .await
+            .unwrap();
+        let receipt = tokio::time::timeout(EVENT_TIMEOUT, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(receipt, SessionEventKind::AgentMessageReceived {
+            message_id, sender_role: Some(role), from_child: Some(false), ..
+        } if message_id == id && role == expected));
+    }
+    drop(rx);
+    tokio::time::timeout(EVENT_TIMEOUT, collector)
+        .await
+        .unwrap()
+        .unwrap();
+    scratch.discard().await;
+}
+
 // A receipt is not provider-input admission: disabled subagents, a paused goal,
 // and an explicit stop must still permit an authenticated peer receipt. Replay
 // and the direct/relay paths must not duplicate it or infer identity from text.

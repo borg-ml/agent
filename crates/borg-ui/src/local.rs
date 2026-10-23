@@ -644,6 +644,11 @@ impl LocalSessionClient {
 
     fn presentation(&self) -> SessionPresentation {
         let mut timeline = self.timeline.clone();
+        timeline.seed_agent_message_scope(
+            self.root_session_id,
+            self.view.state.team_director.as_ref(),
+            &self.view.agents,
+        );
         let mut live = self.live_events.values().cloned().collect::<Vec<_>>();
         live.sort_by_key(|event| event.created_at);
         timeline.extend(&live);

@@ -788,6 +788,7 @@ mod tests {
                     sender_name: "Peer".into(),
                     text: "Received before checkpoint".into(),
                     from_child: None,
+                    sender_role: None,
                 },
             ))
             .await

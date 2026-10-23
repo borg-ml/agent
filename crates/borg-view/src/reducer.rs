@@ -667,6 +667,7 @@ impl ViewReducer {
             self.history_positions.remove(&id);
             self.group_membership.remove(&id);
             self.core.team_report_sources.remove(&event_id);
+            self.core.team_report_roles.remove(&event_id);
             self.core.messages.retain(|_, i| *i != index);
             self.core.tools.retain(|_, i| *i != index);
             self.core.subagent_entries.retain(|_, i| *i != index);
