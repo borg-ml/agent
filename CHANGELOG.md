@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.2)
 
+- Fix workspace formatting that blocked release verification for 0.19.2.
+
 ## 0.19.2 (2026-10-23)
 
 - Recognize indefinite Codex/GPT subscription cache retention explicitly: preserve
