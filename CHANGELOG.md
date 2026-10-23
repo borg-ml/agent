@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.19.3)
 
+- Update `ctutils` to 0.4.4 and Tokio to 1.53.3 to fix RUSTSEC-2026-0385
+  and RUSTSEC-2026-0386 and unblock the cross-platform release security gate.
+  Includes the journal-stall and retry-safe composer fixes from 0.19.3.
+
 ## 0.19.3 (2026-10-23)
 
 - Bound journal row-lock waits and idle transactions to 60 seconds so a stranded

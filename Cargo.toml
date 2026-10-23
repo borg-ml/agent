@@ -70,7 +70,7 @@ sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "5d3787ef9d699470650
 tar = "0.4"
 tempfile = "3.27.0"
 toml = "1.1.4"
-tokio = { version = "1.53.1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 tokio-util = { version = "0.7.19", features = ["io"] }
 tracing = "0.1.44"
 ts-rs = { version = "12.0.1", features = ["chrono-impl", "serde-json-impl", "uuid-impl"] }
