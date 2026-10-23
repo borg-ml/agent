@@ -3384,7 +3384,12 @@ impl PromptCacheRefreshClient for ProviderModelClient {
                 });
             }
             #[cfg(feature = "subscription-adapters")]
-            NativeRoute::CodexAccount(_) => None,
+            NativeRoute::CodexAccount(account) => {
+                if account.starts_with("sha256:") {
+                    return Err(Ineligible::CacheDoesNotExpire);
+                }
+                None
+            }
             // A real turn writes a cache entry through the system marker, so a
             // refresh has something to keep alive. Whether one is worth sending
             // is still decided below, from a documented lifetime and a real
@@ -9203,13 +9208,13 @@ mod tests {
     #[test]
     fn subscription_cache_refresh_stays_on_the_selected_route() {
         let client = ProviderModelClient {
-            codex_account: Some("selected-codex".into()),
+            codex_account: Some("sha256:selected-codex".into()),
             claude_account: Some("selected-claude".into()),
             ..Default::default()
         };
         assert!(matches!(
             client.route(crate::CodingProvider::Codex, "gpt-5"),
-            Ok(NativeRoute::CodexAccount("selected-codex"))
+            Ok(NativeRoute::CodexAccount("sha256:selected-codex"))
         ));
         assert!(matches!(
             client.route(crate::CodingProvider::Claude, "claude-opus-5"),
@@ -9221,8 +9226,26 @@ mod tests {
         assert!(claude.subscription);
         assert_eq!(claude.cache_lifetime, Duration::from_secs(3600));
         assert_eq!(claude.max_output_tokens, 1);
-        let codex = client.refresh_support(crate::CodingProvider::Codex, "gpt-5", Some("high"));
-        assert_eq!(codex.unwrap_err(), Ineligible::CacheLifetimeUnknown);
+        let codex =
+            client.refresh_support(crate::CodingProvider::Codex, "gpt-6.1-sol", Some("low"));
+        assert_eq!(codex.unwrap_err(), Ineligible::CacheDoesNotExpire);
+        let harness = NativeHarness {
+            model_client: Arc::new(client),
+            ..Default::default()
+        };
+        assert_eq!(
+            harness.prompt_cache_lifetime(crate::CodingProvider::Codex, "gpt-6.1-sol", Some("low")),
+            None
+        );
+        let api = ProviderModelClient {
+            codex_account: Some("api-sha256:selected-key".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            api.refresh_support(crate::CodingProvider::Codex, "gpt-6.1-sol", Some("low"))
+                .unwrap_err(),
+            Ineligible::CacheLifetimeUnknown
+        );
     }
 
     /// A thinking Anthropic route cannot be refreshed. Replaying it under a

@@ -867,10 +867,10 @@ pub fn estimate_prompt_cache_refresh_microusd(
 ///
 /// Only models whose vendor documents a lifetime appear here, because this
 /// value decides when Borg spends a user's money on a refresh. Anthropic sells
-/// an explicit retention. OpenAI only describes its cache as clearing after
-/// "5-10 minutes of inactivity", which reports observed behaviour rather than
-/// promising a window, so its models return `None` and warming reports itself
-/// ineligible instead of guessing.
+/// an explicit retention. OpenAI retention depends on the authenticated route
+/// and request options: Codex subscriptions retain cache indefinitely, while
+/// API retention is separate. Its models return `None` here rather than
+/// inventing a model-only TTL; route policy decides refresh eligibility.
 pub fn prompt_cache_lifetime(model: &str) -> Option<Duration> {
     let normalized = model.trim().to_ascii_lowercase();
     // Matched by prefix because Anthropic ships both the bare id and dated

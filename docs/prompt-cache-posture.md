@@ -28,9 +28,21 @@ faithfully preserve the cached request. Subscription warming consumes quota, not
 API billing: decision events label catalog-price comparisons as API-equivalent
 estimates, and usage retains its subscription cost basis.
 
-Codex automatic warming remains ineligible without established cache-expiry
-semantics, matching Pi's current policy. Normal Codex prefix-cache reuse is
-unaffected. We do not invent a retention timer or fall back to API credentials.
+Codex's logged-in subscription cache has indefinite server-side retention,
+[announced on October 20, 2026](https://x.com/thsottiaux/status/2112712984644784534).
+No client-side `infinite` retention parameter is needed: upstream Codex's
+[Responses request schema](https://github.com/openai/codex/blob/f3a9054/codex-rs/codex-api/src/common.rs)
+still uses `prompt_cache_key`, without a retention override. Borg preserves that
+stable key and native replay across resumes. It explicitly disables subscription
+keepalives and expiry-triggered idle compaction rather than treating an
+indefinite lifetime as a finite timer. Context-limit and manual compaction still
+work normally; changing the prefix can still prevent reuse.
+
+This is distinct from OpenAI API-key cache retention and its separately priced
+options. Borg does not request the API's extended-retention tier, claim infinite
+retention for API keys, or switch billing routes. Actual cache hits remain
+provider-reported usage; a short continuation test cannot prove indefinite
+server-side retention.
 
 A bounded live Claude check is available through `claude_model_probe
 --cache-refresh --cache-prefix`: two one-token refreshes verify subscription

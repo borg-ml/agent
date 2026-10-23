@@ -102,6 +102,9 @@ pub(crate) enum Ineligible {
     /// No documented prompt cache lifetime for this model, so there is no
     /// defensible moment to refresh at.
     CacheLifetimeUnknown,
+    /// The selected subscription keeps cached context indefinitely.
+    #[cfg(feature = "subscription-adapters")]
+    CacheDoesNotExpire,
     /// Borg knows no prices for this model and the last real call reported no
     /// cost, so a refresh cannot be shown to be worth sending.
     EconomicsUnavailable,
@@ -123,6 +126,10 @@ impl Ineligible {
             }
             Self::CacheLifetimeUnknown => {
                 "no documented prompt cache lifetime for this model".to_string()
+            }
+            #[cfg(feature = "subscription-adapters")]
+            Self::CacheDoesNotExpire => {
+                "Codex subscription cache retention is indefinite; no keepalive is needed".to_string()
             }
             Self::EconomicsUnavailable => {
                 "no price or reported cost for this model, so a refresh cannot be justified"

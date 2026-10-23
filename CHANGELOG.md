@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.19.1)
 
+- Recognize indefinite Codex/GPT subscription cache retention explicitly: preserve
+  stable cache keys across resumes without keepalives or expiry-triggered idle
+  compaction. API-key retention and billing are unchanged.
+
+- Fix the strict release Clippy check for director-message label fallback.
+
 - Fix CLI test compilation after removing collaborator status polling by deleting
   stale assertions for the retired helper while keeping host-lifecycle coverage.
 

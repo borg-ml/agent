@@ -4452,25 +4452,25 @@ impl TranscriptCore {
     }
 
     fn refresh_agent_message_labels(&mut self) {
-        let updates = self
-            .order
-            .identities
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (event, _))| {
-                let (_, sender, _) = self.team_report_sources.get(event)?;
-                let operation = self.order.lifecycle(index)?;
-                let role = self.team_report_roles.get(event).copied().or_else(|| {
-                    match operation.label.as_str() {
-                        "Director" => Some(AgentMessageSenderRole::Director),
-                        "Agent" => Some(AgentMessageSenderRole::Agent),
-                        _ => None,
-                    }
-                });
-                let label = self.agent_message_label(*sender, role, None);
-                (operation.label != label).then_some((index, label))
-            })
-            .collect::<Vec<_>>();
+        let updates =
+            self.order
+                .identities
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (event, _))| {
+                    let (_, sender, _) = self.team_report_sources.get(event)?;
+                    let operation = self.order.lifecycle(index)?;
+                    let role = self.team_report_roles.get(event).copied().or(
+                        match operation.label.as_str() {
+                            "Director" => Some(AgentMessageSenderRole::Director),
+                            "Agent" => Some(AgentMessageSenderRole::Agent),
+                            _ => None,
+                        },
+                    );
+                    let label = self.agent_message_label(*sender, role, None);
+                    (operation.label != label).then_some((index, label))
+                })
+                .collect::<Vec<_>>();
         for (index, label) in updates {
             if let Some(operation) = self.order.lifecycle_mut(index) {
                 operation.label = label.into();
