@@ -50,9 +50,9 @@ use crate::editor_preferences::{
 };
 use crate::sleep_inhibitor::{LidSleepStatus, SleepInhibitor, authorize_lid_sleep};
 use crate::terminal_ui::{
-    BorgTerminal, DictationState, ProviderAuthChoice, ResumeSessionOption,
-    TerminalInputEvent, UiAction, dictation_icon_style_for_preference,
-    discard_pending_terminal_input, spawn_terminal_io_worker,
+    BorgTerminal, DictationState, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent,
+    UiAction, dictation_icon_style_for_preference, discard_pending_terminal_input,
+    spawn_terminal_io_worker,
 };
 use borg_ui::localization::UiLanguage;
 
@@ -3246,9 +3246,7 @@ async fn run_local_agent_session(
     let mut agent_config_poll_task: Option<tokio::task::JoinHandle<AgentConfigPollResult>> = None;
     let mut child_status_tick = tokio::time::interval(std::time::Duration::from_secs(5));
     child_status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut child_status_sync_task: Option<
-        tokio::task::JoinHandle<Vec<SubagentSnapshot>>,
-    > = None;
+    let mut child_status_sync_task: Option<tokio::task::JoinHandle<Vec<SubagentSnapshot>>> = None;
     let mut shutdown_signal_open = true;
     let mut session_event_stream_open = true;
     let mut queued_session_events = LiveEventQueue::default();
