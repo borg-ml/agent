@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.19.4)
 
+- Accept silent replies to watcher completion notifications without displaying
+  a spurious Codex empty-answer error; human requests still require a reply.
+
 - Keep the TUI’s background Git status refresh from taking the index lock
   while a human or another agent is updating the repository.
 

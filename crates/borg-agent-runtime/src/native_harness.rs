@@ -1363,20 +1363,27 @@ impl NativeHarness {
                             final_text: truncated_text,
                         });
                     }
-                    bail!("native provider ended the turn without a final response");
+                    if reply_owed
+                        || turn.answers_human
+                        || !turn.prompt_delta.starts_with("Watcher event: ")
+                    {
+                        bail!("native provider ended the turn without a final response");
+                    }
                 }
-                send(
-                    &events,
-                    SessionEventKind::Message {
-                        message_id: assistant_message_id,
-                        actor: EventActor::Assistant,
-                        text: final_text.clone(),
-                        attachments: Vec::new(),
-                        status: MessageStatus::Complete,
-                        delivery: None,
-                    },
-                )
-                .await;
+                if refused || !final_text.trim().is_empty() {
+                    send(
+                        &events,
+                        SessionEventKind::Message {
+                            message_id: assistant_message_id,
+                            actor: EventActor::Assistant,
+                            text: final_text.clone(),
+                            attachments: Vec::new(),
+                            status: MessageStatus::Complete,
+                            delivery: None,
+                        },
+                    )
+                    .await;
+                }
                 reply_owed = false;
                 if let Some((steer, acks)) = admit_steers(std::mem::take(&mut queued_steer)) {
                     // The answer above is already recorded and on screen, so
@@ -12032,11 +12039,14 @@ mod tests {
     /// response to write it, and one with nothing to add still just parks.
     #[tokio::test]
     async fn a_watcher_yield_ends_the_turn_once_any_owed_reply_is_written() {
-        for (yielded, answers_human, reply) in [
-            (true, false, Some("done")),
-            (false, false, Some("done")),
-            (true, true, Some("done")),
-            (true, true, None),
+        for (yielded, answers_human, reply, prompt, expected_completion) in [
+            (true, false, Some("done"), "build it", true),
+            (false, false, Some("done"), "build it", true),
+            (true, true, Some("done"), "build it", true),
+            (true, true, None, "build it", true),
+            (false, false, None, "Watcher event: Build finished", true),
+            (false, true, None, "Watcher event: Build finished", false),
+            (false, false, None, "continue active task", false),
         ] {
             let root = tempfile::tempdir().unwrap();
             let cwd = root.path().to_path_buf();
@@ -12061,7 +12071,9 @@ mod tests {
                 .await
                 .expect("the watcher starts");
 
-            let rounds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let rounds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::from(
+                reply.is_none() && !yielded,
+            )));
             let client = Arc::new(YieldAtRoundBoundaryClient {
                 rounds: std::sync::Arc::clone(&rounds),
                 yield_on_first_round: yielded.then(|| (watches.clone(), info.watch_id)),
@@ -12082,8 +12094,8 @@ mod tests {
                 provider_session_id: None,
                 provider_fork_turn_id: None,
                 cwd: cwd.clone(),
-                prompt_delta: "build it".to_string(),
-                prompt: "build it".to_string(),
+                prompt_delta: prompt.to_string(),
+                prompt: prompt.to_string(),
                 attachments: Vec::new(),
                 output_schema: None,
                 model: Some("test-model".to_string()),
@@ -12136,10 +12148,13 @@ mod tests {
             };
 
             let (events_tx, mut events_rx) = mpsc::channel(256);
-            let result = harness
-                .run(turn, events_tx, None)
-                .await
-                .expect("the turn completes successfully");
+            let result = harness.run(turn, events_tx, None).await;
+            assert_eq!(result.is_ok(), expected_completion, "{prompt}: {result:?}");
+            if !expected_completion {
+                watches.cancel.cancel();
+                continue;
+            }
+            let result = result.unwrap();
 
             let mut assistant_messages = Vec::new();
             while let Ok(event) = events_rx.try_recv() {
@@ -12153,7 +12168,11 @@ mod tests {
                 }
             }
 
-            if yielded && answers_human {
+            if prompt.starts_with("Watcher event: ") {
+                assert_eq!(rounds.load(std::sync::atomic::Ordering::SeqCst), 2);
+                assert!(result.final_text.is_empty());
+                assert!(assistant_messages.is_empty());
+            } else if yielded && answers_human {
                 assert_eq!(
                     rounds.load(std::sync::atomic::Ordering::SeqCst),
                     2,

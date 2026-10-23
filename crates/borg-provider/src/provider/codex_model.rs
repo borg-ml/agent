@@ -1792,7 +1792,10 @@ impl ResponseState {
                 || output.iter().any(|item| item["type"] == "compaction")
                 || !calls.is_empty()
                 || response_hit_output_limit(&response)
-                || response_completed_without_answer_items(&response, &output),
+                // A valid empty message can be a notification-only no-op.
+                // The Borg loop owns whether this turn owes a visible reply.
+                || response_completed_without_answer_items(&response, &output)
+                || (!output.is_empty() && output.iter().all(empty_output_message)),
             "Codex returned no answer or tool calls ({})",
             response_failure_detail(&response, Some(&output))
         );
@@ -2230,9 +2233,18 @@ fn response_failure_detail<'a>(response: &'a Value, output: Option<&'a [Value]>)
     parts.join(" ")
 }
 
+fn empty_output_message(item: &Value) -> bool {
+    item["type"] == "message"
+        && item["content"].as_array().is_some_and(|blocks| {
+            blocks
+                .iter()
+                .all(|block| block["type"] == "output_text" && block["text"].as_str() == Some(""))
+        })
+}
+
 // A completed empty message after encrypted reasoning can resume from that
-// reasoning just like an output-limit stop. Keep genuinely empty completions as
-// errors; a replayable reasoning item is required.
+// reasoning just like an output-limit stop. A silent message without replayable
+// reasoning is a terminal stop, not a continuation.
 fn response_completed_without_answer_items(response: &Value, output: &[Value]) -> bool {
     response["status"] == "completed"
         && output.iter().any(|item| {
@@ -3856,6 +3868,36 @@ mod tests {
         ]});
         assert!(!response_completed_without_answer(&refusal));
         assert!(ResponseState::default().finish(refusal).is_ok());
+    }
+
+    #[test]
+    fn completed_empty_message_remains_a_terminal_reply_for_the_borg_loop() {
+        for content in [json!([]), json!([{"type":"output_text","text":""}])] {
+            let (message, raw) = ResponseState::default()
+                .finish(json!({
+                    "status":"completed",
+                    "output":[{"type":"message","role":"assistant","content":content}],
+                    "usage":{"input_tokens":8,"output_tokens":4}
+                }))
+                .expect("the loop decides whether a notification needs a reply");
+            assert!(
+                matches!(message, ModelMessage::Assistant { content: None, tool_calls, .. }
+                if tool_calls.is_empty())
+            );
+            assert!(!response_completed_without_answer(&raw));
+            assert!(!response_hit_output_limit(&raw));
+            assert_eq!(response_usage(&raw).output_tokens, 4);
+        }
+        for item in [
+            json!({"type":"message"}),
+            json!({"type":"message","content":[{"type":"output_text"}]}),
+        ] {
+            assert!(
+                ResponseState::default()
+                    .finish(json!({"status":"completed","output":[item]}))
+                    .is_err()
+            );
+        }
     }
 
     /// A `max_output_tokens` cut that lands before any text or tool call is
