@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.19.3)
+## Unreleased (since 0.19.4)
+
+## 0.19.4 (2026-10-23)
 
 - Update `ctutils` to 0.4.4 and Tokio to 1.53.3 to fix RUSTSEC-2026-0385
   and RUSTSEC-2026-0386 and unblock the cross-platform release security gate.
