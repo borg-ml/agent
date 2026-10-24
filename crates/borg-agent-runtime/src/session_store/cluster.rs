@@ -578,18 +578,43 @@ impl ManagedCluster {
         .fetch_one(&mut connection)
         .await
         .context("could not inspect the session cluster's commit policy")?;
+        let mut reload = asynchronous;
         if asynchronous {
             connection
                 .execute("alter system set synchronous_commit = on")
                 .await
                 .context("could not restore durable commits for the session cluster")?;
+        }
+        // Client startup options protect new journal pools, not older hosts
+        // already holding connections. Enforce these on the owned server too:
+        // its timers still run when an actor is blocked behind its watchdog.
+        for setting in ["idle_in_transaction_session_timeout", "lock_timeout"] {
+            let unbounded: bool = sqlx::query_scalar(
+                "select setting::bigint = 0 or setting::bigint > 60000 \
+                 from pg_settings where name = $1",
+            )
+            .bind(setting)
+            .fetch_one(&mut connection)
+            .await
+            .context("could not inspect the session cluster's journal timeouts")?;
+            if unbounded {
+                connection
+                    .execute(sqlx::AssertSqlSafe(format!(
+                        "alter system set {setting} = '60s'"
+                    )))
+                    .await
+                    .context("could not bound the session cluster's journal waits")?;
+                reload = true;
+            }
+        }
+        if reload {
             let reloaded: bool = sqlx::query_scalar("select pg_reload_conf()")
                 .fetch_one(&mut connection)
                 .await
-                .context("could not reload the session cluster's commit policy")?;
+                .context("could not reload the session cluster's journal policy")?;
             anyhow::ensure!(
                 reloaded,
-                "the session cluster refused to reload its commit policy"
+                "the session cluster refused to reload its journal policy"
             );
         }
         connection.close().await.ok();
@@ -881,6 +906,136 @@ mod tests {
             "the managed cluster must not adopt a system server's 5432"
         );
         assert!(cluster.url().contains(DATABASE));
+    }
+
+    // A new client's options cannot protect legacy connections. Exercise an
+    // actual server reload and idle-transaction expiry: the lock-holder is not
+    // polled while both main and child journal appends wait behind it.
+    #[tokio::test]
+    async fn server_timeouts_protect_existing_main_and_child_connections() {
+        use crate::{SessionEvent, SessionEventKind, SessionStore};
+        use sqlx::{Connection, Executor, postgres::PgConnection};
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let home = tempfile::tempdir().unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut cluster = ManagedCluster::in_home(home.path());
+        cluster.port = port;
+        cluster
+            .initialize(&locate_binary("initdb").unwrap())
+            .await
+            .unwrap();
+        let mut server = Command::new(locate_binary("postgres").unwrap())
+            .args([
+                "-D",
+                cluster.data_dir.to_str().unwrap(),
+                "-p",
+                &port.to_string(),
+                "-k",
+                home.path().to_str().unwrap(),
+                "-h",
+                "127.0.0.1",
+                "-c",
+                "lc_messages=C",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut log = BufReader::new(server.stderr.take().unwrap()).lines();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let line = log
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("Postgres exited during startup");
+                if line.contains("database system is ready to accept connections") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("private test server starts");
+        let mut admin =
+            PgConnection::connect(&format!("postgres://{ROLE}@127.0.0.1:{port}/postgres"))
+                .await
+                .unwrap();
+        admin
+            .execute("create database borg_sessions")
+            .await
+            .unwrap();
+        let store =
+            super::super::postgres::PostgresSessionStore::connect_with_pool_size(&cluster.url(), 4)
+                .await
+                .unwrap();
+        let main = uuid::Uuid::new_v4();
+        let child = uuid::Uuid::new_v4();
+        store.create_session(main).await.unwrap();
+        store.create_session(child).await.unwrap();
+        let mut legacy = PgConnection::connect(&cluster.url()).await.unwrap();
+        let initial: String = sqlx::query_scalar("show idle_in_transaction_session_timeout")
+            .fetch_one(&mut legacy)
+            .await
+            .unwrap();
+        assert_eq!(initial, "0");
+        cluster.ensure_database().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let settings: (String, String) = sqlx::query_as(
+                    "select current_setting('idle_in_transaction_session_timeout'), current_setting('lock_timeout')"
+                ).fetch_one(&mut legacy).await.unwrap();
+                if settings == ("1min".into(), "1min".into()) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("server policy reaches an already-open legacy connection");
+        // Same server-enforced expiry, shortened so the regression takes no minute.
+        legacy
+            .execute("set idle_in_transaction_session_timeout='100ms'; begin")
+            .await
+            .unwrap();
+        sqlx::query("select id from sessions where id=$1 or id=$2 for update")
+            .bind(main)
+            .bind(child)
+            .execute(&mut legacy)
+            .await
+            .unwrap();
+        let (main_result, child_result) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                store.append(SessionEvent::new(main, 0, SessionEventKind::SessionStarted)),
+                store.append(SessionEvent::new(
+                    child,
+                    0,
+                    SessionEventKind::SessionStarted
+                )),
+            )
+        })
+        .await
+        .expect("both journals advance without polling or cancelling the lock-holder");
+        assert_eq!(main_result.unwrap().session_id, main);
+        assert_eq!(child_result.unwrap().session_id, child);
+        let error = legacy.execute("select 1").await.unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("25P03")
+        );
+        store.pool().close().await;
+        admin.close().await.unwrap();
+        let stopped = Command::new(locate_binary("pg_ctl").unwrap())
+            .arg("-D")
+            .arg(&cluster.data_dir)
+            .args(["-m", "fast", "-w", "stop"])
+            .output()
+            .await
+            .unwrap();
+        assert!(stopped.status.success());
+        server.wait().await.unwrap();
     }
 
     #[test]

@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.19.4)
 
+- Enforce 60-second journal lock and idle-transaction limits on Borg's managed
+  PostgreSQL server, including connections held by older running hosts, so a
+  stranded writer cannot leave main agents and subagents stuck for hours behind
+  their own watchdogs. Stricter server limits are preserved.
+
 - Accept silent replies to watcher completion notifications without displaying
   a spurious Codex empty-answer error; human requests still require a reply.
 
