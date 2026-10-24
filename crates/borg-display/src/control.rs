@@ -680,7 +680,10 @@ fn screenshot(
             Size::from((geometry.size.w, geometry.size.h))
         }
     };
-    let bytes = render(&mut state.renderer, size, &elements)?;
+    let captured = render(&mut state.renderer, size, &elements);
+    let bytes = state.reset_gate.validate_capture(captured, || {
+        crate::gpu::reset_status(&mut state.renderer, state.reset_probe)
+    })?;
     let file = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
     let mut encoder =
         png::Encoder::new(std::io::BufWriter::new(file), size.w as u32, size.h as u32);

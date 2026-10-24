@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.4)
 
+- Reject private-display screenshots when renderer reset is detected after readback, before PNG publication; fail closed on reset-probe errors instead of reporting healthy capabilities.
+
 - Enforce 60-second journal lock and idle-transaction limits on Borg's managed
   PostgreSQL server, including connections held by older running hosts, so a
   stranded writer cannot leave main agents and subagents stuck for hours behind

@@ -92,13 +92,32 @@ impl ResetGate {
         if self.lost {
             bail!(LOST);
         }
-        let status = probe()?;
+        let status = match probe() {
+            Ok(status) => status,
+            Err(error) => {
+                // Unknown health must not be reported as a healthy renderer by
+                // info (which intentionally returns a status instead of failing).
+                self.lost = true;
+                return Err(error.context(LOST));
+            }
+        };
         if status != 0 {
             self.lost = true;
             eprintln!("borg-display: {LOST} (reset status {status:#x})");
             bail!(LOST);
         }
         Ok(())
+    }
+
+    pub(crate) fn validate_capture<T>(
+        &mut self,
+        captured: Result<T>,
+        probe: impl FnOnce() -> Result<u32>,
+    ) -> Result<T> {
+        // A reset may happen after the preflight gate, during rendering or
+        // readback. Never publish those bytes as a successful screenshot.
+        self.check(probe)?;
+        captured
     }
 }
 
@@ -162,6 +181,46 @@ pub(crate) fn reset_status(renderer: &mut GlesRenderer, probe: Option<ResetStatu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capture_bytes_are_rejected_when_reset_happens_during_readback() {
+        let mut gate = ResetGate::default();
+        gate.check(|| Ok(0)).unwrap();
+        let captured = Ok(vec![1, 2, 3]);
+        assert!(gate.validate_capture(captured, || Ok(0x8255)).is_err());
+        assert!(gate.lost);
+        assert!(
+            gate.validate_capture(Ok(vec![4]), || panic!("lost context"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn probe_failure_is_not_reported_as_healthy() {
+        let mut gate = ResetGate::default();
+        assert!(gate.check(|| bail!("context probe unavailable")).is_err());
+        assert!(gate.lost);
+        assert!(
+            gate.check(|| panic!("unknown health stays unsafe"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn healthy_capture_and_original_readback_error_are_preserved() {
+        let mut gate = ResetGate::default();
+        assert_eq!(
+            gate.validate_capture(Ok(vec![1]), || Ok(0)).unwrap(),
+            vec![1]
+        );
+        let failed: Result<Vec<u8>> = Err(anyhow::anyhow!("readback failed"));
+        assert!(
+            gate.validate_capture(failed, || Ok(0))
+                .unwrap_err()
+                .to_string()
+                .contains("readback failed")
+        );
+    }
+
     #[test]
     fn reset_blocks_rendering_and_remains_latched() {
         for status in [0x8253, 0x8254, 0x8255] {
