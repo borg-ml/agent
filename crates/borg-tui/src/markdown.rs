@@ -24,7 +24,7 @@ fn render_markdown_lines(
     text_color: Option<Color>,
     keep_line_breaks: bool,
 ) -> Vec<Line<'static>> {
-    let markdown = escape_currency_dollars(markdown);
+    let markdown = escape_non_math_dollars(markdown);
     let mut lines = Vec::new();
     let mut current = Vec::new();
     let base_style = text_color.map_or_else(Style::default, |color| Style::default().fg(color));
@@ -289,7 +289,7 @@ fn render_markdown_lines(
 /// presentation syntax. In particular, fenced code contributes only its
 /// source, not the opening language marker or closing fence.
 pub(super) fn markdown_plain_text(markdown: &str) -> String {
-    let markdown = escape_currency_dollars(markdown);
+    let markdown = escape_non_math_dollars(markdown);
     let mut output = String::new();
     let mut list_indices = Vec::new();
 
@@ -355,7 +355,7 @@ fn append_line_break(output: &mut String) {
 }
 
 pub(super) fn markdown_link_ranges(markdown: &str, lines: &[Line<'_>]) -> Vec<LinkRowRange> {
-    let markdown = escape_currency_dollars(markdown);
+    let markdown = escape_non_math_dollars(markdown);
     let mut targets = Vec::new();
     let mut active: Option<(Option<String>, String)> = None;
     for event in Parser::new_ext(&markdown, Options::all()) {
@@ -629,7 +629,7 @@ fn terminal_math_lines(source: &str) -> Vec<String> {
         .collect()
 }
 
-fn escape_currency_dollars(markdown: &str) -> String {
+fn escape_non_math_dollars(markdown: &str) -> String {
     let mut escaped = String::with_capacity(markdown.len());
     let mut index = 0;
     while index < markdown.len() {
@@ -657,6 +657,17 @@ fn escape_currency_dollars(markdown: &str) -> String {
             let end = find_code_span_end(markdown, content_start, run).unwrap_or(markdown.len());
             escaped.push_str(&markdown[index..end]);
             index = end;
+            continue;
+        }
+        if character == '$'
+            && markdown[index + 1..]
+                .chars()
+                .next()
+                .is_some_and(|next| matches!(next, '@' | '#' | '?' | '!'))
+        {
+            escaped.push('\\');
+            escaped.push('$');
+            index += 1;
             continue;
         }
         if character == '$'

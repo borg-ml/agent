@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.4)
 
+- Keep shell special parameters such as `"$@"` literal instead of rendering pasted terminal output as math.
+
 - Refresh durable goal status before every model request, alongside live child counts, so a carried active-goal appendix cannot override a later pause, block, completion or clear. Never implicitly resume paused work.
 
 - Reject private-display screenshots when renderer reset is detected after readback, before PNG publication; fail closed on reset-probe errors instead of reporting healthy capabilities.

@@ -8099,6 +8099,40 @@ fn markdown_math_uses_a_real_terminal_layout() {
 }
 
 #[test]
+fn pasted_shell_arguments_do_not_become_terminal_math() {
+    let text = "AB_JUST_EXECUTABLE='/usr/bin/just' bash /home/user/dev_world.sh \"$@\"\n\
+[dev] full pipeline required (Source/terrain_render_runtime.cpp)...\n\
+bash /home/user/cook.sh \"$@\"\n\
+Refusing to cook: 58 GB free, need 60 GB.";
+    let rendered = message_markdown_render(EventActor::User, text, 120, None)
+        .lines
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(rendered.matches("$@").count(), 2, "{rendered}");
+    assert!(
+        rendered.contains("[dev] full pipeline required (Source/terrain_render_runtime.cpp)"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Refusing to cook: 58 GB free, need 60 GB."),
+        "{rendered}"
+    );
+
+    let expansions = "$@ $# $? $!";
+    assert_eq!(
+        markdown_lines(expansions, 120, None)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end(),
+        expansions
+    );
+}
+
+#[test]
 fn markdown_currency_does_not_become_terminal_math() {
     let rendered = markdown_lines(
         "It costs only $0.1667/hour (~$4/day) and currently holds:",
