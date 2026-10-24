@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.4)
 
+- Refresh durable goal status before every model request, alongside live child counts, so a carried active-goal appendix cannot override a later pause, block, completion or clear. Never implicitly resume paused work.
+
 - Reject private-display screenshots when renderer reset is detected after readback, before PNG publication; fail closed on reset-probe errors instead of reporting healthy capabilities.
 
 - Enforce 60-second journal lock and idle-transaction limits on Borg's managed

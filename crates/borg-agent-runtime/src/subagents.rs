@@ -2226,13 +2226,28 @@ impl AgentToolDispatcher {
                 }
             }
         }
+        let goal = match self.goals.call(SessionGoalToolRequest::Get).await {
+            Ok(response) => match response.goal {
+                Some(goal) => format!(
+                    "Live goal state: {} ({}). This refreshed state supersedes earlier goal appendices. \
+                     Paused or blocked goals require explicit human resume authorization; \
+                     an unfinished objective is not permission to resume.",
+                    crate::session::goal_status_name(goal.status),
+                    goal.id,
+                ),
+                None => "Live goal state: none. This supersedes earlier goal appendices.".into(),
+            },
+            Err(_) => "Live goal state unavailable. Earlier goal appendices may be stale; \
+                       check get_goal before relying on their status."
+                .into(),
+        };
         format!(
             "Live subagent counts — direct children: running={}, starting={}, waiting={}, \
              inactive={}; all descendants: running={}, starting={}, waiting={}, inactive={}. \
              Refreshed before this model request; excludes yourself. Waiting agents are idle \
              but parked on live watchers (still running work, they wake themselves) and count \
              as active. Inactive includes ready-with-nothing-pending, approval-waiting, \
-             stopped, failed and dormant agents.{role}",
+             stopped, failed and dormant agents.{role}\n\n{goal}",
             direct.running,
             direct.starting,
             direct.waiting,

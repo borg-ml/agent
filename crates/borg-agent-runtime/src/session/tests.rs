@@ -25517,3 +25517,62 @@ async fn idle_session_compacts_once_before_its_prompt_cache_expires() {
     actor.await.unwrap().unwrap();
     scratch.discard().await;
 }
+
+// A carried active-goal appendix must not outlive a pause during a long turn.
+// Read through the actor channel on every request, without changing authority.
+#[tokio::test]
+async fn live_request_context_refetches_goal_state_without_resuming() {
+    let directory = tempfile::tempdir().unwrap();
+    let (requests, mut receiver) = mpsc::channel::<SessionGoalToolCall>(1);
+    let goals = SessionGoalTools { requests };
+    let responder = tokio::spawn(async move {
+        let mut goal = SessionGoal::new("unfinished task".into(), None);
+        for status in [
+            Some(GoalStatus::Active),
+            Some(GoalStatus::Paused),
+            Some(GoalStatus::Blocked),
+            Some(GoalStatus::Complete),
+            None,
+        ] {
+            let call = receiver.recv().await.unwrap();
+            assert_eq!(call.request, SessionGoalToolRequest::Get);
+            let current = status.map(|status| {
+                goal.status = status;
+                goal.clone()
+            });
+            call.response
+                .send(Ok(SessionGoalToolResponse {
+                    goal: current,
+                    remaining_tokens: None,
+                }))
+                .unwrap();
+        }
+    });
+    let dispatcher = crate::subagents::AgentToolDispatcher::new(
+        goals,
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        Uuid::new_v4(),
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        crate::PermissionMode::FullAccess,
+    );
+    for status in ["active", "paused", "blocked", "complete", "none"] {
+        let prompt = dispatcher.subagent_count_prompt().await;
+        assert!(prompt.contains(&format!("Live goal state: {status}")));
+        if matches!(status, "paused" | "blocked") {
+            assert!(prompt.contains("explicit human resume authorization"));
+        }
+    }
+    responder.await.unwrap();
+}
