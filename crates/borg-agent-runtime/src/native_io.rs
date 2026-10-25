@@ -203,6 +203,7 @@ fn search_text_blocking(
     let mut builder = WalkBuilder::new(&search_root);
     builder
         .hidden(false)
+        .filter_entry(|entry| entry.file_name() != ".git")
         .follow_links(false)
         .git_ignore(true)
         .git_global(true)
@@ -399,6 +400,28 @@ mod tests {
         .expect("read range");
         assert_eq!(range.text, "two\nthree\n");
         assert_eq!(range.next_line, Some(4));
+    }
+
+    #[test]
+    fn search_excludes_git_metadata_but_keeps_hidden_project_files() {
+        let root = tempfile::tempdir().expect("workspace");
+        for relative in [
+            ".git/rr-cache/stale",
+            "nested/.git/objects/stale",
+            ".github/workflow.yml",
+        ] {
+            let path = root.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "needle\n").unwrap();
+        }
+        let result = search_text_blocking(root.path(), Path::new("."), "needle", true, true, 0, 20)
+            .expect("search");
+        assert_eq!(result.files_searched, 1);
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(
+            result.matches[0].path,
+            PathBuf::from(".github/workflow.yml")
+        );
     }
 
     #[tokio::test]
