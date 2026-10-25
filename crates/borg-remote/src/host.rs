@@ -59,6 +59,9 @@ pub struct HostConfig {
     pub execution_profile: HostExecutionProfile,
     #[serde(default)]
     pub resource_limits: HostResourceLimits,
+    /// Unknown for hosts enrolled before relay tokens expired; rotation then runs at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_token_expires_at: Option<DateTime<Utc>>,
     /// Locally pinned device keys; non-empty means the host enforces device
     /// proofs and signed owner commands instead of trusting the relay.
     #[serde(default)]
@@ -198,6 +201,8 @@ struct EnrollRequest {
 struct EnrollResponse {
     host: RemoteHost,
     host_token: String,
+    #[serde(default)]
+    host_token_expires_at: Option<DateTime<Utc>>,
     relay_public_key: String,
     revocation_epoch: u64,
 }
@@ -353,6 +358,7 @@ pub async fn enroll_host(
         server,
         host_id: enrolled.host.id,
         host_token: enrolled.host_token,
+        host_token_expires_at: enrolled.host_token_expires_at,
         relay_public_key: enrolled.relay_public_key,
         revocation_epoch: enrolled.revocation_epoch,
         direct_listener: None,
@@ -1521,7 +1527,7 @@ fn default_host_executor_factory() -> HostExecutorFactory {
             crate::LocalAgentTurnExecutor::with_model_gateway(
                 borg_provider::provider::ModelGateway::new(
                     endpoint(&config.server, "/api/remote/host/kimi/chat/completions"),
-                    config.host_token.clone(),
+                    host_token(config),
                 ),
             )
         } else {
@@ -1566,6 +1572,9 @@ pub(crate) async fn run_host_with_resolved_store(
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(35))
         .build()?;
+    if let Err(error) = rotate_host_token_if_due(&client, config_path).await {
+        tracing::warn!(%error, "host token rotation deferred");
+    }
     let sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let session_root = config_path
@@ -1668,6 +1677,18 @@ pub(crate) async fn run_host_with_resolved_store(
             if changed {
                 tracing::info!(trusted = devices.len(), "trusted devices reloaded");
                 reload_sync.close_untrusted(&devices).await;
+            }
+        }
+    }));
+    let rotation_client = context.client.clone();
+    let rotation_path = config_path.to_path_buf();
+    let _token_rotation = AbortTask(host_transport::spawn(async move {
+        let mut daily = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        daily.tick().await;
+        loop {
+            daily.tick().await;
+            if let Err(error) = rotate_host_token_if_due(&rotation_client, &rotation_path).await {
+                tracing::warn!(%error, "host token rotation deferred");
             }
         }
     }));
@@ -1940,7 +1961,7 @@ async fn viewer_attachments(
                         attachment.sha256
                     ),
                 ))
-                .bearer_auth(&context.config.host_token)
+                .bearer_auth(host_token(&context.config))
                 .timeout(Duration::from_secs(30))
                 .send()
                 .await?
@@ -5259,7 +5280,7 @@ async fn fetch_runtime_mcp_context(
             &format!("/api/remote/host/sessions/{session_id}/runtime-context"),
         ))
         .header("x-borg-runtime-secret-refs", "1")
-        .bearer_auth(&config.host_token)
+        .bearer_auth(host_token(config))
         .send()
         .await
         .context("failed to fetch the Web runtime MCP context")?;
@@ -5319,7 +5340,7 @@ async fn resolve_runtime_mcp_secrets(
             &config.server,
             &format!("/api/remote/host/sessions/{session_id}/runtime-context/secrets"),
         ))
-        .bearer_auth(&config.host_token)
+        .bearer_auth(host_token(config))
         .json(&RuntimeMcpSecretRequest { refs: &refs })
         .send()
         .await
@@ -5616,7 +5637,7 @@ async fn sync_instance_directory(
             &config.server,
             &format!("/api/remote/host/sessions/{session_id}/instances"),
         ))
-        .bearer_auth(&config.host_token)
+        .bearer_auth(host_token(config))
         .send()
         .await?
         .error_for_status()?
@@ -5745,7 +5766,7 @@ async fn sync_relay_inbox(
     let path = format!("/api/remote/host/sessions/{session_id}/inbox");
     let response = client
         .get(endpoint(&config.server, &path))
-        .bearer_auth(&config.host_token)
+        .bearer_auth(host_token(config))
         .send()
         .await?;
     if response.status() == StatusCode::NOT_FOUND {
@@ -5796,7 +5817,7 @@ async fn sync_relay_inbox(
                 &config.server,
                 &format!("{path}/{message_id}/ack"),
             ))
-            .bearer_auth(&config.host_token)
+            .bearer_auth(host_token(config))
             .send()
             .await?
             .error_for_status()?;
@@ -5847,7 +5868,7 @@ async fn fetch_relayed_attachments(
                     message.id, attachment.sha256
                 ),
             ))
-            .bearer_auth(&config.host_token)
+            .bearer_auth(host_token(config))
             .timeout(Duration::from_secs(60))
             .send()
             .await?
@@ -5897,7 +5918,7 @@ async fn upload_message_attachments(
                     attachment.sha256
                 ),
             ))
-            .bearer_auth(&config.host_token)
+            .bearer_auth(host_token(config))
             .timeout(Duration::from_secs(60))
             .query(&[
                 ("media_type", attachment.media_type.clone()),
@@ -6035,7 +6056,7 @@ async fn flush_workspace_messages(
                 &config.server,
                 &format!("/api/remote/host/sessions/{session_id}/workspace/participants"),
             ))
-            .bearer_auth(&config.host_token)
+            .bearer_auth(host_token(config))
             .send()
             .await;
         match response {
@@ -6258,7 +6279,7 @@ async fn flush_workspace_messages(
                     }
                     let response = client
                         .post(endpoint(&config.server, &relay_path))
-                        .bearer_auth(&config.host_token)
+                        .bearer_auth(host_token(config))
                         .json(&serde_json::json!({
                             "text": message.body.text,
                             "audience": audience,
@@ -6483,7 +6504,7 @@ fn replace_config_file(temporary: &Path, destination: &Path) -> std::io::Result<
     fs::rename(temporary, destination)
 }
 
-fn validate_server_url(server: &str) -> Result<String> {
+pub fn validate_server_url(server: &str) -> Result<String> {
     let server = server.trim().trim_end_matches('/');
     ensure!(!server.is_empty(), "remote server URL is empty");
     let parsed = Url::parse(server).with_context(|| "invalid remote server URL")?;
@@ -6512,6 +6533,81 @@ fn validate_server_url(server: &str) -> Result<String> {
         scheme => bail!("unsupported remote server URL scheme `{scheme}`; use HTTPS"),
     }
     Ok(server.to_string())
+}
+
+/// Tokens rotated by the running host; long-lived tasks hold config clones.
+static ROTATED_HOST_TOKENS: OnceLock<std::sync::RwLock<HashMap<Uuid, String>>> = OnceLock::new();
+
+pub(crate) fn host_token(config: &HostConfig) -> String {
+    ROTATED_HOST_TOKENS
+        .get()
+        .and_then(|tokens| tokens.read().ok()?.get(&config.host_id).cloned())
+        .unwrap_or_else(|| config.host_token.clone())
+}
+
+const HOST_TOKEN_ROTATE_BEFORE: chrono::TimeDelta = chrono::TimeDelta::days(30);
+
+#[derive(Deserialize)]
+struct RotatedHostToken {
+    host_token: String,
+    host_token_expires_at: DateTime<Utc>,
+}
+
+/// Rotates the relay host token when under 30 days remain or the expiry is
+/// unknown. The new token is persisted before first use: the relay keeps the
+/// old one valid until the new one authenticates, so a crash here is safe.
+async fn rotate_host_token_if_due(client: &Client, config_path: &Path) -> Result<()> {
+    let mut config = read_config(config_path)?;
+    if config
+        .host_token_expires_at
+        .is_some_and(|expires| expires - Utc::now() > HOST_TOKEN_ROTATE_BEFORE)
+    {
+        return Ok(());
+    }
+    let response = client
+        .post(endpoint(&config.server, "/api/remote/host/token/rotate"))
+        .bearer_auth(host_token(&config))
+        .send()
+        .await
+        .context("failed to contact Borg for host token rotation")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        tracing::debug!("relay does not support host token rotation yet");
+        return Ok(());
+    }
+    ensure!(
+        response.status().is_success(),
+        "host token rotation failed with {}: {}",
+        response.status(),
+        response.text().await.unwrap_or_default()
+    );
+    let rotated: RotatedHostToken = response
+        .json()
+        .await
+        .context("Borg returned an invalid host token rotation response")?;
+    ensure!(
+        !rotated.host_token.trim().is_empty(),
+        "Borg returned an empty host token"
+    );
+    config.host_token = rotated.host_token.clone();
+    config.host_token_expires_at = Some(rotated.host_token_expires_at);
+    write_config(config_path, &config)?;
+    ROTATED_HOST_TOKENS
+        .get_or_init(Default::default)
+        .write()
+        .map_err(|_| anyhow::anyhow!("host token store poisoned"))?
+        .insert(config.host_id, rotated.host_token);
+    tracing::info!(expires_at = %rotated.host_token_expires_at, "host token rotated");
+    Ok(())
+}
+
+/// Body of `POST /api/remote/device-authorizations`, matching enrollment.
+pub fn device_authorization_request(name: Option<&str>) -> serde_json::Value {
+    let name = name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(hostname);
+    serde_json::json!({"name": name, "hostname": hostname(), "platform": platform()})
 }
 
 fn endpoint(server: &str, path: &str) -> String {
@@ -12778,6 +12874,7 @@ connection: close
             roots: vec![root.to_path_buf()],
             execution_profile: HostExecutionProfile::TrustedUser,
             resource_limits: HostResourceLimits::default(),
+            host_token_expires_at: None,
             trusted_devices: Vec::new(),
         }
     }

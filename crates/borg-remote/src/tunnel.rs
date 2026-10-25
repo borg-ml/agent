@@ -46,7 +46,7 @@ pub async fn connect(
     let (mut sink, mut stream) = socket.split();
     let auth = serde_json::to_string(&Authentication::Host {
         host_id: config.host_id.to_string(),
-        token: config.host_token.clone(),
+        token: crate::host::host_token(config),
     })?;
     sink.send(Message::Text(auth.into())).await?;
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));

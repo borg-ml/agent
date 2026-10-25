@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.19.5)
 
+- `borg remote connect` validates the server address before sending anything,
+  sends this machine's name, hostname and platform for the approval page, and
+  shows the code to enter there. Enrollment prints the relay key fingerprint.
+  Hosts rotate their relay token at startup and daily once fewer than 30 days
+  remain, saving the new token before using it. Local session control sockets
+  live in an owner-only directory, and a direct listener on a non-loopback
+  address requires pinned trusted devices.
+
 - Remote hosts can pin the devices they trust with
   `borg remote devices trust|untrust|list`. With any device pinned, the host
   no longer trusts the relay blindly: it verifies each device's own proof,

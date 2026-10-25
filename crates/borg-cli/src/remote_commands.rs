@@ -566,6 +566,7 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
                 "Enrolled {} as {}. Run `borg remote host` to connect.",
                 enrolled.name, enrolled.host_id
             );
+            print_relay_fingerprint(&enrolled)?;
         }
         RemoteCommand::Host { config } => {
             let agent_config = AgentConfig::load(None)?;
@@ -664,6 +665,14 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
     Ok(())
 }
 
+fn print_relay_fingerprint(enrolled: &HostConfig) -> Result<()> {
+    println!(
+        "Relay key fingerprint: {}. Pin your devices with `borg remote devices trust <PUBLIC_KEY>`.",
+        borg_remote::auth::device_fingerprint(&enrolled.relay_public_key)?
+    );
+    Ok(())
+}
+
 fn print_trusted_devices(devices: &[borg_remote::auth::TrustedDevice]) {
     for device in devices {
         let fingerprint = borg_remote::auth::device_fingerprint(&device.public_key)
@@ -701,6 +710,8 @@ fn read_enrollment_token_from_stdin() -> Result<String> {
 struct DeviceAuthorization {
     token: String,
     verification_url: String,
+    #[serde(default)]
+    user_code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -724,13 +735,15 @@ async fn connect_remote_account(
     roots: Vec<PathBuf>,
     config_path: &Path,
 ) -> Result<()> {
-    let server = server.trim_end_matches('/');
+    // Validate before the device token is ever sent to this server.
+    let server = borg_remote::validate_server_url(server)?;
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
     let response = client
         .post(format!("{server}/api/remote/device-authorizations"))
+        .json(&borg_remote::device_authorization_request(name))
         .send()
         .await
         .context("failed to contact Borg")?;
@@ -743,10 +756,16 @@ async fn connect_remote_account(
         .json()
         .await
         .context("Borg returned an invalid remote connection response")?;
-    println!(
-        "Sign in to Borg and approve this machine:\n\n  {}\n",
-        authorization.verification_url
-    );
+    match &authorization.user_code {
+        Some(code) => println!(
+            "Sign in to Borg, check the machine details, and enter this code to approve:\n\n  {code}\n\n  {}\n",
+            authorization.verification_url
+        ),
+        None => println!(
+            "Sign in to Borg and approve this machine:\n\n  {}\n",
+            authorization.verification_url
+        ),
+    }
     if let Err(error) = open_browser(&authorization.verification_url).await {
         eprintln!("Could not open your browser automatically: {error}");
     }
@@ -779,11 +798,12 @@ async fn connect_remote_account(
             _ => {}
         }
     }
-    let enrolled = enroll_host(server, &authorization.token, name, roots, config_path).await?;
+    let enrolled = enroll_host(&server, &authorization.token, name, roots, config_path).await?;
     println!(
         "Connected {} to your Borg account as {}.",
         enrolled.name, enrolled.host_id
     );
+    print_relay_fingerprint(&enrolled)?;
     Ok(())
 }
 

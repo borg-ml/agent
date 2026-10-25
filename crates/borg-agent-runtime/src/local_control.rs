@@ -1150,6 +1150,13 @@ impl LocalSessionControlServer {
         use std::os::unix::fs::PermissionsExt;
         use tokio::net::UnixListener;
 
+        // The socket is bound before it can be chmodded; a private directory
+        // keeps it unreachable by other users during that window.
+        let sessions_dir = socket_path.parent().unwrap_or_else(|| Path::new("."));
+        if fs::metadata(sessions_dir)?.permissions().mode() & 0o077 != 0 {
+            fs::set_permissions(sessions_dir, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("failed to secure {}", sessions_dir.display()))?;
+        }
         if socket_path.exists() {
             fs::remove_file(&socket_path)
                 .with_context(|| format!("failed to remove stale {}", socket_path.display()))?;
