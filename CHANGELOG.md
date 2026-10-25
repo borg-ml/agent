@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.19.4)
+## Unreleased (since 0.19.5)
+
+## 0.19.5 (2026-10-25)
 
 - Show a command's file edits once, under the command that made them, when it runs alongside other tool calls; process start events now record their owning tool call instead of the transcript guessing the latest started one.
 
