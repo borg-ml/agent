@@ -108,6 +108,8 @@ impl HostConfig {
             "remote host token is empty"
         );
         ensure!(!self.name.trim().is_empty(), "remote host name is empty");
+        // An empty list would let remote sessions start in any directory.
+        ensure!(!self.roots.is_empty(), "remote host has no allowed roots");
         self.resource_limits.validate()?;
         Ok(())
     }
@@ -1750,6 +1752,9 @@ pub(crate) async fn run_host_with_resolved_store(
                         }
                         crate::auth::TunnelFrame::EpochUpdate { epoch: updated } => {
                             ensure!(updated >= epoch, "relay revocation epoch regressed");
+                            if updated > epoch {
+                                persist_revocation_epoch(config_path, updated)?;
+                            }
                             epoch = updated;
                             sync.update_epoch(epoch).await;
                         }
@@ -6322,6 +6327,17 @@ fn write_config(path: &Path, config: &HostConfig) -> Result<()> {
     write_private_json(path, config)
 }
 
+/// A revocation must survive a host restart: otherwise tickets revoked while
+/// the host was down stay valid until the relay reconnects and resends it.
+fn persist_revocation_epoch(path: &Path, epoch: u64) -> Result<()> {
+    let mut config: HostConfig = serde_json::from_slice(&fs::read(path)?)?;
+    if config.revocation_epoch < epoch {
+        config.revocation_epoch = epoch;
+        write_config(path, &config)?;
+    }
+    Ok(())
+}
+
 fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -6339,15 +6355,11 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
         .unwrap_or("host.json");
     let temporary = parent.join(format!(".{file_name}.tmp-{}", Uuid::new_v4()));
     let result = (|| -> std::io::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
-        }
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&temporary)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         replace_config_file(&temporary, path)?;

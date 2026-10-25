@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.19.5)
 
+- Remote hosts are stricter about their own state: a host with no allowed
+  roots refuses to start instead of allowing any directory, a revocation from
+  the relay is saved so a restart cannot revive revoked tickets, used direct
+  tickets are pruned once expired, and private host files are created owner-only
+  from the first byte.
+
 - The watchers panel now matches the team panel: a WATCHER / STATE / AGE /
   EVENTS / LAST table with running watchers on top in colour, and exited ones
   folded behind a clickable `▸ Exited · N` row instead of a long flat list.

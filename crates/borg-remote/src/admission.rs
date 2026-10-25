@@ -88,6 +88,10 @@ pub fn authorize_scope(
 pub async fn consume_ticket(pool: &sqlx::PgPool, claims: &TicketClaims, now: i64) -> Result<()> {
     ensure!(claims.expires_at > now, "expired admission ticket");
     sqlx::query("create table if not exists remote_admission_tickets(host_id text not null,ticket_id text not null,expires_at bigint not null,primary key(host_id,ticket_id))").execute(pool).await?;
+    sqlx::query("delete from remote_admission_tickets where expires_at <= $1")
+        .bind(now)
+        .execute(pool)
+        .await?;
     let inserted =
         sqlx::query("insert into remote_admission_tickets values($1,$2,$3) on conflict do nothing")
             .bind(&claims.host_id)
