@@ -7,6 +7,8 @@ Git comparison.
 
 ## 0.19.5 (2026-10-25)
 
+- Refuse a `pgrep -f` wait only when it controls a loop: a `while`/`until` condition, or a loop body that sleeps and stops on it. A one-shot `pgrep -f` after a terminating loop such as `while read` is no longer refused.
+
 - Show a command's file edits once, under the command that made them, when it runs alongside other tool calls; process start events now record their owning tool call instead of the transcript guessing the latest started one.
 
 - Workspace text search excludes `.git` metadata and nested repository internals while retaining hidden project configuration files.

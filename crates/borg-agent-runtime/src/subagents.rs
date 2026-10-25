@@ -1632,7 +1632,8 @@ impl AgentToolDispatcher {
         ensure!(
             !waits_on_self_matching_pgrep(&args.cmd),
             "Refused: this loop waits on `pgrep -f`, which also matches the shell running \
-             this very command (its command line contains the pattern), so it never ends. \
+             this very command (its command line contains the pattern), so it never sees \
+             the process exit. \
              Run the awaited command itself in a blocking exec, start it with `async: true` \
              and await its watcher, or wait on a known PID with `tail --pid=PID -f /dev/null`."
         );
@@ -12506,29 +12507,188 @@ pub(crate) fn file_mutation_tool_specs() -> Vec<Value> {
     ]
 }
 
-/// Seconds slept by a command that does nothing but sleep, optionally
-/// followed by an `echo`: the blind-wait shape, not a pause inside real work.
-/// A `while`/`until` loop polling `pgrep -f`: the shell that runs the command
-/// carries the pattern in its own command line, so the poll always matches it
-/// and the loop never exits.
+/// A loop whose continuation hangs on `pgrep -f`: the shell that runs the
+/// command carries the pattern in its own command line, so the poll always
+/// matches it and the loop never sees the process exit. That is `pgrep -f` in a
+/// `while`/`until` condition, or in a loop body that sleeps and breaks or exits
+/// on it. A `pgrep -f` before, after or beside a loop runs once and is fine.
 fn waits_on_self_matching_pgrep(command: &str) -> bool {
-    let words = command
-        .split(|character: char| character.is_whitespace() || ";&|()`$!".contains(character))
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-    let looping = words.iter().any(|word| matches!(*word, "while" | "until"));
-    looping
-        && words.iter().enumerate().any(|(index, word)| {
-            word.rsplit('/').next() == Some("pgrep")
-                && words[index + 1..]
-                    .iter()
-                    .take_while(|flag| flag.starts_with('-'))
-                    .any(|flag| {
-                        *flag == "--full" || (!flag.starts_with("--") && flag.contains('f'))
-                    })
-        })
+    #[derive(Default)]
+    struct Loop {
+        has_condition: bool,
+        in_body: bool,
+        polls: bool,
+        exits: bool,
+        sleeps: bool,
+    }
+    let tokens = shell_tokens(command);
+    let mut loops: Vec<Loop> = Vec::new();
+    let mut command_start = true;
+    for (index, token) in tokens.iter().enumerate() {
+        let ShellToken::Word {
+            text,
+            quoted,
+            substitutes,
+        } = token
+        else {
+            command_start = true;
+            continue;
+        };
+        let polls = if *substitutes {
+            let words = text
+                .split(|character: char| {
+                    character.is_whitespace() || ";&|()`$!\"".contains(character)
+                })
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>();
+            (0..words.len()).any(|start| runs_full_pgrep(&words[start..]))
+        } else {
+            !quoted
+                && runs_full_pgrep(
+                    &tokens[index..]
+                        .iter()
+                        .map_while(|token| match token {
+                            ShellToken::Word { text, .. } => Some(text.as_str()),
+                            ShellToken::Break => None,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+        };
+        if polls {
+            if loops
+                .last()
+                .is_some_and(|innermost| innermost.has_condition && !innermost.in_body)
+            {
+                return true;
+            }
+            loops
+                .iter_mut()
+                .filter(|open| open.in_body)
+                .for_each(|open| open.polls = true);
+        }
+        if !command_start || *quoted {
+            continue;
+        }
+        command_start = false;
+        match text.as_str() {
+            "while" | "until" => {
+                loops.push(Loop {
+                    has_condition: true,
+                    ..Loop::default()
+                });
+                command_start = true;
+            }
+            "for" | "select" => loops.push(Loop::default()),
+            "do" => {
+                if let Some(innermost) = loops.last_mut() {
+                    innermost.in_body = true;
+                }
+                command_start = true;
+            }
+            "done" => {
+                if loops
+                    .pop()
+                    .is_some_and(|closed| closed.polls && closed.exits && closed.sleeps)
+                {
+                    return true;
+                }
+            }
+            "if" | "then" | "elif" | "else" | "!" | "{" | "time" => command_start = true,
+            "break" | "exit" | "return" => loops
+                .iter_mut()
+                .filter(|open| open.in_body)
+                .for_each(|open| open.exits = true),
+            "sleep" => loops
+                .iter_mut()
+                .filter(|open| open.in_body)
+                .for_each(|open| open.sleeps = true),
+            _ => {}
+        }
+    }
+    false
 }
 
+/// Whether `words` starts with a `pgrep` invocation matching full command lines.
+fn runs_full_pgrep(words: &[&str]) -> bool {
+    words
+        .first()
+        .is_some_and(|word| word.rsplit('/').next() == Some("pgrep"))
+        && words[1..]
+            .iter()
+            .take_while(|flag| flag.starts_with('-'))
+            .any(|flag| *flag == "--full" || (!flag.starts_with("--") && flag.contains('f')))
+}
+
+enum ShellToken {
+    /// `substitutes`: a double-quoted part holds a live `$(...)` or backtick.
+    Word {
+        text: String,
+        quoted: bool,
+        substitutes: bool,
+    },
+    /// A command separator, pipe or (sub)shell boundary.
+    Break,
+}
+
+/// Words and separators of a shell command, honouring quotes and comments.
+fn shell_tokens(command: &str) -> Vec<ShellToken> {
+    fn flush(
+        tokens: &mut Vec<ShellToken>,
+        word: &mut String,
+        quoted: &mut bool,
+        substitutes: &mut bool,
+    ) {
+        if !word.is_empty() || *quoted {
+            tokens.push(ShellToken::Word {
+                text: std::mem::take(word),
+                quoted: std::mem::take(quoted),
+                substitutes: std::mem::take(substitutes),
+            });
+        }
+    }
+    let mut tokens = Vec::new();
+    let (mut word, mut quoted, mut substitutes) = (String::new(), false, false);
+    let mut quote = None;
+    let mut characters = command.chars().peekable();
+    while let Some(character) = characters.next() {
+        match (quote, character) {
+            (Some(open), _) if open == character => quote = None,
+            (Some('\''), _) => word.push(character),
+            (Some(_), '\\') => {
+                word.push(character);
+                word.extend(characters.next());
+            }
+            (Some(_), _) => {
+                substitutes |= character == '`' || (character == '(' && word.ends_with('$'));
+                word.push(character);
+            }
+            (None, '\\') => word.extend(characters.next().filter(|next| *next != '\n')),
+            (None, '\'' | '"') => {
+                quote = Some(character);
+                quoted = true;
+            }
+            (None, '#') if word.is_empty() && !quoted => {
+                while characters.next_if(|next| *next != '\n').is_some() {}
+            }
+            (None, '&') if word.ends_with(['<', '>']) || characters.peek() == Some(&'>') => {
+                word.push(character)
+            }
+            (None, ';' | '&' | '|' | '(' | ')' | '`' | '\n') => {
+                flush(&mut tokens, &mut word, &mut quoted, &mut substitutes);
+                tokens.push(ShellToken::Break);
+            }
+            (None, _) if character.is_whitespace() => {
+                flush(&mut tokens, &mut word, &mut quoted, &mut substitutes)
+            }
+            (None, _) => word.push(character),
+        }
+    }
+    flush(&mut tokens, &mut word, &mut quoted, &mut substitutes);
+    tokens
+}
+
+/// Seconds slept by a command that does nothing but sleep, optionally
+/// followed by an `echo`: the blind-wait shape, not a pause inside real work.
 fn bare_sleep_seconds(command: &str) -> Option<u64> {
     static BARE_SLEEP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"^\s*sleep\s+(\d+)([smh]?)\s*(?:(?:;|&&)\s*echo\b[^;&|]*)?;?\s*$")

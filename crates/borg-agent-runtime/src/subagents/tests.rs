@@ -12064,4 +12064,23 @@ fn self_matching_pgrep_wait_loops_are_recognised() {
     assert!(!refused(
         "while read line; do echo $line; done < pgrep-notes.txt"
     ));
+    // A loop body that sleeps and stops on `pgrep -f` waits forever too.
+    assert!(refused(
+        r#"while true; do pgrep -f "cargo build" >/dev/null || break; sleep 5; done"#
+    ));
+    assert!(refused(
+        "while :; do if ! pgrep -af ninja >/dev/null 2>&1; then exit 0; fi; sleep 2; done"
+    ));
+    assert!(refused(
+        r#"until [ -z "$(pgrep -f 'cargo test')" ]; do sleep 1; done"#
+    ));
+    // `pgrep -f` that runs once beside a loop that terminates on its own.
+    assert!(!refused(
+        "cat /tmp/tests.log 2>/dev/null | tail -5; ls -t /run/jobs/ | head -3 | while read j; \
+         do echo \"== $j\"; head -2 /run/jobs/$j/output.log 2>/dev/null | cut -c1-160; \
+         tail -2 /run/jobs/$j/output.log | cut -c1-160; done; \
+         pgrep -af 'StagedBuilds/Linux|UnrealBuildTool|cmake --build' | grep -v pgrep | cut -c1-120"
+    ));
+    assert!(!refused("for pid in $(pgrep -f cargo); do echo $pid; done"));
+    assert!(!refused("echo 'while pgrep -f x; do sleep 1; done'"));
 }
