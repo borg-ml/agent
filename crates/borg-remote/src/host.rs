@@ -59,6 +59,10 @@ pub struct HostConfig {
     pub execution_profile: HostExecutionProfile,
     #[serde(default)]
     pub resource_limits: HostResourceLimits,
+    /// Locally pinned device keys; non-empty means the host enforces device
+    /// proofs and signed owner commands instead of trusting the relay.
+    #[serde(default)]
+    pub trusted_devices: Vec<crate::auth::TrustedDevice>,
 }
 
 /// Marker written by the generated systemd unit for an isolated host.
@@ -350,6 +354,7 @@ pub async fn enroll_host(
         roots,
         execution_profile,
         resource_limits,
+        trusted_devices: Vec::new(),
     };
     config.validate()?;
     write_config(config_path, &config)?;
@@ -1729,7 +1734,7 @@ pub(crate) async fn run_host_with_resolved_store(
             frame = incoming.recv() => {
                 let Some(frame) = frame else { bail!("host tunnel ingress stopped") };
                 match frame {
-                        crate::auth::TunnelFrame::HostCommand { command_id, command, not_after } => {
+                        crate::auth::TunnelFrame::HostCommand { command_id, command, not_after, .. } => {
                             match commands.try_send((command_id, command, not_after)) {
                                 Ok(()) => {},
                                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -1768,7 +1773,7 @@ pub(crate) async fn run_host_with_resolved_store(
                                 let _ = outbound.try_send(crate::auth::TunnelFrame::Close { connection_id, reason: error.to_string() });
                             }
                         }
-                        crate::auth::TunnelFrame::Open { connection_id, ticket } => {
+                        crate::auth::TunnelFrame::Open { connection_id, ticket, .. } => {
                             let admitted = crate::admission::verify_ticket(&ticket, &issuer, &config.host_id.to_string(), epoch, Utc::now().timestamp());
                             match admitted {
                                 Ok(claims) => { if let Err(error) = sync.open_connection(connection_id.clone(), claims).await {
@@ -12684,6 +12689,7 @@ connection: close
             roots: vec![root.to_path_buf()],
             execution_profile: HostExecutionProfile::TrustedUser,
             resource_limits: HostResourceLimits::default(),
+            trusted_devices: Vec::new(),
         }
     }
 }

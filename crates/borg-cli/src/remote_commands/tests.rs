@@ -1800,6 +1800,7 @@ fn isolated_remote_host_service_is_fail_closed_and_sandboxed() {
         roots: vec![PathBuf::from("/workspace")],
         execution_profile: HostExecutionProfile::IsolatedHosted,
         resource_limits: Default::default(),
+        trusted_devices: Vec::new(),
     };
     let unit = host_service_unit(
         Path::new("/usr/local/bin/borg"),
@@ -1841,6 +1842,7 @@ fn trusted_remote_host_service_keeps_legacy_unit_small() {
         roots: vec![PathBuf::from("/workspace")],
         execution_profile: HostExecutionProfile::TrustedUser,
         resource_limits: Default::default(),
+        trusted_devices: Vec::new(),
     };
     let unit = host_service_unit(
         Path::new("/usr/local/bin/borg"),
@@ -1879,6 +1881,7 @@ fn isolated_remote_host_service_requires_network_allowlist() {
         roots: vec![PathBuf::from("/workspace")],
         execution_profile: HostExecutionProfile::IsolatedHosted,
         resource_limits: Default::default(),
+        trusted_devices: Vec::new(),
     };
     assert!(
         host_service_unit(
@@ -1912,6 +1915,7 @@ fn isolated_remote_host_service_passes_systemd_unit_validation() {
         roots: vec![PathBuf::from("/workspace")],
         execution_profile: HostExecutionProfile::IsolatedHosted,
         resource_limits: Default::default(),
+        trusted_devices: Vec::new(),
     };
     let executable = std::env::current_exe().expect("current test executable");
     let unit = host_service_unit(
