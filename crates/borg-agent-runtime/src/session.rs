@@ -1383,16 +1383,85 @@ impl TurnPhase {
     }
 }
 
+/// A turn loop step this slow is logged, so a stall names its step.
+const SLOW_ACTOR_STEP: Duration = Duration::from_secs(30);
+/// A step held this long has stopped the session: the turn watchdog, provider
+/// output and child activity all wait behind it.
+const ACTOR_STEP_LIMIT: Duration = Duration::from_secs(120);
+const ACTOR_STEP_POLL: Duration = Duration::from_secs(5);
+
+/// The turn loop step the session actor is running, shared with its guard.
+#[derive(Clone, Default)]
+struct ActorStep(Arc<std::sync::Mutex<ActorStepState>>);
+
+#[derive(Default)]
+struct ActorStepState {
+    running: Option<(&'static str, Instant)>,
+    /// Set when the guard ended the turn, for the actor to report.
+    stalled: Option<String>,
+}
+
+impl ActorStep {
+    fn state(&self) -> std::sync::MutexGuard<'_, ActorStepState> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Interrupt a turn whose loop has been held in one step for `limit`.
+///
+/// WHY: a step that never returns holds the whole actor, the turn watchdog
+/// included, and nothing inside can report it. A root session once sat 24
+/// minutes like this until a human Escape ended the turn, which released the
+/// step. This does the same, and names the step.
+async fn guard_actor_steps(
+    session_id: Uuid,
+    step: ActorStep,
+    interrupt: SessionInterrupt,
+    limit: Duration,
+    poll: Duration,
+) {
+    let mut ticks = tokio::time::interval(poll);
+    loop {
+        ticks.tick().await;
+        let mut state = step.state();
+        let Some((branch, since)) = state.running else {
+            continue;
+        };
+        let held = since.elapsed();
+        if held < limit {
+            continue;
+        }
+        tracing::error!(%session_id, step = branch, held_s = held.as_secs(), "session loop stuck in one step; interrupting the turn");
+        state.stalled = Some(format!(
+            "The session loop was stuck in its `{branch}` step for {}s, so the turn was interrupted to recover.",
+            held.as_secs()
+        ));
+        drop(state);
+        interrupt.request();
+        return;
+    }
+}
+
 struct SessionBranchTrace {
     session_id: Uuid,
     branch: &'static str,
     backlog: usize,
-    started: Option<Instant>,
+    started: Instant,
+    trace: bool,
+    step: ActorStep,
 }
 
 impl SessionBranchTrace {
-    fn begin(enabled: bool, session_id: Uuid, branch: &'static str, backlog: usize) -> Self {
-        if enabled {
+    fn begin(
+        trace: bool,
+        step: &ActorStep,
+        session_id: Uuid,
+        branch: &'static str,
+        backlog: usize,
+    ) -> Self {
+        if trace {
             eprintln!(
                 "{}",
                 serde_json::json!({
@@ -1401,24 +1470,33 @@ impl SessionBranchTrace {
                 })
             );
         }
+        let started = Instant::now();
+        step.state().running = Some((branch, started));
         Self {
             session_id,
             branch,
             backlog,
-            started: enabled.then(Instant::now),
+            started,
+            trace,
+            step: step.clone(),
         }
     }
 }
 
 impl Drop for SessionBranchTrace {
     fn drop(&mut self) {
-        if let Some(started) = self.started {
+        self.step.state().running = None;
+        let elapsed = self.started.elapsed();
+        if elapsed >= SLOW_ACTOR_STEP {
+            tracing::warn!(session_id = %self.session_id, step = self.branch, elapsed_ms = elapsed.as_millis() as u64, "session loop step was slow");
+        }
+        if self.trace {
             eprintln!(
                 "{}",
                 serde_json::json!({
                     "type": "session_loop_trace", "stage": "exit", "session_id": self.session_id,
                     "branch": self.branch, "provider_backlog": self.backlog,
-                    "elapsed_us": started.elapsed().as_micros(), "at": Utc::now(),
+                    "elapsed_us": elapsed.as_micros(), "at": Utc::now(),
                 })
             );
         }
@@ -5690,6 +5768,16 @@ async fn run_agent_session_store_kernel_inner(
         let mut interrupted_result = None;
         let mut generation = crate::generation_activity::GenerationActivity::new(launch.provider);
         let trace_loop = std::env::var("BORG_TRACE_SESSION_LOOP").as_deref() == Ok("1");
+        let actor_step = ActorStep::default();
+        let _actor_step_guard = commands.interrupt.clone().map(|interrupt| {
+            AbortTask(tokio::spawn(guard_actor_steps(
+                session_id,
+                actor_step.clone(),
+                interrupt,
+                ACTOR_STEP_LIMIT,
+                ACTOR_STEP_POLL,
+            )))
+        });
         let mut watchdog = TurnWatchdog::new(TurnPhase::AwaitingProvider);
         let mut watchdog_poll = tokio::time::interval(TURN_WATCHDOG_POLL_INTERVAL);
         // A sleeping host freezes the monotonic clock, so ticks would otherwise
@@ -5706,11 +5794,13 @@ async fn run_agent_session_store_kernel_inner(
             tokio::select! {
                 biased;
                 result = async { title_result_rx.as_mut().expect("guarded title receiver").await }, if title_result_rx.is_some() => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "title", provider_events.len() + provider_carry.len());
                     title_result_rx = None;
                     drop(title_task.take());
                     record_generated_session_title(&mut journal, &events, session_id, result.unwrap_or(None)).await?;
                 }
                 _ = generation.wait(), if !interrupted && provider_events.is_empty() && provider_carry.is_empty() => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "generation_expiry", provider_events.len() + provider_carry.len());
                     if !provider_events.is_empty() || !provider_carry.is_empty() { continue; }
                     for kind in generation.expire(tokio::time::Instant::now()) {
                         record_provider_event(
@@ -5725,6 +5815,7 @@ async fn run_agent_session_store_kernel_inner(
                     }
                 }
                 Some(request) = tool_approval_rx.recv(), if pending_approval.is_none() && !interrupted => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "tool_approval", provider_events.len() + provider_carry.len());
                     if request.response.is_closed() { continue; }
                     let approval_id = Uuid::new_v4().to_string();
                     record(&mut journal, &events, session_id, SessionEventKind::StatusChanged {
@@ -5738,6 +5829,7 @@ async fn run_agent_session_store_kernel_inner(
                     watchdog.set_phase(TurnPhase::Active);
                 }
                 _ = tool_approval_caller_closed(&mut pending_approval) => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "tool_approval_closed", provider_events.len() + provider_carry.len());
                     deny_pending_approval(&mut journal, &events, session_id, &mut pending_approval).await?;
                     record(&mut journal, &events, session_id, SessionEventKind::StatusChanged {
                         status: SessionStatus::Running,
@@ -6369,6 +6461,7 @@ async fn run_agent_session_store_kernel_inner(
                 // Settle steer admissions first: an interrupt must observe a
                 // steer the provider already accepted.
                 steer_result = steer_results.recv(), if !pending_steers.is_empty() => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "steer_result", provider_events.len() + provider_carry.len());
                     let Some((acknowledgement_id, acknowledgement)) = steer_result else {
                         continue;
                     };
@@ -6459,7 +6552,7 @@ async fn run_agent_session_store_kernel_inner(
                 // Commands (interrupts, steers) outrank team and watchdog
                 // traffic: a busy team must not delay the person's Esc.
                 command = next_host_command(&mut deferred_commands, &mut commands) => {
-                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "command", provider_events.len() + provider_carry.len());
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "command", provider_events.len() + provider_carry.len());
                     let Some(command) = command else {
                         running.0.abort();
                         let _ = stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT).await;
@@ -7117,6 +7210,10 @@ async fn run_agent_session_store_kernel_inner(
                                     SessionEventKind::Error { message: error },
                                 ).await?;
                             }
+                            let stalled = actor_step.state().stalled.take();
+                            if let Some(message) = stalled {
+                                record(&mut journal, &events, session_id, SessionEventKind::Error { message }).await?;
+                            }
                             // Buffered watcher output waits as queued input too.
                             if let Some(mut output) = watch_prompt(None, &mut watch_events_rx, &watches).await {
                                 output.delivery = PromptDelivery::Queue;
@@ -7279,6 +7376,7 @@ async fn run_agent_session_store_kernel_inner(
                     role_notice_pending |= changed.is_ok() && !executor.uses_native_harness(launch.provider);
                 }
                 permit = control_tx.reserve(), if role_notice_pending => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "role_notice", provider_events.len() + provider_carry.len());
                     if let Ok(permit) = permit
                         && let Some(team) = &subagents
                     {
@@ -7292,7 +7390,7 @@ async fn run_agent_session_store_kernel_inner(
                     role_notice_pending = false;
                 }
                 message = root_message_rx.recv(), if owns_team => {
-                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "root_message", provider_events.len() + provider_carry.len());
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "root_message", provider_events.len() + provider_carry.len());
                     match message {
                         Ok(message) => {
                             team_message_ids.insert(message.message_id);
@@ -7310,7 +7408,7 @@ async fn run_agent_session_store_kernel_inner(
                     }
                 }
                 _ = root_inbox_tick.tick(), if owns_team => {
-                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "root_inbox_refresh", provider_events.len() + provider_carry.len());
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "root_inbox_refresh", provider_events.len() + provider_carry.len());
                     refresh_durable_root_inbox(
                         &mut journal,
                         &events,
@@ -7321,7 +7419,7 @@ async fn run_agent_session_store_kernel_inner(
                     root_inbox_tick.reset();
                 }
                 _ = team_ack_tick.tick(), if owns_team && !team_broadcasts.is_empty() => {
-                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "team_ack_refresh", provider_events.len() + provider_carry.len());
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "team_ack_refresh", provider_events.len() + provider_carry.len());
                     refresh_team_broadcasts(&mut journal, &events, session_id,
                         subagents.as_ref().expect("team broadcast requires coordinator"),
                         &mut team_broadcasts).await?;
@@ -7332,7 +7430,7 @@ async fn run_agent_session_store_kernel_inner(
                 // worker being stalled.
                 _ = watchdog_poll.tick(), if pending_approval.is_none()
                     && pending_provider_interaction.is_none() => {
-                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "watchdog", provider_events.len() + provider_carry.len());
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "watchdog", provider_events.len() + provider_carry.len());
                     let error = match watchdog.verdict() {
                         WatchdogVerdict::Healthy => continue,
                         WatchdogVerdict::Stalling(detail) => {
@@ -7428,6 +7526,7 @@ async fn run_agent_session_store_kernel_inner(
                     break;
                 }
                 _ = watches.changed.notified() => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "watches_changed", provider_events.len() + provider_carry.len());
                     let snapshot = watches.summaries().await;
                     record(
                         &mut journal,
@@ -7438,6 +7537,7 @@ async fn run_agent_session_store_kernel_inner(
                     .await?;
                 }
                 request = goal_tool_rx.recv() => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "goal_tool", provider_events.len() + provider_carry.len());
                     let Some(request) = request else {
                         continue;
                     };
@@ -7457,6 +7557,7 @@ async fn run_agent_session_store_kernel_inner(
                     request.response.send(result).ok();
                 }
                 request = todo_tool_rx.recv() => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "todo_tool", provider_events.len() + provider_carry.len());
                     let Some(request) = request else {
                         continue;
                     };
@@ -7528,7 +7629,7 @@ async fn run_agent_session_store_kernel_inner(
                 }
                 kind = next_provider_event(&mut provider_carry, &mut provider_events),
                     if provider_events_open || !provider_carry.is_empty() => {
-                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "provider_events", provider_events.len() + provider_carry.len());
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "provider_events", provider_events.len() + provider_carry.len());
                     let Some(first_kind) = kind else {
                         provider_events_open = false;
                         continue;
@@ -7719,16 +7820,18 @@ async fn run_agent_session_store_kernel_inner(
                     journal.flush_deferred().await?;
                 }
                 Some(kind) = receipt_rx.recv() => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "receipt", provider_events.len() + provider_carry.len());
                     record(&mut journal, &events, session_id, kind).await?;
                 }
                 result = work_plan_refresh.next(), if work_plan_refresh.is_pending() => {
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "work_plan_result", provider_events.len() + provider_carry.len());
                     match result {
                         Ok(kind) => work_plan_refresh.apply(kind, &mut journal, &events, &work_plan).await?,
                         Err(error) => tracing::warn!(%session_id, %error, "work-plan collection failed; retrying on the next maintenance tick"),
                     }
                 }
                 _ = work_plan_tick.tick() => {
-                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "work_plan_refresh", provider_events.len() + provider_carry.len());
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "work_plan_refresh", provider_events.len() + provider_carry.len());
                     work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
                 }
                 // Last in the biased select: with many children this channel is
@@ -7737,7 +7840,7 @@ async fn run_agent_session_store_kernel_inner(
                 // the journal; an append from another task would leave the live
                 // context behind and change replay.
                 activity = child_activity_rx.recv(), if child_activity_open => {
-                    let _trace = SessionBranchTrace::begin(trace_loop, session_id, "child_activity", provider_events.len() + provider_carry.len());
+                    let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "child_activity", provider_events.len() + provider_carry.len());
                     let Some(activity) = activity else {
                         // The forwarder is gone, so nothing can arrive on this
                         // channel again.

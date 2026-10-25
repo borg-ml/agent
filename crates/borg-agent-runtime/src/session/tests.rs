@@ -21020,6 +21020,33 @@ async fn followup_after_interrupt_starts_another_turn() {
 }
 
 #[tokio::test]
+async fn a_held_loop_step_interrupts_its_turn_and_names_the_step() {
+    // A step that never returns holds the whole actor; only ending the turn
+    // released it, after a human waited 24 minutes to press Escape.
+    let step = ActorStep::default();
+    let interrupt = SessionInterrupt::default();
+    let turn = tokio::spawn(std::future::pending::<()>());
+    interrupt.install(turn.abort_handle());
+    step.state().running = Some(("child_activity", Instant::now()));
+    tokio::time::timeout(
+        EVENT_TIMEOUT,
+        guard_actor_steps(
+            Uuid::new_v4(),
+            step.clone(),
+            interrupt.clone(),
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        ),
+    )
+    .await
+    .expect("the guard ends a held step's turn");
+    assert!(turn.await.unwrap_err().is_cancelled());
+    assert!(interrupt.requested(), "the actor settles it as an Escape");
+    let stalled = step.state().stalled.take();
+    assert!(stalled.is_some_and(|message| message.contains("`child_activity`")));
+}
+
+#[tokio::test]
 async fn stop_holds_waiting_internal_input_until_later_input() {
     // Escape must not reopen a turn for a report that was already waiting:
     // that restart compacted a large context the moment a human pressed it.

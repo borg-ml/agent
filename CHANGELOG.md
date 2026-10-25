@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.19.5)
 
+- A session whose turn loop is stuck in one step for two minutes now
+  interrupts that turn itself and says which step was stuck, instead of
+  sitting silently until Escape. A root session froze for 24 minutes this way,
+  with model output, tool calls and subagent updates all held behind the step.
+  Any loop step slower than 30 seconds is logged by name.
+
 - Escape leaves the session stopped. Watcher output and team reports that were
   already waiting no longer start a new turn the moment a turn is stopped,
   which also started context compaction; they wait for your next message, and
