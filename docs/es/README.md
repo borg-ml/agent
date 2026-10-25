@@ -69,10 +69,10 @@ La documentación normativa completa está disponible en inglés:
 
 ## Recuento mínimo de uso
 
-Las versiones publicadas envían como máximo una señal de instalación activa al
+Desactivado por defecto. Si lo activas con `usage_count.enabled = true`, las
+versiones publicadas envían como máximo una señal de instalación activa al
 día. El identificador aleatorio cambia cada 31 días y no permite seguir una
 instalación entre períodos. No se envían versiones, sistema operativo, modelos,
 sesiones, mensajes, rutas ni datos del dispositivo.
 
-Se puede desactivar con `usage_count.enabled = false` en `agent.toml` o con
-`BORG_DISABLE_USAGE_COUNT=1`.
+`BORG_DISABLE_USAGE_COUNT=1` siempre lo desactiva.

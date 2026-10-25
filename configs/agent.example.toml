@@ -4,11 +4,11 @@
 # Aliases expand to built-in slash commands. They do not execute shell code,
 # load plugins, or register lifecycle hooks.
 
-# Borg sends at most one content-free active-install heartbeat per day. Its
+# Opt in to at most one content-free active-install heartbeat per day. Its
 # random identifier rotates every 31 days and cannot link activity across
-# periods. Set this to false or BORG_DISABLE_USAGE_COUNT=1 to disable it.
+# periods. Off by default; BORG_DISABLE_USAGE_COUNT=1 always disables it.
 [usage_count]
-enabled = true
+enabled = false
 
 # Append personal instructions to Borg's coding system prompt on every local
 # turn (including turns launched on this host). Does not replace Borg's core

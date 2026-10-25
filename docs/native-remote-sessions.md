@@ -36,7 +36,12 @@ the PC, so direct clipboard APIs see the PC clipboard. Bracketed text paste and
 OSC 52 copy continue to cross SSH. A later convenience client can proxy image
 bytes as normal Borg attachments without changing session ownership.
 
-If a dedicated transport is added later, it should reuse the typed local
-control commands and durable event stream behind an authenticated relay. The
-Unix socket itself should remain local-only; exposing it over TCP would weaken
-the current single-owner trust boundary.
+For browser and phone access, Borg Remote reuses the typed control commands
+and durable event stream behind an authenticated relay. It is opt-in: a
+machine joins only after `borg remote connect` and an approval code, and a
+terminal session is shared only with `/remote` or `borg remote mirror on`. Pin
+your devices with `borg remote devices trust` so the host verifies device
+proofs and signed owner commands itself instead of trusting the relay; see the
+[unattended-host runbook](remote-unattended-runbook.md). The Unix control
+socket stays local-only, in an owner-only directory; exposing it over TCP
+would weaken the single-owner trust boundary.

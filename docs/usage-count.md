@@ -6,7 +6,8 @@ daily and monthly active-install estimates.
 
 ## Client contract
 
-A release build sends at most one `POST` request per 24 hours to
+The heartbeat is off unless you turn it on. When enabled, a release build
+sends at most one `POST` request per 24 hours to
 `https://borg.ml/api/v1/active-install`. The JSON body has exactly one field:
 
 ```json
@@ -20,11 +21,11 @@ locale, model, provider, session ID, prompts, paths, tool activity, IP-derived
 location, or hardware identifiers. Failed requests are ignored and never
 affect agent startup or use.
 
-Development builds do not send the heartbeat. Users can disable it with:
+Development builds never send the heartbeat. Opt in with:
 
 ```toml
 [usage_count]
-enabled = false
+enabled = true
 ```
 
 The presence of `BORG_DISABLE_USAGE_COUNT` (any value) is an immediate override.

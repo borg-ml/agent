@@ -688,7 +688,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/stop", "alias for /interrupt"),
     ("/login", "switch ChatGPT / API key billing"),
     ("/connect", "manage provider connections"),
-    ("/remote", "connect this machine to your Borg account"),
+    (
+        "/remote",
+        "share this chat in Borg Remote (connects this machine first if needed)",
+    ),
     ("/collab", "share this live session"),
     ("/quit", "close this view; active work continues"),
     ("/exit", "alias for /quit"),

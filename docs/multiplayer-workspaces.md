@@ -298,7 +298,9 @@ API instances, host reconnects, or machine changes therefore converge on one
 message and one recipient admission.
 
 Both machines must be enrolled and connected to the same server account for
-remote discovery. Updating only the CLI does not add server endpoints: deploy
+remote discovery. A terminal session takes part only while it is shared with
+Borg Remote (`/remote`, or `borg remote mirror on`); local-only sessions are
+never registered with the relay. Updating only the CLI does not add server endpoints: deploy
 the server's instance-directory and direct-message API support as well. Cached
 directory entries can be offline; a successful enqueue is not an acknowledgement.
 

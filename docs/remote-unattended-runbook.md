@@ -8,9 +8,32 @@ On each computer whose projects should appear in Borg Remote, run:
 borg remote connect --name "My laptop" --root /path/to/project
 ```
 
-Approve the computer in the browser using the same Borg account as the web
-app. Repeat `--root` to include more projects. Opening the web app on a new
-computer does not automatically enroll that computer or expose its files.
+`connect` validates the server address, then opens the approval page and
+prints a code. Sign in with the same Borg account as the web app, check the
+machine name, hostname and platform shown there, and type the code to approve.
+Repeat `--root` to include more projects. It prints the relay key fingerprint
+when enrollment finishes.
+
+Borg Remote is off until you do this. Without an enrollment nothing contacts
+the relay, mirrors sessions or listens for remote connections; opening the web
+app on a new computer does not enroll it or expose its files. Enrolling enables
+only the outbound host tunnel, which lets the web app start sessions in the
+enrolled roots. It does not by itself:
+
+- mirror your interactive terminal sessions: run `/remote` inside a session to
+  share that one, or `borg remote mirror on` to share every new interactive
+  session (`borg remote mirror off` turns it back off). Hosts enrolled before
+  this setting existed keep mirroring all sessions until you turn it off;
+- start a direct listener: that needs a `direct_listener` entry in host.json,
+  and a non-loopback address also needs pinned devices;
+- pin any device, so pin yours next (see below).
+
+`borg remote status` prints what is enabled: enrollment, local-session
+mirroring, direct listener, pinned devices and host token expiry. Host tokens
+expire after 90 days. The host rotates its token at startup and daily once fewer
+than 30 days remain, saving the new token to host.json before using it. An
+expired token stops the host; run `borg remote connect` again, and your pinned
+devices and mirroring choice are kept.
 
 On macOS, this installs `~/Library/LaunchAgents/ml.borg.remote.plist`, starts
 the outbound connection, and restarts it after process exits and subsequent

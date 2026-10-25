@@ -1293,6 +1293,14 @@ pub(crate) enum RemoteCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Mirror every interactive local session to Borg Remote (off for new
+    /// enrollments). `/remote` inside a session shares just that session.
+    Mirror {
+        #[arg(value_enum)]
+        state: RemoteSwitchArg,
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Pin the device keys this host trusts. While any key is pinned, the host
     /// verifies device proofs and command signatures itself instead of
     /// trusting the relay, and refuses unsigned owner commands.
@@ -1302,6 +1310,12 @@ pub(crate) enum RemoteCommand {
         #[arg(long, global = true)]
         config: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum RemoteSwitchArg {
+    On,
+    Off,
 }
 
 #[derive(Debug, Subcommand)]

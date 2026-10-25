@@ -62,10 +62,19 @@ pub struct HostConfig {
     /// Unknown for hosts enrolled before relay tokens expired; rotation then runs at startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_token_expires_at: Option<DateTime<Utc>>,
+    /// Mirror interactive local terminal sessions to the relay. New
+    /// enrollments start off; configs written before this field existed
+    /// mirrored every local session, so they keep it until turned off.
+    #[serde(default = "legacy_mirror_local_sessions")]
+    pub mirror_local_sessions: bool,
     /// Locally pinned device keys; non-empty means the host enforces device
     /// proofs and signed owner commands instead of trusting the relay.
     #[serde(default)]
     pub trusted_devices: Vec<crate::auth::TrustedDevice>,
+}
+
+fn legacy_mirror_local_sessions() -> bool {
+    true
 }
 
 /// Marker written by the generated systemd unit for an isolated host.
@@ -354,6 +363,7 @@ pub async fn enroll_host(
         .await
         .context("Borg returned an invalid host enrollment response")?;
     let _issuer = crate::admission::issuer_key(&enrolled.relay_public_key)?;
+    let previous = read_config(config_path).ok();
     let config = HostConfig {
         server,
         host_id: enrolled.host.id,
@@ -366,8 +376,11 @@ pub async fn enroll_host(
         roots,
         execution_profile,
         resource_limits,
+        mirror_local_sessions: previous
+            .as_ref()
+            .is_some_and(|previous| previous.mirror_local_sessions),
         // Re-enrollment must not silently drop the owner's pinned devices.
-        trusted_devices: read_config(config_path)
+        trusted_devices: previous
             .map(|previous| previous.trusted_devices)
             .unwrap_or_default(),
     };
@@ -6434,11 +6447,18 @@ fn canonical_roots(roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-pub(crate) fn read_config(path: &Path) -> Result<HostConfig> {
+pub fn read_config(path: &Path) -> Result<HostConfig> {
     serde_json::from_slice(
         &fs::read(path).with_context(|| format!("failed to read {}", path.display()))?,
     )
     .with_context(|| format!("invalid host config {}", path.display()))
+}
+
+/// Turns mirroring of interactive local sessions to the relay on or off.
+pub fn set_mirror_local_sessions(path: &Path, enabled: bool) -> Result<()> {
+    let mut config = read_config(path)?;
+    config.mirror_local_sessions = enabled;
+    write_config(path, &config)
 }
 
 pub(crate) fn write_config(path: &Path, config: &HostConfig) -> Result<()> {
@@ -12858,6 +12878,19 @@ connection: close
         }))
     }
 
+    // Persistence rule: hosts enrolled before mirroring became opt-in keep
+    // their working local-session mirror; enroll_host writes false for new ones.
+    #[test]
+    fn host_config_without_mirror_field_keeps_legacy_mirroring() {
+        let mut value = serde_json::to_value(test_config(Path::new("/tmp"))).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("mirror_local_sessions");
+        let legacy: HostConfig = serde_json::from_value(value).unwrap();
+        assert!(legacy.mirror_local_sessions);
+    }
+
     fn test_config_for(root: &Path, host_id: Uuid) -> HostConfig {
         HostConfig {
             host_id,
@@ -12878,6 +12911,7 @@ connection: close
             execution_profile: HostExecutionProfile::TrustedUser,
             resource_limits: HostResourceLimits::default(),
             host_token_expires_at: None,
+            mirror_local_sessions: false,
             trusted_devices: Vec::new(),
         }
     }

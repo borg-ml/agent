@@ -137,8 +137,9 @@ an idle agent. Human messages take priority.
 ### Agents, goals and plans
 
 Agents can spawn subagents, run scouts for bounded exploration, and message
-agents in other local projects or on other machines enrolled under the same
-account (`list_instances`, then `send_message` or `followup_task`). A durable
+agents in other local projects or, once Borg Remote is enabled, on other
+machines enrolled under the same account (`list_instances`, then
+`send_message` or `followup_task`). A durable
 goal keeps an agent working across turns until it is complete or blocked; a
 plan tracks the steps. See [team harness](docs/team-harness.md) and
 [multiplayer messaging](docs/multiplayer-workspaces.md).
@@ -154,7 +155,13 @@ another connection.
 ### Remote hosts
 
 Borg Remote hosts run the same durable sessions and tools on other machines.
-See the [unattended-host runbook](docs/remote-unattended-runbook.md) for
+It is off until you run `borg remote connect` (or `/remote`) and approve the
+machine with the code it prints. Enrolling does not mirror your other terminal
+sessions or open a listener. Pin the devices you use with
+`borg remote devices trust`: the host then checks device proofs itself and runs
+owner commands only when a pinned device signed them. Admissions, commands and
+trust changes are logged to `~/.borg/remote/audit.jsonl`. See the
+[unattended-host runbook](docs/remote-unattended-runbook.md) for setup,
 preflight, fault recovery and rollback.
 
 ## Configuration
@@ -197,10 +204,11 @@ See [Blu extensions](docs/blu-extensions.md) and the
 
 ## Privacy and diagnostics
 
-**Usage count.** To estimate active installations, release builds send at most
-one content-free heartbeat a day carrying a random identifier that rotates every
-31 days: no version, OS, model, session, prompt, path or device data. Disable it
-with `usage_count.enabled = false` in `agent.toml` or `BORG_DISABLE_USAGE_COUNT=1`.
+**Usage count.** Off by default. If you opt in with `usage_count.enabled = true`
+in `agent.toml`, release builds send at most one content-free heartbeat a day
+carrying a random identifier that rotates every 31 days: no version, OS, model,
+session, prompt, path or device data. `BORG_DISABLE_USAGE_COUNT=1` always
+disables it.
 See [usage count](docs/usage-count.md).
 
 **Bug reports.** `borg bug` collects a local-only diagnostic bundle: it opens no

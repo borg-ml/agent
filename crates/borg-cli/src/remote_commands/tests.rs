@@ -1801,6 +1801,7 @@ fn isolated_remote_host_service_is_fail_closed_and_sandboxed() {
         execution_profile: HostExecutionProfile::IsolatedHosted,
         resource_limits: Default::default(),
         host_token_expires_at: None,
+        mirror_local_sessions: false,
         trusted_devices: Vec::new(),
     };
     let unit = host_service_unit(
@@ -1844,6 +1845,7 @@ fn trusted_remote_host_service_keeps_legacy_unit_small() {
         execution_profile: HostExecutionProfile::TrustedUser,
         resource_limits: Default::default(),
         host_token_expires_at: None,
+        mirror_local_sessions: false,
         trusted_devices: Vec::new(),
     };
     let unit = host_service_unit(
@@ -1884,6 +1886,7 @@ fn isolated_remote_host_service_requires_network_allowlist() {
         execution_profile: HostExecutionProfile::IsolatedHosted,
         resource_limits: Default::default(),
         host_token_expires_at: None,
+        mirror_local_sessions: false,
         trusted_devices: Vec::new(),
     };
     assert!(
@@ -1919,6 +1922,7 @@ fn isolated_remote_host_service_passes_systemd_unit_validation() {
         execution_profile: HostExecutionProfile::IsolatedHosted,
         resource_limits: Default::default(),
         host_token_expires_at: None,
+        mirror_local_sessions: false,
         trusted_devices: Vec::new(),
     };
     let executable = std::env::current_exe().expect("current test executable");

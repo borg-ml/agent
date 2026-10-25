@@ -63,10 +63,10 @@ UTF-16 组合文本范围。
 
 ## 最小化的使用计数
 
-发行版每天最多发送一次不含内容的活跃安装心跳。随机标识每 31 天更换，不能
-跨周期追踪；不会发送版本、系统、模型、会话、提示、路径或设备信息。可在
-`agent.toml` 中设置 `usage_count.enabled = false`，或设置环境变量
-`BORG_DISABLE_USAGE_COUNT=1` 完全关闭。详细英文契约见
+默认关闭。在 `agent.toml` 中设置 `usage_count.enabled = true` 后，发行版每天
+最多发送一次不含内容的活跃安装心跳。随机标识每 31 天更换，不能跨周期追踪；
+不会发送版本、系统、模型、会话、提示、路径或设备信息。环境变量
+`BORG_DISABLE_USAGE_COUNT=1` 始终关闭它。详细英文契约见
 [`docs/usage-count.md`](../usage-count.md)。
 
 完整英文参考文档位于 [`docs/`](../)。中文入口优先覆盖安装、语言、会话生命

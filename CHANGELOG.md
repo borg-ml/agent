@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.19.5)
 
+- Remote features are opt-in. Enrolling a machine no longer mirrors every
+  interactive terminal session to Borg Remote: `/remote` shares the current
+  chat, and `borg remote mirror on|off` controls mirroring of all sessions.
+  Hosts enrolled before this change keep mirroring until turned off, so
+  existing access is not cut. `borg remote status` now lists what is enabled
+  (enrollment, mirroring, direct listener, pinned devices, token expiry), and
+  enrollment says when no device is pinned yet. The anonymous active-install
+  count is now off unless `usage_count.enabled = true`.
+
 - `borg remote connect` validates the server address before sending anything,
   sends this machine's name, hostname and platform for the approval page, and
   shows the code to enter there. Enrollment prints the relay key fingerprint.

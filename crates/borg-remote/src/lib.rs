@@ -28,6 +28,7 @@ pub use host::{
     enroll_host, host_launch_is_local_mirror, login_provider, login_provider_with_output,
     mirror_local_session, probe_capabilities, probe_provider_admission_capabilities,
     probe_provider_capabilities, provider_credentials_present,
-    provider_subscription_credentials_present, register_existing_session, run_host,
-    run_host_with_executor_factory, sync_remote_session, validate_server_url,
+    provider_subscription_credentials_present, read_config as read_host_config,
+    register_existing_session, run_host, run_host_with_executor_factory, set_mirror_local_sessions,
+    sync_remote_session, validate_server_url,
 };

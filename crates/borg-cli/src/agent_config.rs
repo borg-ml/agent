@@ -521,17 +521,11 @@ pub(crate) struct ShellConfig {
     pub(crate) command: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct UsageCountConfig {
     /// Send a content-free, monthly rotating active-install heartbeat.
     pub(crate) enabled: bool,
-}
-
-impl Default for UsageCountConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
 }
 
 impl Default for UpdateConfig {

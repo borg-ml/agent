@@ -39,7 +39,7 @@ use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use crate::agent_config::AgentConfig;
-use crate::cli::{LocalAgentCliArgs, RemoteCommand, RemoteDevicesCommand};
+use crate::cli::{LocalAgentCliArgs, RemoteCommand, RemoteDevicesCommand, RemoteSwitchArg};
 use crate::dictation::{
     DictationAccelerator, DictationModelId, LocalDictationBackend, LocalDictationConfig,
     LocalDictationRecorder, ensure_backend, parakeet_is_installed,
@@ -607,6 +607,7 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
                 serde_json::to_string_pretty(&probe_capabilities(roots).await)?
             );
             let config_path = config.unwrap_or_else(default_host_config_path);
+            print_remote_features(&config_path);
             if config_path.exists() {
                 let devices = borg_remote::trust::trusted_devices(&config_path)?;
                 if devices.is_empty() {
@@ -620,6 +621,19 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
                     print_trusted_devices(&devices);
                 }
             }
+        }
+        RemoteCommand::Mirror { state, config } => {
+            let config_path = config.unwrap_or_else(default_host_config_path);
+            let enabled = matches!(state, RemoteSwitchArg::On);
+            borg_remote::set_mirror_local_sessions(&config_path, enabled)?;
+            eprintln!(
+                "{}",
+                if enabled {
+                    "Interactive local sessions started from now on are mirrored to Borg Remote."
+                } else {
+                    "Local sessions are no longer mirrored; use /remote in a session to share just that one."
+                }
+            );
         }
         RemoteCommand::Devices { command, config } => {
             let config_path = config.unwrap_or_else(default_host_config_path);
@@ -665,11 +679,67 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
     Ok(())
 }
 
+/// What this machine exposes remotely, on stderr so stdout stays JSON.
+fn print_remote_features(config_path: &Path) {
+    let usage_count = AgentConfig::load(None).is_ok_and(|config| config.usage_count.enabled);
+    eprintln!(
+        "Anonymous usage count: {}",
+        if usage_count { "on" } else { "off" }
+    );
+    let config = match borg_remote::read_host_config(config_path) {
+        Ok(config) => config,
+        Err(_) if !config_path.exists() => {
+            eprintln!(
+                "Borg Remote: not enrolled. Nothing contacts the relay, mirrors sessions or listens for remote connections."
+            );
+            return;
+        }
+        Err(error) => {
+            eprintln!("Borg Remote: host config unreadable: {error:#}");
+            return;
+        }
+    };
+    eprintln!(
+        "Borg Remote: enrolled as {} ({}) with {}; the host tunnel runs while `borg remote host` or its service runs.",
+        config.name, config.host_id, config.server
+    );
+    eprintln!(
+        "Local session mirroring: {}",
+        if config.mirror_local_sessions {
+            "on (`borg remote mirror off` to share only chats where you run /remote)"
+        } else {
+            "off (`/remote` shares one chat; `borg remote mirror on` shares all)"
+        }
+    );
+    eprintln!(
+        "Direct listener: {}",
+        config.direct_listener.as_ref().map_or_else(
+            || "off".to_string(),
+            |listener| listener.bind_address.to_string()
+        )
+    );
+    if let Some(expires) = config.host_token_expires_at {
+        eprintln!("Host token expires: {expires} (rotated automatically)");
+    }
+}
+
 fn print_relay_fingerprint(enrolled: &HostConfig) -> Result<()> {
     println!(
-        "Relay key fingerprint: {}. Pin your devices with `borg remote devices trust <PUBLIC_KEY>`.",
+        "Relay key fingerprint: {}",
         borg_remote::auth::device_fingerprint(&enrolled.relay_public_key)?
     );
+    if enrolled.trusted_devices.is_empty() {
+        println!(
+            "No devices are pinned yet, so this host fully trusts the relay. Pin each device you \
+             use with `borg remote devices trust <PUBLIC_KEY>` (shown in Borg Remote on that device)."
+        );
+    }
+    if !enrolled.mirror_local_sessions {
+        println!(
+            "Local sessions are not mirrored: run /remote in a session to share it, or \
+             `borg remote mirror on` to share all of them."
+        );
+    }
     Ok(())
 }
 
@@ -2833,7 +2903,8 @@ async fn run_local_agent_session(
         && interactive
         && !args.local_only
         && !args.ephemeral
-        && host_config_path.is_file();
+        && borg_remote::read_host_config(&host_config_path)
+            .is_ok_and(|config| config.mirror_local_sessions);
     let mut mirror_shutdown = None;
     let mut mirror_task = None;
     let mut collab_child: Option<Child> = None;
@@ -7962,20 +8033,29 @@ async fn run_local_agent_session(
                                         );
                                     } else if remote_open {
                                         terminal.as_mut().expect("terminal").set_notice(
-                                            "This machine is already connected to Borg Remote."
+                                            "This chat is already available in Borg Remote."
                                         );
                                     } else {
-                                        shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
-                                        let connected = match connect_remote_account(
-                                            "https://borg.ml",
-                                            None,
-                                            vec![cwd.clone()],
-                                            &host_config_path,
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => install_host_service(&host_config_path).await,
-                                            Err(error) => Err(error),
+                                        // An enrolled host shares only this chat; mirroring
+                                        // every local session stays a separate opt-in.
+                                        let enrolled = host_config_path.is_file();
+                                        if !enrolled {
+                                            shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+                                        }
+                                        let connected = if enrolled {
+                                            Ok(())
+                                        } else {
+                                            match connect_remote_account(
+                                                "https://borg.ml",
+                                                None,
+                                                vec![cwd.clone()],
+                                                &host_config_path,
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => install_host_service(&host_config_path).await,
+                                                Err(error) => Err(error),
+                                            }
                                         };
                                         if connected.is_ok() {
                                             let mut registration = registration_template.clone();
@@ -8002,6 +8082,12 @@ async fn run_local_agent_session(
                                             }));
                                             remote_open = true;
                                         }
+                                        if enrolled {
+                                            terminal.as_mut().expect("terminal").set_notice(match connected {
+                                                Ok(()) => "This chat is now available at borg.ml/remote.".to_string(),
+                                                Err(error) => format!("Remote connection failed: {error:#}"),
+                                            });
+                                        } else {
                                         let latest_state = store.state(session_id).await?;
                                         let latest = recent_tui_history(
                                             store.as_ref(),
@@ -8053,6 +8139,7 @@ async fn run_local_agent_session(
                                         });
                                         terminal = Some(restored);
                                         crash_context.tui_active.store(true, Ordering::Release);
+                                        }
                                     }
                                 }
                                 "/login" | "/connect" if attachments.is_empty() => {
@@ -10669,7 +10756,7 @@ fn print_agent_help() {
   /todo remove ID   remove an item
   /todo clear       clear the list
   /login            reconnect the current provider
-  /remote           connect this machine to your Borg account
+  /remote           share this chat in Borg Remote (enrolls the machine if needed)
   /queue TEXT       run after the current turn
   /steer TEXT       steer Codex now; queues on other providers
   /interrupt        stop the current turn and pause its goal
