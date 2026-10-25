@@ -11,9 +11,16 @@ use crate::agent_watch::{AgentSignal, AgentSubjects, Aggregate, SubjectLife, Sub
 use crate::native_process::ProcessManager;
 
 tokio::task_local! { static ACTION_JOB_ID: Uuid; }
+tokio::task_local! { static ACTION_TOOL_CALL_ID: String; }
 
 pub(crate) fn action_job_id() -> Option<Uuid> {
     ACTION_JOB_ID.try_with(|id| *id).ok()
+}
+
+/// The model tool call running this action, so a process it starts names the
+/// call that owns it even while parallel calls are in flight.
+pub(crate) fn action_tool_call_id() -> Option<String> {
+    ACTION_TOOL_CALL_ID.try_with(Clone::clone).ok()
 }
 
 const MAX_WATCHES: usize = 4;
@@ -361,7 +368,7 @@ impl Watches {
                 Uuid::new_v4(),
                 label,
                 command,
-                execution,
+                ACTION_TOOL_CALL_ID.scope(tool_call_id.to_owned(), execution),
                 execution_cancel,
                 foreground,
                 Some(signal),

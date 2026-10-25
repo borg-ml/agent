@@ -4124,6 +4124,7 @@ async fn owner_upgrade_waits_for_child_work_and_background_processes() {
                 pid: 123,
                 command: "test child process".into(),
                 cwd: PathBuf::from("/workspace"),
+                tool_call_id: None,
             },
         ))
         .await

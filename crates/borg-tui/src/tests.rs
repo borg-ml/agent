@@ -31,6 +31,7 @@ fn polling_a_running_command_does_not_add_a_row_of_its_own() {
             pid: 4242,
             command: "cargo test".to_string(),
             cwd: PathBuf::from("/workspace"),
+            tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -1185,6 +1186,7 @@ fn child_history_merge_uses_journal_order_when_timestamps_invert() {
             pid: 4242,
             command: "cargo test".to_string(),
             cwd: PathBuf::from("/workspace"),
+            tool_call_id: None,
         },
     );
     process.created_at = now - chrono::Duration::milliseconds(1);
@@ -2846,6 +2848,7 @@ fn background_process_change_and_terminal_poll_share_one_edit_action() {
             pid: 42,
             command: "python3 rewrite.py".to_string(),
             cwd: PathBuf::from("/workspace"),
+            tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -17937,6 +17940,7 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
             pid: 4242,
             command: "cargo test".to_string(),
             cwd: PathBuf::from("/workspace"),
+            tool_call_id: None,
         },
     ));
 
@@ -18062,6 +18066,7 @@ fn watcher_process_is_counted_as_a_watcher_not_a_shell() {
             pid: 1111,
             command: "tail -f log".to_string(),
             cwd: PathBuf::from("/workspace"),
+            tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -18098,6 +18103,7 @@ fn watcher_process_is_counted_as_a_watcher_not_a_shell() {
             pid: 4242,
             command: "cargo test".to_string(),
             cwd: PathBuf::from("/workspace"),
+            tool_call_id: None,
         },
     ));
 
@@ -18136,6 +18142,7 @@ fn a_parallel_call_is_not_credited_with_a_watch_process() {
             pid: 4242,
             command: "long pipeline".to_string(),
             cwd: PathBuf::from("/workspace"),
+            tool_call_id: None,
         },
     ));
     let watch_input = serde_json::json!({"name": "watch", "arguments": {"label": "rerun", "command": "long pipeline"}});

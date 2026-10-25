@@ -2715,6 +2715,9 @@ pub enum SessionEventKind {
         pid: u32,
         command: String,
         cwd: PathBuf,
+        /// The tool call that started the process, when it ran as an action.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
     },
     RuntimeProcessOutput {
         process_id: Uuid,

@@ -4771,6 +4771,70 @@ mod model_request_tests {
         check_process_result_binding(false);
     }
 
+    #[test]
+    fn parallel_call_does_not_steal_a_commands_edit() {
+        let session = Uuid::new_v4();
+        let process = Uuid::new_v4();
+        let change = borg_remote::CommandChange {
+            path: "CHANGELOG.md".into(),
+            added: 1,
+            removed: 0,
+            diff: "@@ -1 +1,2 @@\n line\n+entry".into(),
+        };
+        let mut transcript = Transcript::default();
+        let kinds = [
+            SessionEventKind::ToolStarted {
+                tool_call_id: "edit".into(),
+                name: "exec".into(),
+                input: serde_json::json!({"cmd": "python3 rewrite.py"}),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+            SessionEventKind::ToolStarted {
+                tool_call_id: "check".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "lib.rs"}),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+            SessionEventKind::RuntimeProcessStarted {
+                process_id: process,
+                pid: 42,
+                command: "python3 rewrite.py".into(),
+                cwd: PathBuf::from("/workspace"),
+                tool_call_id: Some("edit".into()),
+            },
+            SessionEventKind::RuntimeProcessCompleted {
+                process_id: process,
+                pid: 42,
+                status: borg_remote::RuntimeProcessStatus::Exited,
+                exit_code: Some(0),
+                timed_out: false,
+                stdout: String::new(),
+                stderr: String::new(),
+                stdout_omitted_bytes: 0,
+                stderr_omitted_bytes: 0,
+                error: None,
+                changes: vec![change.clone()],
+            },
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "edit".into(),
+                output: serde_json::json!({"session_id": process, "running": false, "changes": [change]})
+                    .to_string(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        ];
+        for (sequence, kind) in kinds.into_iter().enumerate() {
+            transcript.apply(&SessionEvent::new(session, sequence as u64 + 1, kind));
+        }
+        assert_eq!(transcript.command_edit_rows.len(), 1);
+        assert_eq!(transcript.command_edit_rows.get("edit"), Some(&1));
+    }
+
     fn check_process_result_binding(has_changes: bool) {
         let session = Uuid::new_v4();
         let process = Uuid::new_v4();
@@ -4788,6 +4852,7 @@ mod model_request_tests {
                 pid: 42,
                 command: "python3 rewrite.py; cargo test".into(),
                 cwd: PathBuf::from("/workspace"),
+                tool_call_id: None,
             },
             SessionEventKind::ToolStarted {
                 tool_call_id: "edit".into(),

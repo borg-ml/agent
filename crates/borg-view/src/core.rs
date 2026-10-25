@@ -2279,11 +2279,14 @@ impl TranscriptCore {
                 process_id,
                 pid,
                 command,
+                tool_call_id,
                 ..
             } => {
-                let tool_index = self
-                    .foreground_tool
+                // Parallel calls make the latest started tool a guess; older
+                // journals do not name the owning call.
+                let tool_index = tool_call_id
                     .as_ref()
+                    .or(self.foreground_tool.as_ref())
                     .and_then(|tool_call_id| self.tools.get(tool_call_id))
                     .copied();
                 self.runtime_processes.insert(

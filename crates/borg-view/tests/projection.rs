@@ -1065,6 +1065,7 @@ fn active_process_survives_transport_return_and_interruption_until_exit() {
             pid: 42,
             command: "long-test".into(),
             cwd: ".".into(),
+            tool_call_id: None,
         },
     ));
     core.apply(&SessionEvent::new(
@@ -1755,6 +1756,7 @@ fn checkpoint_stays_within_budget_after_many_finished_processes() {
                 pid: 42,
                 command: "x".repeat(14_000),
                 cwd: ".".into(),
+                tool_call_id: None,
             },
         ));
         reducer.apply(SessionEvent::new(
@@ -1814,6 +1816,7 @@ fn late_message_of_the_same_response_does_not_background_a_running_command() {
             pid: 42,
             command: "sleep 30".into(),
             cwd: ".".into(),
+            tool_call_id: None,
         },
     ));
     assert!(!tool_state(&core).is_backgrounded(), "after process start");

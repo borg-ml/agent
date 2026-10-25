@@ -436,6 +436,7 @@ impl ProcessManager {
                     pid,
                     command: entry.command.clone(),
                     cwd: entry.cwd.clone(),
+                    tool_call_id: crate::watch::action_tool_call_id(),
                 },
             )
             .await
@@ -2494,6 +2495,7 @@ mod tests {
                     pid: 42,
                     command: "sleep 30".to_string(),
                     cwd: "/workspace".into(),
+                    tool_call_id: None,
                 },
             ),
             SessionEvent::new(
@@ -2772,6 +2774,7 @@ mod tests {
                     pid: 0,
                     command: "sleep 30".to_string(),
                     cwd: directory.path().to_path_buf(),
+                    tool_call_id: None,
                 },
             ))
             .await

@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.4)
 
+- Show a command's file edits once, under the command that made them, when it runs alongside other tool calls; process start events now record their owning tool call instead of the transcript guessing the latest started one.
+
 - Workspace text search excludes `.git` metadata and nested repository internals while retaining hidden project configuration files.
 
 - Keep shell special parameters such as `"$@"` literal instead of rendering pasted terminal output as math.
