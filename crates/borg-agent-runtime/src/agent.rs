@@ -589,6 +589,9 @@ pub struct LocalAgentSettings {
     pub idle_compaction_min_context_tokens: Option<u64>,
     /// User-scoped instructions appended to the coding prompt on local turns.
     pub prompt_append: String,
+    /// `[capabilities] claude_refusal_fallback`: let Claude answer a refused request on its
+    /// fallback model. Off unless the user turns it on.
+    pub claude_refusal_fallback: bool,
 }
 
 impl LocalAgentTurnExecutor {

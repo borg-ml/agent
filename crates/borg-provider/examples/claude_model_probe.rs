@@ -26,6 +26,7 @@ async fn probe() -> Result<()> {
             }
             .into(),
         ),
+        refusal_fallback: false,
     };
     let session = uuid::Uuid::new_v4().to_string();
     let prefix = if args.iter().any(|arg| arg == "--cache-prefix") {

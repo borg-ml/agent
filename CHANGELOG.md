@@ -16,6 +16,12 @@ Git comparison.
   which also started context compaction; they wait for your next message, and
   input sent after the stop still starts a turn as before.
 
+- Add an opt-in Claude refusal fallback, `[capabilities] claude_refusal_fallback`
+  (off by default). When enabled, a request a Claude model declines, for example
+  on a cybersecurity flag, is answered by its fallback model (claude-opus-4-8);
+  the transcript notes the switch and labels the reply with the model that
+  actually answered. With it off, a Claude refusal now says the option exists.
+
 - Show Claude's between-tool replies again. Since 0.19.2, Claude subscription
   sessions on adaptive-thinking models such as Opus 5.5 received those replies
   as empty signed blocks, so an answer given mid-task was never displayed while

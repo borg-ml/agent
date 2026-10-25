@@ -268,6 +268,8 @@ pub(crate) struct NativeHarness {
     /// Persistent controller-selected subscription authorities.
     codex_auth_file: Option<std::path::PathBuf>,
     claude_config_dir: Option<std::path::PathBuf>,
+    /// `[capabilities] claude_refusal_fallback`: let Claude answer refusals on its fallback model.
+    claude_refusal_fallback: bool,
 }
 
 impl std::fmt::Debug for NativeHarness {
@@ -299,6 +301,7 @@ impl Default for NativeHarness {
             warming: CacheWarmingMode::default(),
             codex_auth_file: None,
             claude_config_dir: None,
+            claude_refusal_fallback: false,
         }
     }
 }
@@ -388,6 +391,8 @@ impl NativeHarness {
                 codex_account: None,
                 #[cfg(feature = "subscription-adapters")]
                 codex_auth_file: None,
+                #[cfg(feature = "subscription-adapters")]
+                claude_refusal_fallback: settings.claude_refusal_fallback,
                 ..ProviderModelClient::default()
             }),
             reviewer_model: settings.approval_reviewer_model.clone(),
@@ -401,6 +406,7 @@ impl NativeHarness {
             warming: settings.warming,
             codex_auth_file: None,
             claude_config_dir: None,
+            claude_refusal_fallback: settings.claude_refusal_fallback,
         }
     }
 
@@ -416,6 +422,8 @@ impl NativeHarness {
                 codex_account: None,
                 #[cfg(feature = "subscription-adapters")]
                 codex_auth_file: None,
+                #[cfg(feature = "subscription-adapters")]
+                claude_refusal_fallback: settings.claude_refusal_fallback,
                 ..ProviderModelClient::default()
             }),
             ..Self::with_settings(settings)
@@ -442,6 +450,8 @@ impl NativeHarness {
             codex_auth_file: next.codex_auth_file.clone(),
             #[cfg(feature = "subscription-adapters")]
             claude_config_dir: next.claude_config_dir.clone(),
+            #[cfg(feature = "subscription-adapters")]
+            claude_refusal_fallback: next.claude_refusal_fallback,
             ..ProviderModelClient::default()
         });
         next
@@ -536,6 +546,7 @@ impl NativeHarness {
                 let fast = borg_provider::provider::ClaudeModelProvider {
                     model: model.to_string(),
                     effort: None,
+                    refusal_fallback: false,
                 }
                 .supports_fast(self.claude_config_dir.as_deref())
                 .await?;
@@ -619,6 +630,7 @@ impl NativeHarness {
                     codex_auth_file: self.codex_auth_file.clone(),
                     claude_account: (provider == crate::CodingProvider::Claude).then_some(identity),
                     claude_config_dir: self.claude_config_dir.clone(),
+                    claude_refusal_fallback: self.claude_refusal_fallback,
                     access: Some(access.clone()),
                     ..ProviderModelClient::default()
                 }),
@@ -1345,11 +1357,16 @@ impl NativeHarness {
                 let refused = result.finish_reason == "refusal";
                 let mut final_text = content.clone().unwrap_or_default();
                 if refused {
-                    let message = if final_text.trim().is_empty() {
+                    let mut message = if final_text.trim().is_empty() {
                         "The provider declined to respond to this request.".to_string()
                     } else {
                         format!("Model refusal: {final_text}")
                     };
+                    message.push_str(&refusal_fallback_hint(
+                        turn.provider,
+                        &model,
+                        self.claude_refusal_fallback,
+                    ));
                     send(&events, SessionEventKind::Error { message }).await;
                     final_text.clear();
                 } else if final_text.trim().is_empty() {
@@ -2790,6 +2807,8 @@ struct ProviderModelClient {
     claude_account: Option<String>,
     #[cfg(feature = "subscription-adapters")]
     claude_config_dir: Option<std::path::PathBuf>,
+    #[cfg(feature = "subscription-adapters")]
+    claude_refusal_fallback: bool,
     access: Option<crate::ModelAccessContext>,
 }
 
@@ -2885,6 +2904,23 @@ impl ProviderModelClient {
     }
 }
 
+/// Point a Claude refusal at the opt-in fallback that could have answered it.
+fn refusal_fallback_hint(provider: crate::CodingProvider, model: &str, enabled: bool) -> String {
+    #[cfg(feature = "subscription-adapters")]
+    if provider == crate::CodingProvider::Claude
+        && !enabled
+        && let Some(fallback) = borg_provider::provider::claude_refusal_fallback_model(model)
+    {
+        return format!(
+            "\n\nClaude can answer refused requests with {fallback} instead: set \
+             `claude_refusal_fallback = true` under `[capabilities]` in agent.toml \
+             (off by default; takes effect after restart). Fallback replies are labeled."
+        );
+    }
+    let _ = (provider, model, enabled);
+    String::new()
+}
+
 fn not_native_error(
     provider: crate::CodingProvider,
     model: &str,
@@ -2973,6 +3009,7 @@ impl ProviderModelClient {
                 return borg_provider::provider::ClaudeModelProvider {
                     model: model.to_string(),
                     effort: effort.map(str::to_owned),
+                    refusal_fallback: self.claude_refusal_fallback,
                 }
                 .model_turn_for_account(
                     request,
@@ -3306,6 +3343,7 @@ impl NativeModelClient for ProviderModelClient {
                 return borg_provider::provider::ClaudeModelProvider {
                     model: model.to_owned(),
                     effort: None,
+                    refusal_fallback: false,
                 }
                 .context_window(self.claude_config_dir.as_deref())
                 .await
@@ -3498,6 +3536,7 @@ impl PromptCacheRefreshClient for ProviderModelClient {
                 borg_provider::provider::ClaudeModelProvider {
                     model: model.to_string(),
                     effort: effort.map(str::to_owned),
+                    refusal_fallback: self.claude_refusal_fallback,
                 }
                 .refresh_prompt_cache_for_account(
                     request,

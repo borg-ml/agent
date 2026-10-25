@@ -25,7 +25,7 @@ pub use anthropic_messages::{
     ANTHROPIC_LABEL, AnthropicMessagesProvider, context_window_tokens, messages_endpoint,
 };
 #[cfg(feature = "claude")]
-pub use claude_model::ClaudeModelProvider;
+pub use claude_model::{ClaudeModelProvider, claude_refusal_fallback_model};
 #[cfg(feature = "codex")]
 pub use codex_model::CodexModelProvider;
 

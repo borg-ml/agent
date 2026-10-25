@@ -241,6 +241,9 @@ pub struct ActiveTurnDisplayConfig {
     pub effort: Option<String>,
     pub fast: bool,
     pub ultrafast: bool,
+    /// The label replies carry after Claude answered on its refusal fallback.
+    #[serde(default)]
+    pub fallback_label: Option<String>,
 }
 
 impl ActiveTurnDisplayConfig {
@@ -580,7 +583,7 @@ impl TranscriptCore {
             .as_ref()
             .map(|turn| {
                 (
-                    turn.model.clone(),
+                    turn.fallback_label.clone().or_else(|| turn.model.clone()),
                     turn.effort.clone(),
                     turn.fast,
                     turn.ultrafast,
@@ -1141,6 +1144,7 @@ impl TranscriptCore {
                     effort: effort.clone(),
                     fast: *fast,
                     ultrafast: *ultrafast,
+                    fallback_label: None,
                 });
             }
             SessionEventKind::UsageUpdated {
@@ -1446,7 +1450,7 @@ impl TranscriptCore {
                             .as_ref()
                             .map(|turn| {
                                 (
-                                    turn.model.clone(),
+                                    turn.fallback_label.clone().or_else(|| turn.model.clone()),
                                     turn.effort.clone(),
                                     turn.fast,
                                     turn.ultrafast,
@@ -2412,6 +2416,36 @@ impl TranscriptCore {
                 if Self::provider_reasoning_lifecycle(kind, payload) == Some(false) =>
             {
                 self.finish_reasoning(event.created_at);
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "model_refusal_fallback" =>
+            {
+                let from = payload["from"].as_str().unwrap_or("The selected model");
+                let to = payload["to"].as_str().unwrap_or("its fallback model");
+                let reason = payload["category"]
+                    .as_str()
+                    .map_or_else(String::new, |category| format!(" ({category})"));
+                let label = format!("{to} (refusal fallback)");
+                if let Some(turn) = self.active_turn.as_mut() {
+                    turn.fallback_label = Some(label.clone());
+                }
+                // The reply already streaming came from the fallback model too.
+                if let Some(TranscriptEntry::Message { model, .. }) =
+                    self.order.iter_mut().rev().find(|entry| {
+                        matches!(entry, TranscriptEntry::Message {
+                            actor: EventActor::Assistant,
+                            execution,
+                            ..
+                        } if !execution.is_terminal())
+                    })
+                {
+                    *model = Some(label);
+                }
+                self.order.push(TranscriptEntry::Info {
+                    title: "Refusal fallback".to_string(),
+                    text: format!("{from} declined this request{reason}; {to} answered instead."),
+                    time: local_event_time(event),
+                });
             }
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "mcp_server_unavailable" =>

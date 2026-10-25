@@ -1550,6 +1550,7 @@ fn draft_commit_message(
                     ClaudeModelProvider {
                         model: model.model.clone(),
                         effort: Some(model.effort.clone()),
+                        refusal_fallback: false,
                     }
                     .model_turn_for_account(request, None, None, None, Some(&account))
                     .await
@@ -4364,6 +4365,7 @@ impl BorgTerminal {
                     || kind == "network_retry"
                     || kind == "network_recovered"
                     || kind == "mcp_server_unavailable"
+                    || kind == "model_refusal_fallback"
                     || kind == "native_model_request"
                     || kind == "native_model_usage"
                     || kind == "reasoning_snapshot"
@@ -14670,6 +14672,7 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
                 || kind == "action/generation_status"
                 || kind == "action/preparing_cancelled"
                 || kind == "mcp_server_unavailable"
+                || kind == "model_refusal_fallback"
                 || kind == "native_model_request"
                     || kind == "native_model_usage"
                     || kind == "reasoning_snapshot"

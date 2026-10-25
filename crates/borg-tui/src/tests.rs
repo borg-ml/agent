@@ -15442,6 +15442,7 @@ fn active_turn_action_group_closes_after_completed_reply() {
                 effort: None,
                 fast: false,
                 ultrafast: false,
+                fallback_label: None,
             }),
             ..TranscriptCore::default()
         },

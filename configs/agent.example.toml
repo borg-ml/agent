@@ -36,6 +36,11 @@ auto_resume_usage_limits = true
 # message. Off by default: the message is answered, but the goal waits for an
 # explicit `/goal resume`.
 resume_paused_goal_on_message = false
+# When a Claude model with a refusal fallback (Opus 5/5.5, Sonnet 5.5, Fable)
+# declines a request, for example on a cybersecurity flag, let Claude answer it
+# with claude-opus-4-8 instead of stopping. The reply is labeled as a refusal
+# fallback. Off by default.
+claude_refusal_fallback = false
 # Provider names or model ids whose model gets a message typed while the agent
 # is working framed with an instruction to address it in the next visible
 # response (claude-fable-5-1 otherwise folds it silently into the running task;

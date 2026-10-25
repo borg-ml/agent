@@ -26,6 +26,48 @@ use crate::runtime::{CostBasis, elapsed_millis_u64};
 pub struct ClaudeModelProvider {
     pub model: String,
     pub effort: Option<String>,
+    /// Let Claude answer a refused request with its refusal-fallback model.
+    pub refusal_fallback: bool,
+}
+
+const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-06-01";
+
+/// The model Claude answers a refused request with, for the models that
+/// offer a server-side refusal fallback.
+pub fn claude_refusal_fallback_model(model: &str) -> Option<&'static str> {
+    let model = model.trim().to_ascii_lowercase();
+    matches!(
+        model.as_str(),
+        "claude-sonnet-5-5"
+            | "claude-opus-5"
+            | "claude-opus-5-5"
+            | "claude-fable-5"
+            | "claude-fable-5-1"
+    )
+    .then_some("claude-opus-4-8")
+}
+
+/// Ask for the refusal fallback when enabled. A replayed fallback block needs
+/// the beta whether or not the option is still on.
+fn apply_refusal_fallback(body: &mut Value, enabled: bool) {
+    let target = enabled
+        .then(|| claude_refusal_fallback_model(body["model"].as_str().unwrap_or_default()))
+        .flatten();
+    if let Some(target) = target {
+        body["fallbacks"] = json!([{ "model": target }]);
+    }
+    let replayed = body["messages"].as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "fallback"))
+        })
+    });
+    if (target.is_some() || replayed)
+        && let Some(betas) = body["betas"].as_array_mut()
+    {
+        betas.push(json!(SERVER_SIDE_FALLBACK_BETA));
+    }
 }
 
 impl ClaudeModelProvider {
@@ -187,13 +229,14 @@ impl ClaudeModelProvider {
         let connector = Connector::connect(auth_directory).await?;
         let info = connector.info(Some(&self.model)).await?;
         let capabilities = info.capabilities.context("missing Claude capabilities")?;
-        let body = subscription_request_body(
+        let mut body = subscription_request_body(
             &self.model,
             self.effort.as_deref(),
             &request,
             &capabilities,
             refresh,
         )?;
+        apply_refusal_fallback(&mut body, self.refusal_fallback);
         let id = if refresh.is_some() {
             Uuid::new_v4().to_string()
         } else {
@@ -270,12 +313,31 @@ impl ClaudeModelProvider {
             while let Some(frame) = claude_subscription_transport::take_event(&mut buffer)
                 .map_err(|_| ModelFailure::lost("Invalid Claude subscription event"))?
             {
-                let SseFrame::Event(event) = frame else {
+                let SseFrame::Event(mut event) = frame else {
                     continue;
                 };
                 let kind = event["type"]
                     .as_str()
-                    .context("Claude event omitted its type")?;
+                    .context("Claude event omitted its type")?
+                    .to_owned();
+                let kind = kind.as_str();
+                if kind == "content_block_start" && event["content_block"]["type"] == "fallback" {
+                    let block = &event["content_block"];
+                    publish(
+                        &progress,
+                        "model_refusal_fallback",
+                        json!({
+                            "request_id": id,
+                            "from": block["from"]["model"],
+                            "to": block["to"]["model"],
+                            "category": block["trigger"]["category"],
+                        }),
+                    );
+                    // Replay carries the switch, not the server's trigger detail.
+                    event["content_block"] = json!({
+                        "type": "fallback", "from": block["from"], "to": block["to"],
+                    });
+                }
                 if kind == "ping" {
                     continue;
                 }
@@ -525,6 +587,27 @@ mod tests {
             subscription_error_kind(529, "overloaded_error"),
             ProviderErrorKind::ConnectionLost
         );
+    }
+
+    // Off sends no fallback; a replayed fallback block keeps its beta, or
+    // turning the option off would break every later request in the session.
+    #[test]
+    fn refusal_fallback_is_opt_in_and_replay_keeps_its_beta() {
+        let body = || json!({"model": "claude-opus-5-5", "betas": [], "messages": []});
+        let mut off = body();
+        apply_refusal_fallback(&mut off, false);
+        assert_eq!(off, body());
+        let mut on = body();
+        apply_refusal_fallback(&mut on, true);
+        assert_eq!(on["fallbacks"], json!([{"model": "claude-opus-4-8"}]));
+        assert_eq!(on["betas"], json!([SERVER_SIDE_FALLBACK_BETA]));
+        let mut replay = body();
+        replay["messages"] = json!([{"role": "assistant", "content": [
+            {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-4-8"}}
+        ]}]);
+        apply_refusal_fallback(&mut replay, false);
+        assert!(replay.get("fallbacks").is_none());
+        assert_eq!(replay["betas"], json!([SERVER_SIDE_FALLBACK_BETA]));
     }
 
     #[test]

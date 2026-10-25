@@ -1202,6 +1202,7 @@ impl Transcript {
                 effort: config.effort.clone(),
                 fast: config.fast,
                 ultrafast: config.ultrafast,
+                fallback_label: None,
             });
         }
     }

@@ -366,6 +366,10 @@ pub(crate) struct CapabilityConfig {
     /// Resume a goal that a stop or a block left parked when the human sends
     /// another message. Off by default; `/goal resume` is the explicit way.
     pub(crate) resume_paused_goal_on_message: bool,
+    /// Let Claude answer a request its model refuses (for example on a
+    /// cybersecurity flag) with its refusal-fallback model, labeled as such.
+    /// Off by default: a refused request stops.
+    pub(crate) claude_refusal_fallback: bool,
     /// Providers whose mid-turn human messages are framed with an instruction
     /// to address them next: `true` (default set), `false`, or a list.
     pub(crate) steer_reply_prompt: borg_remote::SteerReplyPrompt,
@@ -392,6 +396,7 @@ impl Default for CapabilityConfig {
             auto_resume_usage_limits: true,
             watcher_yield: true,
             resume_paused_goal_on_message: false,
+            claude_refusal_fallback: false,
             steer_reply_prompt: borg_remote::SteerReplyPrompt::default(),
             harness: borg_remote::HarnessMode::Borg,
             model_fallback: Vec::new(),
@@ -1109,6 +1114,7 @@ impl AgentConfig {
                 .compaction
                 .idle_compaction_min_context_tokens(),
             prompt_append: self.prompt.append.clone(),
+            claude_refusal_fallback: self.capabilities.claude_refusal_fallback,
         })
     }
 
