@@ -366,7 +366,10 @@ pub async fn enroll_host(
         roots,
         execution_profile,
         resource_limits,
-        trusted_devices: Vec::new(),
+        // Re-enrollment must not silently drop the owner's pinned devices.
+        trusted_devices: read_config(config_path)
+            .map(|previous| previous.trusted_devices)
+            .unwrap_or_default(),
     };
     config.validate()?;
     write_config(config_path, &config)?;
