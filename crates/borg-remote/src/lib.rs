@@ -14,6 +14,7 @@ mod host;
 pub mod projection;
 pub mod row_index;
 pub mod sync;
+pub mod trust;
 pub mod tunnel;
 
 pub use borg_agent_runtime::*;

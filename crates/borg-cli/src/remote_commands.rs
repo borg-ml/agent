@@ -39,7 +39,7 @@ use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use crate::agent_config::AgentConfig;
-use crate::cli::{LocalAgentCliArgs, RemoteCommand};
+use crate::cli::{LocalAgentCliArgs, RemoteCommand, RemoteDevicesCommand};
 use crate::dictation::{
     DictationAccelerator, DictationModelId, LocalDictationBackend, LocalDictationConfig,
     LocalDictationRecorder, ensure_backend, parakeet_is_installed,
@@ -595,7 +595,7 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
         RemoteCommand::Login { provider } => {
             login_command(Some(provider), false, None).await?;
         }
-        RemoteCommand::Status { roots } => {
+        RemoteCommand::Status { roots, config } => {
             let roots = roots
                 .into_iter()
                 .map(|root| root.canonicalize())
@@ -605,9 +605,82 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&probe_capabilities(roots).await)?
             );
+            let config_path = config.unwrap_or_else(default_host_config_path);
+            if config_path.exists() {
+                let devices = borg_remote::trust::trusted_devices(&config_path)?;
+                if devices.is_empty() {
+                    eprintln!(
+                        "Warning: no trusted devices are pinned, so this host fully trusts the relay \
+                         for admission and owner commands. Pin your devices with \
+                         `borg remote devices trust <PUBLIC_KEY>`."
+                    );
+                } else {
+                    eprintln!("Trusted devices (relay verification enforced):");
+                    print_trusted_devices(&devices);
+                }
+            }
+        }
+        RemoteCommand::Devices { command, config } => {
+            let config_path = config.unwrap_or_else(default_host_config_path);
+            match command {
+                RemoteDevicesCommand::List => {
+                    let devices = borg_remote::trust::trusted_devices(&config_path)?;
+                    if devices.is_empty() {
+                        eprintln!("No trusted devices pinned; this host fully trusts the relay.");
+                    }
+                    print_trusted_devices(&devices);
+                }
+                RemoteDevicesCommand::Trust { public_key, label } => {
+                    let label = label.unwrap_or_default();
+                    let added =
+                        borg_remote::trust::trust_device(&config_path, &public_key, &label)?;
+                    let fingerprint = borg_remote::auth::device_fingerprint(
+                        &borg_remote::trust::canonical_device_key(&public_key)?,
+                    )?;
+                    if added {
+                        eprintln!(
+                            "Trusted {fingerprint}. This host now refuses unsigned owner commands \
+                             and devices that are not pinned; a running host applies this within seconds."
+                        );
+                    } else {
+                        eprintln!("{fingerprint} is already trusted.");
+                    }
+                }
+                RemoteDevicesCommand::Untrust { key } => {
+                    let removed = borg_remote::trust::untrust_device(&config_path, &key)?;
+                    eprintln!(
+                        "Untrusted {}; its live connections are closed.",
+                        borg_remote::auth::device_fingerprint(&removed.public_key)?
+                    );
+                    if borg_remote::trust::trusted_devices(&config_path)?.is_empty() {
+                        eprintln!(
+                            "Warning: no trusted devices remain, so this host fully trusts the relay again."
+                        );
+                    }
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn print_trusted_devices(devices: &[borg_remote::auth::TrustedDevice]) {
+    for device in devices {
+        let fingerprint = borg_remote::auth::device_fingerprint(&device.public_key)
+            .unwrap_or_else(|_| "invalid-key".into());
+        let added = chrono::DateTime::from_timestamp(device.added_at, 0)
+            .map(|time| time.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        println!(
+            "{fingerprint}  {}  added {added}  {}",
+            if device.label.is_empty() {
+                "-"
+            } else {
+                &device.label
+            },
+            device.public_key
+        );
+    }
 }
 
 fn read_enrollment_token_from_stdin() -> Result<String> {

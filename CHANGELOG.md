@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.19.5)
 
+- Remote hosts can pin the devices they trust with
+  `borg remote devices trust|untrust|list`. With any device pinned, the host
+  no longer trusts the relay blindly: it verifies each device's own proof,
+  refuses unpinned devices, and runs owner commands only when a pinned device
+  signed them (Interrupt and Stop excepted). Trust changes apply to a running
+  host within seconds. `borg remote status` lists pinned devices or warns that
+  the relay is fully trusted, and admissions, owner commands and trust changes
+  are recorded in `~/.borg/remote/audit.jsonl`.
+
 - Remote hosts are stricter about their own state: a host with no allowed
   roots refuses to start instead of allowing any directory, a revocation from
   the relay is saved so a restart cannot revive revoked tickets, used direct

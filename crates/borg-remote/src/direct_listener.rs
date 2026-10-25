@@ -35,6 +35,8 @@ struct ListenerState {
     host: Uuid,
     issuer: VerifyingKey,
     authority: Arc<SyncAuthority>,
+    trust: Arc<crate::trust::DeviceTrust>,
+    loopback: bool,
     route: String,
     connections: Arc<Semaphore>,
 }
@@ -94,10 +96,16 @@ pub(super) fn start(
     host: Uuid,
     issuer: VerifyingKey,
     authority: Arc<SyncAuthority>,
+    trust: Arc<crate::trust::DeviceTrust>,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
     ensure!(
         config.bind_address.port() != 0,
         "direct listener requires an explicit nonzero port"
+    );
+    let loopback = config.bind_address.ip().is_loopback();
+    ensure!(
+        loopback || !trust.devices().is_empty(),
+        "direct listener on a non-loopback address requires pinned trusted devices (borg remote devices trust)"
     );
     let tls = tls_config(&config)?;
     let listener = std::net::TcpListener::bind(config.bind_address)
@@ -121,6 +129,8 @@ pub(super) fn start(
             host,
             issuer,
             authority,
+            trust,
+            loopback,
             route,
             connections: Arc::new(Semaphore::new(128)),
         });
@@ -184,6 +194,7 @@ async fn upgrade(
 }
 
 async fn connection(mut socket: WebSocket, state: ListenerState) {
+    let mut audited = None;
     let admission = async {
         let frame = tokio::time::timeout(Duration::from_secs(5), socket.recv())
             .await?
@@ -206,11 +217,28 @@ async fn connection(mut socket: WebSocket, state: ListenerState) {
             state.authority.current_epoch(),
             chrono::Utc::now().timestamp(),
         )?;
+        audited = Some(claims.clone());
         crate::admission::verify_device_proof(&claims, &nonce, &proof)?;
+        let devices = state.trust.devices();
+        if devices.is_empty() {
+            // Trust can be removed while a public listener runs.
+            ensure!(
+                state.loopback,
+                "non-loopback direct listener requires pinned trusted devices"
+            );
+        } else {
+            crate::trust::ensure_trusted(&devices, &claims.device_public_key)?;
+        }
         state.authority.consume_client_ticket(&claims).await?;
         Ok::<_, anyhow::Error>(claims)
     }
     .await;
+    crate::trust::audit_admission(
+        &state.trust.audit_path(),
+        "direct",
+        audited.as_ref(),
+        admission.as_ref().err(),
+    );
     let claims = match admission {
         Ok(claims) => claims,
         Err(error) => {

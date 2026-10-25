@@ -36,6 +36,35 @@ laptop in a bag does not overheat. A detached watcher clears the override if
 Borg exits abnormally. Configure the computer's power settings for unattended
 availability beyond active turns.
 
+## Pin trusted devices
+
+By default the host trusts the relay: whatever device the relay admits, and
+any owner command it forwards, runs on this computer. Pin the devices you use
+so the host checks them itself:
+
+```sh
+borg remote devices trust <PUBLIC_KEY> --label "My phone"
+borg remote devices list
+borg remote devices untrust <PUBLIC_KEY|FINGERPRINT>
+```
+
+The device's public key and its fingerprint (`XXXX-XXXX-XXXX-XXXX`) are shown
+in the Borg web app on that device. Once any device is pinned, the host:
+
+- requires the device's own admission proof on relay connections, refuses
+  devices that are not pinned and consumes each ticket itself;
+- refuses owner commands (launch, prompt, shell, files, terminal) unless they
+  are signed by a pinned device and expire within five minutes; only
+  Interrupt and Stop are accepted unsigned. Pinned devices keep full access;
+- refuses a direct listener on a non-loopback address unless devices are
+  pinned.
+
+A running host applies trust changes within seconds and closes the
+connections of an untrusted device. `borg remote status` lists the pinned
+devices, or warns that the relay is fully trusted when none are. Admissions,
+owner commands and trust changes are appended to `~/.borg/remote/audit.jsonl`
+(owner-only), without command content.
+
 ## Linux unattended operation
 
 This runbook covers a personal Linux machine enrolled as a Borg Remote

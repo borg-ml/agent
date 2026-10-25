@@ -361,6 +361,33 @@ impl SyncAuthority {
         }
         Ok(())
     }
+    /// Closes device connections whose key is no longer pinned. An empty list
+    /// means the host trusts the relay, so nothing is closed.
+    pub async fn close_untrusted(&self, devices: &[crate::auth::TrustedDevice]) {
+        if devices.is_empty() {
+            return;
+        }
+        let mut connections = self.connections.lock().await;
+        let mut outputs = self.direct_outputs.write().ok();
+        connections.retain(|id, connection| {
+            let ConnectionClaims::Device(claims) = &connection.claims else {
+                return true;
+            };
+            if crate::trust::ensure_trusted(devices, &claims.device_public_key).is_ok() {
+                return true;
+            }
+            let direct = outputs
+                .as_mut()
+                .is_some_and(|outputs| outputs.remove(id).is_some());
+            if !direct {
+                let _ = self.outbound.try_send(TunnelFrame::Close {
+                    connection_id: id.clone(),
+                    reason: "device no longer trusted".into(),
+                });
+            }
+            false
+        });
+    }
     pub async fn update_epoch(&self, epoch: u64) {
         self.epoch.store(epoch, Ordering::Release);
         let mut connections = self.connections.lock().await;

@@ -114,6 +114,12 @@ impl HostConfig {
         ensure!(!self.name.trim().is_empty(), "remote host name is empty");
         // An empty list would let remote sessions start in any directory.
         ensure!(!self.roots.is_empty(), "remote host has no allowed roots");
+        for device in &self.trusted_devices {
+            ensure!(
+                crate::trust::canonical_device_key(&device.public_key)? == device.public_key,
+                "trusted device key is not canonical base64url"
+            );
+        }
         self.resource_limits.validate()?;
         Ok(())
     }
@@ -1549,11 +1555,7 @@ pub(crate) async fn run_host_with_resolved_store(
     executor_factory: HostExecutorFactory,
     injected_store: Option<crate::session_store::factory::ResolvedSessionStore>,
 ) -> Result<()> {
-    let config: HostConfig = serde_json::from_slice(
-        &fs::read(config_path)
-            .with_context(|| format!("failed to read {}", config_path.display()))?,
-    )
-    .with_context(|| format!("invalid host config {}", config_path.display()))?;
+    let config = read_config(config_path)?;
     config.validate()?;
     ensure!(
         Url::parse(&config.server)?.scheme() == "https",
@@ -1654,10 +1656,25 @@ pub(crate) async fn run_host_with_resolved_store(
     }));
     let issuer = crate::admission::issuer_key(&config.relay_public_key)?;
     let mut epoch = config.revocation_epoch;
-    let mut direct = config.direct_listener.clone().map(|listener| direct_listener::start(listener, config.host_id, issuer, Arc::clone(&sync)).map(AbortTask)).transpose()?;
+    let trust = Arc::new(crate::trust::DeviceTrust::new(config_path, config.trusted_devices.clone()));
+    let mut direct = config.direct_listener.clone().map(|listener| direct_listener::start(listener, config.host_id, issuer, Arc::clone(&sync), Arc::clone(&trust)).map(AbortTask)).transpose()?;
+    let reload_trust = Arc::clone(&trust);
+    let reload_sync = Arc::clone(&sync);
+    let _trust_reload = AbortTask(host_transport::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            let (devices, changed) = reload_trust.refresh();
+            if changed {
+                tracing::info!(trusted = devices.len(), "trusted devices reloaded");
+                reload_sync.close_untrusted(&devices).await;
+            }
+        }
+    }));
+    let dispatch_trust = Arc::clone(&trust);
     let _dispatcher = AbortTask(host_transport::spawn(async move {
-        while let Some((command_id, command, not_after)) = command_rx.recv().await {
-            let result = owner_command(&ledger, context.clone(), command_id, command, not_after).await;
+        while let Some((command_id, command, not_after, signature)) = command_rx.recv().await {
+            let result = owner_command(&ledger, context.clone(), &dispatch_trust, command_id, command, not_after, signature).await;
             if let Err(error) = transport.outbound.send(result).await {
                 tracing::warn!(%error, "owner result transport stopped");
                 break;
@@ -1734,8 +1751,8 @@ pub(crate) async fn run_host_with_resolved_store(
             frame = incoming.recv() => {
                 let Some(frame) = frame else { bail!("host tunnel ingress stopped") };
                 match frame {
-                        crate::auth::TunnelFrame::HostCommand { command_id, command, not_after, .. } => {
-                            match commands.try_send((command_id, command, not_after)) {
+                        crate::auth::TunnelFrame::HostCommand { command_id, command, not_after, device_signature } => {
+                            match commands.try_send((command_id, command, not_after, device_signature)) {
                                 Ok(()) => {},
                                 Err(mpsc::error::TrySendError::Full(_)) => {
                                     restart_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
@@ -1773,13 +1790,20 @@ pub(crate) async fn run_host_with_resolved_store(
                                 let _ = outbound.try_send(crate::auth::TunnelFrame::Close { connection_id, reason: error.to_string() });
                             }
                         }
-                        crate::auth::TunnelFrame::Open { connection_id, ticket, .. } => {
-                            let admitted = crate::admission::verify_ticket(&ticket, &issuer, &config.host_id.to_string(), epoch, Utc::now().timestamp());
-                            match admitted {
-                                Ok(claims) => { if let Err(error) = sync.open_connection(connection_id.clone(), claims).await {
-                                    let _ = outbound.try_send(crate::auth::TunnelFrame::Close { connection_id, reason: error.to_string() });
-                                } }
-                                Err(error) => { let _ = outbound.try_send(crate::auth::TunnelFrame::Close { connection_id, reason: error.to_string() }); }
+                        crate::auth::TunnelFrame::Open { connection_id, ticket, nonce, proof } => {
+                            let mut audited = None;
+                            let admitted = async {
+                                let claims = crate::admission::verify_ticket(&ticket, &issuer, &config.host_id.to_string(), epoch, Utc::now().timestamp())?;
+                                audited = Some(claims.clone());
+                                let devices = trust.devices();
+                                crate::trust::verify_relay_open(&devices, &claims, nonce.as_deref(), proof.as_deref())?;
+                                // An enforcing host does not rely on the relay's single-use check.
+                                if !devices.is_empty() { sync.consume_client_ticket(&claims).await?; }
+                                sync.open_connection(connection_id.clone(), claims).await
+                            }.await;
+                            crate::trust::audit_admission(&trust.audit_path(), "relay", audited.as_ref(), admitted.as_ref().err());
+                            if let Err(error) = admitted {
+                                let _ = outbound.try_send(crate::auth::TunnelFrame::Close { connection_id, reason: error.to_string() });
                             }
                         }
                         crate::auth::TunnelFrame::Client { connection_id, frame } => {
@@ -2371,6 +2395,64 @@ fn owner_frame(command_id: String, outcome: serde_json::Value) -> crate::auth::T
 }
 
 async fn owner_command(
+    ledger: &crate::command_ledger::CommandLedger,
+    context: DispatchContext,
+    trust: &crate::trust::DeviceTrust,
+    command_id: String,
+    command: HostCommand,
+    not_after: Option<i64>,
+    signature: Option<crate::auth::DeviceCommandSignature>,
+) -> crate::auth::TunnelFrame {
+    let kind = crate::trust::command_kind(&command);
+    let verified = crate::trust::verify_owner_command(
+        &trust.devices(),
+        &context.config.host_id.to_string(),
+        &command_id,
+        &command,
+        not_after,
+        signature.as_ref(),
+        Utc::now().timestamp(),
+    );
+    let device = signature
+        .as_ref()
+        .map(|signature| crate::trust::fingerprint_or_none(&signature.device_public_key));
+    if let Err(error) = verified {
+        crate::trust::audit(
+            &trust.audit_path(),
+            serde_json::json!({"event":"owner_command","route":"relay","command_id":command_id,"device":device,"command":kind,"outcome":"rejected","reason":error.to_string()}),
+        );
+        return crate::auth::TunnelFrame::HostCommandResult {
+            command_id,
+            outcome: serde_json::json!({"status":"rejected","error":error.to_string(),"retryable":false}),
+            error: None,
+        };
+    }
+    let frame =
+        owner_command_admitted(ledger, context, command_id.clone(), command, not_after).await;
+    let outcome = match &frame {
+        crate::auth::TunnelFrame::HostCommandAccepted { .. } => "accepted".to_string(),
+        crate::auth::TunnelFrame::HostCommandResult { outcome, error, .. } => {
+            error.as_ref().map_or_else(
+                || {
+                    outcome
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string()
+                },
+                |_| "failed".to_string(),
+            )
+        }
+        _ => "unknown".to_string(),
+    };
+    crate::trust::audit(
+        &trust.audit_path(),
+        serde_json::json!({"event":"owner_command","route":"relay","command_id":command_id,"device":device,"command":kind,"outcome":outcome}),
+    );
+    frame
+}
+
+async fn owner_command_admitted(
     ledger: &crate::command_ledger::CommandLedger,
     context: DispatchContext,
     command_id: String,
@@ -6328,7 +6410,14 @@ fn canonical_roots(roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-fn write_config(path: &Path, config: &HostConfig) -> Result<()> {
+pub(crate) fn read_config(path: &Path) -> Result<HostConfig> {
+    serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("failed to read {}", path.display()))?,
+    )
+    .with_context(|| format!("invalid host config {}", path.display()))
+}
+
+pub(crate) fn write_config(path: &Path, config: &HostConfig) -> Result<()> {
     write_private_json(path, config)
 }
 

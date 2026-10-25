@@ -1286,11 +1286,36 @@ pub(crate) enum RemoteCommand {
         #[arg(value_enum)]
         provider: RemoteProviderArg,
     },
-    /// Inspect installed providers, auth, and enrolled roots.
+    /// Inspect installed providers, auth, enrolled roots and trusted devices.
     Status {
         #[arg(long = "root")]
         roots: Vec<PathBuf>,
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
+    /// Pin the device keys this host trusts. While any key is pinned, the host
+    /// verifies device proofs and command signatures itself instead of
+    /// trusting the relay, and refuses unsigned owner commands.
+    Devices {
+        #[command(subcommand)]
+        command: RemoteDevicesCommand,
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum RemoteDevicesCommand {
+    /// List pinned devices with fingerprints.
+    List,
+    /// Pin a device public key (base64url Ed25519, shown on the device).
+    Trust {
+        public_key: String,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Remove a pinned device by public key or fingerprint.
+    Untrust { key: String },
 }
 
 #[derive(Debug, Subcommand)]
