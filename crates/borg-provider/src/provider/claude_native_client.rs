@@ -783,6 +783,10 @@ fn baseline_betas(id: &str, policy: &VerifiedPolicy) -> Vec<String> {
             betas.push("thinking-token-count-2026-05-13".into());
             betas.push("context-management-2025-06-27".into());
         }
+        // k7e/tXn: display updates need interleaved thinking, which Haiku 4.5 lacks.
+        if interleaved && id != "claude-haiku-4-5" {
+            betas.push(protocol::DISPLAY_UPDATES_BETA.into());
+        }
         betas.push("prompt-caching-scope-2026-01-05".into());
     }
     // zF's concrete pre-4.8 ordering, not a substring/version guess or family blacklist.

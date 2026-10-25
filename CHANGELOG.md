@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.19.5)
 
+- Show Claude's between-tool replies again. Since 0.19.2, Claude subscription
+  sessions on adaptive-thinking models such as Opus 5.5 received those replies
+  as empty signed blocks, so an answer given mid-task was never displayed while
+  the model believed it had been. Borg now requests Claude Code's verbatim
+  `updates` display, which returns them unedited and keeps reasoning private.
+
 - Refuse a `pgrep -f` wait only when it controls a loop: a `while`/`until` condition, or a loop body that sleeps and stops on it. A one-shot `pgrep -f` after a terminating loop such as `while read` is no longer refused.
 
 ## 0.19.5 (2026-10-25)

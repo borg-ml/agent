@@ -46,6 +46,7 @@ use super::claude_connector::Capabilities;
 pub(super) const VERSION: &str = "2.1.296";
 pub(super) const OAUTH_BETA: &str = "oauth-2025-04-20";
 pub(super) const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
+pub(super) const DISPLAY_UPDATES_BETA: &str = "thinking-display-updates-2026-08-18";
 const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 #[derive(Debug, Deserialize)]

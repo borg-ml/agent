@@ -361,8 +361,6 @@ fn subscription_request_body(
         !disabled || !capabilities.thinking_required,
         "the selected Claude model requires thinking"
     );
-    // Summarized display also rewrites between-tool answers, losing details
-    // such as commands. Leave display unset; preserve the signed replay blocks.
     if disabled || !capabilities.thinking {
         body["thinking"] = json!({"type": "disabled"});
     } else if capabilities.adaptive_thinking {
@@ -376,6 +374,16 @@ fn subscription_request_body(
             "effort {effort} is unavailable for the selected Claude model"
         );
         body["output_config"] = json!({"effort": effort});
+    }
+    // Claude Code's default display: narration, the between-tool answers the
+    // user must see, arrives verbatim while reasoning stays omitted. Unset
+    // display omits narration too, and "summarized" rewrites it.
+    let updates = capabilities
+        .betas
+        .iter()
+        .any(|beta| beta == claude_subscription_protocol::DISPLAY_UPDATES_BETA);
+    if updates && body["thinking"]["type"] != "disabled" {
+        body["thinking"]["display"] = json!("updates");
     }
     let mut betas = capabilities.betas.clone();
     if body["output_config"].get("effort").is_some() {
@@ -531,7 +539,7 @@ mod tests {
             thinking_required: false,
             fast: false,
             efforts: vec!["high".into()],
-            betas: vec![],
+            betas: vec![claude_subscription_protocol::DISPLAY_UPDATES_BETA.into()],
         };
         let request = ModelTurnRequest {
             fast: false,
@@ -562,7 +570,7 @@ mod tests {
             Some(PromptCacheRefresh::ONE_TOKEN),
         )
         .unwrap();
-        assert!(original["thinking"].get("display").is_none());
+        assert_eq!(original["thinking"]["display"], "updates");
         assert_eq!(warmed["max_tokens"], 1);
         assert_eq!(warmed["thinking"]["type"], "adaptive");
         warmed["max_tokens"] = original["max_tokens"].clone();
