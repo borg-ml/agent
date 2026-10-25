@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.19.5)
 
+- The watchers panel now matches the team panel: a WATCHER / STATE / AGE /
+  EVENTS / LAST table with running watchers on top in colour, and exited ones
+  folded behind a clickable `▸ Exited · N` row instead of a long flat list.
+  The panel scrolls when it is taller than the screen.
+
 - A session whose turn loop is stuck in one step for two minutes now
   interrupts that turn itself and says which step was stuck, instead of
   sitting silently until Escape. A root session froze for 24 minutes this way,

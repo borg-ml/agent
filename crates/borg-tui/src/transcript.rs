@@ -2168,29 +2168,24 @@ impl Transcript {
         (running > 0).then(|| format!("{running} watcher{}", if running == 1 { "" } else { "s" }))
     }
 
-    /// One row per watch for the watches panel, newest first.
-    pub(crate) fn watch_rows(&self) -> Vec<(String, Uuid)> {
+    /// One row per watch for the watches panel: running watches first, then
+    /// exited ones, each newest first.
+    pub(crate) fn watch_rows(&self) -> Vec<WatchRow> {
         let now = Utc::now();
         let mut watches: Vec<&WatchSummary> = self.watches.iter().collect();
-        watches.sort_by_key(|watch| std::cmp::Reverse(watch.started_at));
+        watches.sort_by_key(|watch| (!watch.running, std::cmp::Reverse(watch.started_at)));
         watches
             .into_iter()
-            .map(|watch| {
-                let state = if watch.running { "running" } else { "exited" };
-                let events = format!(
-                    "{} event{}",
-                    watch.event_count,
-                    if watch.event_count == 1 { "" } else { "s" }
-                );
-                let last = watch
+            .map(|watch| WatchRow {
+                watch_id: watch.watch_id,
+                label: watch.label.clone(),
+                running: watch.running,
+                age: format_short_age(now - watch.started_at),
+                events: watch.event_count.to_string(),
+                last: watch
                     .last_event_at
-                    .map(|at| format!("last {} ago", format_short_age(now - at)))
-                    .unwrap_or_else(|| "no events yet".to_string());
-                let age = format_short_age(now - watch.started_at);
-                (
-                    format!("{} · {state} {age} · {events} · {last}", watch.label),
-                    watch.watch_id,
-                )
+                    .map(|at| format!("{} ago", format_short_age(now - at)))
+                    .unwrap_or_else(|| "—".to_string()),
             })
             .collect()
     }
@@ -4226,6 +4221,17 @@ impl Transcript {
             "Copied last response".to_string()
         }
     }
+}
+
+/// One watch in the watches panel table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WatchRow {
+    pub(crate) watch_id: Uuid,
+    pub(crate) label: String,
+    pub(crate) running: bool,
+    pub(crate) age: String,
+    pub(crate) events: String,
+    pub(crate) last: String,
 }
 
 #[cfg(test)]

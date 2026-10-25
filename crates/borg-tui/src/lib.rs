@@ -1824,7 +1824,9 @@ pub struct BorgTerminal {
     watch_status_area: Option<Rect>,
     watch_status_hovered: bool,
     watch_menu_open: bool,
-    watch_row_hit_areas: Vec<(Rect, Uuid)>,
+    exited_watches_expanded: bool,
+    watch_scroll: usize,
+    watch_row_hit_areas: Vec<(Rect, WatchTarget)>,
     hovered_watch_row: Option<usize>,
     agents_status_area: Option<Rect>,
     agents_status_hovered: bool,
@@ -3258,6 +3260,8 @@ impl BorgTerminal {
             watch_status_area: None,
             watch_status_hovered: false,
             watch_menu_open: false,
+            exited_watches_expanded: false,
+            watch_scroll: 0,
             watch_row_hit_areas: Vec::new(),
             hovered_watch_row: None,
             agents_status_area: None,
@@ -5840,6 +5844,7 @@ impl BorgTerminal {
         self.team_switcher_open = false;
         self.shell_menu_open = false;
         self.watch_menu_open = false;
+        self.exited_watches_expanded = false;
     }
 
     /// Keyboard navigation while a status-line control has focus. Returns
@@ -7539,12 +7544,23 @@ impl BorgTerminal {
                             .is_some_and(|area| area.contains(pointer))
                         {
                             self.watch_menu_open = !self.watch_menu_open;
+                            if !self.watch_menu_open {
+                                self.exited_watches_expanded = false;
+                            }
                             return Ok(UiAction::None);
                         }
                         if let Some(row) = self.hovered_watch_row
-                            && let Some((_, watch_id)) = self.watch_row_hit_areas.get(row)
+                            && let Some((_, target)) = self.watch_row_hit_areas.get(row)
                         {
-                            return Ok(UiAction::StopWatch(*watch_id));
+                            return Ok(match *target {
+                                WatchTarget::Running(watch_id) => UiAction::StopWatch(watch_id),
+                                WatchTarget::Exited => UiAction::None,
+                                WatchTarget::ExitedHeader => {
+                                    self.exited_watches_expanded = !self.exited_watches_expanded;
+                                    self.watch_scroll = 0;
+                                    UiAction::None
+                                }
+                            });
                         }
                         if self
                             .todo_status_area
@@ -7679,6 +7695,21 @@ impl BorgTerminal {
                         self.team_roster_scroll.saturating_sub(scroll_repetitions)
                     } else {
                         self.team_roster_scroll.saturating_add(scroll_repetitions)
+                    };
+                    return Ok(UiAction::None);
+                }
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) && self
+                    .watch_row_hit_areas
+                    .iter()
+                    .any(|(area, _)| area.contains(pointer))
+                {
+                    self.watch_scroll = if mouse.kind == MouseEventKind::ScrollUp {
+                        self.watch_scroll.saturating_sub(scroll_repetitions)
+                    } else {
+                        self.watch_scroll.saturating_add(scroll_repetitions)
                     };
                     return Ok(UiAction::None);
                 }
@@ -9745,7 +9776,7 @@ impl BorgTerminal {
         let mut next_team_roster_hit_areas = Vec::new();
         let mut next_shell_row_hit_areas = Vec::new();
         let mut next_watch_status_area = None;
-        let mut next_watch_row_hit_areas: Vec<(Rect, Uuid)> = Vec::new();
+        let mut next_watch_row_hit_areas: Vec<(Rect, WatchTarget)> = Vec::new();
         let mut next_back_to_director_area = None;
         let mut next_keybindings_hint_area = None;
         let mut next_dictation_button_area = None;
@@ -11049,15 +11080,13 @@ impl BorgTerminal {
             }
             if (self.watch_menu_open || self.hovered_watch_row.is_some()) && !watch_rows.is_empty()
             {
-                let tooltip_width = watch_rows
-                    .iter()
-                    .map(|(row, _)| row.width() as u16)
-                    .max()
-                    .unwrap_or(24)
-                    .saturating_add(4)
-                    .clamp(30, status_area.width.min(110));
-                let tooltip_height = (watch_rows.len() as u16)
+                let visible = visible_watch_rows(&watch_rows, self.exited_watches_expanded);
+                let columns = watch_table_columns(&visible, usize::MAX);
+                let tooltip_width = (watch_columns_width(columns) as u16)
                     .saturating_add(2)
+                    .clamp(30, status_area.width.min(120));
+                let tooltip_height = (visible.len() as u16)
+                    .saturating_add(3)
                     .min(status_area.y.saturating_sub(area.y).max(1));
                 let watch_anchor = next_watch_status_area.unwrap_or(status_area);
                 let tooltip = Rect {
@@ -11069,36 +11098,53 @@ impl BorgTerminal {
                     height: tooltip_height,
                 };
                 overlays.clear(frame, tooltip);
-                let lines = watch_rows
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (row, _))| {
-                        Line::from(format!("  {row}")).style(palette_row_style(
-                            self.hovered_watch_row == Some(index),
-                            WATCH_PURPLE,
-                        ))
-                    })
-                    .collect::<Vec<_>>();
+                let row_capacity = tooltip.height.saturating_sub(3) as usize;
+                self.watch_scroll = self
+                    .watch_scroll
+                    .min(visible.len().saturating_sub(row_capacity));
+                let row_offset = self.watch_scroll;
+                let mut lines = watch_table_lines(
+                    &visible,
+                    tooltip.width.saturating_sub(2) as usize,
+                    self.hovered_watch_row.map(|row| row + row_offset),
+                );
+                lines.drain(1..1 + row_offset);
+                let running = watch_rows.iter().filter(|row| row.running).count();
                 frame.render_widget(
                     Paragraph::new(lines)
                         .style(Style::default().fg(Color::White).bg(COMMAND_PANEL_BG))
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
-                                .border_style(Style::default().fg(WATCH_PURPLE))
-                                .title(" Watchers · click to stop "),
+                                .border_style(Style::default().fg(Color::DarkGray))
+                                .title(Span::styled(
+                                    format!(" Watchers · {running} running · click to stop "),
+                                    Style::default()
+                                        .fg(WATCH_PURPLE)
+                                        .add_modifier(Modifier::BOLD),
+                                )),
                         ),
                     tooltip,
                 );
-                for (index, (_, watch_id)) in watch_rows.iter().enumerate() {
+                for (index, row) in visible
+                    .iter()
+                    .enumerate()
+                    .skip(row_offset)
+                    .take(row_capacity)
+                {
+                    let target = match row {
+                        VisibleWatch::Row(row) if row.running => WatchTarget::Running(row.watch_id),
+                        VisibleWatch::Row(_) => WatchTarget::Exited,
+                        VisibleWatch::ExitedHeader { .. } => WatchTarget::ExitedHeader,
+                    };
                     next_watch_row_hit_areas.push((
                         Rect {
                             x: tooltip.x.saturating_add(1),
-                            y: tooltip.y.saturating_add(1 + index as u16),
+                            y: tooltip.y.saturating_add(2 + (index - row_offset) as u16),
                             width: tooltip.width.saturating_sub(2),
                             height: 1,
                         },
-                        *watch_id,
+                        target,
                     ));
                 }
             }
@@ -13678,6 +13724,130 @@ fn visible_team_roster(
         visible.extend_from_slice(&entries[inactive_start..]);
     }
     (visible, Some(header_index))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchTarget {
+    Running(Uuid),
+    Exited,
+    ExitedHeader,
+}
+
+enum VisibleWatch<'a> {
+    Row(&'a WatchRow),
+    ExitedHeader { count: usize, expanded: bool },
+}
+
+/// Running watches, then exited ones folded behind a header row like the
+/// team roster's inactive agents.
+fn visible_watch_rows(rows: &[WatchRow], exited_expanded: bool) -> Vec<VisibleWatch<'_>> {
+    let exited_start = rows
+        .iter()
+        .position(|row| !row.running)
+        .unwrap_or(rows.len());
+    let mut visible = rows[..exited_start]
+        .iter()
+        .map(VisibleWatch::Row)
+        .collect::<Vec<_>>();
+    let count = rows.len() - exited_start;
+    if count > 0 {
+        visible.push(VisibleWatch::ExitedHeader {
+            count,
+            expanded: exited_expanded,
+        });
+        if exited_expanded {
+            visible.extend(rows[exited_start..].iter().map(VisibleWatch::Row));
+        }
+    }
+    visible
+}
+
+/// Widths of WATCHER, STATE, AGE, EVENTS and LAST.
+type WatchColumns = [usize; 5];
+
+const WATCH_TABLE_HEADERS: [&str; 5] = ["WATCHER", "STATE", "AGE", "EVENTS", "LAST"];
+
+fn watch_columns_width(columns: WatchColumns) -> usize {
+    2 + columns.iter().sum::<usize>() + (columns.len() - 1) * 2
+}
+
+fn watch_row_cells(row: &WatchRow) -> [&str; 5] {
+    [
+        &row.label,
+        if row.running { "running" } else { "exited" },
+        &row.age,
+        &row.events,
+        &row.last,
+    ]
+}
+
+fn watch_table_columns(visible: &[VisibleWatch<'_>], width: usize) -> WatchColumns {
+    let mut columns = WATCH_TABLE_HEADERS.map(UnicodeWidthStr::width);
+    for row in visible {
+        if let VisibleWatch::Row(row) = row {
+            for (column, cell) in columns.iter_mut().zip(watch_row_cells(row)) {
+                *column = (*column).max(cell.width());
+            }
+        }
+    }
+    columns[0] = columns[0].min(60);
+    while watch_columns_width(columns) > width && columns[0] > 12 {
+        columns[0] -= 1;
+    }
+    columns
+}
+
+fn watch_table_lines(
+    visible: &[VisibleWatch<'_>],
+    width: usize,
+    hovered_row: Option<usize>,
+) -> Vec<Line<'static>> {
+    let columns = watch_table_columns(visible, width);
+    let cells = |values: [&str; 5]| {
+        values
+            .iter()
+            .zip(columns)
+            .map(|(value, width)| roster_table_cell(value, width))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let header = Line::from(Span::styled(
+        format!("  {}", cells(WATCH_TABLE_HEADERS)),
+        Style::default()
+            .fg(Color::DarkGray)
+            .bg(COMMAND_PANEL_BG)
+            .add_modifier(Modifier::BOLD),
+    ));
+    std::iter::once(header)
+        .chain(visible.iter().enumerate().map(|(index, row)| {
+            let hovered = hovered_row == Some(index);
+            let hover_style = Style::default()
+                .fg(Color::Black)
+                .bg(WATCH_PURPLE)
+                .add_modifier(Modifier::BOLD);
+            match row {
+                VisibleWatch::ExitedHeader { count, expanded } => Line::from(format!(
+                    "  {} Exited · {count}",
+                    if *expanded { "▾" } else { "▸" }
+                ))
+                .style(if hovered {
+                    hover_style
+                } else {
+                    Style::default().fg(Color::White).bg(COMMAND_PANEL_BG)
+                }),
+                VisibleWatch::Row(row) => {
+                    let style = if hovered {
+                        hover_style
+                    } else if row.running {
+                        Style::default().fg(WATCH_PURPLE).bg(COMMAND_PANEL_BG)
+                    } else {
+                        Style::default().fg(Color::Gray).bg(COMMAND_PANEL_BG)
+                    };
+                    Line::from(format!("  {}", cells(watch_row_cells(row)))).style(style)
+                }
+            }
+        }))
+        .collect()
 }
 
 /// Classify an input event for undo coalescing: plain typing and plain
