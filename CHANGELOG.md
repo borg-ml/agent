@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.19.5)
 
+- Escape leaves the session stopped. Watcher output and team reports that were
+  already waiting no longer start a new turn the moment a turn is stopped,
+  which also started context compaction; they wait for your next message, and
+  input sent after the stop still starts a turn as before.
+
 - Show Claude's between-tool replies again. Since 0.19.2, Claude subscription
   sessions on adaptive-thinking models such as Opus 5.5 received those replies
   as empty signed blocks, so an answer given mid-task was never displayed while

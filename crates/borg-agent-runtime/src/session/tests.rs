@@ -5909,7 +5909,8 @@ fn queued_team_notifications_batch_without_borrowing_priority_or_losing_members(
     assert!(!merged.interrupt_batch);
 
     // Human priority is untouched: the person is still admitted first.
-    let admitted = pop_next_pending_prompt(&mut pending, true).expect("a prompt is admitted");
+    let admitted =
+        pop_next_pending_prompt(&mut pending, &HashSet::new()).expect("a prompt is admitted");
     assert_eq!(admitted.message_id, human.message_id);
 
     // Excluded classes kept their places rather than being absorbed.
@@ -9902,7 +9903,7 @@ fn pending_user_input_always_owns_the_next_turn_boundary() {
         prompt(EventActor::User, "human request"),
     ]);
 
-    let next = pop_next_pending_prompt(&mut pending, true).unwrap();
+    let next = pop_next_pending_prompt(&mut pending, &HashSet::new()).unwrap();
 
     assert_eq!(next.actor, EventActor::User);
     assert_eq!(next.text, "human request");
@@ -19196,7 +19197,10 @@ async fn acknowledged_queued_team_input_cannot_reopen_completed_work() {
         .unwrap(),
         "a human prompt is never inspected as team input"
     );
-    assert_eq!(pop_next_pending_prompt(&mut pending, true).unwrap(), human);
+    assert_eq!(
+        pop_next_pending_prompt(&mut pending, &HashSet::new()).unwrap(),
+        human
+    );
     assert!(
         settle_acknowledged_team_notifications(
             &mut journal,
@@ -21007,6 +21011,141 @@ async fn followup_after_interrupt_starts_another_turn() {
         .await
         .expect("the interrupting parent's follow-up starts a turn");
     assert_eq!(executor.cleanup_calls.load(Ordering::Acquire), 1);
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(30), actor).await;
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn stop_holds_waiting_internal_input_until_later_input() {
+    // Escape must not reopen a turn for a report that was already waiting:
+    // that restart compacted a large context the moment a human pressed it.
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let turn_started = Arc::new(Notify::new());
+    let turn_dropped = Arc::new(Notify::new());
+    let cleanup_started = Arc::new(Notify::new());
+    let release_cleanup = Arc::new(Notify::new());
+    let executor = Arc::new(InterruptibleExecutor {
+        turn_started: Arc::clone(&turn_started),
+        turn_dropped: Arc::clone(&turn_dropped),
+        cleanup_started: Arc::clone(&cleanup_started),
+        release_cleanup: Arc::clone(&release_cleanup),
+        cleanup_calls: AtomicUsize::new(0),
+    });
+    let actor = tokio::spawn({
+        let cwd = root.path().to_path_buf();
+        let store = Arc::clone(&store);
+        let executor = Arc::clone(&executor);
+        async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd,
+                    provider: CodingProvider::OpenRouter,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    ultrafast: None,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                store,
+            )
+            .await
+        }
+    });
+    let team_prompt =
+        |message_id: Uuid, text: &str, delivery: PromptDelivery| HostCommand::TeamPrompt {
+            session_id,
+            message_id,
+            text: text.to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery,
+        };
+    command_tx
+        .send(team_prompt(
+            Uuid::new_v4(),
+            "first task",
+            PromptDelivery::Steer,
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
+        .await
+        .expect("the first task runs");
+    let waiting = Uuid::new_v4();
+    command_tx
+        .send(team_prompt(
+            waiting,
+            "waiting report",
+            PromptDelivery::Queue,
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(EVENT_TIMEOUT, async {
+        while let Some(event) = event_rx.recv().await {
+            if matches!(event.kind, SessionEventKind::Message {
+                message_id,
+                status: MessageStatus::Queued,
+                ..
+            } if message_id == waiting)
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the report waits behind the running turn");
+    command_tx
+        .send(HostCommand::Interrupt { session_id })
+        .await
+        .unwrap();
+    tokio::time::timeout(EVENT_TIMEOUT, cleanup_started.notified())
+        .await
+        .expect("interruption enters cleanup");
+    release_cleanup.notify_one();
+    tokio::time::timeout(EVENT_TIMEOUT, turn_dropped.notified())
+        .await
+        .expect("the stopped turn ends");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), turn_started.notified())
+            .await
+            .is_err(),
+        "a report waiting at the stop does not open another turn"
+    );
+    command_tx
+        .send(team_prompt(
+            Uuid::new_v4(),
+            "later wake",
+            PromptDelivery::Steer,
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
+        .await
+        .expect("input sent after the stop starts a turn");
     command_tx
         .send(HostCommand::Stop { session_id })
         .await

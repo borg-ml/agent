@@ -2991,6 +2991,10 @@ async fn run_agent_session_store_kernel_inner(
     // Whether the current watcher wait has already been journalled, so a wait
     // is recorded once rather than on every pass through the idle select.
     let mut yield_journalled = false;
+    // Internal input that was waiting when an explicit Stop landed. Stop
+    // cancels the turn; this input waits for the next turn instead of opening
+    // one, while input that arrives later still can.
+    let mut held_by_stop = HashSet::<Uuid>::new();
     let (goal_tool_tx, mut goal_tool_rx) = mpsc::channel(8);
     let goal_tools = SessionGoalTools {
         requests: goal_tool_tx,
@@ -3412,7 +3416,7 @@ async fn run_agent_session_store_kernel_inner(
             continue;
         }
         let next = if !usage_limit_retry_waiting
-            && let Some(prompt) = pop_next_pending_prompt(&mut pending, true)
+            && let Some(prompt) = pop_next_pending_prompt(&mut pending, &held_by_stop)
         {
             Some(prompt)
         } else if !usage_limit_retry_waiting
@@ -3552,7 +3556,7 @@ async fn run_agent_session_store_kernel_inner(
                                     }
                                     _ = usage_limit_wait, if retry_not_before.is_some() => {
                                         retry_not_before = None;
-                                        break pop_next_pending_prompt(&mut pending, true).or_else(|| {
+                                        break pop_next_pending_prompt(&mut pending, &held_by_stop).or_else(|| {
                                             (watches.yielded().is_none()).then_some(()).and_then(|()| goal.as_ref()
                                                 .filter(|goal| goal_allows_automatic_continuation(goal)))
                                                 .map(|active_goal| QueuedPrompt {
@@ -3989,7 +3993,7 @@ async fn run_agent_session_store_kernel_inner(
                                 // may be lifted already. If it is not, the turn
                                 // fails back into the same usage wait.
                                 retry_not_before = None;
-                                break pop_next_pending_prompt(&mut pending, true);
+                                break pop_next_pending_prompt(&mut pending, &held_by_stop);
                             }
                             continue;
                         }
@@ -4024,6 +4028,7 @@ async fn run_agent_session_store_kernel_inner(
                         if let Some(id) = usage_limit_continuation_id.take() {
                             pending.retain(|prompt| prompt.message_id != id);
                         }
+                        held_by_stop = internal_input_ids(&pending);
                         record(
                             &mut journal,
                             &events,
@@ -4244,7 +4249,7 @@ async fn run_agent_session_store_kernel_inner(
                                     )
                                     .await?;
                                     usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
-                                    break pop_next_pending_prompt(&mut pending, true);
+                                    break pop_next_pending_prompt(&mut pending, &held_by_stop);
                                 }
                             }
                             Err(error) => {
@@ -4324,7 +4329,8 @@ async fn run_agent_session_store_kernel_inner(
                             )
                             .await?;
                             if resume_pending_retry
-                                && let Some(prompt) = pop_next_pending_prompt(&mut pending, true)
+                                && let Some(prompt) =
+                                    pop_next_pending_prompt(&mut pending, &held_by_stop)
                             {
                                 break Some(prompt);
                             }
@@ -4885,9 +4891,6 @@ async fn run_agent_session_store_kernel_inner(
                         // itself immediately. A held yield parks the session
                         // indefinitely, so an interrupt that lands here has to be
                         // honoured or a human cannot stop a waiting session at all.
-                        // Recording the stop is also what makes the downstream hold
-                        // apply to watcher output, so no further model turn runs
-                        // until the human comes back.
                         if let Some(wait) = watches.resume() {
                             yield_journalled = false;
                             record(
@@ -4956,6 +4959,7 @@ async fn run_agent_session_store_kernel_inner(
         }
         if next.is_some() {
             goal_waits_for_input = false;
+            held_by_stop.clear();
         }
         if let Some(prompt) = next.as_ref() {
             reconcile_usage_limit_continuation(
@@ -7113,6 +7117,18 @@ async fn run_agent_session_store_kernel_inner(
                                     SessionEventKind::Error { message: error },
                                 ).await?;
                             }
+                            // Buffered watcher output waits as queued input too.
+                            if let Some(mut output) = watch_prompt(None, &mut watch_events_rx, &watches).await {
+                                output.delivery = PromptDelivery::Queue;
+                                record_prompt_status(
+                                    &mut journal, &events, session_id, &output,
+                                    MessageStatus::Queued, PromptDelivery::Queue,
+                                ).await?;
+                                pending.push_back(output);
+                            }
+                            held_by_stop = internal_input_ids(
+                                pending.iter().chain(pending_steers.iter().map(|steer| &steer.prompt)),
+                            );
                         }
                         HostCommand::BackgroundAction { target, tool_call_id, .. } => {
                             if let Some(target) = target {
@@ -11332,17 +11348,33 @@ fn human_prompt_ids(pending: &VecDeque<QueuedPrompt>) -> HashSet<Uuid> {
         .collect()
 }
 
+/// Human input first, then the oldest internal input with an entry a Stop
+/// did not hold.
 fn pop_next_pending_prompt(
     pending: &mut VecDeque<QueuedPrompt>,
-    allow_internal_turn: bool,
+    held_by_stop: &HashSet<Uuid>,
 ) -> Option<QueuedPrompt> {
-    if let Some(index) = pending
+    let index = pending
         .iter()
         .position(|prompt| prompt.actor == EventActor::User)
-    {
-        return pending.remove(index);
-    }
-    allow_internal_turn.then(|| pending.pop_front()).flatten()
+        .or_else(|| {
+            pending.iter().position(|prompt| {
+                prompt
+                    .batch_entries()
+                    .iter()
+                    .any(|entry| !held_by_stop.contains(&entry.message_id))
+            })
+        })?;
+    pending.remove(index)
+}
+
+fn internal_input_ids<'a>(prompts: impl IntoIterator<Item = &'a QueuedPrompt>) -> HashSet<Uuid> {
+    prompts
+        .into_iter()
+        .flat_map(QueuedPrompt::batch_entries)
+        .filter(|entry| entry.actor != EventActor::User)
+        .map(|entry| entry.message_id)
+        .collect()
 }
 
 /// An explicit inbox acknowledgment can precede this prompt's own turn.
