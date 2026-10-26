@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.19.5)
+## Unreleased (since 0.19.6)
+
+## 0.19.6 (2026-10-26)
 
 - Remote features are opt-in. Enrolling a machine no longer mirrors every
   interactive terminal session to Borg Remote: `/remote` shares the current
