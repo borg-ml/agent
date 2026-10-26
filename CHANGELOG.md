@@ -5,10 +5,6 @@ Git comparison.
 
 ## Unreleased (since 0.19.5)
 
-- When you mention a project, library or term the agent does not recognise, it
-  now looks it up (local search, then web search) before asking you what it
-  means.
-
 - Remote features are opt-in. Enrolling a machine no longer mirrors every
   interactive terminal session to Borg Remote: `/remote` shares the current
   chat, and `borg remote mirror on|off` controls mirroring of all sessions.
