@@ -408,7 +408,7 @@ async fn helper_command() -> Result<Command> {
     }
     // Linux runs the Rust worker in a child `borg` process, so a hung desktop
     // call is killed without touching the host.
-    let executable = crate::subagents::agent_mcp_executable()?;
+    let executable = crate::subagents::borg_executable()?;
     let mut command = Command::new(executable);
     command.arg("__computer-use-helper");
     // Release archives ship the private-display compositor next to borg.

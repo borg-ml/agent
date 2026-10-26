@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.19.6)
 
+- Private-display `computer_use` launch keeps working after Borg is upgraded
+  while a session host is still running; it previously failed for every
+  program with "No such file or directory". Launch errors now also name the
+  executable that failed to spawn.
+
 ## 0.19.6 (2026-10-26)
 
 - Remote features are opt-in. Enrolling a machine no longer mirrors every

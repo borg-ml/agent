@@ -12,7 +12,7 @@ use anyhow::{Context, Result, ensure};
 
 pub(super) fn command(argv: &[String], control: &Path) -> Result<(Command, UnixStream)> {
     let (startup, report) = UnixStream::pair()?;
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = Command::new(crate::subagents::borg_executable()?);
     command
         .args(["__computer-use-helper", "--private-app"])
         .arg(control)

@@ -852,9 +852,10 @@ impl Helper {
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
-        let app = command
-            .spawn()
-            .map_err(|error| anyhow!("cannot launch {}: {error}", argv[0]))?;
+        let app = command.spawn().map_err(|error| {
+            let program = command.get_program().to_string_lossy();
+            anyhow!("cannot launch {} (spawning {program}): {error}", argv[0])
+        })?;
         drop(command);
         let app = PrivateApp::new(app, detached);
         let pid = app.id();

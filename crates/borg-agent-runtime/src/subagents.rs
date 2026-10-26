@@ -826,7 +826,7 @@ impl AgentToolServer {
         }
         Ok(borg_provider::mcp::ExternalMcpServer {
             name: "borg_agent".to_string(),
-            command: agent_mcp_executable()?.to_string_lossy().into_owned(),
+            command: borg_executable()?.to_string_lossy().into_owned(),
             args: vec!["__agent-mcp".to_string()],
             env,
             allowed_tools: agent_tool_specs_for_surface(
@@ -854,12 +854,12 @@ impl AgentToolServer {
     }
 }
 
-pub(crate) fn agent_mcp_executable() -> Result<PathBuf> {
+pub(crate) fn borg_executable() -> Result<PathBuf> {
     let current = std::env::current_exe().context("failed to locate the Borg executable")?;
-    resolve_agent_mcp_executable(&current)
+    resolve_borg_executable(&current)
 }
 
-fn resolve_agent_mcp_executable(current: &Path) -> Result<PathBuf> {
+fn resolve_borg_executable(current: &Path) -> Result<PathBuf> {
     if current.is_file() {
         return Ok(current.to_path_buf());
     }

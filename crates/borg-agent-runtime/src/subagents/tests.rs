@@ -1127,27 +1127,24 @@ async fn mcp_workspace_reads_are_bounded_and_cannot_escape_the_session_root() {
 }
 
 #[test]
-fn agent_mcp_executable_uses_existing_current_binary() {
+fn borg_executable_uses_existing_current_binary() {
     let directory = tempdir().unwrap();
     let executable = directory.path().join("borg");
     std::fs::write(&executable, b"borg").unwrap();
 
-    assert_eq!(
-        resolve_agent_mcp_executable(&executable).unwrap(),
-        executable
-    );
+    assert_eq!(resolve_borg_executable(&executable).unwrap(), executable);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn agent_mcp_executable_recovers_path_after_atomic_upgrade() {
+fn borg_executable_recovers_path_after_atomic_upgrade() {
     let directory = tempdir().unwrap();
     let executable = directory.path().join("borg");
     std::fs::write(&executable, b"replacement").unwrap();
     let deleted_identity = PathBuf::from(format!("{} (deleted)", executable.display()));
 
     assert_eq!(
-        resolve_agent_mcp_executable(&deleted_identity).unwrap(),
+        resolve_borg_executable(&deleted_identity).unwrap(),
         executable
     );
 }
