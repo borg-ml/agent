@@ -4001,15 +4001,15 @@ async fn resume_bootstrap_stops_at_the_live_cursor() {
     scratch.discard().await;
 }
 
-// Closing every viewer must not let an idle root shut down a busy team. The
-// predicate test covers the five-minute decision without a wall-clock wait.
+// A Ready status alone must not let the idle TTL stop autonomous work.
+// These durable wait states can outlast the five-minute host grace period.
 #[test]
-fn detached_host_remains_alive_for_children_prompts_processes_watches_and_viewers() {
+fn detached_host_remains_alive_for_autonomy_prompts_processes_watches_and_viewers() {
     let mut state = SessionState {
         status: Some(SessionStatus::Ready),
         ..Default::default()
     };
-    assert!(session_host_is_idle(&state, false, false, false));
+    assert!(session_host_is_idle(&state, false, false));
     assert!(passive_owner_stop_is_safe(
         SessionStatus::Ready,
         &state,
@@ -4020,11 +4020,10 @@ fn detached_host_remains_alive_for_children_prompts_processes_watches_and_viewer
         &state,
         true
     ));
-    assert!(!session_host_is_idle(&state, false, true, false));
-    assert!(!session_host_is_idle(&state, true, false, false));
-    assert!(!session_host_is_idle(&state, false, false, true));
+    assert!(!session_host_is_idle(&state, true, false));
+    assert!(!session_host_is_idle(&state, false, true));
     state.active_processes.insert(Uuid::new_v4());
-    assert!(!session_host_is_idle(&state, false, false, false));
+    assert!(!session_host_is_idle(&state, false, false));
     assert!(!stale_local_owner_can_handoff(&state, false));
     assert!(!passive_owner_stop_is_safe(
         SessionStatus::Ready,
@@ -4041,7 +4040,7 @@ fn detached_host_remains_alive_for_children_prompts_processes_watches_and_viewer
         last_event_at: None,
         event_count: 0,
     });
-    assert!(!session_host_is_idle(&state, false, false, false));
+    assert!(!session_host_is_idle(&state, false, false));
     assert!(!stale_local_owner_can_handoff(&state, false));
     assert!(!passive_owner_stop_is_safe(
         SessionStatus::Ready,
@@ -4049,28 +4048,61 @@ fn detached_host_remains_alive_for_children_prompts_processes_watches_and_viewer
         false
     ));
     state.watches[0].running = false;
-    assert!(session_host_is_idle(&state, false, false, false));
+    assert!(session_host_is_idle(&state, false, false));
+    state.goal = Some(SessionGoal::new("autonomous work".into(), None));
+    assert!(!session_host_is_idle(&state, false, false));
+    for status in [
+        GoalStatus::Paused,
+        GoalStatus::Blocked,
+        GoalStatus::Complete,
+    ] {
+        state.goal.as_mut().unwrap().status = status;
+        assert!(session_host_is_idle(&state, false, false));
+    }
+    state.pending_approval_id = Some("approval".into());
+    assert!(!session_host_is_idle(&state, false, false));
+    state.pending_approval_id = None;
+    state.pending_provider_interaction_id = Some("question".into());
+    assert!(!session_host_is_idle(&state, false, false));
+    state.pending_provider_interaction_id = None;
     for status in [
         SessionStatus::Starting,
         SessionStatus::Running,
         SessionStatus::WaitingForApproval,
     ] {
         state.status = Some(status);
-        assert!(!session_host_is_idle(&state, false, false, false));
+        assert!(!session_host_is_idle(&state, false, false));
         assert!(!passive_owner_stop_is_safe(status, &state, false));
     }
 }
 
-// A reattaching newer viewer must consult the child ledger, not just a Ready
-// root or a stale Ready parent mirror, before replacing the execution host.
+// A missed child completion must not retain a detached host forever, while
+// real child work must still veto its timeout. Exercise the production TTL
+// decision against child journals rather than just a presentation predicate.
 #[tokio::test]
-async fn owner_upgrade_waits_for_child_work_and_background_processes() {
+async fn detached_host_timeout_reconciles_stale_child_mirrors_and_preserves_work() {
     let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let root = Uuid::new_v4();
     let child = Uuid::new_v4();
     let now = Utc::now();
     store.create_session(root).await.unwrap();
     store.create_session(child).await.unwrap();
+    let root_state = SessionState {
+        status: Some(SessionStatus::Ready),
+        ..Default::default()
+    };
+    store
+        .append(SessionEvent::new(
+            root,
+            0,
+            SessionEventKind::StatusChanged {
+                lifecycle: None,
+                status: SessionStatus::Ready,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
     let snapshot = SubagentSnapshot {
         lifecycle: None,
         source: None,
@@ -4078,7 +4110,7 @@ async fn owner_upgrade_waits_for_child_work_and_background_processes() {
         session_id: child,
         parent_session_id: root,
         task_name: "/root/worker".into(),
-        status: SubagentStatus::Ready,
+        status: SubagentStatus::Running,
         provider: CodingProvider::Codex,
         model: None,
         effort: None,
@@ -4125,6 +4157,14 @@ async fn owner_upgrade_waits_for_child_work_and_background_processes() {
             local_subagents_are_idle(&store, root).await.unwrap(),
             status == SessionStatus::Ready
         );
+        let mut idle_since = Some(tokio::time::Instant::now() - SESSION_HOST_IDLE_TTL);
+        assert_eq!(
+            session_host_idle_timeout(&store, root, &root_state, false, false, &mut idle_since)
+                .await
+                .unwrap(),
+            status == SessionStatus::Ready,
+        );
+        assert_eq!(idle_since.is_none(), status != SessionStatus::Ready);
     }
     let process_id = Uuid::new_v4();
     store
@@ -4189,6 +4229,45 @@ async fn owner_upgrade_waits_for_child_work_and_background_processes() {
             !running
         );
     }
+    for (prompt, viewer) in [(true, false), (false, true)] {
+        let mut idle_since = Some(tokio::time::Instant::now() - SESSION_HOST_IDLE_TTL);
+        assert!(
+            !session_host_idle_timeout(&store, root, &root_state, prompt, viewer, &mut idle_since)
+                .await
+                .unwrap()
+        );
+        assert!(idle_since.is_none());
+    }
+    let mut idle_since = None;
+    assert!(
+        !session_host_idle_timeout(&store, root, &root_state, false, false, &mut idle_since)
+            .await
+            .unwrap()
+    );
+    assert!(
+        idle_since.is_some(),
+        "an idle host retains its reconnect grace period"
+    );
+    // The root can start work while the CLI is awaiting the child ledger.
+    store
+        .append(SessionEvent::new(
+            root,
+            0,
+            SessionEventKind::StatusChanged {
+                lifecycle: None,
+                status: SessionStatus::Running,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
+    idle_since = Some(tokio::time::Instant::now() - SESSION_HOST_IDLE_TTL);
+    assert!(
+        !session_host_idle_timeout(&store, root, &root_state, false, false, &mut idle_since)
+            .await
+            .unwrap()
+    );
+    assert!(idle_since.is_none());
     scratch.discard().await;
 }
 

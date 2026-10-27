@@ -2179,17 +2179,24 @@ fn stale_local_owner_can_handoff(state: &SessionState, subagents_working: bool) 
         )
 }
 
+fn session_has_pending_work(state: &SessionState) -> bool {
+    matches!(
+        state.status.unwrap_or(SessionStatus::Starting),
+        SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval
+    ) || root_background_work_is_active(state)
+        || state
+            .goal
+            .as_ref()
+            .is_some_and(|goal| goal.status == GoalStatus::Active)
+        || state.usage_limit_retry.is_some()
+        || state.pending_approval_id.is_some()
+        || state.pending_provider_interaction_id.is_some()
+}
+
 async fn local_subagents_are_idle(store: &dyn SessionStore, session_id: Uuid) -> Result<bool> {
     let agents = latest_subagent_snapshots(&restored_team_history(store, session_id).await?);
     for agent in agents {
-        let state = store.state(agent.session_id).await?;
-        let status = state.status.unwrap_or(SessionStatus::Starting);
-        if matches!(
-            status,
-            SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval
-        ) || !state.active_processes.is_empty()
-            || state.watches.iter().any(|watch| watch.running)
-        {
+        if session_has_pending_work(&store.state(agent.session_id).await?) {
             return Ok(false);
         }
     }
@@ -2199,14 +2206,42 @@ async fn local_subagents_are_idle(store: &dyn SessionStore, session_id: Uuid) ->
 fn session_host_is_idle(
     state: &SessionState,
     prompt_submission_pending: bool,
-    subagents_working: bool,
     viewers_attached: bool,
 ) -> bool {
     state.status == Some(SessionStatus::Ready)
-        && !root_background_work_is_active(state)
+        && !session_has_pending_work(state)
         && !prompt_submission_pending
-        && !subagents_working
         && !viewers_attached
+}
+
+async fn session_host_idle_timeout(
+    store: &dyn SessionStore,
+    session_id: Uuid,
+    state: &SessionState,
+    prompt_submission_pending: bool,
+    viewers_attached: bool,
+    idle_since: &mut Option<tokio::time::Instant>,
+) -> Result<bool> {
+    if !session_host_is_idle(state, prompt_submission_pending, viewers_attached) {
+        *idle_since = None;
+        return Ok(false);
+    }
+    if idle_since
+        .get_or_insert_with(tokio::time::Instant::now)
+        .elapsed()
+        < SESSION_HOST_IDLE_TTL
+    {
+        return Ok(false);
+    }
+    // A parent mirror can miss a child's completion. Only the current child
+    // ledgers may veto shutdown, not a stale in-memory Running snapshot.
+    if !local_subagents_are_idle(store, session_id).await?
+        || !session_host_is_idle(&store.state(session_id).await?, false, false)
+    {
+        *idle_since = None;
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn local_owner_rejected_newer_schema(event: &SessionEvent) -> bool {
@@ -3520,31 +3555,30 @@ async fn run_local_agent_session(
                     terminal_dirty = true;
                 }
             }
-            _ = session_host_tick.tick(), if args.session_host.is_some() => {
-                let unattended_idle = session_host_is_idle(
+            _ = session_host_tick.tick(), if args.session_host.is_some() && !stop_sent => {
+                if session_host_idle_timeout(
+                    store.as_ref(),
+                    session_id,
                     delivered_projection.state(),
                     local_prompt_submission_pending(&pending_prompt_ids, &local_prompt_admissions),
-                    !working_subagents.is_empty(),
                     control_server.as_ref().is_none_or(|server| server.has_attached_viewers()),
-                );
-                if unattended_idle {
-                    let idle_since = session_host_idle_since
-                        .get_or_insert_with(tokio::time::Instant::now);
-                    if idle_since.elapsed() >= SESSION_HOST_IDLE_TTL && !stop_sent {
-                        if !local_subagents_are_idle(store.as_ref(), session_id).await? {
-                            session_host_idle_since = None;
-                            continue;
-                        }
-                        tracing::info!(%session_id, "detached session host reached its idle TTL");
-                        stop_sent = true;
-                        user_requested_exit = true;
-                        dispatch_host_command_without_blocking(
-                            &session_command_tx,
-                            HostCommand::Stop { session_id },
-                        );
+                    &mut session_host_idle_since,
+                ).await? {
+                    // Attachments and prompt admissions can arrive while the
+                    // durable team check is awaiting the store.
+                    if control_server.as_ref().is_none_or(|server| server.has_attached_viewers())
+                        || local_prompt_submission_pending(&pending_prompt_ids, &local_prompt_admissions)
+                    {
+                        session_host_idle_since = None;
+                        continue;
                     }
-                } else {
-                    session_host_idle_since = None;
+                    tracing::info!(%session_id, "detached session host reached its idle TTL");
+                    stop_sent = true;
+                    user_requested_exit = true;
+                    dispatch_host_command_without_blocking(
+                        &session_command_tx,
+                        HostCommand::Stop { session_id },
+                    );
                 }
             }
             completion = terminal_io_completions.recv(), if terminal_io_completions_open => {

@@ -1251,9 +1251,7 @@ impl SessionStore for PostgresSessionStore {
         if let Some(override_store) = self.workspace_override.as_ref() {
             return Ok(Some(std::sync::Arc::clone(&override_store.0)));
         }
-        Ok(Some(std::sync::Arc::new(
-            crate::workspace_postgres::PostgresWorkspaceStore::from_pool(self.pool().clone()),
-        )))
+        Ok(Some(self.workspace.clone()))
     }
 
     // The persistent-runtime tier. These forward to the inherent methods of the
@@ -1381,9 +1379,7 @@ impl SessionStore for PostgresSessionStore {
     async fn autonomy_store(
         &self,
     ) -> Result<Option<std::sync::Arc<dyn crate::autonomy::AutonomyStore>>> {
-        Ok(Some(std::sync::Arc::new(
-            crate::autonomy_postgres::PostgresAutonomyStore::from_pool(self.pool().clone()),
-        )))
+        Ok(Some(self.autonomy.clone()))
     }
 
     async fn contains_session(&self, session_id: Uuid) -> Result<bool> {

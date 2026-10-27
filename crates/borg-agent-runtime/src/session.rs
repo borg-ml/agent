@@ -2976,7 +2976,16 @@ async fn run_agent_session_store_kernel_inner(
         observed_revision: None,
     };
     let mut work_plan_refresh = WorkPlanRefresh::default();
-    let mut work_plan_tick = tokio::time::interval(Duration::from_secs(2));
+    // Subscribe before the initial snapshot: a committed update during collection
+    // must leave a wakeup, not wait for the next actor turn.
+    let mut work_plan_changes = match work_plan.store.subscribe_work_changes().await {
+        Ok(changes) => changes,
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "work-plan notifications unavailable");
+            None
+        }
+    };
+    let mut work_plan_tick = tokio::time::interval(Duration::from_secs(60));
     work_plan_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut goal_active_since = goal
         .as_ref()
@@ -3147,8 +3156,27 @@ async fn run_agent_session_store_kernel_inner(
         .unwrap_or_else(|| disabled_root_tx.subscribe());
     // Completed sweeps reset maintenance timers. Skip alone leaves a slow
     // sweep permanently ready in the biased select, starving provider output.
+    let mut root_inbox_delay = ROOT_INBOX_REFRESH_INTERVAL;
     let mut root_inbox_tick = tokio::time::interval(ROOT_INBOX_REFRESH_INTERVAL);
     root_inbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // A child's report reaches the root only through the sweep, so a report
+    // queued here or a message committed by any process ends its idle backoff.
+    // Subscribe before the first sweep.
+    let root_inbox_queued = subagents
+        .as_ref()
+        .filter(|_| owns_team)
+        .map(SubagentCoordinator::root_inbox_queued);
+    let mut root_inbox_changes = match workspace_projection.as_ref() {
+        Some(projection) if owns_team => projection
+            .store
+            .subscribe_message_changes()
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%session_id, %error, "root inbox notifications unavailable");
+                None
+            }),
+        _ => None,
+    };
     let (receipt_tx, mut receipt_rx) = mpsc::channel(16);
     let _receipt_collector = workspace_projection.as_ref().map(|projection| {
         AbortTask(tokio::spawn(collect_agent_message_receipts(
@@ -3573,6 +3601,7 @@ async fn run_agent_session_store_kernel_inner(
                 work_plan_refresh
                     .settle(&mut journal, &events, &work_plan)
                     .await?;
+                work_plan_refresh.restart_if_requested(&journal, &work_plan, subagents.as_ref());
             }
             record(
                 &mut journal,
@@ -3758,6 +3787,10 @@ async fn run_agent_session_store_kernel_inner(
                                             child_activity_open = false;
                                             continue;
                                         };
+                                        if work_plan_topology_changed(&activity) {
+                                            work_plan_refresh.force_refresh = true;
+                                            work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
+                                        }
                                         record_subagent_activity(
                                             &mut journal,
                                             &events,
@@ -3768,15 +3801,21 @@ async fn run_agent_session_store_kernel_inner(
                                         ).await?;
                                         continue;
                                     }
+                                    _ = root_inbox_wakeup(&mut root_inbox_changes, root_inbox_queued.as_deref()), if owns_team => {
+                                        root_inbox_delay = ROOT_INBOX_REFRESH_INTERVAL;
+                                        root_inbox_tick.reset_immediately();
+                                        continue;
+                                    }
                                     _ = root_inbox_tick.tick(), if owns_team => {
-                                        refresh_durable_root_inbox(
+                                        let changed = refresh_durable_root_inbox(
                                             &mut journal,
                                             &events,
                                             session_id,
                                             subagents.as_ref().expect("team inbox requires coordinator"),
                                             &watches,
                                         ).await?;
-                                        root_inbox_tick.reset();
+                                        root_inbox_delay = if changed { ROOT_INBOX_REFRESH_INTERVAL } else { (root_inbox_delay * 2).min(Duration::from_secs(30)) };
+                                        root_inbox_tick.reset_after(root_inbox_delay);
                                         continue;
                                     }
                                     _ = team_ack_tick.tick(), if owns_team && !team_broadcasts.is_empty() => {
@@ -3930,9 +3969,29 @@ async fn run_agent_session_store_kernel_inner(
                             Ok(kind) => work_plan_refresh.apply(kind, &mut journal, &events, &work_plan).await?,
                             Err(error) => tracing::warn!(%session_id, %error, "work-plan collection failed; retrying on the next maintenance tick"),
                         }
+                        work_plan_refresh.restart_if_requested(&journal, &work_plan, subagents.as_ref());
                         continue;
                     }
-                    _ = work_plan_tick.tick() => {
+                    changed = async { director_changes.as_mut().expect("guarded director subscription").changed().await }, if director_changes.is_some() => {
+                        if changed.is_err() {
+                            director_changes = None;
+                        } else {
+                            work_plan_refresh.force_refresh = true;
+                            work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
+                        }
+                        continue;
+                    }
+                    _ = next_work_plan_change(&mut work_plan_changes, work_plan.workspace_id) => {
+                        work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
+                        continue;
+                    }
+                    _ = work_plan_tick.tick(), if work_plan_changes.is_none() || work_plan_refresh.workspace_revision.is_none() => {
+                        if work_plan_changes.is_none() {
+                            work_plan_changes = work_plan.store.subscribe_work_changes().await.unwrap_or_else(|error| {
+                                tracing::warn!(%session_id, %error, "work-plan notifications unavailable");
+                                None
+                            });
+                        }
                         work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
                         continue;
                     }
@@ -7373,7 +7432,13 @@ async fn run_agent_session_store_kernel_inner(
                         None => std::future::pending().await,
                     }
                 } => {
-                    role_notice_pending |= changed.is_ok() && !executor.uses_native_harness(launch.provider);
+                    if changed.is_ok() {
+                        work_plan_refresh.force_refresh = true;
+                        work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
+                        role_notice_pending |= !executor.uses_native_harness(launch.provider);
+                    } else {
+                        director_changes = None;
+                    }
                 }
                 permit = control_tx.reserve(), if role_notice_pending => {
                     let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "role_notice", provider_events.len() + provider_carry.len());
@@ -7407,16 +7472,21 @@ async fn run_agent_session_store_kernel_inner(
                         Err(broadcast::error::RecvError::Closed) => {}
                     }
                 }
+                _ = root_inbox_wakeup(&mut root_inbox_changes, root_inbox_queued.as_deref()), if owns_team => {
+                    root_inbox_delay = ROOT_INBOX_REFRESH_INTERVAL;
+                    root_inbox_tick.reset_immediately();
+                }
                 _ = root_inbox_tick.tick(), if owns_team => {
                     let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "root_inbox_refresh", provider_events.len() + provider_carry.len());
-                    refresh_durable_root_inbox(
+                    let changed = refresh_durable_root_inbox(
                         &mut journal,
                         &events,
                         session_id,
                         subagents.as_ref().expect("team inbox requires coordinator"),
                         &watches,
                     ).await?;
-                    root_inbox_tick.reset();
+                    root_inbox_delay = if changed { ROOT_INBOX_REFRESH_INTERVAL } else { (root_inbox_delay * 2).min(Duration::from_secs(30)) };
+                    root_inbox_tick.reset_after(root_inbox_delay);
                 }
                 _ = team_ack_tick.tick(), if owns_team && !team_broadcasts.is_empty() => {
                     let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "team_ack_refresh", provider_events.len() + provider_carry.len());
@@ -7829,9 +7899,19 @@ async fn run_agent_session_store_kernel_inner(
                         Ok(kind) => work_plan_refresh.apply(kind, &mut journal, &events, &work_plan).await?,
                         Err(error) => tracing::warn!(%session_id, %error, "work-plan collection failed; retrying on the next maintenance tick"),
                     }
+                    work_plan_refresh.restart_if_requested(&journal, &work_plan, subagents.as_ref());
                 }
-                _ = work_plan_tick.tick() => {
+                _ = next_work_plan_change(&mut work_plan_changes, work_plan.workspace_id) => {
+                    work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
+                }
+                _ = work_plan_tick.tick(), if work_plan_changes.is_none() || work_plan_refresh.workspace_revision.is_none() => {
                     let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "work_plan_refresh", provider_events.len() + provider_carry.len());
+                    if work_plan_changes.is_none() {
+                        work_plan_changes = work_plan.store.subscribe_work_changes().await.unwrap_or_else(|error| {
+                            tracing::warn!(%session_id, %error, "work-plan notifications unavailable");
+                            None
+                        });
+                    }
                     work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
                 }
                 // Last in the biased select: with many children this channel is
@@ -7847,6 +7927,10 @@ async fn run_agent_session_store_kernel_inner(
                         child_activity_open = false;
                         continue;
                     };
+                    if work_plan_topology_changed(&activity) {
+                        work_plan_refresh.force_refresh = true;
+                        work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
+                    }
                     record_subagent_activity(
                         &mut journal,
                         &events,
@@ -13321,10 +13405,41 @@ async fn project_work_plan(
     Ok(())
 }
 
+async fn next_work_plan_change(changes: &mut Option<broadcast::Receiver<Uuid>>, workspace: Uuid) {
+    loop {
+        let Some(receiver) = changes.as_mut() else {
+            return std::future::pending().await;
+        };
+        match receiver.recv().await {
+            Ok(id) if id == workspace || id.is_nil() => return,
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(_)) => return,
+            Err(broadcast::error::RecvError::Closed) => {
+                *changes = None;
+                return;
+            }
+        }
+    }
+}
+
+fn work_plan_topology_changed(activity: &SubagentActivity) -> bool {
+    matches!(activity, SubagentActivity::Started { .. })
+        || matches!(activity, SubagentActivity::SessionEvent { event, .. }
+            if matches!(&event.kind, SessionEventKind::PlanProjected { .. }))
+}
+
+struct CollectedWorkPlans {
+    revision: u64,
+    projections: VecDeque<SessionEventKind>,
+}
+
 #[derive(Default)]
 struct WorkPlanRefresh {
-    task: Option<AbortTask<Result<VecDeque<SessionEventKind>>>>,
+    task: Option<AbortTask<Result<CollectedWorkPlans>>>,
     pending: VecDeque<SessionEventKind>,
+    workspace_revision: Option<u64>,
+    refresh_again: bool,
+    force_refresh: bool,
     generation: u64,
     identity: Option<(Uuid, Uuid, Uuid, Uuid)>,
 }
@@ -13341,21 +13456,57 @@ impl WorkPlanRefresh {
         team: Option<&SubagentCoordinator>,
     ) {
         if self.is_pending() {
+            self.refresh_again = true;
             return;
         }
+        self.refresh_again = false;
         self.generation = journal.plan_projection_generation;
-        self.identity = Some((
+        let identity = (
             plan.session_id,
             plan.workspace_id,
             plan.actor_id,
             plan.participant_id,
-        ));
+        );
+        if self.identity != Some(identity) {
+            self.workspace_revision = None;
+        }
+        self.identity = Some(identity);
         let store = Arc::clone(&journal.store);
         let plan = plan.clone();
         let team = team.cloned();
+        let previous_revision = if std::mem::take(&mut self.force_refresh) {
+            None
+        } else {
+            self.workspace_revision
+        };
         self.task = Some(AbortTask(tokio::spawn(async move {
-            collect_work_plans(store.as_ref(), &plan, team.as_ref()).await
+            let revision = plan
+                .store
+                .work_revision(plan.workspace_id, plan.actor_id)
+                .await?;
+            if previous_revision == Some(revision) {
+                return Ok(CollectedWorkPlans {
+                    revision,
+                    projections: VecDeque::new(),
+                });
+            }
+            let projections = collect_work_plans(store.as_ref(), &plan, team.as_ref()).await?;
+            Ok(CollectedWorkPlans {
+                revision,
+                projections,
+            })
         })));
+    }
+
+    fn restart_if_requested(
+        &mut self,
+        journal: &RuntimeSessionStore,
+        plan: &SessionWorkPlan,
+        team: Option<&SubagentCoordinator>,
+    ) {
+        if self.refresh_again && !self.is_pending() {
+            self.start(journal, plan, team);
+        }
     }
 
     async fn next(&mut self) -> Result<Option<SessionEventKind>> {
@@ -13364,7 +13515,10 @@ impl WorkPlanRefresh {
         {
             let result = (&mut task.0).await.context("work plan collector failed");
             self.task = None;
-            self.pending = result??;
+            self.workspace_revision = None;
+            let collected = result??;
+            self.workspace_revision = Some(collected.revision);
+            self.pending = collected.projections;
         }
         Ok(self.pending.pop_front())
     }
@@ -13386,6 +13540,9 @@ impl WorkPlanRefresh {
             || self.generation != journal.plan_projection_generation
         {
             self.pending.clear();
+            self.workspace_revision = None;
+            self.force_refresh = true;
+            self.refresh_again = true;
             return Ok(());
         }
         if let Some(kind) = kind {
@@ -13445,14 +13602,26 @@ async fn collect_work_plans(
         });
     }
     if let Some(subagents) = subagents {
+        let children: Vec<_> = subagents
+            .list(None)
+            .await
+            .into_iter()
+            .filter(|child| {
+                child.session_id != plan.session_id
+                    && (subagents.is_director(plan.session_id)
+                        || child.parent_session_id == plan.session_id)
+            })
+            .collect();
+        if children.is_empty() {
+            #[cfg(test)]
+            tests::pause_work_plan_refresh(plan.session_id).await;
+            return Ok(projections);
+        }
         let roster = plan
             .store
             .workspace_roster(plan.workspace_id, plan.actor_id)
             .await?;
-        for child in subagents.list(None).await {
-            if child.session_id == plan.session_id {
-                continue;
-            }
+        for child in children {
             let Some(binding) = store.workspace_binding(child.session_id).await? else {
                 continue;
             };
@@ -13766,11 +13935,20 @@ async fn collect_agent_message_receipts(
 ) {
     const PAGE_SIZE: usize = 32;
     let mut cursors = HashMap::<Uuid, u64>::new();
+    let mut changes = match store.subscribe_message_changes().await {
+        Ok(changes) => changes,
+        Err(error) => {
+            tracing::warn!(%recipient_id, %error, "peer receipt notifications unavailable");
+            None
+        }
+    };
+    let mut retry_delay = Duration::from_secs(1);
     loop {
+        let mut more_messages = false;
         let poll: Result<()> = async {
             for workspace in store.list_workspaces_for_participant(recipient_id).await? {
                 // A busy workspace must not starve receipts in another one.
-                for _ in 0..4 {
+                for page_index in 0..4 {
                     let after = cursors.get(&workspace.id).copied().unwrap_or(0);
                     let page = store
                         .message_events_after(workspace.id, recipient_id, after, PAGE_SIZE)
@@ -13828,6 +14006,7 @@ async fn collect_agent_message_receipts(
                     if !full {
                         break;
                     }
+                    more_messages |= page_index == 3;
                 }
             }
             Ok(())
@@ -13838,11 +14017,55 @@ async fn collect_agent_message_receipts(
         }
         if let Err(error) = poll {
             tracing::warn!(%recipient_id, %error, "peer receipt collection failed; retrying");
+            tokio::select! {
+                _ = receipts.closed() => return,
+                _ = tokio::time::sleep(retry_delay) => {}
+            }
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
+            continue;
+        }
+        retry_delay = Duration::from_secs(1);
+        if more_messages {
+            continue;
         }
         tokio::select! {
             _ = receipts.closed() => return,
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            _ = next_message_change(&mut changes) => {},
+            _ = tokio::time::sleep(Duration::from_secs(60)), if changes.is_none() => {
+                changes = store.subscribe_message_changes().await.unwrap_or_else(|error| {
+                    tracing::warn!(%recipient_id, %error, "peer receipt notifications unavailable");
+                    None
+                });
+            }
         }
+    }
+}
+
+async fn root_inbox_wakeup(
+    changes: &mut Option<broadcast::Receiver<Uuid>>,
+    queued: Option<&tokio::sync::Notify>,
+) {
+    let queued = async {
+        match queued {
+            Some(queued) => queued.notified().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        () = next_message_change(changes) => {}
+        () = queued => {}
+    }
+}
+
+async fn next_message_change(changes: &mut Option<broadcast::Receiver<Uuid>>) {
+    let Some(receiver) = changes.as_mut() else {
+        return std::future::pending().await;
+    };
+    if matches!(
+        receiver.recv().await,
+        Err(broadcast::error::RecvError::Closed)
+    ) {
+        *changes = None;
     }
 }
 
@@ -13858,6 +14081,42 @@ async fn collect_agent_message_receipts(
 /// drained this channel. This task reads one source and writes one channel
 /// without reordering and without dropping, so what the coordinator emitted is
 /// what the actor receives, and a restart replays that written sequence.
+async fn forward_child_activity_through(
+    coordinator: &SubagentCoordinator,
+    forwarded: &mpsc::Sender<SubagentActivity>,
+    child_sequences: &mut HashMap<Uuid, u64>,
+    child: Uuid,
+    through: u64,
+) -> Result<()> {
+    let mut after = child_sequences.get(&child).copied().unwrap_or(0);
+    while after < through {
+        let page = coordinator.child_activity_after(child, after, 256).await?;
+        let before = after;
+        for activity in page {
+            let SubagentActivity::SessionEvent { event, .. } = &activity else {
+                unreachable!();
+            };
+            if event.sequence > through {
+                break;
+            }
+            if event.sequence <= after {
+                continue;
+            }
+            after = event.sequence;
+            forwarded
+                .send(activity)
+                .await
+                .context("child activity receiver closed")?;
+            child_sequences.insert(child, after);
+        }
+        anyhow::ensure!(
+            after > before,
+            "child {child} replay made no progress after {after} through {through}"
+        );
+    }
+    Ok(())
+}
+
 async fn forward_child_activity(
     mut activity: broadcast::Receiver<SubagentActivity>,
     forwarded: mpsc::Sender<SubagentActivity>,
@@ -13866,13 +14125,18 @@ async fn forward_child_activity(
     session_id: Uuid,
     mut child_sequences: HashMap<Uuid, u64>,
 ) {
-    let mut repair = tokio::time::interval(Duration::from_secs(5));
-    repair.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut recovery_pending = true;
+    let mut recovery_at = tokio::time::Instant::now();
+    let mut recovery_backoff = Duration::from_millis(100);
+    let mut repair_through = HashMap::<Uuid, u64>::new();
+    let mut activity_open = true;
     loop {
         let received = tokio::select! {
             _ = forwarded.closed() => return,
-            activity = activity.recv() => activity,
-            _ = repair.tick() => Err(broadcast::error::RecvError::Lagged(0)),
+            activity = activity.recv(), if activity_open => activity,
+            _ = tokio::time::sleep_until(recovery_at), if recovery_pending => {
+                Err(broadcast::error::RecvError::Lagged(0))
+            }
         };
         match received {
             Ok(activity) => {
@@ -13892,41 +14156,29 @@ async fn forward_child_activity(
                     && event.sequence > 0
                 {
                     let child = event.session_id;
-                    let mut after = child_sequences.get(&child).copied().unwrap_or(0);
+                    let after = child_sequences.get(&child).copied().unwrap_or(0);
                     if event.sequence <= after {
                         continue;
                     }
                     if event.sequence > after.saturating_add(1) {
-                        let through = event.sequence;
-                        while after < through {
-                            let page = match coordinator
-                                .child_activity_after(child, after, 256)
-                                .await
-                            {
-                                Ok(page) if !page.is_empty() => page,
-                                result => {
-                                    tracing::warn!(%child, ?result, "parent child-event gap repair will retry");
-                                    break;
-                                }
-                            };
-                            let before = after;
-                            for activity in page {
-                                let SubagentActivity::SessionEvent { event, .. } = &activity else {
-                                    unreachable!();
-                                };
-                                if event.sequence > through {
-                                    break;
-                                }
-                                after = event.sequence;
-                                if forwarded.send(activity).await.is_err() {
-                                    return;
-                                }
-                                child_sequences.insert(child, after);
+                        if let Err(error) = forward_child_activity_through(
+                            &coordinator,
+                            &forwarded,
+                            &mut child_sequences,
+                            child,
+                            event.sequence,
+                        )
+                        .await
+                        {
+                            tracing::warn!(%child, %error, "parent child-event gap repair will retry");
+                            repair_through
+                                .entry(child)
+                                .and_modify(|through| *through = (*through).max(event.sequence))
+                                .or_insert(event.sequence);
+                            if !recovery_pending {
+                                recovery_at = tokio::time::Instant::now() + recovery_backoff;
                             }
-                            if after == before {
-                                tracing::warn!(%child, after, through, "parent child-event repair made no progress");
-                                break;
-                            }
+                            recovery_pending = true;
                         }
                         continue;
                     }
@@ -13940,6 +14192,26 @@ async fn forward_child_activity(
                 if skipped > 0 {
                     tracing::warn!(%session_id, skipped, "child activity lag; recovering canonical roster");
                 }
+                let mut failed = false;
+                for (child, through) in repair_through.clone() {
+                    match forward_child_activity_through(
+                        &coordinator,
+                        &forwarded,
+                        &mut child_sequences,
+                        child,
+                        through,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            repair_through.remove(&child);
+                        }
+                        Err(error) => {
+                            tracing::warn!(%child, %error, "parent child-event gap repair will retry");
+                            failed = true;
+                        }
+                    }
+                }
                 let mut cursor = None;
                 loop {
                     match coordinator
@@ -13948,19 +14220,49 @@ async fn forward_child_activity(
                     {
                         Ok((page, next)) => {
                             for activity in page {
-                                let owner = match &activity {
+                                let (owner, snapshot) = match &activity {
                                     SubagentActivity::Started { agent }
                                     | SubagentActivity::Completed { agent }
                                     | SubagentActivity::Stopped { agent }
-                                    | SubagentActivity::Failed { agent } => agent.parent_session_id,
+                                    | SubagentActivity::Failed { agent } => {
+                                        (agent.parent_session_id, Some(agent))
+                                    }
                                     SubagentActivity::SessionEvent {
                                         parent_session_id, ..
-                                    } => *parent_session_id,
+                                    } => (*parent_session_id, None),
                                 };
                                 if parent.is_some_and(|parent| parent != owner) {
                                     continue;
                                 }
+                                if let Some(agent) = snapshot
+                                    && let Some(source) = agent.source
+                                    && let Err(error) = forward_child_activity_through(
+                                        &coordinator,
+                                        &forwarded,
+                                        &mut child_sequences,
+                                        agent.session_id,
+                                        source.child_sequence,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(child = %agent.session_id, %error, "parent child-event snapshot repair will retry");
+                                    repair_through
+                                        .entry(agent.session_id)
+                                        .and_modify(|through| {
+                                            *through = (*through).max(source.child_sequence)
+                                        })
+                                        .or_insert(source.child_sequence);
+                                    failed = true;
+                                    continue;
+                                }
                                 if let SubagentActivity::SessionEvent { event, .. } = &activity {
+                                    let after = child_sequences
+                                        .get(&event.session_id)
+                                        .copied()
+                                        .unwrap_or(0);
+                                    if event.sequence <= after {
+                                        continue;
+                                    }
                                     child_sequences.insert(event.session_id, event.sequence);
                                 }
                                 if forwarded.send(activity).await.is_err() {
@@ -13973,16 +14275,29 @@ async fn forward_child_activity(
                             }
                         }
                         Err(error) => {
-                            // Retrying here starves live activity: every child
-                            // would stay frozen at its last forwarded status.
-                            // Resume live forwarding; the next lag recovers again.
-                            tracing::error!(%session_id, %error, "child activity recovery failed; resuming live activity");
+                            tracing::warn!(%session_id, %error, "child activity recovery failed; retrying alongside live activity");
+                            failed = true;
                             break;
                         }
                     }
                 }
+                recovery_pending = failed;
+                if failed {
+                    recovery_at = tokio::time::Instant::now() + recovery_backoff;
+                    recovery_backoff = (recovery_backoff * 2).min(Duration::from_secs(30));
+                } else {
+                    recovery_backoff = Duration::from_millis(100);
+                    if !activity_open {
+                        return;
+                    }
+                }
             }
-            Err(broadcast::error::RecvError::Closed) => return,
+            Err(broadcast::error::RecvError::Closed) => {
+                if !recovery_pending {
+                    return;
+                }
+                activity_open = false;
+            }
         }
     }
 }
@@ -14131,12 +14446,15 @@ async fn refresh_durable_root_inbox(
     session_id: Uuid,
     subagents: &SubagentCoordinator,
     watches: &crate::watch::Watches,
-) -> Result<()> {
-    for (_, activity) in subagents.refresh_root_inbox_reports().await? {
+) -> Result<bool> {
+    let reports = subagents.refresh_root_inbox_reports().await?;
+    let changed = !reports.is_empty();
+    for (_, activity) in reports {
         record_subagent_activity(journal, events, session_id, subagents, watches, activity).await?;
     }
     subagents.wake_pending_root_messages().await;
-    Ok(())
+    // Only a sweep confirms, acknowledges or retries a dispatch.
+    Ok(changed || subagents.root_dispatch_pending().await)
 }
 
 async fn apply_subagent_action(
@@ -15425,6 +15743,33 @@ pub(crate) async fn with_live_delivery_budget(
         .await
 }
 
+tokio::task_local! {
+    static LIVE_DELIVERY_REPAIR: tokio::sync::watch::Sender<u64>;
+}
+
+/// A child observer parks until delivery drops a durable boundary. The
+/// coalesced watermark repairs even a final Ready event with no successor.
+pub(crate) async fn with_live_delivery_repair(
+    repair: tokio::sync::watch::Sender<u64>,
+    future: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>,
+) -> Result<()> {
+    LIVE_DELIVERY_REPAIR.scope(repair, future).await
+}
+
+fn request_live_delivery_repair(sequence: u64, persistence: crate::EventPersistence) {
+    if sequence > 0 && matches!(persistence, crate::EventPersistence::Durable) {
+        let _ = LIVE_DELIVERY_REPAIR.try_with(|repair| {
+            repair.send_if_modified(|through| {
+                if sequence <= *through {
+                    return false;
+                }
+                *through = sequence;
+                true
+            });
+        });
+    }
+}
+
 async fn deliver_recorded_event(
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
@@ -15455,9 +15800,11 @@ async fn deliver_recorded_event(
         match tokio::time::timeout(LIVE_EVENT_DELIVERY_TIMEOUT, events.send(event)).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
+                request_live_delivery_repair(sequence, persistence);
                 tracing::debug!(session_id = %session_id, sequence, "live session event receiver closed")
             }
             Err(_) => {
+                request_live_delivery_repair(sequence, persistence);
                 #[cfg(test)]
                 LIVE_DELIVERY_BLOCKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 mark_live_delivery_lagging();
@@ -15470,11 +15817,97 @@ async fn deliver_recorded_event(
             }
         }
     } else if let Err(error) = events.try_send(event) {
+        let sequence = error.into_inner().sequence;
+        request_live_delivery_repair(sequence, persistence);
         tracing::debug!(
             session_id = %session_id,
-            error = ?error,
-            "dropped ephemeral live session event because the observer is not keeping up"
+            sequence,
+            "dropped live session event because the observer is not keeping up"
         );
+    }
+}
+
+// The repair signal is independent of the bounded event queue: a dropped final
+// durable event must wake its observer even if no successor is ever emitted.
+#[cfg(test)]
+mod live_delivery_repair_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn only_dropped_durable_delivery_notifies_monotonic_repair_watermark() {
+        let session_id = Uuid::new_v4();
+        let (events, mut receiver) = mpsc::channel(1);
+        let (repair, mut repairs) = tokio::sync::watch::channel(0);
+        with_live_delivery_repair(
+            repair,
+            Box::pin(async move {
+                with_live_delivery_budget(Box::pin(async move {
+                    let event = |sequence| {
+                        SessionEvent::new(
+                            session_id,
+                            sequence,
+                            SessionEventKind::StatusChanged {
+                                status: SessionStatus::Ready,
+                                lifecycle: Some(SubagentLifecycle::Ready),
+                                detail: None,
+                            },
+                        )
+                    };
+                    deliver_recorded_event(
+                        &events,
+                        session_id,
+                        event(1),
+                        crate::EventPersistence::Durable,
+                    )
+                    .await;
+                    assert!(
+                        !repairs.has_changed().unwrap(),
+                        "successful delivery must not query the journal"
+                    );
+                    // The queue is full: first the bounded send times out, then the
+                    // lagging fast path drops another durable boundary.
+                    deliver_recorded_event(
+                        &events,
+                        session_id,
+                        event(2),
+                        crate::EventPersistence::Durable,
+                    )
+                    .await;
+                    assert_eq!(*repairs.borrow_and_update(), 2);
+                    deliver_recorded_event(
+                        &events,
+                        session_id,
+                        event(3),
+                        crate::EventPersistence::Durable,
+                    )
+                    .await;
+                    assert_eq!(*repairs.borrow_and_update(), 3);
+                    deliver_recorded_event(
+                        &events,
+                        session_id,
+                        event(2),
+                        crate::EventPersistence::Durable,
+                    )
+                    .await;
+                    deliver_recorded_event(
+                        &events,
+                        session_id,
+                        event(4),
+                        crate::EventPersistence::Ephemeral,
+                    )
+                    .await;
+                    assert!(
+                        !repairs.has_changed().unwrap(),
+                        "old or ephemeral events cannot request repair"
+                    );
+                    assert_eq!(receiver.recv().await.unwrap().sequence, 1);
+                    Ok(())
+                }))
+                .await
+            }),
+        )
+        .await
+        .unwrap();
     }
 }
 

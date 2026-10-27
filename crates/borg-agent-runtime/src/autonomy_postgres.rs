@@ -35,6 +35,7 @@ const MAX_CHECKPOINTS_PER_LIST: i64 = 512;
 #[derive(Debug, Clone)]
 pub struct PostgresAutonomyStore {
     pool: PgPool,
+    changes: tokio::sync::broadcast::Sender<Option<Uuid>>,
 }
 
 fn decode_job(row: &PgRow) -> Result<AutonomyJob> {
@@ -164,7 +165,8 @@ impl PostgresAutonomyStore {
     /// Adopt a pool whose satellite schema is already applied by the session
     /// store's single bootstrap path.
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        let (changes, _) = tokio::sync::broadcast::channel(256);
+        Self { pool, changes }
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -239,6 +241,7 @@ impl PostgresAutonomyStore {
         )
         .await?;
         transaction.commit().await?;
+        let _ = self.changes.send(job.session_id);
         Ok(job)
     }
 
@@ -486,6 +489,9 @@ impl PostgresAutonomyStore {
         )
         .await?;
         transaction.commit().await?;
+        if next == AutonomyJobState::Queued {
+            let _ = self.changes.send(job.session_id);
+        }
         Ok(job)
     }
 
@@ -735,6 +741,25 @@ impl PostgresAutonomyStore {
 impl crate::autonomy::AutonomyStore for PostgresAutonomyStore {
     async fn enqueue(&self, input: EnqueueAutonomyJob) -> Result<AutonomyJob> {
         Self::enqueue(self, input).await
+    }
+
+    fn subscribe_changes(&self) -> Option<tokio::sync::broadcast::Receiver<Option<Uuid>>> {
+        Some(self.changes.subscribe())
+    }
+
+    async fn next_wake_at(&self, session_id: Option<Uuid>) -> Result<Option<DateTime<Utc>>> {
+        let at: Option<i64> = sqlx::query_scalar(
+            "select min(wake_at) from (\
+             select min(due_at_ms) as wake_at from autonomy_jobs \
+             where state='queued' and attempt<max_attempts and ($1::text is null or session_id=$1) \
+             union all select min(lease_expires_at_ms) as wake_at from autonomy_jobs \
+             where state in ('claimed','running') and ($1::text is null or session_id=$1)) deadlines",
+        )
+        .bind(session_id.map(|id| id.to_string()))
+        .fetch_one(&self.pool)
+        .await?;
+        at.map(|at| from_millis(at, "next autonomy wake"))
+            .transpose()
     }
 
     async fn get(&self, job_id: Uuid) -> Result<Option<AutonomyJob>> {

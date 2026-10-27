@@ -4694,6 +4694,8 @@ pub struct SubagentCoordinator {
     table: Arc<Mutex<SubagentTable>>,
     activity_tx: broadcast::Sender<SubagentActivity>,
     root_inbox: Arc<Mutex<Vec<TeamInboxMessage>>>,
+    /// Wakes the root's inbox sweep when a child queues a report for it.
+    root_inbox_queued: Arc<tokio::sync::Notify>,
     root_message_tx: broadcast::Sender<TeamInboxMessage>,
     root_message_dispatches: Arc<Mutex<HashMap<Uuid, Instant>>>,
     projected_root_messages: Arc<Mutex<HashSet<Uuid>>>,
@@ -4757,6 +4759,7 @@ impl SubagentCoordinator {
             })),
             activity_tx,
             root_inbox: Arc::new(Mutex::new(Vec::new())),
+            root_inbox_queued: Arc::new(tokio::sync::Notify::new()),
             root_message_tx,
             root_message_dispatches: Arc::new(Mutex::new(HashMap::new())),
             projected_root_messages: Arc::new(Mutex::new(HashSet::new())),
@@ -4936,6 +4939,20 @@ impl SubagentCoordinator {
                 self.root_inbox.lock().await.push(error.0);
             }
         }
+    }
+
+    pub(crate) fn root_inbox_queued(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.root_inbox_queued)
+    }
+
+    /// A root dispatch still inside its retry window: the next sweep confirms
+    /// or retries it.
+    pub(crate) async fn root_dispatch_pending(&self) -> bool {
+        self.root_message_dispatches
+            .lock()
+            .await
+            .values()
+            .any(|sent_at| sent_at.elapsed() < ROOT_MESSAGE_RETRY_INTERVAL)
     }
 
     /// Re-emit durable wake/boundary messages that could not reach the root's
@@ -6899,7 +6916,8 @@ impl SubagentCoordinator {
         let (command_tx, command_rx) = mpsc::channel(64);
         let (control_tx, control_rx) = mpsc::channel(8);
         let interrupt = crate::SessionInterrupt::default();
-        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (event_tx, event_rx) = mpsc::channel(256);
+        let (repair_tx, repair_rx) = tokio::sync::watch::channel(0);
         let actor_path = child_lock_path(&self.journal_root, snapshot.session_id);
         let actor_session_id = snapshot.session_id;
         let writer = crate::SessionWriterLease::try_acquire(&actor_path)?
@@ -6971,56 +6989,29 @@ impl SubagentCoordinator {
                     .unwrap_or_else(|| snapshot.clone()),
             });
         }
-        let actor = tokio::spawn(boxed_agent_store_session(
-            self.journal_root.clone(),
-            actor_session_id,
-            launch,
-            command_rx,
-            control_rx,
-            interrupt,
-            event_tx,
-            Arc::clone(&self.executor),
-            Arc::clone(&self.store),
-            writer,
-            self.clone(),
+        let actor = tokio::spawn(crate::session::with_live_delivery_repair(
+            repair_tx,
+            boxed_agent_store_session(
+                self.journal_root.clone(),
+                actor_session_id,
+                launch,
+                command_rx,
+                control_rx,
+                interrupt,
+                event_tx,
+                Arc::clone(&self.executor),
+                Arc::clone(&self.store),
+                writer,
+                self.clone(),
+            ),
         ));
         let coordinator = self.clone();
         let table = self.table.clone();
         let activity_tx = self.activity_tx.clone();
         tokio::spawn(async move {
-            let mut repair = tokio::time::interval(Duration::from_secs(1));
-            repair.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                let event = tokio::select! {
-                    event = event_rx.recv() => match event {
-                        Some(event) => event,
-                        None => break,
-                    },
-                    _ = repair.tick() => {
-                        if let Err(error) = coordinator.replay_child_events(actor_session_id, None).await {
-                            tracing::warn!(%actor_session_id, %error, "child projection repair will retry");
-                        }
-                        continue;
-                    }
-                };
-                let after = coordinator
-                    .get(actor_session_id)
-                    .await
-                    .and_then(|agent| agent.source)
-                    .map_or(0, |source| source.child_sequence);
-                if event.sequence > after.saturating_add(1) {
-                    // Delivery timeouts may drop any durable boundary, including
-                    // status/configuration. Repair before accepting its successor.
-                    if let Err(error) = coordinator
-                        .replay_child_events(actor_session_id, Some(event.sequence))
-                        .await
-                    {
-                        tracing::warn!(%actor_session_id, %error, "child event gap repair will retry");
-                    }
-                } else {
-                    coordinator.publish_child_event(event).await;
-                }
-            }
+            coordinator
+                .forward_child_events(actor_session_id, event_rx, repair_rx)
+                .await;
             if let Err(error) = coordinator
                 .replay_child_events(actor_session_id, None)
                 .await
@@ -7085,6 +7076,63 @@ impl SubagentCoordinator {
                 .map_err(|_| anyhow::anyhow!("subagent command channel closed while waking"))?;
         }
         Ok(())
+    }
+
+    async fn forward_child_events(
+        &self,
+        session_id: Uuid,
+        mut events: mpsc::Receiver<SessionEvent>,
+        mut repairs: tokio::sync::watch::Receiver<u64>,
+    ) {
+        let mut repairs_open = true;
+        let mut pending_repair = None;
+        let mut retry_at = tokio::time::Instant::now();
+        loop {
+            let event = tokio::select! {
+                event = events.recv() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+                changed = repairs.changed(), if repairs_open => {
+                    if changed.is_err() {
+                        repairs_open = false;
+                        continue;
+                    }
+                    let through = *repairs.borrow_and_update();
+                    pending_repair = Some(pending_repair.unwrap_or(0).max(through));
+                    retry_at = tokio::time::Instant::now();
+                    continue;
+                }
+                () = tokio::time::sleep_until(retry_at), if pending_repair.is_some() => {
+                    match self.replay_child_events(session_id, pending_repair).await {
+                        Ok(()) => pending_repair = None,
+                        Err(error) => {
+                            tracing::warn!(%session_id, %error, "child delivery repair will retry");
+                            retry_at = tokio::time::Instant::now() + Duration::from_secs(1);
+                        }
+                    }
+                    continue;
+                }
+            };
+            let after = self
+                .get(session_id)
+                .await
+                .and_then(|agent| agent.source)
+                .map_or(0, |source| source.child_sequence);
+            if event.sequence > after.saturating_add(1) {
+                // A dropped boundary must be repaired before its successor.
+                if let Err(error) = self
+                    .replay_child_events(session_id, Some(event.sequence))
+                    .await
+                {
+                    tracing::warn!(%session_id, %error, "child event gap repair will retry");
+                    pending_repair = Some(pending_repair.unwrap_or(0).max(event.sequence));
+                    retry_at = tokio::time::Instant::now() + Duration::from_secs(1);
+                }
+            } else {
+                self.publish_child_event(event).await;
+            }
+        }
     }
 
     async fn record_child_failure(
@@ -7833,6 +7881,7 @@ impl SubagentCoordinator {
         }
         if id == root_session_id {
             self.root_inbox.lock().await.push(inbox_message.clone());
+            self.root_inbox_queued.notify_one();
             if actor_session_id != root_session_id {
                 let _ = self.activity_tx.send(SubagentActivity::SessionEvent {
                     parent_session_id: root_session_id,

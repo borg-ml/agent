@@ -10,11 +10,12 @@
 
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
-use sqlx::postgres::PgPool;
+use sqlx::postgres::{PgListener, PgPool, PgPoolOptions};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
-use std::path::Path;
+use std::{path::Path, sync::Arc, time::Duration};
+use tokio::sync::{OnceCell, broadcast};
 
 use crate::workspace::{
     AgentInstance, Audience, DeliveryAttempt, DeliveryMode, DeliveryState, DirectoryInstance,
@@ -28,6 +29,121 @@ use crate::workspace::{
 #[derive(Debug, Clone)]
 pub struct PostgresWorkspaceStore {
     pool: PgPool,
+    work_changes: Arc<OnceCell<WorkChanges>>,
+}
+
+const WORK_COMMITTED_CHANNEL: &str = "borg_workspace_work_committed";
+const MESSAGE_COMMITTED_CHANNEL: &str = "borg_workspace_outbox";
+
+#[derive(Debug)]
+struct WorkChanges {
+    sender: broadcast::Sender<Uuid>,
+    message_sender: broadcast::Sender<Uuid>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for WorkChanges {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn work_listener(pool: &PgPool) -> Result<PgListener> {
+    let mut listener = PgListener::connect_with(pool).await?;
+    // Reconnect outside the cancellation-safe receive select, so a safety
+    // tick cannot consume the reconnect invalidation before either bus sees it.
+    listener.eager_reconnect(false);
+    listener
+        .listen_all([WORK_COMMITTED_CHANNEL, MESSAGE_COMMITTED_CHANNEL])
+        .await?;
+    Ok(listener)
+}
+
+type WorkFingerprint = (i64, String, String);
+
+async fn work_fingerprint(pool: &PgPool) -> Result<WorkFingerprint> {
+    Ok(sqlx::query_as("select count(*)::bigint, coalesce(sum(work_revision),0)::text, coalesce(sum(work_projection_version),0)::text from workspaces")
+        .fetch_one(pool).await?)
+}
+
+async fn broadcast_work_changes(
+    pool: PgPool,
+    listener_pool: PgPool,
+    mut listener: PgListener,
+    sender: broadcast::Sender<Uuid>,
+    message_sender: broadcast::Sender<Uuid>,
+    mut fingerprint: WorkFingerprint,
+) {
+    // Older hosts update durable revisions without emitting the work channel.
+    // One process-wide summary check repairs rolling upgrades without waking
+    // any actor or reading item projections while the workspace is unchanged.
+    let mut safety = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    safety.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let received = tokio::select! {
+            _ = pool.close_event() => return,
+            received = listener.try_recv() => received,
+            _ = safety.tick() => {
+                match work_fingerprint(&pool).await {
+                    Ok(current) => {
+                        if current != fingerprint {
+                            fingerprint = current;
+                            let _ = sender.send(Uuid::nil());
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "workspace work revision safety check failed"),
+                }
+                continue;
+            }
+        };
+        match received {
+            Ok(Some(notification)) => {
+                if let Ok(workspace_id) = notification.payload().parse() {
+                    let target = match notification.channel() {
+                        WORK_COMMITTED_CHANNEL => &sender,
+                        MESSAGE_COMMITTED_CHANNEL => &message_sender,
+                        _ => continue,
+                    };
+                    let _ = target.send(workspace_id);
+                }
+            }
+            result => {
+                if pool.is_closed() {
+                    return;
+                }
+                if let Err(error) = result {
+                    tracing::warn!(%error, "workspace work listener disconnected");
+                }
+                drop(listener);
+                let mut backoff = Duration::from_millis(100);
+                loop {
+                    tokio::select! {
+                        _ = pool.close_event() => return,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    let reconnect = tokio::select! {
+                        _ = pool.close_event() => return,
+                        result = work_listener(&listener_pool) => result,
+                    };
+                    match reconnect {
+                        Ok(reconnected) => {
+                            listener = reconnected;
+                            let _ = sender.send(Uuid::nil());
+                            let _ = message_sender.send(Uuid::nil());
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "workspace work listener reconnect failed");
+                            backoff = (backoff * 2).min(Duration::from_secs(30));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Provision or refresh the participant row an agent instance belongs to.
@@ -63,11 +179,45 @@ impl PostgresWorkspaceStore {
     /// never creates tables: one bootstrap path keeps concurrent cold starts
     /// serialised behind a single advisory lock.
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            work_changes: Arc::new(OnceCell::new()),
+        }
     }
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    async fn changes(&self) -> Result<&WorkChanges> {
+        self.work_changes
+            .get_or_try_init(|| async {
+                // Await LISTEN before returning any subscriber, then read snapshots.
+                let listener_pool = PgPoolOptions::new()
+                    .max_connections(1)
+                    .min_connections(0)
+                    .max_lifetime(None)
+                    .idle_timeout(None)
+                    .connect_lazy_with((*self.pool.connect_options()).clone());
+                let listener = work_listener(&listener_pool).await?;
+                let fingerprint = work_fingerprint(&self.pool).await?;
+                let (sender, _) = broadcast::channel(256);
+                let (message_sender, _) = broadcast::channel(256);
+                let task = tokio::spawn(broadcast_work_changes(
+                    self.pool.clone(),
+                    listener_pool,
+                    listener,
+                    sender.clone(),
+                    message_sender.clone(),
+                    fingerprint,
+                ));
+                Ok::<_, anyhow::Error>(WorkChanges {
+                    sender,
+                    message_sender,
+                    task,
+                })
+            })
+            .await
     }
 
     async fn apply_work_event(
@@ -95,6 +245,7 @@ impl PostgresWorkspaceStore {
         transaction: &mut Transaction<'_, Postgres>,
         workspace_id: Uuid,
         persist_backfill: bool,
+        assignee_id: Option<Uuid>,
     ) -> Result<WorkSnapshot> {
         let row = sqlx::query(
             "select work_projection_version, work_revision from workspaces where id=$1",
@@ -131,8 +282,14 @@ impl PostgresWorkspaceStore {
             }
         } else {
             snapshot.revision = u64::try_from(row.try_get::<i64, _>("work_revision")?)?;
-            let rows = sqlx::query("select item_json from workspace_work_items where workspace_id=$1 and item_json is not null order by created_sequence, work_id")
-                .bind(workspace_id.to_string()).fetch_all(&mut **transaction).await?;
+            let rows = if let Some(assignee) = assignee_id {
+                sqlx::query("select item_json from workspace_work_items where workspace_id=$1 and item_json::jsonb #>> '{work,assignee_id}'=$2 order by created_sequence, work_id")
+                    .bind(workspace_id.to_string()).bind(assignee.to_string())
+                    .fetch_all(&mut **transaction).await?
+            } else {
+                sqlx::query("select item_json from workspace_work_items where workspace_id=$1 and item_json is not null order by created_sequence, work_id")
+                    .bind(workspace_id.to_string()).fetch_all(&mut **transaction).await?
+            };
             for row in rows {
                 snapshot
                     .items
@@ -379,7 +536,7 @@ impl PostgresWorkspaceStore {
                 members.iter().any(|(id, _)| id == assignee_id),
                 "assignee is not a workspace member"
             );
-            Self::work_snapshot(&mut transaction, event.workspace_id, true).await?;
+            Self::work_snapshot(&mut transaction, event.workspace_id, true, None).await?;
             let existing: Option<String> = sqlx::query_scalar("select e.event_json from workspace_plan_migrations m join workspace_events e on e.id=m.event_id and e.workspace_id=m.workspace_id where m.workspace_id=$1 and m.source_session_id=$2")
                 .bind(event.workspace_id.to_string()).bind(source_session_id.to_string()).fetch_optional(&mut *transaction).await?;
             if let Some(existing) = existing {
@@ -425,7 +582,7 @@ impl PostgresWorkspaceStore {
         Self::apply_side_effects(&mut transaction, &event, sequence).await?;
         if event.kind.is_work() {
             let mut snapshot =
-                Self::work_snapshot(&mut transaction, event.workspace_id, true).await?;
+                Self::work_snapshot(&mut transaction, event.workspace_id, true, None).await?;
             let previous = snapshot.revision;
             Self::apply_work_event(&mut transaction, &mut snapshot, &event).await?;
             Self::persist_work_snapshot(&mut transaction, event.workspace_id, &snapshot, previous)
@@ -437,6 +594,11 @@ impl PostgresWorkspaceStore {
                 sqlx::query("insert into workspace_plan_migrations(workspace_id,source_session_id,event_id) values($1,$2,$3)")
                     .bind(event.workspace_id.to_string()).bind(source_session_id.to_string()).bind(event.id.to_string()).execute(&mut *transaction).await?;
             }
+            sqlx::query("select pg_notify($1,$2)")
+                .bind(WORK_COMMITTED_CHANNEL)
+                .bind(event.workspace_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
         }
         let is_message = matches!(&event.kind, WorkspaceEventKind::Message { .. });
         if is_message {
@@ -476,7 +638,7 @@ impl PostgresWorkspaceStore {
         if !event.kind.is_work() {
             return Ok(());
         }
-        let snapshot = Self::work_snapshot(transaction, event.workspace_id, true).await?;
+        let snapshot = Self::work_snapshot(transaction, event.workspace_id, true, None).await?;
         let plan_revision = match &event.kind {
             WorkspaceEventKind::WorkPlanUpdated { assignee_id, .. } => {
                 Self::plan_revision(transaction, event.workspace_id, *assignee_id).await?
@@ -680,6 +842,30 @@ impl PostgresWorkspaceStore {
 
 #[async_trait::async_trait]
 impl WorkspaceStore for PostgresWorkspaceStore {
+    async fn work_revision(&self, workspace_id: Uuid, viewer_id: Uuid) -> Result<u64> {
+        let row = sqlx::query("select w.work_projection_version, w.work_revision from workspaces w join workspace_members m on m.workspace_id=w.id where w.id=$1 and m.participant_id=$2")
+            .bind(workspace_id.to_string()).bind(viewer_id.to_string())
+            .fetch_optional(&self.pool).await?
+            .context("viewer is not a workspace member")?;
+        if row.try_get::<i32, _>("work_projection_version")? < 2 {
+            return Ok(self
+                .work_items(workspace_id, viewer_id, None)
+                .await?
+                .revision);
+        }
+        Ok(u64::try_from(row.try_get::<i64, _>("work_revision")?)?)
+    }
+
+    async fn subscribe_work_changes(&self) -> Result<Option<broadcast::Receiver<Uuid>>> {
+        let changes = self.changes().await?;
+        Ok(Some(changes.sender.subscribe()))
+    }
+
+    async fn subscribe_message_changes(&self) -> Result<Option<broadcast::Receiver<Uuid>>> {
+        let changes = self.changes().await?;
+        Ok(Some(changes.message_sender.subscribe()))
+    }
+
     async fn work_items(
         &self,
         workspace_id: Uuid,
@@ -702,7 +888,7 @@ impl WorkspaceStore for PostgresWorkspaceStore {
             members.iter().any(|(id, _)| *id == viewer_id),
             "viewer is not a workspace member"
         );
-        let mut snapshot = Self::work_snapshot(&mut tx, workspace_id, false).await?;
+        let mut snapshot = Self::work_snapshot(&mut tx, workspace_id, false, assignee_id).await?;
         if let Some(assignee) = assignee_id {
             let version: i32 =
                 sqlx::query_scalar("select work_projection_version from workspaces where id=$1")

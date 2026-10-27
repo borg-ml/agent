@@ -20636,6 +20636,151 @@ async fn child_activity_after_a_lag_survives_an_untracked_descendant() {
     scratch.discard().await;
 }
 
+// Startup recovery used to replay only sixteen events per quiet child. With
+// no periodic sweep left, the final report could then remain missing forever.
+#[tokio::test]
+async fn forwarded_quiet_child_recovery_drains_past_one_page_to_final_report() {
+    quiet_child_recovery(false).await;
+}
+
+// A gap can fail before the coordinator knows the child. Keep its watermark,
+// continue forwarding live activity, then repair without needing a successor.
+#[tokio::test]
+async fn forwarded_child_gap_failure_retries_while_live_activity_continues() {
+    quiet_child_recovery(true).await;
+}
+
+async fn quiet_child_recovery(retry_gap: bool) {
+    let root = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let (scratch, coordinator, store) = forwarding_coordinator(root).await;
+    store.create_session(root).await.unwrap();
+    store.register_child_session(root, child).await.unwrap();
+    for sequence in 0..40 {
+        store
+            .append(SessionEvent::new(
+                child,
+                0,
+                SessionEventKind::Error {
+                    message: format!("earlier event {sequence}"),
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    let message_id = Uuid::new_v4();
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::Assistant,
+                text: "quiet final report".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let ready = store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                lifecycle: Some(SubagentLifecycle::Ready),
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let mut agent = watched_child(child);
+    agent.parent_session_id = root;
+    agent.status = SubagentStatus::Ready;
+    let registration = SessionEvent::new(
+        root,
+        1,
+        SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Updated,
+            agent,
+            event: None,
+        },
+    );
+    if !retry_gap {
+        coordinator
+            .restore_from_events(std::slice::from_ref(&registration))
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .get(child)
+                .await
+                .unwrap()
+                .source
+                .unwrap()
+                .child_sequence,
+            ready.sequence
+        );
+    }
+    let (activity_tx, activity_rx) = broadcast::channel(8);
+    let (forwarded_tx, mut forwarded_rx) = mpsc::channel(8);
+    let marker = Uuid::new_v4();
+    if retry_gap {
+        activity_tx
+            .send(SubagentActivity::SessionEvent {
+                parent_session_id: root,
+                task_name: "/root/worker".into(),
+                event: ready.clone(),
+            })
+            .unwrap();
+        activity_tx
+            .send(SubagentActivity::Started {
+                agent: watched_child(marker),
+            })
+            .unwrap();
+    }
+    let forwarder = tokio::spawn(forward_child_activity(
+        activity_rx,
+        forwarded_tx,
+        None,
+        coordinator.clone(),
+        root,
+        HashMap::new(),
+    ));
+    if retry_gap {
+        let live = tokio::time::timeout(EVENT_TIMEOUT, forwarded_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(live, SubagentActivity::Started { agent } if agent.session_id == marker));
+        coordinator
+            .restore_from_events(std::slice::from_ref(&registration))
+            .await
+            .unwrap();
+    }
+    let (sequences, saw_report) = tokio::time::timeout(EVENT_TIMEOUT, async {
+        let mut sequences = Vec::new();
+        let mut saw_report = false;
+        while let Some(activity) = forwarded_rx.recv().await {
+            if let SubagentActivity::SessionEvent { event, .. } = activity {
+                saw_report |= matches!(event.kind, SessionEventKind::Message { message_id: id, .. } if id == message_id);
+                sequences.push(event.sequence);
+                if event.sequence == ready.sequence {
+                    return (sequences, saw_report);
+                }
+            }
+        }
+        panic!("quiet child's final report was not recovered");
+    }).await.expect("recovery drains quiet backlog without a later live event");
+    assert!(saw_report);
+    assert_eq!(sequences, (1..=ready.sequence).collect::<Vec<_>>());
+    drop(activity_tx);
+    forwarder.await.unwrap();
+    scratch.discard().await;
+}
+
 // A nested actor receives its own child's lifecycle, never sibling or
 // grandchild activity from the shared coordinator's broadcast.
 #[tokio::test]
@@ -21901,6 +22046,23 @@ async fn workspace_plan_rejects_stale_replacement_and_unassigns_without_deleting
         store.state(session_id).await.unwrap().latest_sequence,
         before_refresh
     );
+    // An unchanged revision must not reread session projections, migration
+    // flags, or work payloads. Locks make any regression block deterministically
+    // rather than relying on timing or shared server query counters.
+    let authority = store.postgres_authority().expect("postgres test store");
+    let mut locked = authority.pool.begin().await.unwrap();
+    sqlx::query("lock table sessions, session_workspace_bindings, workspace_plan_migrations, workspace_work_items in access exclusive mode")
+        .execute(&mut *locked).await.unwrap();
+    for _ in 0..72 {
+        refresh.start(&journal, &plan, None);
+        let kind = tokio::time::timeout(Duration::from_secs(1), refresh.next())
+            .await
+            .expect("unchanged plan does not load projections")
+            .unwrap();
+        assert!(kind.is_none());
+    }
+    locked.rollback().await.unwrap();
+
     let assigned = work_store
         .update_work_plan(
             binding.workspace_id,
@@ -25741,4 +25903,20 @@ async fn live_request_context_refetches_goal_state_without_resuming() {
         }
     }
     responder.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn work_plan_wait_has_no_idle_timer_and_filters_other_workspaces() {
+    let workspace = Uuid::new_v4();
+    let (changes, receiver) = broadcast::channel(8);
+    let mut receiver = Some(receiver);
+    let waiting = next_work_plan_change(&mut receiver, workspace);
+    tokio::pin!(waiting);
+    assert!(futures::poll!(&mut waiting).is_pending());
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    assert!(futures::poll!(&mut waiting).is_pending());
+    changes.send(Uuid::new_v4()).unwrap();
+    assert!(futures::poll!(&mut waiting).is_pending());
+    changes.send(workspace).unwrap();
+    assert!(futures::poll!(&mut waiting).is_ready());
 }

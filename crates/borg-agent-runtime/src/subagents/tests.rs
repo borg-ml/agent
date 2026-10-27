@@ -212,6 +212,102 @@ async fn journal_repair_recovers_dropped_child_boundaries_without_report_complet
     scratch.discard().await;
 }
 
+// An idle Ready child must not query its journal on a timer. Inspect the
+// forwarder's registered wakeups directly; elapsed virtual time must not wake
+// it, but a dropped final boundary must still repair without closing the actor.
+#[tokio::test]
+async fn idle_child_forwarder_parks_and_repairs_notified_final_status() {
+    struct WakeCount(AtomicUsize);
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let (_directory, scratch, coordinator, _root, child) = waiting_team().await;
+    let ready = coordinator
+        .store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                lifecycle: Some(SubagentLifecycle::Ready),
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
+    coordinator.publish_child_event(ready).await;
+    let (events, event_rx) = mpsc::channel(1);
+    let (repairs, repair_rx) = tokio::sync::watch::channel(0);
+    let mut forwarder = Box::pin(coordinator.forward_child_events(child, event_rx, repair_rx));
+    let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let waker = std::task::Waker::from(wakes.clone());
+    assert!(
+        forwarder
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_pending()
+    );
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert_eq!(
+        wakes.0.load(Ordering::Relaxed),
+        0,
+        "idle child scheduled a timed query"
+    );
+    tokio::time::resume();
+
+    // No subsequent channel event or actor shutdown will reveal this suffix.
+    for status in [SessionStatus::Running, SessionStatus::Ready] {
+        let event = coordinator
+            .store
+            .append(SessionEvent::new(
+                child,
+                0,
+                SessionEventKind::StatusChanged {
+                    status,
+                    lifecycle: Some(status.into()),
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+        repairs.send_replace(event.sequence);
+    }
+    assert!(wakes.0.load(Ordering::Relaxed) > 0);
+    let final_sequence = *repairs.borrow();
+    let mut activity = coordinator.subscribe();
+    let observe = async {
+        loop {
+            let event = activity.recv().await.unwrap();
+            if matches!(event, SubagentActivity::SessionEvent { event, .. } if event.sequence == final_sequence)
+            {
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            () = forwarder.as_mut() => panic!("live child forwarder exited"),
+            () = observe => {}
+        }
+    })
+    .await
+    .unwrap();
+    let agent = coordinator.get(child).await.unwrap();
+    assert_eq!(agent.lifecycle(), SubagentLifecycle::Ready);
+    assert_eq!(agent.source.unwrap().child_sequence, final_sequence);
+    assert!(!events.is_closed(), "Ready child must remain wakeable");
+    drop(events);
+    forwarder.await;
+    scratch.discard().await;
+}
+
 // Before durable admission, a rejected spawn is only a failed operation. It
 // must release its name/slot rather than leave an unrecoverable phantom worker.
 #[tokio::test]
@@ -4202,6 +4298,123 @@ async fn durable_root_inbox_poll_replays_a_report_when_wake_delivery_was_missed(
     assert_eq!(wake.delivery, PromptDelivery::Steer);
     assert!(wake.text.contains("durable result"));
     assert!(coordinator.take_root_inbox().await.is_empty());
+    scratch.discard().await;
+}
+
+struct RootTeamExecutor {
+    team: Arc<StdMutex<Option<SubagentCoordinator>>>,
+    calls: Arc<AtomicUsize>,
+    called: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl crate::AgentTurnExecutor for RootTeamExecutor {
+    async fn execute(
+        &self,
+        turn: crate::AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
+    ) -> Result<crate::AgentTurnResult> {
+        *self.team.lock().unwrap() = turn.agent_tools.subagents.clone();
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.called.notify_one();
+        Ok(crate::AgentTurnResult {
+            provider_session_id: None,
+            final_text: String::new(),
+        })
+    }
+}
+
+// Failure mode: an idle root backs off its durable-inbox sweep, and a child's
+// send_message report reaches the root only through that sweep. The report
+// then waited seconds for the next backed-off sweep instead of steering at once.
+// Without multiplayer nothing is committed, so only the in-process wake helps.
+#[tokio::test]
+async fn a_child_report_reaches_a_backed_off_idle_root_promptly() {
+    child_report_reaches_a_backed_off_idle_root(true).await;
+}
+
+#[tokio::test]
+async fn a_child_report_reaches_a_backed_off_single_player_root_promptly() {
+    child_report_reaches_a_backed_off_idle_root(false).await;
+}
+
+async fn child_report_reaches_a_backed_off_idle_root(multiplayer: bool) {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let team = Arc::new(StdMutex::new(None));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let called = Arc::new(tokio::sync::Notify::new());
+    let executor = Arc::new(RootTeamExecutor {
+        team: Arc::clone(&team),
+        calls: Arc::clone(&calls),
+        called: Arc::clone(&called),
+    });
+    let (commands, command_rx) = mpsc::channel(8);
+    let (events, mut event_rx) = mpsc::channel(256);
+    tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+    let actor = tokio::spawn({
+        let session_root = directory.path().to_path_buf();
+        let store: Arc<dyn crate::SessionStore> = store.clone();
+        async move {
+            let writer = crate::SessionWriterLease::acquire(session_root.join("root.lock"))?;
+            crate::run_agent_session_with_store_and_writer(
+                &session_root,
+                root,
+                LaunchSession {
+                    cwd: session_root.clone(),
+                    initial_prompt: Some("start the team".to_string()),
+                    capabilities: crate::SessionCapabilities {
+                        multiplayer,
+                        ..launch().capabilities
+                    },
+                    ..launch()
+                },
+                command_rx,
+                events,
+                executor,
+                store,
+                writer,
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(20), called.notified())
+        .await
+        .expect("the first root turn runs");
+    let coordinator = team
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the root owns its team");
+    let worker = coordinator
+        .table
+        .lock()
+        .await
+        .reserve("worker", &launch())
+        .unwrap();
+    bind_test_team(directory.path(), store.as_ref(), root, &[worker.session_id]).await;
+    // Unchanged sweeps double their interval, so the next one is now seconds away.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    coordinator
+        .send_message_as(worker.session_id, "/root", "blocked on an API decision")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_millis(1500), called.notified())
+        .await
+        .expect("the report reaches the root without waiting for a backed-off sweep");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    commands
+        .send(HostCommand::Stop { session_id: root })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
     scratch.discard().await;
 }
 

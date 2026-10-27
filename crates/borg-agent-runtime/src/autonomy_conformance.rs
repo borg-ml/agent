@@ -435,3 +435,103 @@ async fn postgres_coverage_follows_its_configuration() {
         harness.discard().await;
     }
 }
+
+// Replacing idle polling must not delay newly enqueued work until the slow
+// cross-process fallback, or run future work early. Independent store handles
+// used by the dispatcher and session must share the enqueue wakeup.
+#[tokio::test]
+async fn supervisor_wakes_for_enqueue_and_scheduled_deadline() {
+    use crate::{AutonomyJobHandler, AutonomySupervisor, SessionStore};
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    struct Handler(tokio::sync::mpsc::UnboundedSender<Uuid>);
+    #[async_trait::async_trait]
+    impl AutonomyJobHandler for Handler {
+        async fn execute(&self, job: AutonomyJob) -> anyhow::Result<serde_json::Value> {
+            self.0.send(job.job_id).unwrap();
+            Ok(serde_json::Value::Null)
+        }
+    }
+
+    let (scratch, session) = crate::session_store::postgres::testing::session_store().await;
+    let store = session.autonomy_store().await.unwrap().unwrap();
+    let dispatcher_store = session.autonomy_store().await.unwrap().unwrap();
+    assert!(Arc::ptr_eq(&store, &dispatcher_store));
+    let owner = Uuid::new_v4();
+    let (sent, mut executed) = tokio::sync::mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let supervisor = AutonomySupervisor::new(store.clone(), Arc::new(Handler(sent)), "wake-test")
+        .unwrap()
+        .for_session(owner);
+    let task = tokio::spawn({
+        let cancel = cancel.clone();
+        async move { supervisor.run_until_cancelled(cancel).await }
+    });
+    // Let the empty initial sweep finish, so the enqueue must wake a parked worker.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut request = job("scheduled-wake", 1);
+    request.session_id = Some(owner);
+    request.due_at = Utc::now() + chrono::Duration::milliseconds(700);
+    let scheduled = dispatcher_store.enqueue(request).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), executed.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), executed.recv())
+            .await
+            .unwrap(),
+        Some(scheduled.job_id)
+    );
+    let mut request = job("immediate-wake", 1);
+    request.session_id = Some(owner);
+    let immediate = dispatcher_store.enqueue(request).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), executed.recv())
+            .await
+            .unwrap(),
+        Some(immediate.job_id)
+    );
+    cancel.cancel();
+    task.await.unwrap();
+    scratch.discard().await;
+}
+
+// A parked supervisor must wake to reclaim abandoned work at lease expiry,
+// not just to execute queued jobs, and must never inspect another session's due work.
+#[tokio::test]
+async fn next_wake_tracks_scoped_queue_and_lease_deadlines() {
+    let (scratch, session) = crate::session_store::postgres::testing::session_store().await;
+    let store = PostgresAutonomyStore::from_pool(session.pool().clone());
+    let owner = Uuid::new_v4();
+    assert_eq!(store.next_wake_at(Some(owner)).await.unwrap(), None);
+    let mut request = job("deadline", 1);
+    request.session_id = Some(owner);
+    request.due_at = Utc::now() + chrono::Duration::seconds(30);
+    let queued = store.enqueue(request).await.unwrap();
+    assert_eq!(
+        store.next_wake_at(Some(owner)).await.unwrap(),
+        Some(queued.due_at)
+    );
+    assert_eq!(
+        store.next_wake_at(Some(Uuid::new_v4())).await.unwrap(),
+        None
+    );
+    let claimed = store
+        .claim_due_for_session(
+            queued.due_at,
+            "deadline-owner",
+            Duration::from_secs(60),
+            1,
+            owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.next_wake_at(Some(owner)).await.unwrap(),
+        claimed[0].lease_expires_at
+    );
+    scratch.discard().await;
+}

@@ -2396,3 +2396,301 @@ async fn legacy_delivery_rows_convert_then_prune_resumably_or_reclaim() {
     pool.close().await;
     scratch.discard().await;
 }
+
+// A revision-only idle check must not deserialize the workspace, and a plan
+// read must not deserialize another assignee's payload. A corrupt unrelated
+// projection catches both regressions without relying on query instrumentation.
+#[tokio::test]
+async fn work_revision_and_assignee_reads_do_not_load_unrelated_items() {
+    use crate::workspace::SharedWork;
+    let (scratch, session) = crate::session_store::postgres::testing::session_store().await;
+    let store = PostgresWorkspaceStore::from_pool(session.pool().clone());
+    let (workspace, actor, other, _) = workspace_with_members(&store).await;
+    let mut events = Vec::new();
+    for assignee in [actor, other] {
+        events.push(
+            store
+                .append(WorkspaceEvent {
+                    id: Uuid::new_v4(),
+                    workspace_id: workspace,
+                    sequence: 0,
+                    author_id: actor,
+                    idempotency_key: assignee.to_string(),
+                    created_at: Utc::now(),
+                    kind: WorkspaceEventKind::WorkCreated {
+                        work: SharedWork {
+                            id: Uuid::new_v4(),
+                            title: "assigned work".into(),
+                            assignee_id: Some(assignee),
+                            ..SharedWork::default()
+                        },
+                        mode: DeliveryMode::Notify,
+                    },
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    let revision = events.last().unwrap().sequence;
+    assert_eq!(
+        store.work_revision(workspace, actor).await.unwrap(),
+        revision
+    );
+    assert!(
+        store
+            .work_revision(workspace, Uuid::new_v4())
+            .await
+            .is_err()
+    );
+    // A pre-v2 workspace must still derive the revision from canonical work
+    // events rather than trusting its not-yet-backfilled revision column.
+    sqlx::query("update workspaces set work_projection_version=0,work_revision=0 where id=$1")
+        .bind(workspace.to_string())
+        .execute(session.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.work_revision(workspace, actor).await.unwrap(),
+        revision
+    );
+    sqlx::query("update workspaces set work_projection_version=2,work_revision=$2 where id=$1")
+        .bind(workspace.to_string())
+        .bind(i64::try_from(revision).unwrap())
+        .execute(session.pool())
+        .await
+        .unwrap();
+    sqlx::query("update workspace_work_items set item_json=$2 where workspace_id=$1 and item_json::jsonb #>> '{work,assignee_id}'=$3")
+        .bind(workspace.to_string())
+        .bind(serde_json::json!({"work": {"assignee_id": other}}).to_string())
+        .bind(other.to_string()).execute(session.pool()).await.unwrap();
+    assert_eq!(
+        store.work_revision(workspace, actor).await.unwrap(),
+        revision
+    );
+    let own = store
+        .work_items(workspace, actor, Some(actor))
+        .await
+        .unwrap();
+    assert_eq!(own.items.len(), 1);
+    assert_eq!(own.items[0].work.assignee_id, Some(actor));
+    assert!(store.work_items(workspace, actor, None).await.is_err());
+    // Table locks prove the hot revision path does not read either payload
+    // table, including after an unrelated message advances workspace sequence.
+    store
+        .append(message_event(
+            workspace,
+            actor,
+            "not work",
+            Audience::Workspace,
+            "revision-message",
+        ))
+        .await
+        .unwrap();
+    let mut blocker = session.pool().begin().await.unwrap();
+    sqlx::query("lock table workspace_work_items, workspace_events in access exclusive mode")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.work_revision(workspace, actor)
+        )
+        .await
+        .expect("idle revision check read full work payloads")
+        .unwrap(),
+        revision
+    );
+    blocker.rollback().await.unwrap();
+    drop(store);
+    drop(session);
+    scratch.discard().await;
+}
+
+// Work written through an independent pool must wake all actor subscribers,
+// while messages/rolled-back transactions must not. The subscription call
+// itself is the LISTEN barrier: no timing sleeps are needed before the write.
+#[tokio::test]
+async fn work_changes_are_commit_coupled_cross_pool_and_shared_by_actors() {
+    use crate::{SessionStore, workspace::SharedWork};
+    use std::time::Duration;
+    let (scratch, session) = crate::session_store::postgres::testing::session_store().await;
+    let store = session.workspace_store().await.unwrap().unwrap();
+    let same = session.clone().workspace_store().await.unwrap().unwrap();
+    assert!(std::sync::Arc::ptr_eq(&store, &same));
+    let (workspace, actor, _, _) = workspace_with_members(store.as_ref()).await;
+    let writer_pool = sqlx::PgPool::connect(&scratch.url).await.unwrap();
+    let writer = PostgresWorkspaceStore::from_pool(writer_pool.clone());
+    let mut first = store.subscribe_work_changes().await.unwrap().unwrap();
+    let mut second = same.subscribe_work_changes().await.unwrap().unwrap();
+    let mut messages = same.subscribe_message_changes().await.unwrap().unwrap();
+    let listeners: i64 = sqlx::query_scalar("select count(*) from pg_stat_activity where datname=current_database() and query like 'LISTEN %borg_workspace_work_committed%'")
+        .fetch_one(&writer_pool).await.unwrap();
+    assert_eq!(listeners, 1, "actors must share one LISTEN connection");
+    let event = WorkspaceEvent {
+        id: Uuid::new_v4(),
+        workspace_id: workspace,
+        sequence: 0,
+        author_id: actor,
+        idempotency_key: "cross-pool-work".into(),
+        created_at: Utc::now(),
+        kind: WorkspaceEventKind::WorkCreated {
+            work: SharedWork {
+                id: Uuid::new_v4(),
+                title: "cross-pool work".into(),
+                ..SharedWork::default()
+            },
+            mode: DeliveryMode::Notify,
+        },
+    };
+    let appended = writer.append(event.clone()).await.unwrap();
+    for receiver in [&mut first, &mut second] {
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            workspace
+        );
+    }
+    assert_eq!(
+        store.work_revision(workspace, actor).await.unwrap(),
+        appended.sequence
+    );
+    assert!(matches!(
+        messages.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    writer.append(event).await.unwrap(); // Idempotent retry is not a new commit.
+    writer
+        .append(message_event(
+            workspace,
+            actor,
+            "message only",
+            Audience::Workspace,
+            "no-work-wake",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), messages.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        workspace
+    );
+    let mut rollback = writer_pool.begin().await.unwrap();
+    sqlx::query("select pg_notify('borg_workspace_work_committed',$1)")
+        .bind(workspace.to_string())
+        .execute(&mut *rollback)
+        .await
+        .unwrap();
+    rollback.rollback().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), first.recv())
+            .await
+            .is_err()
+    );
+    // Disconnect only the listener in this test's UUID-named scratch DB. No
+    // production server or process is restarted; reconnect must invalidate all.
+    sqlx::query("select pg_terminate_backend(pid) from pg_stat_activity where datname=current_database() and query like 'LISTEN %borg_workspace_work_committed%'")
+        .execute(&writer_pool).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), first.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        Uuid::nil()
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), second.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        Uuid::nil()
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), messages.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        Uuid::nil()
+    );
+    sqlx::query("select pg_notify('borg_workspace_work_committed',$1)")
+        .bind(workspace.to_string())
+        .execute(&writer_pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), first.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        workspace
+    );
+    drop((store, same, writer, session));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), first.recv())
+            .await
+            .unwrap(),
+        Err(tokio::sync::broadcast::error::RecvError::Closed)
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), messages.recv())
+            .await
+            .unwrap(),
+        Err(tokio::sync::broadcast::error::RecvError::Closed)
+    ));
+    drop((first, second, messages));
+    writer_pool.close().await;
+    scratch.discard().await;
+}
+
+// Rolling upgrades have old writers that persist revisions but know nothing
+// about the new NOTIFY channel. A process-wide metadata check must wake all
+// work consumers without also waking receipts or reading work-item payloads.
+#[tokio::test]
+async fn work_changes_recover_old_writers_without_notifications() {
+    use std::time::Duration;
+    let (scratch, session) = crate::session_store::postgres::testing::session_store().await;
+    let store = PostgresWorkspaceStore::from_pool(session.pool().clone());
+    let (workspace, _, _, _) = workspace_with_members(&store).await;
+    let mut work = store.subscribe_work_changes().await.unwrap().unwrap();
+    let mut messages = store.subscribe_message_changes().await.unwrap().unwrap();
+    sqlx::query("update workspaces set work_revision=work_revision+1 where id=$1")
+        .bind(workspace.to_string())
+        .execute(session.pool())
+        .await
+        .unwrap();
+    let mut blocker = session.pool().begin().await.unwrap();
+    sqlx::query("lock table workspace_work_items, workspace_events in access exclusive mode")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::time::resume();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), work.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        Uuid::nil()
+    );
+    assert!(matches!(
+        messages.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::time::resume();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), work.recv())
+            .await
+            .is_err(),
+        "unchanged process-wide safety tick must not wake any actor"
+    );
+    blocker.rollback().await.unwrap();
+    drop((work, messages, store, session));
+    scratch.discard().await;
+}

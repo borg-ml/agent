@@ -93,6 +93,8 @@ pub struct PostgresSessionStore {
     /// work tables) supplies it here so the runtime projects into that
     /// authority instead of a second workspace schema.
     workspace_override: Option<WorkspaceStoreOverride>,
+    workspace: std::sync::Arc<crate::workspace_postgres::PostgresWorkspaceStore>,
+    autonomy: std::sync::Arc<crate::autonomy_postgres::PostgresAutonomyStore>,
 }
 
 /// A workspace projection supplied by the embedding controller.
@@ -150,6 +152,12 @@ impl PostgresSessionStore {
     /// server across stores without reconnecting.
     pub async fn from_pool(pool: PgPool) -> Result<Self> {
         let store = Self {
+            autonomy: std::sync::Arc::new(
+                crate::autonomy_postgres::PostgresAutonomyStore::from_pool(pool.clone()),
+            ),
+            workspace: std::sync::Arc::new(
+                crate::workspace_postgres::PostgresWorkspaceStore::from_pool(pool.clone()),
+            ),
             pool,
             dictionaries: cold::DictionaryCache::default(),
             workspace_override: None,

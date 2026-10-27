@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const MAX_BATCH_SIZE: u32 = 256;
+const IDLE_RECHECK: Duration = Duration::from_secs(60);
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const MAX_KIND_BYTES: usize = 128;
 const MAX_OWNER_BYTES: usize = 256;
@@ -142,6 +143,17 @@ pub trait AutonomyStore: Send + Sync {
     /// Enqueue a job, returning the existing row for a repeated idempotency
     /// key when its immutable request fields match exactly.
     async fn enqueue(&self, input: EnqueueAutonomyJob) -> Result<AutonomyJob>;
+
+    /// In-process queue changes. Subscribe before reading due work so an
+    /// enqueue racing with the initial sweep cannot be missed.
+    fn subscribe_changes(&self) -> Option<tokio::sync::broadcast::Receiver<Option<Uuid>>> {
+        None
+    }
+
+    /// The next queued due time or abandoned-lease deadline in this scope.
+    async fn next_wake_at(&self, _session_id: Option<Uuid>) -> Result<Option<DateTime<Utc>>> {
+        Ok(None)
+    }
 
     /// One job by id.
     async fn get(&self, job_id: Uuid) -> Result<Option<AutonomyJob>>;
@@ -381,18 +393,57 @@ impl AutonomySupervisor {
         Ok(completed)
     }
 
-    /// Keep the worker alive until its cancellation token is closed. A poll
-    /// error does not kill the supervisor; the next iteration can recover a
-    /// transient store/provider failure while the lease fence prevents dupes.
+    /// Park on queue changes or a known due/lease deadline. The slow fallback
+    /// notices cross-process writes without a listener connection per session.
     pub async fn run_until_cancelled(&self, cancel: CancellationToken) {
-        let mut tick = tokio::time::interval(self.poll_interval);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut changes = self.store.subscribe_changes();
+        let mut backoff = self.poll_interval;
         loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tick.tick() => {
-                    if let Err(error) = self.run_once(Utc::now()).await {
-                        tracing::warn!(owner = %self.owner, %error, "autonomy supervisor iteration failed");
+            if cancel.is_cancelled() {
+                return;
+            }
+            let iteration = async {
+                self.run_once(Utc::now()).await?;
+                self.store.next_wake_at(self.session_id).await
+            }
+            .await;
+            let delay = match iteration {
+                Ok(next) => {
+                    backoff = self.poll_interval;
+                    let fallback = if changes.is_some() {
+                        IDLE_RECHECK
+                    } else {
+                        self.poll_interval
+                    };
+                    next.map(|at| {
+                        (at - Utc::now())
+                            .to_std()
+                            .ok()
+                            .filter(|delay| !delay.is_zero())
+                            .unwrap_or(self.poll_interval)
+                    })
+                    .unwrap_or(fallback)
+                    .min(fallback)
+                }
+                Err(error) => {
+                    tracing::warn!(owner = %self.owner, %error, "autonomy supervisor iteration failed");
+                    let delay = backoff;
+                    backoff = backoff.saturating_mul(2).min(IDLE_RECHECK);
+                    delay
+                }
+            };
+            let deadline = tokio::time::Instant::now() + delay;
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    () = tokio::time::sleep_until(deadline) => break,
+                    change = async { changes.as_mut().expect("guarded queue subscription").recv().await }, if changes.is_some() => {
+                        match change {
+                            Ok(session) if self.session_id.is_none() || session == self.session_id => break,
+                            Ok(_) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => changes = None,
+                        }
                     }
                 }
             }

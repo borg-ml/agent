@@ -30,6 +30,16 @@ attached. When the whole team is idle, has no pending prompt, and has no viewers
 the host waits five minutes and then exits. Resuming the session starts a new
 host from its journal.
 
+Idle child actors wait on notifications rather than repeatedly loading every
+team member's plan. Workspace work and message changes share one PostgreSQL
+LISTEN connection per session store; ordinary pooled connections have a zero
+minimum and expire while idle. Scheduled jobs wait for enqueue notifications
+or their next due/lease deadline, with a bounded cross-process recovery check.
+The maximum pool size is not reduced. Host shutdown verifies current child
+ledgers instead of trusting a possibly stale parent activity mirror, and stops
+its child actors before releasing ownership. Active goals, retries, approvals,
+and background work continue to keep a detached host alive.
+
 Reopening with a newer Borg build does not replace an older session host while
 its children are working. Automatic host upgrades wait for the team to settle;
 installing a binary alone does not change the code running in that host.

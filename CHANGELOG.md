@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.19.6)
 
+- Idle session trees no longer rescan every agent's plans and inboxes on tight
+  timers. Committed workspace changes and explicit delivery-repair wakeups
+  drive updates, with revision-gated plan reads and deadline-driven scheduled
+  jobs. Ordinary database connections drain while idle; real-load pool capacity
+  is unchanged. Detached, settled hosts can now reach their five-minute idle
+  shutdown even when a stale child mirror still says it is running.
+
 - Private-display `computer_use` launch keeps working after Borg is upgraded
   while a session host is still running; it previously failed for every
   program with "No such file or directory". Launch errors now also name the

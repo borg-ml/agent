@@ -528,6 +528,25 @@ pub enum WorkspaceEventKind {
 
 #[async_trait]
 pub trait WorkspaceStore: Send + Sync {
+    async fn work_revision(&self, workspace_id: Uuid, viewer_id: Uuid) -> Result<u64> {
+        Ok(self
+            .work_items(workspace_id, viewer_id, None)
+            .await?
+            .revision)
+    }
+    /// Subscribe before reading the initial snapshot. A nil UUID or lagged
+    /// receiver means every workspace must refresh its durable revision.
+    async fn subscribe_work_changes(
+        &self,
+    ) -> Result<Option<tokio::sync::broadcast::Receiver<Uuid>>> {
+        Ok(None)
+    }
+    /// Shares the subscription barrier and reconnect semantics of work changes.
+    async fn subscribe_message_changes(
+        &self,
+    ) -> Result<Option<tokio::sync::broadcast::Receiver<Uuid>>> {
+        Ok(None)
+    }
     async fn work_items(
         &self,
         workspace_id: Uuid,

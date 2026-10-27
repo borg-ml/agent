@@ -304,6 +304,8 @@ alter table workspaces add column if not exists work_projection_version integer 
 alter table workspaces add column if not exists work_revision bigint not null default 0;
 alter table workspace_work_items add column if not exists item_json text;
 alter table workspace_work_items add column if not exists updated_sequence bigint not null default 0;
+create index if not exists idx_workspace_work_items_assignee
+    on workspace_work_items (workspace_id, (item_json::jsonb #>> '{work,assignee_id}'));
 create table if not exists workspace_plan_migrations (
     workspace_id text not null references workspaces(id) on delete cascade,
     source_session_id text not null,
