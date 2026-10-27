@@ -60,6 +60,38 @@ pub async fn clear_login_dependent_usage_caches() {
     if let Some(cache) = CLAUDE_LOGIN_STATUS_CACHE.get() {
         *cache.lock().await = None;
     }
+    if let Some(cache) = SESSION_CAPABILITY_REFRESH.get() {
+        *cache.lock().await = None;
+    }
+}
+
+/// How long one session's periodic capability refresh serves the others.
+/// Every session refreshes every few seconds; done per session, a host with
+/// a hundred idle agents re-read the same credential files dozens of times a
+/// second.
+const SESSION_CAPABILITY_REFRESH_TTL: Duration = Duration::from_secs(2);
+
+type SessionCapabilityRefresh = Option<(Instant, Vec<ProviderCapability>, Vec<ProviderCapability>)>;
+
+static SESSION_CAPABILITY_REFRESH: OnceLock<Mutex<SessionCapabilityRefresh>> = OnceLock::new();
+
+/// The periodic session refresh, single-flight and shared by sessions that
+/// pass the same capabilities. Explicit snapshots keep calling
+/// [`refresh_provider_capability_usage`] directly.
+pub async fn refresh_session_provider_capabilities(
+    capabilities: &[ProviderCapability],
+) -> Vec<ProviderCapability> {
+    let cache = SESSION_CAPABILITY_REFRESH.get_or_init(|| Mutex::new(None));
+    let mut slot = cache.lock().await;
+    if let Some((refreshed_at, input, output)) = &*slot
+        && refreshed_at.elapsed() < SESSION_CAPABILITY_REFRESH_TTL
+        && input.as_slice() == capabilities
+    {
+        return output.clone();
+    }
+    let output = refresh_provider_capability_usage(capabilities).await;
+    *slot = Some((Instant::now(), capabilities.to_vec(), output.clone()));
+    output
 }
 
 pub async fn refresh_provider_capability_usage(

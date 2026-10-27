@@ -2839,7 +2839,7 @@ async fn run_agent_session_store_kernel_inner(
             loop {
                 seed = tokio::select! {
                     _ = capability_refresh_tx.closed() => break,
-                    refreshed = crate::provider_usage::refresh_provider_capability_usage(&seed) => refreshed,
+                    refreshed = crate::provider_usage::refresh_session_provider_capabilities(&seed) => refreshed,
                 };
                 if capability_refresh_tx.send(seed.clone()).await.is_err() {
                     break;

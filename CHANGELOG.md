@@ -17,6 +17,9 @@ Git comparison.
   is unchanged. Detached, settled hosts can now reach their five-minute idle
   shutdown even when a stale child mirror still says it is running.
 
+- Sessions in one host share their periodic provider-capability refresh
+  instead of each re-reading credentials every three seconds.
+
 - Private-display `computer_use` launch keeps working after Borg is upgraded
   while a session host is still running; it previously failed for every
   program with "No such file or directory". Launch errors now also name the
