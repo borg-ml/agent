@@ -30,7 +30,7 @@ default-members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.19.6"
+version = "0.19.7"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"

@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.19.6)
+## Unreleased (since 0.19.7)
+
+## 0.19.7 (2026-10-27)
 
 - `control_agent_goal` and `team_batch` accept `"pause"`, `"resume"` or
   `"clear"` as a bare `goal_action`, and the schema documents both forms. A
