@@ -76,7 +76,7 @@ tracing = "0.1.44"
 ts-rs = { version = "12.0.1", features = ["chrono-impl", "serde-json-impl", "uuid-impl"] }
 url = "2.5"
 uuid = { version = "1.26.0", features = ["serde", "v4", "v5", "v7"] }
-zstd = "0.13"
+zstd = "0.14.3"
 
 [profile.dev]
 # Debug info dominated target/ size. Opt back in for one build with
