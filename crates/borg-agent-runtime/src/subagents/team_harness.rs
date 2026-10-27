@@ -23,7 +23,29 @@ struct InspectArgs {
 #[serde(deny_unknown_fields)]
 struct AgentGoalArgs {
     target: String,
+    #[serde(default, deserialize_with = "goal_action_arg")]
     goal_action: Option<crate::GoalAction>,
+}
+
+/// The documented object, or the bare action name callers naturally write.
+fn goal_action_arg<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<crate::GoalAction>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let value = match value {
+        Value::String(name) => json!({ "type": name }),
+        value => value,
+    };
+    serde_json::from_value(value).map(Some).map_err(|error| {
+        serde::de::Error::custom(format!(
+            "goal_action must be \"pause\", \"resume\", \"clear\" or {{\"type\":\"set\",\"objective\":\"...\"}}: {error}"
+        ))
+    })
 }
 
 // Deliberate allowlist: no provider events, nested child events, reasoning,
@@ -471,7 +493,11 @@ struct BatchItem {
     #[serde(default)]
     message: String,
     configuration: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "goal_action_arg"
+    )]
     goal_action: Option<crate::GoalAction>,
 }
 #[derive(Deserialize)]

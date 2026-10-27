@@ -11289,6 +11289,7 @@ async fn parent_goal_control_routes_real_actions_and_denies_unrelated_callers() 
         json!({"type":"pause"}),
         json!({"type":"resume"}),
         json!({"type":"clear"}),
+        json!("pause"),
     ] {
         let request = json!({"target":"worker","goal_action":action});
         assert!(
@@ -11311,7 +11312,7 @@ async fn parent_goal_control_routes_real_actions_and_denies_unrelated_callers() 
                 assert_eq!(session_id, child);
                 assert_eq!(
                     serde_json::to_value(received).unwrap()["type"],
-                    action["type"]
+                    *action.get("type").unwrap_or(&action)
                 );
             }
             other => panic!("wrong command: {other:?}"),

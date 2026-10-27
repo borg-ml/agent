@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.19.6)
 
+- `control_agent_goal` and `team_batch` accept `"pause"`, `"resume"` or
+  `"clear"` as a bare `goal_action`, and the schema documents both forms. A
+  wrong shape now names the accepted forms instead of only reporting a
+  missing `type` field.
+
 - Idle session trees no longer rescan every agent's plans and inboxes on tight
   timers. Committed workspace changes and explicit delivery-repair wakeups
   drive updates, with revision-gated plan reads and deadline-driven scheduled

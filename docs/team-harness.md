@@ -94,7 +94,8 @@ these capabilities.
 `get_agent_goal({target})` reads the owned child's canonical goal/accounting and revision.
 `control_agent_goal({target, goal_action: {type: "set", objective, token_budget}})`
 sets a goal through its owning actor. Use `type: "pause"`, `"resume"`, or `"clear"`
-for the other actions. Only the director can mutate descendant goals, and only
+for the other actions; the bare strings `"pause"`, `"resume"` and `"clear"` are
+accepted as `goal_action` too. Only the director can mutate descendant goals, and only
 under explicit human authorization.
 Clear detaches the goal while retaining journal history. Pause/clear do not
 interrupt a running turn: use `interrupt_agent` separately when stopping work.
