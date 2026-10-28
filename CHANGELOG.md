@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.19.7)
 
+- The start screen's version always keeps its `v`. A version that would
+  otherwise throw the splash off centre gets one extra space after the channel
+  glyph instead of losing the prefix.
+
 - Settings are a real screen now. Click **Settings** in the top-right corner of
   the start screen, or run `/settings`, to open a fullscreen view grouped into
   Agent, Transcript, Names & colours, Appearance, Notifications and System.

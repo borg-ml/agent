@@ -17893,7 +17893,7 @@ fn splitmix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-/// The version, spelled so the splash's three lines share a width.
+/// The version, spaced so the splash's three lines share a width.
 ///
 /// The logo and the caption are both seven columns, and all three centre
 /// together only when they are the *same* width - a line of different parity
@@ -17902,19 +17902,18 @@ fn splitmix64(mut value: u64) -> u64 {
 /// columns and `v0.12.10` is eight, so the first two-digit patch release would
 /// have knocked the whole block out by a cell.
 ///
-/// So the prefix yields to the width. `v` is kept whenever the version with it
-/// is already odd; when it would be even, the bare version is one column
-/// shorter and puts the line back on the block's width. The prefix is a
-/// convenience; the three lines agreeing is what the eye actually reads.
+/// So when the version would be even it gains a leading space, which widens
+/// the gap after the channel glyph by one column and puts the line back on the
+/// block's width. The `v` always stays.
 fn splash_version() -> String {
     splash_version_text(env!("CARGO_PKG_VERSION"))
 }
 
-/// The `v` prefix, or its absence, decided by the width it produces.
+/// The `v`-prefixed version, padded with a leading space when it is even.
 fn splash_version_text(version: &str) -> String {
     let prefixed = format!("v{version}");
     if UnicodeWidthStr::width(prefixed.as_str()) % 2 == 0 {
-        version.to_string()
+        format!(" {prefixed}")
     } else {
         prefixed
     }
