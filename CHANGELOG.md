@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.19.7)
 
+- Escape stops a turn promptly even while a burst of team messages is being
+  steered into it. The burst used to be admitted one message at a time, each
+  with its own journal round trips, so the interrupt waited behind all of them
+  and could take most of a second on a busy database.
+
 - After a restart, the Team panel shows resumed agents as working again within
   seconds. A restarted session used to re-record every agent's whole history
   before passing on their current state, so for many minutes agents that

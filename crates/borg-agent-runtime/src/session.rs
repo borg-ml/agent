@@ -6746,7 +6746,14 @@ async fn run_agent_session_store_kernel_inner(
                             // Escape keeps its place instead of waiting on the
                             // batch.
                             let mut drained = vec![(message_id, text, attachments, output_schema)];
-                            while let Ok(waiting) = commands.try_recv() {
+                            // Deferred commands precede the channel, so a run
+                            // takes the steers waiting there first: a team burst
+                            // split into deferred prompts must still share one
+                            // admission run rather than pay one each.
+                            while let Some(waiting) = match deferred_commands.pop_front() {
+                                Some(command) => Some(command),
+                                None => commands.try_recv().ok(),
+                            } {
                                 let team = matches!(waiting, HostCommand::TeamPrompt { .. });
                                 match waiting {
                                     HostCommand::TeamPrompt {
@@ -6793,7 +6800,17 @@ async fn run_agent_session_store_kernel_inner(
                                 .iter()
                                 .any(|steer| !steer.admission.is_accepted());
                             let had_pending = has_pending;
-                            for (message_id, text, attachments, output_schema) in drained {
+                            // Looked up together: sequential round trips per
+                            // prompt are what an Escape behind the run waits on.
+                            let admission_states = futures::future::try_join_all(
+                                drained.iter().map(|(message_id, ..)| {
+                                    journal.prompt_admission_state(session_id, *message_id)
+                                }),
+                            )
+                            .await?;
+                            for ((message_id, text, attachments, output_schema), admission_state) in
+                                drained.into_iter().zip(admission_states)
+                            {
                                 if prompt.message_id == message_id
                                     || prompt
                                         .batch
@@ -6811,9 +6828,6 @@ async fn run_agent_session_store_kernel_inner(
                                 {
                                     continue;
                                 }
-                                let admission_state = journal
-                                    .prompt_admission_state(session_id, message_id)
-                                    .await?;
                                 if admission_state == PromptAdmissionState::Settled {
                                     continue;
                                 }
