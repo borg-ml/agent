@@ -9121,28 +9121,11 @@ impl BorgTerminal {
         let terminal_size = self.terminal.size()?;
         let content_width = terminal_content_width(terminal_size.width);
         let tool_run_viewport_height = tool_run_viewport_height(terminal_size.height as usize);
-        // Frozen to the last committed frame during an input-only redraw so the
-        // committed-snapshot lookup below is keyed to the width that snapshot
-        // was actually rendered at.
-        // A cold draw (first paint of a resumed thread, or after a cache
-        // reset) would render the whole transcript at the gutterless width and
-        // then again with the scrollbar gutter once it overflows. A thread
-        // that fills the screen is the common case, so start there; a short
-        // one only re-renders a few rows.
-        let cold_render = !input_fast_path
-            && self.transcript_render_cache.is_none()
-            && self.transcript_full_render_cache.is_none();
-        let full_transcript_width = if cold_render {
-            transcript_width_with_gutter(content_width)
-        } else {
-            transcript_frame_width(
-                content_width,
-                input_fast_path,
-                self.last_committed_viewport_render
-                    .as_ref()
-                    .map(|(width, ..)| *width),
-            )
-        };
+        // The scrollbar gutter is always reserved, so history lays out at one
+        // width whether or not it overflows: right-aligned timers do not shift
+        // when the scrollbar appears, and a frame never renders twice.
+        let full_transcript_width = transcript_width_with_gutter(content_width);
+        let transcript_width = full_transcript_width;
         if !input_fast_path {
             // This draw replaces both snapshots. Releasing them first leaves the
             // transcript sole owner of its last render, so it can redraw only
@@ -9600,7 +9583,7 @@ impl BorgTerminal {
                         active_message_placeholder(self.steer_active_turn),
                     ),
                     SessionStatus::WaitingForApproval => "Allow · Y   Deny · N",
-                    _ => ui_text(ui_language, "Describe a task…"),
+                    _ => ui_text(ui_language, "Tell Borg what you want…"),
                 }
             };
             let style = composer_placeholder_style(
@@ -9665,60 +9648,12 @@ impl BorgTerminal {
             (composer_cursor.0 as u16)
                 .saturating_sub(composer_height.saturating_sub(composer_border_rows + 1))
         };
-        let transcript_viewport_height = if is_launch_screen {
-            0
-        } else {
-            let area = centered_content_area_with_margin(
-                Rect::new(0, 0, terminal_size.width, terminal_size.height),
-                self.horizontal_margin,
-            );
-            let chunks = terminal_vertical_chunks(
-                area,
-                queued_prompt_panel_height(
-                    &queued_prompts,
-                    area.width,
-                    self.pending_input_expanded,
-                ),
-                composer_height,
-                footer_height,
-                is_launch_screen,
-            );
-            usize::from(chunks[0].height)
-        };
-        let transcript_width = transcript_width_for_viewport(
-            content_width,
-            full_transcript_render.0.len(),
-            transcript_viewport_height,
-        );
-        let transcript_render =
-            if reuse_current_transcript_width(input_fast_path, transcript_snapshot_current)
-                && transcript_width == full_transcript_width
-            {
-                Arc::clone(&full_transcript_render)
-            } else if transcript_width == full_transcript_width {
-                if self.focused_tool.is_none() {
-                    self.transcript_render_cache = self.transcript_full_render_cache.clone();
-                }
-                Arc::clone(&full_transcript_render)
-            } else if let Some(index) = self.focused_tool {
-                Arc::new(self.transcript.render_tool_for_cache_at(
-                    index,
-                    transcript_width,
-                    tool_run_viewport_height,
-                    render_time,
-                ))
-            } else {
-                cached_transcript_render(
-                    &self.transcript,
-                    &mut self.transcript_render_cache,
-                    transcript_width,
-                    tool_run_viewport_height,
-                    goal_tick,
-                    &current_tool_elapsed,
-                    local_date,
-                    render_time,
-                )
-            };
+        if !reuse_current_transcript_width(input_fast_path, transcript_snapshot_current)
+            && self.focused_tool.is_none()
+        {
+            self.transcript_render_cache = self.transcript_full_render_cache.clone();
+        }
+        let transcript_render = Arc::clone(&full_transcript_render);
         self.active_transcript_render = Some(Arc::clone(&transcript_render));
         let (
             transcript,
@@ -16787,9 +16722,9 @@ fn composer_placeholder_style(focused_subagent: bool, needs_attention: bool) -> 
 
 fn active_message_placeholder(steer_active: bool) -> &'static str {
     if steer_active {
-        "Type a follow-up to redirect the current turn now…"
+        "Tell Borg what to change…"
     } else {
-        "Type a follow-up to send after the current turn finishes…"
+        "Tell Borg what to do next…"
     }
 }
 
@@ -17075,24 +17010,7 @@ fn reuse_current_transcript_width(input_fast_path: bool, snapshot_current: bool)
     input_fast_path && snapshot_current
 }
 
-fn transcript_width_for_viewport(
-    content_width: u16,
-    transcript_height: usize,
-    viewport_height: usize,
-) -> usize {
-    if transcript_height > viewport_height {
-        transcript_width_with_gutter(content_width)
-    } else {
-        transcript_width_without_gutter(content_width)
-    }
-}
-
-/// The transcript width when history fits on screen and no scrollbar is drawn.
-fn transcript_width_without_gutter(content_width: u16) -> usize {
-    content_width.max(1) as usize
-}
-
-/// The transcript width when a scrollbar is drawn and its gutter is reserved.
+/// The transcript width: the scrollbar gutter is always reserved.
 /// A terminal too narrow to spare the lane keeps every column it has.
 fn transcript_width_with_gutter(content_width: u16) -> usize {
     if content_width > 4 {
@@ -17102,32 +17020,6 @@ fn transcript_width_with_gutter(content_width: u16) -> usize {
     } else {
         content_width.max(1) as usize
     }
-}
-
-/// The width a frame lays history out at before its own height is known.
-///
-/// An ordinary frame measures at the ungutted width and lets
-/// `transcript_width_for_viewport` reserve the gutter once the measured height
-/// proves history overflows. An input-only redraw must not re-decide that: the
-/// transcript is unchanged, so the width the last committed frame was rendered
-/// at is still the correct one, and it is the width that frame is cached under.
-/// Measuring at any other width keys the committed-snapshot lookup to a width
-/// the snapshot was never rendered at, misses on every keystroke, and rebuilds
-/// the history the fast path exists to reuse. A committed width that no longer
-/// belongs to this terminal is discarded, so a resize still measures afresh.
-fn transcript_frame_width(
-    content_width: u16,
-    input_fast_path: bool,
-    committed_width: Option<usize>,
-) -> usize {
-    // Overflowing history stays guttered. Measuring it ungutted first laid
-    // out a newly viewed agent's whole transcript a second time.
-    committed_width
-        .filter(|width| {
-            *width == transcript_width_with_gutter(content_width)
-                || (input_fast_path && *width == transcript_width_without_gutter(content_width))
-        })
-        .unwrap_or_else(|| transcript_width_without_gutter(content_width))
 }
 
 fn responsive_launch_width(available: u16) -> u16 {

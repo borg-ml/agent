@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.19.7)
 
+- Right-aligned timers in the transcript no longer jump left when the
+  scrollbar appears: the scrollbar lane is always reserved, so short threads
+  look the same as long ones.
+
+- The composer asks plainly: "Tell Borg what you want…" when idle, and "Tell
+  Borg what to change…" or "Tell Borg what to do next…" while it works. The
+  queued-message hint is now translated too.
+
 ## 0.19.7 (2026-10-27)
 
 - `control_agent_goal` and `team_batch` accept `"pause"`, `"resume"` or

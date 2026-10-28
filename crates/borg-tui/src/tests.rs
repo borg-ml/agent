@@ -10092,35 +10092,6 @@ fn launch_resume_picker_height_is_stable_and_reserved_once() {
     assert!(bounded.saturating_add(6 + 1) <= 24);
 }
 
-#[test]
-fn transcript_gutter_is_reserved_only_when_content_overflows() {
-    assert_eq!(transcript_width_for_viewport(100, 0, 24), 100);
-    assert_eq!(transcript_width_for_viewport(100, 24, 24), 100);
-    assert_eq!(transcript_width_for_viewport(100, 25, 24), 98);
-    assert_eq!(transcript_width_for_viewport(4, 25, 24), 4);
-}
-
-/// An input-only redraw reuses the last committed frame, so it has to measure
-/// at the width that frame was rendered at. Measuring at the ungutted width
-/// instead keys the committed-snapshot lookup to a width the snapshot never
-/// had, misses on every keystroke, and rebuilds history the fast path exists
-/// to reuse.
-#[test]
-fn input_redraw_measures_history_at_the_committed_frame_width() {
-    // Overflowing history committed at the guttered width stays there.
-    assert_eq!(transcript_frame_width(100, true, Some(98)), 98);
-    // History that fit on screen was committed ungutted and stays ungutted.
-    assert_eq!(transcript_frame_width(100, true, Some(100)), 100);
-    // An ordinary frame keeps overflowing history guttered, but re-measures
-    // history that fit at full width.
-    assert_eq!(transcript_frame_width(100, false, Some(98)), 98);
-    assert_eq!(transcript_frame_width(100, false, Some(100)), 100);
-    // Nothing committed yet, so there is no width to hold on to.
-    assert_eq!(transcript_frame_width(100, true, None), 100);
-    // A width from a terminal this narrow no longer belongs to: measure afresh.
-    assert_eq!(transcript_frame_width(100, true, Some(57)), 100);
-}
-
 /// What a frame of a fast reasoning stream costs end to end: the deltas applied
 /// and the terminal drawn, through a real terminal, rather than the renderer
 /// measured on its own.
@@ -17202,11 +17173,11 @@ fn focused_subagent_composer_tints_follow_up_and_both_separator_rows() {
 fn active_message_placeholder_explains_both_follow_up_modes() {
     assert_eq!(
         active_message_placeholder(true),
-        "Type a follow-up to redirect the current turn now…"
+        "Tell Borg what to change…"
     );
     assert_eq!(
         active_message_placeholder(false),
-        "Type a follow-up to send after the current turn finishes…"
+        "Tell Borg what to do next…"
     );
 }
 

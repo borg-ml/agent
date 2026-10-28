@@ -92,9 +92,9 @@ fn chinese(value: &str) -> Option<&'static str> {
         "Spanish" => "西班牙语",
         "Russian" => "俄语",
         "What are we working on?" => "我们要做什么？",
-        "Describe a task…" => "描述任务…",
-        "Type a follow-up to redirect the current turn now…" => "输入后续消息以调整当前任务…",
-        "Type a follow-up to send after the current turn…" => "输入将在当前任务后发送的消息…",
+        "Tell Borg what you want…" => "告诉 Borg 你想要什么…",
+        "Tell Borg what to change…" => "告诉 Borg 要改什么…",
+        "Tell Borg what to do next…" => "告诉 Borg 接下来做什么…",
         "send" => "发送",
         "commands" => "命令",
         "palette menu" => "命令面板",
@@ -177,13 +177,9 @@ fn spanish(value: &str) -> Option<&'static str> {
         "Spanish" => "Español",
         "Russian" => "Ruso",
         "What are we working on?" => "¿En qué estamos trabajando?",
-        "Describe a task…" => "Describe una tarea…",
-        "Type a follow-up to redirect the current turn now…" => {
-            "Escribe un mensaje para redirigir el turno actual…"
-        }
-        "Type a follow-up to send after the current turn…" => {
-            "Escribe un mensaje para enviar después del turno actual…"
-        }
+        "Tell Borg what you want…" => "Dile a Borg lo que quieres…",
+        "Tell Borg what to change…" => "Dile a Borg qué cambiar…",
+        "Tell Borg what to do next…" => "Dile a Borg qué hacer después…",
         "send" => "enviar",
         "commands" => "comandos",
         "palette menu" => "menú de comandos",
@@ -266,13 +262,9 @@ fn russian(value: &str) -> Option<&'static str> {
         "Spanish" => "Испанский",
         "Russian" => "Русский",
         "What are we working on?" => "Над чем будем работать?",
-        "Describe a task…" => "Опишите задачу…",
-        "Type a follow-up to redirect the current turn now…" => {
-            "Введите сообщение, чтобы изменить текущий ход…"
-        }
-        "Type a follow-up to send after the current turn…" => {
-            "Введите сообщение для отправки после текущего хода…"
-        }
+        "Tell Borg what you want…" => "Скажите Borg, что вам нужно…",
+        "Tell Borg what to change…" => "Скажите Borg, что изменить…",
+        "Tell Borg what to do next…" => "Скажите Borg, что делать дальше…",
         "send" => "отправить",
         "commands" => "команды",
         "palette menu" => "палитра команд",
