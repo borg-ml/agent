@@ -17,6 +17,7 @@ mod composer_undo;
 mod key_hints;
 mod markdown;
 mod rendering;
+mod settings;
 mod terminal_input;
 #[cfg(test)]
 use borg_view::projection_helpers::effective_subagent_status;
@@ -103,6 +104,7 @@ use self::markdown::{
     markdown_lines, markdown_link_ranges, markdown_plain_text, open_link, resolve_link,
     truncate_table_cell,
 };
+use self::settings::{SettingsEffect, SettingsScreen, SettingsValues};
 use self::terminal_input::TerminalInput;
 pub use self::terminal_input::{
     TerminalInputEvent, take_last_enter_read, take_last_escape_read, take_unpainted_key_read,
@@ -653,7 +655,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/claude", "ask the active model to consult its Claude peer"),
     ("/gpt", "ask the active model to consult its GPT peer"),
     ("/peer", "message, clear, or replace a persistent peer"),
-    ("/settings", "view interactive session settings"),
+    ("/settings", "open settings"),
     (
         "/customize",
         "inspect effective settings and extension authority",
@@ -1764,6 +1766,18 @@ pub struct BorgTerminal {
     keybindings_hovered: bool,
     dictation_button_area: Option<Rect>,
     dictation_button_hovered: bool,
+    /// The fullscreen settings screen, while it is open.
+    settings: Option<SettingsScreen>,
+    /// Whether the last frame was the settings screen, so switching in or out
+    /// clears the terminal once and inline images cannot bleed through.
+    settings_painted: bool,
+    settings_button_area: Option<Rect>,
+    settings_button_hovered: bool,
+    refresh_rate_fps: u64,
+    prevent_sleep: bool,
+    prevent_lid_sleep: bool,
+    /// User label, user message, assistant label, assistant message.
+    transcript_colour_hex: [String; 4],
     dictation_state: DictationState,
     dictation_icon: DictationIconStyle,
     running_sweeps: bool,
@@ -1941,6 +1955,7 @@ struct HoverState {
     jump_to_bottom_hovered: bool,
     keybindings_hovered: bool,
     dictation_button_hovered: bool,
+    settings_button_hovered: bool,
 }
 
 impl BorgTerminal {
@@ -1976,6 +1991,7 @@ impl BorgTerminal {
             jump_to_bottom_hovered: self.jump_to_bottom_hovered,
             keybindings_hovered: self.keybindings_hovered,
             dictation_button_hovered: self.dictation_button_hovered,
+            settings_button_hovered: self.settings_button_hovered,
         }
     }
 }
@@ -2053,7 +2069,6 @@ pub struct ResumeSessionOption {
 enum PickerKind {
     ImportSource,
     ImportPreview { threads: bool, memory: bool },
-    Settings,
     Resume,
     Model,
     Effort,
@@ -3205,6 +3220,14 @@ impl BorgTerminal {
             keybindings_hovered: false,
             dictation_button_area: None,
             dictation_button_hovered: false,
+            settings: None,
+            settings_painted: false,
+            settings_button_area: None,
+            settings_button_hovered: false,
+            refresh_rate_fps: 60,
+            prevent_sleep: false,
+            prevent_lid_sleep: false,
+            transcript_colour_hex: Default::default(),
             dictation_state: DictationState::Idle,
             dictation_icon: dictation_icon_style_for_preference(None),
             running_sweeps: true,
@@ -3413,6 +3436,8 @@ impl BorgTerminal {
         self.keybindings_hovered = false;
         self.dictation_button_area = None;
         self.dictation_button_hovered = false;
+        self.settings_button_area = None;
+        self.settings_button_hovered = false;
         self.dictation_state = DictationState::Idle;
         self.tool_hit_areas.clear();
         self.tool_run_hit_areas.clear();
@@ -5765,6 +5790,7 @@ impl BorgTerminal {
         self.jump_to_bottom_hovered = false;
         self.keybindings_hovered = false;
         self.dictation_button_hovered = false;
+        self.settings_button_hovered = false;
     }
 
     /// Focusable status-line controls in reading order, from the last frame.
@@ -6304,81 +6330,149 @@ impl BorgTerminal {
         });
     }
 
-    pub fn open_settings_picker(&mut self, user_label: &str, assistant_label: &str) {
-        let options = vec![
-            "Import threads and memory".to_string(),
-            self.tr("Model").to_string(),
-            "Reasoning effort".to_string(),
-            self.tr("Response language").to_string(),
-            self.tr("UI language").to_string(),
-            "Language servers".to_string(),
-            "Speed tier".to_string(),
-            "Active messages".to_string(),
-            "Refresh rate".to_string(),
-            "Keep machine awake".to_string(),
-            "Auto-expand edits".to_string(),
-            "Auto-expand tools".to_string(),
-            "Auto-expand thinking".to_string(),
-            "Tool click behavior".to_string(),
-            "Response streaming".to_string(),
-            "Action descriptors".to_string(),
-            "Running sweep animations".to_string(),
-            "Composer cursor".to_string(),
-            "Wrap action rows".to_string(),
-            "Action group completion times".to_string(),
-            "Completion notifications".to_string(),
-            "Completion sound".to_string(),
-            "Auto-copy selections".to_string(),
-            "Numbered Ctrl/Cmd hints".to_string(),
-            "Luna titles across providers".to_string(),
-            "Microphone icon".to_string(),
-            "Transcript colours".to_string(),
-            format!("User label · {user_label}"),
-            format!("Assistant label · {assistant_label}"),
-        ];
-        let values = [
-            "/import",
-            "/model",
-            "/effort",
-            "/language",
-            "/ui-language",
-            "/lsp",
-            "/fast",
-            "/followups",
-            "/refresh",
-            "/sleep",
-            "/expand-edits",
-            "/expand-tools",
-            "/expand-thinking",
-            "/tool-click",
-            "/streaming",
-            "/action-descriptors",
-            "/animations",
-            "cursor-style",
-            "/wrap-actions",
-            "/done-at",
-            "/notifications",
-            "/sound",
-            "auto-copy",
-            "key-hints",
-            "luna-titles",
-            "/icons",
-            "/colors",
-            "/user-label",
-            "/assistant-label",
-        ];
-        self.picker = Some(Picker {
-            kind: PickerKind::Settings,
-            title: self.tr("Settings"),
-            options: options
-                .into_iter()
-                .zip(values)
-                .map(|(label, value)| PickerOption::new(label, value))
-                .collect(),
-            selected: 0,
-            query: None,
-            viewport_offset: Cell::new(0),
-        });
+    /// Open the fullscreen settings screen.
+    pub fn open_settings(&mut self) {
+        self.picker = None;
+        self.keybindings_open = false;
+        self.notice = None;
+        self.settings = Some(SettingsScreen::default());
+    }
+
+    pub fn set_refresh_rate(&mut self, fps: u64) {
+        self.refresh_rate_fps = fps;
+    }
+
+    pub fn set_prevent_sleep(&mut self, enabled: bool, lid: bool) {
+        self.prevent_sleep = enabled;
+        self.prevent_lid_sleep = lid;
+    }
+
+    fn settings_values(&self) -> SettingsValues {
+        let config = self.transcript.config.as_ref();
+        let director = self
+            .director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript)
+            .config
+            .as_ref();
+        let colour = |index: usize, colour: Color| {
+            let hex = match (&self.transcript_colour_hex[index], colour) {
+                (hex, _) if !hex.is_empty() => hex.clone(),
+                (_, Color::Rgb(red, green, blue)) => format!("#{red:02x}{green:02x}{blue:02x}"),
+                _ => String::new(),
+            };
+            (hex, colour)
+        };
+        SettingsValues {
+            provider: config.map(|config| config.provider),
+            model: config.and_then(|config| config.model.clone()),
+            effort: config.and_then(|config| config.effort.clone()),
+            fast: config.is_some_and(|config| config.fast),
+            ultrafast: config.is_some_and(|config| config.ultrafast),
+            speed_support: config
+                .map(|config| config.speed_support)
+                .unwrap_or_default(),
+            permission_mode: director.map(|config| config.permission_mode),
+            response_language: director.map(|config| config.response_language),
+            steer_active: self.steer_active_turn,
+            streaming: self.response_streaming,
+            diff_expansion: self.transcript.diff_expansion,
+            auto_expand_tools: self.transcript.auto_expand_tools,
+            auto_expand_thinking: self.transcript.auto_expand_thinking,
+            tool_click: self.tool_click_behavior,
+            action_descriptors: self.action_descriptors,
+            wrap_action_rows: self.transcript.wrap_action_rows,
+            show_done_at: self.transcript.show_action_done_at,
+            ui_language: self.ui_language,
+            user_label: self.transcript.user_label.clone(),
+            assistant_label: self.transcript.assistant_label.clone(),
+            colours: [
+                colour(0, self.transcript.user_label_color),
+                colour(1, self.transcript.user_message_color),
+                colour(2, self.transcript.assistant_label_color),
+                colour(3, self.transcript.assistant_message_color),
+            ],
+            cursor: self.composer_cursor_style,
+            icons: self.dictation_icon,
+            running_sweeps: self.running_sweeps,
+            refresh_fps: self.refresh_rate_fps,
+            notifications: self.completion_notifications,
+            sound: self.completion_sound,
+            prevent_sleep: self.prevent_sleep,
+            prevent_lid_sleep: self.prevent_lid_sleep,
+            auto_copy: self.auto_copy_selection,
+            key_hints: self.key_hints_enabled,
+            luna_titles: self.luna_titles_for_all_providers,
+        }
+    }
+
+    fn handle_settings_event(&mut self, event: Event) -> Result<UiAction> {
+        let values = self.settings_values();
+        let Some(screen) = self.settings.as_mut() else {
+            return Ok(UiAction::None);
+        };
+        let rows = screen.rows(&values);
+        let effect = match event {
+            Event::Key(key) => screen.handle_key(key, &rows),
+            Event::Mouse(mouse) => {
+                let (effect, changed) = screen.handle_mouse(mouse, &rows);
+                self.event_redraw_needed = changed;
+                effect
+            }
+            Event::Paste(text) => {
+                screen.paste(&text);
+                SettingsEffect::None
+            }
+            _ => SettingsEffect::None,
+        };
+        Ok(match effect {
+            SettingsEffect::None => UiAction::None,
+            SettingsEffect::Close => {
+                self.settings = None;
+                UiAction::None
+            }
+            SettingsEffect::Apply(action) => action,
+            SettingsEffect::OpenModelPicker => {
+                self.open_model_picker();
+                UiAction::None
+            }
+            SettingsEffect::CloseAndRun(command) => {
+                self.settings = None;
+                UiAction::Submit {
+                    target: None,
+                    text: command.to_string(),
+                    attachments: Vec::new(),
+                }
+            }
+        })
+    }
+
+    /// Paint the settings screen over the whole terminal.
+    fn draw_settings(&mut self) -> Result<()> {
+        let values = self.settings_values();
+        let notice = self.notice.clone();
+        let icon = settings_icon(self.dictation_icon);
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        execute!(
+            output,
+            crossterm::terminal::BeginSynchronizedUpdate,
+            crossterm::cursor::Hide
+        )?;
+        if !self.settings_painted {
+            clear_terminal_viewport(&mut self.terminal)?;
+            self.settings_painted = true;
+        }
+        let screen = self.settings.as_mut().expect("settings screen is open");
+        let rows = screen.rows(&values);
+        let drawn = self
+            .terminal
+            .draw(|frame| screen.render(frame, &rows, notice.as_deref(), icon))
+            .map(|_| ());
+        let end = execute!(output, crossterm::terminal::EndSynchronizedUpdate);
+        drawn?;
+        end?;
+        Ok(())
     }
 
     pub fn open_import_source_picker(&mut self) {
@@ -7061,6 +7155,12 @@ impl BorgTerminal {
     }
 
     pub fn set_transcript_colors(&mut self, preferences: &TranscriptPreferences) {
+        self.transcript_colour_hex = [
+            preferences.user_label_color.clone(),
+            preferences.user_message_color.clone(),
+            preferences.assistant_label_color.clone(),
+            preferences.assistant_message_color.clone(),
+        ];
         self.transcript.user_label_color = terminal_color(&preferences.user_label_color);
         self.transcript.user_message_color = terminal_color(&preferences.user_message_color);
         self.transcript.assistant_label_color = terminal_color(&preferences.assistant_label_color);
@@ -7220,6 +7320,12 @@ impl BorgTerminal {
             &event,
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved)
         );
+        if self.settings.is_some()
+            && self.picker.is_none()
+            && matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_))
+        {
+            return self.handle_settings_event(event);
+        }
         if self.key_hints_enabled
             && let Event::Key(key) = &event
             && let Some(action) = self.handle_key_hint(*key)?
@@ -7365,6 +7471,9 @@ impl BorgTerminal {
                 self.dictation_button_hovered = self
                     .dictation_button_area
                     .is_some_and(|area| area.contains(pointer));
+                self.settings_button_hovered = self
+                    .settings_button_area
+                    .is_some_and(|area| area.contains(pointer));
                 if background_hover_suppressed {
                     self.clear_background_hover();
                 }
@@ -7416,6 +7525,10 @@ impl BorgTerminal {
                     }
                 }
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    if self.settings_button_hovered {
+                        self.open_settings();
+                        return Ok(UiAction::None);
+                    }
                     if self.dictation_button_hovered {
                         if self.dictation_enabled {
                             return Ok(UiAction::ToggleDictation);
@@ -8800,27 +8913,6 @@ impl BorgTerminal {
                 }
             }
             PickerKind::Commands => unreachable!("handled above"),
-            PickerKind::Settings if picker.options[picker.selected].value == "luna-titles" => {
-                self.open_luna_titles_for_all_providers_picker();
-                UiAction::None
-            }
-            PickerKind::Settings if picker.options[picker.selected].value == "cursor-style" => {
-                self.open_composer_cursor_style_picker();
-                UiAction::None
-            }
-            PickerKind::Settings if picker.options[picker.selected].value == "key-hints" => {
-                self.open_key_hints_picker();
-                UiAction::None
-            }
-            PickerKind::Settings if picker.options[picker.selected].value == "auto-copy" => {
-                self.open_auto_copy_selection_picker();
-                UiAction::None
-            }
-            PickerKind::Settings => UiAction::Submit {
-                target: None,
-                text: picker.selected_value(),
-                attachments: Vec::new(),
-            },
             PickerKind::Resume => UiAction::Submit {
                 target: None,
                 text: format!("/resume {}", picker.selected_value()),
@@ -9057,6 +9149,14 @@ impl BorgTerminal {
     }
 
     fn draw_internal(&mut self, input_fast_path: bool) -> Result<()> {
+        if self.settings.is_some() && self.picker.is_none() {
+            return self.draw_settings();
+        }
+        if self.settings_painted {
+            // Leaving the settings screen: repaint everything, images included.
+            self.settings_painted = false;
+            clear_terminal_viewport(&mut self.terminal)?;
+        }
         self.restore_action_inspector(self.action_inspector_anchor());
         if self.transcript.tool_click_behavior != self.tool_click_behavior {
             self.transcript.tool_click_behavior = self.tool_click_behavior;
@@ -9718,6 +9818,8 @@ impl BorgTerminal {
         let mut next_back_to_director_area = None;
         let mut next_keybindings_hint_area = None;
         let mut next_dictation_button_area = None;
+        let mut next_settings_button_area = None;
+        let settings_button_hovered = self.settings_button_hovered;
         let dictation_state = self.dictation_state;
         let dictation_button_hovered = self.dictation_button_hovered;
         let pending_transcript_anchor = if using_committed_snapshot {
@@ -9800,6 +9902,29 @@ impl BorgTerminal {
                         }),
                     launch_chunks[2],
                 );
+                if self.picker.is_none() {
+                    let label = format!(" {} Settings ", settings_icon(self.dictation_icon));
+                    let screen = frame.area();
+                    let width = (label.width() as u16).min(screen.width);
+                    let button = Rect {
+                        x: screen.right().saturating_sub(width + 1),
+                        y: screen.y.saturating_add(1).min(screen.bottom().saturating_sub(1)),
+                        width,
+                        height: 1,
+                    };
+                    frame.render_widget(
+                        Paragraph::new(label).style(if settings_button_hovered {
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(BORG_ORANGE)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        }),
+                        button,
+                    );
+                    next_settings_button_area = Some(button);
+                }
                 (
                     chunks[4],
                     Rect::default(),
@@ -11592,6 +11717,7 @@ impl BorgTerminal {
             next_back_to_director_area = None;
             next_keybindings_hint_area = None;
             next_dictation_button_area = None;
+            next_settings_button_area = None;
         }
         if picker_open || self.keybindings_open {
             next_team_roster_hit_areas.clear();
@@ -11634,6 +11760,7 @@ impl BorgTerminal {
         self.back_to_director_area = next_back_to_director_area;
         self.keybindings_hint_area = next_keybindings_hint_area;
         self.dictation_button_area = next_dictation_button_area;
+        self.settings_button_area = next_settings_button_area;
         self.scroll_from_bottom = restored_scroll_from_bottom
             .unwrap_or(self.scroll_from_bottom)
             .min(next_scroll_max);
@@ -17746,6 +17873,15 @@ const RELEASE_CHANNEL: &str = "\u{3b2}";
 /// `agent` beneath it says "Borg agent" as a name rather than as two pieces of
 /// branding. Five columns, odd like the other three lines, so the block still
 /// centres as one.
+/// The gear on the splash and the settings title, in the icon set the user
+/// chose so it draws in their terminal font.
+fn settings_icon(style: DictationIconStyle) -> &'static str {
+    match style {
+        DictationIconStyle::NerdFont => "\u{f013}",
+        DictationIconStyle::Emoji => "⚙",
+    }
+}
+
 fn splash_agent_line() -> Line<'static> {
     Line::from(Span::styled("agent", Style::default().fg(Color::White)))
 }

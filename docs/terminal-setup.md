@@ -26,7 +26,7 @@ so there is no visible bottom strip. The physical remainder can still exist.
 
 ## Numbered click hints
 
-Numbered hints can be disabled under /settings → Numbered Ctrl/Cmd hints.
+Numbered hints can be turned off in Settings → System → Shortcut numbers.
 They are enabled by default.
 
 Hold Ctrl (or Cmd/Super where the terminal forwards it) to show up to ten

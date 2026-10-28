@@ -2000,6 +2000,7 @@ fn hover_redraw_gate_ignores_motion_inside_one_target() {
         jump_to_bottom_hovered: false,
         keybindings_hovered: false,
         dictation_button_hovered: false,
+        settings_button_hovered: false,
     };
     let running = HoverState {
         status_hovered: true,

@@ -6,7 +6,7 @@ Borg 的用户配置通常位于 `~/.config/borg`：
 - `agent.toml` 管理提供商、能力、MCP、命令别名、按键和扩展权限；
 - Blu 软件包可以增加技能、工具、工作流和扩展命令。
 
-在交互界面中运行 `/settings` 可打开设置选择器。界面语言可用
+点击启动界面右上角的 **Settings**，或运行 `/settings`，即可打开设置界面。界面语言可用
 `/ui-language` 设置，支持 `auto`、`en`、`zh-Hans`、`es` 和 `ru`：
 
 ```toml

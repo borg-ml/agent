@@ -3,7 +3,7 @@
 Open `/import` in Borg, or run `borg import`. Pick a source, review the counts,
 then select **Import**. **Threads** and **Memory** are both selected by default;
 you can turn either off. Escape cancels the terminal preview without copying.
-Import is also available from `/settings`.
+Import is also available from Settings → System.
 
 | Source | Input |
 | --- | --- |

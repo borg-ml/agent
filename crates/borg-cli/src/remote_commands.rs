@@ -3397,6 +3397,8 @@ async fn run_local_agent_session(
         editor_preferences.interaction.active_messages == ActiveMessageBehavior::Steer;
     if let Some(terminal) = terminal.as_mut() {
         terminal.set_active_message_behavior(steer_active_turn);
+        terminal.set_refresh_rate(tui_fps);
+        terminal.set_prevent_sleep(prevent_sleep, prevent_lid_sleep);
     }
     let mut resume_session = None;
     let mut rewind_prompt = None;
@@ -6238,6 +6240,7 @@ async fn run_local_agent_session(
                     }
                     UiAction::SetRefreshRate(fps) => {
                         tui_fps = fps.clamp(MIN_TUI_FPS, MAX_TUI_FPS);
+                        terminal.as_mut().expect("terminal").set_refresh_rate(tui_fps);
                         render_frame_interval = tui_frame_interval(tui_fps);
                         render_tick = tui_render_interval(render_frame_interval);
                         interaction_tick = tui_render_interval(tui_frame_interval(tui_fps));
@@ -6255,6 +6258,7 @@ async fn run_local_agent_session(
                     UiAction::SetPreventSleep { enabled, lid } => {
                         prevent_sleep = enabled;
                         prevent_lid_sleep = lid;
+                        terminal.as_mut().expect("terminal").set_prevent_sleep(enabled, lid);
                         sleep_inhibitor.set_enabled(enabled);
                         sleep_inhibitor.set_lid_enabled(lid);
                         editor_preferences.interaction.prevent_sleep = enabled;
@@ -6302,6 +6306,7 @@ async fn run_local_agent_session(
                                 editor_preferences.interaction.lid_sleep_setup =
                                     LidSleepSetup::Declined;
                                 prevent_lid_sleep = false;
+                                terminal.set_prevent_sleep(prevent_sleep, false);
                                 sleep_inhibitor.set_lid_enabled(false);
                                 editor_preferences.interaction.prevent_lid_sleep = false;
                                 dispatch_editor_preferences_save(
@@ -7252,13 +7257,7 @@ async fn run_local_agent_session(
                                 .expect("terminal")
                                 .open_active_messages_picker(steer_active_turn);
                         } else if line == "/settings" && attachments.is_empty() {
-                            terminal
-                                .as_mut()
-                                .expect("terminal")
-                                .open_settings_picker(
-                                    &editor_preferences.transcript.user_label,
-                                    &editor_preferences.transcript.assistant_label,
-                                );
+                            terminal.as_mut().expect("terminal").open_settings();
                         } else if line == "/lsp" && attachments.is_empty() {
                             terminal
                                 .as_mut()
@@ -10756,7 +10755,7 @@ fn print_history(events: &[SessionEvent]) {
 fn print_agent_help() {
     println!(
         r#"
-  /settings         show interactive settings
+  /settings         open settings
   /import           copy threads and memory from another assistant
   /customize        inspect effective settings and extension authority
   /ask PROFILE TEXT ask another model through its persistent peer thread

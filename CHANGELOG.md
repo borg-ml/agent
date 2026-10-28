@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.19.7)
 
+- Settings are a real screen now. Click **Settings** in the top-right corner of
+  the start screen, or run `/settings`, to open a fullscreen view grouped into
+  Agent, Transcript, Names & colours, Appearance, Notifications and System.
+  Every option is clickable and changes in place, with ←/→, Enter and Tab for
+  the keyboard; long lists such as languages open a dropdown, names and colours
+  are edited inline with a live colour swatch, and typing searches every
+  setting. Only the focused setting is explained, so the screen stays calm. It
+  also covers Access and Reply language, which the old list did not.
+
 - Right-aligned timers in the transcript no longer jump left when the
   scrollbar appears: the scrollbar lane is always reserved, so short threads
   look the same as long ones.

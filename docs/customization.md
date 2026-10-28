@@ -88,8 +88,11 @@ setting is the same as never having configured one.
 
 ## Interactive agent settings
 
-Run `/settings` to open the settings picker. Changes made by agent UI pickers are
-persisted to `editor.toml`.
+Click **Settings** in the top-right corner of the start screen, or run
+`/settings`, to open the settings screen. It groups every setting below into
+Agent, Transcript, Appearance, Notifications and System. Click an option or use
+←/→ to change it, Tab to move between sections, and type to search; Esc closes
+it. Changes apply at once and are persisted to `editor.toml`.
 
 | Setting | Command | Configuration |
 | --- | --- | --- |
