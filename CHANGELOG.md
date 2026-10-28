@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.19.7)
+## Unreleased (since 0.19.8)
+
+## 0.19.8 (2026-10-28)
 
 - Escape stops a turn promptly even while a burst of team messages is being
   steered into it. The burst used to be admitted one message at a time, each
