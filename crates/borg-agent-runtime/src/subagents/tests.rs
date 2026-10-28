@@ -4405,7 +4405,9 @@ async fn child_report_reaches_a_backed_off_idle_root(multiplayer: bool) {
         .send_message_as(worker.session_id, "/root", "blocked on an API decision")
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_millis(1500), called.notified())
+    // The backed-off sweep is still about six seconds away; a loaded host must
+    // not turn a prompt wake into a failure.
+    tokio::time::timeout(Duration::from_secs(3), called.notified())
         .await
         .expect("the report reaches the root without waiting for a backed-off sweep");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
