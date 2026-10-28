@@ -397,7 +397,10 @@ fn worker_lifecycle_is_independent_of_reports_and_stale_deliveries() {
     stale.updated_at = now + chrono::Duration::hours(1);
     history.push(event(3, &stale, None));
     live.apply(history[2].clone());
-    assert_eq!(live.core.subagents[&child], SubagentStatus::Running);
+    assert_eq!(
+        live.core.effective_subagent_snapshot(child).unwrap().status,
+        SubagentStatus::Running
+    );
     assert!(matches!(
         &live.core.order[0],
         borg_view::entry::TranscriptEntry::Operation(borg_view::entry::Operation {
@@ -497,7 +500,10 @@ fn worker_lifecycle_is_independent_of_reports_and_stale_deliveries() {
     // The two lifecycle receipts form a run, so a group row summarises them.
     assert!(snapshot.rows.iter().filter(|row| !matches!(&row.body, RowBody::ActionGroup { actions, .. } if actions.is_empty())).all(|row| matches!(&row.body, RowBody::ActionGroup { actions, .. }
         if matches!(&actions[0], borg_view::wire::ActionRow::Lifecycle { target_session_id: Some(target), .. } if target == &child.to_string()))));
-    assert_eq!(live.core.subagents[&child], SubagentStatus::Running);
+    assert_eq!(
+        live.core.effective_subagent_snapshot(child).unwrap().status,
+        SubagentStatus::Running
+    );
 }
 
 #[test]
@@ -580,7 +586,10 @@ fn child_metadata_and_coordinator_state_share_a_child_journal_watermark() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(view.core.subagents[&child], SubagentStatus::Running);
+    assert_eq!(
+        view.core.effective_subagent_snapshot(child).unwrap().status,
+        SubagentStatus::Running
+    );
     assert!(matches!(
         view.snapshot().meta.children[0].status,
         Lifecycle::Running
@@ -617,7 +626,10 @@ fn child_metadata_and_coordinator_state_share_a_child_journal_watermark() {
             .lifecycle(),
         SubagentLifecycle::Dormant
     );
-    assert_eq!(view.core.subagents[&child], SubagentStatus::Ready);
+    assert_eq!(
+        view.core.effective_subagent_snapshot(child).unwrap().status,
+        SubagentStatus::Ready
+    );
     assert!(matches!(
         view.snapshot().meta.children[0].status,
         Lifecycle::Waiting

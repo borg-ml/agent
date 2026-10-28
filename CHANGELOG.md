@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.19.7)
 
+- After a restart, the Team panel shows resumed agents as working again within
+  seconds. A restarted session used to re-record every agent's whole history
+  before passing on their current state, so for many minutes agents that
+  `list_agents` reported running were listed as inactive. Working, waiting and
+  inactive counts now all come from the same agent lifecycle.
+
 - The start screen's version always keeps its `v`. A version that would
   otherwise throw the splash off centre gets one extra space after the channel
   glyph instead of losing the prefix.

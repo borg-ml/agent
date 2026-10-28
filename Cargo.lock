@@ -1451,12 +1451,15 @@ name = "borg-view"
 version = "0.19.7"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.23.1",
  "borg-agent-runtime",
  "borg-provider",
  "chrono",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
  "ts-rs",
  "uuid",
 ]

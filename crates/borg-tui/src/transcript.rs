@@ -1211,7 +1211,6 @@ impl Transcript {
         self.order.reserve(event_count);
         self.messages.reserve(event_count / 4);
         self.tools.reserve(event_count / 4);
-        self.subagents.reserve(event_count / 16);
         self.subagent_snapshots.reserve(event_count / 16);
         self.subagent_entries.reserve(event_count / 16);
         self.local_minute_cache.reserve(event_count.min(4_096) / 32);
@@ -2027,13 +2026,6 @@ impl Transcript {
         }
         let signature = self.config.as_ref()?.cache_signature();
         self.cache_diagnostics.status(now, &signature)
-    }
-
-    fn active_subagent_count(&self) -> usize {
-        self.subagents
-            .values()
-            .filter(|status| matches!(status, SubagentStatus::Starting | SubagentStatus::Running))
-            .count()
     }
 
     fn agent_roster_entries(&self) -> Vec<AgentRosterEntry> {

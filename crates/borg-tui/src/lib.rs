@@ -13254,7 +13254,6 @@ fn replace_root_transcript_history(
     // Paging changes conversation rows, not the live roster. Preserve both
     // retained snapshots and compacted inactive IDs, including child overlays.
     replacement.subagent_snapshots = previous.subagent_snapshots.clone();
-    replacement.subagents = previous.subagents.clone();
     replacement.pruned_settled_children = previous.pruned_settled_children.clone();
     replacement.child_meta_refs = previous.child_meta_refs.clone();
     replacement.agent_names = previous.agent_names.clone();

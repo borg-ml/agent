@@ -85,15 +85,33 @@ fn recovery_scan_predicate(parts: RecoveryParts, alias: &str) -> String {
     }
 }
 
-/// Keep only the newest activity row per subagent.
+/// Keep the newest activity row per subagent, plus its newest row that
+/// mirrors a child event.
 ///
-/// A roster needs each child's latest state, not its whole history. SQLite
-/// expressed this with `json_extract(...)` over the body; here the subagent id
-/// is a real column, so the dedup also works for compressed rows.
+/// A roster needs each child's latest state, not its whole history; the
+/// subagent id is a real column, so that dedup also works for compressed rows.
+/// The newest mirrored child event is the parent's delivery cursor for that
+/// child. Parking at shutdown, restore and wakes write snapshot-only rows, so
+/// after any restart the latest row alone carries no cursor and the parent
+/// re-forwarded each child's whole history, one durable row per event, before
+/// any child's current state reached the journal and the Team panel. A row
+/// stored in the opaque body tier is skipped here, which only moves the cursor
+/// back to an older mirrored event.
 const LATEST_SUBAGENT_ROWS: &str = "e.sequence in ( \
-     select max(sequence) from session_events \
-     where session_id = $1 and event_kind = 'subagent_activity' \
-     group by subagent_session_id \
+     select kept.sequence from ( \
+       select subagent_session_id, max(sequence) as latest from session_events \
+       where session_id = $1 and event_kind = 'subagent_activity' \
+       group by subagent_session_id \
+     ) child cross join lateral ( \
+       select child.latest as sequence \
+       union all ( \
+         select sequence from session_events \
+         where session_id = $1 and event_kind = 'subagent_activity' \
+           and subagent_session_id = child.subagent_session_id \
+           and jsonb_typeof(event_json -> 'kind' -> 'event') = 'object' \
+         order by sequence desc limit 1 \
+       ) \
+     ) kept \
    )";
 
 impl PostgresSessionStore {

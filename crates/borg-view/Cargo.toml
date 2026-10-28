@@ -17,3 +17,9 @@ uuid.workspace = true
 anyhow.workspace = true
 borg-provider = { path = "../borg-provider", default-features = false }
 base64.workspace = true
+
+[dev-dependencies]
+borg-agent-runtime = { path = "../borg-agent-runtime", default-features = false, features = ["test-support"] }
+async-trait.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

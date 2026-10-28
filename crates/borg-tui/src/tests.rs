@@ -391,7 +391,10 @@ fn older_root_history_hides_agent_cards_and_preserves_authoritative_roster_state
 
     assert!(displayed.order.is_empty());
     assert_eq!(displayed.active_subagent_count(), 0);
-    assert_eq!(displayed.subagents[&child], SubagentStatus::Stopped);
+    assert_eq!(
+        displayed.subagent_snapshots[&child].status,
+        SubagentStatus::Stopped
+    );
     assert_eq!(displayed.session_usage.total_tokens, 42_000);
     assert_eq!(displayed.session_usage.context_tokens, Some(8_400));
     assert_eq!(
@@ -8452,36 +8455,6 @@ fn wait_spawn_and_lsp_diagnostics_use_compact_stable_result_shapes() {
 }
 
 #[test]
-fn active_subagent_count_includes_starting_and_running_children() {
-    let mut transcript = Transcript::default();
-    assert_eq!(transcript.active_subagent_count(), 0);
-
-    transcript
-        .subagents
-        .insert(Uuid::new_v4(), SubagentStatus::Running);
-    transcript
-        .subagents
-        .insert(Uuid::new_v4(), SubagentStatus::Starting);
-    transcript
-        .subagents
-        .insert(Uuid::new_v4(), SubagentStatus::WaitingForApproval);
-    transcript
-        .subagents
-        .insert(Uuid::new_v4(), SubagentStatus::Stopped);
-    transcript
-        .subagents
-        .insert(Uuid::new_v4(), SubagentStatus::Ready);
-
-    assert_eq!(transcript.active_subagent_count(), 2);
-
-    transcript
-        .subagents
-        .values_mut()
-        .for_each(|status| *status = SubagentStatus::Ready);
-    assert_eq!(transcript.active_subagent_count(), 0);
-}
-
-#[test]
 fn completed_child_turn_does_not_override_worker_execution_state() {
     let event = SessionEventKind::TurnCompleted {
         message_id: Uuid::new_v4(),
@@ -8971,11 +8944,12 @@ fn parked_children_show_as_waiting_and_count_as_active() {
         snapshot("done", SubagentStatus::Ready, None),
         snapshot("broken", SubagentStatus::Failed, None),
         snapshot("live", SubagentStatus::Running, None),
+        snapshot("warming", SubagentStatus::Starting, None),
     ] {
         transcript.upsert_subagent_snapshot(&agent);
     }
 
-    assert_eq!(transcript.active_subagent_count(), 1);
+    assert_eq!(transcript.active_subagent_count(), 2);
     assert_eq!(transcript.waiting_subagent_count(), 1);
     assert_eq!(transcript.inactive_subagent_count(), 2);
     assert_eq!(agents_status_label(1, 1).as_deref(), Some("2 subagents"));
@@ -8984,11 +8958,13 @@ fn parked_children_show_as_waiting_and_count_as_active() {
 
     let rows = transcript.agent_roster_entries();
     assert_eq!(rows[1].name, "live");
-    assert_eq!(rows[2].name, "builder");
-    assert_eq!(rows[2].state, "waiting");
+    assert_eq!(rows[2].name, "warming");
+    assert_eq!(rows[2].state, "starting");
+    assert_eq!(rows[3].name, "builder");
+    assert_eq!(rows[3].state, "waiting");
     let (collapsed, header) = visible_team_roster(&rows, false);
-    assert_eq!(header, Some(3));
-    assert_eq!(collapsed[3].name, "▸ Inactive · 2");
+    assert_eq!(header, Some(4));
+    assert_eq!(collapsed[4].name, "▸ Inactive · 2");
 }
 
 #[test]
@@ -9320,7 +9296,6 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
 
     assert_eq!(transcript.order.len(), 2);
     assert_eq!(transcript.active_subagent_count(), 0);
-    assert_eq!(transcript.subagents[&child_id], SubagentStatus::Ready);
     assert_eq!(
         transcript.subagent_snapshots[&child_id].status,
         SubagentStatus::Ready

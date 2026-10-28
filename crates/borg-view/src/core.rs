@@ -317,7 +317,6 @@ pub struct TranscriptCore {
     pub model_request: Option<ModelRequestDisplay>,
     pub live_turn_closed: bool,
     pub waiting_on_watchers: bool,
-    pub subagents: HashMap<Uuid, SubagentStatus>,
     pub subagent_snapshots: HashMap<Uuid, SubagentSnapshot>,
     /// Settled children dropped from `subagent_snapshots` to bound memory.
     /// Remembered by id so the team's inactive count stays the real total.
@@ -407,7 +406,6 @@ impl Default for TranscriptCore {
             model_request: None,
             live_turn_closed: false,
             waiting_on_watchers: false,
-            subagents: HashMap::new(),
             subagent_snapshots: HashMap::new(),
             pruned_settled_children: HashSet::new(),
             agent_names: HashMap::new(),
@@ -4338,12 +4336,6 @@ impl TranscriptCore {
                     .retain(|a| a.source_session_id != agent.session_id.to_string());
             }
         }
-        let status = self
-            .child_meta_refs
-            .get(&agent.session_id)
-            .and_then(|r| r.snapshot.as_ref())
-            .map_or(snapshot.status, |s| s.status);
-        self.subagents.insert(agent.session_id, status);
         self.subagent_snapshots.insert(agent.session_id, snapshot);
         true
     }
@@ -4863,7 +4855,6 @@ impl TranscriptCore {
                 }
             }));
         }
-        self.subagents.insert(child_id, snapshot.status);
         if newer {
             let usage = &meta.usage;
             let read = |value: &str, current| value.parse::<u64>().unwrap_or(current);
@@ -4908,6 +4899,22 @@ impl TranscriptCore {
         self.refresh_subagent_summary(child_id, false);
         self.prune_child_metadata();
         Ok(true)
+    }
+
+    /// Children that are starting or running a turn. Working, waiting and
+    /// inactive all classify the same effective snapshot lifecycle, the
+    /// runtime's own, so the Team panel cannot drift from `list_agents`.
+    pub fn active_subagent_count(&self) -> usize {
+        self.subagent_snapshots
+            .keys()
+            .filter_map(|id| self.effective_subagent_snapshot(*id))
+            .filter(|agent| {
+                matches!(
+                    agent.lifecycle(),
+                    SubagentLifecycle::Starting | SubagentLifecycle::Running
+                )
+            })
+            .count()
     }
 
     /// Children that are not running, including settled ones pruned from the
@@ -4973,7 +4980,6 @@ impl TranscriptCore {
         for (_, id) in settled.into_iter().take(remove) {
             self.subagent_snapshots.remove(&id);
             self.pruned_settled_children.insert(id);
-            self.subagents.remove(&id);
             self.agent_names.remove(&id);
             self.child_meta_refs.remove(&id);
             self.agent_message_senders.remove(&id);

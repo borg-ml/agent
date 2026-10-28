@@ -3131,6 +3131,9 @@ async fn run_agent_session_store_kernel_inner(
             (!owns_team).then_some(session_id),
             subagents.as_ref().expect("enabled coordinator").clone(),
             session_id,
+            // Recovery keeps each child's newest mirrored event even when a
+            // later snapshot-only row (park, restore, wake) is its latest, so
+            // a restart resumes delivery here instead of from the beginning.
             recovery
                 .subagent_events
                 .iter()
