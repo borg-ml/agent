@@ -4147,15 +4147,18 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
                 spec.restart.defer_while = vec![key.clone()];
                 spec.restart.debounce_ms = 50;
                 spec.readiness_timeout_ms = 5_000;
-                // Every replacement takes 0.8 s to serve.
+                // A replacement does not serve while `hold-ready` exists, so
+                // "not ready yet" does not depend on scheduling.
                 spec.argv[3] = FAKE_HTTP.replace(
                     "class Handler",
-                    "if len(open(record).readlines()) > 1: time.sleep(.8)\nclass Handler",
+                    "while len(open(record).readlines()) > 1 and os.path.exists(os.path.join(os.path.dirname(record), 'hold-ready')): time.sleep(0.01)\nclass Handler",
                 );
             })
             .await;
             let lanes = LaneStore::new(root.path()).unwrap();
             let old = manager.read_status("fake").unwrap().backend_pid.unwrap();
+            let hold_ready = root.path().join("hold-ready");
+            fs::write(&hold_ready, "").unwrap();
             request_restart(&manager).await;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             while launch_count(root.path()) < 2 {
@@ -4178,6 +4181,7 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
                     .is_err(),
                 "{mode:?}: build admitted while the restart was unready"
             );
+            fs::remove_file(&hold_ready).unwrap();
             let lease = tokio::time::timeout(Duration::from_secs(5), build)
                 .await
                 .unwrap()
