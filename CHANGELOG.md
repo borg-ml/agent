@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.19.8)
 
+- Markdown rendering uses pulldown-cmark 0.13.5, which fixes RUSTSEC-2026-0414.
+  Releases now run the same dependency advisory check as CI before tagging, so
+  an advisory stops the release locally instead of after the tag is pushed.
+
 ## 0.19.8 (2026-10-28)
 
 - Escape stops a turn promptly even while a burst of team messages is being

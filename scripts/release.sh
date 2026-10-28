@@ -300,6 +300,8 @@ run_release_checks() (
   test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/b.XXXXXX")"
   trap 'rm -rf -- "$test_tmp"' EXIT
   cargo fmt --all
+  # The same advisory gate CI applies, before the tag rather than after it.
+  run_build cargo deny check advisories bans licenses sources
   TMPDIR="$test_tmp" run_build cargo test --workspace --exclude borg-gui --locked -- --test-threads=1
   run_build cargo clippy --workspace --exclude borg-gui --all-targets --locked -- -D warnings
   git diff --check -- Cargo.toml Cargo.lock CHANGELOG.md

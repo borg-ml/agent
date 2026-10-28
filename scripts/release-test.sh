@@ -301,7 +301,7 @@ chmod +x "$fake_bin/df"
     fi
 FAKE_CARGO
   echo '    ;;'
-  echo '  fmt|clippy)'
+  echo '  fmt|clippy|deny)'
   echo '    ;;'
   echo '  test)'
   echo '    if [[ "${FAKE_CARGO_FAIL:-}" == signal ]]; then'
