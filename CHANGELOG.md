@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.19.8)
+## Unreleased (since 0.19.9)
+
+## 0.19.9 (2026-10-28)
 
 - Markdown rendering uses pulldown-cmark 0.13.5, which fixes RUSTSEC-2026-0414.
   Releases now run the same dependency advisory check as CI before tagging, so
