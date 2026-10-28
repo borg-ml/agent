@@ -25337,14 +25337,22 @@ async fn promote_moves_live_authority_and_restores_without_moving_session_state(
         )
         .await
         .unwrap();
-        assert_eq!(
-            before.latest_sequence,
-            store
-                .state(successor.session_id)
-                .await
-                .unwrap()
-                .latest_sequence,
-            "promotion must not rewrite the successor journal"
+        // As director the successor now projects its teammates' plans; that
+        // refresh is asynchronous and the only thing promotion may add.
+        let added: Vec<_> = store
+            .events_after(successor.session_id, before.latest_sequence, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .filter(|kind| {
+                !matches!(kind, SessionEventKind::AgentPlanProjected { session_id, .. }
+                    if *session_id != successor.session_id)
+            })
+            .collect();
+        assert!(
+            added.is_empty(),
+            "promotion must not rewrite the successor journal: {added:?}"
         );
         assert!(!has_consult(&old_dispatcher));
         assert!(has_consult(&promoted_dispatcher));
