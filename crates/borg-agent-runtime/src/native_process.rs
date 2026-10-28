@@ -450,7 +450,10 @@ impl ProcessManager {
             terminate_process_tree(pid).await;
             let _ = child.wait().await;
             startup.pid = None;
-            return Err(error.context("failed to journal native process start"));
+            // Tool boundaries often display only Error::to_string(). Keep the journal cause visible there;
+            // otherwise a transient database failure is indistinguishable from a process-spawn failure.
+            let message = format!("failed to journal native process start: {error:#}");
+            return Err(error.context(message));
         }
 
         // Pipe draining must not wait on database publication: otherwise a

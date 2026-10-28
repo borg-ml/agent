@@ -1,5 +1,7 @@
 # Changelog
 
+- Native process startup errors now include the underlying journal error in the tool-visible message, rather than hiding the cause behind a generic failure.
+
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
