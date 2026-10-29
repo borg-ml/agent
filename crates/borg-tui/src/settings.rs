@@ -71,6 +71,14 @@ impl SettingsSection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SettingId {
     Model,
+    CommitModel,
+    CommitEffort,
+    CustomCommitModel,
+    StreamingRefreshRate,
+    HorizontalMargin,
+    ComposerHeight,
+    Footer,
+    Dictation,
     Effort,
     Speed,
     Access,
@@ -163,6 +171,10 @@ pub(crate) struct SettingsValues {
     pub(crate) auto_copy: bool,
     pub(crate) key_hints: bool,
     pub(crate) luna_titles: bool,
+    pub(crate) commit_model: String,
+    pub(crate) configured_models: Vec<borg_provider::DynamicModelEntry>,
+    pub(crate) streaming_refresh_fps: u64,
+    pub(crate) layout: borg_ui::preferences::LayoutPreferences,
 }
 
 const REFRESH_RATES: [u64; 7] = [30, 60, 90, 120, 144, 165, 240];
@@ -219,6 +231,10 @@ pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
         (None, Some(provider)) => format!("Default · {}", provider.label()),
         (None, None) => "Default".to_string(),
     };
+    let commit = CommitMessageModel::parse(&values.commit_model);
+    let commit_efforts =
+        borg_provider::gateway_effort_levels(commit.model_id(), &values.configured_models)
+            .unwrap_or_else(|| effort_picker_options(commit.provider(), Some(commit.model_id())));
     let efforts = effort_picker_options(values.provider, values.model.as_deref());
     let effort = if efforts.is_empty() {
         SettingRow {
@@ -337,6 +353,42 @@ pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
                 Some(usize::from(!values.steer_active)),
             ),
         ),
+        row(
+            Id::CommitModel,
+            Section::Agent,
+            "Commit message model",
+            "Independent of chat. Search all supported models and configured providers for click-to-commit drafts.",
+            SettingControl::Action(commit.model.clone()),
+        ),
+        row(
+            Id::CustomCommitModel,
+            Section::Agent,
+            "Custom commit model",
+            "Any model-only route: MODEL@EFFORT or PROVIDER::MODEL@EFFORT (for example open_router::vendor/model). External agent-loop routes cannot draft safely.",
+            SettingControl::Text(values.commit_model.clone()),
+        ),
+        SettingRow {
+            enabled: !commit_efforts.is_empty(),
+            ..row(
+                Id::CommitEffort,
+                Section::Agent,
+                "Commit reasoning",
+                "How much reasoning the commit drafter uses. Does not change chat reasoning.",
+                SettingControl::Choice {
+                    selected: commit_efforts
+                        .iter()
+                        .position(|effort| *effort == commit.effort),
+                    disabled: commit_efforts
+                        .iter()
+                        .map(|effort| {
+                            effort == "none"
+                                && !effort_is_optional(commit.provider(), Some(commit.model_id()))
+                        })
+                        .collect(),
+                    options: commit_efforts,
+                },
+            )
+        },
         row(
             Id::Streaming,
             Section::Transcript,
@@ -507,6 +559,49 @@ pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
             ),
         ),
         row(
+            Id::StreamingRefreshRate,
+            Section::Appearance,
+            "Streaming refresh rate",
+            "Independent redraw rate while replies stream.",
+            choice(
+                &refresh_labels
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                REFRESH_RATES
+                    .iter()
+                    .position(|fps| *fps == values.streaming_refresh_fps),
+            ),
+        ),
+        row(
+            Id::HorizontalMargin,
+            Section::Appearance,
+            "Horizontal margin",
+            "Space on each side of the conversation, in columns.",
+            SettingControl::Text(values.layout.horizontal_margin.to_string()),
+        ),
+        row(
+            Id::ComposerHeight,
+            Section::Appearance,
+            "Message box height",
+            "Maximum composer height, in rows (3–30).",
+            SettingControl::Text(values.layout.composer_max_height.to_string()),
+        ),
+        row(
+            Id::Footer,
+            Section::Appearance,
+            "Status footer",
+            "Show the bottom status line and working directory.",
+            toggle(values.layout.show_footer),
+        ),
+        row(
+            Id::Dictation,
+            Section::System,
+            "Dictation",
+            "Choose local speech recognition, accelerator and icons without starting the microphone.",
+            SettingControl::Action("Configure…".to_string()),
+        ),
+        row(
             Id::Notifications,
             Section::Notifications,
             "Desktop notification",
@@ -581,6 +676,13 @@ fn choice_action(row: &SettingRow, index: usize) -> Option<UiAction> {
     let option = options.get(index)?;
     let on = index == 1;
     Some(match row.id {
+        Id::CommitEffort => UiAction::SetCommitMessageEffort(option.clone()),
+        Id::StreamingRefreshRate => UiAction::Submit {
+            target: None,
+            text: format!("/refresh streaming {}", REFRESH_RATES[index]),
+            attachments: Vec::new(),
+        },
+        Id::Footer => UiAction::SetShowFooter(on),
         Id::Effort => UiAction::SetEffort(option.clone()),
         Id::Speed => match option.as_str() {
             "Ultrafast" => UiAction::SetUltrafast(true),
@@ -647,6 +749,8 @@ pub(crate) enum SettingsEffect {
     Close,
     Apply(UiAction),
     OpenModelPicker,
+    OpenCommitModelPicker,
+    OpenDictation,
     /// Close the screen, then run a slash command whose result shows in the
     /// conversation.
     CloseAndRun(&'static str),
@@ -822,6 +926,8 @@ impl SettingsScreen {
                 SettingsEffect::None
             }
             SettingControl::Action(_) => match row.id {
+                SettingId::CommitModel => SettingsEffect::OpenCommitModelPicker,
+                SettingId::Dictation => SettingsEffect::OpenDictation,
                 SettingId::Model => SettingsEffect::OpenModelPicker,
                 SettingId::LanguageServers => SettingsEffect::CloseAndRun("/lsp"),
                 SettingId::Import => SettingsEffect::CloseAndRun("/import"),
@@ -836,6 +942,53 @@ impl SettingsScreen {
         };
         let value = value.trim();
         let command = match id {
+            SettingId::CustomCommitModel => {
+                let model = CommitMessageModel::parse(value);
+                if value.is_empty()
+                    || model.model_id().is_empty()
+                    || matches!(
+                        model.provider(),
+                        Some(CodingProvider::Grok | CodingProvider::Muse)
+                    )
+                    || (model.model.starts_with("opencode/")
+                        && !model.model.starts_with("opencode-go/"))
+                {
+                    self.error =
+                        Some("Use a model-only route, not an external agent loop.".to_string());
+                    self.editing = Some((id, value.to_string()));
+                    return SettingsEffect::None;
+                }
+                self.error = None;
+                return SettingsEffect::Apply(UiAction::SetCommitMessageModel(model.label()));
+            }
+            SettingId::HorizontalMargin | SettingId::ComposerHeight => {
+                let max = if id == SettingId::HorizontalMargin {
+                    40
+                } else {
+                    30
+                };
+                let min = if id == SettingId::HorizontalMargin {
+                    0
+                } else {
+                    3
+                };
+                let Ok(number) = value.parse::<u16>() else {
+                    self.error = Some(format!("Enter a number from {min} to {max}."));
+                    self.editing = Some((id, value.to_string()));
+                    return SettingsEffect::None;
+                };
+                if !(min..=max).contains(&number) {
+                    self.error = Some(format!("Enter a number from {min} to {max}."));
+                    self.editing = Some((id, value.to_string()));
+                    return SettingsEffect::None;
+                }
+                self.error = None;
+                return SettingsEffect::Apply(if id == SettingId::HorizontalMargin {
+                    UiAction::SetHorizontalMargin(number)
+                } else {
+                    UiAction::SetComposerMaxHeight(number)
+                });
+            }
             SettingId::UserLabel | SettingId::AssistantLabel => {
                 if value.is_empty() {
                     self.error = Some("A name can't be empty.".to_string());
@@ -1764,6 +1917,10 @@ mod tests {
             auto_copy: true,
             key_hints: true,
             luna_titles: false,
+            commit_model: DEFAULT_COMMIT_MESSAGE_MODEL.to_string(),
+            configured_models: Vec::new(),
+            streaming_refresh_fps: 120,
+            layout: Default::default(),
         }
     }
 

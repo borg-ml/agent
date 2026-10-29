@@ -3094,6 +3094,7 @@ async fn run_local_agent_session(
                 &agent_config.keybindings,
             )?;
             terminal.set_configured_model_entries(agent_config.configured_model_entries());
+            terminal.set_commit_model_gateways(agent_config.configured_model_gateways());
             terminal.set_extension_commands(extension_catalog.api_snapshot().commands);
             Some(terminal)
         } else {
@@ -3128,6 +3129,7 @@ async fn run_local_agent_session(
         // its messages link name files here.
         terminal.set_local_file_links(true);
         terminal.set_configured_model_entries(agent_config.configured_model_entries());
+        terminal.set_commit_model_gateways(agent_config.configured_model_gateways());
         terminal.set_extension_commands(extension_catalog.api_snapshot().commands);
         let seed_started = std::time::Instant::now();
         terminal.seed_team_roster(&team_snapshots);
@@ -3178,6 +3180,15 @@ async fn run_local_agent_session(
         terminal.set_show_action_done_at(editor_preferences.presentation.show_action_done_at);
         terminal.set_ui_language(editor_preferences.presentation.ui_language);
         terminal.set_layout_preferences(&editor_preferences.layout);
+        terminal.set_commit_message_model(
+            editor_preferences
+                .interaction
+                .commit_message_model
+                .as_deref(),
+        );
+        terminal.set_streaming_refresh_rate(u64::from(
+            editor_preferences.presentation.streaming_refresh_rate_fps,
+        ));
         terminal.set_completion_alerts(
             editor_preferences.interaction.completion_notifications,
             editor_preferences.interaction.completion_sound,
@@ -3710,6 +3721,7 @@ async fn run_local_agent_session(
                             terminal.set_configured_model_entries(
                                 agent_config.configured_model_entries(),
                             );
+                            terminal.set_commit_model_gateways(agent_config.configured_model_gateways());
                             terminal.set_extension_commands(
                                 extension_catalog.api_snapshot().commands,
                             );
@@ -4489,6 +4501,8 @@ async fn run_local_agent_session(
                                     editor_preferences.presentation.ui_language,
                                 );
                                 terminal.set_layout_preferences(&editor_preferences.layout);
+                                terminal.set_commit_message_model(editor_preferences.interaction.commit_message_model.as_deref());
+                                terminal.set_streaming_refresh_rate(u64::from(editor_preferences.presentation.streaming_refresh_rate_fps));
                                 terminal.set_completion_alerts(
                                     editor_preferences.interaction.completion_notifications,
                                     editor_preferences.interaction.completion_sound,
@@ -5324,6 +5338,7 @@ async fn run_local_agent_session(
                     match value.trim().parse::<u64>() {
                         Ok(rate @ MIN_TUI_FPS..=MAX_TUI_FPS) => {
                             tui_streaming_fps = rate;
+                            if let Some(terminal) = terminal.as_mut() { terminal.set_streaming_refresh_rate(rate); }
                             editor_preferences.presentation.streaming_refresh_rate_fps =
                                 u16::try_from(rate).expect("bounded refresh rate fits u16");
                             editor_preferences.save_changes(&previous_preferences)?;
@@ -6133,6 +6148,9 @@ async fn run_local_agent_session(
                                 restored.set_active_message_behavior(steer_active_turn);
                                 restored.set_key_hints(editor_preferences.interaction.key_hints);
                                 restored.set_configured_model_entries(agent_config.configured_model_entries());
+                                restored.set_commit_model_gateways(agent_config.configured_model_gateways());
+                                restored.set_commit_message_model(editor_preferences.interaction.commit_message_model.as_deref());
+                                restored.set_streaming_refresh_rate(u64::from(editor_preferences.presentation.streaming_refresh_rate_fps));
                                 restored.set_extension_commands(extension_catalog.api_snapshot().commands);
                                 let composer_history = store
                                     .recent_user_messages(session_id, RICH_TUI_PROMPT_HISTORY_LIMIT)
@@ -6477,6 +6495,38 @@ async fn run_local_agent_session(
                             completion_alert_policy_name(policy)
                         ));
                     }
+                    UiAction::SetCommitMessageEffort(effort) => {
+                        let current = editor_preferences.interaction.commit_message_model.clone()
+                            .or_else(|| std::env::var("BORG_COMMIT_MODEL").ok())
+                            .unwrap_or_else(|| "gpt-6-luna@low".to_string());
+                        let model = current.rsplit_once('@').map_or(current.as_str(), |(model, _)| model);
+                        let spec = format!("{model}@{effort}");
+                        editor_preferences.interaction.commit_message_model = Some(spec.clone());
+                        dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
+                        terminal.as_mut().expect("terminal").set_commit_message_model(Some(&spec));
+                    }
+                    UiAction::SetCommitMessageModel(spec) => {
+                        editor_preferences.interaction.commit_message_model = Some(spec.clone());
+                        dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_commit_message_model(Some(&spec));
+                        terminal.set_notice(format!("Commit message model: {spec}"));
+                    }
+                    UiAction::SetHorizontalMargin(value) => {
+                        editor_preferences.layout.horizontal_margin = value;
+                        dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
+                        terminal.as_mut().expect("terminal").set_layout_preferences(&editor_preferences.layout);
+                    }
+                    UiAction::SetComposerMaxHeight(value) => {
+                        editor_preferences.layout.composer_max_height = value;
+                        dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
+                        terminal.as_mut().expect("terminal").set_layout_preferences(&editor_preferences.layout);
+                    }
+                    UiAction::SetShowFooter(value) => {
+                        editor_preferences.layout.show_footer = value;
+                        dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
+                        terminal.as_mut().expect("terminal").set_layout_preferences(&editor_preferences.layout);
+                    }
                     UiAction::SetLunaTitlesForAllProviders(enabled) => {
                         editor_preferences.interaction.luna_titles_for_all_providers = enabled;
                         dispatch_editor_preferences_save(
@@ -6544,6 +6594,7 @@ async fn run_local_agent_session(
                         model,
                         accelerator,
                         icon,
+                        record,
                     } => {
                         editor_preferences.interaction.dictation_enabled = true;
                         editor_preferences.presentation.dictation_model = Some(model.clone());
@@ -6565,7 +6616,9 @@ async fn run_local_agent_session(
                         let terminal = terminal.as_mut().expect("terminal");
                         terminal.set_dictation_icon(icon);
                         terminal.set_dictation_settings(true, Some(model));
-                        if dictation_task.is_none()
+                        if !record {
+                            terminal.set_notice("Dictation settings saved · use the microphone button to record".to_string());
+                        } else if dictation_task.is_none()
                             && dictation_setup_task.is_none()
                             && dictation_start_task.is_none()
                         {
@@ -7557,6 +7610,7 @@ async fn run_local_agent_session(
                             match value.trim().parse::<u64>() {
                                 Ok(rate @ MIN_TUI_FPS..=MAX_TUI_FPS) => {
                                     tui_streaming_fps = rate;
+                                    if let Some(terminal) = terminal.as_mut() { terminal.set_streaming_refresh_rate(rate); }
                                     editor_preferences.presentation.streaming_refresh_rate_fps =
                                         u16::try_from(rate).expect("bounded refresh rate fits u16");
                                     dispatch_editor_preferences_save(
@@ -8140,6 +8194,9 @@ async fn run_local_agent_session(
                                         ));
                                         restored.set_local_file_links(true);
                                         restored.set_configured_model_entries(agent_config.configured_model_entries());
+                                        restored.set_commit_model_gateways(agent_config.configured_model_gateways());
+                                        restored.set_commit_message_model(editor_preferences.interaction.commit_message_model.as_deref());
+                                        restored.set_streaming_refresh_rate(u64::from(editor_preferences.presentation.streaming_refresh_rate_fps));
                                         restored.set_extension_commands(extension_catalog.api_snapshot().commands);
                                         let composer_history = store
                                             .recent_user_messages(

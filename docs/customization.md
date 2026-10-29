@@ -90,12 +90,17 @@ setting is the same as never having configured one.
 
 Click **Settings** in the top-right corner of the start screen, or run
 `/settings`, to open the settings screen. It groups every setting below into
-Agent, Transcript, Appearance, Notifications and System. Click an option or use
+Agent, Transcript, Names & colours, Appearance, Notifications and System. Click an option or use
 ←/→ to change it, Tab to move between sections, and type to search; Esc closes
 it. Changes apply at once and are persisted to `editor.toml`.
 
 | Setting | Command | Configuration |
 | --- | --- | --- |
+| Commit message model | Settings → Agent | `interaction.commit_message_model = "gpt-6-luna@low"` |
+| Horizontal margin | Settings → Appearance | `layout.horizontal_margin = 0..40` |
+| Composer maximum height | Settings → Appearance | `layout.composer_max_height = 3..30` |
+| Status footer | Settings → Appearance | `layout.show_footer = true` or `false` |
+| Dictation model and accelerator | Settings → System → Dictation | `presentation.dictation_model`, `presentation.dictation_accelerator` |
 | Interface language | `/ui-language` | `presentation.ui_language = "auto"`, `"en"`, `"zh-Hans"`, `"es"`, or `"ru"` |
 | Active-turn messages | `/followups` | `interaction.active_messages = "steer"` or `"queue"` |
 | Keep machine awake | `/sleep lid`, `/sleep idle`, `/sleep off` | `interaction.prevent_sleep = true` or `false`; `interaction.prevent_lid_sleep = true` (default) also blocks lid-close sleep — on macOS this needs a one-time admin approval (Touch ID or password), tracked in `interaction.lid_sleep_setup = "ask"`, `"authorized"`, or `"declined"` |
@@ -113,6 +118,17 @@ it. Changes apply at once and are persisted to `editor.toml`.
 | Dictation icon | `/icons` | `presentation.dictation_icon = "nerd_font"` or `"emoji"` |
 | Transcript labels | `/user-label`, `/assistant-label` | `transcript.user_label`, `transcript.assistant_label` |
 | Transcript colors | `/colors`, `/color` | the four `transcript.*_color` values in `#RRGGBB` form |
+
+The commit-message model is independent of chat and uses the existing connection
+and billing route. The searchable picker includes native subscription models,
+OpenCode Go, API catalogs and configured endpoints; **Custom commit model** also
+accepts `PROVIDER::MODEL@EFFORT`, with provider names such as `anthropic`,
+`open_router`, `vercel`, `kimi`, `glm` and `qwen`. An explicit saved choice takes
+precedence over `BORG_COMMIT_MODEL`; otherwise that environment variable overrides
+the default `gpt-6-luna@low`. Grok, Muse and non-Go OpenCode require external
+agent loops and are not used for background commit drafting. No different model
+or billing route is substituted on failure: the commit uses a file summary and
+reports that fallback. Dictation configuration does not start recording.
 
 Messages sent while a turn is running (`/followups steer`) reach the model at
 its next tool boundary. For `claude-fable-5-1`, Borg frames each one with an instruction to address it

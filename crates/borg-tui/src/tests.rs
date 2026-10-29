@@ -20304,6 +20304,57 @@ fn commit_message_model_spec_parses_with_default_effort() {
         }
     );
     assert_eq!(CommitMessageModel::parse("gpt-5.6-luna").effort, "low");
+    let routed = CommitMessageModel::parse("open_router::vendor/model@high");
+    assert_eq!(routed.provider(), Some(CodingProvider::OpenRouter));
+    assert_eq!(routed.model_id(), "vendor/model");
+    assert_eq!(routed.label(), "open_router::vendor/model@high");
+}
+
+#[tokio::test]
+#[ignore = "requires a PTY; run under script with a sized terminal"]
+async fn commit_model_settings_never_switch_the_chat_model() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = composer_test_terminal(&directory);
+    let session = Uuid::new_v4();
+    terminal.apply_session_event(&SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::SessionConfigured {
+            cwd: directory.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-6.1-sol".into()),
+            effort: Some("high".into()),
+            fast: false,
+            ultrafast: false,
+            permission_mode: PermissionMode::Manual,
+            response_language: ResponseLanguage::default(),
+            speed_support: Default::default(),
+        },
+    ));
+    terminal.set_commit_message_model(Some("gpt-6-luna@low"));
+    terminal.open_commit_model_picker();
+    terminal
+        .handle_event(composer_input(KeyCode::Char('h'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        terminal.picker.as_ref().unwrap().query.as_deref(),
+        Some("h")
+    );
+    terminal.refresh_configuration_picker();
+    let picker = terminal.picker.as_mut().unwrap();
+    assert!(matches!(picker.kind, PickerKind::CommitModel));
+    picker.selected = picker
+        .options
+        .iter()
+        .position(|option| option.value == "claude-haiku-5-5")
+        .unwrap();
+    assert!(
+        matches!(terminal.run_selected_picker().unwrap(), UiAction::SetCommitMessageModel(spec) if spec.starts_with("claude-haiku-5-5@"))
+    );
+    let config = terminal.transcript.config.as_ref().unwrap();
+    assert_eq!(config.provider, CodingProvider::Codex);
+    assert_eq!(config.model.as_deref(), Some("gpt-6.1-sol"));
+    assert_eq!(config.effort.as_deref(), Some("high"));
 }
 
 #[test]

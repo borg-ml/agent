@@ -7,6 +7,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.9)
 
+- The splash bottom line shows the working directory. Settings now include an independent, saved commit-message model picker with reasoning controls and custom model-only routes, plus streaming refresh rate, layout and dictation configuration. Commit drafts support native subscription/API routes and configured gateways without switching the chat model; unavailable drafts visibly fall back to a file summary.
+
 - Escape sends queued input immediately instead of leaving it as “Next”; pending-input flushes cancel generation through the fast interrupt signal before recovery I/O or a full actor queue, while preserving the composer draft.
 - Session delivery boundaries no longer wait for a busy workspace mirror or replay its backlog on the foreground actor, keeping interruption and queued-input handoff responsive while background repair preserves delivery order.
 

@@ -148,6 +148,8 @@ pub struct InteractionPreferences {
     pub dictation_enabled: bool,
     /// The model the last interactive session ran on; new sessions start there.
     pub last_model: Option<borg_remote::ModelRoute>,
+    /// Independent model and reasoning effort for footer commit messages.
+    pub commit_message_model: Option<String>,
 }
 
 impl Default for InteractionPreferences {
@@ -164,6 +166,7 @@ impl Default for InteractionPreferences {
             luna_titles_for_all_providers: false,
             dictation_enabled: false,
             last_model: None,
+            commit_message_model: None,
         }
     }
 }
@@ -590,6 +593,7 @@ keep = true
                 key_hints: false,
                 luna_titles_for_all_providers: true,
                 dictation_enabled: true,
+                commit_message_model: Some("gpt-6-luna@low".to_string()),
                 last_model: Some(borg_remote::ModelRoute {
                     provider: borg_remote::CodingProvider::Codex,
                     model: Some("gpt-6-sol".to_string()),
