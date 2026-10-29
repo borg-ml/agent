@@ -7,6 +7,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.9)
 
+- Trusted local Python/Bun runtimes retain HOME so Git and other user-configured tools work; hosted isolation, explicit opt-outs, and provider-environment filtering are preserved.
+
 - Codex request diagnostics now separate the HTTP-header wait from the first body chunk and first stream event, and record image upload size, without changing model or billing settings.
 
 - Shell and watcher change summaries no longer expose unrelated committed patches when the checkout advances during a command.

@@ -18,19 +18,34 @@ pub(crate) fn configure_sanitized_child_environment(command: &mut Command) {
     }
 }
 
-/// The home directory to give a child running model-authored code, when the
-/// user has opted in with `BORG_RUNTIME_HOME`.
-///
-/// The runtime child gets a fixed environment with no `HOME` by default, which
-/// is what keeps ambient configuration and credentials out of model-authored
-/// code. That is worth keeping as the default, but it also means a
-/// non-negotiable set of tools cannot run there at all: `gh`, `git`, `cargo`,
-/// `pip` and npm all read `~/.config`, and without `HOME` they report the user
-/// as logged out rather than failing with something actionable. The setting
-/// names the trade-off instead of leaving it implicit, and the child still
-/// receives nothing else from the supervisor's environment.
+/// Trusted local runtimes use the user's tool configuration, just like shell
+/// execution. Hosted isolation and explicit opt-outs keep HOME absent; neither
+/// path inherits provider/deployment environment variables.
 pub(crate) fn configure_runtime_environment(command: &mut Command) {
     configure_sanitized_child_environment(command);
+    if let Some(home) = runtime_home(
+        std::env::var("BORG_RUNTIME_HOME").ok().as_deref(),
+        std::env::var("BORG_HOST_EXECUTION_PROFILE").ok().as_deref(),
+        std::env::var("HOME").ok(),
+    ) {
+        command.env("HOME", home);
+        if cfg!(windows)
+            && let Ok(profile) = std::env::var("USERPROFILE")
+        {
+            command.env("USERPROFILE", profile);
+        }
+    }
+}
+
+fn runtime_home(
+    setting: Option<&str>,
+    execution_profile: Option<&str>,
+    supervisor_home: Option<String>,
+) -> Option<String> {
+    if setting.is_some() || execution_profile == Some("isolated_hosted") {
+        return home_for_opt_in(setting, supervisor_home);
+    }
+    supervisor_home.filter(|home| !home.is_empty())
 }
 
 pub fn configure_host_child_environment(command: &mut Command) {
@@ -41,9 +56,8 @@ pub fn configure_host_child_environment(command: &mut Command) {
 
 /// The supervisor's home directory when `BORG_RUNTIME_HOME` opts in.
 ///
-/// Opt-in rather than default: the child runs code the model wrote, and `HOME`
-/// is the fastest route from there to a user's dotfiles. Off by default; on for
-/// anyone whose work needs tools that read user configuration.
+/// Sanitized MCP and hosted children stay opt-in. Trusted local runtimes
+/// additionally apply their local-home policy in `configure_runtime_environment`.
 pub(crate) fn opted_in_home() -> Option<String> {
     home_for_opt_in(
         std::env::var("BORG_RUNTIME_HOME").ok().as_deref(),
@@ -183,6 +197,58 @@ mod tests {
     /// The setting exists because tools that read user configuration cannot run
     /// at all without it: `gh` reports logged-out rather than failing usefully.
     /// Off stays off, on hands over exactly `HOME` and nothing else.
+    #[test]
+    fn local_runtime_home_respects_isolation_and_explicit_opt_out() {
+        for profile in [None, Some("local")] {
+            assert_eq!(
+                runtime_home(None, profile, Some("/home/u".into())),
+                Some("/home/u".into())
+            );
+            for off in ["", "0", "false", "no", "off"] {
+                assert_eq!(
+                    runtime_home(Some(off), profile, Some("/home/u".into())),
+                    None
+                );
+            }
+        }
+        assert_eq!(
+            runtime_home(None, Some("isolated_hosted"), Some("/home/u".into())),
+            None
+        );
+        assert_eq!(
+            runtime_home(Some("1"), Some("isolated_hosted"), Some("/home/u".into())),
+            Some("/home/u".into())
+        );
+        assert_eq!(runtime_home(None, None, None), None);
+        assert_eq!(runtime_home(None, None, Some(String::new())), None);
+    }
+
+    // Missing HOME caused Git to report existing configured credentials as
+    // unavailable. Check real global-config lookup without reading user files.
+    #[tokio::test]
+    async fn local_runtime_git_finds_its_home_configuration() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            "[borg]\n runtime-test = found\n",
+        )
+        .unwrap();
+        let mut command = Command::new("git");
+        configure_sanitized_child_environment(&mut command);
+        command.env(
+            "HOME",
+            runtime_home(None, None, Some(home.path().to_string_lossy().into_owned())).unwrap(),
+        );
+        command.args(["config", "--global", "--get", "borg.runtime-test"]);
+        let output = command.output().await.expect("git config child");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "found");
+    }
+
     #[test]
     fn home_is_given_only_when_the_user_opts_in() {
         for off in [
