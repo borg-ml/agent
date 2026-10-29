@@ -5926,7 +5926,7 @@ pub(crate) async fn native_user_message(
         });
     }
     Ok(ModelMessage::user_with_attachments(
-        &native_user_message_content(prompt, attachments),
+        native_user_message_content(prompt, attachments),
         encoded,
     ))
 }

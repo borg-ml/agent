@@ -7,6 +7,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.9)
 
+- Linux desktop access recovers from an inherited stale niri IPC socket by verifying the current same-user Wayland compositor and its matching socket, without replaying requests after uncertain delivery.
+
 - Interrupted native-session recovery no longer duplicates an image prompt already recorded in model context, avoiding repeated screenshot uploads while retaining accepted inputs that were not yet recorded.
 
 - Persistent Python runtimes isolate their control pipe from user stdin, so subprocesses that read stdin receive EOF instead of hanging or consuming later runtime requests.

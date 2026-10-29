@@ -4,10 +4,13 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::{Map, Value, json};
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
@@ -108,9 +111,81 @@ fn desktop_scale(scales: impl IntoIterator<Item = Option<f64>>) -> f64 {
 
 // ---- niri: JSON IPC on $NIRI_SOCKET ----------------------------------------
 
+fn socket_peer(stream: &UnixStream) -> Result<libc::ucred> {
+    // SAFETY: ucred is a plain C struct; getsockopt receives its valid buffer.
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    ensure!(
+        length as usize == std::mem::size_of::<libc::ucred>(),
+        "invalid socket credentials"
+    );
+    Ok(credentials)
+}
+
+fn niri_connect(path: &Path, runtime: &Path, display: &Path) -> Result<UnixStream> {
+    match UnixStream::connect(path) {
+        Ok(stream) => return Ok(stream),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) => {}
+        Err(error) => return Err(error.into()),
+    }
+    // A restarted compositor leaves old inherited NIRI_SOCKET values behind.
+    // Identify the current compositor through Wayland, not newest-file guesses.
+    ensure!(
+        display.components().count() == 1 && display.file_name().is_some(),
+        "cannot discover niri for a non-local WAYLAND_DISPLAY"
+    );
+    // SAFETY: geteuid has no arguments or preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let metadata = runtime.metadata()?;
+    ensure!(
+        metadata.is_dir() && metadata.uid() == uid,
+        "niri runtime directory is not owned by the current user"
+    );
+    let compositor = socket_peer(&UnixStream::connect(runtime.join(display))?)?;
+    ensure!(
+        compositor.uid == uid && compositor.pid > 0,
+        "Wayland compositor is not owned by the current user"
+    );
+    let socket = runtime.join(format!(
+        "niri.{}.{}.sock",
+        display.to_string_lossy(),
+        compositor.pid
+    ));
+    let metadata = socket.symlink_metadata()?;
+    ensure!(
+        metadata.file_type().is_socket() && metadata.uid() == uid,
+        "discovered niri socket is not owned by the current user"
+    );
+    let stream = UnixStream::connect(socket)?;
+    let peer = socket_peer(&stream)?;
+    ensure!(
+        peer.uid == uid && peer.pid == compositor.pid,
+        "niri socket does not belong to the current Wayland compositor"
+    );
+    Ok(stream)
+}
+
 pub(super) fn niri_request(request: Value) -> Result<Value> {
     let path = std::env::var_os("NIRI_SOCKET").context("NIRI_SOCKET is not set")?;
-    let mut stream = UnixStream::connect(path)?;
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_default();
+    let display = std::env::var_os("WAYLAND_DISPLAY").unwrap_or_default();
+    let mut stream = niri_connect(Path::new(&path), Path::new(&runtime), Path::new(&display))?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     stream.write_all(format!("{request}\n").as_bytes())?;
@@ -993,6 +1068,48 @@ mod tests {
 
     /// Parsers and mapping decide where injected clicks land; a regression
     /// would click the wrong pixels.
+    // A stale inherited endpoint must recover, without selecting an unrelated
+    // compositor or changing the behavior of an explicitly working endpoint.
+    #[test]
+    fn stale_niri_socket_follows_current_wayland_peer() {
+        use std::os::unix::net::UnixListener;
+        let root = tempfile::tempdir().unwrap();
+        let display = Path::new("wayland-test");
+        let _wayland = UnixListener::bind(root.path().join(display)).unwrap();
+        let current = root
+            .path()
+            .join(format!("niri.wayland-test.{}.sock", std::process::id()));
+        let _niri = UnixListener::bind(current).unwrap();
+        let stale = root.path().join("stale.sock");
+        drop(UnixListener::bind(&stale).unwrap());
+        assert!(niri_connect(&stale, root.path(), display).is_ok());
+        // Unexpected failures must not silently redirect to another endpoint.
+        std::fs::write(root.path().join("not-a-directory"), b"").unwrap();
+        assert!(
+            niri_connect(
+                &root.path().join("not-a-directory/socket"),
+                root.path(),
+                display
+            )
+            .is_err()
+        );
+        assert!(niri_connect(&root.path().join("missing.sock"), root.path(), display).is_ok());
+        assert!(niri_connect(&stale, root.path(), Path::new("../wayland-test")).is_err());
+        // Do not scan another live socket when the exact current one is absent.
+        let wrong_display = Path::new("wayland-other");
+        let _other = UnixListener::bind(root.path().join(wrong_display)).unwrap();
+        assert!(niri_connect(&stale, root.path(), wrong_display).is_err());
+        // Explicit working endpoints need neither fallback environment variable.
+        assert!(
+            niri_connect(
+                &root.path().join(display),
+                Path::new("/missing"),
+                Path::new("")
+            )
+            .is_ok()
+        );
+    }
+
     #[test]
     fn niri_geometry_only_for_floating_windows_on_active_workspaces() {
         let outputs = json!({"DP-1": {"logical": {"x": 100, "y": 0, "width": 1280, "height": 720, "scale": 2.0}}});
