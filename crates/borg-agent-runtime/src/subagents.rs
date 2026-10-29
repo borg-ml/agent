@@ -3543,9 +3543,6 @@ impl AgentToolDispatcher {
                 }
                 let args: ReleaseIdleArgs = serde_json::from_value(arguments)?;
                 let idle_seconds = args.idle_seconds.unwrap_or(60);
-                if idle_seconds < 60 {
-                    bail!("idle_seconds must be at least 60");
-                }
                 self.lsp.release_idle(idle_seconds).await
             }
             "lsp_status" => {
@@ -10593,8 +10590,8 @@ pub fn agent_tool_specs_for_surface(
         ),
         tool(
             "lsp_release_idle",
-            "Release this session's exclusively leased language servers after at least 60 seconds without analysis. Skips active/queued requests and servers shared with other live sessions. Does not stop the broker or other workers' tools.",
-            json!({"type":"object", "properties":{"idle_seconds":{"type":"integer","minimum":60,"default":60}},"additionalProperties":false}),
+            "Release this session's exclusively leased idle language servers (default 60 seconds without analysis; explicit idle_seconds=0 releases immediately). Skips active/queued requests and servers shared with other live sessions. Does not stop the broker or other workers' tools.",
+            json!({"type":"object", "properties":{"idle_seconds":{"type":"integer","minimum":0,"default":60}},"additionalProperties":false}),
         ),
         tool(
             "lsp_status",

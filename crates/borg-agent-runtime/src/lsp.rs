@@ -478,7 +478,6 @@ impl LspService {
     /// Explicit release affects only this service's exclusively leased idle
     /// slots. Busy/queued requests and other live service owners are preserved.
     pub async fn release_idle(&self, idle_seconds: u64) -> Result<Value> {
-        let idle_seconds = idle_seconds.max(60);
         #[cfg(unix)]
         if let Some(value) = self
             .shared_request(broker::Operation::ReleaseIdle { idle_seconds })
@@ -510,8 +509,7 @@ impl LspService {
                 .map(|state| slot_idle_for(slot, &state));
             let reason = if shared_owner {
                 Some("shared with another session")
-            } else if idle_for.is_some_and(|idle| idle < Duration::from_secs(idle_seconds.max(60)))
-            {
+            } else if idle_for.is_some_and(|idle| idle < Duration::from_secs(idle_seconds)) {
                 Some("recent analysis")
             } else if std::sync::Arc::strong_count(&slot.client) != 1 || idle_for.is_none() {
                 Some("active or queued request")
@@ -528,7 +526,7 @@ impl LspService {
                 false
             } // kill_on_drop owns exactly this child
         });
-        json!({"released": released, "skipped": skipped, "minimum_idle_seconds": idle_seconds.max(60)})
+        json!({"released": released, "skipped": skipped, "minimum_idle_seconds": idle_seconds})
     }
 
     pub fn supported_status() -> Value {
@@ -2653,6 +2651,22 @@ mod tests {
         assert_eq!(released["released"].as_array().unwrap().len(), 1);
     }
 
+    // An explicit emergency release must free a recently used but unowned
+    // idle slot, without weakening the separate busy/shared ownership checks.
+    #[tokio::test]
+    async fn zero_idle_release_frees_recent_exclusively_owned_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let service = LspService::new(root.path());
+        drop(
+            service
+                .lease_client(spec_for_id("clangd").unwrap(), root.path())
+                .await,
+        );
+        let released = service.release_idle_local(0).await;
+        assert_eq!(released["minimum_idle_seconds"], 0);
+        assert_eq!(released["released"].as_array().unwrap().len(), 1);
+    }
+
     // Product boundary: a cleanup request cannot evict another session's
     // shared workspace or a request queued on the same server mutex.
     #[tokio::test]
@@ -2666,7 +2680,7 @@ mod tests {
         first.clients.lock().await.get_mut(&key).unwrap().last_used =
             Instant::now() - Duration::from_secs(120);
         assert!(
-            first.release_idle_local(60).await["released"]
+            first.release_idle_local(0).await["released"]
                 .as_array()
                 .unwrap()
                 .is_empty()
@@ -2681,14 +2695,14 @@ mod tests {
         first.clients.lock().await.get_mut(&key).unwrap().last_used =
             Instant::now() - Duration::from_secs(120);
         assert!(
-            first.release_idle_local(60).await["released"]
+            first.release_idle_local(0).await["released"]
                 .as_array()
                 .unwrap()
                 .is_empty()
         );
         drop(second);
         assert_eq!(
-            first.release_idle_local(60).await["released"]
+            first.release_idle_local(0).await["released"]
                 .as_array()
                 .unwrap()
                 .len(),
