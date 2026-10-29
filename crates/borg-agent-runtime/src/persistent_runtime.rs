@@ -772,11 +772,17 @@ import contextlib
 import io
 import inspect
 import json
+import os
 import sys
 import threading
 import traceback
 import uuid
 
+# User code and its children must not read the host's JSON control stream.
+PROTOCOL_IN = os.fdopen(os.dup(0), "r", encoding="utf-8")
+os.set_inheritable(PROTOCOL_IN.fileno(), False)
+with open(os.devnull, "r") as user_stdin:
+    os.dup2(user_stdin.fileno(), 0)
 PROTOCOL_OUT = sys.__stdout__
 HOST_CALL_LOCK = threading.Lock()
 NAMESPACE = {"__name__": "__borg_runtime__"}
@@ -830,7 +836,7 @@ class Borg:
             }) + "\n")
             PROTOCOL_OUT.flush()
             while True:
-                line = sys.stdin.readline()
+                line = PROTOCOL_IN.readline()
                 if not line:
                     raise RuntimeError("Borg host closed the runtime")
                 message = json.loads(line)
@@ -1248,7 +1254,7 @@ def _run_code(source, stdout, stderr):
     return value
 
 
-for line in sys.stdin:
+for line in PROTOCOL_IN:
     try:
         message = json.loads(line)
         if message.get("type") != "execute":
@@ -2550,6 +2556,35 @@ borg = _sdk_module"#
                 .unwrap()
                 .value,
             43
+        );
+        runtime.stop().await;
+    }
+
+    // Child stdin must be EOF, not the runtime transport. Otherwise a pathless
+    // rg (or any stdin reader) blocks and can steal later protocol requests.
+    #[tokio::test]
+    async fn python_children_cannot_consume_runtime_control_input() {
+        if !python_available().await {
+            return;
+        }
+        let root = tempdir().unwrap();
+        let runtime = PersistentRuntimeWorker::new(root.path().to_path_buf());
+        let result = runtime.execute(
+            "import subprocess, sys\nmarker = 41\nchild = subprocess.run([sys.executable, '-c', 'import sys; print(repr(sys.stdin.read()))'], capture_output=True, text=True, timeout=2)\nassert child.returncode == 0\nassert child.stdout == chr(39) + chr(39) + chr(10)\nassert sys.stdin.read() == ''\nmarker",
+            Some(5_000), Arc::new(TestHost),
+        ).await.unwrap();
+        assert_eq!(result.value, 41);
+        assert_eq!(
+            runtime
+                .execute(
+                    "borg.call('echo', {'answer': marker + 1})",
+                    Some(5_000),
+                    Arc::new(TestHost)
+                )
+                .await
+                .unwrap()
+                .value["answer"],
+            42
         );
         runtime.stop().await;
     }

@@ -7,6 +7,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.9)
 
+- Persistent Python runtimes isolate their control pipe from user stdin, so subprocesses that read stdin receive EOF instead of hanging or consuming later runtime requests.
+
 - Trusted local Python/Bun runtimes retain HOME so Git and other user-configured tools work; hosted isolation, explicit opt-outs, and provider-environment filtering are preserved.
 
 - Codex request diagnostics now separate the HTTP-header wait from the first body chunk and first stream event, and record image upload size, without changing model or billing settings.
