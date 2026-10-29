@@ -106,6 +106,11 @@ impl CommandChangeBaseline {
     pub(crate) fn finish(self) -> Vec<CommandChange> {
         let started = Instant::now();
         let end_head = git_head(&self.root);
+        // A pull, checkout or another process's commit is not this command's edit.
+        // Once HEAD moves there is no trustworthy per-command patch baseline.
+        if end_head != self.head {
+            return Vec::new();
+        }
         let Some(after) = git_status(&self.root) else {
             return Vec::new();
         };
@@ -116,16 +121,6 @@ impl CommandChangeBaseline {
                 .filter(|(path, code)| !self.preexisting.contains(*path) && code.as_str() != "??")
                 .map(|(path, _)| path.clone()),
         );
-        for path in committed_paths(
-            &self.root,
-            self.head.as_deref(),
-            end_head.as_deref(),
-            &self.preexisting,
-        ) {
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
-        }
         paths.extend(
             after
                 .iter()
@@ -147,7 +142,7 @@ impl CommandChangeBaseline {
                 }
                 Some((before.as_deref(), now))
             } else {
-                (after.contains_key(&path) || self.head != end_head).then_some((None, None))
+                after.contains_key(&path).then_some((None, None))
             };
             let Some((before, now)) = changed else {
                 continue;
@@ -203,57 +198,6 @@ fn git_head(root: &Path) -> Option<String> {
     git_output(root, &["rev-parse", "--verify", "HEAD"])
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|head| head.trim().to_string())
-}
-
-fn committed_paths(
-    root: &Path,
-    before: Option<&str>,
-    after: Option<&str>,
-    preexisting: &BTreeSet<String>,
-) -> Vec<String> {
-    let Some(after) = after.filter(|after| Some(*after) != before) else {
-        return Vec::new();
-    };
-    let output = if let Some(before) = before {
-        git_output(
-            root,
-            &[
-                "diff",
-                "--name-only",
-                "-z",
-                "--no-renames",
-                before,
-                after,
-                "--",
-            ],
-        )
-    } else {
-        git_output(
-            root,
-            &[
-                "diff-tree",
-                "--root",
-                "--no-commit-id",
-                "--name-only",
-                "-r",
-                "-z",
-                "--no-renames",
-                after,
-            ],
-        )
-    };
-    let Some(output) = output else {
-        return Vec::new();
-    };
-    output
-        .stdout
-        .split(|byte| *byte == 0)
-        .map(str::from_utf8)
-        .filter_map(Result::ok)
-        .filter(|path| !path.is_empty() && !preexisting.contains(*path))
-        .take(MAX_CHANGE_PATHS)
-        .map(str::to_string)
-        .collect()
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Option<Output> {
@@ -472,6 +416,21 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, "owned.txt");
         assert!(changes[0].diff.contains("+command change"));
+    }
+
+    // This reproduces a build watcher exposing unrelated committed patches. A compiler
+    // cannot check edit provenance when another process advances the shared checkout.
+    #[test]
+    fn head_movement_does_not_expose_unrelated_committed_patches() {
+        let root = tempfile::tempdir().expect("workspace");
+        git_output(root.path(), &["init", "--quiet"]).expect("repository");
+        let mut baseline = CommandChangeBaseline::capture(root.path()).expect("baseline");
+        // A checkout from an existing revision to an unborn branch also changes HEAD.
+        // Model the captured revision without creating a commit or inventing an author.
+        baseline.head = Some("a".repeat(40));
+        fs::create_dir(root.path().join("foreign")).unwrap();
+        fs::write(root.path().join("foreign/patch.txt"), "unrelated source\n").unwrap();
+        assert!(baseline.finish().is_empty());
     }
 
     #[test]

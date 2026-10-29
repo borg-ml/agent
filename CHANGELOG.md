@@ -7,6 +7,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.9)
 
+- Shell and watcher change summaries no longer expose unrelated committed patches when the checkout advances during a command.
+
 ## 0.19.9 (2026-10-28)
 
 - Markdown rendering uses pulldown-cmark 0.13.5, which fixes RUSTSEC-2026-0414.
