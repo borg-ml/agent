@@ -310,11 +310,12 @@ impl OpenAiCompatibleProvider {
                 kind: ProviderErrorKind::Unknown,
             });
         }
-        let api_key = gateway
-            .and_then(|gateway| {
+        let api_key = match gateway {
+            Some(gateway) => {
                 (!gateway.bearer_token.trim().is_empty()).then(|| gateway.bearer_token.clone())
-            })
-            .or_else(|| profile.api_key());
+            }
+            None => profile.api_key(),
+        };
         if api_key.is_none() && profile != OpenAiCompatibleProfile::Generic {
             return Err(ProviderCallError {
                 message: match profile {
@@ -387,7 +388,14 @@ impl OpenAiCompatibleProvider {
                 body["prompt_cache_key"] = json!(prompt_cache_key);
             }
         }
-        apply_reasoning(&mut body, profile, request_model, self.effort.as_deref());
+        let configured_variant = gateway.and_then(|gateway| {
+            self.effort
+                .as_deref()
+                .and_then(|effort| gateway.variant_bodies.get(effort))
+        });
+        if configured_variant.is_none() {
+            apply_reasoning(&mut body, profile, request_model, self.effort.as_deref());
+        }
         match profile {
             OpenAiCompatibleProfile::Kimi => {
                 body["max_completion_tokens"] = json!(kimi_max_completion_tokens());
@@ -406,7 +414,7 @@ impl OpenAiCompatibleProvider {
             OpenAiCompatibleProfile::Glm
             | OpenAiCompatibleProfile::Qwen
             | OpenAiCompatibleProfile::Vercel => {}
-            OpenAiCompatibleProfile::Generic => {
+            OpenAiCompatibleProfile::Generic if gateway.is_none() => {
                 if let Some(max_tokens) = openai_compatible_max_tokens() {
                     body["max_tokens"] = json!(max_tokens);
                 }
@@ -425,6 +433,7 @@ impl OpenAiCompatibleProvider {
                     body_object.extend(extra);
                 }
             }
+            OpenAiCompatibleProfile::Generic => {}
         }
         if let Some(gateway) = gateway {
             merge_gateway_body(&mut body, &gateway.body);
@@ -2797,6 +2806,86 @@ mod tests {
         assert!(k27 < 1_500_000, "k2.7 billed at the k3 rate: {k27}");
         // An unpriced model reports nothing rather than a guess.
         assert_eq!(kimi_cost_microusd(&raw, "kimi-never-shipped"), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn anonymous_custom_endpoint_never_inherits_global_credentials_or_options() {
+        let _lock = OPENROUTER_ENV_LOCK.lock().await;
+        let _key = TestEnvGuard::set(
+            "BORG_OPENAI_COMPATIBLE_API_KEY",
+            "unrelated-provider-secret",
+        );
+        let _options = TestEnvGuard::set(
+            "BORG_OPENAI_COMPATIBLE_EXTRA_BODY",
+            r#"{"unrelated_option":true}"#,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let end = loop {
+                let mut bytes = [0; 4096];
+                let count = socket.read(&mut bytes).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&bytes[..count]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let len: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + len {
+                        break end;
+                    }
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+            let body: Value = serde_json::from_slice(&request[end + 4..]).unwrap();
+            let response = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            (headers, body)
+        });
+        let mut gateway = ModelGateway::new(endpoint, "");
+        gateway.variant_bodies.insert(
+            "Creative".into(),
+            json!({"temperature": 0.8}).as_object().unwrap().clone(),
+        );
+        OpenAiCompatibleProvider {
+            model: "demo".into(),
+            effort: Some("Creative".into()),
+            system_prompt: "",
+        }
+        .model_turn_via(
+            ModelTurnRequest {
+                fast: false,
+                ultrafast: false,
+                request_id: None,
+                session_id: None,
+                prompt_cache_key: None,
+                turn_routing: Default::default(),
+                messages: vec![ModelMessage::user("hello")],
+                tools: Vec::new(),
+                output_schema: None,
+            },
+            None,
+            Some(&gateway),
+        )
+        .await
+        .unwrap();
+        let (headers, body) = server.await.unwrap();
+        assert!(!headers.contains("authorization:"));
+        assert!(!headers.contains("unrelated-provider-secret"));
+        assert!(body.get("unrelated_option").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["temperature"], 0.8);
     }
 
     #[tokio::test(flavor = "current_thread")]

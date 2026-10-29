@@ -263,6 +263,8 @@ pub(crate) struct NativeHarness {
     /// already spelled `provider/model`, so its budget is keyed by that alias
     /// rather than by the generic provider kind prefixed again.
     configured_model_aliases: std::collections::BTreeSet<String>,
+    configured_routes:
+        Arc<std::sync::RwLock<std::collections::BTreeMap<String, Option<ModelGateway>>>>,
     /// `[warming] mode`, unless `BORG_CACHE_WARMING` overrides it.
     warming: CacheWarmingMode,
     /// Persistent controller-selected subscription authorities.
@@ -298,6 +300,7 @@ impl Default for NativeHarness {
             harness: HarnessMode::Borg,
             compaction: CompactionBudgetPolicy::default(),
             configured_model_aliases: std::collections::BTreeSet::new(),
+            configured_routes: Default::default(),
             warming: CacheWarmingMode::default(),
             codex_auth_file: None,
             claude_config_dir: None,
@@ -382,6 +385,36 @@ impl NativeHarness {
             .resolve(provider.config_alias(), model, context_window_tokens)
     }
 
+    pub(crate) fn replace_configured_model_gateways(
+        &self,
+        next: std::collections::BTreeMap<String, ModelGateway>,
+    ) {
+        let mut routes = self
+            .configured_routes
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        // Keep removed aliases as tombstones: they must never fall through to
+        // an unrelated generic endpoint or billing route.
+        for (alias, gateway) in routes.iter_mut() {
+            if !next.contains_key(alias) {
+                *gateway = None;
+            }
+        }
+        routes.extend(
+            next.into_iter()
+                .map(|(alias, gateway)| (alias, Some(gateway))),
+        );
+    }
+
+    pub(crate) fn supports_custom_effort(&self, model: &str, effort: &str) -> bool {
+        self.configured_routes
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(model)
+            .and_then(Option::as_ref)
+            .is_some_and(|gateway| gateway.variant_bodies.contains_key(effort))
+    }
+
     pub(crate) fn with_settings(settings: &super::agent::LocalAgentSettings) -> Self {
         Self {
             model_client: Arc::new(ProviderModelClient {
@@ -403,6 +436,13 @@ impl NativeHarness {
             harness: settings.harness,
             compaction: settings.compaction.clone(),
             configured_model_aliases: settings.configured_model_gateways.keys().cloned().collect(),
+            configured_routes: Arc::new(std::sync::RwLock::new(
+                settings
+                    .configured_model_gateways
+                    .iter()
+                    .map(|(alias, gateway)| (alias.clone(), Some(gateway.clone())))
+                    .collect(),
+            )),
             warming: settings.warming,
             codex_auth_file: None,
             claude_config_dir: None,
@@ -595,6 +635,22 @@ impl NativeHarness {
         model: Option<&str>,
         access: &crate::ModelAccessContext,
     ) -> Result<Self> {
+        if provider == crate::CodingProvider::OpenAiCompatible
+            && let Some(model) = model
+        {
+            let route = self
+                .configured_routes
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(model)
+                .cloned();
+            if let Some(route) = route {
+                let gateway = route.context("This custom provider was removed. Choose a configured model before continuing.")?;
+                let mut bound = self.with_turn_gateway(gateway);
+                bound.configured_model_aliases.insert(model.to_string());
+                return Ok(bound);
+            }
+        }
         if provider == crate::CodingProvider::OpenCode {
             return self.with_opencode_go_access(model, access).await;
         }
@@ -6096,6 +6152,63 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn custom_endpoint_refresh_is_turn_scoped_and_removed_routes_fail_closed() {
+        let provider = crate::CodingProvider::OpenAiCompatible;
+        let alias = "work/demo";
+        let make_gateway = |window| {
+            let mut gateway =
+                ModelGateway::new("http://localhost:12345/v1/chat/completions", "test-key");
+            gateway.model = Some("demo".into());
+            gateway.context_window_tokens = Some(window);
+            gateway
+                .variant_bodies
+                .insert("Creative".into(), Default::default());
+            gateway
+        };
+        let harness = NativeHarness::with_settings(&super::super::agent::LocalAgentSettings {
+            configured_model_gateways: [(alias.to_string(), make_gateway(8192))].into(),
+            ..Default::default()
+        });
+        let access = crate::ModelAccessContext {
+            session_id: Uuid::new_v4(),
+            store: None,
+            provider_context: None,
+            parent_session_id: None,
+            request_prefix: None,
+        };
+        let running = harness
+            .with_model_access_for(provider, Some(alias), &access)
+            .await
+            .unwrap();
+        harness
+            .replace_configured_model_gateways([(alias.to_string(), make_gateway(16384))].into());
+        let next = harness
+            .with_model_access_for(provider, Some(alias), &access)
+            .await
+            .unwrap();
+        assert_eq!(
+            running.model_client.context_window(provider, alias).await,
+            Some(8192)
+        );
+        assert_eq!(
+            next.model_client.context_window(provider, alias).await,
+            Some(16384)
+        );
+        assert!(harness.supports_custom_effort(alias, "Creative"));
+        harness.replace_configured_model_gateways(Default::default());
+        assert!(
+            harness
+                .with_model_access_for(provider, Some(alias), &access)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            running.model_client.context_window(provider, alias).await,
+            Some(8192)
+        );
+    }
+
     /// A user's attachment is named by whatever saved it, and that name is
     /// not evidence of what the bytes are. Announcing a JPEG as a PNG gets the
     /// whole turn rejected with `invalid_value` on `input`, so the media type

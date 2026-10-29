@@ -982,6 +982,15 @@ pub enum UiAction {
         sequence: u64,
     },
     SetModel(String),
+    SaveCustomProvider {
+        original: Option<(String, borg_ui::providers::ConfiguredProvider)>,
+        id: String,
+        provider: borg_ui::providers::ConfiguredProvider,
+    },
+    DeleteCustomProvider {
+        id: String,
+        expected: borg_ui::providers::ConfiguredProvider,
+    },
     SetCommitMessageModel(String),
     SetCommitMessageEffort(String),
     SetHorizontalMargin(u16),
@@ -1820,6 +1829,7 @@ pub struct BorgTerminal {
     ui_language: UiLanguage,
     cwd: PathBuf,
     configured_model_entries: Vec<borg_provider::DynamicModelEntry>,
+    custom_providers: std::collections::BTreeMap<String, borg_ui::providers::ConfiguredProvider>,
     extension_commands: Vec<borg_remote::ExtensionApiCommand>,
     git_status_cache: GitStatusCache,
     git_push: GitRemoteState,
@@ -3285,6 +3295,7 @@ impl BorgTerminal {
             ui_language: UiLanguage::Auto,
             cwd,
             configured_model_entries: Vec::new(),
+            custom_providers: Default::default(),
             extension_commands: Vec::new(),
             git_status_cache: GitStatusCache::default(),
             git_push: GitRemoteState::default(),
@@ -6430,6 +6441,19 @@ impl BorgTerminal {
         }
     }
 
+    pub fn set_custom_providers(
+        &mut self,
+        providers: std::collections::BTreeMap<String, borg_ui::providers::ConfiguredProvider>,
+    ) {
+        self.custom_providers = providers;
+    }
+
+    pub fn custom_provider_save_result(&mut self, error: Option<String>) {
+        if let Some(screen) = &mut self.settings {
+            screen.provider_save_result(error);
+        }
+    }
+
     pub fn set_commit_model_gateways(
         &mut self,
         gateways: std::collections::BTreeMap<String, borg_provider::provider::ModelGateway>,
@@ -6575,6 +6599,7 @@ impl BorgTerminal {
             luna_titles: self.luna_titles_for_all_providers,
             commit_model: self.commit_message_model.label(),
             configured_models: self.configured_model_entries.clone(),
+            custom_providers: self.custom_providers.clone(),
             streaming_refresh_fps: self.streaming_refresh_rate_fps,
             layout: borg_ui::preferences::LayoutPreferences {
                 horizontal_margin: self.horizontal_margin,
@@ -6783,7 +6808,11 @@ impl BorgTerminal {
             .config
             .as_ref()
             .and_then(|config| config.effort.clone());
-        let options = effort_picker_options(provider, model);
+        let options = model
+            .and_then(|model| {
+                borg_provider::gateway_effort_levels(model, &self.configured_model_entries)
+            })
+            .unwrap_or_else(|| effort_picker_options(provider, model));
         // A model with no known effort support has nothing to choose between,
         // so leave the picker closed rather than listing levels it will refuse.
         if options.is_empty() {
@@ -6800,7 +6829,10 @@ impl BorgTerminal {
         // disabled rather than offering a switch that fails on send. This
         // generalizes the gpt-6-astra special case, which was the only model
         // hardcoded to behave this way.
-        if !effort_is_optional(provider, model) {
+        if !model.is_some_and(|model| {
+            borg_provider::gateway_effort_is_optional(model, &self.configured_model_entries)
+        }) && !effort_is_optional(provider, model)
+        {
             for option in &mut picker.options {
                 option.disabled = option.value == "none";
             }

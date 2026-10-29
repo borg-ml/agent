@@ -68,6 +68,7 @@ tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"]
 rustls = "0.23"
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 toml = "1.1.4"
+toml_edit = "0.25"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-width = "0.2"

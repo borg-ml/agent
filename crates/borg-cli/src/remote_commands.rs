@@ -3095,6 +3095,7 @@ async fn run_local_agent_session(
             )?;
             terminal.set_configured_model_entries(agent_config.configured_model_entries());
             terminal.set_commit_model_gateways(agent_config.configured_model_gateways());
+            terminal.set_custom_providers(agent_config.providers.clone());
             terminal.set_extension_commands(extension_catalog.api_snapshot().commands);
             Some(terminal)
         } else {
@@ -3130,6 +3131,7 @@ async fn run_local_agent_session(
         terminal.set_local_file_links(true);
         terminal.set_configured_model_entries(agent_config.configured_model_entries());
         terminal.set_commit_model_gateways(agent_config.configured_model_gateways());
+        terminal.set_custom_providers(agent_config.providers.clone());
         terminal.set_extension_commands(extension_catalog.api_snapshot().commands);
         let seed_started = std::time::Instant::now();
         terminal.seed_team_roster(&team_snapshots);
@@ -3717,11 +3719,13 @@ async fn run_local_agent_session(
                     Ok((signature, Some(Ok(next)))) => {
                         let keybindings_changed = next.keybindings != agent_config.keybindings;
                         agent_config = next;
+                        live_extension_executor.replace_configured_model_gateways(agent_config.configured_model_gateways());
                         if let Some(terminal) = terminal.as_mut() {
                             terminal.set_configured_model_entries(
                                 agent_config.configured_model_entries(),
                             );
                             terminal.set_commit_model_gateways(agent_config.configured_model_gateways());
+                            terminal.set_custom_providers(agent_config.providers.clone());
                             terminal.set_extension_commands(
                                 extension_catalog.api_snapshot().commands,
                             );
@@ -3739,7 +3743,7 @@ async fn run_local_agent_session(
                                     terminal.set_notice("Agent settings reloaded · aliases/keybindings are live · Blu/MCP apply next turn".to_string());
                                 }
                             } else {
-                                terminal.set_notice("Agent settings changed · Blu/MCP apply next turn · provider/session policy applies next session".to_string());
+                                terminal.set_notice("Agent settings changed · endpoints and Blu/MCP apply next turn · other session policy applies next session".to_string());
                             }
                             terminal_dirty = true;
                         }
@@ -6149,6 +6153,7 @@ async fn run_local_agent_session(
                                 restored.set_key_hints(editor_preferences.interaction.key_hints);
                                 restored.set_configured_model_entries(agent_config.configured_model_entries());
                                 restored.set_commit_model_gateways(agent_config.configured_model_gateways());
+                                restored.set_custom_providers(agent_config.providers.clone());
                                 restored.set_commit_message_model(editor_preferences.interaction.commit_message_model.as_deref());
                                 restored.set_streaming_refresh_rate(u64::from(editor_preferences.presentation.streaming_refresh_rate_fps));
                                 restored.set_extension_commands(extension_catalog.api_snapshot().commands);
@@ -6494,6 +6499,43 @@ async fn run_local_agent_session(
                             "Completion notifications: {}",
                             completion_alert_policy_name(policy)
                         ));
+                    }
+                    UiAction::SaveCustomProvider { original, id, provider } => {
+                        let result = agent_config_path.as_deref().context("No agent configuration path is available")
+                            .and_then(|path| crate::agent_config::save_custom_provider(path, original.as_ref(), Some((&id, &provider))));
+                        let terminal = terminal.as_mut().expect("terminal");
+                        match result {
+                            Ok(next) => {
+                                agent_config = next;
+                                live_extension_executor.replace_configured_model_gateways(agent_config.configured_model_gateways());
+                                agent_config_signature = agent_config_file_signature(agent_config_path.as_deref());
+                                terminal.set_custom_providers(agent_config.providers.clone());
+                                terminal.set_configured_model_entries(agent_config.configured_model_entries());
+                                terminal.set_commit_model_gateways(agent_config.configured_model_gateways());
+                                terminal.custom_provider_save_result(None);
+                                terminal.set_notice(format!("Provider {id} saved · available in model pickers · chat model unchanged"));
+                            }
+                            Err(error) => terminal.custom_provider_save_result(Some(error.to_string())),
+                        }
+                    }
+                    UiAction::DeleteCustomProvider { id, expected } => {
+                        let original = (id.clone(), expected);
+                        let result = agent_config_path.as_deref().context("No agent configuration path is available")
+                            .and_then(|path| crate::agent_config::save_custom_provider(path, Some(&original), None));
+                        let terminal = terminal.as_mut().expect("terminal");
+                        match result {
+                            Ok(next) => {
+                                agent_config = next;
+                                live_extension_executor.replace_configured_model_gateways(agent_config.configured_model_gateways());
+                                agent_config_signature = agent_config_file_signature(agent_config_path.as_deref());
+                                terminal.set_custom_providers(agent_config.providers.clone());
+                                terminal.set_configured_model_entries(agent_config.configured_model_entries());
+                                terminal.set_commit_model_gateways(agent_config.configured_model_gateways());
+                                terminal.custom_provider_save_result(None);
+                                terminal.set_notice(format!("Provider {id} removed"));
+                            }
+                            Err(error) => terminal.custom_provider_save_result(Some(error.to_string())),
+                        }
                     }
                     UiAction::SetCommitMessageEffort(effort) => {
                         let current = editor_preferences.interaction.commit_message_model.clone()
@@ -8195,6 +8237,7 @@ async fn run_local_agent_session(
                                         restored.set_local_file_links(true);
                                         restored.set_configured_model_entries(agent_config.configured_model_entries());
                                         restored.set_commit_model_gateways(agent_config.configured_model_gateways());
+                                        restored.set_custom_providers(agent_config.providers.clone());
                                         restored.set_commit_message_model(editor_preferences.interaction.commit_message_model.as_deref());
                                         restored.set_streaming_refresh_rate(u64::from(editor_preferences.presentation.streaming_refresh_rate_fps));
                                         restored.set_extension_commands(extension_catalog.api_snapshot().commands);

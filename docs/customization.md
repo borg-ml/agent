@@ -90,7 +90,7 @@ setting is the same as never having configured one.
 
 Click **Settings** in the top-right corner of the start screen, or run
 `/settings`, to open the settings screen. It groups every setting below into
-Agent, Transcript, Names & colours, Appearance, Notifications and System. Click an option or use
+Agent, Providers, Transcript, Names & colours, Appearance, Notifications and System. Click an option or use
 ←/→ to change it, Tab to move between sections, and type to search; Esc closes
 it. Changes apply at once and are persisted to `editor.toml`.
 
@@ -118,6 +118,39 @@ it. Changes apply at once and are persisted to `editor.toml`.
 | Dictation icon | `/icons` | `presentation.dictation_icon = "nerd_font"` or `"emoji"` |
 | Transcript labels | `/user-label`, `/assistant-label` | `transcript.user_label`, `transcript.assistant_label` |
 | Transcript colors | `/colors`, `/color` | the four `transcript.*_color` values in `#RRGGBB` form |
+
+### Custom endpoints in settings
+
+Open **Settings → Providers → Add custom provider**. Give the connection a stable
+ID and friendly name, then enter its OpenAI-compatible base URL (including any
+required `/v1` path) or complete `/chat/completions` URL. Local servers such as
+Ollama, vLLM and llama.cpp can use no API key. Cloud and enterprise gateways can
+use an environment-variable reference or a masked saved key, plus custom headers.
+Blank replacement-key input keeps the existing key; **Clear authentication**
+removes it from the draft. Saved keys live only in the private `agent.toml` file,
+not session history. A custom connection never inherits the generic OpenAI key.
+
+Use **Add model** to enter the exact upstream model ID, a display name, context
+and output limits, and optional request options. **Variants** maps preset names
+to JSON request options, for example `{"high":{"reasoning_effort":"high"}}` or
+`{"creative":{"temperature":0.8}}`. Presets appear in the model's reasoning
+controls and work for chat and commit-message drafting. **Keep model changes**
+returns to the provider draft; **Save provider** validates and writes the whole
+connection. Escape cancels the current draft. Removing a provider requires a
+second confirmation.
+
+Configured models appear as `provider/model` in both model pickers. Saving does
+not switch the chat model or contact the endpoint. Future turns use refreshed
+routes; an in-flight turn keeps its original endpoint and key. Removing a route
+makes later calls fail clearly instead of falling through to another connection.
+Agent-driven edits to the same configuration are picked up by settings, while a
+stale form cannot overwrite a provider changed elsewhere. Comments, unrelated
+settings and unknown keys survive saves. The same schema is documented in
+[`configs/agent.example.toml`](../configs/agent.example.toml).
+
+Custom connections currently speak OpenAI-compatible Chat Completions; arbitrary
+URLs do not imply support for an unrelated wire protocol such as Responses or
+Anthropic Messages. Borg's built-in Anthropic route remains separate.
 
 The commit-message model is independent of chat and uses the existing connection
 and billing route. The searchable picker includes native subscription models,

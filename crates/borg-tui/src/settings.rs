@@ -6,6 +6,7 @@
 //! slash commands use; the host applies and persists it.
 
 use super::*;
+mod providers;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 
@@ -28,6 +29,7 @@ const LIST_PANEL: Color = Color::Rgb(40, 40, 44);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SettingsSection {
     Agent,
+    Providers,
     Transcript,
     Names,
     Appearance,
@@ -36,8 +38,9 @@ pub(crate) enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Agent,
+        Self::Providers,
         Self::Transcript,
         Self::Names,
         Self::Appearance,
@@ -48,6 +51,7 @@ impl SettingsSection {
     fn label(self) -> &'static str {
         match self {
             Self::Agent => "Agent",
+            Self::Providers => "Providers",
             Self::Transcript => "Transcript",
             Self::Names => "Names & colours",
             Self::Appearance => "Appearance",
@@ -59,6 +63,7 @@ impl SettingsSection {
     fn summary(self) -> &'static str {
         match self {
             Self::Agent => "Model, reasoning and how Borg works",
+            Self::Providers => "Custom endpoints, credentials, models and variants",
             Self::Transcript => "What the conversation shows",
             Self::Names => "How you and Borg appear in the conversation",
             Self::Appearance => "Language, cursor, icons and motion",
@@ -70,6 +75,30 @@ impl SettingsSection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SettingId {
+    ProviderAdd,
+    ProviderEntry(usize),
+    ProviderBack,
+    ProviderId,
+    ProviderName,
+    ProviderEndpoint,
+    ProviderKeyEnv,
+    ProviderKey,
+    ProviderClearAuth,
+    ProviderHeaders,
+    ProviderModelAdd,
+    ProviderModelEntry(usize),
+    ProviderSave,
+    ProviderDelete,
+    ProviderModelId,
+    ProviderModelName,
+    ProviderModelContext,
+    ProviderModelOutput,
+    ProviderModelCache,
+    ProviderModelBody,
+    ProviderModelVariants,
+    ProviderModelSave,
+    ProviderModelDelete,
+
     Model,
     CommitModel,
     CommitEffort,
@@ -121,6 +150,7 @@ pub(crate) enum SettingControl {
         disabled: Vec<bool>,
     },
     Text(String),
+    Secret(String),
     Colour(String, Color),
     Action(String),
 }
@@ -173,6 +203,8 @@ pub(crate) struct SettingsValues {
     pub(crate) luna_titles: bool,
     pub(crate) commit_model: String,
     pub(crate) configured_models: Vec<borg_provider::DynamicModelEntry>,
+    pub(crate) custom_providers:
+        std::collections::BTreeMap<String, borg_ui::providers::ConfiguredProvider>,
     pub(crate) streaming_refresh_fps: u64,
     pub(crate) layout: borg_ui::preferences::LayoutPreferences,
 }
@@ -235,7 +267,11 @@ pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
     let commit_efforts =
         borg_provider::gateway_effort_levels(commit.model_id(), &values.configured_models)
             .unwrap_or_else(|| effort_picker_options(commit.provider(), Some(commit.model_id())));
-    let efforts = effort_picker_options(values.provider, values.model.as_deref());
+    let efforts = values
+        .model
+        .as_deref()
+        .and_then(|model| borg_provider::gateway_effort_levels(model, &values.configured_models))
+        .unwrap_or_else(|| effort_picker_options(values.provider, values.model.as_deref()));
     let effort = if efforts.is_empty() {
         SettingRow {
             enabled: false,
@@ -248,7 +284,9 @@ pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
             )
         }
     } else {
-        let optional = effort_is_optional(values.provider, values.model.as_deref());
+        let optional = values.model.as_deref().is_some_and(|model| {
+            borg_provider::gateway_effort_is_optional(model, &values.configured_models)
+        }) || effort_is_optional(values.provider, values.model.as_deref());
         row(
             Id::Effort,
             Section::Agent,
@@ -305,7 +343,7 @@ pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
         let (hex, colour) = &values.colours[index];
         SettingControl::Colour(hex.clone(), *colour)
     };
-    vec![
+    let mut rows = vec![
         row(
             Id::Model,
             Section::Agent,
@@ -382,6 +420,10 @@ pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
                         .iter()
                         .map(|effort| {
                             effort == "none"
+                                && !borg_provider::gateway_effort_is_optional(
+                                    commit.model_id(),
+                                    &values.configured_models,
+                                )
                                 && !effort_is_optional(commit.provider(), Some(commit.model_id()))
                         })
                         .collect(),
@@ -664,7 +706,9 @@ pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
             "Bring threads and memory over from Codex, Claude Code, Claude Desktop or other apps. Originals stay untouched.",
             SettingControl::Action("Choose a source".to_string()),
         ),
-    ]
+    ];
+    rows.extend(providers::list_rows(&values.custom_providers));
+    rows
 }
 
 /// The action that applies option `index` of a choice row.
@@ -770,6 +814,8 @@ enum Target {
 
 #[derive(Default)]
 pub(crate) struct SettingsScreen {
+    custom_providers: std::collections::BTreeMap<String, borg_ui::providers::ConfiguredProvider>,
+    provider_editor: Option<providers::ProviderEditor>,
     section: usize,
     /// Index into the visible rows.
     selected: usize,
@@ -788,7 +834,12 @@ impl SettingsScreen {
     /// Rows to show, with choices the host has not confirmed yet shown as
     /// chosen so a click never appears to bounce back.
     pub(crate) fn rows(&mut self, values: &SettingsValues) -> Vec<SettingRow> {
+        self.custom_providers = values.custom_providers.clone();
         let mut rows = setting_rows(values);
+        if let Some(editor) = &self.provider_editor {
+            rows.retain(|row| row.section != SettingsSection::Providers);
+            rows.extend(providers::editor_rows(editor));
+        }
         self.pending.retain(|(id, index, at)| {
             if at.elapsed() > PENDING_TTL {
                 return false;
@@ -906,7 +957,17 @@ impl SettingsScreen {
         if !row.enabled {
             return SettingsEffect::None;
         }
+        if matches!(row.control, SettingControl::Action(_)) {
+            if let Some(effect) = self.provider_action(row.id) {
+                return effect;
+            }
+        }
         match &row.control {
+            SettingControl::Secret(_) => {
+                self.editing = Some((row.id, String::new()));
+                self.error = None;
+                SettingsEffect::None
+            }
             SettingControl::Choice {
                 options, selected, ..
             } => {
@@ -941,6 +1002,16 @@ impl SettingsScreen {
             return SettingsEffect::None;
         };
         let value = value.trim();
+        if let Some(result) = self.provider_edit(id, value) {
+            match result {
+                Ok(()) => self.error = None,
+                Err(error) => {
+                    self.error = Some(error);
+                    self.editing = Some((id, value.to_string()));
+                }
+            }
+            return SettingsEffect::None;
+        }
         let command = match id {
             SettingId::CustomCommitModel => {
                 let model = CommitMessageModel::parse(value);
@@ -1032,7 +1103,20 @@ impl SettingsScreen {
 
     /// Pasted text goes to the field being edited, otherwise to the search.
     pub(crate) fn paste(&mut self, text: &str) {
-        let text = text.lines().next().unwrap_or_default();
+        let joined;
+        let text = if self.editing.as_ref().is_some_and(|(id, _)| {
+            matches!(
+                id,
+                SettingId::ProviderHeaders
+                    | SettingId::ProviderModelBody
+                    | SettingId::ProviderModelVariants
+            )
+        }) {
+            joined = text.replace(['\n', '\r'], " ");
+            &joined
+        } else {
+            text.lines().next().unwrap_or_default()
+        };
         match self.editing.as_mut() {
             Some((_, buffer)) => buffer.push_str(text),
             None => {
@@ -1092,6 +1176,11 @@ impl SettingsScreen {
                 self.query.clear();
                 self.selected = 0;
                 self.scroll = 0;
+            }
+            KeyCode::Esc if self.provider_editor.is_some() => {
+                return self
+                    .provider_action(SettingId::ProviderBack)
+                    .unwrap_or(SettingsEffect::None);
             }
             KeyCode::Esc => return SettingsEffect::Close,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1700,7 +1789,22 @@ impl SettingsScreen {
                 }
                 None
             }
-            SettingControl::Text(value) | SettingControl::Colour(value, _) => {
+            SettingControl::Text(value)
+            | SettingControl::Colour(value, _)
+            | SettingControl::Secret(value) => {
+                let secret = matches!(row.control, SettingControl::Secret(_));
+                let masked_value = if value.is_empty() {
+                    "Not set"
+                } else {
+                    "••••••••"
+                };
+                let masked_editing = editing.map(|value| "•".repeat(value.chars().count()));
+                let value = if secret { masked_value } else { value.as_str() };
+                let editing = if secret {
+                    masked_editing.as_deref()
+                } else {
+                    editing
+                };
                 // While a colour is typed, the swatch previews it once valid.
                 let swatch = match &row.control {
                     SettingControl::Colour(_, colour) => Some(
@@ -1919,6 +2023,7 @@ mod tests {
             luna_titles: false,
             commit_model: DEFAULT_COMMIT_MESSAGE_MODEL.to_string(),
             configured_models: Vec::new(),
+            custom_providers: Default::default(),
             streaming_refresh_fps: 120,
             layout: Default::default(),
         }

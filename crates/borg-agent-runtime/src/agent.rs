@@ -359,6 +359,11 @@ pub trait AgentTurnExecutor: Send + Sync {
         Ok(None)
     }
 
+    /// Named endpoint presets may use effort names outside vendor ladders.
+    fn supports_custom_effort(&self, _model: &str, _effort: &str) -> bool {
+        false
+    }
+
     /// The selected execution route owns this decision, not the billing
     /// provider. It also determines how the actor projects durable context.
     fn uses_native_harness(&self, provider: CodingProvider) -> bool {
@@ -595,12 +600,6 @@ pub struct LocalAgentSettings {
 }
 
 impl LocalAgentTurnExecutor {
-    /// Compatibility builder: Codex execution is now always model-only.
-    #[cfg(feature = "subscription-adapters")]
-    pub fn with_codex_model_only(self) -> Self {
-        self
-    }
-
     pub fn with_settings(settings: LocalAgentSettings) -> Self {
         Self {
             native_harness: NativeHarness::with_settings(&settings),
@@ -608,6 +607,16 @@ impl LocalAgentTurnExecutor {
             idle_compaction_min_context_tokens: settings.idle_compaction_min_context_tokens,
             ..Self::default()
         }
+    }
+
+    /// Refresh host-local endpoint routes for future turns only. In-flight
+    /// turns retain their selected endpoint and credentials.
+    pub fn replace_configured_model_gateways(
+        &self,
+        gateways: BTreeMap<String, borg_provider::provider::ModelGateway>,
+    ) {
+        self.native_harness
+            .replace_configured_model_gateways(gateways);
     }
 
     pub fn with_model_gateway(gateway: borg_provider::provider::ModelGateway) -> Self {
@@ -886,6 +895,10 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         let mut executor = self.clone();
         executor.opencode_session_native = opencode_native;
         Ok(Some(Arc::new(executor)))
+    }
+
+    fn supports_custom_effort(&self, model: &str, effort: &str) -> bool {
+        self.native_harness.supports_custom_effort(model, effort)
     }
 
     fn uses_native_harness(&self, provider: CodingProvider) -> bool {
@@ -2626,13 +2639,6 @@ mod tests {
         assert!(!migrated.supports_subscription_context_reuse(CodingProvider::Codex));
         assert!(migrated.uses_native_harness(CodingProvider::Claude));
         assert!(!migrated.supports_subscription_context_reuse(CodingProvider::Claude));
-        assert!(
-            LocalAgentTurnExecutor::default()
-                .with_codex_model_only()
-                .for_session(legacy, &store, None)
-                .await
-                .is_ok()
-        );
         scratch.discard().await;
     }
 
@@ -2729,7 +2735,7 @@ mod tests {
     #[cfg(feature = "subscription-adapters")]
     #[tokio::test]
     async fn native_subscription_auxiliary_calls_require_durable_access_before_auth() {
-        let executor = LocalAgentTurnExecutor::default().with_codex_model_only();
+        let executor = LocalAgentTurnExecutor::default();
         let access = ModelAccessContext {
             session_id: Uuid::new_v4(),
             store: None,

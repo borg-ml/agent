@@ -13117,12 +13117,22 @@ pub(crate) async fn apply_session_config(
             }
         }
         crate::SessionConfigAction::SetEffort { effort } => {
-            let effort = effort.trim().to_ascii_lowercase();
+            let custom = next.provider == CodingProvider::OpenAiCompatible
+                && next
+                    .model
+                    .as_deref()
+                    .is_some_and(|model| executor.supports_custom_effort(model, effort.trim()));
+            let effort = if custom {
+                effort.trim().to_string()
+            } else {
+                effort.trim().to_ascii_lowercase()
+            };
             anyhow::ensure!(
-                matches!(
-                    effort.as_str(),
-                    "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
-                ),
+                custom
+                    || matches!(
+                        effort.as_str(),
+                        "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+                    ),
                 "effort must be one of none, low, medium, high, xhigh, max, or ultra"
             );
             next.effort = Some(effort);

@@ -7,6 +7,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.9)
 
+- Settings now has a Providers section for custom OpenAI-compatible endpoints, masked API keys or environment references, headers, model limits, request options and named variants. Saves preserve unrelated configuration and detect stale drafts; updated endpoints apply on future turns without changing the chat model. Anonymous custom endpoints no longer inherit another provider's API key or generic request options, and removed routes fail closed.
+
 - The splash bottom line shows the working directory. Settings now include an independent, saved commit-message model picker with reasoning controls and custom model-only routes, plus streaming refresh rate, layout and dictation configuration. Commit drafts support native subscription/API routes and configured gateways without switching the chat model; unavailable drafts visibly fall back to a file summary.
 
 - Escape sends queued input immediately instead of leaving it as “Next”; pending-input flushes cancel generation through the fast interrupt signal before recovery I/O or a full actor queue, while preserving the composer draft.

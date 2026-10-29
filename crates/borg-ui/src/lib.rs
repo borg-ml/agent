@@ -19,6 +19,7 @@ pub mod local;
 pub mod localization;
 pub mod markdown;
 pub mod preferences;
+pub mod providers;
 pub mod timeline;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use borg_core::compaction::{CompactionBudgetOverride, CompactionBudgetPolicy};
 use borg_core::warming::CacheWarmingMode;
+use borg_ui::providers::ConfiguredProvider;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -118,61 +119,6 @@ impl ModelsConfig {
         }
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub(crate) struct ConfiguredProvider {
-    /// Currently `openai-compatible`; the field makes the config forward
-    /// compatible with future provider protocols without hiding semantics.
-    pub(crate) protocol: String,
-    pub(crate) name: Option<String>,
-    /// Base URL or a complete `/chat/completions` URL.
-    pub(crate) base_url: String,
-    /// Prefer an environment reference for secrets. `api_key` is supported
-    /// for local-only setups but is never copied into durable session state.
-    pub(crate) api_key_env: Option<String>,
-    pub(crate) api_key: Option<String>,
-    pub(crate) headers: BTreeMap<String, String>,
-    pub(crate) models: BTreeMap<String, ConfiguredModel>,
-}
-
-impl Default for ConfiguredProvider {
-    fn default() -> Self {
-        Self {
-            protocol: "openai-compatible".to_string(),
-            name: None,
-            base_url: String::new(),
-            api_key_env: None,
-            api_key: None,
-            headers: BTreeMap::new(),
-            models: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub(crate) struct ConfiguredModel {
-    pub(crate) name: Option<String>,
-    pub(crate) context_window_tokens: Option<u64>,
-    pub(crate) max_output_tokens: Option<u64>,
-    /// How long this route keeps a prompt cache entry. Set it only from the
-    /// upstream's documented retention: it is the schedule Borg pays refreshes
-    /// on, and there is no default, so leaving it unset means no warming.
-    pub(crate) prompt_cache_ttl_seconds: Option<u64>,
-    /// Variant names normally match Borg effort values (`low`, `high`, ...).
-    pub(crate) variants: BTreeMap<String, ConfiguredModelVariant>,
-    /// Extra request fields for this model, such as `temperature` or a vendor
-    /// routing object. Core conversation/tool fields are protected by the
-    /// provider adapter.
-    pub(crate) body: BTreeMap<String, toml::Value>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub(crate) struct ConfiguredModelVariant {
-    pub(crate) body: BTreeMap<String, toml::Value>,
 }
 
 /// Declarative setup for a locally hosted OpenAI-compatible server
@@ -730,9 +676,8 @@ impl AgentConfig {
                         id: alias,
                         label: format!("{provider_label} · {model_label}"),
                         detail: (!details.is_empty()).then(|| details.join(" · ")),
-                        // A configured model alias declares no effort
-                        // vocabulary, so none is claimed for it.
-                        supported_efforts: None,
+                        supported_efforts: (!model.variants.is_empty())
+                            .then(|| model.variants.keys().cloned().collect()),
                         reasoning_mandatory: false,
                         default_effort: None,
                     }
@@ -860,6 +805,15 @@ impl AgentConfig {
             anyhow::ensure!(
                 base_url.starts_with("http://") || base_url.starts_with("https://"),
                 "provider `{provider_id}` base_url must start with http:// or https://"
+            );
+            let parsed_url = url::Url::parse(base_url)
+                .context("Provider base URL must be a valid HTTP(S) URL")?;
+            anyhow::ensure!(
+                parsed_url.host_str().is_some()
+                    && parsed_url.username().is_empty()
+                    && parsed_url.password().is_none()
+                    && parsed_url.fragment().is_none(),
+                "Provider URL needs a host and must not contain embedded credentials or a fragment. Use the API key or headers fields instead."
             );
             anyhow::ensure!(
                 !base_url.contains(['\0', '\r', '\n']),
@@ -1293,6 +1247,125 @@ impl AgentConfig {
     }
 }
 
+/// Apply one settings edit to the latest file, not the stale session snapshot.
+/// Other providers, unknown keys and comments stay intact.
+pub(crate) fn save_custom_provider(
+    path: &Path,
+    original: Option<&(String, ConfiguredProvider)>,
+    next: Option<(&str, &ConfiguredProvider)>,
+) -> Result<AgentConfig> {
+    use std::io::Write;
+    use toml_edit::{DocumentMut, Item};
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).context("cannot read agent configuration"),
+    };
+    let mut config: AgentConfig =
+        toml::from_str(&source).context("cannot edit invalid agent configuration")?;
+    if let Some((id, before)) = original {
+        anyhow::ensure!(
+            config.providers.get(id) == Some(before),
+            "This provider changed in another session. Cancel and reopen it before saving."
+        );
+    }
+    if let Some((id, _)) = next {
+        anyhow::ensure!(
+            original.is_some_and(|(old, _)| old == id) || !config.providers.contains_key(id),
+            "A provider with this ID already exists. Choose another ID."
+        );
+    }
+    let mut document = source.parse::<DocumentMut>()?;
+    let mut entry = original
+        .and_then(|(id, _)| {
+            document
+                .get("providers")
+                .and_then(|providers| providers.get(id))
+        })
+        .cloned()
+        .unwrap_or_else(|| Item::Table(toml_edit::Table::new()));
+    if let Some((id, provider)) = next {
+        let after = toml::to_string(provider)?.parse::<DocumentMut>()?;
+        let before = original
+            .map(|(_, old)| toml::to_string(old))
+            .transpose()?
+            .unwrap_or_default()
+            .parse::<DocumentMut>()?;
+        merge_provider_changes(
+            &mut entry,
+            &Item::Table(before.into_table()),
+            &Item::Table(after.into_table()),
+        );
+        config.providers.insert(id.to_string(), provider.clone());
+    }
+    if let Some((old_id, _)) = original {
+        if next.is_none_or(|(id, _)| id != old_id) {
+            config.providers.remove(old_id);
+            if let Some(table) = document
+                .get_mut("providers")
+                .and_then(Item::as_table_like_mut)
+            {
+                table.remove(old_id);
+            }
+        }
+    }
+    config.validate()?;
+    config.capabilities.model_fallback = config.models.resolve()?;
+    if let Some((id, _)) = next {
+        document["providers"][id] = entry;
+    }
+    let parent = path
+        .parent()
+        .context("agent configuration has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(document.to_string().as_bytes())?;
+    temporary.as_file().sync_all()?;
+    // Detect non-cooperating editors that wrote while the form was being saved.
+    let latest = fs::read_to_string(path).or_else(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(String::new())
+        } else {
+            Err(error)
+        }
+    })?;
+    anyhow::ensure!(
+        latest == source,
+        "Configuration changed while saving. Try again."
+    );
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(config)
+}
+
+fn merge_provider_changes(
+    target: &mut toml_edit::Item,
+    before: &toml_edit::Item,
+    after: &toml_edit::Item,
+) {
+    if let (Some(target), Some(before), Some(after)) = (
+        target.as_table_like_mut(),
+        before.as_table_like(),
+        after.as_table_like(),
+    ) {
+        for (key, value) in after.iter() {
+            if let (Some(old), Some(current)) = (before.get(key), target.get_mut(key)) {
+                merge_provider_changes(current, old, value);
+            } else if !value.as_table_like().is_some_and(|table| table.is_empty())
+                && !before.get(key).is_some_and(|old| {
+                    old.as_table_like().is_none() && old.to_string() == value.to_string()
+                })
+            {
+                target.insert(key, value.clone());
+            }
+        }
+        for (key, _) in before.iter().filter(|(key, _)| !after.contains_key(key)) {
+            target.remove(key);
+        }
+    } else if before.to_string() != after.to_string() {
+        *target = after.clone();
+    }
+}
+
 /// `borg config {path|init|edit|validate}`.
 pub(crate) fn run_config(command: crate::cli::ConfigCommand) -> Result<()> {
     use crate::cli::ConfigCommand;
@@ -1399,12 +1472,12 @@ fn format_configured_model_alias(provider_id: &str, model_id: &str) -> String {
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {
-    let trimmed = base_url.trim_end_matches('/');
-    if trimmed.ends_with("/chat/completions") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/chat/completions")
+    let mut url = url::Url::parse(base_url.trim()).expect("validated provider base URL");
+    let path = url.path().trim_end_matches('/');
+    if !path.ends_with("/chat/completions") {
+        url.set_path(&format!("{path}/chat/completions"));
     }
+    url.to_string()
 }
 
 /// Split a `Name <email>` identity the way git spells it: the name is
@@ -2236,6 +2309,80 @@ reasoning_format = "deepseek"
         assert_eq!(servers[0].command, "docs-mcp");
         assert_eq!(servers[0].args, ["--stdio"]);
         assert_eq!(servers[0].allowed_tools, ["search"]);
+    }
+
+    #[test]
+    fn provider_settings_save_preserves_other_edits_and_rejects_stale_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        let source = r#"# keep this operator note
+[prompt]
+append = "keep these instructions"
+[providers.work]
+base_url = "http://localhost:9000/v1"
+api_key = "private-test-key"
+future_option = "keep me"
+[providers.work.models.demo]
+context_window_tokens = 8192
+body = { temperature = 0.2 }
+"#;
+        fs::write(&path, source).unwrap();
+        let initial = AgentConfig::load(Some(&path)).unwrap();
+        let original = ("work".to_string(), initial.providers["work"].clone());
+        let mut edited = original.1.clone();
+        edited.base_url = "http://localhost:9100/v1?region=local".into();
+        edited.models.get_mut("demo").unwrap().max_output_tokens = Some(1024);
+        edited.models.get_mut("demo").unwrap().body.insert(
+            "routing".into(),
+            toml::Value::Table(
+                [("region".to_string(), toml::Value::String("local".into()))]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        let with_other_edit =
+            source.replace("keep these instructions", "edited by another session");
+        fs::write(&path, &with_other_edit).unwrap();
+        let saved = save_custom_provider(&path, Some(&original), Some(("work", &edited))).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep this operator note"));
+        assert!(text.contains("future_option = \"keep me\""));
+        assert_eq!(saved.prompt.append, "edited by another session");
+        assert_eq!(saved.providers["work"], edited);
+        assert_eq!(
+            AgentConfig::load(Some(&path)).unwrap().providers["work"],
+            edited,
+            "saved source: {text}"
+        );
+        assert!(
+            saved.configured_model_gateways()["work/demo"]
+                .endpoint
+                .ends_with("/v1/chat/completions?region=local")
+        );
+        assert!(save_custom_provider(&path, Some(&original), Some(("work", &edited))).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        let current = ("work".to_string(), edited.clone());
+        edited.base_url = "not a URL".into();
+        assert!(save_custom_provider(&path, Some(&current), Some(("work", &edited))).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        save_custom_provider(&path, Some(&current), None).unwrap();
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("private-test-key")
+        );
+        let added = save_custom_provider(&path, None, Some(("another", &current.1))).unwrap();
+        assert!(added.providers.contains_key("another"));
+        let previous = ("another".to_string(), current.1.clone());
+        let renamed =
+            save_custom_provider(&path, Some(&previous), Some(("renamed", &current.1))).unwrap();
+        assert!(!renamed.providers.contains_key("another"));
+        assert!(renamed.providers.contains_key("renamed"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        }
     }
 
     #[test]
