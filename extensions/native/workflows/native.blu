@@ -605,7 +605,9 @@ local function service(options)
             min_free_disk_bytes = 2 * GIB, reserve_disk_bytes = GIB, disk_path = data,
         },
         health = {
-            argv = { "pg_isready", "-h", parent, "-p", tostring(port) },
+            -- Socket readiness alone accepts a cluster with missing catalog files.
+            argv = { "psql", "-X", "-w", "-h", parent, "-p", tostring(port), "-d", "postgres",
+                "-v", "ON_ERROR_STOP=1", "-tA", "-c", "SELECT count(*) FROM pg_catalog.pg_am" },
             kind = "command", interval_ms = 1000, timeout_ms = 3000,
         },
         restart = { max_restarts = 3, backoff_ms = 500, debounce_ms = 500 },

@@ -5809,6 +5809,11 @@ async fn run_agent_session_store_kernel_inner(
         }
         let turn_executor = Arc::clone(&executor);
         let turn_interrupt = interrupt.clone();
+        let (secret_request_tx, mut secret_request_rx) = mpsc::channel(8);
+        dispatcher.configure_secret_requests(crate::sensitive_input::SessionSecretRequests {
+            requests: secret_request_tx,
+        });
+        let mut pending_secret_request: Option<crate::sensitive_input::SecretInputRequest> = None;
         let (tool_approval_tx, mut tool_approval_rx) = mpsc::channel(8);
         dispatcher.configure_tool_approvals(SessionToolApprovals {
             requests: tool_approval_tx,
@@ -5898,6 +5903,24 @@ async fn run_agent_session_store_kernel_inner(
                         )
                         .await?;
                     }
+                }
+                Some(request) = secret_request_rx.recv(), if pending_provider_interaction.is_none() && !interrupted => {
+                    if request.response.is_closed() { continue; }
+                    record(&mut journal, &events, session_id, SessionEventKind::ProviderInteractionRequested {
+                        interaction_id: request.id.clone(), title: format!("Private API key · {}", request.provider),
+                        detail: request.payload["questions"][0]["question"].as_str().unwrap_or_default().to_string(),
+                        kind: "borg_secret_request".into(), payload: request.payload.clone(),
+                    }).await?;
+                    pending_provider_interaction = Some(request.id.clone());
+                    pending_secret_request = Some(request);
+                    watchdog.note_output();
+                }
+                _ = crate::sensitive_input::secret_request_closed(&mut pending_secret_request) => {
+                    let expired = pending_secret_request.take();
+                    if expired.as_ref().is_some_and(|request| pending_provider_interaction.as_deref() == Some(&request.id)) {
+                        cancel_pending_provider_interaction(&mut journal, &events, session_id, &mut pending_provider_interaction).await?;
+                    }
+                    watchdog.note_output();
                 }
                 Some(request) = tool_approval_rx.recv(), if pending_approval.is_none() && !interrupted => {
                     let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "tool_approval", provider_events.len() + provider_carry.len());
@@ -7162,6 +7185,28 @@ async fn run_agent_session_store_kernel_inner(
                             && acknowledgement.as_ref().is_none_or(|ack| ack.is_waiting())
                             && approval_request_matches(&journal, expected_request, true) =>
                         {
+                            if pending_secret_request.as_ref().is_some_and(|request| request.id == interaction_id) {
+                                let request = pending_secret_request.take().unwrap();
+                                let mut transient_response = response;
+                                let receipt = if request.response.is_closed() || tokio::time::Instant::now() >= request.expires_at { serde_json::json!({"status":"cancelled"}) }
+                                    else { match crate::sensitive_input::save_requested_key(&request.provider, &mut transient_response) {
+                                        Ok(receipt) => receipt,
+                                        Err(_) => serde_json::json!({"status":"failed","message":"The key was not saved. Check the destination and try again."}),
+                                    }};
+                                pending_provider_interaction = None;
+                                record(&mut journal, &events, session_id, SessionEventKind::ProviderInteractionResolved { interaction_id, response: receipt.clone() }).await?;
+                                let delivered = request.response.send(receipt).is_ok();
+                                if let Some(ack) = acknowledgement { ack.complete(if delivered { Ok(()) } else { Err("secret request expired".into()) }); }
+                                watchdog.note_output();
+                                continue;
+                            }
+                            let request_payload = journal.state(session_id).await?.pending_provider_interaction_payload.unwrap_or_default();
+                            if journal.state(session_id).await?.pending_provider_interaction_kind.as_deref() == Some("borg_secret_request") {
+                                cancel_pending_provider_interaction(&mut journal, &events, session_id, &mut pending_provider_interaction).await?;
+                                if let Some(ack) = acknowledgement { ack.complete(Err("private key request is no longer active".into())); }
+                                continue;
+                            }
+                            let journal_response = crate::sensitive_input::journal_interaction_response(&request_payload, &response);
                             pending_provider_interaction = None;
                             watchdog.note_output();
                             record(
@@ -7170,7 +7215,7 @@ async fn run_agent_session_store_kernel_inner(
                                 session_id,
                                 SessionEventKind::ProviderInteractionResolved {
                                     interaction_id: interaction_id.clone(),
-                                    response: response.clone(),
+                                    response: journal_response,
                                 },
                             )
                             .await?;
@@ -12600,13 +12645,14 @@ fn native_steer_applied_to(kind: &SessionEventKind) -> Vec<Uuid> {
 /// evidence; a drain path that skips the marker leaves a folded steer
 /// pending, so teardown requeues it and the model is handed it twice.
 async fn record_provider_event(
-    kind: SessionEventKind,
+    mut kind: SessionEventKind,
     pending_steers: &mut VecDeque<PendingSteer>,
     awaiting: &mut HashMap<Uuid, PromptBatchEntry>,
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
 ) -> Result<()> {
+    crate::sensitive_input::mark_external_private_request(&mut kind);
     // Assistant fragments need only their first display anchor. Reasoning
     // fragments also update the coalesced state archived at the next boundary.
     if matches!(

@@ -22,7 +22,12 @@ pub enum FrontendCommand {
     FlushPendingInput,
     Interrupt,
     Approve(ApprovalDecision),
-    RespondToProviderInteraction(serde_json::Value),
+    RespondToProviderInteraction {
+        source_session_id: Uuid,
+        interaction_id: String,
+        expected_request: Option<Uuid>,
+        response: borg_agent_runtime::SensitiveInteractionResponse,
+    },
     ApplyGoal(GoalAction),
     ApplyTodo(TodoAction),
     ApplyAgentTodo {
@@ -487,5 +492,22 @@ pub fn parse_submission_intent(
             crate::wire::ClientEffect::CloseView,
         )),
         command => Ok(SubmissionIntent::Session(command)),
+    }
+}
+
+#[cfg(test)]
+mod private_reply_tests {
+    use super::*;
+    #[test]
+    fn request_bound_private_reply_debug_does_not_disclose_the_answer() {
+        let command = FrontendCommand::RespondToProviderInteraction {
+            source_session_id: Uuid::new_v4(),
+            interaction_id: "request-1".into(),
+            expected_request: Some(Uuid::new_v4()),
+            response: borg_agent_runtime::SensitiveInteractionResponse::new(
+                serde_json::json!({"key":"private-test-value"}),
+            ),
+        };
+        assert!(!format!("{command:?}").contains("private-test-value"));
     }
 }

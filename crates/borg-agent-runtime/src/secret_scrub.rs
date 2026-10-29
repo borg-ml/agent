@@ -184,3 +184,97 @@ mod tests {
         );
     }
 }
+
+/// Journal complete lines rather than raw pipe chunks, which can split a key.
+/// An overlong line is omitted, never partially released. PEM bodies remain
+/// suppressed across lines until their closing fence.
+#[derive(Default)]
+pub(crate) struct JournalOutputRedactor {
+    pending: String,
+    overlong: bool,
+    private_key: bool,
+}
+
+impl JournalOutputRedactor {
+    pub fn push(&mut self, chunk: &str) -> String {
+        let mut output = String::new();
+        for piece in chunk.split_inclusive('\n') {
+            if !self.overlong {
+                if self.pending.len() + piece.len() > 64 * 1024 {
+                    self.pending.clear();
+                    self.overlong = true;
+                    // A dropped line may contain a PEM opening fence. Stay
+                    // fail-closed until a closing fence establishes a boundary.
+                    self.private_key = true;
+                    output.push_str("[output line omitted: exceeds private streaming limit]\n");
+                } else {
+                    self.pending.push_str(piece);
+                }
+            }
+            if piece.ends_with('\n') {
+                if !self.overlong {
+                    output.push_str(&self.finish_line());
+                }
+                self.overlong = false;
+            }
+        }
+        output
+    }
+
+    pub fn finish(&mut self) -> String {
+        if self.overlong {
+            self.pending.clear();
+            String::new()
+        } else {
+            self.finish_line()
+        }
+    }
+
+    fn finish_line(&mut self) -> String {
+        let line = std::mem::take(&mut self.pending);
+        if line.is_empty() {
+            return line;
+        }
+        let begins = line.contains("-----BEGIN ") && line.contains("PRIVATE KEY-----");
+        let ends = line.contains("-----END ") && line.contains("PRIVATE KEY-----");
+        if begins || self.private_key {
+            let first = !self.private_key;
+            self.private_key = !ends;
+            return if first {
+                "[redacted:private-key]\n".into()
+            } else {
+                String::new()
+            };
+        }
+        scrub_secrets(&line).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+    #[test]
+    fn streaming_journal_never_releases_split_keys_or_private_key_bodies() {
+        let mut redactor = JournalOutputRedactor::default();
+        assert!(redactor.push("key=sk-proj-abcdefghijkl").is_empty());
+        let output = redactor.push("mnopqrstuvwxyz0123456789\nnormal log\n");
+        assert!(!output.contains("abcdefghijkl"));
+        assert!(output.contains("[redacted:openai-key]"));
+        assert!(output.contains("normal log"));
+        assert!(redactor.push("-----BEGIN PRI").is_empty());
+        assert_eq!(
+            redactor.push("VATE KEY-----\nprivate-body\n"),
+            "[redacted:private-key]\n"
+        );
+        assert!(
+            redactor
+                .push("more-body\n-----END PRIVATE KEY-----\n")
+                .is_empty()
+        );
+        assert_eq!(redactor.push("safe again\n"), "safe again\n");
+        assert!(redactor.push(&"x".repeat(70 * 1024)).contains("omitted"));
+        assert!(redactor.push("tail-must-not-leak\nnext\n").is_empty());
+        assert_eq!(redactor.push("-----END PRIVATE KEY-----\nnext\n"), "next\n");
+        assert!(redactor.finish().is_empty());
+    }
+}

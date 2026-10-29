@@ -1,4 +1,4 @@
-use crate::composer::{self, Composer, PastedImage, Submitted};
+use crate::composer::{self, Composer, PastedImage, PrivateSubmitted, Submitted};
 use borg_dictation::{DictationUpdate, DictationWorker};
 use borg_ui::{
     ApprovalDecision, CodingProvider, FrontendCommand, ModelOption, PromptDelivery,
@@ -58,6 +58,20 @@ fn rich_text_element(rich: &borg_ui::markdown::RichText) -> StyledText {
     StyledText::new(rich.text.clone()).with_highlights(highlights)
 }
 
+fn provider_request_revision(view: &SessionView, id: &str) -> Option<Uuid> {
+    view.history
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            borg_ui::SessionEventKind::ProviderInteractionRequested { interaction_id, .. }
+                if interaction_id == id =>
+            {
+                Some(event.id)
+            }
+            _ => None,
+        })
+}
+
 struct BorgGui {
     worker: Option<LocalSessionWorker>,
     view: Option<SessionView>,
@@ -68,6 +82,7 @@ struct BorgGui {
     timeline: Arc<Vec<Arc<TimelineEntry>>>,
     transcript_state: ListState,
     attachments: Vec<PathBuf>,
+    suspended_private_attachments: Option<Vec<PathBuf>>,
     sessions: Vec<LocalSessionOption>,
     sessions_open: bool,
     models_open: bool,
@@ -88,7 +103,94 @@ impl BorgGui {
         composer: Entity<Composer>,
         cx: &mut Context<Self>,
     ) -> Self {
+        cx.subscribe(&composer, |this, _, event: &PrivateSubmitted, cx| {
+            let active =
+                event
+                    .request
+                    .as_ref()
+                    .and_then(|(source_session_id, id, expected_request)| {
+                        let view = this.view.as_ref()?;
+                        if view.session_id != *source_session_id
+                            || view.state.pending_provider_interaction_id.as_deref()
+                                != Some(id.as_str())
+                            || expected_request.is_some_and(|revision| {
+                                provider_request_revision(view, id) != Some(revision)
+                            })
+                        {
+                            return None;
+                        }
+                        Some((
+                            *source_session_id,
+                            id.clone(),
+                            *expected_request,
+                            view.state.pending_provider_interaction_kind.clone()?,
+                            view.state.pending_provider_interaction_payload.clone()?,
+                        ))
+                    });
+            if let Some((source_session_id, interaction_id, expected_request, kind, payload)) =
+                active
+                && borg_ui::provider_interaction_contains_secret(&payload)
+            {
+                match borg_ui::provider_interaction_response(&kind, &payload, &event.text) {
+                    Ok(response) => this.send(FrontendCommand::RespondToProviderInteraction {
+                        source_session_id,
+                        interaction_id,
+                        expected_request,
+                        response: borg_ui::SensitiveInteractionResponse::new(response),
+                    }),
+                    Err(_) => {
+                        this.error = Some(
+                            "Private input was not sent; re-enter it for the active request".into(),
+                        )
+                    }
+                }
+            } else {
+                this.error =
+                    Some("Private input request expired or changed; value was not sent".into());
+            }
+            cx.notify();
+        })
+        .detach();
         cx.subscribe(&composer, |this, _, event: &Submitted, cx| {
+            if let Some((source_session_id, expected_request, interaction_id, kind, payload)) =
+                this.view.as_ref().and_then(|view| {
+                    Some((
+                        view.session_id,
+                        provider_request_revision(
+                            view,
+                            view.state.pending_provider_interaction_id.as_deref()?,
+                        ),
+                        view.state.pending_provider_interaction_id.clone()?,
+                        view.state.pending_provider_interaction_kind.clone()?,
+                        view.state.pending_provider_interaction_payload.clone()?,
+                    ))
+                })
+            {
+                if borg_ui::provider_interaction_contains_secret(&payload) {
+                    this.composer
+                        .update(cx, |composer, cx| composer.append_recalled(&event.0, cx));
+                    this.error = Some(
+                        "Private request arrived; ordinary input was retained as a draft".into(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                if !this.attachments.is_empty() {
+                    this.error = Some("Provider input responses cannot include attachments".into());
+                } else {
+                    match borg_ui::provider_interaction_response(&kind, &payload, &event.0) {
+                        Ok(response) => this.send(FrontendCommand::RespondToProviderInteraction {
+                            source_session_id,
+                            interaction_id,
+                            expected_request,
+                            response: borg_ui::SensitiveInteractionResponse::new(response),
+                        }),
+                        Err(error) => this.error = Some(error.to_string()),
+                    }
+                }
+                cx.notify();
+                return;
+            }
             if let Some(value) = event.0.trim().strip_prefix("/ui-language ") {
                 match UiLanguage::parse(value) {
                     Some(language) => {
@@ -110,25 +212,6 @@ impl BorgGui {
                         this.error = Some(
                             "Unknown interface language. Use auto, en, zh-Hans, es, or ru.".into(),
                         )
-                    }
-                }
-                cx.notify();
-                return;
-            }
-            if let Some((kind, payload)) = this.view.as_ref().and_then(|view| {
-                Some((
-                    view.state.pending_provider_interaction_kind.clone()?,
-                    view.state.pending_provider_interaction_payload.clone()?,
-                ))
-            }) {
-                if !this.attachments.is_empty() {
-                    this.error = Some("Provider input responses cannot include attachments".into());
-                } else {
-                    match borg_ui::provider_interaction_response(&kind, &payload, &event.0) {
-                        Ok(response) => {
-                            this.send(FrontendCommand::RespondToProviderInteraction(response))
-                        }
-                        Err(error) => this.error = Some(error.to_string()),
                     }
                 }
                 cx.notify();
@@ -339,6 +422,7 @@ impl BorgGui {
             timeline: Arc::new(Vec::new()),
             transcript_state: ListState::new(0, ListAlignment::Bottom, px(320.)),
             attachments: Vec::new(),
+            suspended_private_attachments: None,
             sessions: Vec::new(),
             sessions_open: false,
             models_open: false,
@@ -402,8 +486,30 @@ impl BorgGui {
                                     .pending_provider_interaction_payload
                                     .as_ref()
                                     .is_some_and(borg_ui::provider_interaction_contains_secret);
-                                this.composer
-                                    .update(cx, |composer, cx| composer.set_secret(secret, cx));
+                                if secret && this.suspended_private_attachments.is_none() {
+                                    this.suspended_private_attachments =
+                                        Some(std::mem::take(&mut this.attachments));
+                                } else if !secret
+                                    && let Some(attachments) =
+                                        this.suspended_private_attachments.take()
+                                {
+                                    this.attachments.extend(attachments);
+                                }
+                                this.composer.update(cx, |composer, cx| {
+                                    composer.set_secret(
+                                        secret,
+                                        view.state.pending_provider_interaction_id.as_ref().map(
+                                            |id| {
+                                                (
+                                                    view.session_id,
+                                                    id.clone(),
+                                                    provider_request_revision(&view, id),
+                                                )
+                                            },
+                                        ),
+                                        cx,
+                                    )
+                                });
                                 this.view = Some(view);
                             }
                             LocalSessionUpdate::Sessions(sessions) => this.sessions = sessions,
@@ -666,17 +772,31 @@ impl BorgGui {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(kind) = self
-            .view
-            .as_ref()
-            .and_then(|view| view.state.pending_provider_interaction_kind.as_deref())
+        if let Some((source_session_id, expected_request, interaction_id, kind)) =
+            self.view.as_ref().and_then(|view| {
+                Some((
+                    view.session_id,
+                    provider_request_revision(
+                        view,
+                        view.state.pending_provider_interaction_id.as_deref()?,
+                    ),
+                    view.state.pending_provider_interaction_id.clone()?,
+                    view.state.pending_provider_interaction_kind.clone()?,
+                ))
+            })
         {
-            self.send(FrontendCommand::RespondToProviderInteraction(
-                borg_ui::cancelled_provider_interaction_response(kind),
-            ));
+            self.send(FrontendCommand::RespondToProviderInteraction {
+                source_session_id,
+                interaction_id,
+                expected_request,
+                response: borg_ui::SensitiveInteractionResponse::new(
+                    borg_ui::cancelled_provider_interaction_response(&kind),
+                ),
+            });
             cx.notify();
         }
     }
+
     fn toggle_delivery(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.delivery = match self.delivery {
             PromptDelivery::Steer => PromptDelivery::Queue,
@@ -1117,6 +1237,14 @@ impl Render for BorgGui {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("The provider needs input to continue")
                 .to_string();
+            let prompt = if let Some(notice) = payload
+                .get("borg_private_input_notice")
+                .and_then(serde_json::Value::as_str)
+            {
+                format!("{notice} {prompt}")
+            } else {
+                prompt
+            };
             Some((kind, prompt))
         });
         let delivery = match self.delivery {

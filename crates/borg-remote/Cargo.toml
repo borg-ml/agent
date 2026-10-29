@@ -39,6 +39,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+hmac = "0.13"
 sqlx.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

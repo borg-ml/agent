@@ -4753,12 +4753,16 @@ async fn run_local_agent_session(
                             pending_provider_interaction =
                                 Some((interaction_id.clone(), kind.clone(), payload.clone()));
                         }
-                        SessionEventKind::ProviderInteractionResolved { interaction_id, .. }
+                        SessionEventKind::ProviderInteractionResolved { interaction_id, response }
                             if pending_provider_interaction
                                 .as_ref()
                                 .is_some_and(|(pending_id, _, _)| pending_id == interaction_id) =>
                         {
                             pending_provider_interaction = None;
+                            if response["status"] == "saved" && response.get("provider").is_some() {
+                                live_extension_executor.replace_configured_model_gateways(agent_config.configured_model_gateways());
+                                if let Some(terminal) = terminal.as_mut() { terminal.set_commit_model_gateways(agent_config.configured_model_gateways()); }
+                            }
                         }
                         SessionEventKind::GoalUpdated { goal } => {
                             current_goal = Some(goal.clone());
@@ -6500,9 +6504,17 @@ async fn run_local_agent_session(
                             completion_alert_policy_name(policy)
                         ));
                     }
-                    UiAction::SaveCustomProvider { original, id, provider } => {
+                    UiAction::SaveCustomProvider { original, id, provider, key_changed } => {
                         let result = agent_config_path.as_deref().context("No agent configuration path is available")
-                            .and_then(|path| crate::agent_config::save_custom_provider(path, original.as_ref(), Some((&id, &provider))));
+                            .and_then(|path| crate::agent_config::save_custom_provider(path, original.as_ref(), Some((&id, &provider))))
+                            .and_then(|next| {
+                                if key_changed { borg_provider::credentials::clear_named_provider_api_key(&id)?; }
+                                if let Some((old_id, _)) = &original && old_id != &id {
+                                    if !key_changed && let Some(key) = borg_provider::credentials::named_provider_api_key(old_id) { borg_provider::credentials::store_named_provider_api_key(&id, &key)?; }
+                                    borg_provider::credentials::clear_named_provider_api_key(old_id)?;
+                                }
+                                Ok(next)
+                            });
                         let terminal = terminal.as_mut().expect("terminal");
                         match result {
                             Ok(next) => {
@@ -6521,7 +6533,8 @@ async fn run_local_agent_session(
                     UiAction::DeleteCustomProvider { id, expected } => {
                         let original = (id.clone(), expected);
                         let result = agent_config_path.as_deref().context("No agent configuration path is available")
-                            .and_then(|path| crate::agent_config::save_custom_provider(path, Some(&original), None));
+                            .and_then(|path| crate::agent_config::save_custom_provider(path, Some(&original), None))
+                            .and_then(|next| { borg_provider::credentials::clear_named_provider_api_key(&id)?; Ok(next) });
                         let terminal = terminal.as_mut().expect("terminal");
                         match result {
                             Ok(next) => {
@@ -6992,11 +7005,73 @@ async fn run_local_agent_session(
                             continue;
                         }
                     }
+                    UiAction::RespondToPrivateInput { source_session_id, interaction_id, expected_request, answer } => {
+                        let text = answer.into_text();
+                        if let Some((expected, kind, payload)) = pending_provider_interaction.as_ref()
+                            && source_session_id == session_id && expected == &interaction_id && provider_interaction_payload_contains_secret(payload) {
+                            match provider_interaction_response(kind, payload, &text) {
+                                Ok(response) => { dispatch_ui_command(&ui_interaction_tx, HostCommand::RespondToProviderInteraction {
+                                    session_id, interaction_id, response, expected_request, acknowledgement: None,
+                                }); },
+                                Err(_) => terminal.as_mut().expect("terminal").set_notice("Private input was not sent; re-enter it for the active request"),
+                            }
+                        } else {
+                            terminal.as_mut().expect("terminal").set_notice("Private input request expired or changed; value was not sent");
+                        }
+                        continue;
+                    }
                     UiAction::Submit {
                         target,
                         text,
                         attachments,
                     } => {
+                        if let Some((interaction_id, kind, payload)) =
+                            pending_provider_interaction.clone()
+                            && target.is_none()
+                        {
+                            if provider_interaction_payload_contains_secret(&payload) {
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.restore_composer(text, attachments);
+                                terminal.set_notice("Private request arrived; your ordinary prompt was retained as a draft");
+                                continue;
+                            }
+                            if !attachments.is_empty() {
+                                terminal.as_mut().expect("terminal").restore_composer(
+                                    text,
+                                    attachments,
+                                );
+                                terminal.as_mut().expect("terminal").set_notice(
+                                    "Provider input responses cannot include attachments"
+                                        .to_string(),
+                                );
+                                continue;
+                            }
+                            match provider_interaction_response(&kind, &payload, text.trim()) {
+                                Ok(response) => {
+                                    dispatch_ui_command(
+                                        &ui_interaction_tx,
+                                        HostCommand::RespondToProviderInteraction {
+                                            session_id,
+                                            interaction_id,
+                                            response,
+
+                                            expected_request: None, acknowledgement: None,
+                                        },
+                                    );
+                                }
+                                Err(error) => {
+                                    terminal
+                                        .as_mut()
+                                        .expect("terminal")
+                                        .restore_composer(text, Vec::new());
+                                    terminal
+                                        .as_mut()
+                                        .expect("terminal")
+                                        .set_notice(error.to_string());
+                                }
+                            }
+                            continue;
+                        }
                         let text = normalize_consultation_command(&text);
                         if let Some(prompt) = director_prompt_command(&text) {
                             let terminal = terminal.as_mut().expect("terminal");
@@ -7108,47 +7183,6 @@ async fn run_local_agent_session(
                                 Err(error) => {
                                     terminal.restore_composer(text, attachments);
                                     terminal.set_notice(error.to_string());
-                                }
-                            }
-                            continue;
-                        }
-                        if let Some((interaction_id, kind, payload)) =
-                            pending_provider_interaction.clone()
-                            && target.is_none()
-                        {
-                            if !attachments.is_empty() {
-                                terminal.as_mut().expect("terminal").restore_composer(
-                                    text,
-                                    attachments,
-                                );
-                                terminal.as_mut().expect("terminal").set_notice(
-                                    "Provider input responses cannot include attachments"
-                                        .to_string(),
-                                );
-                                continue;
-                            }
-                            match provider_interaction_response(&kind, &payload, text.trim()) {
-                                Ok(response) => {
-                                    dispatch_ui_command(
-                                        &ui_interaction_tx,
-                                        HostCommand::RespondToProviderInteraction {
-                                            session_id,
-                                            interaction_id,
-                                            response,
-
-                                            expected_request: None, acknowledgement: None,
-                                        },
-                                    );
-                                }
-                                Err(error) => {
-                                    terminal
-                                        .as_mut()
-                                        .expect("terminal")
-                                        .restore_composer(text, Vec::new());
-                                    terminal
-                                        .as_mut()
-                                        .expect("terminal")
-                                        .set_notice(error.to_string());
                                 }
                             }
                             continue;

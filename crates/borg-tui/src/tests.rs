@@ -22891,3 +22891,122 @@ fn focused_child_message_scope_survives_history_rebuild() {
         );
     }
 }
+
+#[test]
+fn private_composer_has_no_draft_history_or_undo() {
+    let mut composer = Composer {
+        private: true,
+        ..Default::default()
+    };
+    composer.insert("private-test-value");
+    composer.checkpoint(EditKind::Discrete);
+    assert!(composer.draft().is_none());
+    assert!(!composer.undo());
+    let (answer, attachments) = composer.take();
+    assert_eq!(answer, "private-test-value");
+    assert!(attachments.is_empty());
+    assert!(composer.history.is_empty());
+    assert!(!composer.undo());
+}
+
+#[tokio::test]
+#[ignore = "requires a PTY; run under script with a sized terminal"]
+async fn private_input_preserves_draft_but_never_saves_or_recalls_secret() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = composer_test_terminal(&directory);
+    terminal.composer.insert("ordinary unfinished prompt");
+    terminal.persist_composer_draft();
+    terminal.open_settings();
+    let session = Uuid::new_v4();
+    terminal.apply_session_event(&SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::ProviderInteractionRequested {
+            interaction_id: "private-1".into(),
+            kind: "borg_secret_request".into(),
+            title: "Private API key".into(),
+            detail: "Test only".into(),
+            payload: serde_json::json!({"questions":[{"id":"api_key","isSecret":true}]}),
+        },
+    ));
+    let secret = "/director private-test-value";
+    assert!(matches!(
+        terminal
+            .handle_event(TerminalInputEvent {
+                event: Event::Paste(secret.into()),
+                scroll_repetitions: 1
+            })
+            .unwrap(),
+        UiAction::None
+    ));
+    terminal
+        .handle_event(composer_input(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(terminal.composer.text, secret);
+    assert_eq!(
+        terminal.composer_draft().unwrap().0,
+        "ordinary unfinished prompt"
+    );
+    let bound_reply = terminal
+        .handle_event(composer_input(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        matches!(&bound_reply, UiAction::RespondToPrivateInput { source_session_id, interaction_id, expected_request: Some(_), .. }
+        if *source_session_id == terminal.session_id && interaction_id == "private-1")
+    );
+    assert!(!format!("{bound_reply:?}").contains("private-test-value"));
+    assert!(terminal.composer.history.is_empty());
+    let fresh = ComposerDraftStore::for_session(directory.path(), terminal.session_id);
+    let pending = std::mem::replace(&mut terminal.composer_draft_store, fresh);
+    drop(pending); // Flush the sidecar writer before inspecting its bytes.
+    let stored = terminal.composer_draft_store.load().unwrap();
+    assert_eq!(stored.text, "ordinary unfinished prompt");
+    assert!(stored.private_input_suspended);
+    terminal.apply_session_event(&SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::ProviderInteractionResolved {
+            interaction_id: "private-1".into(),
+            response: serde_json::json!({"redacted":true}),
+        },
+    ));
+    assert_eq!(terminal.composer.text, "ordinary unfinished prompt");
+    assert!(
+        terminal.settings.is_some(),
+        "a private prompt must not discard an open settings draft"
+    );
+    // The request expired before dispatch. The captured value remains a
+    // request-bound reply, never an ordinary prompt or a reply to a new card.
+    let UiAction::RespondToPrivateInput {
+        interaction_id,
+        answer,
+        ..
+    } = bound_reply
+    else {
+        panic!("private reply became an ordinary prompt");
+    };
+    assert_eq!(interaction_id, "private-1");
+    assert_eq!(answer.into_text(), secret);
+    terminal.composer_draft_store.save(ComposerDraft {
+        text: "old-private-test-value".into(),
+        ..Default::default()
+    });
+    let fresh = ComposerDraftStore::for_session(directory.path(), terminal.session_id);
+    drop(std::mem::replace(&mut terminal.composer_draft_store, fresh));
+    terminal.composer.clear();
+    terminal.set_private_input(true);
+    terminal.restore_composer_draft();
+    assert!(terminal.composer_draft_store.load().is_none());
+    assert!(terminal.composer.text.is_empty());
+    assert!(terminal.composer_draft().is_none());
+    assert!(
+        std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                std::fs::read_to_string(entry.path())
+                    .is_ok_and(|text| text.contains("old-private-test-value"))
+            }),
+        "the ambiguous older draft is preserved for local human recovery"
+    );
+}

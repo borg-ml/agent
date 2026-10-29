@@ -7,6 +7,9 @@ Git comparison.
 
 ## Unreleased (since 0.19.9)
 
+- Private input no longer enters composer drafts/history/undo or slash-command parsing, and sensitive answers are redacted from resolution events. Provider headers are masked; GUI copy/input-method readback is blocked for private input. New `request_secret` asks the human for a destination-bound provider API key and returns only a receipt, without switching billing. Credential updates are atomic and locked; remote private-answer receipts use keyed commitments. Streaming command journals redact complete lines and suppress split key/private-key material. Keys remain permission-protected local plaintext, not an encrypted/payment vault; see `docs/sensitive-input.md` and the T3 Code audit.
+- Native PostgreSQL test-service readiness now queries a system catalog, detecting broken clusters that a socket-only readiness probe reported healthy.
+
 - Settings now has a Providers section for custom OpenAI-compatible endpoints, masked API keys or environment references, headers, model limits, request options and named variants. Saves preserve unrelated configuration and detect stale drafts; updated endpoints apply on future turns without changing the chat model. Anonymous custom endpoints no longer inherit another provider's API key or generic request options, and removed routes fail closed.
 
 - The splash bottom line shows the working directory. Settings now include an independent, saved commit-message model picker with reasoning controls and custom model-only routes, plus streaming refresh rate, layout and dictation configuration. Commit drafts support native subscription/API routes and configured gateways without switching the chat model; unavailable drafts visibly fall back to a file summary.

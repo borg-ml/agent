@@ -326,19 +326,9 @@ pub fn cancelled_provider_interaction_response(kind: &str) -> serde_json::Value 
     }
 }
 
-pub fn provider_interaction_contains_secret(payload: &serde_json::Value) -> bool {
-    payload
-        .get("questions")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|questions| {
-            questions.iter().any(|question| {
-                question
-                    .get("isSecret")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-            })
-        })
-}
+pub use borg_remote::{
+    SensitiveInteractionResponse, SessionEventKind, provider_interaction_contains_secret,
+};
 
 pub fn provider_interaction_response(
     kind: &str,

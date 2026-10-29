@@ -1315,28 +1315,54 @@ async fn journal_process_output(
     entry: Arc<ProcessEntry>,
     store: Arc<dyn crate::SessionStore>,
 ) {
-    while let Some((stream, chunk)) = receiver.recv().await {
-        if let Err(error) = append_runtime_event(
-            store.as_ref(),
-            entry.session_id,
-            SessionEventKind::RuntimeProcessOutput {
-                process_id: entry.process_id,
-                stream,
-                chunk,
-            },
-        )
-        .await
-        {
-            {
-                let mut status = entry
-                    .status
-                    .lock()
-                    .expect("native process status lock poisoned");
-                if status.error.is_none() {
-                    status.error = Some(format!("failed to journal process output: {error}"));
-                }
+    let mut stdout = crate::secret_scrub::JournalOutputRedactor::default();
+    let mut stderr = crate::secret_scrub::JournalOutputRedactor::default();
+    loop {
+        let (chunks, finished) = match receiver.recv().await {
+            Some((stream, chunk)) => {
+                let safe = match stream {
+                    RuntimeProcessStream::Stdout => stdout.push(&chunk),
+                    RuntimeProcessStream::Stderr => stderr.push(&chunk),
+                };
+                (vec![(stream, safe)], false)
             }
-            terminate_process_tree(entry.pid).await;
+            None => (
+                vec![
+                    (RuntimeProcessStream::Stdout, stdout.finish()),
+                    (RuntimeProcessStream::Stderr, stderr.finish()),
+                ],
+                true,
+            ),
+        };
+        for (stream, chunk) in chunks {
+            if chunk.is_empty() {
+                continue;
+            }
+            if let Err(error) = append_runtime_event(
+                store.as_ref(),
+                entry.session_id,
+                SessionEventKind::RuntimeProcessOutput {
+                    process_id: entry.process_id,
+                    stream,
+                    chunk,
+                },
+            )
+            .await
+            {
+                {
+                    let mut status = entry
+                        .status
+                        .lock()
+                        .expect("native process status lock poisoned");
+                    if status.error.is_none() {
+                        status.error = Some(format!("failed to journal process output: {error}"));
+                    }
+                }
+                terminate_process_tree(entry.pid).await;
+                return;
+            }
+        }
+        if finished {
             break;
         }
     }
@@ -2481,7 +2507,7 @@ mod tests {
             .exec(
                 session_id,
                 directory.path(),
-                "printf 'hello'; printf 'warning' >&2".to_string(),
+                "printf 'hello\n'; printf 'sk-proj-abcdefghijkl'; printf 'mnopqrstuvwxyz0123456789\n'; printf 'warning' >&2".to_string(),
                 None,
                 Some(2_000),
                 Some(1_000),
@@ -2492,6 +2518,12 @@ mod tests {
             .expect("command");
         assert!(!result.running);
         let events = store.read(session_id).await.expect("journal");
+        assert!(result.stdout.contains("[redacted:openai-key]"));
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains("sk-proj-abcdefghijklmnopqrstuvwxyz0123456789")
+        );
         assert!(matches!(
             events.first().map(|event| &event.kind),
             Some(SessionEventKind::RuntimeProcessStarted { .. })

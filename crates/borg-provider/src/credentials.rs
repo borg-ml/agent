@@ -73,7 +73,7 @@ impl ApiKeyCredential {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct CredentialsFile {
     #[serde(flatten)]
     keys: BTreeMap<String, String>,
@@ -130,6 +130,31 @@ pub fn api_key(credential: ApiKeyCredential) -> Option<String> {
 /// Persists `key` for `credential`, replacing any previously stored value.
 pub fn store_api_key(credential: ApiKeyCredential, key: &str) -> Result<PathBuf> {
     store_value(credential.storage_key(), key)
+}
+
+/// A custom provider slot. No key is returned to an agent-facing API.
+pub fn named_provider_api_key(provider: &str) -> Option<String> {
+    let path = credentials_path()?;
+    read_credentials(&path)
+        .ok()?
+        .keys
+        .get(&format!("provider:{provider}"))
+        .cloned()
+}
+
+pub fn store_named_provider_api_key(provider: &str, key: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        !provider.is_empty()
+            && provider
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "invalid provider ID"
+    );
+    store_value(&format!("provider:{provider}"), key)
+}
+
+pub fn clear_named_provider_api_key(provider: &str) -> Result<()> {
+    clear_value(&format!("provider:{provider}"))
 }
 
 /// The coding plan persisted on this machine, if any. Written by
@@ -318,12 +343,28 @@ pub fn openai_uses_api_key() -> bool {
     }
 }
 
+fn lock_credentials(dir: &Path) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(dir.join("credentials.lock"))
+        .context("open private credential lock")?;
+    file.lock().context("lock credential store")?;
+    Ok(file)
+}
+
 fn store_value(storage_key: &str, key: &str) -> Result<PathBuf> {
     let key = key.trim();
     anyhow::ensure!(!key.is_empty(), "API key cannot be empty");
     let dir = credentials_dir().context("cannot locate a home directory for the key store")?;
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     restrict_permissions(&dir, 0o700)?;
+    let _lock = lock_credentials(&dir)?;
     let path = dir.join("credentials.json");
     let mut file = read_credentials(&path)?;
     file.keys.insert(storage_key.to_string(), key.to_string());
@@ -336,6 +377,7 @@ fn store_value(storage_key: &str, key: &str) -> Result<PathBuf> {
         tempfile::NamedTempFile::new_in(&dir).context("create private credential file")?;
     temp.write_all(&contents)
         .context("write private credential file")?;
+    temp.as_file().sync_all().context("sync credential store")?;
     temp.persist(&path)
         .with_context(|| format!("replace {}", path.display()))?;
     restrict_permissions(&path, 0o600)?;
@@ -344,15 +386,31 @@ fn store_value(storage_key: &str, key: &str) -> Result<PathBuf> {
 
 /// Removes the stored key for `credential`, if any.
 pub fn clear_api_key(credential: ApiKeyCredential) -> Result<()> {
+    clear_value(credential.storage_key())
+}
+
+fn clear_value(storage_key: &str) -> Result<()> {
     let Some(path) = credentials_path() else {
         return Ok(());
     };
+    let dir = path.parent().context("credential store has no parent")?;
+    if !dir.exists() {
+        return Ok(());
+    }
+    let _lock = lock_credentials(dir)?;
     let mut file = read_credentials(&path)?;
-    if file.keys.remove(credential.storage_key()).is_none() {
+    if file.keys.remove(storage_key).is_none() {
         return Ok(());
     }
     let contents = serde_json::to_vec_pretty(&file).context("serialize credential store")?;
-    fs::write(&path, contents).with_context(|| format!("write {}", path.display()))?;
+    use std::io::Write;
+    let mut temp =
+        tempfile::NamedTempFile::new_in(path.parent().context("credential store has no parent")?)?;
+    temp.write_all(&contents)
+        .context("write private credential file")?;
+    temp.as_file().sync_all().context("sync credential store")?;
+    temp.persist(&path)
+        .with_context(|| format!("replace {}", path.display()))?;
     restrict_permissions(&path, 0o600)
 }
 
@@ -405,6 +463,30 @@ mod tests {
             Some("sk-env")
         );
 
+        store_named_provider_api_key("work", "private-custom-test-key").unwrap();
+        assert_eq!(
+            named_provider_api_key("work").as_deref(),
+            Some("private-custom-test-key")
+        );
+        let writers: Vec<_> = (0..8)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    store_named_provider_api_key(&format!("worker-{index}"), "parallel-test-key")
+                        .unwrap()
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        for index in 0..8 {
+            assert_eq!(
+                named_provider_api_key(&format!("worker-{index}")).as_deref(),
+                Some("parallel-test-key")
+            );
+        }
+        clear_named_provider_api_key("work").unwrap();
+        assert!(named_provider_api_key("work").is_none());
         clear_api_key(ApiKeyCredential::Anthropic).unwrap();
         assert_eq!(stored_api_key(ApiKeyCredential::Anthropic), None);
         store_api_key(ApiKeyCredential::OpenAi, "saved-openai-key").unwrap();

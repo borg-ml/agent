@@ -979,17 +979,23 @@ impl LocalSessionClient {
                 acknowledgement: None,
                 edited_input: None,
             },
-            FrontendCommand::RespondToProviderInteraction(response) => {
+            FrontendCommand::RespondToProviderInteraction {
+                source_session_id,
+                interaction_id,
+                expected_request,
+                response,
+            } => {
+                anyhow::ensure!(
+                    source_session_id == session_id
+                        && self.view.state.pending_provider_interaction_id.as_deref()
+                            == Some(interaction_id.as_str()),
+                    "private input request expired or changed; answer was not sent"
+                );
                 HostCommand::RespondToProviderInteraction {
                     session_id,
-                    interaction_id: self
-                        .view
-                        .state
-                        .pending_provider_interaction_id
-                        .clone()
-                        .context("this session is not waiting for provider input")?,
-                    response,
-                    expected_request: None,
+                    interaction_id,
+                    response: response.into_value(),
+                    expected_request,
                     acknowledgement: None,
                 }
             }

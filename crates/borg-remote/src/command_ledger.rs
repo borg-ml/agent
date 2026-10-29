@@ -5,6 +5,24 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+/// Answer receipts must not be offline password/PIN verifiers. The relay's
+/// private authority keys this digest; raw answers and unkeyed hashes are not
+/// persisted. A token rotation deliberately makes old answer retries fail closed.
+pub(crate) fn private_answer_intent(encoded: &[u8], authority: &str) -> Result<Vec<u8>> {
+    use hmac::{Hmac, KeyInit, Mac};
+    ensure!(
+        !authority.is_empty(),
+        "private answer authority is unavailable"
+    );
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(authority.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(b"borg:private-answer-intent:v1\0");
+    mac.update(encoded);
+    let mut intent = b"private-answer-v1:".to_vec();
+    intent.extend_from_slice(&mac.finalize().into_bytes());
+    Ok(intent)
+}
+
 pub enum Admission {
     New,
     InDoubt,
@@ -137,5 +155,29 @@ impl CommandLedger {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod private_answer_tests {
+    use super::*;
+    #[test]
+    fn answer_intents_require_private_authority_and_do_not_store_plain_hashes() {
+        let input = br#"{"answer":"1234"}"#;
+        let intent = private_answer_intent(input, "test-authority").unwrap();
+        assert_eq!(
+            intent,
+            private_answer_intent(input, "test-authority").unwrap()
+        );
+        assert_ne!(
+            intent,
+            private_answer_intent(input, "other-authority").unwrap()
+        );
+        assert_ne!(
+            intent,
+            private_answer_intent(br#"{"answer":"1235"}"#, "test-authority").unwrap()
+        );
+        assert!(!intent.windows(4).any(|bytes| bytes == b"1234"));
+        assert!(private_answer_intent(input, "").is_err());
     }
 }

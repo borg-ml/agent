@@ -2032,6 +2032,11 @@ async fn viewer_command(
         .await?
         .context("scope projection is not initialized")?;
     let encoded = serde_json::to_vec(&viewer.command)?;
+    let encoded = if matches!(&viewer.command, Command::RespondToQuestion { .. }) {
+        crate::command_ledger::private_answer_intent(&encoded, &context.config.host_token)?
+    } else {
+        encoded
+    };
     let outcome = match ledger
         .admit(
             context.config.host_id,
@@ -2500,6 +2505,7 @@ async fn owner_command_admitted(
         let host = context.config.host_id;
         let id = Uuid::parse_str(&command_id)?;
         let encoded = serde_json::to_vec(&command)?;
+        let encoded = if matches!(&command, HostCommand::RespondToProviderInteraction { .. }) { crate::command_ledger::private_answer_intent(&encoded, &context.config.host_token)? } else { encoded };
         let admission = ledger.admit(host, id, "host", "owner:trusted-relay", &encoded).await?;
         if let crate::command_ledger::Admission::Terminal(bytes) = admission {
             return Ok(owner_frame(command_id.clone(), serde_json::from_slice(&bytes)?));

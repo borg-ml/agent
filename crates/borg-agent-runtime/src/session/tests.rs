@@ -26082,3 +26082,186 @@ async fn pending_input_cancellation_keeps_recovery_before_delivery_without_a_pla
         "the consumed flush must not abort its replacement turn"
     );
 }
+
+struct PrivateInputExecutor {
+    first_party: bool,
+    saved: bool,
+}
+#[async_trait::async_trait]
+impl AgentTurnExecutor for PrivateInputExecutor {
+    async fn execute(
+        &self,
+        turn: AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        mut controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        if self.first_party {
+            let receipt = turn.agent_tools.call("request_secret", json!({"provider":"anthropic","reason":"Integration test","timeout_seconds":10})).await?;
+            assert_eq!(
+                receipt["status"],
+                if self.saved { "saved" } else { "declined" }
+            );
+            assert!(!receipt.to_string().contains("private-test-value"));
+            assert!(
+                controls.as_mut().unwrap().try_recv().is_err(),
+                "first-party secret answers must never go to a provider control channel"
+            );
+        } else {
+            events
+                .send(SessionEventKind::ProviderInteractionRequested {
+                    interaction_id: "provider-private".into(),
+                    kind: "question".into(),
+                    title: "Private input".into(),
+                    detail: "Test only".into(),
+                    payload: json!({"questions":[{"id":"password","isSecret":true}]}),
+                })
+                .await?;
+            match controls.as_mut().unwrap().recv().await {
+                Some(AgentTurnControl::ProviderInteractionResponse { response, .. }) => assert_eq!(
+                    response["answers"]["password"]["answers"][0],
+                    "private-test-value"
+                ),
+                _ => panic!("expected transient provider response"),
+            }
+        }
+        Ok(AgentTurnResult {
+            provider_session_id: None,
+            final_text: "Private interaction complete".into(),
+        })
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn private_interactions_keep_raw_answers_out_of_durable_history() {
+    // A child process owns its credential environment; no test or developer
+    // session can accidentally read or overwrite real provider credentials.
+    if std::env::var_os("BORG_PRIVATE_INPUT_TEST_CHILD").is_none() {
+        let home = tempdir().unwrap();
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session::tests::private_interactions_keep_raw_answers_out_of_durable_history",
+                "--nocapture",
+            ])
+            .env("BORG_HOME", home.path())
+            .env("BORG_PRIVATE_INPUT_TEST_CHILD", "1")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let credentials = home.path().join("credentials.json");
+        assert!(
+            std::fs::read_to_string(&credentials)
+                .unwrap()
+                .contains("private-test-value")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(credentials).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+        return;
+    }
+    for (first_party, saved) in [(false, false), (true, false), (true, true)] {
+        let root = tempdir().unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        let (commands, command_rx) = mpsc::channel(8);
+        let (event_tx, mut events) = mpsc::channel(64);
+        let actor = tokio::spawn({
+            let root_path = root.path().to_path_buf();
+            let store = store.clone();
+            async move {
+                run_session_actor(
+                    &root_path.join("session.lock"),
+                    session_id,
+                    LaunchSession {
+                        request_id: Uuid::new_v4(),
+                        cwd: root_path.clone(),
+                        provider: CodingProvider::Codex,
+                        model: None,
+                        effort: None,
+                        fast: Some(false),
+                        ultrafast: None,
+                        response_language: crate::ResponseLanguage::Auto,
+                        permission_mode: PermissionMode::Manual,
+                        name: None,
+                        initial_prompt: Some("Request private input".into()),
+                        capabilities: Default::default(),
+                        subagent_concurrency_limit: None,
+                        extension_skill_roots: Vec::new(),
+                        team_policy: None,
+                    },
+                    command_rx,
+                    event_tx,
+                    Arc::new(PrivateInputExecutor { first_party, saved }),
+                    store,
+                )
+                .await
+            }
+        });
+        let id = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if let SessionEventKind::ProviderInteractionRequested { interaction_id, .. } =
+                    event.kind
+                {
+                    break interaction_id;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        commands
+            .send(HostCommand::RespondToProviderInteraction {
+                session_id,
+                interaction_id: id,
+                response: if saved {
+                    json!({"answers":{"api_key":{"answers":["private-test-value"]}}})
+                } else if first_party {
+                    json!({"answers":{}})
+                } else {
+                    json!({"answers":{"password":{"answers":["private-test-value"]}}})
+                },
+                expected_request: None,
+                acknowledgement: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if let SessionEventKind::TurnCompleted { error, .. } = event.kind {
+                    assert!(error.is_none(), "{error:?}");
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let durable = store.read(session_id).await.unwrap();
+        assert!(
+            !serde_json::to_string(&durable)
+                .unwrap()
+                .contains("private-test-value")
+        );
+        assert!(durable.iter().any(|event| matches!(&event.kind, SessionEventKind::ProviderInteractionResolved { response, .. } if response["redacted"] == true || response["status"] == "declined" || response["status"] == "saved")));
+        commands
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
+        scratch.discard().await;
+    }
+}

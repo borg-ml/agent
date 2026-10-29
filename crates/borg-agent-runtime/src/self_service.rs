@@ -224,9 +224,9 @@ impl SelfServiceContext {
             "exists": exists,
             "settings": serde_json::to_value(settings)?,
             "hot_reload": ["commands.aliases", "keybindings", "scout", "search"],
-            "next_turn_reload": ["extensions", "mcp"],
+            "next_turn_reload": ["extensions", "mcp", "providers"],
             "restart_required": [
-                "capabilities", "team", "approvals", "updates", "providers", "prompt"
+                "capabilities", "team", "approvals", "updates", "prompt"
             ]
         }))
     }

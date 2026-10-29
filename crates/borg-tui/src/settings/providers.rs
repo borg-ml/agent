@@ -8,6 +8,7 @@ pub(super) struct ProviderEditor {
     provider: ConfiguredProvider,
     model: Option<ModelEditor>,
     confirm_delete: bool,
+    key_changed: bool,
 }
 
 struct ModelEditor {
@@ -66,7 +67,9 @@ pub(super) fn list_rows(providers: &BTreeMap<String, ConfiguredProvider>) -> Vec
                     " (not set)"
                 }
             )
-        } else if provider.api_key.is_some() {
+        } else if provider.api_key.is_some()
+            || borg_provider::credentials::named_provider_api_key(id).is_some()
+        {
             "saved key".into()
         } else {
             "no API key".into()
@@ -194,7 +197,15 @@ pub(super) fn editor_rows(editor: &ProviderEditor) -> Vec<SettingRow> {
             Id::ProviderKey,
             "API key",
             "Paste a replacement key into your private agent config. Blank keeps the saved key; Clear authentication removes it. Keys stay masked. A new key clears the environment reference.",
-            SettingControl::Secret(provider.api_key.clone().unwrap_or_default()),
+            SettingControl::Secret(provider.api_key.clone().unwrap_or_else(|| {
+                if !editor.key_changed
+                    && borg_provider::credentials::named_provider_api_key(&editor.id).is_some()
+                {
+                    "saved in credential store".into()
+                } else {
+                    String::new()
+                }
+            })),
         ),
         action(
             Id::ProviderClearAuth,
@@ -202,11 +213,15 @@ pub(super) fn editor_rows(editor: &ProviderEditor) -> Vec<SettingRow> {
             "Remove the saved key and environment reference from this draft. Save provider to apply.",
             "Use no API key",
         ),
-        text(
+        row(
             Id::ProviderHeaders,
-            "Headers (JSON)",
-            "Optional string-valued headers, e.g. {\"X-Project\":\"work\"}. Headers are sent only to this provider.",
-            serde_json::to_string(&provider.headers).unwrap_or_default(),
+            "Headers (private JSON)",
+            "Header values may be credentials and stay masked. Paste a replacement JSON object; blank keeps existing headers and {} clears them.",
+            SettingControl::Secret(if provider.headers.is_empty() {
+                String::new()
+            } else {
+                serde_json::to_string(&provider.headers).unwrap_or_default()
+            }),
         ),
         action(
             Id::ProviderModelAdd,
@@ -241,6 +256,7 @@ impl SettingsScreen {
                     provider: Default::default(),
                     model: None,
                     confirm_delete: false,
+                    key_changed: false,
                 })
             }
             Id::ProviderEntry(index) => {
@@ -251,6 +267,7 @@ impl SettingsScreen {
                     provider: provider.clone(),
                     model: None,
                     confirm_delete: false,
+                    key_changed: false,
                 });
             }
             Id::ProviderBack => {
@@ -264,6 +281,7 @@ impl SettingsScreen {
                 let editor = self.provider_editor.as_mut()?;
                 editor.provider.api_key = None;
                 editor.provider.api_key_env = None;
+                editor.key_changed = true;
                 return Some(SettingsEffect::None);
             }
             Id::ProviderModelAdd => {
@@ -314,6 +332,7 @@ impl SettingsScreen {
                     original: editor.original.clone(),
                     id: editor.id.clone(),
                     provider: editor.provider.clone(),
+                    key_changed: editor.key_changed,
                 }));
             }
             Id::ProviderDelete => {
@@ -392,16 +411,21 @@ impl SettingsScreen {
                     editor.provider.api_key_env = optional();
                     if !value.is_empty() {
                         editor.provider.api_key = None;
+                        editor.key_changed = true;
                     }
                 }
                 Id::ProviderKey => {
                     if !value.is_empty() {
                         editor.provider.api_key = optional();
                         editor.provider.api_key_env = None;
+                        editor.key_changed = true;
                     }
                 }
                 Id::ProviderHeaders => {
-                    editor.provider.headers = serde_json::from_str(value).map_err(json_error)?
+                    if !value.is_empty() {
+                        editor.provider.headers =
+                            serde_json::from_str(value).map_err(json_error)?;
+                    }
                 }
                 id => {
                     let model = editor
@@ -527,6 +551,7 @@ mod tests {
             original,
             id,
             provider,
+            ..
         })) = screen.provider_action(SettingId::ProviderSave)
         else {
             panic!("expected one provider save");

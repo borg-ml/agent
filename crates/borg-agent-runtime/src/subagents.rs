@@ -502,6 +502,7 @@ pub struct AgentToolDispatcher {
     runtime_root: PathBuf,
     runtime_permission: crate::PermissionMode,
     tool_approvals: Arc<RwLock<Option<crate::session::SessionToolApprovals>>>,
+    secret_requests: Arc<RwLock<Option<crate::sensitive_input::SessionSecretRequests>>>,
     resource_limits: Option<HostResourceLimits>,
     execution_provider: Arc<RwLock<Arc<dyn crate::ExecutionProvider>>>,
     /// Environment for commands the model runs through Borg's shell tools, so
@@ -1195,6 +1196,7 @@ impl AgentToolDispatcher {
             runtime_root,
             runtime_permission: permission,
             tool_approvals: Arc::new(RwLock::new(None)),
+            secret_requests: Arc::new(RwLock::new(None)),
             resource_limits: None,
             execution_provider: Arc::new(RwLock::new(execution_provider)),
             command_environment: Arc::new(RwLock::new(BTreeMap::new())),
@@ -1295,6 +1297,16 @@ impl AgentToolDispatcher {
             *current = pending;
             changed
         });
+    }
+
+    pub(crate) fn configure_secret_requests(
+        &self,
+        requests: crate::sensitive_input::SessionSecretRequests,
+    ) {
+        *self
+            .secret_requests
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(requests);
     }
 
     pub(crate) fn configure_tool_approvals(&self, approvals: crate::session::SessionToolApprovals) {
@@ -2789,7 +2801,11 @@ impl AgentToolDispatcher {
     ) -> Result<Value> {
         if matches!(
             name,
-            "consult_model" | "consult_peer" | "rotate_peer" | "update_agent_settings"
+            "consult_model"
+                | "consult_peer"
+                | "rotate_peer"
+                | "update_agent_settings"
+                | "request_secret"
         ) && let Some(team) = &self.subagents
         {
             team.require_director(self.actor_session_id)?;
@@ -2996,7 +3012,11 @@ impl AgentToolDispatcher {
     ) -> Result<Value> {
         if matches!(
             name,
-            "consult_model" | "consult_peer" | "rotate_peer" | "update_agent_settings"
+            "consult_model"
+                | "consult_peer"
+                | "rotate_peer"
+                | "update_agent_settings"
+                | "request_secret"
         ) && let Some(team) = &self.subagents
         {
             team.require_director(self.actor_session_id)?;
@@ -3069,6 +3089,28 @@ impl AgentToolDispatcher {
                 .await;
         }
         match name {
+            "request_secret" => {
+                let args: crate::sensitive_input::RequestSecretArgs =
+                    serde_json::from_value(arguments)?;
+                if crate::sensitive_input::builtin_credential(&args.provider).is_none() {
+                    let settings = self.self_service.call("get_agent_settings", json!({}))?;
+                    ensure!(
+                        settings
+                            .get("settings")
+                            .and_then(|settings| settings.get("providers"))
+                            .and_then(|providers| providers.get(&args.provider))
+                            .is_some(),
+                        "Configure the custom provider in Settings before requesting its key"
+                    );
+                }
+                let requests = self
+                    .secret_requests
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone()
+                    .context("Secret requests require a live interactive session")?;
+                requests.request(args).await
+            }
             "read_file" | "search_files" | "list_files" => {
                 self.read_workspace_tool(self.execution_provider().as_ref(), name, arguments)
                     .await
@@ -10754,6 +10796,9 @@ pub fn agent_tool_specs_for_surface(
             },"required":["op","project"],"additionalProperties":false}),
         ));
     }
+    specs.push(tool("request_secret",
+        "Ask the human for a provider API key in a masked private input. Required provider is a built-in API lane (openai, anthropic, openrouter, vercel, opencode-go, kimi, glm, qwen) or an existing custom provider ID. Borg saves it directly to that provider's owner-only local credential slot; you receive status only, never the key. This does not switch billing or model. Do not ask for passwords, bank/card PINs, CVVs or payment details: have the user complete those in the original app. Never ask the human to paste secrets into chat.",
+        json!({"type":"object","properties":{"provider":{"type":"string"},"reason":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":3600}},"required":["provider","reason"],"additionalProperties":false})));
     specs.extend(crate::self_service::tool_specs());
     if surface.shared_work {
         specs.extend(shared_work_tool_specs());
@@ -10779,7 +10824,9 @@ pub fn agent_tool_specs_for_surface(
     // person to decide; a child reports to its parent instead, or sixty
     // children interrogate one human.
     if !surface.human_prompt {
-        specs.retain(|spec| spec["name"] != "update_agent_settings");
+        specs.retain(|spec| {
+            spec["name"] != "update_agent_settings" && spec["name"] != "request_secret"
+        });
     }
     // Exception: the user's desktop. A child's computer_use drives only its
     // own private display (or one it attaches to); the dispatcher enforces it.

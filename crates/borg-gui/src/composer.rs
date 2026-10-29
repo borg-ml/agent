@@ -45,6 +45,10 @@ actions!(
 );
 
 pub struct Submitted(pub String);
+pub struct PrivateSubmitted {
+    pub text: String,
+    pub request: Option<(uuid::Uuid, String, Option<uuid::Uuid>)>,
+}
 pub struct PastedImage(pub gpui::Image);
 
 pub struct Composer {
@@ -57,6 +61,8 @@ pub struct Composer {
     last_bounds: Option<Bounds<Pixels>>,
     selecting: bool,
     secret: bool,
+    private_request_id: Option<(uuid::Uuid, String, Option<uuid::Uuid>)>,
+    suspended_draft: Option<(SharedString, Range<usize>)>,
     history: Vec<String>,
     history_index: Option<usize>,
     history_draft: SharedString,
@@ -74,20 +80,58 @@ impl Composer {
             last_bounds: None,
             selecting: false,
             secret: false,
+            private_request_id: None,
+            suspended_draft: None,
             history: Vec::new(),
             history_index: None,
             history_draft: "".into(),
         }
     }
 
-    pub fn set_secret(&mut self, secret: bool, cx: &mut Context<Self>) {
+    pub fn set_secret(
+        &mut self,
+        secret: bool,
+        interaction_id: Option<(uuid::Uuid, String, Option<uuid::Uuid>)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.secret && secret && self.private_request_id != interaction_id {
+            self.content = "".into();
+            self.selected = 0..0;
+            self.marked = None;
+        }
+        self.private_request_id = interaction_id.filter(|_| secret);
         if self.secret != secret {
             self.secret = secret;
+            if secret {
+                self.suspended_draft = Some((self.content.clone(), self.selected.clone()));
+                self.content = "".into();
+                self.selected = 0..0;
+            } else if let Some((content, selected)) = self.suspended_draft.take() {
+                self.content = content;
+                self.selected = selected;
+            }
+            self.history_index = None;
+            self.history_draft = "".into();
+            self.marked = None;
             cx.notify();
         }
     }
 
+    fn append_to_suspended(&mut self, text: &str) {
+        let (draft, selected) = self
+            .suspended_draft
+            .get_or_insert_with(|| ("".into(), 0..0));
+        let separator = if draft.is_empty() { "" } else { "\n\n" };
+        *draft = format!("{draft}{separator}{text}").into();
+        *selected = draft.len()..draft.len();
+    }
+
     pub fn append_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.secret {
+            self.append_to_suspended(text);
+            cx.notify();
+            return;
+        }
         let separator = if self.content.is_empty()
             || self.content.chars().last().is_some_and(char::is_whitespace)
             || text.chars().next().is_some_and(char::is_whitespace)
@@ -103,6 +147,11 @@ impl Composer {
     }
 
     pub fn append_recalled(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.secret {
+            self.append_to_suspended(text);
+            cx.notify();
+            return;
+        }
         let separator = if self.content.is_empty() { "" } else { "\n\n" };
         self.content = format!("{}{separator}{text}", self.content).into();
         self.selected = self.content.len()..self.content.len();
@@ -199,6 +248,9 @@ impl Composer {
         self.move_to(self.content.len(), cx);
     }
     fn history_previous(&mut self, _: &HistoryPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        if self.secret {
+            return;
+        }
         let Some(index) = self
             .history_index
             .map(|index| index.saturating_sub(1))
@@ -216,6 +268,9 @@ impl Composer {
         cx.notify();
     }
     fn history_next(&mut self, _: &HistoryNext, _: &mut Window, cx: &mut Context<Self>) {
+        if self.secret {
+            return;
+        }
         let Some(index) = self.history_index else {
             return;
         };
@@ -246,16 +301,18 @@ impl Composer {
         if let Some(item) = cx.read_from_clipboard() {
             if let Some(text) = item.text() {
                 self.replace_text_in_range(None, &text, window, cx);
-            } else if let Some(image) = item.into_entries().find_map(|entry| match entry {
-                gpui::ClipboardEntry::Image(image) => Some(image),
-                gpui::ClipboardEntry::String(_) => None,
-            }) {
+            } else if !self.secret
+                && let Some(image) = item.into_entries().find_map(|entry| match entry {
+                    gpui::ClipboardEntry::Image(image) => Some(image),
+                    gpui::ClipboardEntry::String(_) => None,
+                })
+            {
                 cx.emit(PastedImage(image));
             }
         }
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected.is_empty() {
+        if !self.secret && !self.selected.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected.clone()].to_string(),
             ));
@@ -268,7 +325,11 @@ impl Composer {
         }
     }
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
-        let text = self.content.trim().to_string();
+        let text = if self.secret {
+            self.content.to_string()
+        } else {
+            self.content.trim().to_string()
+        };
         if text.is_empty() {
             return;
         }
@@ -277,7 +338,14 @@ impl Composer {
         self.marked = None;
         self.history_index = None;
         self.history_draft = "".into();
-        cx.emit(Submitted(text));
+        if self.secret {
+            cx.emit(PrivateSubmitted {
+                text,
+                request: self.private_request_id.clone(),
+            });
+        } else {
+            cx.emit(Submitted(text));
+        }
         cx.notify();
     }
 
@@ -373,6 +441,7 @@ impl Composer {
 }
 
 impl gpui::EventEmitter<Submitted> for Composer {}
+impl gpui::EventEmitter<PrivateSubmitted> for Composer {}
 impl gpui::EventEmitter<PastedImage> for Composer {}
 impl Focusable for Composer {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -388,6 +457,9 @@ impl EntityInputHandler for Composer {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
+        if self.secret {
+            return None;
+        }
         let range = self.range_from_utf16(&range);
         actual.replace(self.range_to_utf16(&range));
         Some(self.content[range].to_string())

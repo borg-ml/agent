@@ -26,6 +26,8 @@ mod tests;
 #[cfg(test)]
 mod view_parity;
 
+use borg_ui::provider_interaction_contains_secret;
+
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -918,6 +920,18 @@ pub enum LidSleepAuthorizationChoice {
     Never,
 }
 
+pub struct PrivateInputAnswer(String);
+impl PrivateInputAnswer {
+    pub fn into_text(self) -> String {
+        self.0
+    }
+}
+impl std::fmt::Debug for PrivateInputAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[private input]")
+    }
+}
+
 #[derive(Debug)]
 pub enum UiAction {
     None,
@@ -933,6 +947,12 @@ pub enum UiAction {
     },
     ToggleGoal {
         action: GoalAction,
+    },
+    RespondToPrivateInput {
+        source_session_id: Uuid,
+        interaction_id: String,
+        expected_request: Option<Uuid>,
+        answer: PrivateInputAnswer,
     },
     Submit {
         target: Option<Uuid>,
@@ -986,6 +1006,7 @@ pub enum UiAction {
         original: Option<(String, borg_ui::providers::ConfiguredProvider)>,
         id: String,
         provider: borg_ui::providers::ConfiguredProvider,
+        key_changed: bool,
     },
     DeleteCustomProvider {
         id: String,
@@ -1816,6 +1837,8 @@ pub struct BorgTerminal {
     back_to_director_area: Option<Rect>,
     back_to_director_hovered: bool,
     composer: Composer,
+    suspended_private_input_draft: Option<Composer>,
+    suspended_private_input_ui: Option<(Option<settings::SettingsScreen>, Option<Picker>)>,
     attachment_store: AttachmentStore,
     composer_draft_store: ComposerDraftStore,
     /// Last composer state written to the sidecar, so a save only touches the
@@ -1858,6 +1881,8 @@ pub struct BorgTerminal {
     pending_approval: bool,
     pending_provider_interaction: bool,
     pending_provider_interaction_secret: bool,
+    private_input_interaction_id: Option<String>,
+    private_input_request_event: Option<Uuid>,
     scroll_from_bottom: usize,
     scroll_motion: ScrollMotion,
     scrollbar_area: Option<Rect>,
@@ -3286,6 +3311,8 @@ impl BorgTerminal {
             back_to_director_area: None,
             back_to_director_hovered: false,
             composer: Composer::default(),
+            suspended_private_input_draft: None,
+            suspended_private_input_ui: None,
             attachment_store,
             composer_draft_store: ComposerDraftStore::for_session(sessions_dir, session_id),
             persisted_draft: None,
@@ -3318,6 +3345,8 @@ impl BorgTerminal {
             pending_approval: false,
             pending_provider_interaction: false,
             pending_provider_interaction_secret: false,
+            private_input_interaction_id: None,
+            private_input_request_event: None,
             scroll_from_bottom: 0,
             scroll_motion: ScrollMotion::default(),
             scrollbar_area: None,
@@ -3486,6 +3515,8 @@ impl BorgTerminal {
         cwd: PathBuf,
         keybindings: &KeybindingConfig,
     ) -> Result<()> {
+        self.persist_composer_draft();
+        self.set_private_input(false);
         self.session_id = session_id;
         self.attachment_store = AttachmentStore::for_session(sessions_dir, session_id)?;
         self.composer_draft_store = ComposerDraftStore::for_session(sessions_dir, session_id);
@@ -3540,7 +3571,7 @@ impl BorgTerminal {
         self.session_state_sequence = 0;
         self.pending_approval = false;
         self.pending_provider_interaction = false;
-        self.pending_provider_interaction_secret = false;
+        self.set_private_input(false);
         self.scroll_from_bottom = 0;
         self.scroll_motion = ScrollMotion::default();
         self.scrollbar_area = None;
@@ -3865,10 +3896,16 @@ impl BorgTerminal {
         self.session_state_sequence = state.latest_sequence;
         self.pending_approval = state.pending_approval_id.is_some();
         self.pending_provider_interaction = state.pending_provider_interaction_id.is_some();
-        self.pending_provider_interaction_secret = state
+        let private = state
             .pending_provider_interaction_payload
             .as_ref()
             .is_some_and(provider_interaction_contains_secret);
+        self.update_private_input_request(
+            state
+                .pending_provider_interaction_id
+                .clone()
+                .filter(|_| private),
+        );
         if let Some(director) = &state.team_director {
             self.apply_team_director(director);
         }
@@ -3881,7 +3918,10 @@ impl BorgTerminal {
         // rejection arriving was silently lost. `append_recalled` degrades to
         // a plain restore when the composer is empty, which is the usual case
         // because submission takes it.
-        self.composer.append_recalled(text, attachments);
+        self.suspended_private_input_draft
+            .as_mut()
+            .unwrap_or(&mut self.composer)
+            .append_recalled(text, attachments);
         self.composer_selection = None;
         self.persist_composer_draft();
     }
@@ -3911,7 +3951,116 @@ impl BorgTerminal {
     }
 
     pub fn composer_draft(&self) -> Option<(String, Vec<PathBuf>)> {
-        self.composer.draft()
+        self.suspended_private_input_draft
+            .as_ref()
+            .unwrap_or(&self.composer)
+            .draft()
+    }
+
+    fn update_private_input_request(&mut self, id: Option<String>) {
+        if self.private_input_interaction_id != id {
+            if self.composer.private {
+                self.composer.clear();
+            }
+            self.private_input_request_event = None;
+        }
+        self.private_input_interaction_id = id;
+        self.set_private_input(self.private_input_interaction_id.is_some());
+    }
+
+    fn private_answer(&mut self, text: String) -> UiAction {
+        match self.private_input_interaction_id.clone() {
+            Some(interaction_id) => UiAction::RespondToPrivateInput {
+                source_session_id: self.session_id,
+                interaction_id,
+                expected_request: self.private_input_request_event,
+                answer: PrivateInputAnswer(text),
+            },
+            None => {
+                self.notice = Some("Private input request expired; value was not sent".into());
+                UiAction::None
+            }
+        }
+    }
+
+    fn set_private_input(&mut self, private: bool) {
+        if !private {
+            self.private_input_interaction_id = None;
+            self.private_input_request_event = None;
+        }
+        self.pending_provider_interaction_secret = private;
+        if private && self.suspended_private_input_draft.is_none() {
+            self.focus_host_transcript();
+            self.suspended_private_input_draft = Some(std::mem::replace(
+                &mut self.composer,
+                Composer {
+                    private: true,
+                    ..Default::default()
+                },
+            ));
+            self.composer_selection = None;
+            self.suspended_private_input_ui = Some((self.settings.take(), self.picker.take()));
+        } else if !private && let Some(normal) = self.suspended_private_input_draft.take() {
+            self.composer.clear();
+            self.composer = normal;
+            if let Some((settings, picker)) = self.suspended_private_input_ui.take() {
+                self.settings = settings;
+                self.picker = picker;
+            }
+            self.composer_selection = None;
+        }
+    }
+
+    fn handle_private_input(&mut self, event: &Event) -> Option<UiAction> {
+        if !self.composer.private {
+            return None;
+        }
+        match event {
+            Event::Paste(value) => {
+                if self.composer.text.len() + value.len() <= 16_384 {
+                    self.composer.insert(value);
+                } else {
+                    self.notice = Some("Private input is limited to 16 KiB".into());
+                }
+            }
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                let control = key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT);
+                match key.code {
+                    KeyCode::Esc => {
+                        self.composer.clear();
+                        return Some(self.private_answer("/cancel".into()));
+                    }
+                    KeyCode::Enter if !control => {
+                        let (text, _) = self.composer.take();
+                        if !text.is_empty() {
+                            return Some(self.private_answer(text));
+                        }
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.composer.clear()
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.composer.clear();
+                        return Some(self.private_answer("/cancel".into()));
+                    }
+                    KeyCode::Char(character) if !control && self.composer.text.len() < 16_384 => {
+                        self.composer.insert(&character.to_string())
+                    }
+                    KeyCode::Backspace => self.composer.backspace(),
+                    KeyCode::Delete => self.composer.delete(),
+                    KeyCode::Left => self.composer.move_left(),
+                    KeyCode::Right => self.composer.move_right(),
+                    KeyCode::Home => self.composer.move_line_start(),
+                    KeyCode::End => self.composer.move_line_end(),
+                    _ => {}
+                }
+            }
+            Event::Key(_) | Event::Mouse(_) => {}
+            _ => return None,
+        }
+        Some(UiAction::None)
     }
 
     /// Bring back the prompt this session was left holding, so quitting
@@ -3920,7 +4069,16 @@ impl BorgTerminal {
         let Some(draft) = self.composer_draft_store.load() else {
             return;
         };
-        self.composer
+        if self.composer.private && !draft.private_input_suspended {
+            self.notice = Some(match self.composer_draft_store.quarantine_private_input() {
+                Ok(path) => format!("Older draft withheld during private input. Review it locally, not through chat: {}", path.display()),
+                Err(_) => "Older draft was not restored during private input. Review the local draft file before resuming it.".into(),
+            });
+            return;
+        }
+        self.suspended_private_input_draft
+            .as_mut()
+            .unwrap_or(&mut self.composer)
             .restore(draft.text.clone(), draft.attachments.clone());
         self.provisional_recalls = draft
             .recall_originals
@@ -3946,6 +4104,7 @@ impl BorgTerminal {
                         recall_originals: self.provisional_recall_ids(),
                         recall_acknowledged: self.acknowledged_recalls.iter().copied().collect(),
                         recall_submission: self.recall_submission.clone(),
+                        private_input_suspended: self.composer.private,
                     }
                 });
         if self
@@ -4624,14 +4783,35 @@ impl BorgTerminal {
             }
             SessionEventKind::ApprovalRequested { .. } => self.pending_approval = true,
             SessionEventKind::ApprovalResolved { .. } => self.pending_approval = false,
-            SessionEventKind::ProviderInteractionRequested { payload, .. } => {
+            SessionEventKind::ProviderInteractionRequested {
+                interaction_id,
+                payload,
+                ..
+            } => {
                 self.pending_provider_interaction = true;
-                self.pending_provider_interaction_secret =
-                    provider_interaction_contains_secret(payload);
+                if self.composer.private
+                    && self
+                        .private_input_request_event
+                        .is_some_and(|id| id != event.id)
+                {
+                    self.composer.clear();
+                }
+                self.update_private_input_request(
+                    provider_interaction_contains_secret(payload).then(|| interaction_id.clone()),
+                );
+                if self.composer.private {
+                    self.private_input_request_event = Some(event.id);
+                }
             }
-            SessionEventKind::ProviderInteractionResolved { .. } => {
-                self.pending_provider_interaction = false;
-                self.pending_provider_interaction_secret = false;
+            SessionEventKind::ProviderInteractionResolved { interaction_id, .. } => {
+                if self
+                    .private_input_interaction_id
+                    .as_deref()
+                    .is_none_or(|id| id == interaction_id)
+                {
+                    self.pending_provider_interaction = false;
+                    self.update_private_input_request(None);
+                }
             }
             SessionEventKind::Error { message } => self.notice = Some(message.clone()),
             SessionEventKind::SubagentControl {
@@ -7538,6 +7718,9 @@ impl BorgTerminal {
             &event,
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved)
         );
+        if let Some(action) = self.handle_private_input(&event) {
+            return Ok(action);
+        }
         if self.settings.is_some()
             && self.picker.is_none()
             && matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_))
@@ -9587,8 +9770,7 @@ impl BorgTerminal {
         let pending_approval = self.active_pending_approval();
         let pending_provider_interaction =
             self.focused_child.is_none() && self.pending_provider_interaction;
-        let pending_provider_interaction_secret =
-            self.focused_child.is_none() && self.pending_provider_interaction_secret;
+        let pending_provider_interaction_secret = self.composer.private;
         let status = self.active_status();
         let reconnect_label = self
             .connection_retry_at
@@ -14215,6 +14397,7 @@ fn team_roster_target_at(
 
 #[derive(Default)]
 struct Composer {
+    private: bool,
     text: String,
     cursor: usize,
     preferred_column: Option<usize>,
@@ -14276,6 +14459,9 @@ impl Composer {
     /// Commit the current content as an undo step if it changed since the
     /// last checkpoint. Cheap when nothing changed: no snapshot is cloned.
     fn checkpoint(&mut self, kind: EditKind) {
+        if self.private {
+            return;
+        }
         let baseline = self.undo.baseline();
         if baseline.text == self.text
             && baseline.attachments == self.attachments
@@ -14288,6 +14474,9 @@ impl Composer {
     }
 
     fn undo(&mut self) -> bool {
+        if self.private {
+            return false;
+        }
         let current = self.snapshot();
         self.undo
             .undo(&current, Instant::now())
@@ -14296,6 +14485,9 @@ impl Composer {
     }
 
     fn redo(&mut self) -> bool {
+        if self.private {
+            return false;
+        }
         let current = self.snapshot();
         self.undo
             .redo(&current, Instant::now())
@@ -14318,6 +14510,10 @@ impl Composer {
     /// Forget undo steps once the content has been sent: undoing past a
     /// submission would resurrect a prompt that is already in the transcript.
     fn reset_undo(&mut self) {
+        if self.private {
+            self.undo = Default::default();
+            return;
+        }
         let snapshot = self.snapshot();
         self.undo.reset(snapshot);
     }
@@ -14709,7 +14905,10 @@ impl Composer {
 
     fn take(&mut self) -> (String, Vec<PathBuf>) {
         let text = self.expanded_text();
-        if !text.trim().is_empty() && self.history.last().is_none_or(|previous| previous != &text) {
+        if !self.private
+            && !text.trim().is_empty()
+            && self.history.last().is_none_or(|previous| previous != &text)
+        {
             self.history.push(text.clone());
         }
         self.text.clear();
@@ -14727,6 +14926,9 @@ impl Composer {
     }
 
     fn draft(&self) -> Option<(String, Vec<PathBuf>)> {
+        if self.private {
+            return None;
+        }
         let text = self.expanded_text();
         let attachments = self
             .attachments
@@ -18177,20 +18379,6 @@ fn splash_version_text(version: &str) -> String {
     } else {
         prefixed
     }
-}
-
-fn provider_interaction_contains_secret(payload: &serde_json::Value) -> bool {
-    payload
-        .get("questions")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|questions| {
-            questions.iter().any(|question| {
-                question
-                    .get("isSecret")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-            })
-        })
 }
 
 fn mask_secret_composer_text(value: &str, cursor: usize) -> (String, usize) {

@@ -44,6 +44,8 @@ pub mod provider_usage;
 pub mod receipt;
 mod runtime_protocol;
 mod secret_scrub;
+mod sensitive_input;
+pub use sensitive_input::{SensitiveInteractionResponse, provider_interaction_contains_secret};
 mod self_service;
 pub mod session;
 mod session_action;

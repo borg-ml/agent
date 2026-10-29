@@ -119,6 +119,8 @@ it. Changes apply at once and are persisted to `editor.toml`.
 | Transcript labels | `/user-label`, `/assistant-label` | `transcript.user_label`, `transcript.assistant_label` |
 | Transcript colors | `/colors`, `/color` | the four `transcript.*_color` values in `#RRGGBB` form |
 
+See [Private input and provider-key requests](sensitive-input.md) before entering credentials.
+
 ### Custom endpoints in settings
 
 Open **Settings → Providers → Add custom provider**. Give the connection a stable

@@ -18,6 +18,8 @@ pub struct ComposerDraft {
     pub recall_originals: Vec<Uuid>,
     pub recall_acknowledged: Vec<Uuid>,
     pub recall_submission: Option<(Uuid, String, Vec<PathBuf>)>,
+    /// Confirms this is the ordinary draft suspended beside a private prompt.
+    pub private_input_suspended: bool,
 }
 
 impl ComposerDraft {
@@ -32,6 +34,7 @@ impl ComposerDraft {
             "recall_originals": self.recall_originals,
             "recall_acknowledged": self.recall_acknowledged,
             "recall_submission": self.recall_submission,
+            "private_input_suspended": self.private_input_suspended,
         })
     }
 
@@ -69,6 +72,10 @@ impl ComposerDraft {
             recall_originals,
             recall_acknowledged,
             recall_submission,
+            private_input_suspended: value
+                .get("private_input_suspended")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
         })
     }
 }
@@ -112,6 +119,16 @@ impl ComposerDraftStore {
         let raw = fs::read_to_string(&self.path).ok()?;
         let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
         ComposerDraft::from_value(value).filter(|draft| !draft.is_empty())
+    }
+
+    /// Preserve an older ambiguous draft without automatically restoring a
+    /// value that may have been typed into a pre-isolation private prompt.
+    pub fn quarantine_private_input(&self) -> Result<PathBuf> {
+        let destination = self
+            .path
+            .with_extension(format!("private-input-{}.json", Uuid::new_v4()));
+        fs::rename(&self.path, &destination).context("withhold old private-input draft")?;
+        Ok(destination)
     }
 
     /// Hand the draft to the writer thread, superseding any unwritten one.
@@ -207,6 +224,7 @@ mod recall_tests {
             recall_originals: vec![Uuid::new_v4()],
             recall_acknowledged: vec![Uuid::new_v4()],
             recall_submission: Some((Uuid::new_v4(), "submitted".into(), Vec::new())),
+            private_input_suspended: true,
         };
         assert_eq!(ComposerDraft::from_value(draft.to_value()), Some(draft));
         let old =
