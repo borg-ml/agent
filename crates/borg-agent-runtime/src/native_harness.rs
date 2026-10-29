@@ -3086,7 +3086,10 @@ impl ProviderModelClient {
         progress: ProviderProgress,
     ) -> Result<()> {
         if let ProviderProgress::ProviderEvent { kind, payload, .. } = progress
-            && matches!(kind.as_str(), "native_model_request" | "native_model_usage")
+            && matches!(
+                kind.as_str(),
+                "native_model_request" | "native_model_usage" | "native_model_transport"
+            )
             && let Some(access) = &self.access
             && let Some(store) = &access.store
         {

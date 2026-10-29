@@ -706,6 +706,12 @@ impl CodexModelProvider {
                 }).collect::<Vec<_>>().join("\n\n").as_bytes())),
                 "tools_sha256": hex::encode(Sha256::digest(serde_json::to_vec(&request.tools)?)),
                 "auth": if access.is_api_key() { "api_key" } else { "subscription_oauth" },
+                "input_items": body["input"].as_array().map(Vec::len),
+                "image_base64_bytes": request.messages.iter().map(|message| match message {
+                    ModelMessage::User { attachments, .. } | ModelMessage::Tool { attachments, .. } =>
+                        attachments.iter().map(|image| image.data_base64.len()).sum::<usize>(),
+                    _ => 0,
+                }).sum::<usize>(),
                 "agent_loop": "borg",
             }));
             let (mut message, response) = self
@@ -1127,9 +1133,21 @@ impl CodexModelProvider {
         progress: Option<&UnboundedSender<ProviderProgress>>,
     ) -> Result<(ModelMessage, Value)> {
         for attempt in 1..=3 {
+            let started = Instant::now();
             let response = self
                 .send(client, wire.0, access, expected_account, request, wire.1)
-                .await?;
+                .await;
+            publish_model_audit(
+                progress,
+                "native_model_transport",
+                json!({
+                    "request_id": request.request_id, "attempt": attempt,
+                    "phase": if response.is_ok() { "response_headers" } else { "request_failed" },
+                    "send_ms": crate::runtime::elapsed_millis_u64(started),
+                    "status": response.as_ref().ok().map(|response| response.status().as_u16()),
+                }),
+            );
+            let response = response?;
             // Each read owns a fresh ResponseState. Nothing from an unsuccessful
             // attempt becomes a returned message or an executable tool call.
             match self
@@ -1165,6 +1183,9 @@ impl CodexModelProvider {
         progress: Option<&UnboundedSender<ProviderProgress>>,
         request_id: Option<&str>,
     ) -> Result<(ModelMessage, Value)> {
+        let started = Instant::now();
+        let mut first_chunk = true;
+        let mut first_event = true;
         let response = check_subscription_response(response).await?;
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::new();
@@ -1177,6 +1198,17 @@ impl CodexModelProvider {
                 let message = format!("Codex model stream disconnected: {error:#}");
                 error.context(message)
             })?;
+            if first_chunk && !chunk.is_empty() {
+                first_chunk = false;
+                publish_model_audit(
+                    progress,
+                    "native_model_transport",
+                    json!({
+                        "request_id": request_id, "phase": "first_body_chunk",
+                        "read_ms": crate::runtime::elapsed_millis_u64(started),
+                    }),
+                );
+            }
             total = total.saturating_add(chunk.len());
             ensure!(
                 total <= MAX_STREAM_BYTES,
@@ -1192,6 +1224,17 @@ impl CodexModelProvider {
                         let event: Value = serde_json::from_str(&data)
                             .context("invalid Codex model event JSON")?;
                         data.clear();
+                        if first_event {
+                            first_event = false;
+                            publish_model_audit(
+                                progress,
+                                "native_model_transport",
+                                json!({
+                                    "request_id": request_id, "phase": "first_sse_event",
+                                    "read_ms": crate::runtime::elapsed_millis_u64(started),
+                                }),
+                            );
+                        }
                         if let Some(usage) =
                             event.pointer("/response/usage").filter(|v| v.is_object())
                         {
@@ -3359,9 +3402,21 @@ mod tests {
                 );
                 assert!(!error.to_string().contains("private-"));
             }
+            let mut header_events = 0;
             while let Ok(event) = rx.try_recv() {
                 assert!(!format!("{event:?}").contains("private-"));
+                if let ProviderProgress::ProviderEvent { kind, payload, .. } = event
+                    && kind == "native_model_transport"
+                    && payload["phase"] == "response_headers"
+                {
+                    header_events += 1;
+                    assert_eq!(payload["attempt"], header_events);
+                    assert_eq!(payload["request_id"], "same-request");
+                    assert_eq!(payload["status"], 200);
+                    assert!(payload["send_ms"].is_u64());
+                }
             }
+            assert_eq!(header_events, if retry { 2 } else { 1 });
             server.await.unwrap();
         }
     }
@@ -3661,6 +3716,11 @@ mod tests {
                 &request, &body).await.unwrap();
             let (tx, mut rx) = mpsc::unbounded_channel();
             let read = tokio::spawn(async move { provider.read_stream(response, Some(&tx), Some("test-request")).await });
+            for phase in ["first_body_chunk", "first_sse_event"] {
+                assert!(matches!(rx.recv().await.unwrap(), ProviderProgress::ProviderEvent { kind, payload, .. }
+                    if kind == "native_model_transport" && payload["phase"] == phase
+                        && payload["request_id"] == "test-request" && payload["read_ms"].is_u64()));
+            }
             assert!(matches!(rx.recv().await.unwrap(), ProviderProgress::ProviderEvent { kind, .. } if kind == "reasoning_delta"));
             assert!(rx.try_recv().is_err());
             first_tx.send(()).unwrap();

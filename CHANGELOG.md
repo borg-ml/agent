@@ -7,6 +7,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.9)
 
+- Codex request diagnostics now separate the HTTP-header wait from the first body chunk and first stream event, and record image upload size, without changing model or billing settings.
+
 - Shell and watcher change summaries no longer expose unrelated committed patches when the checkout advances during a command.
 
 ## 0.19.9 (2026-10-28)
