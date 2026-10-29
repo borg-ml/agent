@@ -3537,18 +3537,23 @@ impl BorgTerminal {
     }
 
     pub fn acknowledge_interrupt(&mut self) {
-        self.apply_session_event(&SessionEvent::new(
-            self.session_id,
-            0,
-            SessionEventKind::StatusChanged {
-                lifecycle: Some(SessionStatus::Ready.into()),
-                status: SessionStatus::Ready,
-                detail: Some("Interrupted".into()),
-            },
-        ));
+        let sending_pending = self.notice.as_deref() == Some("Sending pending input");
+        if !sending_pending {
+            self.apply_session_event(&SessionEvent::new(
+                self.session_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    lifecycle: Some(SessionStatus::Ready.into()),
+                    status: SessionStatus::Ready,
+                    detail: Some("Interrupted".into()),
+                },
+            ));
+        }
         self.interrupt_acknowledged = true;
         self.interrupt_requested = false;
-        self.set_notice("Stopped · saving state and cleaning up");
+        if !sending_pending {
+            self.set_notice("Stopped · saving state and cleaning up");
+        }
     }
 
     pub fn handle_external_interrupt(&mut self) {
@@ -12115,6 +12120,20 @@ impl BorgTerminal {
         if self.keybindings_open && self.keymap.matches(KeyAction::Interrupt, &key) {
             self.keybindings_open = false;
             return Ok(UiAction::None);
+        }
+        if !ctrl_c
+            && self.keymap.matches(KeyAction::Interrupt, &key)
+            && self
+                .visible_queued_prompts()
+                .iter()
+                .any(|prompt| prompt.actor == EventActor::User)
+        {
+            self.begin_user_interrupt();
+            self.active_turn_followup = true;
+            self.set_notice("Sending pending input");
+            return Ok(UiAction::FlushPendingInput {
+                target: self.focused_child,
+            });
         }
         if let Some(target) = focused_child_interrupt_target(&self.keymap, &key, self.focused_child)
         {

@@ -7,6 +7,9 @@ Git comparison.
 
 ## Unreleased (since 0.19.9)
 
+- Escape sends queued input immediately instead of leaving it as “Next”; pending-input flushes cancel generation through the fast interrupt signal before recovery I/O or a full actor queue, while preserving the composer draft.
+- Session delivery boundaries no longer wait for a busy workspace mirror or replay its backlog on the foreground actor, keeping interruption and queued-input handoff responsive while background repair preserves delivery order.
+
 - Linux desktop access recovers from an inherited stale niri IPC socket by verifying the current same-user Wayland compositor and its matching socket, without replaying requests after uncertain delivery.
 
 - Interrupted native-session recovery no longer duplicates an image prompt already recorded in model context, avoiding repeated screenshot uploads while retaining accepted inputs that were not yet recorded.

@@ -8816,7 +8816,9 @@ impl SubagentCoordinator {
         let command = command(id);
         if matches!(
             command,
-            HostCommand::Interrupt { .. } | HostCommand::Stop { .. }
+            HostCommand::Interrupt { .. }
+                | HostCommand::Stop { .. }
+                | HostCommand::FlushPendingInput { .. }
         ) {
             let control = self
                 .table
@@ -8826,6 +8828,21 @@ impl SubagentCoordinator {
                 .get(&id)
                 .and_then(|entry| entry.control.clone());
             if let Some((priority, interrupt)) = control {
+                if matches!(command, HostCommand::FlushPendingInput { .. }) {
+                    interrupt.request_pending_input();
+                    match priority.try_send(command) {
+                        Ok(()) => return Ok(()),
+                        Err(mpsc::error::TrySendError::Full(command)) => {
+                            tokio::spawn(async move {
+                                if let Err(error) = priority.send(command).await {
+                                    tracing::warn!(%error, "pending-input flush owner stopped");
+                                }
+                            });
+                            return Ok(());
+                        }
+                        Err(error) => bail!("pending-input flush owner stopped: {error}"),
+                    }
+                }
                 interrupt.request();
                 return priority.try_send(command).map_err(|error| {
                     anyhow::anyhow!(

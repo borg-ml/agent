@@ -5955,6 +5955,7 @@ async fn run_local_agent_session(
                     // Flushing interrupts the turn, so it takes the interrupt's
                     // lane rather than queueing behind prompt admission.
                     UiAction::FlushPendingInput { target: None } => {
+                        interrupt.request_pending_input();
                         let command = HostCommand::FlushPendingInput { session_id };
                         let dispatched = if session_access.is_attached() {
                             let socket = control_socket_path.clone();

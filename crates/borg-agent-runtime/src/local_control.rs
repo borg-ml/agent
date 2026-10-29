@@ -1498,55 +1498,68 @@ async fn handle_control_connection(
             }
         }
         if matches!(command, HostCommand::FlushPendingInput { .. }) {
-            let store = store
-                .as_ref()
-                .context("session owner cannot recover pending input without a durable journal")?;
-            // Admission can succeed before the original control handoff fails.
-            // Re-send those identities before flushing; the actor deduplicates
-            // prompts already present in its queue or active turn.
-            let mut recovered = Vec::new();
-            for action in store.pending_actions(session_id, usize::MAX).await? {
-                if !matches!(
-                    action.kind,
-                    crate::SessionActionKind::Prompt
-                        | crate::SessionActionKind::Steering
-                        | crate::SessionActionKind::FollowUp
-                ) || !matches!(
-                    action.state,
-                    crate::SessionActionState::Queued | crate::SessionActionState::Admitted
-                ) {
-                    continue;
-                }
-                let text = action
-                    .payload
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .context("pending prompt is missing its text")?
-                    .to_owned();
-                let attachments = serde_json::from_value(
-                    action
-                        .payload
-                        .get("attachments")
-                        .cloned()
-                        .context("pending prompt is missing its attachments")?,
-                )?;
-                recovered.push(crate::RecoveredPendingPrompt {
-                    message_id: action.action_id,
-                    text,
-                    attachments,
-                    output_schema: action.payload.get("output_schema").cloned(),
-                });
+            if let Some(interrupt) = &interrupt {
+                interrupt.request_pending_input();
             }
-            if !recovered.is_empty() {
-                priority
-                    .as_ref()
-                    .unwrap_or(&commands)
-                    .send(HostCommand::RecoverPendingInput {
-                        session_id,
-                        prompts: recovered,
-                    })
-                    .await
-                    .map_err(|_| anyhow::anyhow!("session owner stopped"))?;
+            let recovery: Result<()> = async {
+                let store = store.as_ref().context(
+                    "session owner cannot recover pending input without a durable journal",
+                )?;
+                // Admission can succeed before the original control handoff fails.
+                // Re-send those identities before flushing; the actor deduplicates
+                // prompts already present in its queue or active turn.
+                let mut recovered = Vec::new();
+                for action in store.pending_actions(session_id, usize::MAX).await? {
+                    if !matches!(
+                        action.kind,
+                        crate::SessionActionKind::Prompt
+                            | crate::SessionActionKind::Steering
+                            | crate::SessionActionKind::FollowUp
+                    ) || !matches!(
+                        action.state,
+                        crate::SessionActionState::Queued | crate::SessionActionState::Admitted
+                    ) {
+                        continue;
+                    }
+                    let text = action
+                        .payload
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .context("pending prompt is missing its text")?
+                        .to_owned();
+                    let attachments = serde_json::from_value(
+                        action
+                            .payload
+                            .get("attachments")
+                            .cloned()
+                            .context("pending prompt is missing its attachments")?,
+                    )?;
+                    recovered.push(crate::RecoveredPendingPrompt {
+                        message_id: action.action_id,
+                        text,
+                        attachments,
+                        output_schema: action.payload.get("output_schema").cloned(),
+                    });
+                }
+                if !recovered.is_empty() {
+                    priority
+                        .as_ref()
+                        .unwrap_or(&commands)
+                        .send(HostCommand::RecoverPendingInput {
+                            session_id,
+                            prompts: recovered,
+                        })
+                        .await
+                        .map_err(|_| anyhow::anyhow!("session owner stopped"))?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = recovery {
+                if let Some(interrupt) = &interrupt {
+                    interrupt.request();
+                }
+                return Err(error);
             }
         }
         let sender = if matches!(
@@ -3243,61 +3256,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attached_interrupt_bypasses_a_full_owner_command_queue() {
-        let root = short_socket_tempdir();
-        let session_id = Uuid::new_v4();
-        let lock_path = root.path().join("session.lock");
-        let socket_path = session_control_socket_path(root.path(), session_id);
-        let writer = SessionWriterLease::try_acquire(&lock_path)
-            .unwrap()
+    async fn attached_interrupt_and_flush_cancel_before_full_actor_queues() {
+        for flush in [false, true] {
+            let root = short_socket_tempdir();
+            let session_id = Uuid::new_v4();
+            let lock_path = root.path().join("session.lock");
+            let socket_path = session_control_socket_path(root.path(), session_id);
+            let writer = SessionWriterLease::try_acquire(&lock_path)
+                .unwrap()
+                .unwrap();
+            let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+            store.create_session(session_id).await.unwrap();
+            let store: Arc<dyn SessionStore> = Arc::new(store);
+            let (normal_tx, mut normal_rx) = mpsc::channel(1);
+            normal_tx
+                .try_send(HostCommand::Stop { session_id })
+                .unwrap();
+            let (urgent_tx, mut urgent_rx) = mpsc::channel(1);
+            urgent_tx
+                .try_send(HostCommand::FlushPendingInput { session_id })
+                .unwrap();
+            let interrupt = SessionInterrupt::default();
+            let mut acknowledgement = interrupt.subscribe();
+            let _server = LocalSessionControlServer::start_with_priority_commands(
+                socket_path.clone(),
+                session_id,
+                &writer,
+                normal_tx,
+                urgent_tx,
+                interrupt,
+                None,
+                store,
+            )
             .unwrap();
-        let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
-        let store: Arc<dyn SessionStore> = Arc::new(store);
-        let (normal_tx, mut normal_rx) = mpsc::channel(1);
-        normal_tx
-            .send(HostCommand::Stop { session_id })
-            .await
-            .unwrap();
-        let (urgent_tx, mut urgent_rx) = mpsc::channel(1);
-        urgent_tx
-            .try_send(HostCommand::FlushPendingInput { session_id })
-            .unwrap();
-        let interrupt = SessionInterrupt::default();
-        let mut acknowledgement = interrupt.subscribe();
-        let _server = LocalSessionControlServer::start_with_priority_commands(
-            socket_path.clone(),
-            session_id,
-            &writer,
-            normal_tx,
-            urgent_tx,
-            interrupt,
-            None,
-            store,
-        )
-        .unwrap();
-        tokio::time::timeout(
-            Duration::from_millis(250),
-            forward_attached_command(
-                &lock_path,
-                &socket_path,
-                HostCommand::Interrupt { session_id },
-            ),
-        )
-        .await
-        .expect("interrupt blocked on full command queue")
-        .unwrap();
-        tokio::time::timeout(Duration::from_millis(250), acknowledgement.changed())
-            .await
-            .expect("stop acknowledgement waited for the actor")
-            .unwrap();
-        assert!(matches!(
-            urgent_rx.recv().await,
-            Some(HostCommand::FlushPendingInput { .. })
-        ));
-        assert!(matches!(
-            normal_rx.recv().await,
-            Some(HostCommand::Stop { .. })
-        ));
+            let command = if flush {
+                HostCommand::FlushPendingInput { session_id }
+            } else {
+                HostCommand::Interrupt { session_id }
+            };
+            let forwarded = tokio::spawn(async move {
+                forward_attached_command(&lock_path, &socket_path, command).await
+            });
+            tokio::time::timeout(Duration::from_millis(250), acknowledgement.changed())
+                .await
+                .expect("cancellation waited for actor queue or recovery I/O")
+                .unwrap();
+            if !flush {
+                tokio::time::timeout(Duration::from_millis(250), forwarded)
+                    .await
+                    .expect("interrupt acknowledgement waited for the actor")
+                    .unwrap()
+                    .unwrap();
+            } else {
+                // Freeing the actor's lane lets recovery finish and the flush
+                // follow it; cancellation has already been acknowledged.
+                assert!(matches!(
+                    urgent_rx.recv().await,
+                    Some(HostCommand::FlushPendingInput { .. })
+                ));
+                tokio::time::timeout(Duration::from_secs(2), forwarded)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+            assert!(matches!(
+                urgent_rx.recv().await,
+                Some(HostCommand::FlushPendingInput { .. })
+            ));
+            assert!(matches!(
+                normal_rx.recv().await,
+                Some(HostCommand::Stop { .. })
+            ));
+        }
     }
 
     #[tokio::test]

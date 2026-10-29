@@ -1559,7 +1559,7 @@ async fn pending_prompt_admission_does_not_wait_for_workspace_repair() {
         ))
         .await
         .unwrap();
-    let runtime = RuntimeSessionStore::new(session_store, Vec::new(), true)
+    let mut runtime = RuntimeSessionStore::new(session_store, Vec::new(), true)
         .with_workspace_projection(projection.clone());
     let blocked_repair = projection.projected_sequence.lock().await;
     assert_eq!(
@@ -1572,10 +1572,29 @@ async fn pending_prompt_admission_does_not_wait_for_workspace_repair() {
         .unwrap(),
         PromptAdmissionState::Pending,
     );
+    let completed = tokio::time::timeout(
+        Duration::from_millis(250),
+        runtime.append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "next request".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        )),
+    )
+    .await
+    .expect("delivery settlement waited behind the busy workspace mirror")
+    .unwrap();
+    assert!(completed.sequence > queued.sequence);
     assert_eq!(*blocked_repair, 0);
     drop(blocked_repair);
     tokio::time::timeout(EVENT_TIMEOUT, async {
-        while *projection.projected_sequence.lock().await < queued.sequence {
+        while *projection.projected_sequence.lock().await < completed.sequence {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -26011,4 +26030,55 @@ async fn interrupted_native_image_steer_is_replayed_once() {
             "interrupted recovery must retain an image input once, whether or not its native message was recorded"
         );
     }
+}
+
+#[tokio::test]
+async fn pending_input_cancellation_keeps_recovery_before_delivery_without_a_plain_stop() {
+    let session_id = Uuid::new_v4();
+    let interrupt = SessionInterrupt::default();
+    let turn = tokio::spawn(std::future::pending::<()>());
+    interrupt.install(turn.abort_handle());
+    let (_normal_tx, normal_rx) = mpsc::channel(1);
+    let (priority_tx, priority_rx) = mpsc::channel(2);
+    let mut inbox = HostCommandInbox::new(
+        normal_rx,
+        Some((priority_rx, interrupt.clone())),
+        session_id,
+    );
+    interrupt.request_pending_input();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), turn)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled()
+    );
+    assert!(
+        inbox.try_recv_priority().is_none(),
+        "a pending-input flush must not synthesize a goal-pausing stop"
+    );
+    priority_tx
+        .try_send(HostCommand::RecoverPendingInput {
+            session_id,
+            prompts: Vec::new(),
+        })
+        .unwrap();
+    priority_tx
+        .try_send(HostCommand::FlushPendingInput { session_id })
+        .unwrap();
+    assert!(matches!(
+        inbox.try_recv_priority(),
+        Some(HostCommand::RecoverPendingInput { .. })
+    ));
+    assert!(matches!(
+        inbox.try_recv_priority(),
+        Some(HostCommand::FlushPendingInput { .. })
+    ));
+    interrupt.settle();
+    let replacement = tokio::spawn(async {});
+    interrupt.install(replacement.abort_handle());
+    assert!(
+        replacement.await.is_ok(),
+        "the consumed flush must not abort its replacement turn"
+    );
 }

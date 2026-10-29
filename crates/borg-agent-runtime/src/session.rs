@@ -39,11 +39,18 @@ pub struct SessionInterrupt {
     acknowledged: tokio::sync::watch::Sender<u64>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InterruptIntent {
+    Stop,
+    FlushPendingInput,
+}
+
 #[derive(Default)]
 struct SessionInterruptState {
     revision: u64,
     settled: u64,
     turn: Option<tokio::task::AbortHandle>,
+    intent: Option<InterruptIntent>,
 }
 
 impl Default for SessionInterrupt {
@@ -57,8 +64,18 @@ impl Default for SessionInterrupt {
 
 impl SessionInterrupt {
     pub fn request(&self) {
+        self.request_intent(InterruptIntent::Stop);
+    }
+
+    /// Cancel now; the caller must deliver FlushPendingInput after recovering its queue.
+    pub fn request_pending_input(&self) {
+        self.request_intent(InterruptIntent::FlushPendingInput);
+    }
+
+    fn request_intent(&self, intent: InterruptIntent) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.revision += 1;
+        state.intent = Some(intent);
         if let Some(turn) = &state.turn {
             turn.abort();
         }
@@ -82,10 +99,16 @@ impl SessionInterrupt {
         state.revision != state.settled
     }
 
+    fn stop_command_requested(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.revision != state.settled && state.intent == Some(InterruptIntent::Stop)
+    }
+
     fn settle(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.settled = state.revision;
         state.turn = None;
+        state.intent = None;
     }
 }
 
@@ -599,7 +622,6 @@ impl WorkspaceProjection {
     /// falsely declare the projection complete and would scramble workspace
     /// ordering. The source session remains authoritative while the lagging
     /// event is picked up by `repair`.
-    #[cfg(test)]
     async fn project(&self, event: &SessionEvent) -> Result<()> {
         if event.sequence == 0 {
             return Ok(());
@@ -607,7 +629,9 @@ impl WorkspaceProjection {
         if event.sequence <= self.inherited_sequence {
             return Ok(());
         }
-        let mut projected = self.projected_sequence.lock().await;
+        let Ok(mut projected) = self.projected_sequence.try_lock() else {
+            return Ok(());
+        };
         if event.sequence <= *projected {
             return Ok(());
         }
@@ -978,10 +1002,7 @@ impl RuntimeSessionStore {
         let Some(projection) = &self.workspace_projection else {
             return Ok(());
         };
-        let Err(error) = projection
-            .repair(Arc::clone(&self.store), event.session_id)
-            .await
-        else {
+        let Err(error) = projection.project(event).await else {
             return Ok(());
         };
         let diagnostic = format!(
@@ -1206,13 +1227,10 @@ impl RuntimeSessionStore {
         if self.workspace_projection.is_some()
             && WorkspaceProjection::needs_delivery_transition(&event)
         {
-            // A delivery boundary settles team-message state that inbox reads
-            // depend on, so it catches the mirror up before the append returns:
-            // one batched pass, not one lock per event.
+            // Settle a contiguous delivery row without waiting behind repair.
             self.settle_workspace_projection(&event).await?;
-        } else {
-            self.wake_workspace_projector(event.session_id);
         }
+        self.wake_workspace_projector(event.session_id);
         self.absorb_appended(&event).await?;
         self.note_assistant_row_anchor(&event);
         Ok(event)
@@ -1999,7 +2017,7 @@ impl HostCommandInbox {
             && self
                 .interrupt
                 .as_ref()
-                .is_some_and(SessionInterrupt::requested)
+                .is_some_and(SessionInterrupt::stop_command_requested)
         {
             self.interrupt_delivered = true;
             return Some(HostCommand::Interrupt {
@@ -4270,7 +4288,12 @@ async fn run_agent_session_store_kernel_inner(
                         }
                         coalesce_queued_prompts(&mut pending);
                     }
-                    Some(HostCommand::FlushPendingInput { .. }) => {}
+                    Some(HostCommand::FlushPendingInput { .. }) => {
+                        if let Some(interrupt) = &interrupt {
+                            interrupt.settle();
+                            commands.interrupt_delivered = false;
+                        }
+                    }
                     Some(HostCommand::ExtensionCommand {
                         session_id: command_session_id,
                         invocation_id,
@@ -6995,7 +7018,16 @@ async fn run_agent_session_store_kernel_inner(
                             }
                         }
                         HostCommand::FlushPendingInput { .. } => {
-                            if !pending.iter().any(|queued| queued.actor == EventActor::User) {
+                            let cancellation_requested = interrupt.as_ref().is_some_and(SessionInterrupt::requested);
+                            if let Some(interrupt) = &interrupt {
+                                interrupt.settle();
+                                commands.interrupt_delivered = false;
+                            }
+                            if interrupted {
+                                batch_pending_after_interrupt = true;
+                                continue;
+                            }
+                            if !cancellation_requested && !pending.iter().any(|queued| queued.actor == EventActor::User) {
                                 continue;
                             }
                             let cooperative = if let Some(result) = interrupted_result.take() {
@@ -12108,7 +12140,12 @@ async fn collect_input_at_turn_boundary(
             }
             HostCommand::FlushPendingInput {
                 session_id: command_session_id,
-            } if command_session_id == session_id => {}
+            } if command_session_id == session_id => {
+                if let Some(interrupt) = &commands.interrupt {
+                    interrupt.settle();
+                    commands.interrupt_delivered = false;
+                }
+            }
             HostCommand::Interrupt {
                 session_id: command_session_id,
             } if command_session_id == session_id => {

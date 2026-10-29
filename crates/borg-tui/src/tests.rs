@@ -12449,7 +12449,7 @@ fn recovered_idle_session_stops_orphaned_tool_spinner() {
 
 #[tokio::test]
 #[ignore = "requires a PTY; exercises Esc and Up with a queued prompt and a typed draft"]
-async fn escape_interrupts_with_pending_queue_and_keeps_the_composer_draft() {
+async fn escape_sends_pending_input_and_keeps_the_composer_draft() {
     let session_id = Uuid::new_v4();
     let directory = tempfile::tempdir().unwrap();
     let mut terminal = BorgTerminal::enter(
@@ -12468,13 +12468,11 @@ async fn escape_interrupts_with_pending_queue_and_keeps_the_composer_draft() {
     });
     terminal.composer.insert("unsent draft");
 
-    // Esc is the Running button: with queued input it is the same plain
-    // interrupt, not a separate flush path.
     assert!(matches!(
         terminal
             .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap(),
-        UiAction::Interrupt { target: None }
+        UiAction::FlushPendingInput { target: None }
     ));
     assert!(terminal.interrupt_requested);
     assert!(terminal.transcript.order.iter().any(|entry| matches!(entry,
@@ -12482,6 +12480,9 @@ async fn escape_interrupts_with_pending_queue_and_keeps_the_composer_draft() {
     )));
     assert_eq!(terminal.composer.text, "unsent draft");
     assert_eq!(terminal.queued_prompts.len(), 1);
+    terminal.acknowledge_interrupt();
+    assert_eq!(terminal.status, SessionStatus::Running);
+    assert_eq!(terminal.notice.as_deref(), Some("Sending pending input"));
 
     terminal.status = SessionStatus::Ready;
     terminal.interrupt_requested = false;
@@ -12489,10 +12490,28 @@ async fn escape_interrupts_with_pending_queue_and_keeps_the_composer_draft() {
         terminal
             .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap(),
-        UiAction::None
+        UiAction::FlushPendingInput { target: None }
     ));
     assert_eq!(terminal.composer.text, "unsent draft");
     assert_eq!(terminal.queued_prompts.len(), 1);
+
+    let child = Uuid::new_v4();
+    terminal.focused_child = Some(child);
+    terminal.child_queued_prompts.insert(
+        child,
+        vec![PendingPromptProjection {
+            message_id: Uuid::new_v4(),
+            text: "child follow-up".into(),
+            delivery: PromptDelivery::Queue,
+            actor: EventActor::User,
+        }],
+    );
+    assert!(matches!(
+        terminal.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap(),
+        UiAction::FlushPendingInput { target: Some(target) } if target == child
+    ));
+    assert_eq!(terminal.composer.text, "unsent draft");
+    terminal.focused_child = None;
 
     terminal.status = SessionStatus::Running;
     terminal.queued_prompts.clear();
@@ -22604,7 +22623,7 @@ async fn promote_focused_agent_rebinds_default_without_replacing_the_host() {
 
 #[tokio::test]
 #[ignore = "requires a PTY; exercises Esc and the Running button"]
-async fn escape_and_running_button_reach_the_same_interrupt() {
+async fn escape_sends_queued_input_while_running_button_only_stops() {
     let directory = tempfile::tempdir().unwrap();
     let build = |queued: bool| {
         let mut terminal = BorgTerminal::enter(
@@ -22643,7 +22662,11 @@ async fn escape_and_running_button_reach_the_same_interrupt() {
                 scroll_repetitions: 1,
             })
             .unwrap();
-        assert!(matches!(key, UiAction::Interrupt { target: None }));
+        if queued {
+            assert!(matches!(key, UiAction::FlushPendingInput { target: None }));
+        } else {
+            assert!(matches!(key, UiAction::Interrupt { target: None }));
+        }
         assert!(matches!(click, UiAction::Interrupt { target: None }));
         assert_eq!(by_key.interrupt_requested, by_click.interrupt_requested);
     }
