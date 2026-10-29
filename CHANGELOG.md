@@ -7,6 +7,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.9)
 
+- Interrupted native-session recovery no longer duplicates an image prompt already recorded in model context, avoiding repeated screenshot uploads while retaining accepted inputs that were not yet recorded.
+
 - Persistent Python runtimes isolate their control pipe from user stdin, so subprocesses that read stdin receive EOF instead of hanging or consuming later runtime requests.
 
 - Explicit `lsp_release_idle(idle_seconds=0)` can release this session's recently used idle language servers immediately; busy, queued and shared-owner servers remain protected. The omitted threshold still defaults to 60 seconds.

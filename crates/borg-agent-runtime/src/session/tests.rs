@@ -409,7 +409,7 @@ async fn failed_compaction_start_keeps_native_history_and_claude_images() {
                 message_id: claude_turn,
                 actor: EventActor::User,
                 text: "inspect screenshot".into(),
-                attachments: vec![image],
+                attachments: vec![image.clone()],
                 status: MessageStatus::InProgress,
                 delivery: None,
             },
@@ -490,7 +490,13 @@ async fn failed_compaction_start_keeps_native_history_and_claude_images() {
             content,
             attachments,
         } => {
-            assert_eq!(content, "inspect screenshot");
+            assert_eq!(
+                content,
+                &crate::native_harness::native_user_message_content(
+                    "inspect screenshot",
+                    std::slice::from_ref(&image),
+                )
+            );
             assert_eq!(attachments.len(), 1);
             assert_eq!(attachments[0].data_base64, real_png_base64());
         }
@@ -25927,4 +25933,82 @@ async fn work_plan_wait_has_no_idle_timer_and_filters_other_workspaces() {
     assert!(futures::poll!(&mut waiting).is_pending());
     changes.send(workspace).unwrap();
     assert!(futures::poll!(&mut waiting).is_ready());
+}
+
+#[tokio::test]
+async fn interrupted_native_image_steer_is_replayed_once() {
+    use borg_provider::provider::ModelMessage;
+
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("scene.png");
+    image::DynamicImage::new_rgba8(2, 2).save(&path).unwrap();
+    let image_message = crate::native_harness::native_user_message(
+        directory.path(),
+        "inspect this frame",
+        std::slice::from_ref(&path),
+    )
+    .await
+    .unwrap();
+    for already_recorded in [true, false] {
+        let session_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let mut kinds = vec![
+            SessionEventKind::TurnStarted {
+                message_id: turn_id,
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+                ultrafast: false,
+            },
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "native_model_message".into(),
+                payload: serde_json::to_value(ModelMessage::user("inspect the scene")).unwrap(),
+            },
+        ];
+        if already_recorded {
+            kinds.push(SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "native_model_message".into(),
+                payload: serde_json::to_value(&image_message).unwrap(),
+            });
+        }
+        kinds.extend([
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "inspect this frame".into(),
+                attachments: vec![path.clone()],
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+            SessionEventKind::TurnCompleted {
+                message_id: turn_id,
+                provider_session_id: None,
+                final_text: String::new(),
+                error: Some("turn interrupted".into()),
+            },
+        ]);
+        let events = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| SessionEvent::new(session_id, i as u64 + 1, kind))
+            .collect::<Vec<_>>();
+        let replay = native_conversation_with_historical_images(
+            &events,
+            CodingProvider::Codex,
+            directory.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay,
+            vec![
+                ModelMessage::user("inspect the scene"),
+                image_message.clone()
+            ],
+            "interrupted recovery must retain an image input once, whether or not its native message was recorded"
+        );
+    }
 }

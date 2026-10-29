@@ -5925,6 +5925,16 @@ pub(crate) async fn native_user_message(
             filename: Some(path.strip_prefix(cwd).unwrap_or(path).display().to_string()),
         });
     }
+    Ok(ModelMessage::user_with_attachments(
+        &native_user_message_content(prompt, attachments),
+        encoded,
+    ))
+}
+
+pub(crate) fn native_user_message_content(prompt: &str, attachments: &[PathBuf]) -> String {
+    if attachments.is_empty() {
+        return prompt.to_string();
+    }
     // The pixels alone leave the model no way to pass the image on, so name
     // each file where `send_message`/`followup_task` can attach it.
     let paths = attachments
@@ -5932,10 +5942,9 @@ pub(crate) async fn native_user_message(
         .map(|path| format!("- {}", path.display()))
         .collect::<Vec<_>>()
         .join("\n");
-    let prompt = format!(
+    format!(
         "{prompt}\n\nAttached image files (pass these paths as `attachments` to share them with another agent):\n{paths}"
-    );
-    Ok(ModelMessage::user_with_attachments(&prompt, encoded))
+    )
 }
 
 /// How much of the system prompt the capability signatures may take; the

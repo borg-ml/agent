@@ -8370,7 +8370,7 @@ fn replayed_user_message(
     let encoded = images.remove(&message_id).unwrap_or_default();
     let unavailable = attachments.len().saturating_sub(encoded.len());
     let content = if unavailable == 0 {
-        text.to_string()
+        crate::native_harness::native_user_message_content(text, attachments)
     } else {
         let noun = if unavailable == 1 { "image" } else { "images" };
         format!("{text}\n\n[{unavailable} historical {noun} not replayed]")
