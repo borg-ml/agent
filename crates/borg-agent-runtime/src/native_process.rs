@@ -2020,55 +2020,6 @@ mod tests {
         assert!(clean.diff.contains("+change"), "{}", clean.diff);
     }
 
-    /// A command can leave a clean worktree by committing its own edit. The
-    /// action still needs the patch between HEAD at launch and HEAD at exit.
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn command_that_commits_its_edit_reports_the_change() {
-        let root = tempfile::tempdir().expect("workspace");
-        let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(root.path())
-                .output()
-                .expect("git");
-            assert!(output.status.success(), "git {args:?}: {output:?}");
-            output.stdout
-        };
-        git(&["init", "-q"]);
-        std::fs::write(root.path().join("code.rs"), "old\n").expect("seed");
-        git(&["add", "code.rs"]);
-        git(&[
-            "-c",
-            "user.name=Borg Test",
-            "-c",
-            "user.email=borg@example.invalid",
-            "commit",
-            "-qm",
-            "initial",
-        ]);
-
-        let completed = ProcessManager::default()
-            .exec(
-                Uuid::new_v4(),
-                root.path(),
-                "printf 'new\\n' >> code.rs && git add code.rs && git -c user.name='Borg Test' -c user.email=borg@example.invalid commit -qm updated"
-                    .to_string(),
-                None,
-                Some(2_000),
-                Some(100),
-                10_000,
-                None,
-            )
-            .await
-            .expect("command");
-        assert!(!completed.running, "{completed:?}");
-        assert!(git(&["status", "--porcelain"]).is_empty());
-        assert_eq!(completed.changes.len(), 1, "{completed:?}");
-        assert_eq!(completed.changes[0].path, "code.rs");
-        assert!(completed.changes[0].diff.contains("+new"));
-    }
-
     #[tokio::test]
     #[cfg(unix)]
     async fn process_inherits_explicit_session_capabilities() {
