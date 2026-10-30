@@ -1422,6 +1422,7 @@ async fn durable_session_events_project_once_into_the_bound_workspace() {
         ))
         .await
         .unwrap();
+    projection.repair(store.clone(), session_id).await.unwrap();
     let admitted_delivery = workspace_store
         .deliveries_after(binding.workspace_id, binding.participant_id, 0, 10)
         .await
@@ -1440,6 +1441,7 @@ async fn durable_session_events_project_once_into_the_bound_workspace() {
         ))
         .await
         .unwrap();
+    projection.repair(store.clone(), session_id).await.unwrap();
     let acknowledged = workspace_store
         .deliveries_after(binding.workspace_id, binding.participant_id, 0, 10)
         .await
@@ -1465,6 +1467,7 @@ async fn durable_session_events_project_once_into_the_bound_workspace() {
         ))
         .await
         .expect("a completed team notification must not regress delivery state");
+    projection.repair(store.clone(), session_id).await.unwrap();
     let after_team_report = workspace_store
         .deliveries_after(binding.workspace_id, binding.participant_id, 0, 10)
         .await
@@ -19295,7 +19298,7 @@ async fn an_accepted_steer_settles_a_long_running_child_team_delivery() {
     .await;
     let store: Arc<dyn SessionStore> = session_store.clone();
     let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new(), true)
-        .with_workspace_projection(projection);
+        .with_workspace_projection(projection.clone());
 
     assert_eq!(
         unread_ids(&workspace_store, &binding).await,
@@ -19340,6 +19343,8 @@ async fn an_accepted_steer_settles_a_long_running_child_team_delivery() {
         ))
         .await
         .unwrap();
+
+    projection.repair(store, session_id).await.unwrap();
 
     // Consumed: admitted, and gone from the unread inbox. Not acknowledged --
     // no turn boundary ever answered for it, and claiming otherwise would
@@ -19388,6 +19393,7 @@ async fn a_completed_queued_team_turn_acknowledges_its_delivery() {
         ))
         .await
         .unwrap();
+    projection.repair(store.clone(), session_id).await.unwrap();
     assert_eq!(
         delivery_state(&workspace_store, &binding, message_id).await,
         crate::DeliveryState::Admitted
@@ -19406,6 +19412,7 @@ async fn a_completed_queued_team_turn_acknowledges_its_delivery() {
         ))
         .await
         .unwrap();
+    projection.repair(store.clone(), session_id).await.unwrap();
     assert_eq!(
         delivery_state(&workspace_store, &binding, message_id).await,
         crate::DeliveryState::Acknowledged

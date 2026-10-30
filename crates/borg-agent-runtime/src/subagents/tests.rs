@@ -9131,6 +9131,7 @@ fn a_child_surface_is_the_director_surface_minus_the_documented_exceptions() {
         "consult_peer",
         "rotate_peer",
         "update_agent_settings",
+        "request_secret",
         "watch",
         "list_watchers",
         "await_watchers",
