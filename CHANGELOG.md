@@ -7,6 +7,10 @@ Git comparison.
 
 ## Unreleased (since 0.19.9)
 
+- Internal session-watchdog recovery no longer impersonates a human Stop or pauses the active goal: it continues from saved state, respects real Stop/input-flush requests, and reports a blocker after three consecutive recovery failures.
+
+- Command watcher startup no longer holds the watcher registry across process and journal I/O, preventing a slow launch from freezing child activity and triggering a session-wide watchdog interruption. Watcher admission remains serialized.
+
 - Workspace diagnostics now use bounded document checks when the server does not advertise workspace pull support, avoiding Pyright timeouts while preserving real cross-module errors.
 
 - LSP initialization now includes the discovered workspace folder, so modern Pyright resolves project imports instead of analyzing a nonexistent default workspace and hiding cross-module type errors.

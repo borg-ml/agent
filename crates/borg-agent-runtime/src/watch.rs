@@ -140,6 +140,8 @@ pub(crate) struct Watches {
     processes: ProcessManager,
     session_id: Uuid,
     entries: Arc<Mutex<BTreeMap<Uuid, WatchEntry>>>,
+    /// Serialize watcher admission without holding the registry during process I/O.
+    starts: Arc<Mutex<()>>,
     events: mpsc::Sender<String>,
     completion_notices: Arc<Mutex<Option<Vec<JobNotice>>>>,
     /// Completion batches waiting in the event channel, by their exact text.
@@ -167,6 +169,7 @@ impl Watches {
             processes,
             session_id,
             entries: Default::default(),
+            starts: Default::default(),
             events,
             completion_notices: Default::default(),
             queued_completions: Default::default(),
@@ -631,6 +634,7 @@ impl Watches {
                 "watch needs a command, an exec session_id, or agents"
             );
         }
+        let _start = self.starts.lock().await;
         ensure!(!self.cancel.is_cancelled(), "session watchers have stopped");
         let mut entries = self.entries.lock().await;
         ensure!(
@@ -650,9 +654,11 @@ impl Watches {
                 "shell session {process} is already watched"
             );
         }
+        drop(entries);
         // Subscribe before reading state so an exit between the two is not lost.
         let updates = self.processes.subscribe_output();
         let cancel = self.cancel.child_token();
+        let cancel_on_drop = cancel.clone().drop_guard();
         let stopped = CancellationToken::new();
         let snapshot = match attached {
             Some(process) => self
@@ -694,6 +700,7 @@ impl Watches {
             event_count: 0,
             result: None,
         };
+        let mut entries = self.entries.lock().await;
         entries.insert(
             info.watch_id,
             WatchEntry {
@@ -729,6 +736,7 @@ impl Watches {
             watches.changed.notify_one();
             stopped.cancel();
         });
+        cancel_on_drop.disarm();
         Ok(info)
     }
 
@@ -758,6 +766,7 @@ impl Watches {
             None | Some(NotifyOn::Attention) => AgentSignal::Attention,
             Some(NotifyOn::Exit) => AgentSignal::Exit,
         };
+        let _start = self.starts.lock().await;
         ensure!(!self.cancel.is_cancelled(), "session watchers have stopped");
         let subjects = AgentSubjects::new(args.agents, signal, args.aggregate);
         let mut entries = self.entries.lock().await;
@@ -1959,6 +1968,44 @@ mod tests {
                 .expect("stopped watcher is still listed")
                 .running
         );
+    }
+
+    // Process startup may wait on the journal. Child observations and stop/list
+    // operations must not queue behind it and freeze the owning session actor.
+    #[tokio::test]
+    async fn watch_startup_does_not_block_child_activity() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn crate::SessionStore> = Arc::new(store);
+        store.create_session(session_id).await.unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let watches = Watches::new(ProcessManager::default(), tx, session_id);
+        let environment = BTreeMap::new();
+        let mut startup = Box::pin(watches.start(
+            session_id,
+            root.path(),
+            WatchArgs {
+                command: "read gate".into(),
+                label: "blocked startup".into(),
+                ..Default::default()
+            },
+            Some(store),
+            60_000,
+            &environment,
+        ));
+        assert!(futures::poll!(&mut startup).is_pending());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            watches
+                .observe_agent(Uuid::new_v4(), SubjectLife::Live, "worker")
+                .await;
+            assert!(watches.list().await.is_empty());
+        })
+        .await
+        .expect("child activity and watch reads remain responsive during startup");
+        let info = startup.await.unwrap();
+        watches.stop(info.watch_id).await.unwrap();
+        scratch.discard().await;
     }
 
     #[tokio::test]

@@ -41,6 +41,7 @@ pub struct SessionInterrupt {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InterruptIntent {
+    Recover,
     Stop,
     FlushPendingInput,
 }
@@ -72,8 +73,16 @@ impl SessionInterrupt {
         self.request_intent(InterruptIntent::FlushPendingInput);
     }
 
+    fn request_recovery(&self) {
+        self.request_intent(InterruptIntent::Recover);
+    }
+
     fn request_intent(&self, intent: InterruptIntent) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Internal recovery cannot replace a pending human stop or input flush.
+        if intent == InterruptIntent::Recover && state.revision != state.settled {
+            return;
+        }
         state.revision += 1;
         state.intent = Some(intent);
         if let Some(turn) = &state.turn {
@@ -99,16 +108,24 @@ impl SessionInterrupt {
         state.revision != state.settled
     }
 
-    fn stop_command_requested(&self) -> bool {
+    fn interrupt_command_requested(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.revision != state.settled && state.intent == Some(InterruptIntent::Stop)
+        state.revision != state.settled
+            && matches!(
+                state.intent,
+                Some(InterruptIntent::Stop | InterruptIntent::Recover)
+            )
     }
 
-    fn settle(&self) {
+    /// Whether the settled cancellation was internal recovery rather than a stop.
+    fn settle(&self) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let recovering =
+            state.revision != state.settled && state.intent == Some(InterruptIntent::Recover);
         state.settled = state.revision;
         state.turn = None;
         state.intent = None;
+        recovering
     }
 }
 
@@ -1457,7 +1474,7 @@ async fn guard_actor_steps(
             held.as_secs()
         ));
         drop(state);
-        interrupt.request();
+        interrupt.request_recovery();
         return;
     }
 }
@@ -2017,7 +2034,7 @@ impl HostCommandInbox {
             && self
                 .interrupt
                 .as_ref()
-                .is_some_and(SessionInterrupt::stop_command_requested)
+                .is_some_and(SessionInterrupt::interrupt_command_requested)
         {
             self.interrupt_delivered = true;
             return Some(HostCommand::Interrupt {
@@ -6119,7 +6136,9 @@ async fn run_agent_session_store_kernel_inner(
                             auth_lookup_retries = 0;
                             usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
                             retry_not_before = None;
-                            goal_turn_failures.reset();
+                            if !interrupted {
+                                goal_turn_failures.reset();
+                            }
                             subscription_context_reusable =
                                 subscription_context_reusable_after_turn(
                                     launch.provider,
@@ -7309,16 +7328,24 @@ async fn run_agent_session_store_kernel_inner(
                         }
                         HostCommand::Interrupt { .. } if interrupted => {
                             if let Some(interrupt) = &interrupt {
-                                interrupt.settle();
+                                let recovering = interrupt.settle();
                                 commands.interrupt_delivered = false;
+                                if !recovering {
+                                    pause_active_goal(
+                                        &mut journal, &events, session_id, &mut goal,
+                                        &mut goal_active_since,
+                                    ).await?;
+                                    held_by_stop = internal_input_ids(
+                                        pending.iter().chain(pending_steers.iter().map(|steer| &steer.prompt)),
+                                    );
+                                    next_ready_detail = Some("Interrupted".into());
+                                }
                             }
                         }
                         HostCommand::Interrupt { .. } => {
-                            if let Some(interrupt) = &interrupt {
-                                interrupt.settle();
-                                commands.interrupt_delivered = false;
-                            }
-                            tracing::info!(%session_id, "session interrupt received (active turn)");
+                            let recovering = interrupt.as_ref().is_some_and(SessionInterrupt::settle);
+                            commands.interrupt_delivered = false;
+                            tracing::info!(%session_id, recovering, "session interrupt received (active turn)");
                             retry_not_before = None;
                             // Let a responsive turn flush its tail and continuation within
                             // one frame, never behind journal I/O or a full control queue.
@@ -7343,10 +7370,19 @@ async fn run_agent_session_store_kernel_inner(
                             let (cleanup, recorded) = tokio::join!(
                                 stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT),
                                 async {
-                                    pause_active_goal(
-                                        &mut journal, &events, session_id, &mut goal,
-                                        &mut goal_active_since,
-                                    ).await?;
+                                    if recovering {
+                                        if goal_turn_failures.record("session actor stalled") >= 3 {
+                                            block_active_goal(
+                                                &mut journal, &events, session_id, &mut goal,
+                                                &mut goal_active_since,
+                                            ).await?;
+                                        }
+                                    } else {
+                                        pause_active_goal(
+                                            &mut journal, &events, session_id, &mut goal,
+                                            &mut goal_active_since,
+                                        ).await?;
+                                    }
                                     let terminal = vec![SessionEventKind::StatusChanged {
                                         status: SessionStatus::Running,
                                         lifecycle: Some(SubagentLifecycle::Running),
@@ -7376,9 +7412,21 @@ async fn run_agent_session_store_kernel_inner(
                                 ).await?;
                                 pending.push_back(output);
                             }
-                            held_by_stop = internal_input_ids(
-                                pending.iter().chain(pending_steers.iter().map(|steer| &steer.prompt)),
-                            );
+                            if recovering {
+                                held_by_stop.clear();
+                                watches.resume();
+                                next_ready_detail = Some(if goal.as_ref().is_some_and(|goal| goal.status == GoalStatus::Blocked) {
+                                    "Session recovery failed three times; the goal is blocked. Your work is saved.".into()
+                                } else if goal.as_ref().is_some_and(|goal| goal.status == GoalStatus::Active) {
+                                    "Session watchdog recovered the stalled turn; continuing the active goal from saved state.".into()
+                                } else {
+                                    "Session watchdog stopped the stalled turn; saved state and goal status are preserved.".into()
+                                });
+                            } else {
+                                held_by_stop = internal_input_ids(
+                                    pending.iter().chain(pending_steers.iter().map(|steer| &steer.prompt)),
+                                );
+                            }
                         }
                         HostCommand::BackgroundAction { target, tool_call_id, .. } => {
                             if let Some(target) = target {

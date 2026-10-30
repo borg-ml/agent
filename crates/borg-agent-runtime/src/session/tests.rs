@@ -21211,9 +21211,183 @@ async fn a_held_loop_step_interrupts_its_turn_and_names_the_step() {
     .await
     .expect("the guard ends a held step's turn");
     assert!(turn.await.unwrap_err().is_cancelled());
-    assert!(interrupt.requested(), "the actor settles it as an Escape");
+    assert!(interrupt.requested());
+    assert!(
+        interrupt.settle(),
+        "a watchdog cancellation is internal recovery"
+    );
     let stalled = step.state().stalled.take();
     assert!(stalled.is_some_and(|message| message.contains("`child_activity`")));
+}
+
+// A harness fault must continue the active goal; only a real stop may pause it.
+// Exercise the actor and durable goal, not just the interrupt flag.
+#[tokio::test]
+async fn watchdog_recovery_continues_goals_but_human_stop_still_pauses() {
+    for recoveries in [1, 3] {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        store.create_session(session_id).await.unwrap();
+        for kind in [
+            SessionEventKind::SessionStarted,
+            SessionEventKind::SessionConfigured {
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+                ultrafast: false,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                speed_support: Default::default(),
+            },
+        ] {
+            store
+                .append(SessionEvent::new(session_id, 0, kind))
+                .await
+                .unwrap();
+        }
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::GoalUpdated {
+                    goal: SessionGoal::new("Finish saved work".into(), None),
+                },
+            ))
+            .await
+            .unwrap();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (_priority_tx, priority_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let interrupt = SessionInterrupt::default();
+        let actor = tokio::spawn({
+            let cwd = root.path().to_path_buf();
+            let store = store.clone();
+            let interrupt = interrupt.clone();
+            let writer = SessionWriterLease::acquire(&cwd.join("session.lock")).unwrap();
+            async move {
+                run_agent_session_with_priority_commands(
+                    &cwd,
+                    session_id,
+                    LaunchSession {
+                        request_id: Uuid::new_v4(),
+                        cwd: cwd.clone(),
+                        provider: CodingProvider::Codex,
+                        model: None,
+                        effort: None,
+                        fast: Some(false),
+                        ultrafast: None,
+                        response_language: crate::ResponseLanguage::Auto,
+                        permission_mode: PermissionMode::Manual,
+                        name: None,
+                        initial_prompt: None,
+                        capabilities: Default::default(),
+                        subagent_concurrency_limit: None,
+                        extension_skill_roots: Vec::new(),
+                        team_policy: None,
+                    },
+                    command_rx,
+                    priority_rx,
+                    interrupt,
+                    event_tx,
+                    Arc::new(HungProviderExecutor),
+                    store,
+                    writer,
+                    Vec::new(),
+                )
+                .await
+            }
+        });
+        for attempt in 0..=recoveries {
+            if attempt == 3 {
+                break;
+            }
+            tokio::time::timeout(EVENT_TIMEOUT, async {
+                while let Some(event) = event_rx.recv().await {
+                    if matches!(event.kind, SessionEventKind::TurnStarted { .. }) {
+                        return;
+                    }
+                }
+                panic!("actor ended before continuation");
+            })
+            .await
+            .expect("active goal starts or continues automatically");
+            assert_eq!(
+                store.state(session_id).await.unwrap().goal.unwrap().status,
+                GoalStatus::Active
+            );
+            if attempt < recoveries {
+                interrupt.request_recovery();
+            }
+        }
+        if recoveries == 1 {
+            interrupt.request();
+        }
+        let expected = if recoveries == 3 {
+            GoalStatus::Blocked
+        } else {
+            GoalStatus::Paused
+        };
+        tokio::time::timeout(EVENT_TIMEOUT, async {
+            while let Some(event) = event_rx.recv().await {
+                if matches!(
+                    event.kind,
+                    SessionEventKind::StatusChanged {
+                        status: SessionStatus::Ready,
+                        ..
+                    }
+                ) && store.state(session_id).await.unwrap().goal.unwrap().status == expected
+                {
+                    return;
+                }
+            }
+            panic!("actor ended without settling its goal");
+        })
+        .await
+        .expect("human stop pauses; three failed recoveries report a blocker");
+        let history = store.read(session_id).await.unwrap();
+        if recoveries == 3 {
+            assert!(
+                !history.iter().any(|event| matches!(&event.kind,
+                SessionEventKind::GoalUpdated { goal } if goal.status == GoalStatus::Paused)),
+                "watchdog recovery must never fabricate a user pause"
+            );
+        }
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        tokio::time::timeout(EVENT_TIMEOUT, actor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        scratch.discard().await;
+    }
+}
+
+#[test]
+fn watchdog_recovery_never_replaces_human_cancellation() {
+    for human_first in [true, false] {
+        for flush in [true, false] {
+            let interrupt = SessionInterrupt::default();
+            if !human_first {
+                interrupt.request_recovery();
+            }
+            if flush {
+                interrupt.request_pending_input();
+            } else {
+                interrupt.request();
+            }
+            if human_first {
+                interrupt.request_recovery();
+            }
+            assert!(!interrupt.settle(), "human intent wins in either order");
+        }
+    }
 }
 
 #[tokio::test]
