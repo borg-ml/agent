@@ -6814,7 +6814,7 @@ impl BorgTerminal {
                 self.settings = None;
                 UiAction::None
             }
-            SettingsEffect::Apply(action) => action,
+            SettingsEffect::Apply(action) => *action,
             SettingsEffect::OpenCommitModelPicker => {
                 self.open_commit_model_picker();
                 UiAction::None

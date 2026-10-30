@@ -328,21 +328,22 @@ impl SettingsScreen {
             }
             Id::ProviderSave => {
                 let editor = self.provider_editor.as_ref()?;
-                return Some(SettingsEffect::Apply(UiAction::SaveCustomProvider {
-                    original: editor.original.clone(),
-                    id: editor.id.clone(),
-                    provider: editor.provider.clone(),
-                    key_changed: editor.key_changed,
-                }));
+                return Some(SettingsEffect::Apply(Box::new(
+                    UiAction::SaveCustomProvider {
+                        original: editor.original.clone(),
+                        id: editor.id.clone(),
+                        provider: editor.provider.clone(),
+                        key_changed: editor.key_changed,
+                    },
+                )));
             }
             Id::ProviderDelete => {
                 let editor = self.provider_editor.as_mut()?;
                 if editor.confirm_delete {
                     let (id, expected) = editor.original.clone()?;
-                    return Some(SettingsEffect::Apply(UiAction::DeleteCustomProvider {
-                        id,
-                        expected,
-                    }));
+                    return Some(SettingsEffect::Apply(Box::new(
+                        UiAction::DeleteCustomProvider { id, expected },
+                    )));
                 }
                 editor.confirm_delete = true;
                 return Some(SettingsEffect::None);
@@ -547,12 +548,16 @@ mod tests {
         screen
             .provider_action(SettingId::ProviderModelSave)
             .unwrap();
-        let Some(SettingsEffect::Apply(UiAction::SaveCustomProvider {
+        let Some(SettingsEffect::Apply(action)) = screen.provider_action(SettingId::ProviderSave)
+        else {
+            panic!("expected one provider save");
+        };
+        let UiAction::SaveCustomProvider {
             original,
             id,
             provider,
             ..
-        })) = screen.provider_action(SettingId::ProviderSave)
+        } = *action
         else {
             panic!("expected one provider save");
         };

@@ -21276,7 +21276,7 @@ async fn watchdog_recovery_continues_goals_but_human_stop_still_pauses() {
             let cwd = root.path().to_path_buf();
             let store = store.clone();
             let interrupt = interrupt.clone();
-            let writer = SessionWriterLease::acquire(&cwd.join("session.lock")).unwrap();
+            let writer = SessionWriterLease::acquire(cwd.join("session.lock")).unwrap();
             async move {
                 run_agent_session_with_priority_commands(
                     &cwd,

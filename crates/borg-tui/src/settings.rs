@@ -791,7 +791,7 @@ fn choice_action(row: &SettingRow, index: usize) -> Option<UiAction> {
 pub(crate) enum SettingsEffect {
     None,
     Close,
-    Apply(UiAction),
+    Apply(Box<UiAction>),
     OpenModelPicker,
     OpenCommitModelPicker,
     OpenDictation,
@@ -920,7 +920,7 @@ impl SettingsScreen {
             Some(action) => {
                 self.pending.retain(|(id, ..)| *id != row.id);
                 self.pending.push((row.id, index, Instant::now()));
-                SettingsEffect::Apply(action)
+                SettingsEffect::Apply(Box::new(action))
             }
             None => SettingsEffect::None,
         }
@@ -957,10 +957,10 @@ impl SettingsScreen {
         if !row.enabled {
             return SettingsEffect::None;
         }
-        if matches!(row.control, SettingControl::Action(_)) {
-            if let Some(effect) = self.provider_action(row.id) {
-                return effect;
-            }
+        if matches!(row.control, SettingControl::Action(_))
+            && let Some(effect) = self.provider_action(row.id)
+        {
+            return effect;
         }
         match &row.control {
             SettingControl::Secret(_) => {
@@ -1030,7 +1030,9 @@ impl SettingsScreen {
                     return SettingsEffect::None;
                 }
                 self.error = None;
-                return SettingsEffect::Apply(UiAction::SetCommitMessageModel(model.label()));
+                return SettingsEffect::Apply(Box::new(UiAction::SetCommitMessageModel(
+                    model.label(),
+                )));
             }
             SettingId::HorizontalMargin | SettingId::ComposerHeight => {
                 let max = if id == SettingId::HorizontalMargin {
@@ -1054,11 +1056,11 @@ impl SettingsScreen {
                     return SettingsEffect::None;
                 }
                 self.error = None;
-                return SettingsEffect::Apply(if id == SettingId::HorizontalMargin {
+                return SettingsEffect::Apply(Box::new(if id == SettingId::HorizontalMargin {
                     UiAction::SetHorizontalMargin(number)
                 } else {
                     UiAction::SetComposerMaxHeight(number)
-                });
+                }));
             }
             SettingId::UserLabel | SettingId::AssistantLabel => {
                 if value.is_empty() {
@@ -1094,11 +1096,11 @@ impl SettingsScreen {
             }
         };
         self.error = None;
-        SettingsEffect::Apply(UiAction::Submit {
+        SettingsEffect::Apply(Box::new(UiAction::Submit {
             target: None,
             text: command,
             attachments: Vec::new(),
-        })
+        }))
     }
 
     /// Pasted text goes to the field being edited, otherwise to the search.

@@ -1299,15 +1299,15 @@ pub(crate) fn save_custom_provider(
         );
         config.providers.insert(id.to_string(), provider.clone());
     }
-    if let Some((old_id, _)) = original {
-        if next.is_none_or(|(id, _)| id != old_id) {
-            config.providers.remove(old_id);
-            if let Some(table) = document
-                .get_mut("providers")
-                .and_then(Item::as_table_like_mut)
-            {
-                table.remove(old_id);
-            }
+    if let Some((old_id, _)) = original
+        && next.is_none_or(|(id, _)| id != old_id)
+    {
+        config.providers.remove(old_id);
+        if let Some(table) = document
+            .get_mut("providers")
+            .and_then(Item::as_table_like_mut)
+        {
+            table.remove(old_id);
         }
     }
     config.validate()?;
