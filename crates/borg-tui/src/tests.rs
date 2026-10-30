@@ -12871,19 +12871,15 @@ fn borging_roll_selects_exactly_one_in_a_thousand_uniform_run_ids() {
 
 #[test]
 fn splash_logo_randomizes_glitches_and_then_settles() {
-    assert_eq!(
-        splash_version().trim_start(),
-        format!("v{}", env!("CARGO_PKG_VERSION"))
-    );
     assert_eq!(splash_version().width() % 2, 1);
-    // Whatever the version, an even one gains a leading space instead of
-    // losing its `v`, so the three splash lines keep one width and one centre.
     for version in ["0.12.9", "0.12.10", "0.13.0", "0.123.9", "0.1234.5"] {
         let text = splash_version_text(version);
         assert_eq!(text.width() % 2, 1, "{version}");
-        assert_eq!(text.trim_start(), format!("v{version}"), "{version}");
+        assert_eq!(text.trim_start_matches('v'), version);
+        assert!(!text.contains(' '));
     }
-    assert_eq!(splash_version_text("0.12.10"), " v0.12.10");
+    assert_eq!(splash_version_text("0.12.9"), "v0.12.9");
+    assert_eq!(splash_version_text("0.12.10"), "0.12.10");
 
     // Tracked like the logo above it, so the three splash lines share a width
     // and therefore a centre. A line can only sit dead centre when its width

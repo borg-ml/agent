@@ -4385,7 +4385,10 @@ impl BorgTerminal {
     }
 
     pub fn has_active_splash_animation(&self) -> bool {
-        self.is_launch_screen() && self.splash_started_at.elapsed() < SPLASH_ANIMATION_DURATION
+        self.is_launch_screen()
+            && (self.splash_started_at.elapsed() < SPLASH_ANIMATION_DURATION
+                || self.splash_started_at.elapsed()
+                    >= splash_animation_interval(self.splash_glitch_seed))
     }
 
     pub fn has_running_tool(&self) -> bool {
@@ -10254,6 +10257,13 @@ impl BorgTerminal {
         let mut output = stdout.lock();
         let mut frame_cursor = None;
         let mut restore_images = false;
+        if is_launch_screen
+            && self.splash_started_at.elapsed()
+                >= splash_animation_interval(self.splash_glitch_seed)
+        {
+            self.splash_started_at = Instant::now();
+            self.splash_glitch_seed = splitmix64(self.splash_glitch_seed);
+        }
         let draw_result = self.terminal.try_draw(|frame| -> io::Result<()> {
             let mut overlays = OverlayLayer::default();
             let area = centered_content_area_with_margin(frame.area(), self.horizontal_margin);
@@ -18236,6 +18246,10 @@ fn composer_frame_cursor(
     })
 }
 
+fn splash_animation_interval(seed: u64) -> Duration {
+    Duration::from_millis(5_000 + splitmix64(seed) % 15_001)
+}
+
 fn splash_logo_line(elapsed: Duration, seed: u64) -> Line<'static> {
     let bold = Modifier::BOLD;
     const ORIGINAL: [char; 4] = ['B', 'O', 'R', 'G'];
@@ -18355,29 +18369,16 @@ fn splitmix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-/// The version, spaced so the splash's three lines share a width.
-///
-/// The logo and the caption are both seven columns, and all three centre
-/// together only when they are the *same* width - a line of different parity
-/// cannot be nudged onto the same centre, because the terminal has no half
-/// cell. The version is the one line whose length moves: `v0.12.9` is seven
-/// columns and `v0.12.10` is eight, so the first two-digit patch release would
-/// have knocked the whole block out by a cell.
-///
-/// So when the version would be even it gains a leading space, which widens
-/// the gap after the channel glyph by one column and puts the line back on the
-/// block's width. The `v` always stays.
 fn splash_version() -> String {
     splash_version_text(env!("CARGO_PKG_VERSION"))
 }
 
-/// The `v`-prefixed version, padded with a leading space when it is even.
+/// Drop the `v` rather than add padding when needed to keep the line odd-width.
 fn splash_version_text(version: &str) -> String {
-    let prefixed = format!("v{version}");
-    if UnicodeWidthStr::width(prefixed.as_str()) % 2 == 0 {
-        format!(" {prefixed}")
+    if UnicodeWidthStr::width(version) % 2 == 1 {
+        version.to_owned()
     } else {
-        prefixed
+        format!("v{version}")
     }
 }
 

@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.10)
 
+- The splash version drops its `v` instead of adding an extra space when needed for centering. The Borg-letter animation now repeats at random 5–20-second intervals.
+
 ## 0.19.10 (2026-10-30)
 
 - Inactive subagents retain their actual activity timestamps during journal replay and roster restoration, keeping the list ordered by most recent activity rather than recovery time.
