@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.19.9)
+## Unreleased (since 0.19.10)
+
+## 0.19.10 (2026-10-30)
 
 - Inactive subagents retain their actual activity timestamps during journal replay and roster restoration, keeping the list ordered by most recent activity rather than recovery time.
 
