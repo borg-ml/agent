@@ -1029,6 +1029,10 @@ impl LspClient {
         let mut initialize = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
+            "workspaceFolders": [{
+                "uri": root_uri,
+                "name": root.file_name().and_then(|name| name.to_str()).unwrap_or("workspace")
+            }],
             "capabilities": {
                 "general": { "positionEncodings": ["utf-16"] },
                 "textDocument": {
@@ -3105,6 +3109,54 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "LSP path must stay inside an authorized workspace root"
+        );
+    }
+
+    // rootUri alone leaves modern Pyright in a nonexistent default workspace:
+    // sibling imports become Unknown and real cross-module type errors disappear.
+    #[tokio::test]
+    async fn pyright_resolves_project_imports_and_reports_cross_module_errors_when_available() {
+        if !command_available("pyright-langserver") {
+            return;
+        }
+        let root = tempfile::tempdir().expect("Python workspace");
+        for directory in ["pkg", "src"] {
+            tokio::fs::create_dir(root.path().join(directory))
+                .await
+                .expect("source directory");
+        }
+        for (path, source) in [
+            (
+                "pyproject.toml",
+                "[tool.pyright]\ntypeCheckingMode = \"basic\"\n",
+            ),
+            ("pkg/__init__.py", ""),
+            ("pkg/library.py", "def number() -> int:\n    return 1\n"),
+            (
+                "src/main.py",
+                "from pkg.library import number\nvalue: str = number()\n",
+            ),
+        ] {
+            tokio::fs::write(root.path().join(path), source)
+                .await
+                .expect("Python project source");
+        }
+        let result = LspService::new(root.path())
+            .diagnostics(Path::new("src/main.py"))
+            .await
+            .expect("Pyright diagnostics");
+        let items = result["items"].as_array().expect("full diagnostics");
+        assert!(
+            items
+                .iter()
+                .any(|item| item["code"] == "reportAssignmentType"),
+            "resolved imports must expose the real type mismatch: {result}"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| item["code"] == "reportMissingImports"),
+            "project sibling imports must resolve: {result}"
         );
     }
 
