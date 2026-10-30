@@ -7,6 +7,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.9)
 
+- Workspace diagnostics now use bounded document checks when the server does not advertise workspace pull support, avoiding Pyright timeouts while preserving real cross-module errors.
+
 - LSP initialization now includes the discovered workspace folder, so modern Pyright resolves project imports instead of analyzing a nonexistent default workspace and hiding cross-module type errors.
 
 - Private input no longer enters composer drafts/history/undo or slash-command parsing, and sensitive answers are redacted from resolution events. Provider headers are masked; GUI copy/input-method readback is blocked for private input. New `request_secret` asks the human for a destination-bound provider API key and returns only a receipt, without switching billing. Credential updates are atomic and locked; remote private-answer receipts use keyed commitments. Streaming command journals redact complete lines and suppress split key/private-key material. Keys remain permission-protected local plaintext, not an encrypted/payment vault; see `docs/sensitive-input.md` and the T3 Code audit.

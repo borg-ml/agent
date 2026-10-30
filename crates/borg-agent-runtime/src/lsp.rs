@@ -201,6 +201,7 @@ struct LspClient {
     outgoing_written: usize,
     pending_request: Option<u64>,
     supports_pull_diagnostics: bool,
+    supports_workspace_diagnostics: bool,
     compilation_configuration: Vec<(PathBuf, u64, std::time::SystemTime)>,
     opened_versions: HashMap<PathBuf, i32>,
     open_order: VecDeque<PathBuf>,
@@ -844,7 +845,13 @@ impl LspService {
                 results.insert(label, slot.unavailable_report());
                 continue;
             };
-            let report = timeout_at(deadline, client.workspace_diagnostics(deadline)).await;
+            let spec = spec_for_id(key.server_id)
+                .with_context(|| format!("unknown language server `{}`", key.server_id))?;
+            let report = timeout_at(
+                deadline,
+                client.workspace_diagnostics(&key.workspace_root, spec, deadline),
+            )
+            .await;
             if report.is_err() {
                 // The outer timer may drop the nested request before its own
                 // cancellation cleanup runs. Do not leave it running until reuse.
@@ -856,17 +863,12 @@ impl LspService {
                     .and_then(|result| result)
                 {
                     Ok(value) => Ok(value),
-                    Err(error) if is_unknown_workspace_diagnostics_request(&error) => {
-                        let spec = spec_for_id(key.server_id).with_context(|| {
-                            format!("unknown language server `{}`", key.server_id)
-                        })?;
-                        client
-                            .document_workspace_diagnostics(&key.workspace_root, spec, deadline)
-                            .await
-                            .with_context(|| {
-                                format!("{label} document diagnostics fallback failed ({error:#})")
-                            })
-                    }
+                    Err(error) if is_unknown_workspace_diagnostics_request(&error) => client
+                        .document_workspace_diagnostics(&key.workspace_root, spec, deadline)
+                        .await
+                        .with_context(|| {
+                            format!("{label} document diagnostics fallback failed ({error:#})")
+                        }),
                     Err(error) => Err(error)
                         .with_context(|| format!("{label} workspace diagnostics request failed")),
                 },
@@ -1016,6 +1018,7 @@ impl LspClient {
             outgoing_written: 0,
             pending_request: None,
             supports_pull_diagnostics: false,
+            supports_workspace_diagnostics: false,
             compilation_configuration: compilation_configuration_stamp(spec, root).await,
             opened_versions: HashMap::new(),
             open_order: VecDeque::new(),
@@ -1061,6 +1064,10 @@ impl LspClient {
         client.supports_pull_diagnostics = initialized
             .pointer("/capabilities/diagnosticProvider")
             .is_some_and(Value::is_object);
+        client.supports_workspace_diagnostics = initialized
+            .pointer("/capabilities/diagnosticProvider/workspaceDiagnostics")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         client.notify("initialized", json!({})).await?;
         Ok(client)
     }
@@ -1306,7 +1313,19 @@ impl LspClient {
         Ok(result)
     }
 
-    async fn workspace_diagnostics(&mut self, deadline: Instant) -> Result<Value> {
+    async fn workspace_diagnostics(
+        &mut self,
+        root: &Path,
+        spec: &ServerSpec,
+        deadline: Instant,
+    ) -> Result<Value> {
+        // Push-only servers may silently ignore unsupported workspace pulls.
+        // Document and workspace pull support are separate LSP capabilities.
+        if !self.supports_workspace_diagnostics {
+            return self
+                .document_workspace_diagnostics(root, spec, deadline)
+                .await;
+        }
         self.request_with_timeout(
             "workspace/diagnostic",
             json!({ "previousResultIds": [] }),
@@ -2952,6 +2971,7 @@ mod tests {
                 outgoing_written: 0,
                 pending_request: None,
                 supports_pull_diagnostics: false,
+                supports_workspace_diagnostics: false,
                 compilation_configuration: Vec::new(),
                 opened_versions: HashMap::new(),
                 open_order: VecDeque::new(),
@@ -3141,7 +3161,8 @@ mod tests {
                 .await
                 .expect("Python project source");
         }
-        let result = LspService::new(root.path())
+        let service = LspService::new(root.path());
+        let result = service
             .diagnostics(Path::new("src/main.py"))
             .await
             .expect("Pyright diagnostics");
@@ -3157,6 +3178,29 @@ mod tests {
                 .iter()
                 .any(|item| item["code"] == "reportMissingImports"),
             "project sibling imports must resolve: {result}"
+        );
+
+        // Pyright publishes diagnostics but does not advertise workspace pull.
+        // A blind workspace/diagnostic request hangs instead of returning -32601.
+        let workspace = service
+            .workspace_diagnostics(Some(Path::new("src/main.py")))
+            .await
+            .expect("Pyright workspace diagnostics");
+        let report = &workspace["pyright"];
+        assert_ne!(report["partial"], json!(true), "{workspace}");
+        let items = report["items"].as_array().expect("workspace documents");
+        assert!(
+            items.iter().any(|document| {
+                document["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.ends_with("/src/main.py"))
+                    && document["items"].as_array().is_some_and(|items| {
+                        items
+                            .iter()
+                            .any(|item| item["code"] == "reportAssignmentType")
+                    })
+            }),
+            "workspace fallback must retain the real cross-module error: {workspace}"
         );
     }
 
@@ -3525,6 +3569,7 @@ mod tests {
             outgoing_written: 0,
             pending_request: None,
             supports_pull_diagnostics: false,
+            supports_workspace_diagnostics: false,
             compilation_configuration: Vec::new(),
             opened_versions: HashMap::new(),
             open_order: VecDeque::new(),
@@ -3606,6 +3651,7 @@ mod tests {
             outgoing_written: 0,
             pending_request: None,
             supports_pull_diagnostics: false,
+            supports_workspace_diagnostics: false,
             compilation_configuration: Vec::new(),
             opened_versions: HashMap::new(),
             open_order: VecDeque::new(),
@@ -3701,6 +3747,7 @@ mod tests {
             outgoing_written: 0,
             pending_request: None,
             supports_pull_diagnostics: false,
+            supports_workspace_diagnostics: false,
             compilation_configuration: Vec::new(),
             opened_versions: HashMap::new(),
             open_order: VecDeque::new(),
@@ -3856,6 +3903,7 @@ w.write(frame({'jsonrpc':'2.0','id':second['id'],'result':'fresh'}));w.flush()
                     outgoing_written: 0,
                     pending_request: None,
                     supports_pull_diagnostics: false,
+                    supports_workspace_diagnostics: false,
                     compilation_configuration: Vec::new(),
                     opened_versions: HashMap::new(),
                     open_order: VecDeque::new(),
@@ -4035,6 +4083,7 @@ read() # didClose cleanup
             outgoing_written: 0,
             pending_request: None,
             supports_pull_diagnostics: false,
+            supports_workspace_diagnostics: false,
             compilation_configuration: Vec::new(),
             opened_versions: HashMap::new(),
             open_order: VecDeque::new(),
