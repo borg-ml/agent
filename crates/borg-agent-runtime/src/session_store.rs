@@ -287,6 +287,7 @@ impl SessionEventKind {
                         | "native_context_edit"
                         | "native_model_request"
                         | "native_model_usage"
+                        | crate::prompt_cache::PROMPT_CACHE_OBSERVED
                         | "native_prompt_context"
                         | "native_tool_round_completed"
                         | "context_microcompaction"
@@ -420,7 +421,7 @@ impl SessionEventKind {
 
     pub fn is_fork_inheritable(&self) -> bool {
         if matches!(self, Self::ProviderEvent { kind, .. }
-            if matches!(kind.as_str(), "native_model_request" | "native_model_usage" | "network_retry" | "usage_limit_retry" | "usage_limit_retry_cancelled" | "usage_limit_retry_released"))
+            if matches!(kind.as_str(), "native_model_request" | "native_model_usage" | crate::prompt_cache::PROMPT_CACHE_OBSERVED | "network_retry" | "usage_limit_retry" | "usage_limit_retry_cancelled" | "usage_limit_retry_released"))
         {
             return false;
         }
@@ -824,6 +825,8 @@ pub struct PendingUsageLimitRetry {
 #[serde(default)]
 pub struct SessionState {
     #[serde(default)]
+    pub prompt_cache: Option<crate::PromptCacheObservation>,
+    #[serde(default)]
     pub team_director: Option<crate::TeamDirector>,
     pub latest_sequence: u64,
     /// Monotonic identity for the canonical provider-context prefix. A
@@ -922,6 +925,7 @@ impl SessionState {
         if event.kind.advances_activity_clock() {
             self.activity_at = Some(event.created_at);
         }
+        crate::PromptCacheObservation::apply(&mut self.prompt_cache, event);
         match &event.kind {
             SessionEventKind::TeamDirectorChanged { director } => {
                 self.team_director = Some(director.clone());
@@ -1345,6 +1349,7 @@ impl SessionState {
         // the child makes the next prompt pass the pre-turn auto-compaction
         // check before the new provider context has been built.
         state.context_generation = state.context_generation.saturating_add(1);
+        state.prompt_cache = None;
         state.usage.context_tokens = Some(0);
         state.pending_approval_id = None;
         state.pending_provider_interaction_id = None;

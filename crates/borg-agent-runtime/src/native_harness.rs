@@ -1130,6 +1130,7 @@ impl NativeHarness {
             // differed in any field would extend a different cache entry from
             // the one the next real request reads.
             let warm_request = warming_armed.then(|| request.clone());
+            let request_started_at = chrono::Utc::now();
             let mut result = match self
                 .call_model(
                     turn.provider,
@@ -1289,6 +1290,21 @@ impl NativeHarness {
                 }
                 Err(error) => return Err(error),
             };
+            send(&events, SessionEventKind::ProviderEvent {
+                provider: turn.provider,
+                kind: crate::prompt_cache::PROMPT_CACHE_OBSERVED.into(),
+                payload: serde_json::to_value(crate::PromptCacheObservation {
+                    at: request_started_at,
+                    provider: turn.provider,
+                    model: model.clone(),
+                    effort: turn.effort.clone(),
+                    retention: self.model_client.cache_retention(turn.provider, &model),
+                    prompt_tokens: result.usage.input_tokens
+                        .saturating_add(result.usage.cached_input_tokens)
+                        .saturating_add(result.usage.cache_creation_input_tokens),
+                    cached_input_tokens: result.usage.cached_input_tokens,
+                })?,
+            }).await;
             let replying_while_parked = parked_reply_unsent_tokens.take().is_some();
             // A response may omit window metadata (notably the public API).
             // Keep the window already resolved for this route instead of
@@ -2795,6 +2811,14 @@ enum NativeModelOutcome {
 
 #[async_trait]
 trait NativeModelClient: Send + Sync {
+    fn cache_retention(
+        &self,
+        _provider: crate::CodingProvider,
+        _model: &str,
+    ) -> crate::PromptCacheRetention {
+        crate::PromptCacheRetention::Unknown
+    }
+
     async fn model_turn(
         &self,
         provider: crate::CodingProvider,
@@ -3221,6 +3245,31 @@ fn limit_request_images(request: &mut ModelTurnRequest) {
 
 #[async_trait]
 impl NativeModelClient for ProviderModelClient {
+    fn cache_retention(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+    ) -> crate::PromptCacheRetention {
+        use crate::PromptCacheRetention;
+        let gateway = match self.route(provider, model) {
+            #[cfg(feature = "subscription-adapters")]
+            Ok(NativeRoute::ClaudeSubscription(_)) => return PromptCacheRetention::Seconds(3600),
+            #[cfg(feature = "subscription-adapters")]
+            Ok(NativeRoute::CodexAccount(account)) if account.starts_with("sha256:") => {
+                return PromptCacheRetention::Indefinite;
+            }
+            Ok(NativeRoute::ChatCompletions { gateway, .. }) => gateway,
+            Ok(_) => None,
+            Err(_) => return PromptCacheRetention::Unknown,
+        };
+        gateway
+            .and_then(|gateway| gateway.prompt_cache_ttl_seconds)
+            .or_else(|| {
+                borg_provider::provider::prompt_cache_lifetime(model).map(|ttl| ttl.as_secs())
+            })
+            .map_or(PromptCacheRetention::Unknown, PromptCacheRetention::Seconds)
+    }
+
     async fn model_turn(
         &self,
         provider: crate::CodingProvider,
@@ -9397,6 +9446,14 @@ mod tests {
         assert!(claude.subscription);
         assert_eq!(claude.cache_lifetime, Duration::from_secs(3600));
         assert_eq!(claude.max_output_tokens, 1);
+        assert_eq!(
+            client.cache_retention(crate::CodingProvider::Claude, "claude-opus-5"),
+            crate::PromptCacheRetention::Seconds(3600)
+        );
+        assert_eq!(
+            client.cache_retention(crate::CodingProvider::Codex, "gpt-6.1-sol"),
+            crate::PromptCacheRetention::Indefinite
+        );
         let codex =
             client.refresh_support(crate::CodingProvider::Codex, "gpt-6.1-sol", Some("low"));
         assert_eq!(codex.unwrap_err(), Ineligible::CacheDoesNotExpire);
@@ -9413,6 +9470,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
+            api.cache_retention(crate::CodingProvider::Codex, "gpt-6.1-sol"),
+            crate::PromptCacheRetention::Unknown
+        );
+        assert_eq!(
             api.refresh_support(crate::CodingProvider::Codex, "gpt-6.1-sol", Some("low"))
                 .unwrap_err(),
             Ineligible::CacheLifetimeUnknown
@@ -9426,6 +9487,21 @@ mod tests {
     #[test]
     fn a_thinking_anthropic_route_refuses_a_cache_refresh() {
         let client = ProviderModelClient::default();
+        assert_eq!(
+            client.cache_retention(crate::CodingProvider::Anthropic, "claude-opus-5"),
+            crate::PromptCacheRetention::Seconds(300)
+        );
+        let mut gateway =
+            ModelGateway::new("http://localhost:12345/v1/chat/completions", "test-key");
+        gateway.prompt_cache_ttl_seconds = Some(120);
+        let custom = ProviderModelClient {
+            gateway: Some(gateway),
+            ..Default::default()
+        };
+        assert_eq!(
+            custom.cache_retention(crate::CodingProvider::OpenAiCompatible, "custom-model"),
+            crate::PromptCacheRetention::Seconds(120)
+        );
         assert_eq!(
             client
                 .refresh_support(

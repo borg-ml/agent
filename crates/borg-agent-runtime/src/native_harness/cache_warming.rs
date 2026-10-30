@@ -693,6 +693,7 @@ impl WarmRun {
                 decision: Some(decision),
             });
             self.record_decision(&decision, "sent").await;
+            let request_started_at = chrono::Utc::now();
             let refreshed = tokio::select! {
                 () = self.cancel.cancelled() => {
                     self.stop("cancelled", Some(decision));
@@ -710,7 +711,7 @@ impl WarmRun {
                 return;
             }
             match refreshed {
-                Ok(usage) => self.record_usage(&usage).await,
+                Ok(usage) => self.record_usage(&usage, request_started_at).await,
                 Err(error) => {
                     // Warming is best-effort. A failed refresh means the next
                     // real request pays for one miss, which is exactly the
@@ -755,7 +756,25 @@ impl WarmRun {
     /// belongs to no turn, and `context_tokens` is cleared because a refresh
     /// adds nothing to the context: letting it through would move the
     /// auto-compaction trigger on spend that never entered the conversation.
-    async fn record_usage(&self, usage: &ProviderCallUsage) {
+    async fn record_usage(&self, usage: &ProviderCallUsage, at: chrono::DateTime<chrono::Utc>) {
+        let observation = crate::PromptCacheObservation {
+            at,
+            provider: self.request.provider,
+            model: self.request.model.clone(),
+            effort: self.request.effort.clone(),
+            retention: crate::PromptCacheRetention::Seconds(self.support.cache_lifetime.as_secs()),
+            prompt_tokens: self.request.prompt_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+        };
+        let _ = self
+            .events
+            .send(SessionEventKind::ProviderEvent {
+                provider: self.request.provider,
+                kind: crate::prompt_cache::PROMPT_CACHE_OBSERVED.into(),
+                payload: serde_json::json!(observation),
+            })
+            .await;
+
         let _ = self
             .events
             .send(SessionEventKind::UsageUpdated {
@@ -912,6 +931,7 @@ mod tests {
 
         let mut billed = 0;
         let mut decisions = 0;
+        let mut observations = 0;
         while let Ok(event) = received.try_recv() {
             match event {
                 SessionEventKind::Message { .. } => {
@@ -931,6 +951,14 @@ mod tests {
                         "a refresh adds nothing to context and must not move the compaction trigger"
                     );
                 }
+                SessionEventKind::ProviderEvent { kind, payload, .. }
+                    if kind == crate::prompt_cache::PROMPT_CACHE_OBSERVED =>
+                {
+                    let cache: crate::PromptCacheObservation =
+                        serde_json::from_value(payload).unwrap();
+                    assert_eq!(cache.retention, crate::PromptCacheRetention::Seconds(100));
+                    observations += 1;
+                }
                 SessionEventKind::ProviderEvent { kind, .. }
                     if kind == "cache_warming_decision" =>
                 {
@@ -941,6 +969,10 @@ mod tests {
         }
         assert_eq!(billed, 1, "the spend has to be visible exactly once");
         assert_eq!(decisions, 1);
+        assert_eq!(
+            observations, 1,
+            "a successful keepalive updates the live cache estimate"
+        );
     }
 
     /// The cancellation contract: an armed refresh belongs to its turn, so a

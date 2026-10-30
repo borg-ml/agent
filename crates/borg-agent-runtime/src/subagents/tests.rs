@@ -766,7 +766,25 @@ async fn live_subagent_count_tracks_lifecycle_and_descendant_scope() {
     assert!(dispatcher.subagent_count_prompt().await.starts_with(
         "Live subagent counts — direct children: running=0, starting=1, waiting=0, inactive=1; all descendants: running=1, starting=1, waiting=0, inactive=1."
     ));
+    {
+        let mut table = coordinator.table.lock().await;
+        let agent = &mut table.entries.get_mut(&grandchild).unwrap().snapshot;
+        agent.usage.prompt_cache = Some(crate::PromptCacheObservation {
+            at: Utc::now() - chrono::Duration::hours(2),
+            provider: agent.provider,
+            model: agent.model.clone().unwrap_or_else(|| "gpt-6.1-sol".into()),
+            effort: agent.effort.clone(),
+            retention: crate::PromptCacheRetention::Seconds(3600),
+            prompt_tokens: 100_000,
+            cached_input_tokens: 90_000,
+        });
+    }
     dispatcher.actor_session_id = child;
+    let prompt = dispatcher.subagent_count_prompt().await;
+    assert!(prompt.contains("possibly cold"));
+    assert!(prompt.contains("prior prompt=100000 tokens"));
+    assert!(!prompt.contains(&format!("session:{sibling}")));
+    assert!(!prompt.contains(&format!("session:{child}")));
     assert!(dispatcher.subagent_count_prompt().await.starts_with(
         "Live subagent counts — direct children: running=1, starting=0, waiting=0, inactive=0; all descendants: running=1, starting=0, waiting=0, inactive=0."
     ));
@@ -2821,7 +2839,7 @@ async fn a_member_delegation_spawns_fresh_and_names_the_requester() {
     let member = coordinator
         .call_tool(
             "spawn_agent",
-            json!({"task_name": "member", "message": "Lead the member's task.", "fresh": true}),
+            json!({"task_name": "member", "message": "Lead the member's task."}),
         )
         .await
         .unwrap();
@@ -6462,7 +6480,6 @@ async fn a_new_assignment_does_not_take_over_a_child_with_missing_membership() {
                 fast: None,
                 ultrafast: None,
             },
-            false,
             None,
         )
         .await
@@ -6542,7 +6559,7 @@ async fn a_default_assignment_spawns_and_preserves_an_idle_workers_identity() {
     let second = coordinator
         .call_tool(
             "spawn_agent",
-            json!({ "task_name": "landing", "message": "Land the branches.", "fresh": false }),
+            json!({ "task_name": "landing", "message": "Land the branches." }),
         )
         .await
         .unwrap();

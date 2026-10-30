@@ -261,6 +261,8 @@ impl FromIterator<SubagentStatus> for SubagentCounts {
 #[serde(default)]
 #[ts(export)]
 pub struct SubagentUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<crate::PromptCacheObservation>,
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
@@ -2214,6 +2216,8 @@ impl AgentToolDispatcher {
             .filter(|team| team.director().epoch > 0)
             .map(|team| format!("\n\n{}", team.role_prompt(self.actor_session_id)))
             .unwrap_or_default();
+        let mut caches = Vec::new();
+        let now = Utc::now();
         let mut direct = SubagentCounts::default();
         let mut descendants = SubagentCounts::default();
         if let Some(subagents) = &self.subagents {
@@ -2231,6 +2235,26 @@ impl AgentToolDispatcher {
                         } else {
                             agent.status
                         };
+                        let cache = agent.usage.prompt_cache.as_ref();
+                        let warmth =
+                            cache.map_or("unknown (no completed request telemetry)", |cache| {
+                                cache.status(
+                                    now,
+                                    agent.provider,
+                                    agent.model.as_deref(),
+                                    agent.effort.as_deref(),
+                                )
+                            });
+                        caches.push(format!(
+                            "- {} (session:{}; {:?}; {:?}/{}): {}; last request/refresh={}; prior prompt={} tokens (last cached={} tokens); context={} tokens.",
+                            agent.task_name, agent.session_id,
+                            if entry.dormant { SubagentLifecycle::Dormant } else { agent.lifecycle() },
+                            agent.provider, agent.model.as_deref().unwrap_or("default"), warmth,
+                            cache.map(|cache| cache.at.to_rfc3339()).unwrap_or_else(|| "unknown".into()),
+                            cache.map(|cache| cache.prompt_tokens.to_string()).unwrap_or_else(|| "unknown".into()),
+                            cache.map(|cache| cache.cached_input_tokens.to_string()).unwrap_or_else(|| "unknown".into()),
+                            agent.usage.context_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "unknown".into()),
+                        ));
                         descendants.add_snapshot(agent, status);
                         if agent.parent_session_id == self.actor_session_id {
                             direct.add_snapshot(agent, status);
@@ -2239,6 +2263,15 @@ impl AgentToolDispatcher {
                 }
             }
         }
+        caches.sort();
+        let cache_prompt = if caches.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nLive subagent prompt-cache estimates (supersede earlier estimates; retention is not a hit guarantee):\n{}\nBefore waking an inactive worker, weigh its retained context against reprocessing its prior prompt. If it may be cold and that context is unnecessary, prefer spawn_agent with a concise brief for a new worker. A fresh worker also pays for its initial prompt; unknown is not cold. Do not interrupt active/watcher-backed work or change model/provider/billing just to chase cache savings.",
+                caches.join("\n")
+            )
+        };
         let goal = match self.goals.call(SessionGoalToolRequest::Get).await {
             Ok(response) => match response.goal {
                 Some(goal) => format!(
@@ -2260,7 +2293,7 @@ impl AgentToolDispatcher {
              Refreshed before this model request; excludes yourself. Waiting agents are idle \
              but parked on live watchers (still running work, they wake themselves) and count \
              as active. Inactive includes ready-with-nothing-pending, approval-waiting, \
-             stopped, failed and dormant agents.{role}\n\n{goal}",
+             stopped, failed and dormant agents.{role}{cache_prompt}\n\n{goal}",
             direct.running,
             direct.starting,
             direct.waiting,
@@ -6042,7 +6075,6 @@ impl SubagentCoordinator {
         &self,
         actor_session_id: Uuid,
         request: SpawnSubagent,
-        _fresh: bool,
         directory: Option<PathBuf>,
     ) -> Result<Value> {
         let mut launch = self.subagent_launch(actor_session_id, &request).await?;
@@ -8981,7 +9013,6 @@ impl SubagentCoordinator {
                         ultrafast: args.ultrafast,
                         desktop: args.desktop,
                     },
-                    args.fresh,
                     args.cwd,
                 )
                 .await
@@ -9796,11 +9827,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
                     "fast": { "type": "boolean", "description": "Select fast mode for this child. Omit speed fields to inherit the live parent's tier on the same provider; explicit false selects standard mode. Only supported models/accounts can enable it." },
                     "ultrafast": { "type": "boolean", "description": "Select the Codex/OpenAI premium tier when supported. Mutually exclusive with fast; explicit speed settings override inheritance." },
                     "desktop": {"type":"boolean", "default":false, "description":"Director-only opt-in granting this child access to the user desktop through computer_use. Default false confines it to a private display. Never inherited by grandchildren; non-directors cannot grant it. Full Access/approval and human confirmation for consequential actions still apply."},
-                    "cwd": {"type":"string", "description":"Explicit existing worktree/default tool directory for a NEW child. Relative to the author workspace. Never takes over or rewrites existing sessions. Exec/runtime/read/search/LSP start here; later explicit shell cd or path overrides remain deliberate. Outside-workspace assignment requires Full Access."},
-                    "fresh": {
-                        "type": "boolean",
-                        "description": "Accepted for compatibility; spawn_agent always starts a new child session. Use followup_task to continue an existing task."
-                    }
+                    "cwd": {"type":"string", "description":"Explicit existing worktree/default tool directory for a NEW child. Relative to the author workspace. Never takes over or rewrites existing sessions. Exec/runtime/read/search/LSP start here; later explicit shell cd or path overrides remain deliberate. Outside-workspace assignment requires Full Access."}
                 },
                 "required": ["task_name", "message"],
                 "additionalProperties": false
@@ -11779,8 +11806,6 @@ struct SpawnAgentArgs {
     ultrafast: Option<bool>,
     #[serde(default)]
     desktop: bool,
-    #[serde(default)]
-    fresh: bool,
     cwd: Option<PathBuf>,
 }
 
@@ -13462,6 +13487,7 @@ async fn update_from_session_event(
     {
         return None;
     }
+    crate::PromptCacheObservation::apply(&mut entry.snapshot.usage.prompt_cache, event);
     match &event.kind {
         SessionEventKind::SessionConfigured {
             provider,
@@ -13659,6 +13685,7 @@ fn project_child_state(snapshot: &mut SubagentSnapshot, state: &crate::SessionSt
     }
     snapshot.final_text = state.latest_response.clone();
     snapshot.usage = SubagentUsage {
+        prompt_cache: state.prompt_cache.clone(),
         input_tokens: state.usage.input_tokens,
         cached_input_tokens: state.usage.cached_input_tokens,
         cache_creation_input_tokens: state.usage.cache_creation_input_tokens,

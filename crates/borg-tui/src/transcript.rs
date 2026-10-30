@@ -1322,6 +1322,7 @@ impl Transcript {
                 context_remaining_percent(context_tokens, context_window_tokens);
         }
         self.session_usage = borg_remote::SubagentUsage {
+            prompt_cache: state.prompt_cache.clone(),
             input_tokens: state.usage.input_tokens,
             cached_input_tokens: state.usage.cached_input_tokens,
             cache_creation_input_tokens: state.usage.cache_creation_input_tokens,
