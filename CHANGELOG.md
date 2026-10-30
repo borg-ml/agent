@@ -1,11 +1,11 @@
 # Changelog
 
-- Native process startup errors now include the underlying journal error in the tool-visible message, rather than hiding the cause behind a generic failure.
-
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
 ## Unreleased (since 0.19.9)
+
+- Native process startup errors now include the underlying journal error in the tool-visible message, rather than hiding the cause behind a generic failure.
 
 - Internal session-watchdog recovery no longer impersonates a human Stop or pauses the active goal: it continues from saved state, respects real Stop/input-flush requests, and reports a blocker after three consecutive recovery failures.
 
