@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.9)
 
+- Inactive subagents retain their actual activity timestamps during journal replay and roster restoration, keeping the list ordered by most recent activity rather than recovery time.
+
 - Every model request now receives fresh per-worker prompt-cache estimates, last request/refresh times, and prompt/context sizes alongside live subagent counts, helping agents weigh reusing retained context against starting a fresh worker without assuming unknown caches are cold. The ignored spawn_agent `fresh` compatibility flag is removed; spawning already always creates a new session.
 
 - Native process startup errors now include the underlying journal error in the tool-visible message, rather than hiding the cause behind a generic failure.

@@ -74,7 +74,8 @@ fn canonical_lifecycle_and_cursor_survive_legacy_snapshot_decode() {
     assert_eq!(legacy.lifecycle(), SubagentLifecycle::WaitingOnWatchers);
     let mut newer = agent.clone();
     newer.lifecycle = Some(SubagentLifecycle::Running);
-    newer.advance(Some(9));
+    newer.advance(Some(9), agent.updated_at);
+    assert_eq!(newer.updated_at, agent.updated_at);
     agent.updated_at = newer.updated_at + chrono::Duration::hours(1);
     assert!(
         newer.supersedes(&agent),
@@ -4089,36 +4090,39 @@ async fn an_idle_child_releases_retained_context_and_a_stop_still_stops() {
         parking: None,
         resume_after_restore: Vec::new(),
     }));
+    let activity_at = Utc::now() - chrono::Duration::days(1);
     let (child_id, mut released_rx) = {
         let mut table = table.lock().await;
         let child = table.reserve("worker", &launch()).unwrap();
         let (commands, released_rx) = mpsc::channel(4);
         let entry = table.entries.get_mut(&child.session_id).unwrap();
+        entry.snapshot.updated_at = activity_at - chrono::Duration::minutes(1);
         entry.snapshot.status = SubagentStatus::Running;
         entry.snapshot.lifecycle = Some(SubagentLifecycle::Running);
         entry.commands = Some(commands);
         (child.session_id, released_rx)
     };
 
-    update_from_session_event(
-        &table,
+    let mut idle = SessionEvent::new(
         child_id,
-        &SessionEvent::new(
-            child_id,
-            1,
-            SessionEventKind::StatusChanged {
-                status: SessionStatus::Ready,
-                lifecycle: None,
-                detail: None,
-            },
-        ),
-    )
-    .await;
+        1,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            lifecycle: None,
+            detail: None,
+        },
+    );
+    idle.created_at = activity_at;
+    update_from_session_event(&table, child_id, &idle).await;
 
     {
         let table = table.lock().await;
         let entry = table.entries.get(&child_id).unwrap();
         assert_eq!(entry.snapshot.status, SubagentStatus::Ready);
+        assert_eq!(
+            entry.snapshot.updated_at, activity_at,
+            "replay must preserve activity time"
+        );
         assert!(
             entry.commands.is_some(),
             "an idle child must stay addressable and wakeable"
