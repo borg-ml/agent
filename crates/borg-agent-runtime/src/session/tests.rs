@@ -1748,6 +1748,8 @@ async fn a_forked_session_never_reprojects_the_inherited_ancestry() {
             .await
             .unwrap();
     }
+    // Appends wake the background mirror; the watermark is not an append barrier.
+    projection.repair(store.clone(), session_id).await.unwrap();
     let parent_events = workspace_store
         .replay(binding.workspace_id, binding.participant_id, 0, 64)
         .await
