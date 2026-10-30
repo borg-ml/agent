@@ -20343,6 +20343,10 @@ async fn assert_immediate_interrupt(control_backlog: usize) {
     store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
+    let (priority_tx, priority_rx) = mpsc::channel(8);
+    let interrupt = SessionInterrupt::default();
+    let actor_interrupt = interrupt.clone();
+    let writer = SessionWriterLease::acquire(&journal_path).unwrap();
     let (event_tx, mut event_rx) = mpsc::channel(256);
     let started = Arc::new(Notify::new());
     let dropped = Arc::new(Notify::new());
@@ -20356,8 +20360,8 @@ async fn assert_immediate_interrupt(control_backlog: usize) {
     });
     let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_session_actor(
-            &journal_path,
+        run_agent_session_with_priority_commands(
+            root.path(),
             session_id,
             LaunchSession {
                 request_id: Uuid::new_v4(),
@@ -20377,9 +20381,13 @@ async fn assert_immediate_interrupt(control_backlog: usize) {
                 team_policy: None,
             },
             command_rx,
+            priority_rx,
+            actor_interrupt,
             event_tx,
             executor,
             actor_store,
+            writer,
+            Vec::new(),
         )
         .await
     });
@@ -20425,9 +20433,10 @@ async fn assert_immediate_interrupt(control_backlog: usize) {
     }
 
     let escape_at = std::time::Instant::now();
+    interrupt.request();
     tokio::time::timeout(
         Duration::from_millis(250),
-        command_tx.send(HostCommand::Interrupt { session_id }),
+        priority_tx.send(HostCommand::Interrupt { session_id }),
     )
     .await
     .expect("Escape is not blocked by the command backlog")
