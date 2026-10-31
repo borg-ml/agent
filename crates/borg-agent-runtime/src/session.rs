@@ -14502,11 +14502,14 @@ async fn record_subagent_activity(
     {
         return Ok(());
     }
+    // Director-addressed inbox reports are synthetic (sequence zero). Durable
+    // child-thread replies are activity, not messages to their observer.
     if let SubagentActivity::SessionEvent {
         task_name,
         event:
             SessionEvent {
                 session_id: sender_id,
+                sequence: 0,
                 kind:
                     SessionEventKind::Message {
                         message_id,

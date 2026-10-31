@@ -15869,16 +15869,6 @@ async fn parent_journal_preserves_full_child_transcript_events() {
     .unwrap();
 
     let partial = event_rx.recv().await.unwrap();
-    let notification = event_rx.recv().await.unwrap();
-    assert!(matches!(
-        notification.kind,
-        SessionEventKind::AgentMessageReceived {
-            message_id: received_id,
-            sender_id,
-            ref text,
-            ..
-        } if received_id == message_id && sender_id == child_id && text == "I am complete"
-    ));
     let complete = event_rx.recv().await.unwrap();
     assert!(matches!(
         partial.kind,
@@ -15908,6 +15898,16 @@ async fn parent_journal_preserves_full_child_transcript_events() {
             } if text == "I am complete"
         )
     ));
+    assert!(event_rx.try_recv().is_err());
+    assert!(
+        !persisted
+            .read(parent_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| { matches!(event.kind, SessionEventKind::AgentMessageReceived { .. }) }),
+        "ordinary child replies must not become director message receipts"
+    );
     // The streaming partial reaches a live observer but is never journaled:
     // the child itself keeps only coalesced live state for an in-progress
     // message, so mirroring every keystroke into a durable parent row is what
@@ -15965,6 +15965,28 @@ async fn parent_journal_preserves_full_child_transcript_events() {
     .await
     .unwrap();
     assert!(event_rx.try_recv().is_err());
+    let report_id = Uuid::new_v4();
+    let mut report = child_message(0, "Please review this result", MessageStatus::Complete);
+    if let SubagentActivity::SessionEvent { event, .. } = &mut report
+        && let SessionEventKind::Message { message_id, .. } = &mut event.kind
+    {
+        *message_id = report_id;
+    }
+    record_subagent_activity(
+        &mut journal,
+        &events,
+        parent_id,
+        &coordinator,
+        &watches,
+        report,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        event_rx.recv().await.unwrap().kind,
+        SessionEventKind::AgentMessageReceived { message_id, ref text, .. }
+            if message_id == report_id && text == "Please review this result"
+    ));
     scratch.discard().await;
 }
 

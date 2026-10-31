@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.10)
 
+- The director transcript shows subagent messages only when addressed to the director. Ordinary child replies stay in their own threads rather than appearing as received reports.
+
 - Restart shutdown parks child actors without synthesizing a human Stop or pausing their active goals. Real human pauses remain paused, so interrupted task continuation no longer wakes a worker into a contradictory paused goal.
 
 - Codex `cyber_policy` refusals show the actual provider policy block instead of `code=other` and are no longer misclassified as transient failures that retry an unchanged compaction request.
