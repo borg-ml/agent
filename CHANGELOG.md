@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.10)
 
+- Codex `cyber_policy` refusals show the actual provider policy block instead of `code=other` and are no longer misclassified as transient failures that retry an unchanged compaction request.
+
 - Failed compaction cards no longer claim “Compacted context.” Native subscription requests retain their already-redacted terminal-failure and per-attempt diagnostics in the journal.
 
 - Workspace diagnostic discovery honors Git ignore rules, so ignored scratch/build trees no longer consume the bounded scan before real project sources. Explicitly requested ignored roots still work; discovery runs off the async worker and stops when its request is cancelled.

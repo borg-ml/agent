@@ -1377,6 +1377,8 @@ fn subscription_failure_message(
         });
     let mut message = if limited {
         "Codex subscription usage or rate limit reached.".to_string()
+    } else if codes.contains(&Some("cyber_policy")) {
+        "Codex subscription request was blocked by OpenAI’s cybersecurity policy (cyber_policy). The provider refused this content; retrying the unchanged request will not resolve it.".to_string()
     } else if codes.contains(&Some("context_length_exceeded")) {
         "Codex context limit reached; compact the conversation before trying again.".to_string()
     } else if status == Some(reqwest::StatusCode::UNAUTHORIZED)
@@ -1920,7 +1922,7 @@ const KNOWN_INCOMPLETE_REASONS: [&str; 2] = ["max_output_tokens", "content_filte
 /// counted as `other`, which still shows that an unsupported item arrived
 /// without repeating whatever the backend called it.
 const KNOWN_ITEM_TYPES: [&str; 3] = ["message", "function_call", "reasoning"];
-const KNOWN_ERROR_CODES: [&str; 16] = [
+const KNOWN_ERROR_CODES: [&str; 17] = [
     "server_error",
     "internal_error",
     "service_unavailable",
@@ -1937,6 +1939,7 @@ const KNOWN_ERROR_CODES: [&str; 16] = [
     "rate_limit_exceeded",
     "insufficient_quota",
     "content_filter",
+    "cyber_policy",
 ];
 const KNOWN_ERROR_PARAMS: [&str; 15] = [
     "reasoning.effort",
@@ -3082,7 +3085,12 @@ mod tests {
                     && raw_payload.is_none()
         ));
         assert!(events.try_recv().is_err());
-        for kind in ["invalid_value", "rate_limit_exceeded", "server_error"] {
+        for kind in [
+            "invalid_value",
+            "rate_limit_exceeded",
+            "server_error",
+            "cyber_policy",
+        ] {
             let error = state
                 .event(
                     &json!({"type":"response.failed","response":{"error":{"type":kind}}}),
@@ -3094,6 +3102,18 @@ mod tests {
             let failure = error.downcast_ref::<TerminalResponseFailure>().unwrap();
             assert_eq!(failure.retryable, kind == "server_error");
             assert!(failure.message.contains(&format!("code={kind}")));
+            if kind == "cyber_policy" {
+                assert!(
+                    failure
+                        .message
+                        .contains("blocked by OpenAI’s cybersecurity policy")
+                );
+                assert!(
+                    !failure
+                        .message
+                        .contains("Provider terminal failure is retryable")
+                );
+            }
         }
         let context_error = subscription_failure_message(
             Some(&json!({"code":"context_length_exceeded"})),
@@ -3276,6 +3296,8 @@ mod tests {
             ("new_backend_error", true),
             ("invalid_value", false),
             ("invalid_value", true),
+            ("cyber_policy", false),
+            ("cyber_policy", true),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
