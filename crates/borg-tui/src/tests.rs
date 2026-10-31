@@ -13224,6 +13224,14 @@ fn failed_compaction_retains_a_terminal_failure_card() {
     assert!(compactions[0].is_terminal());
     assert!(compactions[0].is_failed());
     assert!(compactions[0].completed_at().is_some());
+    let rendered = transcript
+        .lines(160)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Compaction failed"));
+    assert!(!rendered.contains("Compacted context"));
 }
 
 /// A replay that only truncated bulk is silent; one that dropped whole messages

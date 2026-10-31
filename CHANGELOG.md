@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.10)
 
+- Failed automatic compactions stop after three turn attempts instead of spending the ten-retry connection budget, preserving history and handing blocked goals back to the human. Failed compaction cards no longer claim “Compacted context.”
+
 - Workspace diagnostic discovery honors Git ignore rules, so ignored scratch/build trees no longer consume the bounded scan before real project sources. Explicitly requested ignored roots still work; discovery runs off the async worker and stops when its request is cancelled.
 
 - Durable PostgreSQL journal appends retry bounded, server-confirmed transaction aborts from lock contention, deadlocks and serialization failures. Single events and atomic batches keep their original IDs and gap-free sequence allocation; ambiguous network/commit failures are not replayed. This prevents transient contention from losing command completion records.

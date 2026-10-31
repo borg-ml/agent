@@ -5871,6 +5871,7 @@ async fn run_agent_session_store_kernel_inner(
         let mut turn_had_side_effects = false;
         let mut retryable_provider_errors = Vec::new();
         let mut turn_reported_error = false;
+        let mut turn_compaction_failed = false;
         let mut batch_pending_after_interrupt = false;
         let mut interrupted_result = None;
         let mut generation = crate::generation_activity::GenerationActivity::new(launch.provider);
@@ -6036,6 +6037,8 @@ async fn run_agent_session_store_kernel_inner(
                             retryable_provider_errors.push(kind);
                             continue;
                         }
+                        turn_compaction_failed |= matches!(&kind, SessionEventKind::ProviderEvent { kind, .. }
+                            if kind == "context_compaction_failed");
                         turn_reported_error |= matches!(&kind, SessionEventKind::Error { .. });
                         turn_had_side_effects |= provider_event_has_side_effect(&kind);
                         if watchdog.phase() == TurnPhase::AwaitingProvider {
@@ -6282,8 +6285,13 @@ async fn run_agent_session_store_kernel_inner(
                             // The bound the status line already implies. Once this chain has spent its
                             // attempts the failure is terminal: the prompt settles failed, the goal goes
                             // back to the human, and the reason is recorded instead of counted down again.
+                            let network_retry_limit = if turn_compaction_failed {
+                                COMPACTION_RETRY_MAX_ATTEMPTS - 1
+                            } else {
+                                NETWORK_RETRY_MAX_ATTEMPTS
+                            };
                             let network_retry_exhausted =
-                                network_retry && network_retry_attempts >= NETWORK_RETRY_MAX_ATTEMPTS;
+                                network_retry && network_retry_attempts >= network_retry_limit;
                             let network_retry = network_retry && !network_retry_exhausted;
                             let retry = (network_retry || usage_limit_retry || automatic_retry_allowed(
                                 &error,
@@ -6331,8 +6339,9 @@ async fn run_agent_session_store_kernel_inner(
                             }
                             let ready_detail = if network_retry_exhausted {
                                 format!(
-                                    "Provider connection unavailable · stopped after {} retries · check connectivity or provider status, then resume · your work is saved · last error: {}",
-                                    NETWORK_RETRY_MAX_ATTEMPTS,
+                                    "{} · stopped after {} retries · check connectivity or provider status, then resume · your work is saved · last error: {}",
+                                    if turn_compaction_failed { "Context compaction failed; history preserved" } else { "Provider connection unavailable" },
+                                    network_retry_limit,
                                     compact_provider_error(&error)
                                 )
                             } else if retry {
@@ -6340,14 +6349,14 @@ async fn run_agent_session_store_kernel_inner(
                                     format!(
                                         "Codex authentication lookup unavailable · attempt {}/{} · retrying in {}s · Esc to cancel. Your work is saved.",
                                         network_retry_attempts.saturating_add(1),
-                                        NETWORK_RETRY_MAX_ATTEMPTS,
+                                        network_retry_limit,
                                         network_retry_delay.as_secs()
                                     )
                                 } else if network_retry {
                                     format!(
                                         "Provider temporarily unavailable · attempt {}/{} · retrying in {}s · Esc to cancel. Your work is saved. Last error: {}",
                                         network_retry_attempts.saturating_add(1),
-                                        NETWORK_RETRY_MAX_ATTEMPTS,
+                                        network_retry_limit,
                                         network_retry_delay.as_secs(),
                                         compact_provider_error(&error)
                                     )
@@ -6410,7 +6419,7 @@ async fn run_agent_session_store_kernel_inner(
                                     provider: launch.provider,
                                     kind: "network_retry_exhausted".into(),
                                     payload: serde_json::json!({
-                                        "attempts": NETWORK_RETRY_MAX_ATTEMPTS,
+                                        "attempts": network_retry_limit,
                                         "message_ids": prompt.batch_entries().iter().map(|entry| entry.message_id).collect::<Vec<_>>(),
                                         "error": compact_provider_error(&error),
                                     }),
@@ -6515,7 +6524,7 @@ async fn run_agent_session_store_kernel_inner(
                                         "message_ids": prompt.batch_entries().iter().map(|entry| entry.message_id).collect::<Vec<_>>(),
                                         "delay_ms": network_retry_delay.as_millis() as u64,
                                         "attempt": network_retry_attempts,
-                                        "max_attempts": NETWORK_RETRY_MAX_ATTEMPTS,
+                                        "max_attempts": network_retry_limit,
                                         "error": compact_provider_error(&error),
                                         "auth_lookup_retry": auth_lookup_failure.then_some(network_retry_attempts),
                                     }),
@@ -7941,6 +7950,8 @@ async fn run_agent_session_store_kernel_inner(
                         retryable_provider_errors.push(kind);
                         continue;
                     }
+                    turn_compaction_failed |= matches!(&kind, SessionEventKind::ProviderEvent { kind, .. }
+                        if kind == "context_compaction_failed");
                     turn_reported_error |= matches!(&kind, SessionEventKind::Error { .. });
                     turn_had_side_effects |= provider_event_has_side_effect(&kind);
                     if watchdog.phase() == TurnPhase::AwaitingProvider {

@@ -3742,7 +3742,9 @@ impl Transcript {
                     let time = display_local_time(time, &today_prefix);
                     let expandable =
                         execution.is_terminal() && compaction_has_expandable_detail(summary);
-                    let title = if execution.is_terminal() || focused_tool == Some(index) {
+                    let title = if execution.is_failed() {
+                        "Compaction failed".to_string()
+                    } else if execution.is_terminal() || focused_tool == Some(index) {
                         "Compacted context".to_string()
                     } else {
                         compact_text(summary, 180)
