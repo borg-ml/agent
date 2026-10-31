@@ -264,12 +264,7 @@ impl PostgresSessionStore {
 
     /// Append one durable event under a per-session row lock.
     async fn append_durable(&self, event: SessionEvent) -> Result<SessionEvent> {
-        let mut transaction = self.pool().begin().await?;
-        let stored = self
-            .append_durable_in_transaction(&mut transaction, event)
-            .await?;
-        transaction.commit().await?;
-        Ok(stored)
+        Ok(self.append_batch(vec![event]).await?.remove(0))
     }
 
     /// Append one durable event inside a caller-owned transaction.
@@ -1634,16 +1629,35 @@ impl SessionStore for PostgresSessionStore {
         if events.is_empty() {
             return Ok(Vec::new());
         }
-        let mut transaction = self.pool().begin().await?;
-        let mut appended = Vec::with_capacity(events.len());
-        for event in events {
-            appended.push(
-                self.append_durable_in_transaction(&mut transaction, event)
-                    .await?,
-            );
+        for attempt in 0..6 {
+            let result: Result<Vec<SessionEvent>> = async {
+                let mut transaction = self.pool().begin().await?;
+                let mut appended = Vec::with_capacity(events.len());
+                for event in &events {
+                    appended.push(
+                        self.append_durable_in_transaction(&mut transaction, event.clone())
+                            .await?,
+                    );
+                }
+                transaction.commit().await?;
+                Ok(appended)
+            }
+            .await;
+            match result {
+                Ok(appended) => return Ok(appended),
+                Err(error) => {
+                    if !super::retryable_transaction_error(&error) || attempt == 5 {
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        "retrying contended Postgres journal append"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100 << attempt)).await;
+                }
+            }
         }
-        transaction.commit().await?;
-        Ok(appended)
+        unreachable!()
     }
 
     async fn raw_event_page(
@@ -2210,6 +2224,95 @@ mod tests {
                 delivery: None,
             },
         )
+    }
+
+    // A transient row lock must not lose a completion or partially publish an atomic batch.
+    #[tokio::test]
+    async fn durable_appends_survive_transaction_lock_timeouts_without_duplicates() {
+        let url = super::super::testing::required_test_url();
+        let scratch = ScratchDatabase::create(&url).await;
+        let store = Arc::new(
+            PostgresSessionStore::connect_with_pool_size(&scratch.url, 1)
+                .await
+                .expect("connect"),
+        );
+        sqlx::query("set lock_timeout='50ms'")
+            .execute(store.pool())
+            .await
+            .expect("short contention deadline");
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.expect("session");
+        let blocker = sqlx::PgPool::connect(&scratch.url)
+            .await
+            .expect("blocker connection");
+        let other = Uuid::new_v4();
+        store.create_session(other).await.expect("other session");
+        let mut expected = HashMap::<Uuid, Vec<Uuid>>::new();
+        for count in [1, 2] {
+            let mut lock = blocker.begin().await.expect("lock transaction");
+            sqlx::query("select id from sessions where id=$1 for update")
+                .bind(session_id)
+                .fetch_one(&mut *lock)
+                .await
+                .expect("hold row");
+            let events = if count == 1 {
+                vec![message(session_id, "single")]
+            } else {
+                vec![
+                    message(other, "batch first"),
+                    message(session_id, "batch locked second"),
+                ]
+            };
+            let before = expected.clone();
+            for event in &events {
+                expected.entry(event.session_id).or_default().push(event.id);
+            }
+            let writer = store.clone();
+            let mut task = tokio::spawn(async move {
+                if count == 1 {
+                    writer
+                        .append(events.into_iter().next().unwrap())
+                        .await
+                        .map(|e| vec![e])
+                } else {
+                    writer.append_batch(events).await
+                }
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), &mut task)
+                    .await
+                    .is_err(),
+                "a rolled-back lock timeout must remain retryable"
+            );
+            for id in [session_id, other] {
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>(
+                        "select count(*) from session_events where session_id=$1"
+                    )
+                    .bind(id)
+                    .fetch_one(&mut *lock)
+                    .await
+                    .expect("atomic read"),
+                    before.get(&id).map_or(0, Vec::len) as i64
+                );
+            }
+            lock.rollback().await.expect("release row");
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect("retry deadline")
+                .expect("writer task")
+                .expect("durable append");
+        }
+        for (id, ids) in expected {
+            let events = store.read(id).await.expect("journal");
+            assert_eq!(events.iter().map(|e| e.id).collect::<Vec<_>>(), ids);
+            assert_eq!(
+                events.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+                (1..=events.len() as u64).collect::<Vec<_>>()
+            );
+        }
+        blocker.close().await;
+        scratch.discard().await;
     }
 
     #[tokio::test]

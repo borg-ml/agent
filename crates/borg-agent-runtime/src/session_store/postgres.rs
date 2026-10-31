@@ -110,6 +110,17 @@ impl std::fmt::Debug for WorkspaceStoreOverride {
     }
 }
 
+// These server errors abort the transaction. Network/unknown commit errors must not replay writes.
+fn retryable_transaction_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .and_then(sqlx::Error::as_database_error)
+            .and_then(|e| e.code())
+            .is_some_and(|code| matches!(code.as_ref(), "40P01" | "55P03" | "40001"))
+    })
+}
+
 impl PostgresSessionStore {
     /// Connect with a caller-chosen pool size.
     ///
@@ -249,15 +260,7 @@ impl PostgresSessionStore {
             match self.ensure_schema_once(&fingerprint).await {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    let transient = error.chain().any(|cause| {
-                        cause
-                            .downcast_ref::<sqlx::Error>()
-                            .and_then(sqlx::Error::as_database_error)
-                            .and_then(|error| error.code())
-                            .is_some_and(|code| {
-                                matches!(code.as_ref(), "40P01" | "55P03" | "40001")
-                            })
-                    });
+                    let transient = retryable_transaction_error(&error);
                     if !transient || attempt == 5 {
                         return Err(error);
                     }
