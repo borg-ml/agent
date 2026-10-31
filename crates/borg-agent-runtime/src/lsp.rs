@@ -1213,7 +1213,7 @@ impl LspClient {
         )
         .await
         {
-            Ok(scan) => scan,
+            Ok(scan) => scan?,
             Err(_) => return Ok(skipped_for_budget_report()),
         };
         let total = scan.paths.len();
@@ -2226,48 +2226,57 @@ struct WorkspaceDocumentScan {
     truncated: bool,
 }
 
-async fn discover_workspace_documents(root: &Path, extensions: &[&str]) -> WorkspaceDocumentScan {
-    let mut pending = vec![root.to_path_buf()];
-    let mut paths = Vec::new();
-    let mut truncated = false;
-    while let Some(directory) = pending.pop() {
-        let Ok(mut entries) = tokio::fs::read_dir(&directory).await else {
-            continue;
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type().await else {
+async fn discover_workspace_documents(
+    root: &Path,
+    extensions: &[&str],
+) -> Result<WorkspaceDocumentScan> {
+    let root = root.to_path_buf();
+    let extensions = extensions.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let cancelled = tokio_util::sync::CancellationToken::new();
+    let guard = cancelled.clone().drop_guard();
+    let scan = tokio::task::spawn_blocking(move || {
+        let mut paths = Vec::new();
+        let mut truncated = false;
+        let mut walk = ignore::WalkBuilder::new(root);
+        // An explicitly requested ignored worktree is a workspace in its own right.
+        walk.hidden(false)
+            .parents(false)
+            .require_git(false)
+            .follow_links(false)
+            .filter_entry(|entry| {
+                entry.depth() == 0
+                    || !entry.file_type().is_some_and(|t| t.is_dir())
+                    || !ignored_workspace_directory(entry.path())
+            });
+        for entry in walk.build() {
+            if cancelled.is_cancelled() {
+                break;
+            }
+            let Ok(entry) = entry else {
                 continue;
             };
-            if file_type.is_dir() {
-                if !ignored_workspace_directory(&path) {
-                    pending.push(path);
-                }
-                continue;
-            }
-            if file_type.is_file()
-                && path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| {
-                        extensions
-                            .iter()
-                            .any(|candidate| candidate.eq_ignore_ascii_case(extension))
-                    })
+            let path = entry.path();
+            if entry.file_type().is_some_and(|t| t.is_file())
+                && path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                    extensions
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(e))
+                })
             {
                 if paths.len() == MAX_WORKSPACE_DIAGNOSTIC_FILES {
                     truncated = true;
                     break;
                 }
-                paths.push(path);
+                paths.push(path.to_path_buf());
             }
         }
-        if truncated {
-            break;
-        }
-    }
-    paths.sort();
-    WorkspaceDocumentScan { paths, truncated }
+        paths.sort();
+        WorkspaceDocumentScan { paths, truncated }
+    })
+    .await
+    .context("workspace document discovery worker failed");
+    guard.disarm();
+    scan
 }
 
 fn ignored_workspace_directory(path: &Path) -> bool {
@@ -2775,12 +2784,16 @@ mod tests {
     // Nested checkout sources can consume the whole scan budget before any
     // active project source is checked. An explicit worktree root is different.
     #[tokio::test]
-    async fn workspace_discovery_excludes_nested_worktrees_but_accepts_an_explicit_one() {
+    async fn workspace_discovery_honors_git_ignores_and_explicit_roots() {
         let root = tempfile::tempdir().expect("workspace");
         let current = root.path().join("src/lib.rs");
         let worktree = root.path().join(".worktrees/archive");
         let archived = worktree.join("src/lib.rs");
-        for source in [&current, &archived] {
+        let ignored = root.path().join("tmp/archive/src/lib.rs");
+        tokio::fs::write(root.path().join(".gitignore"), "/tmp/\n")
+            .await
+            .expect("ignore rules");
+        for source in [&current, &archived, &ignored] {
             tokio::fs::create_dir_all(source.parent().expect("source parent"))
                 .await
                 .expect("source directory");
@@ -2788,11 +2801,20 @@ mod tests {
                 .await
                 .expect("source");
         }
-        let scan = discover_workspace_documents(root.path(), &["rs"]).await;
+        let scan = discover_workspace_documents(root.path(), &["rs"])
+            .await
+            .expect("scan");
         assert_eq!(scan.paths, vec![current]);
         assert!(!scan.truncated);
-        let explicit = discover_workspace_documents(&worktree, &["rs"]).await;
+        let explicit = discover_workspace_documents(&worktree, &["rs"])
+            .await
+            .expect("explicit scan");
         assert_eq!(explicit.paths, vec![archived]);
+        assert!(!explicit.truncated);
+        let explicit = discover_workspace_documents(&root.path().join("tmp/archive"), &["rs"])
+            .await
+            .expect("explicit ignored root");
+        assert_eq!(explicit.paths, vec![ignored]);
         assert!(!explicit.truncated);
     }
 
