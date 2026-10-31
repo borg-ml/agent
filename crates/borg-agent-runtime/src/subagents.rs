@@ -8781,10 +8781,14 @@ impl SubagentCoordinator {
                 .entries
                 .iter()
                 .filter_map(|(session_id, entry)| {
-                    entry
-                        .commands
-                        .clone()
-                        .map(|commands| (*session_id, commands))
+                    entry.commands.as_ref().map(|commands| {
+                        let shutdown = entry
+                            .control
+                            .as_ref()
+                            .map(|(priority, _)| priority)
+                            .unwrap_or(commands);
+                        (*session_id, shutdown.clone())
+                    })
                 })
                 .collect::<Vec<_>>()
         };
@@ -8792,8 +8796,10 @@ impl SubagentCoordinator {
             .iter()
             .map(|(session_id, _)| *session_id)
             .collect::<Vec<_>>();
-        for (session_id, _commands) in children {
-            let _ = self.stop(&session_id.to_string()).await;
+        for (session_id, commands) in children {
+            // Stop the actor, not the human's goal. The interactive stop path
+            // raises a Stop interrupt first, which durably pauses active goals.
+            let _ = commands.send(HostCommand::Stop { session_id }).await;
         }
         let mut warn_at = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {

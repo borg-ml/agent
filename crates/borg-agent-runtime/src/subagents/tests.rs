@@ -6841,7 +6841,10 @@ async fn restored_live_child_stays_dormant_and_parks_with_its_root() {
     store.create_session(root).await.unwrap();
     store.append(parent_event.clone()).await.unwrap();
     store.create_session(child_id).await.unwrap();
+    let mut goal = crate::SessionGoal::new("Finish the interrupted task".into(), None);
+    goal.tokens_used = 123;
     for kind in [
+        SessionEventKind::GoalUpdated { goal: goal.clone() },
         SessionEventKind::SessionStarted,
         SessionEventKind::SessionConfigured {
             cwd: workspace,
@@ -6866,12 +6869,20 @@ async fn restored_live_child_stays_dormant_and_parks_with_its_root() {
             .unwrap();
     }
     let session_store: Arc<dyn SessionStore> = store.clone();
+    let first_started = Arc::new(tokio::sync::Notify::new());
+    let started = first_started.notified();
+    tokio::pin!(started);
+    started.as_mut().enable();
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
         root,
         launch(),
         3,
-        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        Arc::new(ControlledPeerExecutor {
+            calls: Arc::new(AtomicUsize::new(0)),
+            first_started: first_started.clone(),
+            release_first: Arc::new(tokio::sync::Notify::new()),
+        }),
         session_store,
     )
     .unwrap();
@@ -6905,6 +6916,9 @@ async fn restored_live_child_stays_dormant_and_parks_with_its_root() {
         vec![root]
     );
     coordinator.ensure_child_actor(child_id).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .expect("the active goal starts its retained task");
     assert!(
         crate::SessionWriterLease::try_acquire(&child_path)
             .unwrap()
@@ -6918,6 +6932,20 @@ async fn restored_live_child_stays_dormant_and_parks_with_its_root() {
         other => panic!("root shutdown parks the child: {other:?}"),
     };
     assert_eq!(parked.status, SubagentStatus::Ready);
+    let parked_goal = store.state(child_id).await.unwrap().goal.unwrap();
+    assert_eq!(parked_goal.status, crate::GoalStatus::Active);
+    assert_eq!(parked_goal.id, goal.id);
+    assert_eq!(parked_goal.tokens_used, goal.tokens_used);
+    // A real pause must remain paused across a later wake and shutdown.
+    goal.status = crate::GoalStatus::Paused;
+    store
+        .append(SessionEvent::new(
+            child_id,
+            0,
+            SessionEventKind::GoalUpdated { goal: goal.clone() },
+        ))
+        .await
+        .unwrap();
     assert!(matches!(
         parked.detail.as_deref(),
         Some(PARKED_MID_TASK | PARKED_WITH_PARENT)
@@ -7002,6 +7030,10 @@ async fn restored_live_child_stays_dormant_and_parks_with_its_root() {
         "revived child owns its writer again"
     );
     coordinator.stop_all().await;
+    assert_eq!(
+        store.state(child_id).await.unwrap().goal.unwrap().status,
+        crate::GoalStatus::Paused
+    );
     scratch.discard().await;
 }
 

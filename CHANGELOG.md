@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.19.10)
 
+- Restart shutdown parks child actors without synthesizing a human Stop or pausing their active goals. Real human pauses remain paused, so interrupted task continuation no longer wakes a worker into a contradictory paused goal.
+
 - Codex `cyber_policy` refusals show the actual provider policy block instead of `code=other` and are no longer misclassified as transient failures that retry an unchanged compaction request.
 
 - Failed compaction cards no longer claim “Compacted context.” Native subscription requests retain their already-redacted terminal-failure and per-attempt diagnostics in the journal.
