@@ -3168,7 +3168,11 @@ impl ProviderModelClient {
         if let ProviderProgress::ProviderEvent { kind, payload, .. } = progress
             && matches!(
                 kind.as_str(),
-                "native_model_request" | "native_model_usage" | "native_model_transport"
+                "native_model_request"
+                    | "native_model_usage"
+                    | "native_model_transport"
+                    | "native_model_terminal_failure"
+                    | "native_model_attempt_failed"
             )
             && let Some(access) = &self.access
             && let Some(store) = &access.store

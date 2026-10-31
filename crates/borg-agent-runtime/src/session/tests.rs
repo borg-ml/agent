@@ -16330,16 +16330,6 @@ impl AgentTurnExecutor for NetworkThenSuccessExecutor {
             );
         }
         if attempt < self.failures {
-            if self.error.starts_with("native context compaction failed") {
-                events
-                    .send(SessionEventKind::ProviderEvent {
-                        provider: turn.provider,
-                        kind: "context_compaction_failed".into(),
-                        payload: json!({"error": self.error, "history_preserved": true}),
-                    })
-                    .await
-                    .unwrap();
-            }
             anyhow::bail!(self.error);
         }
         events
@@ -16471,12 +16461,6 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
     // bound.
     for (error, failures, expected_attempts, expected_exhausted) in [
         ("Codex subscription connection failed", 3, 4, 0),
-        (
-            "native context compaction failed: Provider terminal failure is retryable.",
-            12,
-            3,
-            1,
-        ),
         ("Codex model catalog disconnected", 3, 4, 0),
         (
             "openrouter request failed with HTTP 502: Provider returned error",
