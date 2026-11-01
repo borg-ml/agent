@@ -3603,7 +3603,7 @@ fn usage_screen_keeps_account_limits_and_session_usage_distinct() {
     };
 
     let limits = AccountRateLimits::Codex(limits);
-    let summary = format_usage_summary(CodingProvider::Codex, &session, Some(&limits));
+    let summary = format_usage_summary(CodingProvider::Codex, &session, Some(&limits), None);
     assert!(summary.contains("Account limits · Codex"));
     assert!(summary.contains("Weekly"));
     assert!(summary.contains("[██████████░░░░░░░░░░] 52% left"));
@@ -3614,7 +3614,7 @@ fn usage_screen_keeps_account_limits_and_session_usage_distinct() {
     assert!(summary.contains("Account allowance is reported separately"));
     assert!(!summary.contains("Session ·"));
 
-    let generic = format_usage_summary(CodingProvider::OpenRouter, &SessionUsage::default(), None);
+    let generic = format_usage_summary(CodingProvider::OpenRouter, &SessionUsage::default(), None, None);
     assert!(generic.contains("Account limits · OpenRouter"));
     assert!(generic.contains("not exposed by OpenRouter"));
     assert!(!generic.contains("Codex"));
@@ -3637,6 +3637,7 @@ fn usage_screen_keeps_account_limits_and_session_usage_distinct() {
         CodingProvider::Claude,
         &SessionUsage::default(),
         Some(&claude),
+        None,
     );
     assert!(claude_summary.contains("Account limits · Claude"));
     assert!(claude_summary.contains("[░░░░░░░░░░░░░░░░░░░░] 0% left"));

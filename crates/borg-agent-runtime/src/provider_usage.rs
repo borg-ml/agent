@@ -260,7 +260,7 @@ async fn probe_provider_usage(provider: CodingProvider) -> Option<ProviderUsage>
             .await
             .ok()
             .map(codex_provider_usage),
-        CodingProvider::Claude => borg_provider::provider::read_claude_account_rate_limits()
+        CodingProvider::Claude => borg_provider::provider::read_claude_account_rate_limits(false)
             .await
             .ok()
             .map(claude_provider_usage),

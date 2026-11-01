@@ -434,7 +434,10 @@ pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits> 
 /// are kept: a fresh read is reused briefly, and a refused refresh reports the
 /// last known values (from the endpoint or Claude's response headers) with
 /// their age instead of nothing.
-pub async fn read_claude_account_rate_limits() -> Result<ClaudeAccountRateLimits> {
+///
+/// `fresh` asks the endpoint now, for an explicit user request; otherwise the
+/// shared host-wide interval applies.
+pub async fn read_claude_account_rate_limits(fresh: bool) -> Result<ClaudeAccountRateLimits> {
     #[cfg(not(feature = "claude"))]
     {
         bail!("Claude account limits require the Claude subscription adapter")
@@ -461,14 +464,14 @@ pub async fn read_claude_account_rate_limits() -> Result<ClaudeAccountRateLimits
         let last_asked = known
             .as_ref()
             .and_then(|known| known.fetched_at.max(known.attempted_at));
-        if last_asked.is_some_and(|at| Utc::now() - at < CLAUDE_USAGE_FETCH_INTERVAL) {
+        if !fresh && last_asked.is_some_and(|at| Utc::now() - at < CLAUDE_USAGE_FETCH_INTERVAL) {
             return match known {
                 Some(known) if !known.limits.windows.is_empty() => Ok(with_plan(known.limits)),
                 _ => anyhow::bail!("Claude account limits are not known yet; Borg asks again shortly"),
             };
         }
         mark_claude_usage_attempt(&account);
-        let fresh = tokio::time::timeout(Duration::from_secs(10), async {
+        let fetched = tokio::time::timeout(Duration::from_secs(10), async {
             let usage =
                 crate::claude_subscription::usage(&access, &access.profile.identity).await?;
             // The raw endpoint uses percentages. Do not pass the fraction-valued
@@ -482,7 +485,7 @@ pub async fn read_claude_account_rate_limits() -> Result<ClaudeAccountRateLimits
         .await
         .context("timed out reading Claude account limits")
         .and_then(|result| result);
-        match (fresh, known) {
+        match (fetched, known) {
             (Ok(limits), _) => {
                 remember_claude_usage(&account, limits.clone(), true);
                 Ok(limits)

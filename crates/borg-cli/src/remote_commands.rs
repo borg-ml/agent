@@ -11061,35 +11061,32 @@ impl SessionUsage {
     }
 }
 
-/// Account limits come from the host's journaled provider usage when it has
-/// any: the host already refreshes it, and a second client-side probe of the
-/// same account endpoints is what gets throttled.
+/// An explicit `/usage` asks the provider now and waits for the answer. When
+/// it refuses, the host's journaled usage stands in, marked stale.
 async fn usage_summary(
     provider: CodingProvider,
     session: &SessionUsage,
     journaled: Option<borg_remote::ProviderUsage>,
 ) -> String {
-    if let Some(usage) = journaled.filter(|usage| !usage.windows.is_empty()) {
-        return format_usage_summary(provider, session, Some(&AccountRateLimits::Host(usage)));
-    }
-    let limits = match provider {
-        CodingProvider::Codex => match read_codex_account_rate_limits().await {
-            Ok(limits) => Some(AccountRateLimits::Codex(limits)),
-            Err(error) => {
-                tracing::debug!(%error, "Codex account limits unavailable for usage view");
-                None
-            }
-        },
-        CodingProvider::Claude => match read_claude_account_rate_limits().await {
-            Ok(limits) => Some(AccountRateLimits::Claude(limits)),
-            Err(error) => {
-                tracing::debug!(%error, "Claude account limits unavailable for usage view");
-                None
-            }
-        },
-        _ => None,
+    let fetched = match provider {
+        CodingProvider::Codex => read_codex_account_rate_limits()
+            .await
+            .map(|limits| Some(AccountRateLimits::Codex(limits))),
+        CodingProvider::Claude => read_claude_account_rate_limits(true)
+            .await
+            .map(|limits| Some(AccountRateLimits::Claude(limits))),
+        _ => Ok(None),
     };
-    format_usage_summary(provider, session, limits.as_ref())
+    let (limits, error) = match fetched {
+        Ok(limits) => (limits, None),
+        Err(error) => (
+            journaled
+                .filter(|usage| !usage.windows.is_empty())
+                .map(AccountRateLimits::Host),
+            Some(format!("{error:#}")),
+        ),
+    };
+    format_usage_summary(provider, session, limits.as_ref(), error.as_deref())
 }
 
 enum AccountRateLimits {
@@ -11102,8 +11099,10 @@ fn format_usage_summary(
     provider: CodingProvider,
     session: &SessionUsage,
     limits: Option<&AccountRateLimits>,
+    refresh_error: Option<&str>,
 ) -> String {
     let mut lines = vec![format!("Account limits · {}", provider.label())];
+    let unavailable = refresh_error.unwrap_or("Could not read current account limits.");
     match (provider, limits) {
         (CodingProvider::Codex, Some(AccountRateLimits::Codex(limits))) => {
             if let Some(plan) = limits.plan_type.as_deref() {
@@ -11168,13 +11167,16 @@ fn format_usage_summary(
             if let Some(detail) = usage.detail.as_deref() {
                 lines.push(format!("  {:<16} {detail}", ""));
             }
+            if let Some(error) = refresh_error {
+                lines.push(format!("  {:<16} last known · refresh failed: {error}", "Stale"));
+            }
         }
         (CodingProvider::Codex, None) => {
-            lines.push("  Unavailable      Could not read current account limits.".to_string());
+            lines.push(format!("  Unavailable      {unavailable}"));
             lines.push("  Details          https://chatgpt.com/codex/settings/usage".to_string());
         }
         (CodingProvider::Claude, None) => {
-            lines.push("  Unavailable      Could not read current account limits.".to_string());
+            lines.push(format!("  Unavailable      {unavailable}"));
         }
         _ => {
             lines.push(format!(

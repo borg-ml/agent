@@ -14,10 +14,10 @@ Git comparison.
   reads "ultra sub" and "Plan Ultra" rather than the Max organization type
   it is billed under.
 
-- `/usage` shows Claude and Codex account limits from the host's own usage
-  refresh instead of probing the account endpoints again from the client,
-  which Claude throttled with HTTP 429 so the view almost always read
-  "Unavailable".
+- `/usage` asks the provider for fresh account limits and waits for them.
+  When the provider refuses (Claude throttles with HTTP 429), it shows the
+  host's last known limits marked stale with the actual error, instead of a
+  bare "Could not read current account limits".
 
 - The splash screen breathes: more room under the version and between the
   composer and its hints, and the bottom line now ends with the working
