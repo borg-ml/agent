@@ -7579,6 +7579,18 @@ impl BorgTerminal {
         self.local_file_links = allowed;
     }
 
+    /// The provider's account usage as the host last journaled it.
+    pub fn provider_usage(
+        &self,
+        provider: CodingProvider,
+    ) -> Option<borg_remote::ProviderUsage> {
+        self.transcript
+            .provider_capabilities
+            .iter()
+            .find(|capability| capability.provider == provider)
+            .and_then(|capability| capability.usage.clone())
+    }
+
     pub fn set_icon_style(&mut self, style: IconStyle) {
         NERD_FONT_ICONS.store(style == IconStyle::NerdFont, Ordering::Relaxed);
         self.invalidate_transcript_render_cache();

@@ -5250,7 +5250,7 @@ async fn run_local_agent_session(
                     continue;
                 }
                 if is_usage_command(line) {
-                    let summary = usage_summary(provider, &session_usage).await;
+                    let summary = usage_summary(provider, &session_usage, None).await;
                     println!(
                         "\n  Usage\n{}\n",
                         indent_usage_summary(&summary)
@@ -7486,8 +7486,11 @@ async fn run_local_agent_session(
                                     .set_notice("Usage is still loading".to_string());
                             } else {
                                 let usage = session_usage.clone();
+                                let journaled = terminal
+                                    .as_ref()
+                                    .and_then(|terminal| terminal.provider_usage(provider));
                                 usage_summary_task = Some(tokio::spawn(async move {
-                                    usage_summary(provider, &usage).await
+                                    usage_summary(provider, &usage, journaled).await
                                 }));
                                 terminal
                                     .as_mut()
@@ -11058,7 +11061,17 @@ impl SessionUsage {
     }
 }
 
-async fn usage_summary(provider: CodingProvider, session: &SessionUsage) -> String {
+/// Account limits come from the host's journaled provider usage when it has
+/// any: the host already refreshes it, and a second client-side probe of the
+/// same account endpoints is what gets throttled.
+async fn usage_summary(
+    provider: CodingProvider,
+    session: &SessionUsage,
+    journaled: Option<borg_remote::ProviderUsage>,
+) -> String {
+    if let Some(usage) = journaled.filter(|usage| !usage.windows.is_empty()) {
+        return format_usage_summary(provider, session, Some(&AccountRateLimits::Host(usage)));
+    }
     let limits = match provider {
         CodingProvider::Codex => match read_codex_account_rate_limits().await {
             Ok(limits) => Some(AccountRateLimits::Codex(limits)),
@@ -11082,6 +11095,7 @@ async fn usage_summary(provider: CodingProvider, session: &SessionUsage) -> Stri
 enum AccountRateLimits {
     Codex(CodexAccountRateLimits),
     Claude(ClaudeAccountRateLimits),
+    Host(borg_remote::ProviderUsage),
 }
 
 fn format_usage_summary(
@@ -11120,7 +11134,12 @@ fn format_usage_summary(
                 lines.push("  No active account limit reported.".to_string());
             } else {
                 for window in &limits.windows {
-                    append_claude_rate_limit_window(&mut lines, window);
+                    append_usage_window(
+                        &mut lines,
+                        &window.label,
+                        window.used_percent,
+                        window.resets_at,
+                    );
                 }
                 if let Some(at) = limits.last_known_at {
                     lines.push(format!(
@@ -11132,6 +11151,22 @@ fn format_usage_summary(
             }
             if limits.extra_usage_available {
                 lines.push("  Extra usage      Available after plan limits.".to_string());
+            }
+        }
+        (_, Some(AccountRateLimits::Host(usage))) => {
+            if let Some(plan) = usage.plan.as_deref() {
+                lines.push(format!("  {:<16} {}", "Plan", title_case(plan)));
+            }
+            for window in &usage.windows {
+                append_usage_window(
+                    &mut lines,
+                    &window.label,
+                    window.used_percent,
+                    window.resets_at,
+                );
+            }
+            if let Some(detail) = usage.detail.as_deref() {
+                lines.push(format!("  {:<16} {detail}", ""));
             }
         }
         (CodingProvider::Codex, None) => {
@@ -11219,13 +11254,14 @@ fn append_rate_limit_window(lines: &mut Vec<String>, label: &str, window: &Codex
     }
 }
 
-fn append_claude_rate_limit_window(lines: &mut Vec<String>, window: &ClaudeRateLimitWindow) {
-    lines.push(format!(
-        "  {:<16} {}",
-        window.label,
-        rate_limit_bar(window.used_percent)
-    ));
-    if let Some(reset) = window.resets_at {
+fn append_usage_window(
+    lines: &mut Vec<String>,
+    label: &str,
+    used_percent: u8,
+    resets_at: Option<DateTime<Utc>>,
+) {
+    lines.push(format!("  {:<16} {}", label, rate_limit_bar(used_percent)));
+    if let Some(reset) = resets_at {
         lines.push(format!(
             "  {:<16} resets {}",
             "",

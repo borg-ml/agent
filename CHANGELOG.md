@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.19.11)
 
+- `/usage` shows Claude and Codex account limits from the host's own usage
+  refresh instead of probing the account endpoints again from the client,
+  which Claude throttled with HTTP 429 so the view almost always read
+  "Unavailable".
+
 - The splash screen breathes: more room under the version and between the
   composer and its hints, and the bottom line now ends with the working
   directory and Git branch.
