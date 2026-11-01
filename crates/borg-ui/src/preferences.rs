@@ -101,9 +101,10 @@ pub enum CompletionAlertPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DictationIconStyle {
+pub enum IconStyle {
     NerdFont,
-    Emoji,
+    #[serde(alias = "emoji")]
+    Unicode,
 }
 
 /// How a reply appears while it streams: a finished block at a time, or every
@@ -192,7 +193,8 @@ pub struct PresentationPreferences {
     /// Let tool and action rows wrap onto more lines; off keeps each row on one line.
     pub wrap_action_rows: bool,
     pub show_action_done_at: bool,
-    pub dictation_icon: Option<DictationIconStyle>,
+    #[serde(alias = "dictation_icon")]
+    pub icons: Option<IconStyle>,
     /// Selected managed dictation model id (e.g. "parakeet-v2"); `None` uses
     /// the built-in default.
     pub dictation_model: Option<String>,
@@ -218,7 +220,7 @@ impl Default for PresentationPreferences {
             composer_cursor_style: ComposerCursorStyle::Underline,
             wrap_action_rows: false,
             show_action_done_at: false,
-            dictation_icon: None,
+            icons: None,
             dictation_model: None,
             dictation_accelerator: None,
         }
@@ -616,7 +618,7 @@ keep = true
                 composer_cursor_style: ComposerCursorStyle::Bar,
                 wrap_action_rows: true,
                 show_action_done_at: true,
-                dictation_icon: Some(DictationIconStyle::NerdFont),
+                icons: Some(IconStyle::NerdFont),
                 dictation_model: Some("lightweight".to_string()),
                 dictation_accelerator: Some("auto".to_string()),
             },
@@ -633,7 +635,7 @@ keep = true
         let source = fs::read_to_string(path).unwrap();
         assert!(source.contains("assistant_label = \"cLaNkEr\""));
         assert!(source.contains("assistant_message_color = \"#e6edf3\""));
-        assert!(source.contains("dictation_icon = \"nerd_font\""));
+        assert!(source.contains("icons = \"nerd_font\""));
     }
 
     #[test]

@@ -42,7 +42,7 @@ fn live_tui_input_latency_under_storage_pressure() {
     .expect("disable updates in performance fixture");
     fs::write(
         config_home.join("borg/editor.toml"),
-        "[presentation]\nrefresh_rate_fps = 165\ndictation_icon = \"emoji\"\n",
+        "[presentation]\nrefresh_rate_fps = 165\nicons = \"unicode\"\n",
     )
     .expect("configure the isolated editor fixture");
 

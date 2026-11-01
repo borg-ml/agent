@@ -953,7 +953,7 @@ fn tool_kind_marker(kind: OperationKind, name: &str) -> &'static str {
     }
     match name.split(' ').next().unwrap_or(name) {
         "Read" | "List" | "View" | "Open" | "Inspect" => "≡",
-        "Search" | "Find" | "Grep" => "⌕",
+        "Search" | "Find" | "Grep" => search_icon(current_icon_style()),
         "Write" | "Edit" | "Update" | "Create" | "Delete" | "Apply" | "Rename" | "Move" => "◈",
         "Run" | "Wait" | "Send" | "Stop" | "Build" | "Test" => "›",
         _ => "✓",

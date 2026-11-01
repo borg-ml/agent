@@ -17167,7 +17167,7 @@ fn focused_subagent_composer_tints_follow_up_and_both_separator_rows() {
                 Color::DarkGray
             }
         );
-        assert!(buffer.content().iter().any(|cell| cell.symbol() == "T"));
+        assert!(buffer.content().iter().any(|cell| cell.symbol() == "R"));
     }
     // A surface tint must not override typed syntax or semantic foregrounds.
     assert_eq!(composer_surface_style(false, true).fg, None);
@@ -17179,11 +17179,11 @@ fn focused_subagent_composer_tints_follow_up_and_both_separator_rows() {
 fn active_message_placeholder_explains_both_follow_up_modes() {
     assert_eq!(
         active_message_placeholder(true),
-        "Tell Borg what to change…"
+        "Redirect the current task…"
     );
     assert_eq!(
         active_message_placeholder(false),
-        "Tell Borg what to do next…"
+        "Queue a follow-up…"
     );
 }
 

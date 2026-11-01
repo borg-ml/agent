@@ -191,7 +191,7 @@ pub(crate) struct SettingsValues {
     /// User label, user message, assistant label, assistant message.
     pub(crate) colours: [(String, Color); 4],
     pub(crate) cursor: ComposerCursorStyle,
-    pub(crate) icons: DictationIconStyle,
+    pub(crate) icons: IconStyle,
     pub(crate) running_sweeps: bool,
     pub(crate) refresh_fps: u64,
     pub(crate) notifications: CompletionAlertPolicy,
@@ -337,8 +337,8 @@ pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
     let languages = ResponseLanguage::ALL.map(ResponseLanguage::name);
     let ui_languages = UiLanguage::ALL.map(|language| ui_text(values.ui_language, language.name()));
     let refresh_labels = REFRESH_RATES.map(|fps| format!("{fps} fps"));
-    let nerd_icons = format!("Nerd Font {DICTATION_NERD_FONT_ICON}");
-    let emoji_icons = format!("Emoji {DICTATION_EMOJI_ICON}");
+    let nerd_icons = icon_set_preview(IconStyle::NerdFont);
+    let unicode_icons = icon_set_preview(IconStyle::Unicode);
     let colour = |index: usize| {
         let (hex, colour) = &values.colours[index];
         SettingControl::Colour(hex.clone(), *colour)
@@ -572,10 +572,10 @@ pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
             Id::Icons,
             Section::Appearance,
             "Icons",
-            "Pick the set that draws correctly in your terminal font. Used for the microphone and settings buttons.",
+            "Pick the set that draws correctly in your terminal font. Used for the microphone, settings and search icons.",
             choice(
-                &[nerd_icons.as_str(), emoji_icons.as_str()],
-                Some(usize::from(values.icons == DictationIconStyle::Emoji)),
+                &[nerd_icons.as_str(), unicode_icons.as_str()],
+                Some(usize::from(values.icons == IconStyle::Unicode)),
             ),
         ),
         row(
@@ -766,10 +766,10 @@ fn choice_action(row: &SettingRow, index: usize) -> Option<UiAction> {
             1 => ComposerCursorStyle::Bar,
             _ => ComposerCursorStyle::Block,
         }),
-        Id::Icons => UiAction::SetDictationIcon(if on {
-            DictationIconStyle::Emoji
+        Id::Icons => UiAction::SetIconStyle(if on {
+            IconStyle::Unicode
         } else {
-            DictationIconStyle::NerdFont
+            IconStyle::NerdFont
         }),
         Id::Animations => UiAction::SetRunningSweeps(on),
         Id::RefreshRate => UiAction::SetRefreshRate(*REFRESH_RATES.get(index)?),
@@ -2013,7 +2013,7 @@ mod tests {
                 ("#ffffff".into(), Color::White),
             ],
             cursor: ComposerCursorStyle::Bar,
-            icons: DictationIconStyle::Emoji,
+            icons: IconStyle::Unicode,
             running_sweeps: true,
             refresh_fps: 120,
             notifications: CompletionAlertPolicy::Unfocused,

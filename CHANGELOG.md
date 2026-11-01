@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.19.11)
 
+- The splash screen breathes: more room under the version and between the
+  composer and its hints, and the bottom line now ends with the working
+  directory and Git branch.
+
+- Composer placeholders say what typing does: "Describe a task or ask
+  anything…" when idle, and "Redirect the current task…" or "Queue a
+  follow-up…" while Borg works.
+
 ## 0.19.11 (2026-11-01)
 
 - The director transcript shows subagent messages only when addressed to the director. Ordinary child replies stay in their own threads rather than appearing as received reports.

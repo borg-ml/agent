@@ -115,7 +115,7 @@ it. Changes apply at once and are persisted to `editor.toml`.
 | Reply streaming | `/streaming` | `presentation.response_streaming = "paragraph"` or `"token"` |
 | Action descriptors | `/action-descriptors` | `presentation.action_descriptors = true` or `false` |
 | Running animations | `/animations` | `presentation.running_sweeps = true` or `false` |
-| Dictation icon | `/icons` | `presentation.dictation_icon = "nerd_font"` or `"emoji"` |
+| Icons | `/icons` | `presentation.icons = "nerd_font"` or `"unicode"` |
 | Transcript labels | `/user-label`, `/assistant-label` | `transcript.user_label`, `transcript.assistant_label` |
 | Transcript colors | `/colors`, `/color` | the four `transcript.*_color` values in `#RRGGBB` form |
 

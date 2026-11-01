@@ -42,6 +42,7 @@ use ratatui_image::{
     sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -62,7 +63,7 @@ use borg_remote::{
 use borg_remote::{tool_call_summary, tool_code_view};
 use borg_ui::localization::{UiLanguage, text as ui_text};
 use borg_ui::preferences::{
-    CompletionAlertPolicy, ComposerCursorStyle, DictationIconStyle, DiffExpansionPolicy,
+    CompletionAlertPolicy, ComposerCursorStyle, IconStyle, DiffExpansionPolicy,
     ResponseStreaming, ToolClickBehavior, TranscriptPreferences, parse_hex_color,
 };
 use borg_ui::timeline::tool_lifecycle_label;
@@ -170,8 +171,9 @@ const TOOL_RUN_CHROME_HEIGHT: usize = 2;
 const MIN_SCROLLBAR_THUMB_ROWS: u16 = 6;
 const TRANSCRIPT_SCROLLBAR_GUTTER_WIDTH: u16 = 2;
 const DICTATION_BUTTON_WIDTH: u16 = 6;
-const DICTATION_EMOJI_ICON: &str = "🎤";
-const DICTATION_NERD_FONT_ICON: &str = "󰍬";
+/// Whether icons use Nerd Font glyphs. Transcript rows read it while
+/// rendering; the terminal keeps it in step with its icon style.
+static NERD_FONT_ICONS: AtomicBool = AtomicBool::new(false);
 
 /// Selectable managed dictation models (value id, human label). Values mirror
 /// `borg_dictation::DictationModelId::id`; the CLI maps them back.
@@ -764,32 +766,66 @@ fn rich_terminal_supported(term: Option<&str>, borg_tui: Option<&str>) -> bool {
     !term.is_some_and(|value| matches!(value.trim(), "" | "dumb" | "unknown"))
 }
 
-pub fn dictation_icon_style_for_preference(
-    preference: Option<DictationIconStyle>,
-) -> DictationIconStyle {
-    dictation_icon_from_environment()
+pub fn icon_style_for_preference(
+    preference: Option<IconStyle>,
+) -> IconStyle {
+    icon_style_from_environment()
         .or(preference)
-        .unwrap_or(DictationIconStyle::Emoji)
+        .unwrap_or(IconStyle::Unicode)
 }
 
-fn dictation_icon_from_environment() -> Option<DictationIconStyle> {
+fn icon_style_from_environment() -> Option<IconStyle> {
     match std::env::var("BORG_TUI_NERD_FONT")
         .ok()?
         .trim()
         .to_ascii_lowercase()
         .as_str()
     {
-        "1" | "true" | "yes" | "on" => Some(DictationIconStyle::NerdFont),
-        "0" | "false" | "no" | "off" => Some(DictationIconStyle::Emoji),
+        "1" | "true" | "yes" | "on" => Some(IconStyle::NerdFont),
+        "0" | "false" | "no" | "off" => Some(IconStyle::Unicode),
         _ => None,
     }
 }
 
-fn dictation_icon(style: DictationIconStyle) -> &'static str {
+/// Every icon has a Nerd Font glyph and a fallback any terminal font draws.
+fn icon(style: IconStyle, nerd_font: &'static str, unicode: &'static str) -> &'static str {
     match style {
-        DictationIconStyle::NerdFont => DICTATION_NERD_FONT_ICON,
-        DictationIconStyle::Emoji => DICTATION_EMOJI_ICON,
+        IconStyle::NerdFont => nerd_font,
+        IconStyle::Unicode => unicode,
     }
+}
+
+fn dictation_icon(style: IconStyle) -> &'static str {
+    icon(style, "\u{f036c}", "🎤")
+}
+
+fn settings_icon(style: IconStyle) -> &'static str {
+    icon(style, "\u{f013}", "⚙")
+}
+
+fn search_icon(style: IconStyle) -> &'static str {
+    icon(style, "\u{f002}", "⌕")
+}
+
+fn current_icon_style() -> IconStyle {
+    if NERD_FONT_ICONS.load(Ordering::Relaxed) {
+        IconStyle::NerdFont
+    } else {
+        IconStyle::Unicode
+    }
+}
+
+fn icon_set_preview(style: IconStyle) -> String {
+    let name = match style {
+        IconStyle::NerdFont => "Nerd Font",
+        IconStyle::Unicode => "Unicode",
+    };
+    format!(
+        "{name} {} {} {}",
+        dictation_icon(style),
+        settings_icon(style),
+        search_icon(style)
+    )
 }
 
 pub struct TerminalIoRequest {
@@ -1052,14 +1088,14 @@ pub enum UiAction {
     SetAutoCopySelection(bool),
     SetKeyHints(bool),
     SetLunaTitlesForAllProviders(bool),
-    SetDictationIcon(DictationIconStyle),
+    SetIconStyle(IconStyle),
     /// Completes the enable-dictation flow: persist model/accelerator/icon,
     /// mark dictation enabled, and optionally begin recording (which prompts
     /// the OS for microphone access). Settings only configure; the mic starts recording.
     EnableDictation {
         model: String,
         accelerator: String,
-        icon: DictationIconStyle,
+        icon: IconStyle,
         record: bool,
     },
     ToggleDictation,
@@ -1917,7 +1953,6 @@ pub struct BorgTerminal {
     /// User label, user message, assistant label, assistant message.
     transcript_colour_hex: [String; 4],
     dictation_state: DictationState,
-    dictation_icon: DictationIconStyle,
     running_sweeps: bool,
     composer_cursor_style: ComposerCursorStyle,
     action_descriptors: bool,
@@ -2240,7 +2275,7 @@ enum PickerKind {
     LunaTitlesForAllProviders,
     DictationModel,
     DictationAccelerator,
-    DictationIcon,
+    IconStyle,
     Rewind,
     MessageActions,
     Commands,
@@ -3275,6 +3310,10 @@ impl BorgTerminal {
         // many rows the image needs. A picker that reports none keeps glyph
         // previews, which say so rather than pretending to be legible.
         transcript.set_image_cell(image_preview_cell(image_picker.as_ref()));
+        NERD_FONT_ICONS.store(
+            icon_style_for_preference(None) == IconStyle::NerdFont,
+            Ordering::Relaxed,
+        );
         Ok(Self {
             session_id,
             terminal,
@@ -3377,7 +3416,6 @@ impl BorgTerminal {
             prevent_lid_sleep: false,
             transcript_colour_hex: Default::default(),
             dictation_state: DictationState::Idle,
-            dictation_icon: dictation_icon_style_for_preference(None),
             running_sweeps: true,
             composer_cursor_style: ComposerCursorStyle::Underline,
             action_descriptors: true,
@@ -6770,7 +6808,7 @@ impl BorgTerminal {
                 colour(3, self.transcript.assistant_message_color),
             ],
             cursor: self.composer_cursor_style,
-            icons: self.dictation_icon,
+            icons: current_icon_style(),
             running_sweeps: self.running_sweeps,
             refresh_fps: self.refresh_rate_fps,
             notifications: self.completion_notifications,
@@ -6845,7 +6883,7 @@ impl BorgTerminal {
     fn draw_settings(&mut self) -> Result<()> {
         let values = self.settings_values();
         let notice = self.notice.clone();
-        let icon = settings_icon(self.dictation_icon);
+        let icon = settings_icon(current_icon_style());
         let stdout = io::stdout();
         let mut output = stdout.lock();
         execute!(
@@ -7480,21 +7518,18 @@ impl BorgTerminal {
         self.notice = Some("NVIDIA/Vulkan builds run on your GPU; Automatic uses CPU here".into());
     }
 
-    pub fn open_dictation_icon_picker(&mut self) {
+    pub fn open_icon_style_picker(&mut self) {
         let options = vec![
-            PickerOption::new(
-                format!("Nerd Font {}", DICTATION_NERD_FONT_ICON),
-                "nerd_font",
-            ),
-            PickerOption::new(format!("Emoji {}", DICTATION_EMOJI_ICON), "emoji"),
+            PickerOption::new(icon_set_preview(IconStyle::NerdFont), "nerd_font"),
+            PickerOption::new(icon_set_preview(IconStyle::Unicode), "unicode"),
         ];
-        let selected = match self.dictation_icon {
-            DictationIconStyle::NerdFont => 0,
-            DictationIconStyle::Emoji => 1,
+        let selected = match current_icon_style() {
+            IconStyle::NerdFont => 0,
+            IconStyle::Unicode => 1,
         };
         self.picker = Some(Picker {
-            kind: PickerKind::DictationIcon,
-            title: "Choose microphone icon",
+            kind: PickerKind::IconStyle,
+            title: "Choose icon set",
             options,
             selected,
             query: None,
@@ -7544,9 +7579,9 @@ impl BorgTerminal {
         self.local_file_links = allowed;
     }
 
-    pub fn set_dictation_icon(&mut self, style: DictationIconStyle) {
-        self.dictation_icon = style;
-        self.event_redraw_needed = true;
+    pub fn set_icon_style(&mut self, style: IconStyle) {
+        NERD_FONT_ICONS.store(style == IconStyle::NerdFont, Ordering::Relaxed);
+        self.invalidate_transcript_render_cache();
     }
 
     pub fn set_transcript_labels(&mut self, user: String, assistant: String) {
@@ -9495,20 +9530,20 @@ impl BorgTerminal {
                     self.open_dictation_accelerator_picker();
                 } else {
                     self.pending_dictation_accelerator = Some("auto".to_string());
-                    self.open_dictation_icon_picker();
+                    self.open_icon_style_picker();
                 }
                 UiAction::None
             }
             PickerKind::DictationAccelerator => {
                 self.pending_dictation_accelerator = Some(picker.selected_value());
-                self.open_dictation_icon_picker();
+                self.open_icon_style_picker();
                 UiAction::None
             }
-            PickerKind::DictationIcon => {
+            PickerKind::IconStyle => {
                 let icon = match picker.selected_value().as_str() {
-                    "nerd_font" => DictationIconStyle::NerdFont,
-                    "emoji" => DictationIconStyle::Emoji,
-                    _ => self.dictation_icon,
+                    "nerd_font" => IconStyle::NerdFont,
+                    "unicode" => IconStyle::Unicode,
+                    _ => current_icon_style(),
                 };
                 if self.dictation_enable_flow {
                     self.dictation_enable_flow = false;
@@ -9529,7 +9564,7 @@ impl BorgTerminal {
                         record: self.settings.is_none(),
                     }
                 } else {
-                    UiAction::SetDictationIcon(icon)
+                    UiAction::SetIconStyle(icon)
                 }
             }
             PickerKind::Goal => {
@@ -10110,7 +10145,7 @@ impl BorgTerminal {
                         active_message_placeholder(self.steer_active_turn),
                     ),
                     SessionStatus::WaitingForApproval => "Allow · Y   Deny · N",
-                    _ => ui_text(ui_language, "Tell Borg what you want…"),
+                    _ => ui_text(ui_language, "Describe a task or ask anything…"),
                 }
             };
             let style = composer_placeholder_style(
@@ -10282,7 +10317,7 @@ impl BorgTerminal {
             let (status_area, transcript_area, composer_area, footer_area) = if is_launch_screen {
                 let launch_width = composer_area_width.min(chunks[0].width);
                 let launch_height = composer_height
-                    .saturating_add(7)
+                    .saturating_add(9)
                     .saturating_add(controls_height)
                     .min(chunks[0].height);
                 let launch = Rect {
@@ -10294,8 +10329,9 @@ impl BorgTerminal {
                 let launch_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(6),
+                        Constraint::Length(7),
                         Constraint::Length(composer_height),
+                        Constraint::Length(1),
                         Constraint::Length(controls_height),
                     ])
                     .split(launch);
@@ -10315,6 +10351,7 @@ impl BorgTerminal {
                             ),
                         ]),
                         Line::from(""),
+                        Line::from(""),
                         Line::from(Span::styled(
                             ui_text(ui_language, "What are we working on?"),
                             Style::default().fg(Color::Gray),
@@ -10332,10 +10369,10 @@ impl BorgTerminal {
                         } else {
                             Alignment::Center
                         }),
-                    launch_chunks[2],
+                    launch_chunks[3],
                 );
                 if self.picker.is_none() {
-                    let label = format!(" {} Settings ", settings_icon(self.dictation_icon));
+                    let label = format!(" {} Settings ", settings_icon(current_icon_style()));
                     let screen = frame.area();
                     let width = (label.width() as u16).min(screen.width);
                     let button = Rect {
@@ -10996,7 +11033,7 @@ impl BorgTerminal {
                     height: 1,
                 };
                 let (label, color) = match dictation_state {
-                    DictationState::Idle => (dictation_icon(self.dictation_icon), BORG_ORANGE),
+                    DictationState::Idle => (dictation_icon(current_icon_style()), BORG_ORANGE),
                     DictationState::Installing => (" ...  ", Color::Yellow),
                     DictationState::Recording => ("  ■   ", Color::LightRed),
                     DictationState::Transcribing => (" ...  ", Color::Yellow),
@@ -11221,6 +11258,14 @@ impl BorgTerminal {
                     Style::default()
                         .fg(SUBAGENT_PURPLE)
                         .add_modifier(Modifier::BOLD),
+                ));
+            }
+            // The splash has no footer, so the path and branch close its one
+            // status line instead.
+            if is_launch_screen && !cwd_status.trim().is_empty() {
+                status_spans.push(Span::styled(
+                    format!("{STATUS_SEPARATOR}{}", cwd_status.trim()),
+                    Style::default().fg(Color::DarkGray),
                 ));
             }
 
@@ -11742,13 +11787,6 @@ impl BorgTerminal {
             self.git_status_area = None;
             self.git_pull_area = None;
             self.git_commit_area = None;
-            if is_launch_screen {
-                frame.render_widget(
-                    Paragraph::new(footer_metadata_line("", &cwd_status, false, footer_area.width as usize))
-                        .alignment(Alignment::Right),
-                    footer_area,
-                );
-            }
             if !is_launch_screen {
                 let footer_metadata = Some(footer_metadata_text(
                     &footer_status_text(
@@ -11828,7 +11866,7 @@ impl BorgTerminal {
                         composer_area
                             .x
                             .saturating_add(composer_area.width.saturating_sub(width) / 2),
-                        composer_area.bottom(),
+                        composer_area.bottom().saturating_add(1),
                         width,
                     )
                 } else {
@@ -17321,9 +17359,9 @@ fn composer_placeholder_style(focused_subagent: bool, needs_attention: bool) -> 
 
 fn active_message_placeholder(steer_active: bool) -> &'static str {
     if steer_active {
-        "Tell Borg what to change…"
+        "Redirect the current task…"
     } else {
-        "Tell Borg what to do next…"
+        "Queue a follow-up…"
     }
 }
 
@@ -18351,12 +18389,6 @@ const RELEASE_CHANNEL: &str = "\u{3b2}";
 /// centres as one.
 /// The gear on the splash and the settings title, in the icon set the user
 /// chose so it draws in their terminal font.
-fn settings_icon(style: DictationIconStyle) -> &'static str {
-    match style {
-        DictationIconStyle::NerdFont => "\u{f013}",
-        DictationIconStyle::Emoji => "⚙",
-    }
-}
 
 fn splash_agent_line() -> Line<'static> {
     Line::from(Span::styled("agent", Style::default().fg(Color::White)))
