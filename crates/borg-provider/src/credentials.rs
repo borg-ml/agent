@@ -79,7 +79,7 @@ struct CredentialsFile {
     keys: BTreeMap<String, String>,
 }
 
-fn credentials_dir() -> Option<PathBuf> {
+pub(crate) fn borg_dir() -> Option<PathBuf> {
     if let Some(dir) = crate::env::nonempty_var("BORG_HOME") {
         return Some(PathBuf::from(dir));
     }
@@ -89,7 +89,7 @@ fn credentials_dir() -> Option<PathBuf> {
 }
 
 fn credentials_path() -> Option<PathBuf> {
-    credentials_dir().map(|dir| dir.join("credentials.json"))
+    borg_dir().map(|dir| dir.join("credentials.json"))
 }
 
 fn read_credentials(path: &Path) -> Result<CredentialsFile> {
@@ -238,7 +238,7 @@ pub fn set_claude_subscription_config_dir(path: &Path) -> Result<PathBuf> {
 
 /// Where `borg login claude` keeps a Borg-owned Claude login.
 pub fn default_claude_subscription_config_dir() -> Option<PathBuf> {
-    credentials_dir().map(|dir| dir.join("claude"))
+    borg_dir().map(|dir| dir.join("claude"))
 }
 
 pub fn set_openai_subscription_auth_file(path: &Path) -> Result<PathBuf> {
@@ -361,7 +361,7 @@ fn lock_credentials(dir: &Path) -> Result<fs::File> {
 fn store_value(storage_key: &str, key: &str) -> Result<PathBuf> {
     let key = key.trim();
     anyhow::ensure!(!key.is_empty(), "API key cannot be empty");
-    let dir = credentials_dir().context("cannot locate a home directory for the key store")?;
+    let dir = borg_dir().context("cannot locate a home directory for the key store")?;
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     restrict_permissions(&dir, 0o700)?;
     let _lock = lock_credentials(&dir)?;

@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.19.11)
 
+- Claude usage is shared by every Borg process through
+  `~/.borg/state/claude-usage.json`, and the throttled usage endpoint is asked
+  at most once every five minutes per host instead of once a minute per
+  session. Usage from any session's response headers reaches all of them.
+
 - Claude plans show the name the account reports, so an Ultra subscription
   reads "ultra sub" and "Plan Ultra" rather than the Max organization type
   it is billed under.

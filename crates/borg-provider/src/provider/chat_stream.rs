@@ -12,6 +12,7 @@ use crate::{ProviderAuthBundle, ProviderAuthProvider, ProviderChannel};
 use anyhow::bail;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 use std::path::PathBuf;
@@ -399,7 +400,7 @@ pub struct CodexAccountRateLimits {
     pub secondary: Option<CodexRateLimitWindow>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeRateLimitWindow {
     pub label: String,
     pub used_percent: u8,
@@ -407,7 +408,7 @@ pub struct ClaudeRateLimitWindow {
     pub global: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeAccountRateLimits {
     pub subscription_type: Option<String>,
     pub rate_limits_available: bool,
@@ -447,25 +448,33 @@ pub async fn read_claude_account_rate_limits() -> Result<ClaudeAccountRateLimits
         .await
         .context("timed out reading Claude account limits")??;
         let account = access.profile.identity.subscription_id();
+        let plan = access
+            .profile
+            .plan_name
+            .clone()
+            .or_else(|| access.profile.subscription_type.clone());
+        let with_plan = |limits: ClaudeAccountRateLimits| ClaudeAccountRateLimits {
+            subscription_type: limits.subscription_type.or_else(|| plan.clone()),
+            ..limits
+        };
         let known = known_claude_usage(&account);
-        if let Some(known) = &known
-            && known
-                .fetched_at
-                .is_some_and(|at| Utc::now() - at < chrono::TimeDelta::seconds(60))
-        {
-            return Ok(known.limits.clone());
+        let last_asked = known
+            .as_ref()
+            .and_then(|known| known.fetched_at.max(known.attempted_at));
+        if last_asked.is_some_and(|at| Utc::now() - at < CLAUDE_USAGE_FETCH_INTERVAL) {
+            return match known {
+                Some(known) if !known.limits.windows.is_empty() => Ok(with_plan(known.limits)),
+                _ => anyhow::bail!("Claude account limits are not known yet; Borg asks again shortly"),
+            };
         }
+        mark_claude_usage_attempt(&account);
         let fresh = tokio::time::timeout(Duration::from_secs(10), async {
             let usage =
                 crate::claude_subscription::usage(&access, &access.profile.identity).await?;
             // The raw endpoint uses percentages. Do not pass the fraction-valued
             // normalized windows into the existing percentage UI parser.
             parse_claude_account_rate_limits(&serde_json::json!({
-                "subscription_type":access
-                    .profile
-                    .plan_name
-                    .as_ref()
-                    .or(access.profile.subscription_type.as_ref()),
+                "subscription_type":plan,
                 "rate_limits_available":true,
                 "rate_limits":usage.raw,
             }))
@@ -478,60 +487,132 @@ pub async fn read_claude_account_rate_limits() -> Result<ClaudeAccountRateLimits
                 remember_claude_usage(&account, limits.clone(), true);
                 Ok(limits)
             }
-            (Err(_), Some(known)) => Ok(ClaudeAccountRateLimits {
-                last_known_at: Some(known.updated_at),
-                ..known.limits
-            }),
-            (Err(error), None) => Err(error),
+            (Err(_), Some(known)) if !known.limits.windows.is_empty() => {
+                Ok(with_plan(ClaudeAccountRateLimits {
+                    last_known_at: Some(known.updated_at),
+                    ..known.limits
+                }))
+            }
+            (Err(error), _) => Err(error),
         }
     }
 }
 
-#[derive(Clone)]
+/// How often any Borg process on this host may ask Claude's usage endpoint.
+/// Claude throttles it hard, and every model response already carries the
+/// 5-hour and weekly utilization in its headers.
+const CLAUDE_USAGE_FETCH_INTERVAL: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
+
+/// Known usage is shared by every Borg process through one small file, so
+/// many sessions cost the endpoint one read per interval rather than one
+/// each, and usage seen in any session's response headers reaches them all.
+#[derive(Clone, Serialize, Deserialize)]
 struct KnownClaudeUsage {
     account: String,
     updated_at: DateTime<Utc>,
     /// When the usage endpoint last answered; header updates do not count.
     fetched_at: Option<DateTime<Utc>>,
+    /// When any process last asked the endpoint, whether or not it answered.
+    #[serde(default)]
+    attempted_at: Option<DateTime<Utc>>,
     limits: ClaudeAccountRateLimits,
 }
 
-static KNOWN_CLAUDE_USAGE: std::sync::Mutex<Vec<KnownClaudeUsage>> =
-    std::sync::Mutex::new(Vec::new());
+/// Serializes this process's read-modify-write of the shared file; other
+/// processes replace it atomically, so a lost update costs one refresh.
+static CLAUDE_USAGE_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn claude_usage_path() -> Option<PathBuf> {
+    if cfg!(test) {
+        return Some(
+            std::env::temp_dir().join(format!("borg-claude-usage-{}.json", std::process::id())),
+        );
+    }
+    crate::credentials::borg_dir().map(|dir| dir.join("state").join("claude-usage.json"))
+}
+
+fn load_claude_usage() -> Vec<KnownClaudeUsage> {
+    claude_usage_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
 
 fn known_claude_usage(account: &str) -> Option<KnownClaudeUsage> {
-    KNOWN_CLAUDE_USAGE
-        .lock()
-        .ok()?
-        .iter()
+    load_claude_usage()
+        .into_iter()
         .find(|known| known.account == account)
-        .cloned()
+}
+
+fn update_claude_usage(
+    account: &str,
+    update: impl FnOnce(Option<&KnownClaudeUsage>) -> KnownClaudeUsage,
+) {
+    let Some(path) = claude_usage_path() else {
+        return;
+    };
+    let _guard = CLAUDE_USAGE_FILE_LOCK.lock();
+    let mut entries = load_claude_usage();
+    let index = entries.iter().position(|entry| entry.account == account);
+    let entry = update(index.map(|index| &entries[index]));
+    match index {
+        Some(index) => entries[index] = entry,
+        None => entries.push(entry),
+    }
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let written = path
+        .parent()
+        .is_some_and(|dir| std::fs::create_dir_all(dir).is_ok())
+        && serde_json::to_vec(&entries)
+            .is_ok_and(|bytes| std::fs::write(&temporary, bytes).is_ok());
+    if written && std::fs::rename(&temporary, &path).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+}
+
+fn mark_claude_usage_attempt(account: &str) {
+    update_claude_usage(account, |previous| {
+        let now = Utc::now();
+        match previous {
+            Some(previous) => KnownClaudeUsage {
+                attempted_at: Some(now),
+                ..previous.clone()
+            },
+            None => KnownClaudeUsage {
+                account: account.to_owned(),
+                updated_at: now,
+                fetched_at: None,
+                attempted_at: Some(now),
+                limits: ClaudeAccountRateLimits {
+                    subscription_type: None,
+                    rate_limits_available: true,
+                    windows: Vec::new(),
+                    extra_usage_available: false,
+                    last_known_at: None,
+                },
+            },
+        }
+    });
 }
 
 fn remember_claude_usage(account: &str, limits: ClaudeAccountRateLimits, fetched: bool) {
-    let Ok(mut known) = KNOWN_CLAUDE_USAGE.lock() else {
-        return;
-    };
-    let now = Utc::now();
-    let previous = known.iter().position(|entry| entry.account == account);
-    let fetched_at = if fetched {
-        Some(now)
-    } else {
-        previous.and_then(|index| known[index].fetched_at)
-    };
-    let entry = KnownClaudeUsage {
-        account: account.to_owned(),
-        updated_at: now,
-        fetched_at,
-        limits: ClaudeAccountRateLimits {
-            last_known_at: None,
-            ..limits
-        },
-    };
-    match previous {
-        Some(index) => known[index] = entry,
-        None => known.push(entry),
-    }
+    update_claude_usage(account, |previous| {
+        let now = Utc::now();
+        KnownClaudeUsage {
+            account: account.to_owned(),
+            updated_at: now,
+            fetched_at: if fetched {
+                Some(now)
+            } else {
+                previous.and_then(|previous| previous.fetched_at)
+            },
+            attempted_at: previous.and_then(|previous| previous.attempted_at),
+            limits: ClaudeAccountRateLimits {
+                last_known_at: None,
+                ..limits
+            },
+        }
+    });
 }
 
 /// Update an account's known usage from the unified rate-limit headers Claude
