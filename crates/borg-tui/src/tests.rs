@@ -17181,10 +17181,7 @@ fn active_message_placeholder_explains_both_follow_up_modes() {
         active_message_placeholder(true),
         "Redirect the current task…"
     );
-    assert_eq!(
-        active_message_placeholder(false),
-        "Queue a follow-up…"
-    );
+    assert_eq!(active_message_placeholder(false), "Queue a follow-up…");
 }
 
 #[test]

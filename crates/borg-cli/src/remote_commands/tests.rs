@@ -1,4 +1,5 @@
 use super::*;
+use borg_provider::provider::ClaudeRateLimitWindow;
 use borg_remote::session_store::postgres::PostgresSessionStore;
 use std::io::Read as _;
 use std::time::{Duration, Instant};
@@ -3614,7 +3615,12 @@ fn usage_screen_keeps_account_limits_and_session_usage_distinct() {
     assert!(summary.contains("Account allowance is reported separately"));
     assert!(!summary.contains("Session ·"));
 
-    let generic = format_usage_summary(CodingProvider::OpenRouter, &SessionUsage::default(), None, None);
+    let generic = format_usage_summary(
+        CodingProvider::OpenRouter,
+        &SessionUsage::default(),
+        None,
+        None,
+    );
     assert!(generic.contains("Account limits · OpenRouter"));
     assert!(generic.contains("not exposed by OpenRouter"));
     assert!(!generic.contains("Codex"));

@@ -11,7 +11,7 @@ use std::sync::{
 
 use anyhow::{Context, Result, ensure};
 use borg_provider::provider::{
-    ClaudeAccountRateLimits, ClaudeRateLimitWindow, CodexAccountRateLimits, CodexRateLimitWindow,
+    ClaudeAccountRateLimits, CodexAccountRateLimits, CodexRateLimitWindow,
     read_claude_account_rate_limits, read_codex_account_rate_limits,
 };
 use borg_remote::{
@@ -45,14 +45,13 @@ use crate::dictation::{
     LocalDictationRecorder, ensure_backend, parakeet_is_installed,
 };
 use crate::editor_preferences::{
-    ActiveMessageBehavior, CompletionAlertPolicy, ComposerCursorStyle, IconStyle,
-    DiffExpansionPolicy, EditorPreferences, LidSleepSetup, ResponseStreaming, ToolClickBehavior,
+    ActiveMessageBehavior, CompletionAlertPolicy, ComposerCursorStyle, DiffExpansionPolicy,
+    EditorPreferences, IconStyle, LidSleepSetup, ResponseStreaming, ToolClickBehavior,
 };
 use crate::sleep_inhibitor::{LidSleepStatus, SleepInhibitor, authorize_lid_sleep};
 use crate::terminal_ui::{
     BorgTerminal, DictationState, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent,
-    UiAction, icon_style_for_preference, discard_pending_terminal_input,
-    spawn_terminal_io_worker,
+    UiAction, discard_pending_terminal_input, icon_style_for_preference, spawn_terminal_io_worker,
 };
 use borg_ui::localization::UiLanguage;
 
@@ -3161,8 +3160,7 @@ async fn run_local_agent_session(
                 },
             ));
         }
-        let icon =
-            icon_style_for_preference(editor_preferences.presentation.icons);
+        let icon = icon_style_for_preference(editor_preferences.presentation.icons);
         terminal.set_icon_style(icon);
         // The mic icon is now chosen inside the enable-dictation flow rather
         // than in a picker forced open on first boot.
@@ -11168,7 +11166,10 @@ fn format_usage_summary(
                 lines.push(format!("  {:<16} {detail}", ""));
             }
             if let Some(error) = refresh_error {
-                lines.push(format!("  {:<16} last known · refresh failed: {error}", "Stale"));
+                lines.push(format!(
+                    "  {:<16} last known · refresh failed: {error}",
+                    "Stale"
+                ));
             }
         }
         (CodingProvider::Codex, None) => {

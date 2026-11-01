@@ -467,7 +467,9 @@ pub async fn read_claude_account_rate_limits(fresh: bool) -> Result<ClaudeAccoun
         if !fresh && last_asked.is_some_and(|at| Utc::now() - at < CLAUDE_USAGE_FETCH_INTERVAL) {
             return match known {
                 Some(known) if !known.limits.windows.is_empty() => Ok(with_plan(known.limits)),
-                _ => anyhow::bail!("Claude account limits are not known yet; Borg asks again shortly"),
+                _ => anyhow::bail!(
+                    "Claude account limits are not known yet; Borg asks again shortly"
+                ),
             };
         }
         mark_claude_usage_attempt(&account);

@@ -63,8 +63,8 @@ use borg_remote::{
 use borg_remote::{tool_call_summary, tool_code_view};
 use borg_ui::localization::{UiLanguage, text as ui_text};
 use borg_ui::preferences::{
-    CompletionAlertPolicy, ComposerCursorStyle, IconStyle, DiffExpansionPolicy,
-    ResponseStreaming, ToolClickBehavior, TranscriptPreferences, parse_hex_color,
+    CompletionAlertPolicy, ComposerCursorStyle, DiffExpansionPolicy, IconStyle, ResponseStreaming,
+    ToolClickBehavior, TranscriptPreferences, parse_hex_color,
 };
 use borg_ui::timeline::tool_lifecycle_label;
 use chrono::{DateTime, Local, NaiveDate, Utc};
@@ -766,9 +766,7 @@ fn rich_terminal_supported(term: Option<&str>, borg_tui: Option<&str>) -> bool {
     !term.is_some_and(|value| matches!(value.trim(), "" | "dumb" | "unknown"))
 }
 
-pub fn icon_style_for_preference(
-    preference: Option<IconStyle>,
-) -> IconStyle {
+pub fn icon_style_for_preference(preference: Option<IconStyle>) -> IconStyle {
     icon_style_from_environment()
         .or(preference)
         .unwrap_or(IconStyle::Unicode)
@@ -7580,10 +7578,7 @@ impl BorgTerminal {
     }
 
     /// The provider's account usage as the host last journaled it.
-    pub fn provider_usage(
-        &self,
-        provider: CodingProvider,
-    ) -> Option<borg_remote::ProviderUsage> {
+    pub fn provider_usage(&self, provider: CodingProvider) -> Option<borg_remote::ProviderUsage> {
         self.transcript
             .provider_capabilities
             .iter()
@@ -18401,9 +18396,6 @@ const RELEASE_CHANNEL: &str = "\u{3b2}";
 /// `agent` beneath it says "Borg agent" as a name rather than as two pieces of
 /// branding. Five columns, odd like the other three lines, so the block still
 /// centres as one.
-/// The gear on the splash and the settings title, in the icon set the user
-/// chose so it draws in their terminal font.
-
 fn splash_agent_line() -> Line<'static> {
     Line::from(Span::styled("agent", Style::default().fg(Color::White)))
 }
