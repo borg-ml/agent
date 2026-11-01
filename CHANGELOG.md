@@ -9,9 +9,9 @@ Git comparison.
   composer and its hints, and the bottom line now ends with the working
   directory and Git branch.
 
-- Composer placeholders say what typing does: "Describe a task or ask
-  anything…" when idle, and "Redirect the current task…" or "Queue a
-  follow-up…" while Borg works.
+- The splash composer is blank under "What are we working on?"; elsewhere
+  placeholders say what typing does: "Message Borg…" when idle, and
+  "Redirect the current task…" or "Queue a follow-up…" while Borg works.
 
 - One Icons setting (`presentation.icons = "nerd_font"` or `"unicode"`) now
   drives every icon: microphone, settings and the search marker on action

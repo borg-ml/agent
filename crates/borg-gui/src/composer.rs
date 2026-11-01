@@ -606,7 +606,7 @@ impl Element for ComposerElement {
         let style = window.text_style();
         let (display, color) = if content.is_empty() {
             (
-                SharedString::from("Describe a task or ask anything…"),
+                SharedString::from("Message Borg…"),
                 hsla(0., 0., 0.62, 0.65),
             )
         } else if input.secret {

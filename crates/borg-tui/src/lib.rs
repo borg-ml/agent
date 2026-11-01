@@ -10145,7 +10145,9 @@ impl BorgTerminal {
                         active_message_placeholder(self.steer_active_turn),
                     ),
                     SessionStatus::WaitingForApproval => "Allow · Y   Deny · N",
-                    _ => ui_text(ui_language, "Describe a task or ask anything…"),
+                    // The splash already asks "What are we working on?".
+                    _ if is_launch_screen => "",
+                    _ => ui_text(ui_language, "Message Borg…"),
                 }
             };
             let style = composer_placeholder_style(
