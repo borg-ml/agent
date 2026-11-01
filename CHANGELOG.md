@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.19.10)
+## Unreleased (since 0.19.11)
+
+## 0.19.11 (2026-11-01)
 
 - The director transcript shows subagent messages only when addressed to the director. Ordinary child replies stay in their own threads rather than appearing as received reports.
 
