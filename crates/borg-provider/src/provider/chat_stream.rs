@@ -461,7 +461,11 @@ pub async fn read_claude_account_rate_limits() -> Result<ClaudeAccountRateLimits
             // The raw endpoint uses percentages. Do not pass the fraction-valued
             // normalized windows into the existing percentage UI parser.
             parse_claude_account_rate_limits(&serde_json::json!({
-                "subscription_type":access.profile.subscription_type,
+                "subscription_type":access
+                    .profile
+                    .plan_name
+                    .as_ref()
+                    .or(access.profile.subscription_type.as_ref()),
                 "rate_limits_available":true,
                 "rate_limits":usage.raw,
             }))

@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.19.11)
 
+- Claude plans show the name the account reports, so an Ultra subscription
+  reads "ultra sub" and "Plan Ultra" rather than the Max organization type
+  it is billed under.
+
 - `/usage` shows Claude and Codex account limits from the host's own usage
   refresh instead of probing the account endpoints again from the client,
   which Claude throttled with HTTP 429 so the view almost always read

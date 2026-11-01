@@ -126,6 +126,9 @@ pub struct SubscriptionProfile {
     pub email: Option<String>,
     pub subscription_type: Option<String>,
     pub rate_limit_tier: Option<String>,
+    /// The plan's marketed name ("Ultra"), which can outrun the
+    /// organization type it is billed under (`claude_max`).
+    pub plan_name: Option<String>,
     /// Includes billing type, seat/trial/extra-usage entitlements without guessing a plan.
     pub raw: Value,
 }
@@ -152,6 +155,7 @@ impl SubscriptionProfile {
             email: optional_string(&account["email"]),
             subscription_type: kind,
             rate_limit_tier: optional_string(&org["rate_limit_tier"]),
+            plan_name: optional_string(&org["plan_display_name"]),
             raw,
         };
         ensure!(
