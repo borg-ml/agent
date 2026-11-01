@@ -13,6 +13,11 @@ Git comparison.
   anything…" when idle, and "Redirect the current task…" or "Queue a
   follow-up…" while Borg works.
 
+- One Icons setting (`presentation.icons = "nerd_font"` or `"unicode"`) now
+  drives every icon: microphone, settings and the search marker on action
+  rows, which uses the Nerd Font magnifier instead of relying on font
+  fallback for `⌕`. Existing `dictation_icon` / `"emoji"` settings still load.
+
 ## 0.19.11 (2026-11-01)
 
 - The director transcript shows subagent messages only when addressed to the director. Ordinary child replies stay in their own threads rather than appearing as received reports.
