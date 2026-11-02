@@ -18,7 +18,7 @@ borg-provider = { path = "../borg-provider" }
 borg-remote = { path = "../borg-remote", default-features = false }
 chrono.workspace = true
 dirs.workspace = true
-pulldown-cmark = "0.13"
+pulldown-cmark = "0.13.6"
 serde.workspace = true
 serde_ignored.workspace = true
 serde_json.workspace = true

@@ -25,7 +25,7 @@ chrono.workspace = true
 crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
 futures-util = "0.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
-pulldown-cmark = "0.13"
+pulldown-cmark = "0.13.6"
 qrcode = { version = "0.14.1", default-features = false }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "macros", "underline-color"] }
 ratatui-image = { version = "11.0.8", default-features = false, features = ["crossterm"] }
