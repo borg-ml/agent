@@ -183,7 +183,15 @@ impl SubagentCoordinator {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    let reason = if input_waiting(&input) && !reported.swap(true, Ordering::AcqRel) { "input_pending" } else { "cancelled" };
+                    // The harness ends a wait when input reaches the turn, so a
+                    // cancel with input waiting is that input, even input an
+                    // earlier wait already reported and that is still unfolded.
+                    let reason = if input_waiting(&input) {
+                        reported.store(true, Ordering::Release);
+                        "input_pending"
+                    } else {
+                        "cancelled"
+                    };
                     let unseen = self.unseen(actor).await?;
                     return self.report(actor, reason, unseen, started).await;
                 }

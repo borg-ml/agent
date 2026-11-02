@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.19.12)
 
+- A message you send while the agent waits on its subagents reaches it right
+  away. A blocking `wait_agent` could hold it as pending input for up to the
+  wait's 30 minutes when an earlier teammate message was still waiting to be
+  folded in. Input that reaches the turn during a wait, or is already waiting
+  for the model when one starts, now ends it, and the input is handed to the
+  model right after.
+
 - Replies from an `ultrathink` turn are labeled with the effort they actually
   ran at (xhigh), not the session's setting, and the GUI composer also says
   "Deeper reasoning requested for this turn".

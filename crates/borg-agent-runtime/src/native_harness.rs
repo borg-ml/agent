@@ -1770,6 +1770,10 @@ impl NativeHarness {
                                     &events,
                                     &mut controls,
                                     &mut usage,
+                                    queued_steer
+                                        .iter()
+                                        .chain(&pending_steer)
+                                        .any(|steer| !steer.admission.is_recalled()),
                                 )
                                 .await?
                             }
@@ -4490,6 +4494,7 @@ async fn execute_tool(
     events: &mpsc::Sender<SessionEventKind>,
     controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
     usage: &mut ProviderCallUsage,
+    input_parked: bool,
 ) -> Result<(String, bool, Vec<CapturedSteer>)> {
     // Team reports and Borg's own notices wait for this call; only a person's
     // redirect skips tools that have not started.
@@ -4725,7 +4730,14 @@ async fn execute_tool(
         tool_call.function.name.as_str(),
         "exec" | "exec_command" | "runtime_exec"
     );
+    // A wait exists to hand the model the next thing to act on, so any input
+    // that reaches the turn ends it and folds in right after: a person's
+    // message, or a teammate's, must not sit behind a 30-minute wait.
+    let ends_on_input = tool_call.function.name == "wait_agent"
+        || (tool_call.function.name == "capability"
+            && input.get("name").and_then(Value::as_str) == Some("wait_agent"));
     let call_cancel = (effectful_batch
+        || ends_on_input
         || matches!(
             tool_call.function.name.as_str(),
             "run_workflow"
@@ -4738,6 +4750,17 @@ async fn execute_tool(
                 | "watch"
         ))
     .then(CancellationToken::new);
+    // Input already held for the model (parked while it generated, or caught
+    // just above) is what a wait would wait for: it reports at once instead.
+    if ends_on_input
+        && (input_parked
+            || carried
+                .iter()
+                .any(|steer: &CapturedSteer| !steer.admission.is_recalled()))
+        && let Some(cancel) = &call_cancel
+    {
+        cancel.cancel();
+    }
     let call = runtime.call_action(
         &tool_call.id,
         &tool_call.function.name,
@@ -4745,11 +4768,15 @@ async fn execute_tool(
         workflow_approved,
         call_cancel.clone(),
     );
-    let (output, is_error, mut steers) =
-        await_tool_with_controls(call, call_cancel, !effectful_batch, controls, || {
-            runtime.agent_tools.background_action(&tool_call.id)
-        })
-        .await?;
+    let (output, is_error, mut steers) = await_tool_with_controls(
+        call,
+        call_cancel,
+        !effectful_batch,
+        ends_on_input,
+        controls,
+        || runtime.agent_tools.background_action(&tool_call.id),
+    )
+    .await?;
     carried.append(&mut steers);
     Ok((output, is_error, carried))
 }
@@ -4758,6 +4785,7 @@ async fn await_tool_with_controls(
     call: impl std::future::Future<Output = Result<Value>>,
     call_cancel: Option<CancellationToken>,
     cancel_on_steer: bool,
+    ends_on_input: bool,
     controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
     background_on_steer: impl Fn(),
 ) -> Result<(String, bool, Vec<CapturedSteer>)> {
@@ -4809,7 +4837,9 @@ async fn await_tool_with_controls(
                     let Some(captured) = CapturedSteer::from_control(control) else {
                         continue;
                     };
-                    if !captured.admission.is_recalled() && (captured.human || captured.preempt) {
+                    if !captured.admission.is_recalled()
+                        && (captured.human || captured.preempt || ends_on_input)
+                    {
                         if cancel_on_steer {
                             if let Some(cancel) = &call_cancel {
                                 cancel.cancel();
@@ -7586,6 +7616,7 @@ mod tests {
                 },
                 Some(call_cancel),
                 false,
+                false,
                 &mut None,
                 || {},
             )
@@ -7604,6 +7635,7 @@ mod tests {
             async { Ok(json!({"running":true,"session_id":"owned-command"})) },
             Some(cancel.clone()),
             false,
+            false,
             &mut None,
             || {},
         )
@@ -7619,6 +7651,7 @@ mod tests {
         let (_, is_error, _) = await_tool_with_controls(
             async { bail!("tool failed") },
             Some(cancel.clone()),
+            false,
             false,
             &mut None,
             || {},
@@ -7717,6 +7750,7 @@ mod tests {
                     &events_tx,
                     &mut Some(control_rx),
                     &mut ProviderCallUsage::default(),
+                    false,
                 )
                 .await
             });
@@ -7837,6 +7871,7 @@ mod tests {
                     &events_tx,
                     &mut Some(control_rx),
                     &mut ProviderCallUsage::default(),
+                    false,
                 )
                 .await
             });
@@ -7979,6 +8014,7 @@ mod tests {
                 call,
                 Some(cancel.clone()),
                 false,
+                false,
                 &mut controls,
                 || watches.background_action("blocking-action"),
             ));
@@ -8057,6 +8093,7 @@ mod tests {
                 async { Ok(finish_rx.await?) },
                 Some(call_cancel),
                 false,
+                false,
                 &mut Some(control_rx),
                 || {},
             )
@@ -8132,6 +8169,7 @@ mod tests {
                     async { Ok(finish_rx.await?) },
                     Some(call_cancel),
                     true,
+                    false,
                     &mut Some(control_rx),
                     || {},
                 )
@@ -13421,7 +13459,7 @@ mod tests {
             Ok(json!({ "reason": "input_pending" }))
         };
         let (output, is_error, captured) =
-            await_tool_with_controls(call, None, false, &mut controls, || {})
+            await_tool_with_controls(call, None, false, false, &mut controls, || {})
                 .await
                 .unwrap();
         assert_eq!(
@@ -13444,6 +13482,55 @@ mod tests {
         assert!(steer.human);
         confirm_steers(acks);
         assert!(acked.await.unwrap().is_ok());
+    }
+
+    /// A wait that does not wake on its own -- its input already reported, or
+    /// a teammate's message -- must still end when a steer reaches the turn:
+    /// the steer folds in only after the call returns, and a wait can run for
+    /// 30 minutes. A person's message must never sit behind it.
+    #[tokio::test]
+    async fn a_running_wait_ends_on_any_steer_and_hands_it_over() {
+        for human in [true, false] {
+            let (tx, rx) = mpsc::channel(1);
+            let mut controls = Some(rx);
+            let cancel = CancellationToken::new();
+            let wait = cancel.clone();
+            let (ack, _acked) = tokio::sync::oneshot::channel();
+            tx.send(AgentTurnControl::Steer {
+                message_id: Uuid::new_v4(),
+                text: "game crashed, fix in foreground".into(),
+                attachments: Vec::new(),
+                admission: borg_provider::provider::SteerAdmission::pending(),
+                preempt: false,
+                human,
+                ack,
+            })
+            .await
+            .unwrap();
+            let (output, is_error, captured) = tokio::time::timeout(
+                Duration::from_secs(5),
+                await_tool_with_controls(
+                    async move {
+                        wait.cancelled().await;
+                        Ok(json!({ "reason": "input_pending" }))
+                    },
+                    Some(cancel),
+                    true,
+                    true,
+                    &mut controls,
+                    || {},
+                ),
+            )
+            .await
+            .expect("a steer must end the wait")
+            .unwrap();
+            assert!(!is_error);
+            assert_eq!(
+                serde_json::from_str::<Value>(&output).unwrap()["reason"],
+                "input_pending"
+            );
+            assert_eq!(captured.len(), 1, "the steer folds in right after the wait");
+        }
     }
 
     type SteerAckReceiver = tokio::sync::oneshot::Receiver<std::result::Result<(), String>>;
