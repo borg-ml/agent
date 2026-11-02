@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.20.1)
+## Unreleased (since 0.20.2)
+
+## 0.20.2 (2026-11-02)
 
 - Fix the release Clippy check failing on the size of stored Claude message-thread
   state, without changing the saved conversation format.
