@@ -4431,6 +4431,26 @@ impl BorgTerminal {
         self.transcript.has_running_tool()
     }
 
+    /// Where the draft says `ultrathink` and the session's Claude model will
+    /// honour it. Elsewhere the word is plain text, so it is not colored.
+    fn composer_ultrathink(&self) -> Vec<std::ops::Range<usize>> {
+        self.transcript
+            .config
+            .as_ref()
+            .map(|config| {
+                borg_ui::ultrathink::ranges(
+                    config.provider,
+                    config.model.as_deref(),
+                    &self.composer.text,
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn has_ultrathink_animation(&self) -> bool {
+        self.running_sweeps && !self.composer_ultrathink().is_empty()
+    }
+
     pub fn running_tool_timer_refresh_due(&mut self) -> bool {
         let tick = self.transcript.running_tool_timer_tick_at(Utc::now());
         let due = tick.is_some() && tick != self.last_tool_timer_refresh_tick;
@@ -10033,6 +10053,7 @@ impl BorgTerminal {
             )
         };
         let keybindings_hint = format!("keybindings {}", self.keymap.label(KeyAction::Keybindings));
+        let ultrathink = self.composer_ultrathink();
         let copy_notice_active = notice.as_deref().is_some_and(is_copy_notice);
         let copy_notice_text = notice.clone().filter(|_| copy_notice_active);
         let notice_style = if copy_notice_active {
@@ -10058,6 +10079,11 @@ impl BorgTerminal {
                 } else {
                     vec![Line::from(Span::styled(notice, notice_style))]
                 }
+            } else if !ultrathink.is_empty() {
+                vec![Line::from(Span::styled(
+                    borg_ui::ultrathink::HINT,
+                    Style::default().fg(Color::Gray),
+                ))]
             } else if let Some(guidance) = cold_cache_guidance {
                 wrap_display(&guidance, content_width.saturating_sub(2).max(1) as usize)
                     .into_iter()
@@ -10171,6 +10197,16 @@ impl BorgTerminal {
             self.composer
                 .styled_lines_for_ranges(&composer_ranges, prompt_marker)
         };
+        if self.picker.is_none() && !pending_provider_interaction_secret {
+            apply_ultrathink_rainbow(
+                &mut composer_render_lines,
+                &composer_display_text,
+                &composer_ranges,
+                UnicodeWidthStr::width(prompt_marker),
+                &ultrathink,
+                self.running_sweeps.then(ultrathink_shimmer_phase),
+            );
+        }
         if self.picker.is_none()
             && !pending_provider_interaction_secret
             && let Some(selection) = self.composer_selection
@@ -19084,6 +19120,56 @@ fn apply_running_status_shimmer(spans: &mut Vec<Span<'static>>, phase: u128) {
     }
     spans.clear();
     spans.extend(animated);
+}
+
+fn ultrathink_shimmer_phase() -> u128 {
+    RUNNING_SHIMMER_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        % borg_ui::ultrathink::SHIMMER_INTERVAL_MILLIS
+}
+
+/// Claude Code's rainbow on a live `ultrathink`: one color per letter, with a
+/// lighter crest sweeping across it while animations run.
+fn apply_ultrathink_rainbow(
+    lines: &mut [Line<'static>],
+    value: &str,
+    ranges: &[(usize, usize)],
+    prompt_width: usize,
+    keywords: &[std::ops::Range<usize>],
+    phase: Option<u128>,
+) {
+    for keyword in keywords {
+        let letters = value[keyword.clone()].chars().count();
+        for (row, (line_start, line_end)) in ranges.iter().copied().enumerate() {
+            let (start, end) = (keyword.start.max(line_start), keyword.end.min(line_end));
+            let Some(line) = lines.get_mut(row).filter(|_| start < end) else {
+                continue;
+            };
+            let from = prompt_width + UnicodeWidthStr::width(&value[line_start..start]);
+            let to = prompt_width + UnicodeWidthStr::width(&value[line_start..end]);
+            let first_letter = value[keyword.start..start].chars().count();
+            let mut column = 0usize;
+            let mut spans = Vec::with_capacity(line.spans.len() + letters);
+            for span in &line.spans {
+                for grapheme in span.content.graphemes(true) {
+                    let style = if (from..to).contains(&column) {
+                        let letter = first_letter + (column - from);
+                        let (red, green, blue) = borg_ui::ultrathink::color(letter, letters, phase);
+                        span.style
+                            .fg(Color::Rgb(red, green, blue))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        span.style
+                    };
+                    spans.push(Span::styled(grapheme.to_string(), style));
+                    column = column.saturating_add(grapheme.width());
+                }
+            }
+            line.spans = spans;
+        }
+    }
 }
 
 /// Salmon at rest, sweeping through orange to gold at the crest.

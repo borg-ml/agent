@@ -761,6 +761,8 @@ impl NativeHarness {
             .model
             .clone()
             .context("native provider sessions require an explicit model")?;
+        // `ultrathink` raises only this turn; the session keeps its own effort.
+        let session_effort = turn.effort.clone();
         if self.execution_provider_explicit {
             turn.agent_tools
                 .configure_execution_provider(self.execution_provider.clone());
@@ -860,6 +862,10 @@ impl NativeHarness {
         let user_message = native_user_message(&turn.cwd, &turn.prompt, &turn.attachments).await?;
         record_native_message(&events, turn.provider, &user_message).await?;
         messages.push(user_message);
+        if turn.answers_human {
+            let typed = turn.prompt_delta.clone();
+            apply_ultrathink(&mut turn, &model, &typed, &events, &mut messages).await?;
+        }
         // One message each, as before. Admission is taken per steer and only
         // confirmed once that steer's message is recorded.
         for captured in steers {
@@ -870,6 +876,9 @@ impl NativeHarness {
             record_folded_steer(&events, turn.provider, None, &message, &steer).await?;
             messages.push(message);
             confirm_steers(acks);
+            if steer.human {
+                apply_ultrathink(&mut turn, &model, &steer.text, &events, &mut messages).await?;
+            }
         }
         // Runtime context that varies between turns (usage percentages, MCP
         // availability, harness state) trails the prompt instead of sitting in
@@ -1027,7 +1036,7 @@ impl NativeHarness {
             if let Some(store) = turn.agent_tools.session_store()
                 && let Some(config) = store.state(turn.session_id).await?.configuration
                 && config.provider == turn.provider && config.model.as_deref() == Some(model.as_str())
-                && config.effort == turn.effort
+                && config.effort == session_effort
             {
                 request_template.fast = config.fast;
                 request_template.ultrafast = config.ultrafast;
@@ -1150,6 +1159,8 @@ impl NativeHarness {
                     if steer.human {
                         reply_owed = true;
                         reply_round_spent = false;
+                        apply_ultrathink(&mut turn, &model, &steer.text, &events, &mut messages)
+                            .await?;
                     }
                     parked_reply_unsent_tokens = None;
                     // A human spoke, which is what makes a parked wait
@@ -1451,6 +1462,8 @@ impl NativeHarness {
                     if steer.human {
                         reply_owed = true;
                         reply_round_spent = false;
+                        apply_ultrathink(&mut turn, &model, &steer.text, &events, &mut messages)
+                            .await?;
                     }
                     truncated_text.clear();
                     assistant_message_id = Uuid::new_v4();
@@ -1787,6 +1800,10 @@ impl NativeHarness {
                 canonicalize_native_messages(&mut messages);
                 // Journaled and named to the session, so it is consumed now.
                 confirm_steers(acks);
+                if steer.human {
+                    apply_ultrathink(&mut turn, &model, &steer.text, &events, &mut messages)
+                        .await?;
+                }
             }
             if let Some(system_override) = editor.apply_pending(&mut messages).await {
                 canonicalize_native_messages(&mut messages);
@@ -1857,6 +1874,14 @@ impl NativeHarness {
                         if steer.human {
                             reply_owed = true;
                             reply_round_spent = false;
+                            apply_ultrathink(
+                                &mut turn,
+                                &model,
+                                &steer.text,
+                                &events,
+                                &mut messages,
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -5089,6 +5114,29 @@ fn skipped_tool_result() -> (String, bool) {
         json!({"error": "Tool not executed: cancelled after user steering."}).to_string(),
         true,
     )
+}
+
+/// Claude Code's `ultrathink`: a person who types the keyword gets the rest of
+/// the turn at xhigh effort on the Claude models that offer it, and the model
+/// is told why. Journaled, so a replay rebuilds the same request.
+async fn apply_ultrathink(
+    turn: &mut AgentTurn,
+    model: &str,
+    typed: &str,
+    events: &mpsc::Sender<SessionEventKind>,
+    messages: &mut Vec<ModelMessage>,
+) -> Result<()> {
+    if turn.provider != crate::CodingProvider::Claude
+        || !borg_provider::ultrathink::available(model)
+        || borg_provider::ultrathink::ranges(typed).is_empty()
+    {
+        return Ok(());
+    }
+    turn.effort = Some(borg_provider::ultrathink::effort(turn.effort.as_deref()).to_string());
+    let reminder = ModelMessage::user(borg_provider::ultrathink::REMINDER);
+    record_native_message(events, turn.provider, &reminder).await?;
+    messages.push(reminder);
+    Ok(())
 }
 
 /// Journal a tool result for the model without a transcript row.

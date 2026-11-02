@@ -12,6 +12,7 @@ pub mod provider_bin;
 pub mod provider_install;
 pub mod runtime;
 pub mod subscription;
+pub mod ultrathink;
 
 mod auth;
 mod bounded_io;

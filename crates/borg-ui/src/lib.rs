@@ -21,6 +21,7 @@ pub mod markdown;
 pub mod preferences;
 pub mod providers;
 pub mod timeline;
+pub mod ultrathink;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(default)]

@@ -4332,6 +4332,7 @@ async fn run_local_agent_session(
                     || terminal.has_running_tool()
                     || terminal.has_active_subagents()
                     || terminal.has_active_splash_animation()
+                    || terminal.has_ultrathink_animation()
                     || terminal.is_history_page_loading()
                     || terminal.has_pending_scroll_frame()
             }) => {

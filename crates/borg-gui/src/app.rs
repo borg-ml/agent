@@ -508,7 +508,12 @@ impl BorgGui {
                                             },
                                         ),
                                         cx,
-                                    )
+                                    );
+                                    composer.set_ultrathink(view.state.configuration.as_ref().map(
+                                        |configuration| {
+                                            (configuration.provider, configuration.model.clone())
+                                        },
+                                    ));
                                 });
                                 this.view = Some(view);
                             }

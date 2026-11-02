@@ -66,6 +66,9 @@ pub struct Composer {
     history: Vec<String>,
     history_index: Option<usize>,
     history_draft: SharedString,
+    /// The session's provider and model, which decide whether `ultrathink`
+    /// in the draft will raise the next turn.
+    ultrathink: Option<(borg_ui::CodingProvider, Option<String>)>,
 }
 
 impl Composer {
@@ -85,7 +88,12 @@ impl Composer {
             history: Vec::new(),
             history_index: None,
             history_draft: "".into(),
+            ultrathink: None,
         }
+    }
+
+    pub fn set_ultrathink(&mut self, session: Option<(borg_ui::CodingProvider, Option<String>)>) {
+        self.ultrathink = session;
     }
 
     pub fn set_secret(
@@ -560,6 +568,16 @@ impl IntoElement for ComposerElement {
         self
     }
 }
+
+fn ultrathink_phase() -> u128 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
+        % borg_ui::ultrathink::SHIMMER_INTERVAL_MILLIS
+}
+
 impl Element for ComposerElement {
     type RequestLayoutState = ();
     type PrepaintState = Prepaint;
@@ -614,6 +632,15 @@ impl Element for ComposerElement {
         } else {
             (content, style.color)
         };
+        let ultrathink = match &input.ultrathink {
+            Some((provider, model)) if !input.secret => {
+                borg_ui::ultrathink::ranges(*provider, model.as_deref(), &input.content)
+            }
+            _ => Vec::new(),
+        };
+        if !ultrathink.is_empty() {
+            window.request_animation_frame();
+        }
         let base_run = TextRun {
             len: display.len(),
             font: style.font(),
@@ -628,6 +655,10 @@ impl Element for ComposerElement {
             if let Some(marked) = &marked {
                 boundaries.extend([marked.start, marked.end]);
             }
+            // One run per letter: each gets its own color.
+            for keyword in &ultrathink {
+                boundaries.extend(keyword.start..=keyword.end);
+            }
         }
         boundaries.sort_unstable();
         boundaries.dedup();
@@ -638,6 +669,17 @@ impl Element for ComposerElement {
                 let end = range[1];
                 (end > start).then(|| TextRun {
                     len: end - start,
+                    color: ultrathink
+                        .iter()
+                        .find(|keyword| keyword.contains(&start))
+                        .map_or(base_run.color, |keyword| {
+                            let (red, green, blue) = borg_ui::ultrathink::color(
+                                start - keyword.start,
+                                keyword.len(),
+                                Some(ultrathink_phase()),
+                            );
+                            rgb(u32::from_be_bytes([0, red, green, blue])).into()
+                        }),
                     background_color: (!selected.is_empty()
                         && start < selected.end
                         && end > selected.start)

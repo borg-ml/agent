@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.19.12)
 
+- `ultrathink` in a Claude prompt runs that turn at xhigh effort, as in Claude
+  Code, on Opus 5.5, Sonnet 5.5, Haiku 5.5 and Fable 5.1. A session already at
+  xhigh or max stays there, and the session's own effort setting is unchanged.
+  Typed while Claude is working, it raises the rest of that turn. The TUI and
+  GUI composers draw the word as a sweeping rainbow wherever it will take
+  effect, and the TUI says "Deeper reasoning requested for this turn". As in
+  Claude Code, the word does not count inside quotes or brackets, in a file
+  path or name, or in a slash command.
+
 - Borg has one tool surface. The `capabilities.harness = "native"` mode, which
   exposed every capability as its own tool and started external MCP servers at
   the start of every turn, is gone; sessions use the shell-first surface, where
