@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.20.0)
+## Unreleased (since 0.20.1)
+
+## 0.20.1 (2026-11-02)
 
 - Update the Markdown parser to fix RUSTSEC-2026-0433 and unblock the release
   security check; also replace a yanked Windows clipboard dependency.
