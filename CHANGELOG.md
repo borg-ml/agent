@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.19.12)
+## Unreleased (since 0.20.0)
+
+## 0.20.0 (2026-11-02)
 
 - Thread titles have their own model and reasoning settings, like commit
   messages, so any model-only route can name new threads instead of only Luna.
