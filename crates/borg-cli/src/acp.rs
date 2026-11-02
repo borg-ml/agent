@@ -367,11 +367,11 @@ async fn respond_prompt(
                     ))),
                 ))?;
             }
-            SessionEventKind::ReasoningDelta { text } => {
+            SessionEventKind::ReasoningBlockDelta { delta, .. } => {
                 connection.send_notification(SessionNotification::new(
                     request.session_id.clone(),
                     SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-                        TextContent::new(text),
+                        TextContent::new(delta),
                     ))),
                 ))?;
             }

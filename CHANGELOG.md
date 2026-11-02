@@ -5,6 +5,17 @@ Git comparison.
 
 ## Unreleased (since 0.19.12)
 
+- Claude's mid-task replies arrive word for word. Claude returns the prose it
+  writes between tool calls only as a short server summary, so a command
+  block or value it gave you mid-task could reach the transcript as "I've put
+  together the setup commands". Claude sessions now offer Claude Code's
+  `SendUserMessage` tool for content you need exactly as written; its message
+  appears as an ordinary reply, not a tool row, and settles the answer the
+  turn owes you.
+
+- ACP clients receive the model's reasoning as thought chunks. The ACP server
+  listened only for a reasoning event the runtime no longer emits.
+
 - Claude's reasoning streams as Reasoned rows again. Since 0.19.2 Claude
   sessions on adaptive-thinking models such as Opus 5.5 showed no reasoning at
   all: Borg first left the thinking display unset and then, from 0.19.6,

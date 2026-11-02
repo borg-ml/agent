@@ -11,7 +11,7 @@ use borg_provider::provider::{
     ModelCompactionResult, ModelGateway, ModelInputAttachment, ModelMessage, ModelToolCall,
     ModelToolDefinition, ModelTurnRequest, ModelTurnResult, OpenAiCompatibleProfile,
     OpenAiCompatibleProvider, PromptCacheRefresh, ProviderAttemptTrace, ProviderCallError,
-    ProviderInvocation, ProviderProgress, ProviderProgressStream,
+    ProviderInvocation, ProviderProgress, ProviderProgressStream, SEND_USER_MESSAGE_TOOL,
 };
 use borg_provider::{CostBasis, ProviderCallUsage};
 use serde::Deserialize;
@@ -788,7 +788,7 @@ impl NativeHarness {
             workflow_process_manager: self.workflow_process_manager.clone(),
         })
         .await?;
-        let tools = runtime.tool_definitions()?;
+        let tools = runtime.tool_definitions(turn.provider)?;
         let mut messages = Vec::with_capacity(turn.conversation.len().saturating_add(3));
         let mut system_prompt = super::agent::CODING_SYSTEM_PROMPT.to_string();
         match self.harness {
@@ -1063,6 +1063,8 @@ impl NativeHarness {
         // that still owes one gets a single further response to write it.
         let mut reply_owed = turn.answers_human;
         let mut reply_round_spent = false;
+        // The latest reply delivered through `SendUserMessage`.
+        let mut sent_reply: Option<String> = None;
         // Set for that one response: the context it sends that the model has
         // not seen, for the usage anchor if the turn settles without a reply.
         let mut parked_reply_unsent_tokens: Option<u64> = None;
@@ -1453,8 +1455,9 @@ impl NativeHarness {
                         });
                     }
                     if reply_owed
-                        || turn.answers_human
-                        || !turn.prompt_delta.starts_with("Watcher event: ")
+                        || (sent_reply.is_none()
+                            && (turn.answers_human
+                                || !turn.prompt_delta.starts_with("Watcher event: ")))
                     {
                         bail!("native provider ended the turn without a final response");
                     }
@@ -1553,6 +1556,11 @@ impl NativeHarness {
                 if let Some(warmer) = warmer.as_ref() {
                     warmer.on_agent_settled();
                 }
+                if final_text.trim().is_empty()
+                    && let Some(reply) = sent_reply
+                {
+                    final_text = reply;
+                }
                 return Ok(AgentTurnResult {
                     provider_session_id: None,
                     final_text: if truncated_text.is_empty() {
@@ -1584,6 +1592,22 @@ impl NativeHarness {
                 reply_owed = false;
             }
             assistant_message_id = Uuid::new_v4();
+            for reply in tool_calls.iter().filter_map(sent_user_message) {
+                send(
+                    &events,
+                    SessionEventKind::Message {
+                        message_id: Uuid::new_v4(),
+                        actor: EventActor::Assistant,
+                        text: reply.clone(),
+                        attachments: Vec::new(),
+                        status: MessageStatus::Complete,
+                        delivery: None,
+                    },
+                )
+                .await;
+                reply_owed = false;
+                sent_reply = Some(reply);
+            }
 
             // Background input waits for this batch; a human who arrived
             // after generation completed still cancels calls not yet started.
@@ -1596,6 +1620,9 @@ impl NativeHarness {
                 .map(parse_tool_arguments)
                 .collect::<Vec<_>>();
             for (tool_call, input) in tool_calls.iter().zip(&inputs) {
+                if tool_call.function.name == SEND_USER_MESSAGE_TOOL {
+                    continue;
+                }
                 let resolved_input = input.clone().unwrap_or_else(|error| {
                     json!({
                         "malformed_arguments": tool_call.function.arguments,
@@ -1719,6 +1746,28 @@ impl NativeHarness {
                 }
             } else {
                 for (tool_call, input) in tool_calls.iter().zip(inputs) {
+                    if tool_call.function.name == SEND_USER_MESSAGE_TOOL {
+                        // Shown with the response, so delivered even when a
+                        // steer redirects the rest of the batch.
+                        let output = if sent_user_message(tool_call).is_some() {
+                            "Message delivered to user.".to_string()
+                        } else {
+                            json!({ "error": "SendUserMessage needs a non-empty string `message`." })
+                                .to_string()
+                        };
+                        trailing_context_tokens = trailing_context_tokens.saturating_add(
+                            record_native_tool_message(
+                                &events,
+                                turn.provider,
+                                &mut messages,
+                                &tool_call.id,
+                                &output,
+                                Vec::new(),
+                            )
+                            .await?,
+                        );
+                        continue;
+                    }
                     let (output, is_error, steer) = if redirects(&pending_steer) {
                         let (output, is_error) = skipped_tool_result();
                         (output, is_error, Vec::new())
@@ -3766,7 +3815,10 @@ impl NativeToolRuntime {
         })
     }
 
-    fn tool_definitions(&self) -> Result<Vec<ModelToolDefinition>> {
+    fn tool_definitions(
+        &self,
+        provider: crate::CodingProvider,
+    ) -> Result<Vec<ModelToolDefinition>> {
         let mut definitions = match self.harness {
             // The curated surface is the default, so a model on defaults gets
             // these too: the promoted capabilities it is expected to reach for,
@@ -3792,6 +3844,9 @@ impl NativeToolRuntime {
         };
         for definition in &mut definitions {
             add_action_metadata(definition)?;
+        }
+        if provider == crate::CodingProvider::Claude {
+            definitions.push(send_user_message_definition()?);
         }
         sort_tool_definitions(&mut definitions);
         validate_tool_definitions(&definitions)?;
@@ -5129,6 +5184,26 @@ fn skipped_tool_result() -> (String, bool) {
     )
 }
 
+/// Journal a tool result for the model without a transcript row.
+async fn record_native_tool_message(
+    events: &mpsc::Sender<SessionEventKind>,
+    provider: crate::CodingProvider,
+    messages: &mut Vec<ModelMessage>,
+    tool_call_id: &str,
+    output: &str,
+    attachments: Vec<ModelInputAttachment>,
+) -> Result<u64> {
+    let message = ModelMessage::Tool {
+        tool_call_id: tool_call_id.to_string(),
+        content: bounded_tool_content(command_result_for_model(output)),
+        attachments,
+    };
+    let tokens = estimated_message_tokens(&message);
+    record_native_message(events, provider, &message).await?;
+    messages.push(message);
+    Ok(tokens)
+}
+
 async fn record_native_tool_result(
     events: &mpsc::Sender<SessionEventKind>,
     provider: crate::CodingProvider,
@@ -5138,16 +5213,16 @@ async fn record_native_tool_result(
     is_error: bool,
 ) -> Result<u64> {
     let (output, attachments) = split_tool_result_attachments(output);
-    let model_output = bounded_tool_content(command_result_for_model(&output));
     let attachment_count = attachments.len();
-    let message = ModelMessage::Tool {
-        tool_call_id: tool_call_id.to_string(),
-        content: model_output,
+    let tokens = record_native_tool_message(
+        events,
+        provider,
+        messages,
+        tool_call_id,
+        &output,
         attachments,
-    };
-    let tokens = estimated_message_tokens(&message);
-    record_native_message(events, provider, &message).await?;
-    messages.push(message);
+    )
+    .await?;
     let output = if attachment_count == 0 {
         output
     } else {
@@ -6139,6 +6214,39 @@ pub(crate) fn builtin_tool_specs() -> Vec<Value> {
         ),
     ]);
     specs
+}
+
+/// Claude Code's `SendUserMessage` in its verbatim mode, word for word, with no
+/// action metadata. Claude returns the prose it writes between tool calls only
+/// as a server summary, so a mid-task snippet or answer reaches the user intact
+/// only through this call.
+fn send_user_message_definition() -> Result<ModelToolDefinition> {
+    ModelToolDefinition::new(
+        SEND_USER_MESSAGE_TOOL,
+        "Send a message the user will read verbatim. Use this for content they need to see exactly as written between tool calls \u{2014} a generated code snippet, a specific value, a direct reply to something they asked mid-task. Don't use it for routine narration of what you're about to do, or for your final answer \u{2014} normal text reaches them for those.",
+        json!({
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The message for the user. Supports markdown formatting."
+                }
+            },
+            "required": ["message"],
+            "additionalProperties": false
+        }),
+    )
+    .map_err(anyhow::Error::msg)
+}
+
+/// The reply a well-formed `SendUserMessage` call delivers.
+fn sent_user_message(call: &ModelToolCall) -> Option<String> {
+    if call.function.name != SEND_USER_MESSAGE_TOOL {
+        return None;
+    }
+    let input = serde_json::from_str::<Value>(&call.function.arguments).ok()?;
+    let message = input.get("message")?.as_str()?;
+    (!message.trim().is_empty()).then(|| message.to_string())
 }
 
 fn exec_tool_definition() -> Result<ModelToolDefinition> {
@@ -12214,6 +12322,163 @@ mod tests {
     /// the out-of-process call leaves it. Asking for another response once the
     /// model has parked is what made Codex return a completed-but-empty message
     /// and kill the turn on the provider's empty-output guard.
+    struct SendUserMessageClient {
+        requests: Mutex<Vec<ModelTurnRequest>>,
+    }
+
+    const VERBATIM_REPLY: &str = "Paste these:\n\n```sh\ncargo nextest run --workspace\n```";
+
+    #[async_trait]
+    impl NativeModelClient for SendUserMessageClient {
+        async fn model_turn(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+            request: ModelTurnRequest,
+            _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+        ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request);
+            let calls = if requests.len() == 1 {
+                vec![ModelToolCall::function(
+                    "reply-1".to_string(),
+                    SEND_USER_MESSAGE_TOOL.to_string(),
+                    json!({ "message": VERBATIM_REPLY }).to_string(),
+                )]
+            } else {
+                Vec::new()
+            };
+            let finish_reason = if calls.is_empty() {
+                "stop"
+            } else {
+                "tool_calls"
+            }
+            .to_string();
+            Ok(ModelTurnResult {
+                message: ModelMessage::assistant(None, None, None, calls),
+                finish_reason,
+                usage: ProviderCallUsage::default(),
+                raw_response: Value::Null,
+                trace: ProviderAttemptTrace::default(),
+            })
+        }
+    }
+
+    /// Claude returns between-tool prose only as a server summary, so a
+    /// mid-task snippet reaches the user intact only through `SendUserMessage`.
+    /// It must arrive as that exact reply, never as a tool row, and it pays the
+    /// reply the person is owed. Only offering the tool is Claude-specific; the
+    /// loop handles the call the same way on any route, so a scriptable one
+    /// stands in for the subscription client here.
+    #[tokio::test]
+    async fn send_user_message_reaches_the_user_verbatim() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().to_path_buf();
+        let session_id = Uuid::new_v4();
+        let client = Arc::new(SendUserMessageClient {
+            requests: Mutex::new(Vec::new()),
+        });
+        let harness = NativeHarness {
+            model_client: client.clone(),
+            harness: HarnessMode::Native,
+            ..NativeHarness::default()
+        };
+        let turn = AgentTurn {
+            session_id,
+            prompt_cache_session_id: Some(Uuid::new_v4()),
+            message_id: Uuid::new_v4(),
+            context_generation: 0,
+            prior_native_context_tokens: None,
+            provider: crate::CodingProvider::OpenRouter,
+            provider_session_id: None,
+            provider_fork_turn_id: None,
+            cwd: cwd.clone(),
+            prompt_delta: "set it up".to_string(),
+            prompt: "set it up".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            model: Some("test-model".to_string()),
+            effort: None,
+            fast: None,
+            ultrafast: None,
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+            conversation: Vec::new(),
+            agent_mcp_server: borg_provider::mcp::ExternalMcpServer {
+                name: "test".to_string(),
+                command: "test".to_string(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                allowed_tools: Vec::new(),
+            },
+            agent_tools: crate::AgentToolDispatcher::new(
+                crate::session::SessionGoalTools::disconnected(),
+                crate::session::SessionTodoTools::disconnected(),
+                None,
+                crate::LspService::new(&cwd),
+                crate::CodingProvider::OpenRouter,
+                session_id,
+                false,
+                None,
+                None,
+                cwd.clone(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                crate::native_process::ProcessManager::default(),
+                PermissionMode::FullAccess,
+            ),
+            external_mcp_servers: Vec::new(),
+            runtime_mcp_context: Default::default(),
+            runtime_provider_context: None,
+            extension_skill_roots: Vec::new(),
+            extension_workflows: Vec::new(),
+            extension_api: Default::default(),
+            system_prompt_appendix: String::new(),
+            declaration_base: None,
+            request_prefix_base: None,
+            system_prompt_override: None,
+            prompt_context_base: Default::default(),
+            answers_human: true,
+            volatile_system_prompt_appendix: String::new(),
+        };
+        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let result = harness
+            .run(turn, events_tx, None)
+            .await
+            .expect("a delivered reply settles the turn");
+        assert_eq!(result.final_text, VERBATIM_REPLY);
+
+        let mut replies = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            match event {
+                SessionEventKind::Message {
+                    actor: EventActor::Assistant,
+                    text,
+                    ..
+                } => replies.push(text),
+                SessionEventKind::ToolStarted { name, .. } => {
+                    assert_ne!(name, SEND_USER_MESSAGE_TOOL, "a reply is not a tool row");
+                }
+                SessionEventKind::ToolCompleted { tool_call_id, .. } => {
+                    assert_ne!(tool_call_id, "reply-1", "a reply is not a tool row");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(replies, [VERBATIM_REPLY]);
+
+        let requests = client.requests.lock().unwrap();
+        assert!(requests[1].messages.iter().any(|message| matches!(
+            message,
+            ModelMessage::Tool { tool_call_id, content, .. }
+                if tool_call_id == "reply-1" && content == "Message delivered to user."
+        )));
+    }
+
     struct YieldAtRoundBoundaryClient {
         rounds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         /// `Some` establishes the yield out of band, the way the subprocess

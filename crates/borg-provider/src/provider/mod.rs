@@ -22,7 +22,8 @@ mod openai_compatible;
 /// compatibility path through the `opencode` CLI.
 pub mod opencode_model;
 pub use anthropic_messages::{
-    ANTHROPIC_LABEL, AnthropicMessagesProvider, context_window_tokens, messages_endpoint,
+    ANTHROPIC_LABEL, AnthropicMessagesProvider, SEND_USER_MESSAGE_TOOL, context_window_tokens,
+    messages_endpoint,
 };
 #[cfg(feature = "claude")]
 pub use claude_model::{ClaudeModelProvider, claude_refusal_fallback_model};

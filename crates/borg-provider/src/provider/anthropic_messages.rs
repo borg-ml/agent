@@ -728,6 +728,11 @@ pub(crate) fn anthropic_error_kind(status: u16, body: &str) -> ProviderErrorKind
     ProviderErrorKind::Unknown
 }
 
+/// Claude Code's verbatim reply tool. Claude summarizes the prose it writes
+/// between tool calls, so text the user must read exactly goes through this
+/// call. Its input is a reply rather than an action, so it opens no tool row.
+pub const SEND_USER_MESSAGE_TOOL: &str = "SendUserMessage";
+
 /// One model response, including opaque blocks required for continuation.
 #[derive(Debug, Default)]
 pub(crate) struct AnthropicStreamState {
@@ -993,7 +998,7 @@ pub(crate) fn apply_stream_event(
                 Some("thinking") if !state.defer_thinking => {
                     send_reasoning(progress, block["thinking"].as_str().unwrap_or_default())
                 }
-                Some("tool_use") => {
+                Some("tool_use") if block["name"] != SEND_USER_MESSAGE_TOOL => {
                     if let Some(sender) = progress {
                         let _ = sender.send(ProviderProgress::ToolCallGenerating {
                             id: block["id"].as_str().map(str::to_string),
@@ -1056,8 +1061,15 @@ pub(crate) fn apply_stream_event(
                     };
                     state.input_json.entry(index).or_default().push_str(partial);
                     if let Some(sender) = progress {
-                        let _ = sender.send(ProviderProgress::ToolCallInputDelta {
-                            id: block["id"].as_str().map(str::to_string),
+                        let _ = sender.send(if block["name"] == SEND_USER_MESSAGE_TOOL {
+                            ProviderProgress::Phase {
+                                name: "transport_activity".into(),
+                                input: Value::Null,
+                            }
+                        } else {
+                            ProviderProgress::ToolCallInputDelta {
+                                id: block["id"].as_str().map(str::to_string),
+                            }
                         });
                     }
                 }
@@ -1112,7 +1124,7 @@ pub(crate) fn apply_stream_event(
                     state.protocol_error("tool call input is not an object");
                     return;
                 }
-                if let Some(sender) = progress {
+                if let Some(sender) = progress.filter(|_| name != SEND_USER_MESSAGE_TOOL) {
                     let _ = sender.send(ProviderProgress::ToolCallStarted {
                         id: id.to_string(),
                         name: name.to_string(),
