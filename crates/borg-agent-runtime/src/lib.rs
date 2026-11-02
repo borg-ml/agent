@@ -20,6 +20,8 @@ mod extension_api;
 mod filesystem;
 mod generation_activity;
 mod harness;
+mod helper_model;
+pub use helper_model::{DEFAULT_HELPER_MODEL, HelperModel, ThreadTitleScope, helper_model_text};
 mod host_paths;
 mod imported_memory;
 #[cfg(unix)]

@@ -1049,9 +1049,18 @@ pub struct SessionCapabilities {
     /// by local and enrolled hosts.
     #[serde(default)]
     pub provider_capabilities: Vec<ProviderCapability>,
-    /// Opt in to subscription-funded Luna titles for new non-Codex threads.
+    /// Which new threads get a model-written title.
     #[serde(default)]
-    pub luna_titles_for_all_providers: bool,
+    pub thread_titles: crate::ThreadTitleScope,
+    /// Title route as `MODEL[@EFFORT]` or `PROVIDER::MODEL[@EFFORT]`; unset
+    /// uses the default helper model.
+    #[serde(default)]
+    pub title_model: Option<String>,
+    /// Configured endpoint for a custom-provider title model. Holds a
+    /// credential, so it is never serialized.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub title_gateway: Option<borg_provider::provider::ModelGateway>,
     /// Populated by an enrolled host after fetching the authenticated Web
     /// context grant. It is intentionally omitted from serialized launch
     /// state so short-lived credentials never enter the relay journal.
@@ -1104,7 +1113,9 @@ impl Default for SessionCapabilities {
             model_fallback: Vec::new(),
             steer_reply_prompt: SteerReplyPrompt::default(),
             provider_capabilities: Vec::new(),
-            luna_titles_for_all_providers: false,
+            thread_titles: crate::ThreadTitleScope::default(),
+            title_model: None,
+            title_gateway: None,
             runtime_mcp_context: None,
             runtime_provider_context: None,
             system_prompt_appendix: None,
@@ -2544,6 +2555,9 @@ pub enum SessionEventKind {
         generated: bool,
         #[serde(default)]
         usage_tokens: Option<u64>,
+        /// The helper route that wrote a generated title.
+        #[serde(default)]
+        model: Option<String>,
     },
     SessionConfigured {
         cwd: PathBuf,

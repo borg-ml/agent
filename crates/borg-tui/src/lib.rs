@@ -59,12 +59,13 @@ use borg_remote::{
     project_tool_presentation, tool_action_is_instant, tool_can_start_background_process,
     tool_has_rich_ui, tool_output_code_view, web_search_query,
 };
+use borg_remote::{HelperModel, ThreadTitleScope};
 #[cfg(test)]
 use borg_remote::{tool_call_summary, tool_code_view};
 use borg_ui::localization::{UiLanguage, text as ui_text};
 use borg_ui::preferences::{
-    CompletionAlertPolicy, ComposerCursorStyle, DiffExpansionPolicy, IconStyle, ResponseStreaming,
-    ToolClickBehavior, TranscriptPreferences, parse_hex_color,
+    CompletionAlertPolicy, ComposerCursorStyle, DiffExpansionPolicy, HelperKind, IconStyle,
+    ResponseStreaming, ToolClickBehavior, TranscriptPreferences, parse_hex_color,
 };
 use borg_ui::timeline::tool_lifecycle_label;
 use chrono::{DateTime, Local, NaiveDate, Utc};
@@ -1046,8 +1047,9 @@ pub enum UiAction {
         id: String,
         expected: borg_ui::providers::ConfiguredProvider,
     },
-    SetCommitMessageModel(String),
-    SetCommitMessageEffort(String),
+    SetHelperModel(HelperKind, String),
+    SetHelperEffort(HelperKind, String),
+    SetThreadTitles(ThreadTitleScope),
     SetHorizontalMargin(u16),
     SetComposerMaxHeight(u16),
     SetShowFooter(bool),
@@ -1085,7 +1087,6 @@ pub enum UiAction {
     SetCompletionSound(CompletionAlertPolicy),
     SetAutoCopySelection(bool),
     SetKeyHints(bool),
-    SetLunaTitlesForAllProviders(bool),
     SetIconStyle(IconStyle),
     /// Completes the enable-dictation flow: persist model/accelerator/icon,
     /// mark dictation enabled, and optionally begin recording (which prompts
@@ -1414,7 +1415,7 @@ impl GitCommitState {
     fn start(
         &mut self,
         cwd: &Path,
-        model: CommitMessageModel,
+        model: HelperModel,
         gateway: Option<borg_provider::provider::ModelGateway>,
     ) -> bool {
         if !self.in_flight.insert(cwd.to_path_buf()) {
@@ -1439,69 +1440,28 @@ impl GitCommitState {
     }
 }
 
-/// Model used to draft click-to-commit messages, as `MODEL[@EFFORT]`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CommitMessageModel {
-    model: String,
-    effort: String,
-}
-
-const DEFAULT_COMMIT_MESSAGE_MODEL: &str = "gpt-6-luna@low";
 const COMMIT_DIFF_CHAR_BUDGET: usize = 60_000;
 
-impl CommitMessageModel {
-    fn parse(spec: &str) -> Self {
-        let spec = spec.trim();
-        let spec = if spec.is_empty() {
-            DEFAULT_COMMIT_MESSAGE_MODEL
+/// Parse a helper route, choosing a cheap effort when the spec names none.
+fn helper_model(spec: &str) -> HelperModel {
+    let mut parsed = HelperModel::parse(spec);
+    if parsed.effort.is_empty() {
+        let efforts = effort_picker_options(parsed.provider(), Some(parsed.model_id()));
+        parsed.effort = if efforts.iter().any(|effort| effort == "low") {
+            "low".to_string()
         } else {
-            spec
-        };
-        let (model, effort) = spec
-            .rsplit_once('@')
-            .map_or((spec, "low"), |(model, effort)| (model, effort));
-        let mut parsed = Self {
-            model: model.trim().to_string(),
-            effort: effort.trim().to_string(),
-        };
-        if !spec.contains('@') {
-            let efforts = effort_picker_options(parsed.provider(), Some(parsed.model_id()));
-            parsed.effort = if efforts.iter().any(|effort| effort == "low") {
-                "low".to_string()
-            } else {
-                efforts
-                    .into_iter()
-                    .find(|effort| effort != "none")
-                    .unwrap_or_default()
-            };
-        }
-        parsed
-    }
-
-    fn label(&self) -> String {
-        format!("{}@{}", self.model, self.effort)
-    }
-
-    fn provider(&self) -> Option<CodingProvider> {
-        if let Some((provider, _)) = self.model.split_once("::") {
-            CodingProvider::ALL
+            efforts
                 .into_iter()
-                .find(|candidate| candidate.config_alias() == provider)
-        } else {
-            CodingProvider::for_model(&self.model)
-        }
+                .find(|effort| effort != "none")
+                .unwrap_or_default()
+        };
     }
-
-    fn model_id(&self) -> &str {
-        self.model
-            .split_once("::")
-            .map_or(self.model.as_str(), |(_, model)| model)
-    }
+    parsed
 }
 
 /// `BORG_COMMIT_MODEL=MODEL[@EFFORT]` overrides the default cheap model.
-fn commit_model_from_environment() -> CommitMessageModel {
-    CommitMessageModel::parse(&std::env::var("BORG_COMMIT_MODEL").unwrap_or_default())
+fn commit_model_from_environment() -> HelperModel {
+    helper_model(&std::env::var("BORG_COMMIT_MODEL").unwrap_or_default())
 }
 
 fn git_in(cwd: &Path, args: &[&str]) -> std::result::Result<std::process::Output, String> {
@@ -1527,7 +1487,7 @@ fn git_last_stderr_line(output: &std::process::Output) -> String {
 /// human summary for the footer notice.
 fn run_git_commit_and_push(
     cwd: &Path,
-    model: &CommitMessageModel,
+    model: &HelperModel,
     gateway: Option<&borg_provider::provider::ModelGateway>,
 ) -> std::result::Result<String, String> {
     let add = git_in(cwd, &["add", "-A"])?;
@@ -1629,126 +1589,22 @@ fn commit_message_prompt(stat: &str, diff: &str) -> String {
 /// Draft through Borg's model-only providers. No external agent loop.
 /// Returns None on failure so the caller can use its deterministic fallback.
 fn draft_commit_message(
-    model: &CommitMessageModel,
+    model: &HelperModel,
     gateway: Option<&borg_provider::provider::ModelGateway>,
     stat: &str,
     diff: &str,
 ) -> Option<String> {
-    #[cfg(feature = "subscription-adapters")]
-    use borg_provider::provider::{ClaudeModelProvider, CodexModelProvider};
-    use borg_provider::provider::{ModelMessage, ModelTurnRequest};
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .ok()?;
-    runtime.block_on(async {
-        tokio::time::timeout(std::time::Duration::from_secs(90), async {
-            let request = ModelTurnRequest {
-                fast: false,
-                ultrafast: false,
-                request_id: Some(uuid::Uuid::new_v4().to_string()),
-                session_id: None,
-                prompt_cache_key: None,
-                turn_routing: Default::default(),
-                messages: vec![ModelMessage::user(commit_message_prompt(stat, diff))],
-                tools: Vec::new(),
-                output_schema: None,
-            };
-            let provider = if gateway.is_some() {
-                CodingProvider::OpenAiCompatible
-            } else {
-                model.provider()?
-            };
-            let result = if provider == CodingProvider::Claude {
-                #[cfg(not(feature = "subscription-adapters"))]
-                {
-                    return None;
-                }
-                #[cfg(feature = "subscription-adapters")]
-                {
-                    let account = ClaudeModelProvider::account_identity(None).await.ok()?;
-                    ClaudeModelProvider {
-                        model: model.model_id().to_string(),
-                        effort: (!model.effort.is_empty()).then(|| model.effort.clone()),
-                        refusal_fallback: false,
-                    }
-                    .model_turn_for_account(request, None, None, None, Some(&account))
-                    .await
-                    .ok()?
-                }
-            } else if provider == CodingProvider::Codex {
-                #[cfg(not(feature = "subscription-adapters"))]
-                {
-                    return None;
-                }
-                #[cfg(feature = "subscription-adapters")]
-                {
-                    let account = CodexModelProvider::account_identity().await.ok()?;
-                    CodexModelProvider {
-                        model: model.model_id().to_string(),
-                        effort: model.effort.clone(),
-                    }
-                    .model_turn_for_account(request, None, &account)
-                    .await
-                    .ok()?
-                }
-            } else if provider == CodingProvider::Anthropic {
-                let key = borg_provider::credentials::api_key(
-                    borg_provider::credentials::ApiKeyCredential::Anthropic,
-                )?;
-                borg_provider::provider::AnthropicMessagesProvider {
-                    model: model.model_id().to_string(),
-                    effort: (!model.effort.is_empty()).then(|| model.effort.clone()),
-                }
-                .model_turn(request, None, &key)
-                .await
-                .ok()?
-            } else {
-                use borg_provider::provider::{
-                    OpenAiCompatibleProfile as Profile, OpenAiCompatibleProvider,
-                };
-                let go_gateway = if provider == CodingProvider::OpenCode {
-                    Some(
-                        borg_provider::provider::opencode_model::gateway(
-                            model.model_id(),
-                            Uuid::new_v4(),
-                        )
-                        .ok()?,
-                    )
-                } else {
-                    None
-                };
-                let gateway = gateway.or(go_gateway.as_ref());
-                let profile = match provider {
-                    CodingProvider::Kimi => Profile::Kimi,
-                    CodingProvider::Glm => Profile::Glm,
-                    CodingProvider::Qwen => Profile::Qwen,
-                    CodingProvider::OpenRouter => Profile::OpenRouter,
-                    CodingProvider::Vercel => Profile::Vercel,
-                    CodingProvider::OpenCode | CodingProvider::OpenAiCompatible => Profile::Generic,
-                    _ => return None,
-                };
-                OpenAiCompatibleProvider {
-                    model: gateway
-                        .and_then(|gateway| gateway.model.clone())
-                        .unwrap_or_else(|| model.model_id().to_string()),
-                    effort: (!model.effort.is_empty()).then(|| model.effort.clone()),
-                    system_prompt: "",
-                }
-                .model_turn_via_profile(request, None, gateway, profile)
-                .await
-                .ok()?
-            };
-            let (content, _, calls) = result.assistant_parts()?;
-            if !calls.is_empty() {
-                return None;
-            }
-            clean_commit_message(content.as_deref()?)
-        })
-        .await
-        .ok()
-        .flatten()
-    })
+    let (text, _) = runtime.block_on(borg_remote::helper_model_text(
+        model,
+        gateway,
+        commit_message_prompt(stat, diff),
+        Duration::from_secs(90),
+    ))?;
+    clean_commit_message(&text)
 }
 
 /// Strip code fences and surrounding whitespace; reject empty drafts.
@@ -1961,8 +1817,9 @@ pub struct BorgTerminal {
     completion_sound: CompletionAlertPolicy,
     completion_alert_pending: bool,
     auto_copy_selection: bool,
-    luna_titles_for_all_providers: bool,
-    commit_message_model: CommitMessageModel,
+    commit_message_model: HelperModel,
+    title_model: HelperModel,
+    thread_titles: ThreadTitleScope,
     commit_model_gateways:
         std::collections::BTreeMap<String, borg_provider::provider::ModelGateway>,
     streaming_refresh_rate_fps: u64,
@@ -2246,7 +2103,7 @@ enum PickerKind {
     ImportPreview { threads: bool, memory: bool },
     Resume,
     Model,
-    CommitModel,
+    HelperModel(HelperKind),
     Effort,
     Permission,
     Language,
@@ -2270,7 +2127,6 @@ enum PickerKind {
     CompletionSound,
     AutoCopySelection,
     KeyHints,
-    LunaTitlesForAllProviders,
     DictationModel,
     DictationAccelerator,
     IconStyle,
@@ -2336,7 +2192,7 @@ impl Picker {
                         .section
                         .as_deref()
                         .is_some_and(|section| fuzzy_matches(section, query))
-                    || (!matches!(self.kind, PickerKind::Model | PickerKind::CommitModel)
+                    || (!matches!(self.kind, PickerKind::Model | PickerKind::HelperModel(_))
                         && option
                             .preview
                             .as_deref()
@@ -3424,8 +3280,9 @@ impl BorgTerminal {
             completion_sound: CompletionAlertPolicy::Unfocused,
             completion_alert_pending: false,
             auto_copy_selection: true,
-            luna_titles_for_all_providers: false,
             commit_message_model: commit_model_from_environment(),
+            title_model: helper_model(""),
+            thread_titles: ThreadTitleScope::default(),
             commit_model_gateways: Default::default(),
             streaming_refresh_rate_fps: 120,
             horizontal_margin: HORIZONTAL_MARGIN,
@@ -5352,7 +5209,7 @@ impl BorgTerminal {
         match self.picker.as_ref().map(|picker| &picker.kind) {
             Some(PickerKind::Effort) => self.open_effort_picker(),
             Some(PickerKind::Model) => self.open_model_picker(),
-            Some(PickerKind::CommitModel) => self.open_commit_model_picker(),
+            Some(PickerKind::HelperModel(kind)) => self.open_helper_model_picker(*kind),
             Some(PickerKind::Fast) => self.open_fast_picker(),
             Some(PickerKind::Permission) => self.open_permission_picker(),
             Some(PickerKind::Language) => self.open_language_picker(),
@@ -6640,11 +6497,19 @@ impl BorgTerminal {
         });
     }
 
-    fn open_commit_model_picker(&mut self) {
+    fn helper(&self, kind: HelperKind) -> &HelperModel {
+        match kind {
+            HelperKind::Commit => &self.commit_message_model,
+            HelperKind::Title => &self.title_model,
+        }
+    }
+
+    fn open_helper_model_picker(&mut self, kind: HelperKind) {
         self.open_model_picker();
+        let current = self.helper(kind).model.clone();
         if let Some(picker) = &mut self.picker {
-            picker.kind = PickerKind::CommitModel;
-            picker.title = "Commit message model";
+            picker.kind = PickerKind::HelperModel(kind);
+            picker.title = kind.label();
             picker.options.retain(|option| {
                 !option.value.starts_with('/')
                     && !matches!(
@@ -6670,14 +6535,14 @@ impl BorgTerminal {
             }
             for option in &mut picker.options {
                 option.label = option.label.trim_end_matches(" · current").to_string();
-                if option.value == self.commit_message_model.model {
+                if option.value == current {
                     option.label.push_str(" · current");
                 }
             }
             picker.selected = picker
                 .options
                 .iter()
-                .position(|option| option.value == self.commit_message_model.model)
+                .position(|option| option.value == current)
                 .unwrap_or(0);
         }
     }
@@ -6837,8 +6702,9 @@ impl BorgTerminal {
             prevent_lid_sleep: self.prevent_lid_sleep,
             auto_copy: self.auto_copy_selection,
             key_hints: self.key_hints_enabled,
-            luna_titles: self.luna_titles_for_all_providers,
+            thread_titles: self.thread_titles,
             commit_model: self.commit_message_model.label(),
+            title_model: self.title_model.label(),
             configured_models: self.configured_model_entries.clone(),
             custom_providers: self.custom_providers.clone(),
             streaming_refresh_fps: self.streaming_refresh_rate_fps,
@@ -6876,8 +6742,8 @@ impl BorgTerminal {
                 UiAction::None
             }
             SettingsEffect::Apply(action) => *action,
-            SettingsEffect::OpenCommitModelPicker => {
-                self.open_commit_model_picker();
+            SettingsEffect::OpenHelperModelPicker(kind) => {
+                self.open_helper_model_picker(kind);
                 UiAction::None
             }
             SettingsEffect::OpenDictation => {
@@ -7384,19 +7250,6 @@ impl BorgTerminal {
             "Completion notifications",
             self.completion_notifications,
         );
-    }
-
-    pub fn open_luna_titles_for_all_providers_picker(&mut self) {
-        self.picker = Some(Picker::new(
-            PickerKind::LunaTitlesForAllProviders,
-            "Send first prompt to Codex subscription for Luna titles",
-            ["On", "Off"],
-            Some(if self.luna_titles_for_all_providers {
-                "On"
-            } else {
-                "Off"
-            }),
-        ));
     }
 
     pub fn open_key_hints_picker(&mut self) {
@@ -8569,18 +8422,27 @@ impl BorgTerminal {
         std::mem::take(&mut self.event_redraw_needed)
     }
 
-    pub fn set_commit_message_model(&mut self, spec: Option<&str>) {
-        self.commit_message_model = spec
-            .map(CommitMessageModel::parse)
+    /// Apply the saved helper models and title scope.
+    pub fn set_helper_preferences(
+        &mut self,
+        interaction: &borg_ui::preferences::InteractionPreferences,
+    ) {
+        self.commit_message_model = interaction
+            .commit_message_model
+            .as_deref()
+            .map(helper_model)
             .unwrap_or_else(commit_model_from_environment);
+        self.title_model = helper_model(interaction.title_model.as_deref().unwrap_or_default());
+        self.thread_titles = interaction.thread_titles;
+    }
+
+    /// The model part of the current `kind` route, for changing its effort.
+    pub fn helper_model_id(&self, kind: HelperKind) -> String {
+        self.helper(kind).model.clone()
     }
 
     pub fn set_streaming_refresh_rate(&mut self, fps: u64) {
         self.streaming_refresh_rate_fps = fps;
-    }
-
-    pub fn set_luna_titles_for_all_providers(&mut self, enabled: bool) {
-        self.luna_titles_for_all_providers = enabled;
     }
 
     pub fn set_key_hints(&mut self, enabled: bool) {
@@ -9396,9 +9258,9 @@ impl BorgTerminal {
                 text: format!("/resume {}", picker.selected_value()),
                 attachments: Vec::new(),
             },
-            PickerKind::CommitModel => {
+            PickerKind::HelperModel(kind) => {
                 let model = picker.selected_value();
-                let provider = CommitMessageModel::parse(&model).provider();
+                let provider = HelperModel::parse(&model).provider();
                 let efforts =
                     borg_provider::gateway_effort_levels(&model, &self.configured_model_entries)
                         .unwrap_or_else(|| effort_picker_options(provider, Some(&model)));
@@ -9407,7 +9269,7 @@ impl BorgTerminal {
                 } else {
                     efforts.first().cloned().unwrap_or_default()
                 };
-                UiAction::SetCommitMessageModel(format!("{model}@{effort}"))
+                UiAction::SetHelperModel(kind, format!("{model}@{effort}"))
             }
             PickerKind::Model => match picker.selected_value().as_str() {
                 "/connect-go" => {
@@ -9544,9 +9406,6 @@ impl BorgTerminal {
             PickerKind::CompletionSound => UiAction::SetCompletionSound(
                 completion_alert_policy_from_picker(&picker.selected_value()),
             ),
-            PickerKind::LunaTitlesForAllProviders => {
-                UiAction::SetLunaTitlesForAllProviders(picker.selected_value() == "On")
-            }
             PickerKind::KeyHints => UiAction::SetKeyHints(picker.selected_value() == "On"),
             PickerKind::AutoCopySelection => {
                 UiAction::SetAutoCopySelection(picker.selected_value() == "On")
@@ -10224,7 +10083,7 @@ impl BorgTerminal {
         }
         let composer_max_height = if resume_picker_open
             || self.picker.as_ref().is_some_and(|picker| {
-                matches!(picker.kind, PickerKind::Model | PickerKind::CommitModel)
+                matches!(picker.kind, PickerKind::Model | PickerKind::HelperModel(_))
             }) {
             18.max(self.composer_max_height)
         } else {
@@ -12422,7 +12281,7 @@ impl BorgTerminal {
         }
         if matches!(
             self.picker.as_ref().map(|picker| picker.kind),
-            Some(PickerKind::Commands | PickerKind::Model | PickerKind::CommitModel)
+            Some(PickerKind::Commands | PickerKind::Model | PickerKind::HelperModel(_))
         ) {
             // Typing filters, so this runs ahead of every other key path: the
             // palette owns the keyboard while it is open.

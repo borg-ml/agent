@@ -5468,6 +5468,7 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
                 title: "Recipient exploration".into(),
                 generated: false,
                 usage_tokens: None,
+                model: None,
             },
         ))
         .await

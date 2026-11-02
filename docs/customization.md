@@ -90,13 +90,17 @@ setting is the same as never having configured one.
 
 Click **Settings** in the top-right corner of the start screen, or run
 `/settings`, to open the settings screen. It groups every setting below into
-Agent, Providers, Transcript, Names & colours, Appearance, Notifications and System. Click an option or use
+Agent, Helper models, Providers, Transcript, Names & colours, Appearance,
+Notifications and System. Click an option or use
 ←/→ to change it, Tab to move between sections, and type to search; Esc closes
 it. Changes apply at once and are persisted to `editor.toml`.
 
 | Setting | Command | Configuration |
 | --- | --- | --- |
-| Commit message model | Settings → Agent | `interaction.commit_message_model = "gpt-6-luna@low"` |
+| Commit message model | Settings → Helper models | `interaction.commit_message_model = "gpt-6-luna@low"` |
+| Thread title model | Settings → Helper models | `interaction.title_model = "gpt-6-luna@low"` |
+| Thread titles | Settings → Helper models | `interaction.thread_titles = "off"`, `"same_provider"` (default), or `"all_providers"` |
+| Shortcut numbers | Settings → Appearance | `interaction.key_hints = true` or `false` |
 | Horizontal margin | Settings → Appearance | `layout.horizontal_margin = 0..40` |
 | Composer maximum height | Settings → Appearance | `layout.composer_max_height = 3..30` |
 | Status footer | Settings → Appearance | `layout.show_footer = true` or `false` |
@@ -154,16 +158,26 @@ Custom connections currently speak OpenAI-compatible Chat Completions; arbitrary
 URLs do not imply support for an unrelated wire protocol such as Responses or
 Anthropic Messages. Borg's built-in Anthropic route remains separate.
 
-The commit-message model is independent of chat and uses the existing connection
-and billing route. The searchable picker includes native subscription models,
-OpenCode Go, API catalogs and configured endpoints; **Custom commit model** also
+**Settings → Helper models** holds the two background helpers, commit messages
+and thread titles. Each has the same three rows: a model, a typed route and its
+reasoning effort, all independent of chat and using that model's existing
+connection and billing route. The searchable picker includes native subscription
+models, OpenCode Go, API catalogs and configured endpoints; the route row also
 accepts `PROVIDER::MODEL@EFFORT`, with provider names such as `anthropic`,
-`open_router`, `vercel`, `kimi`, `glm` and `qwen`. An explicit saved choice takes
-precedence over `BORG_COMMIT_MODEL`; otherwise that environment variable overrides
-the default `gpt-6-luna@low`. Grok, Muse and non-Go OpenCode require external
-agent loops and are not used for background commit drafting. No different model
-or billing route is substituted on failure: the commit uses a file summary and
-reports that fallback. Dictation configuration does not start recording.
+`open_router`, `vercel`, `kimi`, `glm` and `qwen`. Both default to
+`gpt-6-luna@low`; for commits, an explicit saved choice takes precedence over
+`BORG_COMMIT_MODEL`, which otherwise overrides the default. Grok, Muse and non-Go
+OpenCode require external agent loops and are not used for background helpers.
+No different model or billing route is substituted on failure: a commit uses a
+file summary and reports that fallback, and a thread keeps the title taken from
+its first message.
+
+**Thread titles** chooses which new threads send up to 2,000 characters of their
+first message to the title model: **Off**, **Same provider** (the default: only
+threads already running on the title model's provider) or **All providers**.
+Codex and Claude title models are used only through their subscriptions, never
+an OpenAI API key. Changes apply to threads started afterwards. Dictation
+configuration does not start recording.
 
 Messages sent while a turn is running (`/followups steer`) reach the model at
 its next tool boundary. For `claude-fable-5-1`, Borg frames each one with an instruction to address it

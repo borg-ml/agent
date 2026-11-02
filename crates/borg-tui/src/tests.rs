@@ -20293,23 +20293,23 @@ fn git_commit_hit_area_targets_the_branch_token_when_dirty() {
 }
 
 #[test]
-fn commit_message_model_spec_parses_with_default_effort() {
+fn helper_model_spec_parses_with_default_effort() {
     assert_eq!(
-        CommitMessageModel::parse(""),
-        CommitMessageModel {
+        helper_model(""),
+        HelperModel {
             model: "gpt-6-luna".to_string(),
             effort: "low".to_string(),
         }
     );
     assert_eq!(
-        CommitMessageModel::parse("claude-haiku-4-5@medium"),
-        CommitMessageModel {
+        helper_model("claude-haiku-4-5@medium"),
+        HelperModel {
             model: "claude-haiku-4-5".to_string(),
             effort: "medium".to_string(),
         }
     );
-    assert_eq!(CommitMessageModel::parse("gpt-5.6-luna").effort, "low");
-    let routed = CommitMessageModel::parse("open_router::vendor/model@high");
+    assert_eq!(helper_model("gpt-5.6-luna").effort, "low");
+    let routed = helper_model("open_router::vendor/model@high");
     assert_eq!(routed.provider(), Some(CodingProvider::OpenRouter));
     assert_eq!(routed.model_id(), "vendor/model");
     assert_eq!(routed.label(), "open_router::vendor/model@high");
@@ -20336,8 +20336,7 @@ async fn commit_model_settings_never_switch_the_chat_model() {
             speed_support: Default::default(),
         },
     ));
-    terminal.set_commit_message_model(Some("gpt-6-luna@low"));
-    terminal.open_commit_model_picker();
+    terminal.open_helper_model_picker(HelperKind::Commit);
     terminal
         .handle_event(composer_input(KeyCode::Char('h'), KeyModifiers::NONE))
         .unwrap();
@@ -20347,14 +20346,17 @@ async fn commit_model_settings_never_switch_the_chat_model() {
     );
     terminal.refresh_configuration_picker();
     let picker = terminal.picker.as_mut().unwrap();
-    assert!(matches!(picker.kind, PickerKind::CommitModel));
+    assert!(matches!(
+        picker.kind,
+        PickerKind::HelperModel(HelperKind::Commit)
+    ));
     picker.selected = picker
         .options
         .iter()
         .position(|option| option.value == "claude-haiku-5-5")
         .unwrap();
     assert!(
-        matches!(terminal.run_selected_picker().unwrap(), UiAction::SetCommitMessageModel(spec) if spec.starts_with("claude-haiku-5-5@"))
+        matches!(terminal.run_selected_picker().unwrap(), UiAction::SetHelperModel(HelperKind::Commit, spec) if spec.starts_with("claude-haiku-5-5@"))
     );
     let config = terminal.transcript.config.as_ref().unwrap();
     assert_eq!(config.provider, CodingProvider::Codex);

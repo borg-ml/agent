@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.19.12)
 
+- Thread titles have their own model and reasoning settings, like commit
+  messages, so any model-only route can name new threads instead of only Luna.
+  Both now live under **Settings → Helper models** with the same model, route
+  and reasoning rows. **Thread titles** replaces the Luna on/off toggle with
+  Off, Same provider (default) or All providers; a previous cross-provider
+  opt-in needs to be chosen again as All providers. Shortcut numbers moved to
+  Appearance, and the session info shows which model wrote a title.
+
 - A message you send while the agent waits on its subagents reaches it right
   away. A blocking `wait_agent` could hold it as pending input for up to the
   wait's 30 minutes when an earlier teammate message was still waiting to be

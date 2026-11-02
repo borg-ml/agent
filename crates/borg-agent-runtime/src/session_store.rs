@@ -862,6 +862,8 @@ pub struct SessionState {
     pub title: Option<String>,
     pub title_generated: bool,
     pub title_usage_tokens: Option<u64>,
+    #[serde(default)]
+    pub title_model: Option<String>,
     pub active_processes: BTreeSet<Uuid>,
     pub provider_session_id: Option<String>,
     /// Instruction contract of the last acknowledged native provider thread.
@@ -943,11 +945,13 @@ impl SessionState {
                 title,
                 generated,
                 usage_tokens,
+                model,
             } => {
                 if !self.title_generated {
                     self.title = Some(title.clone());
                     self.title_generated = *generated;
                     self.title_usage_tokens = *usage_tokens;
+                    self.title_model = model.clone();
                 }
             }
             SessionEventKind::ProviderEvent { kind, payload, .. }

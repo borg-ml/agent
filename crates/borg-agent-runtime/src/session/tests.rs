@@ -606,9 +606,10 @@ fn prompt_title_has_a_durable_fallback_for_attachment_only_messages() {
     );
 }
 
-#[cfg(feature = "subscription-adapters")]
 #[test]
-fn luna_title_requires_explicit_cross_provider_opt_in_and_subscription_billing() {
+fn title_route_respects_scope_and_never_bills_titles_to_an_api_key() {
+    use crate::ThreadTitleScope;
+    let eligible = |launch: &LaunchSession, api_key: bool| title_route(launch, api_key).is_some();
     let mut launch: LaunchSession = serde_json::from_value(json!({
         "request_id": Uuid::new_v4(),
         "cwd": "/tmp",
@@ -620,7 +621,10 @@ fn luna_title_requires_explicit_cross_provider_opt_in_and_subscription_billing()
         "initial_prompt": null
     }))
     .unwrap();
-    assert!(!launch.capabilities.luna_titles_for_all_providers);
+    assert_eq!(
+        launch.capabilities.thread_titles,
+        ThreadTitleScope::SameProvider
+    );
     launch.capabilities.provider_capabilities = vec![
         serde_json::from_value(json!({
             "provider": "codex",
@@ -633,35 +637,43 @@ fn luna_title_requires_explicit_cross_provider_opt_in_and_subscription_billing()
         }))
         .unwrap(),
     ];
-    assert!(!eligible_luna_title(&launch, false));
-    launch.capabilities.luna_titles_for_all_providers = true;
-    assert!(eligible_luna_title(&launch, false));
     assert!(
-        !eligible_luna_title(&launch, true),
-        "API keys cannot bill title turns"
+        !eligible(&launch, false),
+        "Luna does not title Claude threads by default"
     );
+    launch.capabilities.thread_titles = ThreadTitleScope::AllProviders;
+    assert!(eligible(&launch, false));
+    assert!(!eligible(&launch, true), "API keys cannot bill title turns");
     launch.capabilities.provider_capabilities[0].billing = Some(crate::BillingLane::ApiKey);
-    assert!(!eligible_luna_title(&launch, false));
+    assert!(!eligible(&launch, false));
     launch.capabilities.provider_capabilities[0].billing = Some(crate::BillingLane::Subscription);
     launch.capabilities.provider_capabilities[0].can_spawn = false;
-    assert!(!eligible_luna_title(&launch, false));
+    assert!(!eligible(&launch, false));
     launch.capabilities.provider_capabilities[0].can_spawn = true;
     launch.capabilities.runtime_provider_context = Some(crate::RuntimeProviderContext {
         persist_session: Some(false),
         ..Default::default()
     });
     assert!(
-        !eligible_luna_title(&launch, false),
+        !eligible(&launch, false),
         "controller access cannot use host credentials"
     );
     launch.capabilities.runtime_provider_context = None;
-    launch.capabilities.luna_titles_for_all_providers = false;
+    launch.capabilities.thread_titles = ThreadTitleScope::Off;
+    assert!(!eligible(&launch, false));
+    launch.capabilities.thread_titles = ThreadTitleScope::SameProvider;
     launch.provider = CodingProvider::Codex;
     assert!(
-        eligible_luna_title(&launch, false),
+        eligible(&launch, false),
         "Codex subscription is eligible by default"
     );
+    launch.capabilities.title_model = Some("claude-haiku-5-5@low".into());
+    assert!(
+        !eligible(&launch, false),
+        "a Claude title model does not see Codex threads by default"
+    );
 }
+
 use crate::{
     AgentCompaction, AgentTurnResult, CodingProvider, LocalAgentTurnExecutor, PermissionMode,
     PostgresSessionStore,

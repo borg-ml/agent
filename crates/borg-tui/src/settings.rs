@@ -29,6 +29,7 @@ const LIST_PANEL: Color = Color::Rgb(40, 40, 44);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SettingsSection {
     Agent,
+    Helpers,
     Providers,
     Transcript,
     Names,
@@ -38,8 +39,9 @@ pub(crate) enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Agent,
+        Self::Helpers,
         Self::Providers,
         Self::Transcript,
         Self::Names,
@@ -51,6 +53,7 @@ impl SettingsSection {
     fn label(self) -> &'static str {
         match self {
             Self::Agent => "Agent",
+            Self::Helpers => "Helper models",
             Self::Providers => "Providers",
             Self::Transcript => "Transcript",
             Self::Names => "Names & colours",
@@ -63,6 +66,7 @@ impl SettingsSection {
     fn summary(self) -> &'static str {
         match self {
             Self::Agent => "Model, reasoning and how Borg works",
+            Self::Helpers => "Models that write commit messages and thread titles",
             Self::Providers => "Custom endpoints, credentials, models and variants",
             Self::Transcript => "What the conversation shows",
             Self::Names => "How you and Borg appear in the conversation",
@@ -101,8 +105,12 @@ pub(crate) enum SettingId {
 
     Model,
     CommitModel,
-    CommitEffort,
     CustomCommitModel,
+    CommitEffort,
+    ThreadTitles,
+    TitleModel,
+    CustomTitleModel,
+    TitleEffort,
     StreamingRefreshRate,
     HorizontalMargin,
     ComposerHeight,
@@ -137,7 +145,6 @@ pub(crate) enum SettingId {
     KeepAwake,
     AutoCopy,
     KeyHints,
-    LunaTitles,
     LanguageServers,
     Import,
 }
@@ -200,8 +207,9 @@ pub(crate) struct SettingsValues {
     pub(crate) prevent_lid_sleep: bool,
     pub(crate) auto_copy: bool,
     pub(crate) key_hints: bool,
-    pub(crate) luna_titles: bool,
+    pub(crate) thread_titles: ThreadTitleScope,
     pub(crate) commit_model: String,
+    pub(crate) title_model: String,
     pub(crate) configured_models: Vec<borg_provider::DynamicModelEntry>,
     pub(crate) custom_providers:
         std::collections::BTreeMap<String, borg_ui::providers::ConfiguredProvider>,
@@ -263,10 +271,6 @@ pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
         (None, Some(provider)) => format!("Default · {}", provider.label()),
         (None, None) => "Default".to_string(),
     };
-    let commit = CommitMessageModel::parse(&values.commit_model);
-    let commit_efforts =
-        borg_provider::gateway_effort_levels(commit.model_id(), &values.configured_models)
-            .unwrap_or_else(|| effort_picker_options(commit.provider(), Some(commit.model_id())));
     let efforts = values
         .model
         .as_deref()
@@ -391,46 +395,6 @@ pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
                 Some(usize::from(!values.steer_active)),
             ),
         ),
-        row(
-            Id::CommitModel,
-            Section::Agent,
-            "Commit message model",
-            "Independent of chat. Search all supported models and configured providers for click-to-commit drafts.",
-            SettingControl::Action(commit.model.clone()),
-        ),
-        row(
-            Id::CustomCommitModel,
-            Section::Agent,
-            "Custom commit model",
-            "Any model-only route: MODEL@EFFORT or PROVIDER::MODEL@EFFORT (for example open_router::vendor/model). External agent-loop routes cannot draft safely.",
-            SettingControl::Text(values.commit_model.clone()),
-        ),
-        SettingRow {
-            enabled: !commit_efforts.is_empty(),
-            ..row(
-                Id::CommitEffort,
-                Section::Agent,
-                "Commit reasoning",
-                "How much reasoning the commit drafter uses. Does not change chat reasoning.",
-                SettingControl::Choice {
-                    selected: commit_efforts
-                        .iter()
-                        .position(|effort| *effort == commit.effort),
-                    disabled: commit_efforts
-                        .iter()
-                        .map(|effort| {
-                            effort == "none"
-                                && !borg_provider::gateway_effort_is_optional(
-                                    commit.model_id(),
-                                    &values.configured_models,
-                                )
-                                && !effort_is_optional(commit.provider(), Some(commit.model_id()))
-                        })
-                        .collect(),
-                    options: commit_efforts,
-                },
-            )
-        },
         row(
             Id::Streaming,
             Section::Transcript,
@@ -680,17 +644,10 @@ pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
         ),
         row(
             Id::KeyHints,
-            Section::System,
+            Section::Appearance,
             "Shortcut numbers",
             "Show numbered Ctrl/Cmd shortcuts on the status controls.",
             toggle(values.key_hints),
-        ),
-        row(
-            Id::LunaTitles,
-            Section::System,
-            "Luna thread titles",
-            "Send each new thread's first message to your Codex subscription so Luna can name it, whichever provider runs the thread.",
-            toggle(values.luna_titles),
         ),
         row(
             Id::LanguageServers,
@@ -707,8 +664,107 @@ pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
             SettingControl::Action("Choose a source".to_string()),
         ),
     ];
+    rows.extend(helper_rows(
+        HelperKind::Commit,
+        &values.commit_model,
+        values,
+    ));
+    rows.push(row(
+        Id::ThreadTitles,
+        Section::Helpers,
+        "Thread titles",
+        "Which new threads send their first message to the title model. \"Same provider\" only titles threads already running on that model's provider.",
+        choice(
+            &["Off", "Same provider", "All providers"],
+            Some(match values.thread_titles {
+                ThreadTitleScope::Off => 0,
+                ThreadTitleScope::SameProvider => 1,
+                ThreadTitleScope::AllProviders => 2,
+            }),
+        ),
+    ));
+    rows.extend(helper_rows(HelperKind::Title, &values.title_model, values));
     rows.extend(providers::list_rows(&values.custom_providers));
     rows
+}
+
+/// The model, route and reasoning rows every helper model shares.
+fn helper_rows(kind: HelperKind, spec: &str, values: &SettingsValues) -> [SettingRow; 3] {
+    use SettingId as Id;
+    let model = helper_model(spec);
+    let (ids, labels, purpose) = match kind {
+        HelperKind::Commit => (
+            [Id::CommitModel, Id::CustomCommitModel, Id::CommitEffort],
+            ["Commit model", "Commit model route", "Commit reasoning"],
+            "click-to-commit messages",
+        ),
+        HelperKind::Title => (
+            [Id::TitleModel, Id::CustomTitleModel, Id::TitleEffort],
+            ["Title model", "Title model route", "Title reasoning"],
+            "thread titles",
+        ),
+    };
+    let efforts = borg_provider::gateway_effort_levels(model.model_id(), &values.configured_models)
+        .unwrap_or_else(|| effort_picker_options(model.provider(), Some(model.model_id())));
+    let optional =
+        borg_provider::gateway_effort_is_optional(model.model_id(), &values.configured_models)
+            || effort_is_optional(model.provider(), Some(model.model_id()));
+    let row = |id, label, description: String, control| SettingRow {
+        id,
+        section: SettingsSection::Helpers,
+        label,
+        description,
+        control,
+        enabled: true,
+    };
+    [
+        row(
+            ids[0],
+            labels[0],
+            format!(
+                "The model that writes {purpose}, independent of chat. Search every supported model and configured provider."
+            ),
+            SettingControl::Action(model.model.clone()),
+        ),
+        row(
+            ids[1],
+            labels[1],
+            format!(
+                "Type any model-only route for {purpose}: MODEL@EFFORT or PROVIDER::MODEL@EFFORT (for example open_router::vendor/model). External agent-loop routes cannot run in the background."
+            ),
+            SettingControl::Text(model.label()),
+        ),
+        SettingRow {
+            enabled: !efforts.is_empty(),
+            ..row(
+                ids[2],
+                labels[2],
+                format!(
+                    "How much the model reasons for {purpose}. Does not change chat reasoning."
+                ),
+                SettingControl::Choice {
+                    selected: efforts.iter().position(|effort| *effort == model.effort),
+                    disabled: efforts
+                        .iter()
+                        .map(|effort| effort == "none" && !optional)
+                        .collect(),
+                    options: efforts,
+                },
+            )
+        },
+    ]
+}
+
+fn helper_kind(id: SettingId) -> Option<HelperKind> {
+    match id {
+        SettingId::CommitModel | SettingId::CustomCommitModel | SettingId::CommitEffort => {
+            Some(HelperKind::Commit)
+        }
+        SettingId::TitleModel | SettingId::CustomTitleModel | SettingId::TitleEffort => {
+            Some(HelperKind::Title)
+        }
+        _ => None,
+    }
 }
 
 /// The action that applies option `index` of a choice row.
@@ -720,7 +776,14 @@ fn choice_action(row: &SettingRow, index: usize) -> Option<UiAction> {
     let option = options.get(index)?;
     let on = index == 1;
     Some(match row.id {
-        Id::CommitEffort => UiAction::SetCommitMessageEffort(option.clone()),
+        Id::CommitEffort | Id::TitleEffort => {
+            UiAction::SetHelperEffort(helper_kind(row.id)?, option.clone())
+        }
+        Id::ThreadTitles => UiAction::SetThreadTitles(match index {
+            0 => ThreadTitleScope::Off,
+            2 => ThreadTitleScope::AllProviders,
+            _ => ThreadTitleScope::SameProvider,
+        }),
         Id::StreamingRefreshRate => UiAction::Submit {
             target: None,
             text: format!("/refresh streaming {}", REFRESH_RATES[index]),
@@ -781,7 +844,6 @@ fn choice_action(row: &SettingRow, index: usize) -> Option<UiAction> {
         },
         Id::AutoCopy => UiAction::SetAutoCopySelection(on),
         Id::KeyHints => UiAction::SetKeyHints(on),
-        Id::LunaTitles => UiAction::SetLunaTitlesForAllProviders(on),
         _ => return None,
     })
 }
@@ -793,7 +855,7 @@ pub(crate) enum SettingsEffect {
     Close,
     Apply(Box<UiAction>),
     OpenModelPicker,
-    OpenCommitModelPicker,
+    OpenHelperModelPicker(HelperKind),
     OpenDictation,
     /// Close the screen, then run a slash command whose result shows in the
     /// conversation.
@@ -987,7 +1049,9 @@ impl SettingsScreen {
                 SettingsEffect::None
             }
             SettingControl::Action(_) => match row.id {
-                SettingId::CommitModel => SettingsEffect::OpenCommitModelPicker,
+                SettingId::CommitModel | SettingId::TitleModel => {
+                    SettingsEffect::OpenHelperModelPicker(helper_kind(row.id).expect("helper row"))
+                }
                 SettingId::Dictation => SettingsEffect::OpenDictation,
                 SettingId::Model => SettingsEffect::OpenModelPicker,
                 SettingId::LanguageServers => SettingsEffect::CloseAndRun("/lsp"),
@@ -1013,8 +1077,8 @@ impl SettingsScreen {
             return SettingsEffect::None;
         }
         let command = match id {
-            SettingId::CustomCommitModel => {
-                let model = CommitMessageModel::parse(value);
+            SettingId::CustomCommitModel | SettingId::CustomTitleModel => {
+                let model = helper_model(value);
                 if value.is_empty()
                     || model.model_id().is_empty()
                     || matches!(
@@ -1030,7 +1094,8 @@ impl SettingsScreen {
                     return SettingsEffect::None;
                 }
                 self.error = None;
-                return SettingsEffect::Apply(Box::new(UiAction::SetCommitMessageModel(
+                return SettingsEffect::Apply(Box::new(UiAction::SetHelperModel(
+                    helper_kind(id).expect("helper row"),
                     model.label(),
                 )));
             }
@@ -2022,8 +2087,9 @@ mod tests {
             prevent_lid_sleep: false,
             auto_copy: true,
             key_hints: true,
-            luna_titles: false,
-            commit_model: DEFAULT_COMMIT_MESSAGE_MODEL.to_string(),
+            thread_titles: ThreadTitleScope::SameProvider,
+            commit_model: borg_remote::DEFAULT_HELPER_MODEL.to_string(),
+            title_model: borg_remote::DEFAULT_HELPER_MODEL.to_string(),
             configured_models: Vec::new(),
             custom_providers: Default::default(),
             streaming_refresh_fps: 120,

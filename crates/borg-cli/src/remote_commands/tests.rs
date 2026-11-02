@@ -3180,6 +3180,7 @@ async fn resume_picker_titles_and_previews_sessions_from_the_latest_response() {
                     title: title.to_string(),
                     generated,
                     usage_tokens: generated.then_some(19),
+                    model: None,
                 },
             ))
             .await

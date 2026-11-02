@@ -141,8 +141,6 @@ pub struct InteractionPreferences {
     /// Copy mouse-selected text to the clipboard when the drag ends.
     pub auto_copy_selection: bool,
     pub key_hints: bool,
-    /// Allow Codex subscription Luna to title new threads on other providers.
-    pub luna_titles_for_all_providers: bool,
     /// Set once the user has completed the enable-dictation flow (which also
     /// grants microphone access). Until then, the dictation key opens that
     /// flow instead of recording.
@@ -151,6 +149,36 @@ pub struct InteractionPreferences {
     pub last_model: Option<borg_remote::ModelRoute>,
     /// Independent model and reasoning effort for footer commit messages.
     pub commit_message_model: Option<String>,
+    /// Which new threads get a model-written title.
+    pub thread_titles: borg_remote::ThreadTitleScope,
+    /// Independent model and reasoning effort for thread titles.
+    pub title_model: Option<String>,
+}
+
+/// A background helper with its own model and reasoning effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperKind {
+    Commit,
+    Title,
+}
+
+impl HelperKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Commit => "Commit message model",
+            Self::Title => "Thread title model",
+        }
+    }
+}
+
+impl InteractionPreferences {
+    /// The saved `MODEL@EFFORT` route for `kind`.
+    pub fn helper_model_mut(&mut self, kind: HelperKind) -> &mut Option<String> {
+        match kind {
+            HelperKind::Commit => &mut self.commit_message_model,
+            HelperKind::Title => &mut self.title_model,
+        }
+    }
 }
 
 impl Default for InteractionPreferences {
@@ -164,10 +192,11 @@ impl Default for InteractionPreferences {
             completion_sound: CompletionAlertPolicy::Unfocused,
             auto_copy_selection: true,
             key_hints: true,
-            luna_titles_for_all_providers: false,
             dictation_enabled: false,
             last_model: None,
             commit_message_model: None,
+            thread_titles: borg_remote::ThreadTitleScope::SameProvider,
+            title_model: None,
         }
     }
 }
@@ -593,9 +622,10 @@ keep = true
                 completion_sound: CompletionAlertPolicy::Off,
                 auto_copy_selection: false,
                 key_hints: false,
-                luna_titles_for_all_providers: true,
                 dictation_enabled: true,
                 commit_message_model: Some("gpt-6-luna@low".to_string()),
+                thread_titles: borg_remote::ThreadTitleScope::AllProviders,
+                title_model: Some("claude-haiku-5-5@low".to_string()),
                 last_model: Some(borg_remote::ModelRoute {
                     provider: borg_remote::CodingProvider::Codex,
                     model: Some("gpt-6-sol".to_string()),
@@ -677,36 +707,15 @@ keep = true
     }
 
     #[test]
-    fn luna_title_cross_provider_opt_in_survives_settings_save() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("borg/editor.toml");
-        let original = EditorPreferences::default();
-        assert!(!original.interaction.luna_titles_for_all_providers);
-        let mut enabled = original.clone();
-        enabled.interaction.luna_titles_for_all_providers = true;
-        enabled.save_changes_to(&original, &path).unwrap();
-        assert!(
-            EditorPreferences::load_from(&path)
-                .unwrap()
-                .interaction
-                .luna_titles_for_all_providers
-        );
-        original.save_changes_to(&enabled, &path).unwrap();
-        assert!(
-            !EditorPreferences::load_from(&path)
-                .unwrap()
-                .interaction
-                .luna_titles_for_all_providers
-        );
-    }
-
-    #[test]
     fn checked_in_example_matches_the_typed_editor_preferences() {
         let preferences: EditorPreferences =
             toml::from_str(include_str!("../../../configs/editor.example.toml")).unwrap();
         preferences.validate().unwrap();
         assert!(preferences.interaction.auto_copy_selection);
-        assert!(!preferences.interaction.luna_titles_for_all_providers);
+        assert_eq!(
+            preferences.interaction.thread_titles,
+            borg_remote::ThreadTitleScope::SameProvider
+        );
         assert_eq!(
             preferences.interaction.active_messages,
             ActiveMessageBehavior::Steer

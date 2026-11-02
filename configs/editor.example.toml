@@ -19,10 +19,14 @@ completion_sound = "unfocused"
 auto_copy_selection = true
 # Show numbered clickable targets while holding Ctrl/Cmd (or toggling F12).
 key_hints = true
-# Send up to 2,000 characters of a new thread's first prompt to your Codex
-# subscription for Luna titles, even when the thread uses another provider.
-# Off by default; never falls back to API-key billing.
-luna_titles_for_all_providers = false
+# Commit messages and thread titles are drafted by independent helper models,
+# written MODEL@EFFORT or PROVIDER::MODEL@EFFORT. Unset uses gpt-6-luna@low.
+# commit_message_model = "gpt-6-luna@low"
+# title_model = "gpt-6-luna@low"
+# Which new threads send up to 2,000 characters of their first prompt to the
+# title model: off, same_provider (only threads already on the title model's
+# provider) or all_providers. Codex and Claude titles use only subscriptions.
+thread_titles = "same_provider"
 
 [presentation]
 # Interface labels only; independent of the model response language selected

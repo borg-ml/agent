@@ -2711,8 +2711,12 @@ async fn run_local_agent_session(
         "{provider:?} requires --model or BORG_OPENAI_COMPATIBLE_MODEL"
     );
     let mut capabilities = borg_remote::SessionCapabilities::from(&agent_config.capabilities);
-    capabilities.luna_titles_for_all_providers =
-        editor_preferences.interaction.luna_titles_for_all_providers;
+    capabilities.thread_titles = editor_preferences.interaction.thread_titles;
+    capabilities.title_model = editor_preferences.interaction.title_model.clone();
+    capabilities.title_gateway = agent_config.configured_model_gateways().remove(
+        &borg_remote::HelperModel::parse(capabilities.title_model.as_deref().unwrap_or_default())
+            .model,
+    );
     let provider_probe_started = std::time::Instant::now();
     capabilities.provider_capabilities = probe_provider_admission_capabilities().await;
     let provider_probe_ms = provider_probe_started.elapsed().as_millis() as u64;
@@ -3180,12 +3184,7 @@ async fn run_local_agent_session(
         terminal.set_show_action_done_at(editor_preferences.presentation.show_action_done_at);
         terminal.set_ui_language(editor_preferences.presentation.ui_language);
         terminal.set_layout_preferences(&editor_preferences.layout);
-        terminal.set_commit_message_model(
-            editor_preferences
-                .interaction
-                .commit_message_model
-                .as_deref(),
-        );
+        terminal.set_helper_preferences(&editor_preferences.interaction);
         terminal.set_streaming_refresh_rate(u64::from(
             editor_preferences.presentation.streaming_refresh_rate_fps,
         ));
@@ -3195,9 +3194,6 @@ async fn run_local_agent_session(
         );
         terminal.set_auto_copy_selection(editor_preferences.interaction.auto_copy_selection);
         terminal.set_key_hints(editor_preferences.interaction.key_hints);
-        terminal.set_luna_titles_for_all_providers(
-            editor_preferences.interaction.luna_titles_for_all_providers,
-        );
         terminal.set_transcript_labels(
             editor_preferences.transcript.user_label.clone(),
             editor_preferences.transcript.assistant_label.clone(),
@@ -4504,7 +4500,7 @@ async fn run_local_agent_session(
                                     editor_preferences.presentation.ui_language,
                                 );
                                 terminal.set_layout_preferences(&editor_preferences.layout);
-                                terminal.set_commit_message_model(editor_preferences.interaction.commit_message_model.as_deref());
+                                terminal.set_helper_preferences(&editor_preferences.interaction);
                                 terminal.set_streaming_refresh_rate(u64::from(editor_preferences.presentation.streaming_refresh_rate_fps));
                                 terminal.set_completion_alerts(
                                     editor_preferences.interaction.completion_notifications,
@@ -4514,9 +4510,6 @@ async fn run_local_agent_session(
                                     editor_preferences.interaction.auto_copy_selection,
                                 );
                                 terminal.set_key_hints(editor_preferences.interaction.key_hints);
-                                terminal.set_luna_titles_for_all_providers(
-                                    editor_preferences.interaction.luna_titles_for_all_providers,
-                                );
                                 terminal.set_transcript_labels(
                                     editor_preferences.transcript.user_label.clone(),
                                     editor_preferences.transcript.assistant_label.clone(),
@@ -6157,7 +6150,7 @@ async fn run_local_agent_session(
                                 restored.set_configured_model_entries(agent_config.configured_model_entries());
                                 restored.set_commit_model_gateways(agent_config.configured_model_gateways());
                                 restored.set_custom_providers(agent_config.providers.clone());
-                                restored.set_commit_message_model(editor_preferences.interaction.commit_message_model.as_deref());
+                                restored.set_helper_preferences(&editor_preferences.interaction);
                                 restored.set_streaming_refresh_rate(u64::from(editor_preferences.presentation.streaming_refresh_rate_fps));
                                 restored.set_extension_commands(extension_catalog.api_snapshot().commands);
                                 let composer_history = store
@@ -6549,22 +6542,37 @@ async fn run_local_agent_session(
                             Err(error) => terminal.custom_provider_save_result(Some(error.to_string())),
                         }
                     }
-                    UiAction::SetCommitMessageEffort(effort) => {
-                        let current = editor_preferences.interaction.commit_message_model.clone()
-                            .or_else(|| std::env::var("BORG_COMMIT_MODEL").ok())
-                            .unwrap_or_else(|| "gpt-6-luna@low".to_string());
-                        let model = current.rsplit_once('@').map_or(current.as_str(), |(model, _)| model);
-                        let spec = format!("{model}@{effort}");
-                        editor_preferences.interaction.commit_message_model = Some(spec.clone());
+                    UiAction::SetHelperEffort(kind, effort) => {
+                        let terminal = terminal.as_mut().expect("terminal");
+                        let spec = format!("{}@{effort}", terminal.helper_model_id(kind));
+                        *editor_preferences.interaction.helper_model_mut(kind) = Some(spec);
                         dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
-                        terminal.as_mut().expect("terminal").set_commit_message_model(Some(&spec));
+                        terminal.set_helper_preferences(&editor_preferences.interaction);
                     }
-                    UiAction::SetCommitMessageModel(spec) => {
-                        editor_preferences.interaction.commit_message_model = Some(spec.clone());
+                    UiAction::SetHelperModel(kind, spec) => {
+                        *editor_preferences.interaction.helper_model_mut(kind) = Some(spec.clone());
                         dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
                         let terminal = terminal.as_mut().expect("terminal");
-                        terminal.set_commit_message_model(Some(&spec));
-                        terminal.set_notice(format!("Commit message model: {spec}"));
+                        terminal.set_helper_preferences(&editor_preferences.interaction);
+                        terminal.set_notice(if kind == borg_ui::preferences::HelperKind::Title {
+                            format!("{}: {spec} · applies to new threads", kind.label())
+                        } else {
+                            format!("{}: {spec}", kind.label())
+                        });
+                    }
+                    UiAction::SetThreadTitles(scope) => {
+                        editor_preferences.interaction.thread_titles = scope;
+                        dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_helper_preferences(&editor_preferences.interaction);
+                        terminal.set_notice(format!(
+                            "Thread titles: {} · applies to new threads",
+                            match scope {
+                                borg_remote::ThreadTitleScope::Off => "off",
+                                borg_remote::ThreadTitleScope::SameProvider => "same provider",
+                                borg_remote::ThreadTitleScope::AllProviders => "all providers",
+                            }
+                        ));
                     }
                     UiAction::SetHorizontalMargin(value) => {
                         editor_preferences.layout.horizontal_margin = value;
@@ -6580,19 +6588,6 @@ async fn run_local_agent_session(
                         editor_preferences.layout.show_footer = value;
                         dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
                         terminal.as_mut().expect("terminal").set_layout_preferences(&editor_preferences.layout);
-                    }
-                    UiAction::SetLunaTitlesForAllProviders(enabled) => {
-                        editor_preferences.interaction.luna_titles_for_all_providers = enabled;
-                        dispatch_editor_preferences_save(
-                            &editor_preferences_tx,
-                            &editor_preferences,
-                        );
-                        let terminal = terminal.as_mut().expect("terminal");
-                        terminal.set_luna_titles_for_all_providers(enabled);
-                        terminal.set_notice(format!(
-                            "Luna titles across providers: {} · applies to new threads with an available Codex subscription",
-                            if enabled { "on" } else { "off" }
-                        ));
                     }
                     UiAction::SetKeyHints(enabled) => {
                         editor_preferences.interaction.key_hints = enabled;
@@ -8274,7 +8269,7 @@ async fn run_local_agent_session(
                                         restored.set_configured_model_entries(agent_config.configured_model_entries());
                                         restored.set_commit_model_gateways(agent_config.configured_model_gateways());
                                         restored.set_custom_providers(agent_config.providers.clone());
-                                        restored.set_commit_message_model(editor_preferences.interaction.commit_message_model.as_deref());
+                                        restored.set_helper_preferences(&editor_preferences.interaction);
                                         restored.set_streaming_refresh_rate(u64::from(editor_preferences.presentation.streaming_refresh_rate_fps));
                                         restored.set_extension_commands(extension_catalog.api_snapshot().commands);
                                         let composer_history = store
@@ -9712,7 +9707,11 @@ async fn recent_session_options(
                 .as_ref()
                 .map(|title| format!("**Original title:** {title}")),
             state.title_usage_tokens.map(|tokens| {
-                format!("**Title model:** `gpt-6-luna@low` · {tokens} tokens (subscription)")
+                let model = state
+                    .title_model
+                    .as_deref()
+                    .unwrap_or(borg_remote::DEFAULT_HELPER_MODEL);
+                format!("**Title model:** `{model}` · {tokens} tokens")
             }),
             cwd.map(|cwd| format!("**Directory:** `{cwd}`")),
             model.map(|model| format!("**Model:** `{model}`")),

@@ -4162,6 +4162,7 @@ mod tests {
                     title: "ahead".into(),
                     generated: false,
                     usage_tokens: None,
+                    model: None,
                 },
             ))
             .await
