@@ -862,6 +862,7 @@ fn validate_body(body: &Value, caps: &Capabilities, state: &State) -> Result<()>
     }
     if policy.experimental_betas && !policy.hipaa {
         allowed.push("extended-cache-ttl-2025-04-11".into());
+        allowed.push(super::anthropic_threads::BETA.into());
         let id = protocol::source_model_facts(&caps.model, &[])
             .context("unknown Claude model")?
             .id;

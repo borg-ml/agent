@@ -43,6 +43,20 @@ pub enum ModelMessage {
     },
 }
 
+/// Best-effort transport cursor. Local messages remain authoritative.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnthropicMessageThread {
+    pub previous_message_id: Option<String>,
+    pub prefix_hash: String,
+    pub message_count: usize,
+    pub settings_hash: String,
+    pub prompt_hash: String,
+    pub strip_replay_thinking: bool,
+    pub scope_hash: String,
+    pub replayed: bool,
+    pub disabled: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "protocol", rename_all = "snake_case")]
 pub enum ModelProviderState {
@@ -60,6 +74,8 @@ pub enum ModelProviderState {
         effective_effort: Option<String>,
     },
     AnthropicMessages {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<AnthropicMessageThread>,
         content: Vec<Value>,
         /// Display-only indexes into `content`; absent in older saved states.
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -3,7 +3,7 @@
 //! Model access only: Borg owns the agent loop, tools, persistence and policy,
 //! and this route bills the Anthropic API key the user configured. It is
 //! deliberately separate from the Claude subscription lane, which runs the
-//! unmodified Claude Code binary. Subscription credentials are never replayed
+//! native subscription transport. Subscription credentials are never replayed
 //! here, and this key is never used to stand in for them.
 
 use std::collections::{HashMap, HashSet};
@@ -129,27 +129,65 @@ impl AnthropicMessagesProvider {
             });
         }
         let body = messages_request_body(&self.model, self.effort.as_deref(), &request);
-        let http = anthropic_http_client()
-            .post(&endpoint)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(&body);
-        let response = match apply_provider_request_timeout(http).send().await {
-            Ok(response) => response,
-            Err(error) => {
-                return Err(ProviderCallError {
-                    message: format!("{ANTHROPIC_LABEL} request failed: {error}"),
-                    trace: Box::new(trace),
-                    session_id: None,
-                    kind: ProviderErrorKind::from_transport(&error),
-                });
+        let mut thread = super::anthropic_threads::enabled().then(|| {
+            super::anthropic_threads::ThreadRequest::new(
+                body.clone(),
+                &request.messages,
+                json!([ANTHROPIC_LABEL, endpoint, api_key, request.session_id]),
+            )
+        });
+        let response = loop {
+            let wire = thread.as_ref().map_or(&body, |thread| &thread.wire);
+            let fields: std::collections::BTreeMap<_, _> = wire
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| name.as_str() != "betas")
+                .collect();
+            let betas = wire.get("betas");
+            let mut http = anthropic_http_client()
+                .post(&endpoint)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION);
+            if let Some(betas) = betas {
+                http = http.header(
+                    "anthropic-beta",
+                    betas
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
             }
-        };
-        let status = response.status();
-        if !status.is_success() {
+            let response = match apply_provider_request_timeout(http.json(&fields))
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    return Err(ProviderCallError {
+                        message: format!("{ANTHROPIC_LABEL} request failed: {error}"),
+                        trace: Box::new(trace),
+                        session_id: None,
+                        kind: ProviderErrorKind::from_transport(&error),
+                    });
+                }
+            };
+            if response.status().is_success() {
+                break response;
+            }
+            let status = response.status();
             let raw = read_provider_error_response_text(response)
                 .await
                 .unwrap_or_else(|error| error.to_string());
+            if thread
+                .as_mut()
+                .is_some_and(|thread| thread.recover(status.as_u16(), &raw))
+            {
+                continue;
+            }
             trace.exit_status = Some(1);
             trace.stderr = raw.clone();
             return Err(ProviderCallError {
@@ -162,8 +200,7 @@ impl AnthropicMessagesProvider {
                 session_id: None,
                 kind: anthropic_error_kind(status.as_u16(), &raw),
             });
-        }
-
+        };
         let mut state = AnthropicStreamState::default();
         let mut buffer: Vec<u8> = Vec::new();
         let mut received_bytes: usize = 0;
@@ -226,8 +263,12 @@ impl AnthropicMessagesProvider {
         }
         let usage = state.usage(elapsed_millis_u64(started_at));
         trace.exit_status = Some(0);
+        let mut message = state.assistant_message();
+        if let Some(thread) = thread {
+            thread.finish(&state.raw_response(), &mut message);
+        }
         Ok(ModelTurnResult {
-            message: state.assistant_message(),
+            message,
             finish_reason: state.finish_reason(),
             usage,
             raw_response: state.raw_response(),
@@ -849,6 +890,7 @@ impl AnthropicStreamState {
             reasoning_details: None,
             provider_state: Some(ModelProviderState::AnthropicMessages {
                 content: self.blocks.clone(),
+                thread: None,
                 narration_block_indexes: Some(narration_block_indexes),
                 account_identity: None,
             }),
@@ -1424,6 +1466,7 @@ mod tests {
                             reasoning_details: None,
                             provider_state: Some(ModelProviderState::AnthropicMessages {
                                 content: native.clone(),
+                                thread: None,
                                 narration_block_indexes: Some(vec![1]),
                                 account_identity: Some("test-account".into()),
                             }),
@@ -1470,6 +1513,7 @@ mod tests {
                 ] {
                     let state = ModelProviderState::AnthropicMessages {
                         content: native.clone(),
+                        thread: None,
                         narration_block_indexes: indexes.clone(),
                         account_identity: Some("test-account".into()),
                     };
@@ -1542,6 +1586,7 @@ mod tests {
                         reasoning_details: None,
                         provider_state: Some(ModelProviderState::AnthropicMessages {
                             content: native.clone(),
+                            thread: None,
                             narration_block_indexes: Some(vec![2]),
                             account_identity: None,
                         }),

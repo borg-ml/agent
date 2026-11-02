@@ -10388,6 +10388,7 @@ mod tests {
         };
         let anthropic = |content| ModelProviderState::AnthropicMessages {
             content,
+            thread: None,
             narration_block_indexes: None,
             account_identity: Some("test-account".into()),
         };
@@ -13665,6 +13666,7 @@ mod tests {
                                         json!({"type":"thinking", "thinking":"retained work", "signature":"opaque-test-signature"}),
                                         json!({"type":"tool_use", "id":"after-steer", "name":"exec", "input": input}),
                                     ],
+                                    thread: None,
                                     narration_block_indexes: None,
                                     account_identity: None,
                                 },

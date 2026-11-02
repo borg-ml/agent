@@ -261,10 +261,30 @@ impl ClaudeModelProvider {
                 "auth": "subscription_oauth", "agent_loop": "borg",
             }),
         );
-        let response = connector
-            .post(&body, &id, &session, parent_agent_id)
-            .await?;
-        if !response.status().is_success() {
+        let mut thread = (refresh.is_none() && super::anthropic_threads::enabled()).then(|| {
+            super::anthropic_threads::ThreadRequest::new(
+                body.clone(),
+                &request.messages,
+                json!([
+                    "claude-subscription",
+                    info.account_identity,
+                    session,
+                    parent_agent_id
+                ]),
+            )
+        });
+        let response = loop {
+            let response = connector
+                .post(
+                    thread.as_ref().map_or(&body, |t| &t.wire),
+                    &id,
+                    &session,
+                    parent_agent_id,
+                )
+                .await?;
+            if response.status().is_success() {
+                break response;
+            }
             let status = response.status().as_u16();
             let mut response = response;
             let mut details = Vec::new();
@@ -276,6 +296,12 @@ impl ClaudeModelProvider {
                 details.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
             }
             let details = String::from_utf8_lossy(&details);
+            if thread
+                .as_mut()
+                .is_some_and(|thread| thread.recover(status, &details))
+            {
+                continue;
+            }
             let message = format!(
                 "Claude subscription request failed (HTTP {status}){}: {details}; no API-key fallback",
                 if status == 429 { " rate_limit" } else { "" },
@@ -287,7 +313,7 @@ impl ClaudeModelProvider {
                 message,
             }
             .into());
-        }
+        };
         super::chat_stream::record_claude_usage_headers(&info.account_identity, response.headers());
         if let Some((five_hour, weekly)) = claude_subscription_transport::grace(response.headers())
         {
@@ -378,6 +404,9 @@ impl ClaudeModelProvider {
         }
         publish_usage(&progress, &id, &state, true);
         let mut message = state.assistant_message();
+        if let Some(thread) = thread {
+            thread.finish(&state.raw_response(), &mut message);
+        }
         if let ModelMessage::Assistant {
             provider_state:
                 Some(ModelProviderState::AnthropicMessages {

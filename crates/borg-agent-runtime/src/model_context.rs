@@ -649,6 +649,7 @@ mod tests {
                 content: vec![
                     json!({"type":"thinking", "thinking":"kept", "signature":"opaque-test-signature"}),
                 ],
+                thread: None,
                 narration_block_indexes: None,
                 account_identity: None,
             });
@@ -802,6 +803,7 @@ mod tests {
         if let ModelMessage::Assistant { provider_state, .. } = &mut message {
             *provider_state = Some(ModelProviderState::AnthropicMessages {
                 content: vec![json!({"type":"thinking", "signature":"old"})],
+                thread: None,
                 narration_block_indexes: None,
                 account_identity: None,
             });

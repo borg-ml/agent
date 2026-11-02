@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.20.1)
 
+- Native Claude subscription and Anthropic API-key routes support message
+  threads with `BORG_CLAUDE_MESSAGE_THREADS=1`: active sessions upload only new
+  turns, with full-history recovery after expiry and safe restarts after context
+  or settings changes. The beta is opt-in because it is not ZDR/HIPAA eligible;
+  local history, prompt caching, usage accounting and billing routes are retained.
+
 ## 0.20.1 (2026-11-02)
 
 - Update the Markdown parser to fix RUSTSEC-2026-0433 and unblock the release

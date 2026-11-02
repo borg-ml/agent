@@ -1,4 +1,5 @@
 mod anthropic_messages;
+mod anthropic_threads;
 pub mod chat_stream;
 #[cfg(feature = "claude")]
 mod claude_connector;

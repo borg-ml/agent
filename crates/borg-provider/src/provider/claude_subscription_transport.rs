@@ -41,17 +41,27 @@ pub(super) fn prepare(
         .get("messages")
         .and_then(Value::as_array)
         .context("Claude messages missing")?;
-    let attribution =
-        protocol::billing_system_text(messages, "borg", identity.parent_agent_id.is_some())?;
-    let mut system = vec![json!({"type":"text","text":attribution})];
-    if let Some(blocks) = object.get("system") {
-        system.extend(
-            blocks
-                .as_array()
-                .context("invalid Claude system blocks")?
-                .iter()
-                .cloned(),
-        );
+    let continuing = object
+        .get("thread")
+        .is_some_and(|thread| thread["type"] == "continue");
+    ensure!(
+        !continuing || (!object.contains_key("system") && !object.contains_key("tools")),
+        "Claude thread continuations must omit system and tools"
+    );
+    if !continuing {
+        let attribution =
+            protocol::billing_system_text(messages, "borg", identity.parent_agent_id.is_some())?;
+        let mut system = vec![json!({"type":"text","text":attribution})];
+        if let Some(blocks) = object.get("system") {
+            system.extend(
+                blocks
+                    .as_array()
+                    .context("invalid Claude system blocks")?
+                    .iter()
+                    .cloned(),
+            );
+        }
+        object.insert("system".into(), Value::Array(system));
     }
     let mut betas = capabilities.betas.clone();
     if let Some(requested) = object.remove("betas") {
@@ -62,7 +72,6 @@ pub(super) fn prepare(
             }
         }
     }
-    object.insert("system".into(), Value::Array(system));
     object.insert("stream".into(), Value::Bool(true));
     object.insert("metadata".into(), identity.metadata()?);
     let headers = protocol::inference_headers(bearer, identity, request_id, "borg", &betas)?;
@@ -71,7 +80,9 @@ pub(super) fn prepare(
         bytes.len() <= MAX_REQUEST_BYTES,
         "Claude subscription request too large"
     );
-    claude_subscription_wire::stamp(&mut bytes).map_err(anyhow::Error::msg)?;
+    if !continuing {
+        claude_subscription_wire::stamp(&mut bytes).map_err(anyhow::Error::msg)?;
+    }
     Ok(PreparedRequest { headers, bytes })
 }
 
@@ -229,6 +240,38 @@ mod tests {
         reset[at..at + 5].copy_from_slice(b"00000");
         claude_subscription_wire::stamp(&mut reset).unwrap();
         assert_eq!(reset, prepared.bytes);
+    }
+
+    // Continuations inherit the original stamped attribution. Re-inserting it
+    // would send a create-only field and make the server reject the request.
+    #[test]
+    fn thread_continuations_keep_auth_and_betas_without_reinserting_system() {
+        let caps = protocol::source_model_facts("claude-opus-5-5", &[])
+            .unwrap()
+            .capabilities;
+        let identity = RequestIdentity {
+            device_id: &"a".repeat(64),
+            account_uuid: "account-a",
+            session_id: "session-a",
+            parent_agent_id: None,
+        };
+        let mut body = json!({"model":caps.model, "max_tokens":1, "messages":[],
+            "thread":{"type":"continue", "previous_message_id":"msg_owned"},
+            "betas":[super::super::anthropic_threads::BETA]});
+        let prepared = prepare(&body, &caps, "owned-fake-bearer", &identity, "request-a").unwrap();
+        let wire: Value = serde_json::from_slice(&prepared.bytes).unwrap();
+        assert!(wire.get("system").is_none());
+        assert!(wire.get("tools").is_none());
+        assert_eq!(wire["thread"], body["thread"]);
+        assert!(prepared.headers["authorization"].is_sensitive());
+        assert!(
+            prepared.headers["anthropic-beta"]
+                .to_str()
+                .unwrap()
+                .contains(super::super::anthropic_threads::BETA)
+        );
+        body["system"] = Value::Null;
+        assert!(prepare(&body, &caps, "owned-fake-bearer", &identity, "request-a").is_err());
     }
 
     #[test]
