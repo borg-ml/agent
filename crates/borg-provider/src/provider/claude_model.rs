@@ -437,15 +437,10 @@ fn subscription_request_body(
         );
         body["output_config"] = json!({"effort": effort});
     }
-    // Claude Code's default display: narration, the between-tool answers the
-    // user must see, arrives verbatim while reasoning stays omitted. Unset
-    // display omits narration too, and "summarized" rewrites it.
-    let updates = capabilities
-        .betas
-        .iter()
-        .any(|beta| beta == claude_subscription_protocol::DISPLAY_UPDATES_BETA);
-    if updates && body["thinking"]["type"] != "disabled" {
-        body["thinking"]["display"] = json!("updates");
+    // Unset display omits reasoning and narration; "updates" also omits
+    // reasoning and rewrites narration no better than "summarized" does.
+    if body["thinking"]["type"] != "disabled" {
+        body["thinking"]["display"] = json!("summarized");
     }
     let mut betas = capabilities.betas.clone();
     if body["output_config"].get("effort").is_some() {
@@ -622,7 +617,7 @@ mod tests {
             thinking_required: false,
             fast: false,
             efforts: vec!["high".into()],
-            betas: vec![claude_subscription_protocol::DISPLAY_UPDATES_BETA.into()],
+            betas: vec![],
         };
         let request = ModelTurnRequest {
             fast: false,
@@ -653,7 +648,7 @@ mod tests {
             Some(PromptCacheRefresh::ONE_TOKEN),
         )
         .unwrap();
-        assert_eq!(original["thinking"]["display"], "updates");
+        assert_eq!(original["thinking"]["display"], "summarized");
         assert_eq!(warmed["max_tokens"], 1);
         assert_eq!(warmed["thinking"]["type"], "adaptive");
         warmed["max_tokens"] = original["max_tokens"].clone();

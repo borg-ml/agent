@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.19.12)
 
+- Claude's reasoning streams as Reasoned rows again. Since 0.19.2 Claude
+  sessions on adaptive-thinking models such as Opus 5.5 showed no reasoning at
+  all: Borg first left the thinking display unset and then, from 0.19.6,
+  requested the `updates` display, and both omit reasoning. Borg again
+  requests summarized thinking. Contrary to the 0.19.6 note, live checks show
+  `updates` does not return between-tool replies verbatim either: a reply
+  Claude writes inside its thinking arrives as the same kind of short
+  rewritten note in both modes, so nothing is lost by the switch.
+
 ## 0.19.12 (2026-11-01)
 
 - Claude usage is shared by every Borg process through
