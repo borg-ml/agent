@@ -21,13 +21,14 @@ use uuid::Uuid;
 
 gpui::actions!(borg_gui, [Interrupt, Escape, ToggleHelp]);
 
-const UI_FONT: &str = if cfg!(target_os = "macos") {
-    "SF Mono"
-} else if cfg!(target_os = "windows") {
-    "Consolas"
-} else {
-    "monospace"
-};
+/// Bundled, so every machine renders the same text and Nerd Font icons.
+const UI_FONT: &str = "JetBrainsMono Nerd Font Mono";
+const UI_FONT_FILES: [&[u8]; 4] = [
+    include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Bold.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Italic.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-BoldItalic.ttf"),
+];
 
 fn shared_prefix_len<T>(old: &[Arc<T>], new: &[Arc<T>]) -> usize {
     old.iter()
@@ -2157,6 +2158,12 @@ pub fn run() {
         None
     });
     Application::new().run(move |cx: &mut App| {
+        if let Err(error) = cx
+            .text_system()
+            .add_fonts(UI_FONT_FILES.map(std::borrow::Cow::Borrowed).to_vec())
+        {
+            eprintln!("borg-gui: bundled font unavailable, using system fonts: {error:#}");
+        }
         cx.bind_keys([
             KeyBinding::new("backspace", composer::Backspace, Some("Composer")),
             KeyBinding::new("delete", composer::Delete, Some("Composer")),

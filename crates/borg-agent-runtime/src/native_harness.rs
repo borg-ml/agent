@@ -1318,12 +1318,21 @@ impl NativeHarness {
                 content,
                 reasoning_content: _,
                 reasoning_details: _,
-                provider_state: _,
+                provider_state,
                 tool_calls,
             } = &result.message
             else {
                 bail!("native provider returned a non-assistant model turn")
             };
+            // Claude returns the prose it writes between tool calls only as a
+            // server summary; the transcript says so, as Claude Code does.
+            let summarized = matches!(
+                provider_state,
+                Some(borg_core::ModelProviderState::AnthropicMessages {
+                    narration_block_indexes: Some(indexes),
+                    ..
+                }) if !indexes.is_empty()
+            );
             record_native_message(&events, turn.provider, &result.message).await?;
             messages.push(result.message.clone());
             editor.publish(&messages, false).await;
@@ -1439,6 +1448,9 @@ impl NativeHarness {
                         },
                     )
                     .await;
+                    if summarized {
+                        mark_summarized(&events, turn.provider, assistant_message_id).await;
+                    }
                 }
                 reply_owed = false;
                 if let Some((steer, acks)) = admit_steers(std::mem::take(&mut queued_steer)) {
@@ -1555,6 +1567,9 @@ impl NativeHarness {
                     },
                 )
                 .await;
+                if summarized {
+                    mark_summarized(&events, turn.provider, assistant_message_id).await;
+                }
                 reply_owed = false;
             }
             assistant_message_id = Uuid::new_v4();
@@ -5116,6 +5131,23 @@ fn skipped_tool_result() -> (String, bool) {
     )
 }
 
+/// Tell the transcript a reply is Claude's summary of what it wrote.
+async fn mark_summarized(
+    events: &mpsc::Sender<SessionEventKind>,
+    provider: crate::CodingProvider,
+    message_id: Uuid,
+) {
+    send(
+        events,
+        SessionEventKind::ProviderEvent {
+            provider,
+            kind: "message_summarized".into(),
+            payload: json!({ "message_id": message_id }),
+        },
+    )
+    .await;
+}
+
 /// Claude Code's `ultrathink`: a person who types the keyword gets the rest of
 /// the turn at xhigh effort on the Claude models that offer it, and the model
 /// is told why. Journaled, so a replay rebuilds the same request.
@@ -5132,7 +5164,17 @@ async fn apply_ultrathink(
     {
         return Ok(());
     }
-    turn.effort = Some(borg_provider::ultrathink::effort(turn.effort.as_deref()).to_string());
+    let effort = borg_provider::ultrathink::effort(turn.effort.as_deref()).to_string();
+    send(
+        events,
+        SessionEventKind::ProviderEvent {
+            provider: turn.provider,
+            kind: "turn_effort".into(),
+            payload: json!({ "effort": effort, "reason": "ultrathink" }),
+        },
+    )
+    .await;
+    turn.effort = Some(effort);
     let reminder = ModelMessage::user(borg_provider::ultrathink::REMINDER);
     record_native_message(events, turn.provider, &reminder).await?;
     messages.push(reminder);

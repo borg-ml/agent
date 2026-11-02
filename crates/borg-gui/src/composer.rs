@@ -96,6 +96,16 @@ impl Composer {
         self.ultrathink = session;
     }
 
+    /// Where the draft says `ultrathink` and the session's model honours it.
+    fn ultrathink_ranges(&self) -> Vec<Range<usize>> {
+        match &self.ultrathink {
+            Some((provider, model)) if !self.secret => {
+                borg_ui::ultrathink::ranges(*provider, model.as_deref(), &self.content)
+            }
+            _ => Vec::new(),
+        }
+    }
+
     pub fn set_secret(
         &mut self,
         secret: bool,
@@ -632,12 +642,7 @@ impl Element for ComposerElement {
         } else {
             (content, style.color)
         };
-        let ultrathink = match &input.ultrathink {
-            Some((provider, model)) if !input.secret => {
-                borg_ui::ultrathink::ranges(*provider, model.as_deref(), &input.content)
-            }
-            _ => Vec::new(),
-        };
+        let ultrathink = input.ultrathink_ranges();
         if !ultrathink.is_empty() {
             window.request_animation_frame();
         }
@@ -806,11 +811,23 @@ impl Render for Composer {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_move(cx.listener(Self::mouse_move))
+            .relative()
             .w_full()
             .h(px(72.))
             .line_height(px(24.))
             .text_size(px(14.))
             .child(ComposerElement { input: cx.entity() })
+            .when(!self.ultrathink_ranges().is_empty(), |composer| {
+                composer.child(
+                    div()
+                        .absolute()
+                        .right_0()
+                        .bottom_0()
+                        .text_xs()
+                        .text_color(hsla(0., 0., 0.62, 0.9))
+                        .child(borg_ui::ultrathink::HINT),
+                )
+            })
     }
 }
 

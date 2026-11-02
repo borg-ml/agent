@@ -1962,3 +1962,75 @@ fn message_roles_survive_replay_and_logical_director_promotions() {
         assert_eq!(labels(&core), ["Agent", "Director", "Agent", "Peer"]);
     }
 }
+
+/// The runtime journals these two events by name. If they were not journaled,
+/// or the transcript stopped reading them on replay, an `ultrathink` reply
+/// would show the session's effort and a server summary would read as Claude's
+/// own words.
+#[test]
+fn turn_effort_and_summary_events_label_the_reply() {
+    use borg_agent_runtime::CodingProvider;
+    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    let session = Uuid::new_v4();
+    let reply = Uuid::new_v4();
+    let provider_event = |sequence, kind: &str, payload| {
+        SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Claude,
+                kind: kind.into(),
+                payload,
+            },
+        )
+    };
+    for kind in ["turn_effort", "message_summarized"] {
+        assert_eq!(
+            provider_event(0, kind, serde_json::Value::Null)
+                .kind
+                .persistence(),
+            borg_agent_runtime::EventPersistence::Durable,
+            "{kind} must survive a resume"
+        );
+    }
+    let mut core = TranscriptCore::default();
+    core.apply(&SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::TurnStarted {
+            message_id: Uuid::new_v4(),
+            provider: CodingProvider::Claude,
+            model: Some("claude-opus-5-5".into()),
+            effort: Some("medium".into()),
+            fast: false,
+            ultrafast: false,
+        },
+    ));
+    core.apply(&provider_event(
+        2,
+        "turn_effort",
+        serde_json::json!({ "effort": "xhigh" }),
+    ));
+    core.apply(&message(
+        session,
+        3,
+        reply,
+        EventActor::Assistant,
+        "checked",
+        MessageStatus::Complete,
+    ));
+    core.apply(&provider_event(
+        4,
+        "message_summarized",
+        serde_json::json!({ "message_id": reply }),
+    ));
+    let label = core.order.iter().find_map(|entry| match entry {
+        TranscriptEntry::Message {
+            actor: EventActor::Assistant,
+            effort,
+            ..
+        } => effort.clone(),
+        _ => None,
+    });
+    assert_eq!(label.as_deref(), Some("xhigh · summarized"));
+}

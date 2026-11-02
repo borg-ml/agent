@@ -2415,6 +2415,32 @@ impl TranscriptCore {
             {
                 self.finish_reasoning(event.created_at);
             }
+            SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "turn_effort" => {
+                // `ultrathink` raised the turn; replies from here ran at this.
+                if let (Some(turn), Some(effort)) =
+                    (self.active_turn.as_mut(), payload["effort"].as_str())
+                {
+                    turn.effort = Some(effort.to_string());
+                }
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "message_summarized" =>
+            {
+                if let Some(index) = payload["message_id"]
+                    .as_str()
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .and_then(|id| self.messages.get(&id).copied())
+                    && let Some(TranscriptEntry::Message { effort, .. }) = self.order.get_mut(index)
+                    && !effort
+                        .as_deref()
+                        .is_some_and(|label| label.ends_with("summarized"))
+                {
+                    *effort = Some(effort.take().map_or_else(
+                        || "summarized".to_string(),
+                        |label| format!("{label} · summarized"),
+                    ));
+                }
+            }
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "model_refusal_fallback" =>
             {

@@ -337,6 +337,14 @@ impl SessionEventKind {
             {
                 EventPersistence::Durable
             }
+            // What a reply's label says about it (the effort an `ultrathink`
+            // turn ran at, a reply Claude's server summarized) has to read the
+            // same after a resume as it did live.
+            Self::ProviderEvent { kind, .. }
+                if kind == "turn_effort" || kind == "message_summarized" =>
+            {
+                EventPersistence::Durable
+            }
             Self::ProviderEvent { kind, .. } if kind == "action/generation_status" => {
                 EventPersistence::Coalesced
             }

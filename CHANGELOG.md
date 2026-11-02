@@ -5,6 +5,17 @@ Git comparison.
 
 ## Unreleased (since 0.19.12)
 
+- Replies from an `ultrathink` turn are labeled with the effort they actually
+  ran at (xhigh), not the session's setting, and the GUI composer also says
+  "Deeper reasoning requested for this turn".
+
+- A Claude reply that the server returned only as a summary of what Claude
+  wrote between tool calls is labeled "· summarized", as Claude Code marks it.
+
+- The GUI bundles JetBrains Mono Nerd Font Mono and uses it by default, so text
+  and Nerd Font icons look the same on every machine. Its licence is noted in
+  `NOTICE.md`.
+
 - `ultrathink` in a Claude prompt runs that turn at xhigh effort, as in Claude
   Code, on Opus 5.5, Sonnet 5.5, Haiku 5.5 and Fable 5.1. A session already at
   xhigh or max stays there, and the session's own effort setting is unchanged.
