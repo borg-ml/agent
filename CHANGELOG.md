@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.19.12)
 
+- Borg has one tool surface. The `capabilities.harness = "native"` mode, which
+  exposed every capability as its own tool and started external MCP servers at
+  the start of every turn, is gone; sessions use the shell-first surface, where
+  `borg call` starts MCP servers when first needed. A config that still sets
+  `harness` or `tool_mode` loads as before and the setting is ignored. Calling
+  a tool on an MCP server that failed to start now says the server is
+  unavailable and why, instead of reporting an unknown tool.
+
 - Claude's mid-task replies arrive word for word. Claude returns the prose it
   writes between tool calls only as a short server summary, so a command
   block or value it gave you mid-task could reach the transcript as "I've put

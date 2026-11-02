@@ -319,10 +319,6 @@ pub(crate) struct CapabilityConfig {
     /// Providers whose mid-turn human messages are framed with an instruction
     /// to address them next: `true` (default set), `false`, or a list.
     pub(crate) steer_reply_prompt: borg_remote::SteerReplyPrompt,
-    /// Model-facing harness. `borg` is the curated shell-first surface;
-    /// `native` is the explicit direct-tool fallback.
-    #[serde(alias = "tool_mode")]
-    pub(crate) harness: borg_remote::HarnessMode,
     /// Resolved from `[models]` when the config loads.
     #[serde(skip)]
     pub(crate) model_fallback: Vec<borg_remote::ModelRoute>,
@@ -344,7 +340,6 @@ impl Default for CapabilityConfig {
             resume_paused_goal_on_message: false,
             claude_refusal_fallback: false,
             steer_reply_prompt: borg_remote::SteerReplyPrompt::default(),
-            harness: borg_remote::HarnessMode::Borg,
             model_fallback: Vec::new(),
         }
     }
@@ -1056,7 +1051,6 @@ impl AgentConfig {
             approval_reviewer_model: self.approvals.reviewer_model.clone(),
             approval_reviewer_effort: self.approvals.reviewer_effort.clone(),
             configured_model_gateways: self.configured_model_gateways(),
-            harness: self.capabilities.harness,
             compaction: self.compaction_budget_policy()?,
             warming: self.warming.mode,
             idle_compaction_min_context_tokens: self
@@ -1072,8 +1066,8 @@ impl AgentConfig {
     ///
     /// Deliberately not [`Self::local_agent_settings`]. A caller that runs a
     /// session on default capabilities must keep doing exactly that, so the
-    /// harness mode, the approval reviewer, and the configured gateways stay
-    /// at their defaults here. These two are different in kind: they are not
+    /// approval reviewer and the configured gateways stay at their defaults
+    /// here. These two are different in kind: they are not
     /// capability or credential decisions, they are the numbers a turn is
     /// measured against, and a session that ignores them silently runs on
     /// values the operator already replaced.
@@ -1671,17 +1665,14 @@ keep_recent_tokens = 250000
     /// ACP deliberately runs a session on default capabilities. The tempting
     /// cleanup is to make the narrow builder delegate to the full one: it
     /// compiles, it reads like deduplication, and it quietly hands every ACP
-    /// session the harness mode, the approval reviewer, and the configured
-    /// gateways -- endpoints and credentials included -- out of the operator's
+    /// session the approval reviewer and the configured gateways -- endpoints
+    /// and credentials included -- out of the operator's
     /// file. Nothing about that failure is visible in a diff. So this pins the
     /// narrowness itself: the two context numbers cross, and nothing else does.
     #[test]
     fn context_settings_carry_the_budget_and_leave_capabilities_alone() {
         let config: AgentConfig = toml::from_str(
             r#"
-[capabilities]
-harness = "native"
-
 [approvals]
 reviewer_model = "openai/gpt-5-mini"
 
@@ -1716,7 +1707,6 @@ base_url = "https://acme.example/v1"
         );
 
         // Everything an ACP session had already decided stays where it was.
-        assert_eq!(narrow.harness, defaults.harness);
         assert_eq!(
             narrow.approval_reviewer_model,
             defaults.approval_reviewer_model
@@ -1730,7 +1720,6 @@ base_url = "https://acme.example/v1"
         // The full builder does carry them, so the narrowing is a decision and
         // not an accident of a config that happened to be empty.
         let full = config.local_agent_settings().expect("full settings build");
-        assert_ne!(full.harness, defaults.harness);
         assert_eq!(
             full.approval_reviewer_model.as_deref(),
             Some("openai/gpt-5-mini")
@@ -2114,35 +2103,20 @@ reasoning_format = "deepseek"
         assert_eq!(config.extensions.default_access, ExtensionAccess::Trusted);
         assert_eq!(config.extensions.project_access, ExtensionAccess::Sandboxed);
         assert_eq!(config.extensions.native_access, NativeAccessPolicy::Prompt);
-        assert_eq!(config.capabilities.harness, borg_remote::HarnessMode::Borg);
     }
 
+    /// Borg has one tool surface. A file written while `harness` (or its
+    /// older `tool_mode` spelling) chose between surfaces must still load.
     #[test]
-    fn native_harness_is_configurable_without_changing_other_capabilities() {
-        let config: AgentConfig = toml::from_str(
-            r#"
-            [capabilities]
-            harness = "native"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(
-            config.capabilities.harness,
-            borg_remote::HarnessMode::Native
-        );
-        assert!(config.capabilities.subagents);
-
-        let migrated: AgentConfig = toml::from_str(
-            r#"
-            [capabilities]
-            tool_mode = "both"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(
-            migrated.capabilities.harness,
-            borg_remote::HarnessMode::Borg
-        );
+    fn retired_harness_settings_still_load() {
+        for setting in ["harness = \"native\"", "tool_mode = \"both\""] {
+            let config: AgentConfig = toml::from_str(&format!("[capabilities]\n{setting}\n"))
+                .unwrap_or_else(|error| panic!("{setting}: {error}"));
+            config
+                .validate()
+                .expect("a retired setting is not an error");
+            assert!(config.capabilities.subagents);
+        }
     }
 
     #[test]

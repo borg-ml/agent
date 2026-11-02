@@ -14,8 +14,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
-    CodingProvider, EventActor, HarnessMode, MessageStatus, PermissionMode, ResponseLanguage,
-    SessionEventKind, SessionStatus, WorkflowRuntime, native_harness::NativeHarness,
+    CodingProvider, EventActor, MessageStatus, PermissionMode, ResponseLanguage, SessionEventKind,
+    SessionStatus, WorkflowRuntime, native_harness::NativeHarness,
 };
 
 pub(crate) const CODING_SYSTEM_PROMPT: &str = "\
@@ -577,8 +577,6 @@ const IDLE_COMPACTION_PERCENT_OF_LIFETIME: f64 = 0.9;
 pub struct LocalAgentSettings {
     pub approval_reviewer_model: Option<String>,
     pub approval_reviewer_effort: Option<String>,
-    /// Model-facing harness selected before the session starts.
-    pub harness: HarnessMode,
     /// Host-local snapshot of named OpenAI-compatible routes. Secrets stay in
     /// memory and are never part of LaunchSession or durable events.
     pub configured_model_gateways: BTreeMap<String, borg_provider::provider::ModelGateway>,

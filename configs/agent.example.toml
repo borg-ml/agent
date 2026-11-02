@@ -47,8 +47,6 @@ claude_refusal_fallback = false
 # Codex answers on its own). `true` selects this default set, `false` always
 # delivers the bare text; e.g. ["claude"] frames every Claude model.
 steer_reply_prompt = ["claude-fable-5-1"]
-# `borg` is the default shell-first harness; `native` exposes direct tools.
-harness = "borg"
 # `shared_work`, `presence`, `cloud_sync`, `web_relay`, and `telemetry` are
 # reserved provider-neutral declarations in this CLI release. They do not
 # initialize a runtime or register tools yet.

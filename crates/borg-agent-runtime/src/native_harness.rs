@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     AgentTurn, AgentTurnControl, AgentTurnResult, ApprovalDecision, ApprovalResolution, EventActor,
-    ExecutionProvider, HarnessMode, MessageStatus, PermissionMode, SessionEventKind, SessionStatus,
+    ExecutionProvider, MessageStatus, PermissionMode, SessionEventKind, SessionStatus,
     agent::NativeCompactionProgress,
 };
 
@@ -255,7 +255,6 @@ pub(crate) struct NativeHarness {
     workflow_process_manager: crate::native_process::ProcessManager,
     reviewer_model: Option<String>,
     reviewer_effort: Option<String>,
-    harness: HarnessMode,
     /// Per-model compaction budgets from `[compaction]`. An empty policy
     /// resolves every model to the percentage defaults.
     compaction: CompactionBudgetPolicy,
@@ -283,7 +282,6 @@ impl std::fmt::Debug for NativeHarness {
             .field("workflow_process_manager", &"[session-owned processes]")
             .field("reviewer_model", &self.reviewer_model)
             .field("reviewer_effort", &self.reviewer_effort)
-            .field("harness", &self.harness)
             .finish()
     }
 }
@@ -297,7 +295,6 @@ impl Default for NativeHarness {
             workflow_process_manager: crate::native_process::ProcessManager::default(),
             reviewer_model: None,
             reviewer_effort: None,
-            harness: HarnessMode::Borg,
             compaction: CompactionBudgetPolicy::default(),
             configured_model_aliases: std::collections::BTreeSet::new(),
             configured_routes: Default::default(),
@@ -433,7 +430,6 @@ impl NativeHarness {
             execution_provider: Arc::new(crate::LocalExecutionProvider::new()),
             execution_provider_explicit: false,
             workflow_process_manager: crate::native_process::ProcessManager::default(),
-            harness: settings.harness,
             compaction: settings.compaction.clone(),
             configured_model_aliases: settings.configured_model_gateways.keys().cloned().collect(),
             configured_routes: Arc::new(std::sync::RwLock::new(
@@ -775,24 +771,16 @@ impl NativeHarness {
             root: turn.cwd.clone(),
             permission: turn.permission_mode,
             agent_tools: turn.agent_tools.clone(),
-            // The Borg harness exposes external MCP only through `borg call`,
-            // which starts servers lazily, so a turn never waits on them.
-            external_mcp_servers: match self.harness {
-                HarnessMode::Borg => Vec::new(),
-                HarnessMode::Native => turn.external_mcp_servers.clone(),
-            },
             extension_skill_roots: turn.extension_skill_roots.clone(),
             execution_provider: turn.agent_tools.execution_provider(),
             session_store,
-            harness: self.harness,
             workflow_process_manager: self.workflow_process_manager.clone(),
         })
         .await?;
         let tools = runtime.tool_definitions(turn.provider)?;
         let mut messages = Vec::with_capacity(turn.conversation.len().saturating_add(3));
         let mut system_prompt = super::agent::CODING_SYSTEM_PROMPT.to_string();
-        match self.harness {
-            HarnessMode::Borg => system_prompt.push_str(concat!(
+        system_prompt.push_str(concat!(
                 "\n\nBorg runs commands through `exec`, and code whose variables should survive between calls through `runtime_exec` (a persistent Python or Bun namespace with `borg` preloaded). ",
                 "Include a short `action` summary first in every tool call so the live UI can display it while the remaining arguments stream. ",
                 "Use shell commands for orchestration and invoke the language or installed runtime that best fits the problem, such as TypeScript/JavaScript for web and JSON work or Python for data and scientific work. ",
@@ -800,51 +788,20 @@ impl NativeHarness {
                 "Use `borg tools` to discover Borg, Blu, plugin, history, workflow, and collaboration capabilities on demand, and `borg call NAME JSON` to invoke one; from code, the preloaded `borg` global in Python or Bun (`borg.send_message(target=..., message=...)`, raising `borg.BorgError`) does the same without quoting or subprocesses; it is already in the namespace, so `import borg` will not work. ",
                 "Inside commands, `$BORG_AGENT_CLI` is the exact Borg executable when `borg` is not on PATH. Keep intermediate data in files, pipes, or programs and return only useful results. ",
                 "To actually see an image, run `borg image FILE` on a PNG or JPEG; printing base64 to stdout does not work, because shell output is truncated and arrives as text."
-            )),
-            HarnessMode::Native => system_prompt.push_str(concat!(
-                "\n\nUse the available Borg capabilities directly. `exec_command` runs trusted user-authority shell commands and can invoke any installed language runtime. ",
-                "Include a short `action` summary first in every tool call so the live UI can display it while the remaining arguments stream. ",
-                "Use `query_history` when compacted context is insufficient."
-            )),
-        }
-        if self.harness == HarnessMode::Borg {
-            // Stable for the session, so it stays in the cached prefix.
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(&crate::capability_catalog::prompt_listing(
-                &turn.agent_tools.mcp_specs(false),
-                CAPABILITY_LISTING_BUDGET_CHARS,
-            ));
-        }
-        // The three parts of the leading instructions that genuinely vary
+        ));
+        // Stable for the session, so it stays in the cached prefix.
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&crate::capability_catalog::prompt_listing(
+            &turn.agent_tools.mcp_specs(false),
+            CAPABILITY_LISTING_BUDGET_CHARS,
+        ));
+        // The parts of the leading instructions that genuinely vary
         // mid-conversation are collected rather than appended, so a lane that
         // can carry them in conversation position keeps its cached prefix.
         let skills_slot = runtime.context.prompt_appendix();
-        let mut mcp_slot = String::new();
-        for failure in &runtime.mcp.startup_failures {
-            let (server, error) = (&failure.server, &failure.error);
-            // The model needs to know the tools are missing on every turn. The
-            // user only needs to hear about it when the situation changed, so
-            // an unreachable optional server does not reprint a warning each
-            // turn while it stays unreachable.
-            if failure.notify {
-                let message = format!(
-                    "MCP server {server} unavailable; continuing without its tools. {error}"
-                );
-                send(
-                    &events,
-                    SessionEventKind::ProviderEvent {
-                        provider: turn.provider,
-                        kind: "mcp_server_unavailable".to_string(),
-                        payload: json!({"server": server, "error": error, "message": message}),
-                    },
-                )
-                .await;
-            }
-            mcp_slot.push_str(&format!("\nExternal MCP server {} is unavailable for this turn. Its tools are not available; do not claim to have used them.", serde_json::to_string(server)?));
-        }
         // Exactly the concatenation this used to splice into the head, kept
         // byte-identical so a lane that still carries it there is unchanged.
-        let mut varying_instructions = format!("{skills_slot}{mcp_slot}");
+        let mut varying_instructions = skills_slot.clone();
         if !turn.system_prompt_appendix.is_empty() {
             varying_instructions.push_str("\n\n");
             varying_instructions.push_str(&turn.system_prompt_appendix);
@@ -852,10 +809,6 @@ impl NativeHarness {
         let declarations = crate::prompt_context::Declarations::capture(
             [
                 (crate::prompt_context::InstructionSlot::Skills, skills_slot),
-                (
-                    crate::prompt_context::InstructionSlot::McpUnavailable,
-                    mcp_slot,
-                ),
                 (
                     crate::prompt_context::InstructionSlot::Appendix,
                     turn.system_prompt_appendix.clone(),
@@ -3751,20 +3704,16 @@ struct NativeToolRuntimeConfig {
     root: PathBuf,
     permission: PermissionMode,
     agent_tools: crate::AgentToolDispatcher,
-    external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
     extension_skill_roots: Vec<PathBuf>,
     execution_provider: Arc<dyn ExecutionProvider>,
     session_store: Option<std::sync::Arc<dyn crate::SessionStore>>,
-    harness: HarnessMode,
     workflow_process_manager: crate::native_process::ProcessManager,
 }
 
 struct NativeToolRuntime {
     permission: PermissionMode,
     agent_tools: crate::AgentToolDispatcher,
-    mcp: Arc<crate::native_mcp::NativeMcpRuntime>,
     context: Arc<crate::native_context::NativeContext>,
-    harness: HarnessMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3793,25 +3742,10 @@ impl NativeToolRuntime {
             .await?,
         );
         config.agent_tools.configure_native_context(context.clone());
-        let mcp = Arc::new(
-            crate::native_mcp::NativeMcpRuntime::start(
-                config.session_id,
-                config.external_mcp_servers,
-            )
-            .await?,
-        );
-        if config.harness == HarnessMode::Native {
-            config
-                .agent_tools
-                .configure_native_mcp_runtime(mcp.clone())
-                .await;
-        }
         Ok(Self {
             permission: config.permission,
             agent_tools: config.agent_tools,
-            mcp,
             context,
-            harness: config.harness,
         })
     }
 
@@ -3819,52 +3753,28 @@ impl NativeToolRuntime {
         &self,
         provider: crate::CodingProvider,
     ) -> Result<Vec<ModelToolDefinition>> {
-        let mut definitions = match self.harness {
-            // The curated surface is the default, so a model on defaults gets
-            // these too: the promoted capabilities it is expected to reach for,
-            // and one tool that reaches everything else. Without them the only
-            // route out is the shell, and the shell is how a model spends turns
-            // rediscovering what the catalog already knows.
-            HarnessMode::Borg => {
-                let mut definitions = vec![exec_tool_definition()?];
-                definitions.extend(
-                    crate::subagents::promoted_specs(&self.agent_tools.mcp_specs(false))
-                        .iter()
-                        .map(ModelToolDefinition::from_mcp_spec)
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(anyhow::Error::msg)?,
-                );
-                definitions.push(
-                    ModelToolDefinition::from_mcp_spec(&crate::subagents::runtime_exec_spec())
-                        .map_err(anyhow::Error::msg)?,
-                );
-                definitions
-            }
-            HarnessMode::Native => self.native_tool_catalog()?,
-        };
+        // The promoted capabilities a model is expected to reach for, and one
+        // tool that reaches everything else. Without them the only route out
+        // is the shell, and the shell is how a model spends turns rediscovering
+        // what the catalog already knows.
+        let mut definitions = vec![exec_tool_definition()?];
+        definitions.extend(
+            crate::subagents::promoted_specs(&self.agent_tools.mcp_specs(false))
+                .iter()
+                .map(ModelToolDefinition::from_mcp_spec)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(anyhow::Error::msg)?,
+        );
+        definitions.push(
+            ModelToolDefinition::from_mcp_spec(&crate::subagents::runtime_exec_spec())
+                .map_err(anyhow::Error::msg)?,
+        );
         for definition in &mut definitions {
             add_action_metadata(definition)?;
         }
         if provider == crate::CodingProvider::Claude {
             definitions.push(send_user_message_definition()?);
         }
-        sort_tool_definitions(&mut definitions);
-        validate_tool_definitions(&definitions)?;
-        Ok(definitions)
-    }
-
-    fn native_tool_catalog(&self) -> Result<Vec<ModelToolDefinition>> {
-        let mut specs = builtin_tool_specs();
-        if self.context.has_skills() {
-            specs.push(self.context.skill_tool_spec());
-        }
-        let mut definitions = specs
-            .into_iter()
-            .chain(self.agent_tools.specs())
-            .chain([crate::subagents::runtime_exec_spec()])
-            .map(|spec| ModelToolDefinition::from_mcp_spec(&spec).map_err(anyhow::Error::msg))
-            .collect::<Result<Vec<_>>>()?;
-        definitions.extend_from_slice(self.mcp.definitions());
         sort_tool_definitions(&mut definitions);
         validate_tool_definitions(&definitions)?;
         Ok(definitions)
@@ -4558,7 +4468,6 @@ async fn execute_tool(
             return Ok((output, is_error, carried));
         }
     }
-    let external_mcp = runtime.mcp.contains(&tool_call.function.name);
     let shell_command = match tool_call.function.name.as_str() {
         "exec_command" | "exec" => input.get("cmd").and_then(Value::as_str).map(str::to_string),
         "watch" => input
@@ -4589,7 +4498,6 @@ async fn execute_tool(
             tool_call.function.name.as_str(),
             "run_workflow" | "run_blu_workflow" | "run_blu_extension"
         )
-        || external_mcp
         || mutating_builtin.is_some()
         || !trusted_settings.is_empty())
         && runtime.permission != PermissionMode::FullAccess
@@ -4777,8 +4685,7 @@ async fn execute_tool(
         tool_call.function.name.as_str(),
         "exec" | "exec_command" | "runtime_exec"
     );
-    let call_cancel = (external_mcp
-        || effectful_batch
+    let call_cancel = (effectful_batch
         || matches!(
             tool_call.function.name.as_str(),
             "run_workflow"
@@ -7694,11 +7601,6 @@ mod tests {
             let runtime = NativeToolRuntime {
                 permission: PermissionMode::Manual,
                 agent_tools: dispatcher.clone(),
-                mcp: Arc::new(
-                    crate::native_mcp::NativeMcpRuntime::start(session_id, Vec::new())
-                        .await
-                        .unwrap(),
-                ),
                 context: Arc::new(
                     crate::native_context::NativeContext::load(
                         root.path().to_path_buf(),
@@ -7707,7 +7609,6 @@ mod tests {
                     .await
                     .unwrap(),
                 ),
-                harness: HarnessMode::Borg,
             };
             let call = ModelToolCall::function("edited".into(), tool.into(), original.to_string());
             let (control_tx, control_rx) = mpsc::channel(1);
@@ -7802,11 +7703,6 @@ mod tests {
             let runtime = NativeToolRuntime {
                 permission: PermissionMode::FullAccess,
                 agent_tools: dispatcher.clone(),
-                mcp: Arc::new(
-                    crate::native_mcp::NativeMcpRuntime::start(session_id, Vec::new())
-                        .await
-                        .unwrap(),
-                ),
                 context: Arc::new(
                     crate::native_context::NativeContext::load(
                         root.path().to_path_buf(),
@@ -7815,7 +7711,6 @@ mod tests {
                     .await
                     .unwrap(),
                 ),
-                harness: HarnessMode::Borg,
             };
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let code = format!(
@@ -8312,7 +8207,6 @@ mod tests {
             });
             let harness = NativeHarness {
                 model_client: client.clone(),
-                harness: HarnessMode::Native,
                 ..NativeHarness::default()
             };
             let turn = AgentTurn {
@@ -8362,12 +8256,7 @@ mod tests {
                     crate::native_process::ProcessManager::default(),
                     PermissionMode::FullAccess,
                 ),
-                external_mcp_servers: vec![borg_provider::mcp::ExternalMcpServer {
-                    name: "unavailable".to_string(),
-                    command: "sh".to_string(),
-                    args: vec!["-c".to_string(), "exit 127".to_string()],
-                    ..Default::default()
-                }],
+                external_mcp_servers: Vec::new(),
                 runtime_mcp_context: Default::default(),
                 runtime_provider_context: None,
                 extension_skill_roots: Vec::new(),
@@ -8387,13 +8276,9 @@ mod tests {
             let task =
                 tokio::spawn(async move { harness.run(turn, events_tx, Some(controls_rx)).await });
             let mut controlled = false;
-            let mut warned = false;
             let mut steer_ack = None;
             tokio::time::timeout(Duration::from_secs(10), async {
                 while let Some(event) = events_rx.recv().await {
-                    if matches!(&event, SessionEventKind::ProviderEvent { kind, .. } if kind == "mcp_server_unavailable") {
-                        warned = true;
-                    }
                     if let SessionEventKind::ProviderEvent { kind, payload, .. } = event
                         && kind == "native_model_message"
                         && matches!(
@@ -8404,12 +8289,24 @@ mod tests {
                         assert!(!controlled);
                         controlled = true;
                         if speed_toggle {
-                            store.append(SessionEvent::new(session_id, 0, SessionEventKind::SessionConfigured {
-                                cwd: cwd.clone(), provider: crate::CodingProvider::OpenRouter,
-                                model: Some("test-model".into()), effort: None,
-                                fast: false, ultrafast: false, response_language: crate::ResponseLanguage::Auto,
-                                permission_mode: PermissionMode::FullAccess, speed_support: Default::default(),
-                            })).await.unwrap();
+                            store
+                                .append(SessionEvent::new(
+                                    session_id,
+                                    0,
+                                    SessionEventKind::SessionConfigured {
+                                        cwd: cwd.clone(),
+                                        provider: crate::CodingProvider::OpenRouter,
+                                        model: Some("test-model".into()),
+                                        effort: None,
+                                        fast: false,
+                                        ultrafast: false,
+                                        response_language: crate::ResponseLanguage::Auto,
+                                        permission_mode: PermissionMode::FullAccess,
+                                        speed_support: Default::default(),
+                                    },
+                                ))
+                                .await
+                                .unwrap();
                             continue;
                         }
                         let control = if interrupt {
@@ -8433,10 +8330,6 @@ mod tests {
             })
             .await
             .expect("tool loop should finish after control");
-            assert!(
-                warned,
-                "unavailable MCP tools must be reported without aborting the model/tool loop"
-            );
             assert!(
                 controlled,
                 "first result must be emitted while the batch is active"
@@ -10716,7 +10609,6 @@ mod tests {
     ) -> (Vec<SessionEventKind>, bool) {
         let harness = NativeHarness {
             model_client,
-            harness: HarnessMode::Native,
             ..NativeHarness::default()
         };
         let turn = AgentTurn {
@@ -12381,7 +12273,6 @@ mod tests {
         });
         let harness = NativeHarness {
             model_client: client.clone(),
-            harness: HarnessMode::Native,
             ..NativeHarness::default()
         };
         let turn = AgentTurn {
@@ -12590,7 +12481,6 @@ mod tests {
             });
             let harness = NativeHarness {
                 model_client: client.clone(),
-                harness: HarnessMode::Native,
                 ..NativeHarness::default()
             };
             let turn = AgentTurn {
@@ -12850,7 +12740,6 @@ mod tests {
             });
             let harness = NativeHarness {
                 model_client: client.clone(),
-                harness: HarnessMode::Native,
                 ..NativeHarness::default()
             };
             let turn = AgentTurn {
@@ -13805,7 +13694,6 @@ mod tests {
                 model_client: client.clone(),
                 // `exec` is the Borg catalog's tool; the native catalog spells it
                 // `exec_command`, and this test needs the command to really run.
-                harness: HarnessMode::Borg,
                 ..NativeHarness::default()
             };
             let turn = AgentTurn {

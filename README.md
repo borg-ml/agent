@@ -116,9 +116,6 @@ and keeps the host's approval, confirmation and cancellation checks.
 - Web search works with Exa, Firecrawl, Parallel and Brave backends; see
   [web search](docs/web-search.md).
 
-Set `capabilities.harness = "native"` to expose one tool per capability
-instead of the shell-first surface.
-
 ### Images
 
 `borg image PATH` shows an image to the model. The `show_image` tool shows

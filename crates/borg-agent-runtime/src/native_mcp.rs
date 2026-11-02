@@ -36,16 +36,11 @@ pub(crate) struct NativeMcpRuntime {
     pub(crate) startup_failures: Vec<McpStartupFailure>,
 }
 
-/// One server that has no tools this turn.
-///
-/// `notify` separates a fresh launch attempt from a failure already reported:
-/// the model is told about the missing tools on every turn, while the user
-/// sees a warning only when something actually changed (a first failure, a
-/// changed configuration, or a real retry after the cooldown).
+/// One configured server that failed to start, so a call to one of its tools
+/// can say why it is missing.
 pub(crate) struct McpStartupFailure {
     pub(crate) server: String,
     pub(crate) error: String,
-    pub(crate) notify: bool,
 }
 
 #[derive(Clone)]
@@ -81,7 +76,6 @@ impl NativeMcpRuntime {
                 startup_failures.push(McpStartupFailure {
                     server: server.name,
                     error: remembered,
-                    notify: false,
                 });
                 continue;
             }
@@ -101,11 +95,10 @@ impl NativeMcpRuntime {
                 Err(error) => {
                     let error = truncate(&format!("{error:#}"), 2048).to_string();
                     tracing::warn!(server = %server.name, %error, "external MCP server unavailable; continuing without its tools");
-                    let notify = remember_startup_failure(session_id, &server, &error);
+                    remember_startup_failure(session_id, &server, &error);
                     startup_failures.push(McpStartupFailure {
                         server: server.name,
                         error,
-                        notify,
                     });
                     continue;
                 }
@@ -160,10 +153,6 @@ impl NativeMcpRuntime {
         &self.definitions
     }
 
-    pub(crate) fn contains(&self, name: &str) -> bool {
-        self.tools.contains_key(name) || self.tools.contains_key(&normalize_tool_name(name))
-    }
-
     pub(crate) async fn call(
         &self,
         name: &str,
@@ -175,7 +164,18 @@ impl NativeMcpRuntime {
             .tools
             .get(name)
             .or_else(|| self.tools.get(&canonical_name))
-            .with_context(|| format!("unknown native MCP tool `{name}`"))?;
+            .with_context(|| {
+                let unavailable = self.startup_failures.iter().find(|failure| {
+                    canonical_name.starts_with(&external_tool_name(&failure.server, ""))
+                });
+                match unavailable {
+                    Some(failure) => format!(
+                        "MCP server `{}` is unavailable, so `{name}` cannot run: {}",
+                        failure.server, failure.error
+                    ),
+                    None => format!("unknown native MCP tool `{name}`"),
+                }
+            })?;
         let mut client = self.clients[tool.client_index].lock().await;
         let result = client.call_tool(&tool.wire_name, arguments, cancel).await;
         if cancel.is_some_and(CancellationToken::is_cancelled) {
@@ -794,19 +794,13 @@ fn recent_startup_failure(session_id: uuid::Uuid, server: &ExternalMcpServer) ->
     ))
 }
 
-fn remember_startup_failure(
-    session_id: uuid::Uuid,
-    server: &ExternalMcpServer,
-    error: &str,
-) -> bool {
+fn remember_startup_failure(session_id: uuid::Uuid, server: &ExternalMcpServer, error: &str) {
     let Ok(mut failures) = STARTUP_FAILURES.lock() else {
-        return true;
+        return;
     };
     let key = startup_key(session_id, server);
-    let notify = failures
-        .remove(&key)
-        .is_none_or(|(_, previous)| previous != error);
-    // Keep the previous cause across cooldowns, but bound configuration history.
+    failures.remove(&key);
+    // Bound configuration history.
     while failures.len() >= MAX_REMEMBERED_STARTUP_FAILURES {
         let Some(oldest) = failures
             .iter()
@@ -818,7 +812,6 @@ fn remember_startup_failure(
         failures.remove(&oldest);
     }
     failures.insert(key, (std::time::Instant::now(), error.to_string()));
-    notify
 }
 
 fn clear_startup_failure(session_id: uuid::Uuid, server: &ExternalMcpServer) {
@@ -930,9 +923,12 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"isError":true,"content":[{"typ
         .unwrap();
         assert_eq!(runtime.startup_failures.len(), 1);
         assert_eq!(runtime.startup_failures[0].server, "unavailable");
-        assert!(runtime.contains("mcp__fake_server__map_generate"));
-        assert!(!runtime.contains("mcp__fake_server__hidden"));
         assert_eq!(runtime.definitions().len(), 1);
+        assert_eq!(
+            runtime.definitions()[0].name,
+            "mcp__fake_server__map_generate",
+            "only the allowed tool is exposed"
+        );
         let result = runtime
             .call(
                 "mcp__fake_server__map.generate",
@@ -973,7 +969,6 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"isError":true,"content":[{"typ
         assert_eq!(runtime.definitions().len(), 0);
         let failure = runtime.startup_failures.first().expect("startup failure");
         let (name, error) = (&failure.server, &failure.error);
-        assert!(failure.notify, "a fresh failure warns the user");
         assert_eq!(name, "surf-lab__lab");
         assert!(
             error.contains("no fresh surf_lab executable found"),
@@ -982,6 +977,15 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"isError":true,"content":[{"typ
         assert!(
             error.contains("127"),
             "failure should report the exit status: {error}"
+        );
+        let call = runtime
+            .call("mcp__surf_lab__lab__generate", json!({}), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            call.contains("`surf-lab__lab` is unavailable") && call.contains("no fresh surf_lab"),
+            "a call to the failed server's tool must say why it is missing: {call}"
         );
     }
 
@@ -1045,10 +1049,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"isError":true,"content":[{"typ
             .unwrap();
         let after_first = launch_count(directory.path(), "launches");
         assert!(after_first >= 1, "the first attempt launches the server");
-        assert!(first.startup_failures[0].notify, "first failure warns");
+        assert_eq!(first.startup_failures.len(), 1);
 
-        // Same configuration inside the cooldown: reported, but not relaunched
-        // and not re-warned.
+        // Same configuration inside the cooldown: reported, but not relaunched.
         let second = NativeMcpRuntime::start(session, vec![server(original.clone())])
             .await
             .unwrap();
@@ -1058,10 +1061,6 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"isError":true,"content":[{"typ
             "a remembered failure must not pay the launch cost again"
         );
         assert_eq!(second.startup_failures.len(), 1, "still reported");
-        assert!(
-            !second.startup_failures[0].notify,
-            "a cached failure must not warn the user again"
-        );
         assert!(
             second.startup_failures[0].error.contains("no fresh binary"),
             "the cached report keeps the real cause: {}",
@@ -1079,7 +1078,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"isError":true,"content":[{"typ
             after_change > after_first,
             "a changed configuration retries at once"
         );
-        assert!(third.startup_failures[0].notify, "a retry warns again");
+        assert_eq!(third.startup_failures.len(), 1);
 
         // An expired cooldown retries the unchanged configuration.
         STARTUP_FAILURES
@@ -1088,34 +1087,13 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"isError":true,"content":[{"typ
             .get_mut(&startup_key(session, &server(original.clone())))
             .expect("the original failure remains cached")
             .0 = std::time::Instant::now() - STARTUP_FAILURE_COOLDOWN;
-        let fourth = NativeMcpRuntime::start(session, vec![server(original.clone())])
+        NativeMcpRuntime::start(session, vec![server(original)])
             .await
             .unwrap();
         assert!(
             launch_count(directory.path(), "launches") > after_change,
             "an expired cooldown retries"
         );
-        assert!(
-            !fourth.startup_failures[0].notify,
-            "an unchanged cause must not warn again"
-        );
-        let server = server(original);
-        assert!(remember_startup_failure(
-            session,
-            &server,
-            "different cause"
-        ));
-        assert!(!remember_startup_failure(
-            session,
-            &server,
-            "different cause"
-        ));
-        clear_startup_failure(session, &server);
-        assert!(remember_startup_failure(
-            session,
-            &server,
-            "different cause"
-        ));
     }
 
     #[tokio::test]
@@ -1243,7 +1221,12 @@ esac
         )
         .await
         .unwrap();
-        assert!(runtime.contains("mcp__modern_server__echo"));
+        assert!(
+            runtime
+                .definitions()
+                .iter()
+                .any(|definition| definition.name == "mcp__modern_server__echo")
+        );
         let result = runtime
             .call(
                 "mcp__modern_server__echo",

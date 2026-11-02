@@ -1994,13 +1994,6 @@ impl AgentToolDispatcher {
             .clone())
     }
 
-    pub(crate) async fn configure_native_mcp_runtime(
-        &self,
-        runtime: Arc<crate::native_mcp::NativeMcpRuntime>,
-    ) {
-        self.runtime_mcp.lock().await.runtime = Some(runtime);
-    }
-
     pub(crate) async fn runtime_mcp_tools(&self) -> Result<Value> {
         Ok(serde_json::to_value(
             self.native_mcp_runtime().await?.definitions(),
