@@ -75,7 +75,7 @@ pub enum ModelProviderState {
     },
     AnthropicMessages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        thread: Option<AnthropicMessageThread>,
+        thread: Option<Box<AnthropicMessageThread>>,
         content: Vec<Value>,
         /// Display-only indexes into `content`; absent in older saved states.
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -224,7 +224,7 @@ impl ThreadRequest {
             self.cursor.previous_message_id = response["id"].as_str().map(str::to_owned);
         }
         self.cursor.replayed &= self.wire["thread"]["type"] == "create";
-        *thread = Some(self.cursor);
+        *thread = Some(Box::new(self.cursor));
     }
 }
 

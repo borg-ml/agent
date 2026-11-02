@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.20.1)
 
+- Fix the release Clippy check failing on the size of stored Claude message-thread
+  state, without changing the saved conversation format.
+
 - Native Claude subscription and Anthropic API-key routes support message
   threads with `BORG_CLAUDE_MESSAGE_THREADS=1`: active sessions upload only new
   turns, with full-history recovery after expiry and safe restarts after context
