@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.20.0)
 
+- Codex shows tool-call generation as soon as the provider announces the call,
+  even if its name and arguments have not arrived yet, rather than hiding that
+  preparation until argument text starts streaming.
+
 ## 0.20.0 (2026-11-02)
 
 - Thread titles have their own model and reasoning settings, like commit

@@ -1488,9 +1488,7 @@ impl ResponseState {
                 let arguments = item["arguments"].as_str().unwrap_or_default();
                 self.calls
                     .insert(id.into(), (call_id.into(), name.into(), arguments.into()));
-                if (!name.is_empty() || !arguments.is_empty())
-                    && self.generating.insert(call_id.into())
-                {
+                if self.generating.insert(call_id.into()) {
                     emit(ProviderProgress::ToolCallGenerating {
                         id: Some(call_id.into()),
                     });
@@ -3075,6 +3073,10 @@ mod tests {
         assert!(!error.contains("private-"));
         assert!(matches!(
             events.try_recv().unwrap(),
+            ProviderProgress::ToolCallInputDelta { .. }
+        ));
+        assert!(matches!(
+            events.try_recv().unwrap(),
             ProviderProgress::ProviderEvent { kind, payload, raw_payload, .. }
                 if kind == "native_model_terminal_failure"
                     && payload == json!({
@@ -3145,7 +3147,7 @@ mod tests {
     }
 
     #[test]
-    fn native_tool_input_progress_ignores_empty_and_refreshes_after_generation() {
+    fn native_tool_input_progress_starts_at_call_announcement_and_ignores_empty_deltas() {
         let (progress, mut events) = mpsc::unbounded_channel();
         let mut state = ResponseState::default();
         for event in [
@@ -3161,6 +3163,10 @@ mod tests {
         assert!(matches!(
             events.try_recv(),
             Ok(ProviderProgress::ToolCallGenerating { id: Some(id) }) if id == "call"
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ProviderProgress::ToolCallInputDelta { id: Some(id) }) if id == "call"
         ));
         assert!(matches!(
             events.try_recv(),
@@ -3641,7 +3647,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_character_precedes_complete_arguments_and_native_output_survives_replay() {
+    async fn call_announcement_precedes_arguments_and_native_output_survives_replay() {
         tokio::time::timeout(Duration::from_secs(10), async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
@@ -3696,7 +3702,7 @@ mod tests {
                 assert_eq!(body["input"][0]["type"], "additional_tools");
                 assert_eq!(body["input"][0]["tools"][0]["name"], "inspect");
                 socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
-                // Metadata and reasoning cannot cause speculative generation.
+                // An explicit call announcement is generation, even before its first argument.
                 for event in [
                     json!({"type":"response.output_item.added","item":{"type":"function_call","id":"item","call_id":"call","name":"","arguments":""}}),
                     json!({"type":"response.function_call_arguments.delta","item_id":"item","delta":""}),
@@ -3743,10 +3749,12 @@ mod tests {
                     if kind == "native_model_transport" && payload["phase"] == phase
                         && payload["request_id"] == "test-request" && payload["read_ms"].is_u64()));
             }
+            assert!(matches!(rx.recv().await.unwrap(), ProviderProgress::ToolCallGenerating { id: Some(id) } if id == "call"));
             assert!(matches!(rx.recv().await.unwrap(), ProviderProgress::ProviderEvent { kind, .. } if kind == "reasoning_delta"));
             assert!(rx.try_recv().is_err());
+            assert!(!read.is_finished(), "generation must be visible before any argument arrives");
             first_tx.send(()).unwrap();
-            assert!(matches!(rx.recv().await.unwrap(), ProviderProgress::ToolCallGenerating { id: Some(id) } if id == "call"));
+            assert!(matches!(rx.recv().await.unwrap(), ProviderProgress::ToolCallInputDelta { id: Some(id) } if id == "call"));
             assert!(!read.is_finished(), "complete arguments must still be withheld");
             finish_tx.send(()).unwrap();
             let (message, raw) = read.await.unwrap().unwrap();
