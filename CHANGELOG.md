@@ -11,6 +11,9 @@ Git comparison.
   Console credits, and the footer and `/usage` follow the choice. Both
   credentials are kept. Previously a stored key was ignored while a Claude
   login existed.
+- The Anthropic API route sends adaptive thinking with the selected effort to
+  models that require it, instead of a thinking budget they reject with
+  HTTP 400.
 
 ## 0.20.2 (2026-11-02)
 

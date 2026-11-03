@@ -462,8 +462,22 @@ pub(crate) fn messages_request_body(
                 .collect(),
         );
     }
-    if let Some(budget) = thinking_budget(effort) {
-        body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+    match (thinking_budget(effort), adaptive_thinking(model)) {
+        // Current models reject a thinking budget: they think adaptively and
+        // take the effort level instead.
+        (budget, Some((required, efforts))) if budget.is_some() || required => {
+            body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
+            if let Some(effort) = effort
+                .map(str::trim)
+                .filter(|effort| efforts.iter().any(|level| level == effort))
+            {
+                body["output_config"] = json!({ "effort": effort });
+            }
+        }
+        (Some(budget), _) => {
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+        }
+        (None, _) => {}
     }
     body
 }
@@ -706,6 +720,21 @@ fn fitted_image(attachment: &super::ModelInputAttachment) -> (String, String) {
     }
     cache.insert(key, fitted.clone());
     fitted
+}
+
+/// For a model that thinks adaptively: whether thinking is required, and the
+/// effort levels it accepts.
+#[cfg(feature = "claude")]
+fn adaptive_thinking(model: &str) -> Option<(bool, Vec<String>)> {
+    super::claude_subscription_protocol::source_model_facts(model, &[])
+        .map(|facts| facts.capabilities)
+        .filter(|capabilities| capabilities.adaptive_thinking)
+        .map(|capabilities| (capabilities.thinking_required, capabilities.efforts))
+}
+
+#[cfg(not(feature = "claude"))]
+fn adaptive_thinking(_model: &str) -> Option<(bool, Vec<String>)> {
+    None
 }
 
 /// Whether extended thinking is requested, and the budget it may spend.
@@ -1840,6 +1869,19 @@ mod tests {
             &request(vec![ModelMessage::user("think")], Vec::new()),
         );
         assert!(off.get("thinking").is_none());
+
+        // Current models reject a budget and take adaptive thinking plus effort.
+        #[cfg(feature = "claude")]
+        {
+            let adaptive = messages_request_body(
+                "claude-opus-5-5",
+                Some("high"),
+                &request(vec![ModelMessage::user("think")], Vec::new()),
+            );
+            assert_eq!(adaptive["thinking"]["type"], json!("adaptive"));
+            assert!(adaptive["thinking"].get("budget_tokens").is_none());
+            assert_eq!(adaptive["output_config"]["effort"], json!("high"));
+        }
     }
 
     #[test]
