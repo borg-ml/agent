@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.20.2)
+## Unreleased (since 0.20.3)
+
+## 0.20.3 (2026-11-03)
 
 - The Anthropic API route takes a Claude model's context window from the
   models.dev catalog (1M for current Opus, Sonnet and Haiku) instead of a
