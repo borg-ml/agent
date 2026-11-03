@@ -579,8 +579,7 @@ impl NativeHarness {
                 return Ok(crate::SpeedSupport { fast, ultrafast });
             }
             // The Messages API lane offers no speed tiers.
-            crate::CodingProvider::Claude
-                if borg_provider::credentials::claude_uses_api_key() => {}
+            crate::CodingProvider::Claude if borg_provider::credentials::claude_uses_api_key() => {}
             crate::CodingProvider::Claude => {
                 let fast = borg_provider::provider::ClaudeModelProvider {
                     model: model.to_string(),
