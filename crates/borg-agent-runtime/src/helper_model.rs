@@ -108,7 +108,7 @@ pub async fn helper_model_text(
     let turn = async {
         match provider {
             #[cfg(feature = "subscription-adapters")]
-            CodingProvider::Claude => {
+            CodingProvider::Claude if !borg_provider::credentials::claude_uses_api_key() => {
                 let account = ClaudeModelProvider::account_identity(None).await.ok()?;
                 ClaudeModelProvider {
                     model: model.model_id().to_string(),
@@ -130,7 +130,10 @@ pub async fn helper_model_text(
                 .await
                 .ok()
             }
-            CodingProvider::Anthropic => {
+            CodingProvider::Anthropic | CodingProvider::Claude
+                if provider == CodingProvider::Anthropic
+                    || borg_provider::credentials::claude_uses_api_key() =>
+            {
                 let key = borg_provider::credentials::api_key(
                     borg_provider::credentials::ApiKeyCredential::Anthropic,
                 )?;

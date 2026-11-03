@@ -578,6 +578,9 @@ impl NativeHarness {
                 .await?;
                 return Ok(crate::SpeedSupport { fast, ultrafast });
             }
+            // The Messages API lane offers no speed tiers.
+            crate::CodingProvider::Claude
+                if borg_provider::credentials::claude_uses_api_key() => {}
             crate::CodingProvider::Claude => {
                 let fast = borg_provider::provider::ClaudeModelProvider {
                     model: model.to_string(),
@@ -649,6 +652,18 @@ impl NativeHarness {
         }
         if provider == crate::CodingProvider::OpenCode {
             return self.with_opencode_go_access(model, access).await;
+        }
+        if provider == crate::CodingProvider::Claude
+            && borg_provider::credentials::claude_uses_api_key()
+        {
+            return Ok(Self {
+                model_client: Arc::new(ProviderModelClient {
+                    claude_api_key: true,
+                    access: Some(access.clone()),
+                    ..ProviderModelClient::default()
+                }),
+                ..self.clone()
+            });
         }
         #[cfg(not(feature = "subscription-adapters"))]
         let _ = (provider, access);
@@ -2935,6 +2950,9 @@ struct ProviderModelClient {
     claude_config_dir: Option<std::path::PathBuf>,
     #[cfg(feature = "subscription-adapters")]
     claude_refusal_fallback: bool,
+    /// Claude turns were bound to the stored Anthropic API key, chosen as the
+    /// Claude billing lane, instead of the subscription login.
+    claude_api_key: bool,
     access: Option<crate::ModelAccessContext>,
 }
 
@@ -2981,6 +2999,10 @@ impl ProviderModelClient {
         provider: crate::CodingProvider,
         model: &str,
     ) -> std::result::Result<NativeRoute<'_>, NotNative> {
+        // A Claude session bound to its API-key lane bills the Messages API.
+        if provider == crate::CodingProvider::Claude && self.claude_api_key {
+            return Ok(NativeRoute::AnthropicMessages);
+        }
         #[cfg(feature = "subscription-adapters")]
         if provider == crate::CodingProvider::Claude
             && let Some(account) = self.claude_account.as_deref()
@@ -9555,6 +9577,22 @@ mod tests {
                 &[],
             )
         );
+    }
+
+    // A Claude session bound to the API-key lane must bill the Messages API,
+    // never the subscription, even when a subscription account is known.
+    #[test]
+    fn claude_api_key_choice_routes_to_the_messages_api() {
+        let client = ProviderModelClient {
+            #[cfg(feature = "subscription-adapters")]
+            claude_account: Some("selected-claude".into()),
+            claude_api_key: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            client.route(crate::CodingProvider::Claude, "claude-opus-5"),
+            Ok(NativeRoute::AnthropicMessages)
+        ));
     }
 
     #[cfg(feature = "subscription-adapters")]

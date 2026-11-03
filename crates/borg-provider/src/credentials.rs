@@ -205,6 +205,24 @@ pub fn set_openai_auth_mode(mode: OpenAiAuthMode) -> Result<PathBuf> {
     )
 }
 
+/// Whether Claude turns bill the stored Anthropic API key instead of the
+/// Claude subscription login. Only an explicit choice selects the API; the
+/// subscription stays the default so a stored key never starts paid usage.
+pub fn claude_uses_api_key() -> bool {
+    credentials_path()
+        .and_then(|path| read_credentials(&path).ok())
+        .is_some_and(|file| {
+            file.keys.get("claude_auth_mode").map(String::as_str) == Some("api-key")
+        })
+}
+
+pub fn set_claude_uses_api_key(api_key: bool) -> Result<PathBuf> {
+    store_value(
+        "claude_auth_mode",
+        if api_key { "api-key" } else { "subscription" },
+    )
+}
+
 /// A path setting: the environment variable wins, the store is the fallback.
 fn stored_path(env_var: &str, storage_key: &str) -> Result<Option<PathBuf>> {
     if let Some(path) = crate::env::nonempty_var(env_var) {

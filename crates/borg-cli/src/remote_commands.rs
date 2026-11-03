@@ -8996,17 +8996,13 @@ pub(crate) async fn login_command(
     };
     let provider: CodingProvider = provider.into();
     match provider {
-        CodingProvider::Codex | CodingProvider::OpenCode if api_key => {
+        CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode if api_key => {
             println!(
                 "{}",
                 authenticate_provider(provider, ProviderAuthChoice::ReplaceApiKey).await?
             );
         }
         CodingProvider::Anthropic | CodingProvider::OpenRouter | CodingProvider::Vercel => {
-            let path = prompt_and_store_api_key(provider)?;
-            println!("{} API key saved to {}.", provider.label(), path.display());
-        }
-        CodingProvider::Claude if api_key => {
             let path = prompt_and_store_api_key(provider)?;
             println!("{} API key saved to {}.", provider.label(), path.display());
         }
@@ -9073,7 +9069,7 @@ fn credential_guidance(provider: CodingProvider) -> &'static str {
             "`borg login codex` (ChatGPT) or `borg login codex --api-key` (API billing); /login switches saved credentials"
         }
         CodingProvider::Claude => {
-            "`borg login claude` (Claude subscription) or `borg login claude --api-key`"
+            "`borg login claude` (Claude subscription) or `borg login claude --api-key` (API billing); /login switches saved credentials"
         }
         CodingProvider::OpenCode => {
             "`borg login opencode --api-key` (Go subscription key), then /model → OpenCode Go"
@@ -9152,12 +9148,20 @@ async fn provider_auth_requires_terminal(
         ProviderAuthChoice::ApiKey => match provider {
             CodingProvider::Codex => credentials::openai_api_key().is_none(),
             CodingProvider::OpenCode => credentials::opencode_go_api_key().is_none(),
+            CodingProvider::Claude => {
+                credentials::api_key(credentials::ApiKeyCredential::Anthropic).is_none()
+            }
             _ => true,
         },
-        ProviderAuthChoice::Subscription => {
-            provider != CodingProvider::Codex
-                || !borg_provider::provider::read_codex_subscription_status().await?
-        }
+        ProviderAuthChoice::Subscription => match provider {
+            CodingProvider::Codex => {
+                !borg_provider::provider::read_codex_subscription_status().await?
+            }
+            CodingProvider::Claude => {
+                !borg_remote::provider_subscription_credentials_present(provider)
+            }
+            _ => true,
+        },
     })
 }
 
@@ -9178,6 +9182,12 @@ async fn authenticate_provider(
             credentials::set_openai_auth_mode(OpenAiAuthMode::ApiKey)?;
             return Ok(
                 "OpenAI API billing selected · pay per use. ChatGPT login kept.".to_string(),
+            );
+        }
+        if provider == CodingProvider::Claude {
+            credentials::set_claude_uses_api_key(true)?;
+            return Ok(
+                "Anthropic API billing selected · pay per use. Claude login kept.".to_string(),
             );
         }
         if provider == CodingProvider::OpenCode {
@@ -9218,6 +9228,10 @@ async fn authenticate_provider(
     if provider == CodingProvider::Codex {
         credentials::set_openai_auth_mode(OpenAiAuthMode::Subscription)?;
         return Ok("ChatGPT subscription selected. Saved OpenAI API key kept.".to_string());
+    }
+    if provider == CodingProvider::Claude {
+        credentials::set_claude_uses_api_key(false)?;
+        return Ok("Claude subscription selected. Saved Anthropic API key kept.".to_string());
     }
     Ok(format!("Connected {}.", provider.label()))
 }

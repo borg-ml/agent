@@ -6592,8 +6592,10 @@ impl BorgTerminal {
                 PickerOption::new("Other OpenCode connections…", "reconnect-subscription"),
             ],
             CodingProvider::Claude => vec![
-                PickerOption::new("Connect Claude subscription…", "subscription"),
-                PickerOption::new("Add Anthropic API key · pay per use", "api-key"),
+                PickerOption::new("Claude subscription · included allowance", "subscription"),
+                PickerOption::new("Anthropic API key · pay per use", "api-key"),
+                PickerOption::new("Sign in to Claude…", "reconnect-subscription"),
+                PickerOption::new("Add or replace Anthropic API key…", "replace-api-key"),
             ],
             CodingProvider::Grok => vec![PickerOption::new(
                 "Connect Grok Build subscription…",
@@ -6612,6 +6614,8 @@ impl BorgTerminal {
             option.preview = Some(match option.value.as_str() {
                 "subscription" if provider == CodingProvider::Codex => "Use your saved ChatGPT login. If needed, Borg opens the subscription sign-in flow.",
                 "api-key" if provider == CodingProvider::Codex => "Use your saved OpenAI key, or enter one privately. Requests are billed to your OpenAI API account. Your ChatGPT login is kept.",
+                "subscription" if provider == CodingProvider::Claude => "Use your saved Claude login. If needed, Borg opens the subscription sign-in flow.",
+                "api-key" if provider == CodingProvider::Claude => "Use your saved Anthropic key, or enter one privately. Requests are billed to your Anthropic Console credits. Your Claude login is kept.",
                 "api-key" | "replace-api-key" if provider == CodingProvider::OpenCode => "Get your subscription key at opencode.ai/auth. Go models use your Go allowance; select one in /model.",
                 "reconnect-subscription" if provider == CodingProvider::Grok => "Opens the Grok Build sign-in. SuperGrok and X Premium Plus plans are supported; set XAI_API_KEY to use the API instead.",
                 "reconnect-subscription" if provider == CodingProvider::Muse => "Opens Muse Code account sign-in. META_API_KEY and stored API keys override subscription login and use pay-as-you-go billing.",

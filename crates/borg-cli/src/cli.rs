@@ -8,7 +8,7 @@ const QUICKSTART: &str = "\
 Quickstart:
   borg                       start a session in the current directory
   borg login codex           connect a ChatGPT/Codex subscription (or: claude, opencode)
-  borg login claude --api-key   store an Anthropic API key instead of a subscription
+  borg login claude --api-key   bill Claude to an Anthropic API key (login kept)
   borg login anthropic       store an Anthropic API key for the separate API lane
   borg --provider claude     start with a specific provider (codex, claude, anthropic, opencode, kimi, glm, openrouter)
   borg resume                pick up the latest session; `borg resume <id>` for a specific one
@@ -644,10 +644,7 @@ pub(crate) fn default_subscription_ready(candidate: RemoteProviderArg) -> bool {
     match candidate {
         RemoteProviderArg::Claude => {
             borg_remote::provider_subscription_credentials_present(candidate.into())
-                && borg_provider::credentials::api_key(
-                    borg_provider::credentials::ApiKeyCredential::Anthropic,
-                )
-                .is_none()
+                && !borg_provider::credentials::claude_uses_api_key()
         }
         RemoteProviderArg::Codex => {
             borg_remote::provider_subscription_credentials_present(candidate.into())

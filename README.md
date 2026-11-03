@@ -55,7 +55,7 @@ Inside a session, `/login` switches connections and `/model` switches models.
 | Provider | Connect | Notes |
 | --- | --- | --- |
 | ChatGPT / Codex | `borg login codex` | Device sign-in to `~/.borg/openai-subscription.json`; an existing Codex login in `~/.codex/auth.json` (or `CODEX_HOME`) is reused if found. `--auth-file PATH` uses an existing auth file in place (Borg stores the path, not a copy of its rotating tokens); `BORG_OPENAI_AUTH_FILE` overrides it. `--api-key` uses OpenAI API billing instead. |
-| Claude | `borg login claude` | Browser sign-in to Borg's own login in `~/.borg/claude` (`BORG_CLAUDE_CONFIG_DIR` overrides), separate from Claude Code's, so the two never refresh one login. The new login is used only once sign-in succeeds. `--api-key` stores an Anthropic API key. |
+| Claude | `borg login claude` | Browser sign-in to Borg's own login in `~/.borg/claude` (`BORG_CLAUDE_CONFIG_DIR` overrides), separate from Claude Code's, so the two never refresh one login. The new login is used only once sign-in succeeds. `--api-key` stores an Anthropic API key and bills Claude models to it instead; the login is kept, and `/login` switches back. |
 | Anthropic API | `borg login anthropic` | API-key lane billed to your Anthropic account. |
 | OpenCode | `borg login opencode --api-key` | Go subscription key; Go models appear under **OpenCode Go** in `/model`. Other OpenCode models run through the OpenCode CLI. |
 | OpenRouter, Vercel AI Gateway | `borg login openrouter`, `borg login vercel` | API keys. |

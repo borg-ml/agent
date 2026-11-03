@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.20.2)
 
+- Claude billing can be switched between the subscription and an Anthropic API
+  key like ChatGPT/OpenAI: choosing the API key in the model's connection
+  picker, or `borg login claude --api-key`, bills the same Claude models to
+  Console credits, and the footer and `/usage` follow the choice. Both
+  credentials are kept. Previously a stored key was ignored while a Claude
+  login existed.
+
 ## 0.20.2 (2026-11-02)
 
 - Fix the release Clippy check failing on the size of stored Claude message-thread

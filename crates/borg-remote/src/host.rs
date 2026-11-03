@@ -731,16 +731,10 @@ async fn probe_provider(
                 auth_methods.push(ProviderAuthMethod::ApiKey);
                 detail.push("Anthropic API key configured");
             }
-            let env_api_key = nonempty_env("ANTHROPIC_API_KEY").is_some()
-                || nonempty_env("ANTHROPIC_AUTH_TOKEN").is_some();
-            if env_api_key {
-                Some(BillingLane::ApiKey)
-            } else if subscription_authenticated {
-                Some(BillingLane::Subscription)
-            } else if api_key {
-                Some(BillingLane::ApiKey)
+            if borg_provider::credentials::claude_uses_api_key() {
+                api_key.then_some(BillingLane::ApiKey)
             } else {
-                None
+                subscription_authenticated.then_some(BillingLane::Subscription)
             }
         }
         CodingProvider::OpenCode => {

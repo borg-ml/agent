@@ -99,6 +99,25 @@ pub async fn refresh_provider_capability_usage(
 ) -> Vec<ProviderCapability> {
     let mut capabilities = capabilities.to_vec();
     for capability in &mut capabilities {
+        if capability.provider == CodingProvider::Claude {
+            // The billing choice can change after the startup snapshot.
+            if borg_provider::credentials::claude_uses_api_key() {
+                let key = borg_provider::credentials::api_key(
+                    borg_provider::credentials::ApiKeyCredential::Anthropic,
+                )
+                .is_some();
+                capability.billing = key.then_some(crate::BillingLane::ApiKey);
+                capability.usage = None;
+                capability.authenticated = key;
+                capability
+                    .auth_methods
+                    .retain(|method| *method != ProviderAuthMethod::Subscription);
+                continue;
+            }
+            if capability.billing == Some(crate::BillingLane::ApiKey) {
+                capability.billing = None;
+            }
+        }
         if capability.provider == CodingProvider::Claude
             && capability.installed
             && !matches!(
