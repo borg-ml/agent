@@ -3542,7 +3542,7 @@ impl NativeModelClient for ProviderModelClient {
             // A published Claude window keeps the context meter and the pre-call
             // budget check working on this route too.
             Ok(NativeRoute::AnthropicMessages) => {
-                return borg_provider::provider::context_window_tokens(model);
+                return borg_provider::provider::context_window_tokens(model).await;
             }
             _ => return None,
         };

@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.20.2)
 
+- The Anthropic API route takes a Claude model's context window from the
+  models.dev catalog (1M for current Opus, Sonnet and Haiku) instead of a
+  flat 200k, so long sessions no longer compact at a fifth of the window.
+  Models the catalog does not list keep 200k.
 - Claude billing can be switched between the subscription and an Anthropic API
   key like ChatGPT/OpenAI: choosing the API key in the model's connection
   picker, or `borg login claude --api-key`, bills the same Claude models to

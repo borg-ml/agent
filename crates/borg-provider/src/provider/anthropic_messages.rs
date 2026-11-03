@@ -58,17 +58,34 @@ pub fn messages_endpoint() -> String {
     format!("{}/v1/messages", base.trim_end_matches("/"))
 }
 
-/// The context window Borg assumes for a Claude API model.
+/// The context window of a Claude API model.
 ///
-/// Published models are 200k. A model outside that set reports no window, and
-/// the harness then relies on its own estimate rather than compacting against
-/// a guess.
-pub fn context_window_tokens(model: &str) -> Option<u64> {
-    model
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("claude-")
-        .then_some(200_000)
+/// The Messages API reports no window, so it is resolved before the call from
+/// the models.dev catalog (loaded once per process, shared with pricing and the
+/// Go route): current Claude models publish 1M there, and a flat 200k made the
+/// harness compact at a fifth of the real window. A Claude model the catalog
+/// does not list keeps the 200k every published Claude model has; anything
+/// else reports no window, and the harness relies on its own estimate.
+pub async fn context_window_tokens(model: &str) -> Option<u64> {
+    if !is_claude_model(model) {
+        return None;
+    }
+    crate::models_catalog::ensure_loaded().await;
+    catalog_context_window(model)
+}
+
+const MODELS_DEV_PROVIDER: &str = "anthropic";
+const CLAUDE_MIN_CONTEXT_WINDOW: u64 = 200_000;
+
+fn is_claude_model(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().starts_with("claude-")
+}
+
+fn catalog_context_window(model: &str) -> Option<u64> {
+    is_claude_model(model).then(|| {
+        crate::models_catalog::context_window(MODELS_DEV_PROVIDER, model.trim())
+            .unwrap_or(CLAUDE_MIN_CONTEXT_WINDOW)
+    })
 }
 
 fn anthropic_http_client() -> reqwest::Client {
@@ -1307,6 +1324,22 @@ fn send_reasoning(progress: Option<&UnboundedSender<ProviderProgress>>, text: &s
 mod tests {
     use super::*;
     use crate::provider::{ModelInputAttachment, ModelToolDefinition};
+
+    /// The window comes from the catalog's `anthropic` entries; an unlisted
+    /// Claude model keeps the published 200k floor and other ids get none.
+    #[test]
+    fn claude_api_window_follows_the_models_dev_catalog() {
+        let _catalog = crate::models_catalog::set_for_test(crate::models_catalog::parse(
+            &serde_json::json!({"anthropic": {"models": {
+                "claude-opus-5-5": {"limit": {"context": 1_000_000, "output": 128_000}},
+                "claude-haiku-4-5": {"limit": {"context": 200_000, "output": 64_000}}
+            }}}),
+        ));
+        assert_eq!(catalog_context_window("claude-opus-5-5"), Some(1_000_000));
+        assert_eq!(catalog_context_window(" claude-haiku-4-5 "), Some(200_000));
+        assert_eq!(catalog_context_window("claude-unlisted-9"), Some(200_000));
+        assert_eq!(catalog_context_window("gpt-6.1-sol"), None);
+    }
 
     fn request(messages: Vec<ModelMessage>, tools: Vec<ModelToolDefinition>) -> ModelTurnRequest {
         ModelTurnRequest {
