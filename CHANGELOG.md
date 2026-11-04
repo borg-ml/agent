@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.20.3)
 
+- `runtime_exec` returns at most 64 KiB of stdout, stderr and value to the
+  model (head and tail kept, with a truncation marker), like `exec`. A single
+  printed screenshot result could previously add a quarter of a million
+  base64 tokens to the transcript and slow every later reply by a minute.
 - Added `gpt-6.1-terra` (Terra 6.1) to the Codex model picker, subagent and
   peer model choices, with its 1.05M context window on the OpenAI API route.
 

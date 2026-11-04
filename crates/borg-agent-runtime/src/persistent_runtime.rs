@@ -25,7 +25,12 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const MAX_CODE_BYTES: usize = 512 * 1024;
-const MAX_RUNTIME_RESULT_BYTES: usize = 1024 * 1024;
+const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024;
+/// Model-visible budget for one execution result, in line with `exec`'s output
+/// budget. Every byte stays in the transcript for the rest of the session, and
+/// one printed screenshot dict (base64 PNG) once added 250k tokens and minutes
+/// of time-to-first-token to every later request.
+const MAX_RUNTIME_RESULT_BYTES: usize = 64 * 1024;
 /// Hard ceiling on one protocol line from the worker. Results above
 /// `MAX_RUNTIME_RESULT_BYTES` are truncated field by field rather than
 /// discarded; only a line this large indicates a broken worker.
@@ -681,7 +686,7 @@ async fn write_json_line(writer: &mut ChildStdin, value: &Value) -> Result<()> {
     let limit = if value["type"] == "host_result" {
         MAX_RUNTIME_LINE_BYTES
     } else {
-        MAX_RUNTIME_RESULT_BYTES
+        MAX_RUNTIME_REQUEST_BYTES
     };
     ensure!(
         line.len() <= limit,
@@ -1639,7 +1644,7 @@ mod tests {
 
     #[test]
     fn runtime_images_survive_the_text_budget_but_keep_attachment_limits() {
-        let image = "a".repeat(2 * MAX_RUNTIME_RESULT_BYTES);
+        let image = "a".repeat(2 * MAX_RUNTIME_REQUEST_BYTES);
         let result = PersistentRuntimeResult {
             runtime: "python",
             persistent: true,
@@ -1649,7 +1654,7 @@ mod tests {
             stderr: String::new(),
             value: json!({"nodes": [], "borg_attachments": [
                 {"media_type": "image/png", "data_base64": image},
-                {"media_type": "image/png", "data_base64": "b".repeat(7 * MAX_RUNTIME_RESULT_BYTES)}
+                {"media_type": "image/png", "data_base64": "b".repeat(7 * MAX_RUNTIME_REQUEST_BYTES)}
             ]}),
         };
         let bounded = bound_runtime_result(result);
