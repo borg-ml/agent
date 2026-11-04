@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.20.3)
 
+- Added `gpt-6.1-terra` (Terra 6.1) to the Codex model picker, subagent and
+  peer model choices, with its 1.05M context window on the OpenAI API route.
+
 ## 0.20.3 (2026-11-03)
 
 - The Anthropic API route takes a Claude model's context window from the

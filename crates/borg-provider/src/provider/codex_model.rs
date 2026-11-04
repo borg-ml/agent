@@ -464,7 +464,7 @@ fn api_context_window(model: &str) -> Option<u64> {
     crate::models_catalog::context_window("openai", model)
         .filter(|window| *window > 0)
         .or(match model {
-            "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-astra" => Some(1_050_000),
+            "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6-sol" | "gpt-6-astra" => Some(1_050_000),
             _ => None,
         })
 }
@@ -3451,7 +3451,7 @@ mod tests {
 
     #[test]
     fn public_api_uses_context_window_not_maximum_output() {
-        for model in ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-astra"] {
+        for model in ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-astra"] {
             assert_eq!(api_context_window(model), Some(1_050_000));
         }
         assert_eq!(api_context_window("gpt-6.1-sol-unverified"), None);
