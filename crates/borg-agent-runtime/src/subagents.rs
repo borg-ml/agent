@@ -86,7 +86,6 @@ const RUNTIME_DEFAULT_FILE_BYTES: u64 = 256 * 1024;
 const RUNTIME_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const RUNTIME_DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 pub(crate) const RUNTIME_MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
-const MAX_RUNTIME_HOST_CALLS: usize = 128;
 const DEFAULT_PERSISTENT_PEER_CONSULTATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MIN_PERSISTENT_PEER_CONSULTATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_PERSISTENT_PEER_CONSULTATION_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
@@ -4050,11 +4049,7 @@ impl DispatcherRuntimeHost {
 #[async_trait::async_trait]
 impl RuntimeHost for DispatcherRuntimeHost {
     async fn call(&self, operation: &str, arguments: Value) -> Result<Value> {
-        let call_number = self.host_calls.fetch_add(1, Ordering::Relaxed) + 1;
-        ensure!(
-            call_number <= MAX_RUNTIME_HOST_CALLS,
-            "persistent runtime exceeded the per-execution limit of {MAX_RUNTIME_HOST_CALLS} host calls"
-        );
+        self.host_calls.fetch_add(1, Ordering::Relaxed);
         match operation {
             "borg_tool" => {
                 let args: RuntimeBorgToolArgs = serde_json::from_value(arguments)?;

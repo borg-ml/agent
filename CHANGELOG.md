@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.20.3)
 
+- `runtime_exec` no longer stops a run after 128 Borg tool calls. Scripted
+  multi-step work (for example clicking through dozens of listings with
+  `cua`) runs to completion within the execution timeout.
 - `runtime_exec` returns at most 64 KiB of stdout, stderr and value to the
   model (head and tail kept, with a truncation marker), like `exec`. A single
   printed screenshot result could previously add a quarter of a million
