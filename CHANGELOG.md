@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.20.3)
+## Unreleased (since 0.20.4)
+
+## 0.20.4 (2026-11-06)
 
 - Several Claude or ChatGPT subscriptions can stay connected at once. `borg
   login claude --account work` (or `borg login codex --account personal`) gives
