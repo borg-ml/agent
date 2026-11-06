@@ -564,7 +564,17 @@ mod tests {
         let session = Uuid::new_v4();
         let message = Uuid::new_v4();
         let output = format!("{}\ninspection tail", "full output\n".repeat(2_000));
+        // Thinking precedes the answer it produced. Emitting the answer first
+        // would be a late reasoning block, which the shared core deliberately
+        // lifts above that answer, and the indices below would shift.
         let events = [
+            SessionEventKind::ReasoningDelta {
+                text: "checking".into(),
+            },
+            SessionEventKind::ReasoningDelta {
+                text: "checking the workspace".into(),
+            },
+            SessionEventKind::ReasoningCompleted,
             SessionEventKind::Message {
                 message_id: message,
                 actor: EventActor::Assistant,
@@ -573,13 +583,6 @@ mod tests {
                 status: MessageStatus::Complete,
                 delivery: None,
             },
-            SessionEventKind::ReasoningDelta {
-                text: "checking".into(),
-            },
-            SessionEventKind::ReasoningDelta {
-                text: "checking the workspace".into(),
-            },
-            SessionEventKind::ReasoningCompleted,
             SessionEventKind::ToolStarted {
                 tool_call_id: "inspect".into(),
                 name: "exec".into(),
@@ -603,13 +606,13 @@ mod tests {
         .collect::<Vec<_>>();
         let mut live = TimelineProjector::default();
         live.extend(&events[..5]);
-        let assistant = Arc::clone(&live.entries[0]);
-        let reasoning = Arc::clone(&live.entries[1]);
+        let reasoning = Arc::clone(&live.entries[0]);
+        let assistant = Arc::clone(&live.entries[1]);
         let tool_id = live.entries[2].id.clone();
         live.push(&events[5]);
-        assert!(Arc::ptr_eq(&assistant, &live.entries[0]));
-        assert!(Arc::ptr_eq(&reasoning, &live.entries[1]));
-        assert_eq!(live.entries[0].id, format!("message:{message}"));
+        assert!(Arc::ptr_eq(&reasoning, &live.entries[0]));
+        assert!(Arc::ptr_eq(&assistant, &live.entries[1]));
+        assert_eq!(live.entries[1].id, format!("message:{message}"));
         assert!(
             assistant
                 .rich_body
