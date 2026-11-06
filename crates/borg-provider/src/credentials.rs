@@ -484,10 +484,8 @@ fn restrict_permissions(_path: &Path, _mode: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::env::test_env_lock()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+    fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::env::test_env_lock().blocking_lock()
     }
 
     #[test]

@@ -258,10 +258,8 @@ pub async fn activate(provider: ProviderAuthProvider, name: &str) -> Result<Subs
 mod tests {
     use super::*;
 
-    fn scratch_home() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
-        let guard = crate::env::test_env_lock()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+    async fn scratch_home() -> (tokio::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+        let guard = crate::env::test_env_lock().lock().await;
         let home = tempfile::tempdir().unwrap();
         // SAFETY: serialised by the shared test environment lock.
         unsafe {
@@ -276,7 +274,7 @@ mod tests {
     // reads, and a login from before named accounts must stay reachable.
     #[tokio::test]
     async fn selecting_an_account_moves_the_authority_and_keeps_the_old_login() {
-        let (_guard, home) = scratch_home();
+        let (_guard, home) = scratch_home().await;
         let legacy = home.path().join("claude");
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join(".credentials.json"), b"{}").unwrap();
@@ -351,7 +349,7 @@ mod tests {
     // while an agent believes it switched accounts.
     #[tokio::test]
     async fn an_environment_override_refuses_to_be_silently_replaced() {
-        let (_guard, home) = scratch_home();
+        let (_guard, home) = scratch_home().await;
         let overridden = home.path().join("operator-claude");
         // SAFETY: serialised by the shared test environment lock.
         unsafe { std::env::set_var("BORG_CLAUDE_CONFIG_DIR", &overridden) };

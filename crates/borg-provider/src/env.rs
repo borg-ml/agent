@@ -13,10 +13,12 @@ pub(crate) fn nonempty_var(name: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
+pub(crate) fn test_env_lock() -> &'static tokio::sync::Mutex<()> {
     // Tests that mutate process-wide environment variables serialize here, so
-    // a scratch BORG_HOME in one module cannot move another's key store.
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // a scratch BORG_HOME in one module cannot move another's key store. It is
+    // an async mutex because the scratch environment must stay in place across
+    // awaits; synchronous tests take it with `blocking_lock`.
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     &LOCK
 }
 
