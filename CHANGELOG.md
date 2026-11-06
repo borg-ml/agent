@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.20.3)
 
+- Reasoning stays in one block per model round. A compatible provider that
+  interleaves empty content writes with its thinking no longer splits the
+  stream into a row per fragment.
+
 - The OpenCode local server starts again when the binary prints the current
   `server listening on …` line, as OpenCode 2.2 does, instead of accepting only
   the older `opencode server listening on …` prefix. A failed launch now shows

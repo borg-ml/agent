@@ -1549,7 +1549,12 @@ async fn read_compatible_model_stream(
                 .and_then(Value::as_str)
             {
                 content.push_str(delta);
-                if let Some(sender) = progress {
+                // An empty content delta is not prose. Forwarding it would
+                // tell the harness that writing began and close the reasoning
+                // block that is still streaming.
+                if let Some(sender) = progress
+                    && !delta.is_empty()
+                {
                     let _ = sender.send(ProviderProgress::stdout(delta.as_bytes().to_vec()));
                 }
             }

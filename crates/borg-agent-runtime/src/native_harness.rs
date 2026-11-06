@@ -4224,7 +4224,7 @@ async fn call_model_streaming_with_timeout(
                 Some(ProviderProgress::Bytes {
                     stream: ProviderProgressStream::Stdout,
                     chunk,
-                }) => {
+                }) if !chunk.is_empty() => {
                     // The model reasons before it writes. A throttled thinking
                     // disclosure still buffered when prose begins must reach the
                     // screen first; otherwise the answer renders above the
@@ -9005,6 +9005,110 @@ mod tests {
             _ = &mut call => panic!("model must remain unfinished while generating"),
             result = tokio::time::timeout(Duration::from_secs(1), observe) => {
                 result.expect("reasoning must reach the stream before the prose");
+            }
+        }
+    }
+
+    /// A compatible provider may interleave empty content writes with a
+    /// reasoning stream. An empty write is not prose, so it must not close the
+    /// block: the fragments belong to the one reasoning row the user reads.
+    struct EmptyWriteBetweenReasoningClient;
+
+    #[async_trait]
+    impl NativeModelClient for EmptyWriteBetweenReasoningClient {
+        async fn model_turn(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+            _request: ModelTurnRequest,
+            progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+        ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+            let progress = progress.unwrap();
+            for fragment in ["K", "inds: "] {
+                progress.send(reasoning_progress(fragment)).unwrap();
+                progress
+                    .send(ProviderProgress::Bytes {
+                        stream: ProviderProgressStream::Stdout,
+                        chunk: Vec::new(),
+                    })
+                    .unwrap();
+            }
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_content_writes_keep_one_reasoning_block() {
+        let client = EmptyWriteBetweenReasoningClient;
+        let (events_tx, mut events_rx) = mpsc::channel(16);
+        let message_id = Uuid::new_v4();
+        let mut controls = None;
+        let mut queued_steer = Vec::new();
+        let call = call_model_streaming(
+            &client,
+            crate::CodingProvider::OpenAiCompatible,
+            "test-model",
+            None,
+            ModelTurnRequest {
+                fast: false,
+                ultrafast: false,
+                request_id: None,
+                session_id: None,
+                prompt_cache_key: None,
+                turn_routing: Default::default(),
+                messages: vec![ModelMessage::user("hello")],
+                tools: Vec::new(),
+                output_schema: None,
+            },
+            ModelStreamContext {
+                coding_provider: crate::CodingProvider::OpenAiCompatible,
+                assistant_message_id: message_id,
+                events: &events_tx,
+                controls: &mut controls,
+                queued_steer: &mut queued_steer,
+                allow_preemption: true,
+                grace_wrapup: None,
+            },
+        );
+        tokio::pin!(call);
+        let observe = async {
+            let Some(SessionEventKind::ReasoningBlockStarted { reasoning_id }) =
+                events_rx.recv().await
+            else {
+                panic!("the stream must open a reasoning block");
+            };
+            let mut text = String::new();
+            let mut deltas = 0;
+            while deltas < 2 {
+                match events_rx.recv().await {
+                    Some(SessionEventKind::ReasoningBlockDelta {
+                        reasoning_id: id,
+                        delta,
+                    }) => {
+                        assert_eq!(id, reasoning_id, "an empty write must not open a new block");
+                        text.push_str(&delta);
+                        deltas += 1;
+                    }
+                    Some(SessionEventKind::ReasoningBlockSnapshot {
+                        reasoning_id: id,
+                        text: snapshot,
+                    }) => {
+                        assert_eq!(id, reasoning_id);
+                        text = snapshot;
+                    }
+                    Some(SessionEventKind::ReasoningBlockCompleted { .. }) => {
+                        panic!("an empty write must not complete the reasoning block")
+                    }
+                    _ => panic!("unexpected event while reasoning streamed"),
+                }
+            }
+            assert_eq!(text, "Kinds: ");
+        };
+        tokio::select! {
+            _ = &mut call => panic!("model must remain unfinished while reasoning"),
+            result = tokio::time::timeout(Duration::from_secs(2), observe) => {
+                result.expect("the whole reasoning stream must stay in one block");
             }
         }
     }
