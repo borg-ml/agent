@@ -189,6 +189,16 @@ pub async fn command(runtime: Runtime) -> Result<Command> {
     Ok(Command::new(executable(runtime).await?))
 }
 
+/// Forget a resolved runtime after it failed to start.
+///
+/// Resolution is cached for the process lifetime, which is right while the
+/// executable works but wrong after an update replaces or guts it. Dropping
+/// the entry makes the next call probe the candidates again and heal a missing
+/// or broken install instead of launching the same dead path forever.
+pub(crate) async fn invalidate(runtime: Runtime) {
+    cache().lock().await.remove(&runtime);
+}
+
 /// Whether Borg is permitted to install runtimes on its own.
 pub fn auto_install_enabled() -> bool {
     match std::env::var(AUTO_INSTALL_ENV) {

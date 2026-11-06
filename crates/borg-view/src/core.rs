@@ -3860,17 +3860,41 @@ impl TranscriptCore {
             }
             self.active_reasoning = None;
         }
-        let index = self.order.len();
-        self.order.push(TranscriptEntry::Operation(Operation {
-            expanded: self.auto_expand_thinking,
-            ..Operation::reasoning(
-                "Reasoning",
-                "",
-                String::new(),
-                time,
-                Execution::new(started_at, ExecutionState::Running),
-            )
-        }));
+        // A provider may deliver the answer before a coalesced thinking
+        // snapshot. The snapshot still carries when the thinking began, so put
+        // it above the trailing answer it produced rather than below it. A new
+        // turn starts with a user row after that answer, which opts out.
+        let index = self
+            .order
+            .last()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    TranscriptEntry::Message {
+                        actor: EventActor::Assistant,
+                        ..
+                    }
+                ) && entry
+                    .execution()
+                    .is_some_and(|execution| execution.started_at() >= started_at)
+            })
+            .map_or(self.order.len(), |_| self.order.len() - 1);
+        if index < self.order.len() {
+            self.reindex_after_insertion(index);
+        }
+        self.order.insert(
+            index,
+            TranscriptEntry::Operation(Operation {
+                expanded: self.auto_expand_thinking,
+                ..Operation::reasoning(
+                    "Reasoning",
+                    "",
+                    String::new(),
+                    time,
+                    Execution::new(started_at, ExecutionState::Running),
+                )
+            }),
+        );
         self.active_reasoning = Some(index);
         self.reasoning_has_preview = false;
     }

@@ -4296,6 +4296,147 @@ mod parallel_preparation_tests {
     }
 
     #[test]
+    fn live_reasoning_stays_above_the_answer_it_produced() {
+        let session_id = Uuid::new_v4();
+        let reasoning_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let started_at = Utc::now();
+        let mut transcript = Transcript::default();
+        let events = [
+            SessionEventKind::ReasoningBlockStarted { reasoning_id },
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::OpenCode,
+                kind: "reasoning_snapshot".into(),
+                payload: serde_json::json!({
+                    "reasoning_id": reasoning_id,
+                    "reasoning_block": true,
+                    "started_at": started_at,
+                    "text": "I should answer briefly.",
+                    "complete": true,
+                }),
+            },
+            SessionEventKind::ReasoningBlockCompleted { reasoning_id },
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::Assistant,
+                text: String::new(),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: None,
+            },
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::Assistant,
+                text: "Hi! How can I help?".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ];
+        let now = Utc::now();
+        for (index, kind) in events.into_iter().enumerate() {
+            transcript.apply(&SessionEvent::new(session_id, index as u64 + 1, kind));
+            let rendered = transcript
+                .render_for_cache_at(80, 20, now)
+                .0
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>();
+            let reasoning = rendered.iter().position(|line| line.contains("Reasoned"));
+            let answer = rendered
+                .iter()
+                .position(|line| line.contains("Hi! How can I help?"));
+            if let (Some(reasoning), Some(answer)) = (reasoning, answer) {
+                assert!(reasoning < answer, "{rendered:#?}");
+            }
+        }
+        let rendered = transcript
+            .lines(80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let reasoning = rendered
+            .iter()
+            .position(|line| line.contains("Reasoned"))
+            .expect("reasoning row");
+        let answer = rendered
+            .iter()
+            .position(|line| line.contains("Hi! How can I help?"))
+            .expect("answer row");
+        assert!(reasoning < answer, "{rendered:#?}");
+    }
+
+    #[test]
+    fn late_reasoning_is_placed_above_the_answer_it_precedes() {
+        let session_id = Uuid::new_v4();
+        let reasoning_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let started_at = Utc::now();
+        let mut transcript = Transcript::default();
+        let mut apply = |sequence, created_at, kind| {
+            let mut event = SessionEvent::new(session_id, sequence, kind);
+            event.created_at = created_at;
+            transcript.apply(&event);
+        };
+        for (sequence, status, text) in [
+            (1, MessageStatus::InProgress, "Hi! How can I help?"),
+            (2, MessageStatus::Complete, "Hi! How can I help?"),
+        ] {
+            apply(
+                sequence,
+                started_at + chrono::Duration::seconds(1),
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::Assistant,
+                    text: text.into(),
+                    attachments: Vec::new(),
+                    status,
+                    delivery: None,
+                },
+            );
+        }
+        apply(
+            3,
+            started_at,
+            SessionEventKind::ReasoningBlockStarted { reasoning_id },
+        );
+        apply(
+            4,
+            started_at,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::OpenCode,
+                kind: "reasoning_snapshot".into(),
+                payload: serde_json::json!({
+                    "reasoning_id": reasoning_id,
+                    "reasoning_block": true,
+                    "started_at": started_at,
+                    "text": "I should answer briefly.",
+                    "complete": true,
+                }),
+            },
+        );
+        apply(
+            5,
+            started_at,
+            SessionEventKind::ReasoningBlockCompleted { reasoning_id },
+        );
+        let rendered = transcript
+            .lines(80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let reasoning = rendered
+            .iter()
+            .position(|line| line.contains("Reasoned"))
+            .expect("reasoning row");
+        let answer = rendered
+            .iter()
+            .position(|line| line.contains("Hi! How can I help?"))
+            .expect("answer row");
+        assert!(reasoning < answer, "{rendered:#?}");
+    }
+
+    #[test]
     fn finalized_reasoning_reuses_a_live_lifecycle_row() {
         let session_id = Uuid::new_v4();
         let mut transcript = Transcript::default();

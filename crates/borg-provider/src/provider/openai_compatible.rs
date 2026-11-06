@@ -353,11 +353,7 @@ impl OpenAiCompatibleProvider {
         }
         let request_id = request.request_id.clone();
         let deepseek_model = request_model.to_ascii_lowercase().contains("deepseek");
-        let wire_messages = request
-            .messages
-            .iter()
-            .flat_map(|message| model_message_wire_values(message, deepseek_model))
-            .collect::<Vec<_>>();
+        let wire_messages = compatible_wire_messages(&request.messages, deepseek_model);
         let mut body = json!({
             "model": request_model,
             "messages": wire_messages,
@@ -1264,6 +1260,41 @@ fn model_message_wire_values(message: &ModelMessage, deepseek_model: bool) -> Ve
     }
 }
 
+/// Serialize model messages for chat completions without splitting a tool-call
+/// group.
+///
+/// A tool result carrying images becomes a `tool` message followed by a `user`
+/// message, because tool messages are text-only. If another result from the
+/// same assistant turn follows, that user message would sit between the call
+/// and its remaining results; OpenAI-compatible providers require the whole
+/// group to be contiguous. Defer those image sidecars until the tool run ends.
+fn compatible_wire_messages(messages: &[ModelMessage], deepseek_model: bool) -> Vec<Value> {
+    let mut wire = Vec::new();
+    let mut image_sidecars = Vec::new();
+    for message in messages {
+        if matches!(
+            message,
+            ModelMessage::Tool {
+                attachments,
+                ..
+            } if !attachments.is_empty()
+        ) {
+            let mut values = model_message_wire_values(message, deepseek_model).into_iter();
+            if let Some(tool_result) = values.next() {
+                wire.push(tool_result);
+            }
+            image_sidecars.extend(values);
+            continue;
+        }
+        if !matches!(message, ModelMessage::Tool { .. }) {
+            wire.append(&mut image_sidecars);
+        }
+        wire.extend(model_message_wire_values(message, deepseek_model));
+    }
+    wire.append(&mut image_sidecars);
+    wire
+}
+
 fn model_message_wire_value(message: &ModelMessage, deepseek_model: bool) -> Value {
     let mut wire = match message {
         ModelMessage::User {
@@ -1739,16 +1770,21 @@ fn request_shape(body: &Value) -> String {
     let mut images: Vec<String> = Vec::new();
     let mut image_count = 0_usize;
     let mut calls = 0_usize;
-    let mut sent: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut answered: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut pending: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut unanswered = 0_usize;
     for message in messages {
-        roles.push_str(match message.get("role").and_then(Value::as_str) {
+        let role = match message.get("role").and_then(Value::as_str) {
             Some("system") => "s",
             Some("user") => "u",
             Some("assistant") => "a",
             Some("tool") => "t",
             _ => "?",
-        });
+        };
+        roles.push_str(role);
+        if role != "t" && !pending.is_empty() {
+            unanswered += pending.len();
+            pending.clear();
+        }
         for part in message
             .get("content")
             .and_then(Value::as_array)
@@ -1804,13 +1840,14 @@ fn request_shape(body: &Value) -> String {
         {
             calls += 1;
             if let Some(id) = call.get("id").and_then(Value::as_str) {
-                sent.insert(id);
+                pending.insert(id);
             }
         }
         if let Some(id) = message.get("tool_call_id").and_then(Value::as_str) {
-            answered.insert(id);
+            pending.remove(id);
         }
     }
+    unanswered += pending.len();
     let shown: String = roles.chars().take(32).collect();
     let elided = roles.chars().count().saturating_sub(32);
     let tools_hash = body
@@ -1839,7 +1876,7 @@ fn request_shape(body: &Value) -> String {
         body.get("tools")
             .and_then(Value::as_array)
             .map_or(0, Vec::len),
-        sent.difference(&answered).count(),
+        unanswered,
         fields.join(","),
     )
 }
@@ -2349,6 +2386,48 @@ mod tests {
             wire["content"][1]["image_url"]["url"],
             "data:image/png;base64,aW1hZ2U="
         );
+    }
+
+    #[test]
+    fn image_tool_result_does_not_split_a_parallel_tool_call_group() {
+        let calls = ["a", "b", "c"]
+            .into_iter()
+            .map(|id| ModelToolCall::function(id.into(), "inspect".into(), "{}".into()))
+            .collect();
+        let messages = vec![
+            ModelMessage::assistant(None, None, None, calls),
+            ModelMessage::tool("a", "first"),
+            ModelMessage::Tool {
+                tool_call_id: "b".into(),
+                content: "second".into(),
+                attachments: vec![super::super::ModelInputAttachment {
+                    media_type: "image/png".into(),
+                    data_base64: "aW1hZ2U=".into(),
+                    filename: None,
+                }],
+            },
+            ModelMessage::tool("c", "third"),
+            ModelMessage::user("next"),
+        ];
+        let wire = compatible_wire_messages(&messages, false);
+        let roles = wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            ["assistant", "tool", "tool", "tool", "user", "user"],
+            "all three results must answer the call before the image sidecar"
+        );
+        assert_eq!(wire[3]["tool_call_id"], "c");
+        assert!(
+            wire[4]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("tool call b"))
+        );
+        let shape = request_shape(&json!({ "messages": wire }));
+        assert!(shape.contains("tool_calls=3"), "{shape}");
+        assert!(shape.contains("unanswered_calls=0"), "{shape}");
     }
 
     #[test]

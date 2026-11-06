@@ -5,6 +5,21 @@ Git comparison.
 
 ## Unreleased (since 0.20.3)
 
+- The OpenCode local server starts again when the binary prints the current
+  `server listening on …` line, as OpenCode 2.2 does, instead of accepting only
+  the older `opencode server listening on …` prefix. A failed launch now shows
+  the process's stderr and drops a stale cached executable immediately rather
+  than surfacing a 30-second deadline timeout.
+
+- An image-returning tool result no longer splits a parallel tool-call group.
+  Its image message is held until every result for the assistant call has been
+  sent, so OpenCode Go and other OpenAI-compatible providers no longer reject
+  the request with HTTP 400 for apparently unanswered `tool_call_id`s.
+
+- A thinking block delivered after its answer is placed above that answer using
+  the block's start time, so the transcript no longer shows the response before
+  the reasoning that produced it.
+
 - Private-display input and observations now use a 45-second helper deadline, longer than the compositor socket deadline. A slow game no longer loses its display merely because the ordinary desktop deadline expires first.
 
 - `runtime_exec` no longer stops a run after 128 Borg tool calls. Scripted

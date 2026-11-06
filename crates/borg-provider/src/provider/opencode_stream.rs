@@ -93,7 +93,7 @@ async fn run(
         .current_dir(&cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     let mut config = opencode_base_config(permission);
     if !request.mcp_external_servers.is_empty() {
@@ -126,24 +126,8 @@ async fn run(
         .env("OPENCODE_SERVER_PASSWORD", &password)
         .env("OPENCODE_SERVER_USERNAME", "opencode");
     let mut server = command.spawn().context("failed to start OpenCode server")?;
-    let mut server_output = BufReader::new(
-        server
-            .stdout
-            .take()
-            .context("OpenCode server stdout missing")?,
-    )
-    .lines();
-    let server_url = tokio::time::timeout(Duration::from_secs(30), async {
-        while let Some(line) = server_output.next_line().await? {
-            if let Some(url) = line.strip_prefix("opencode server listening on http://127.0.0.1:") {
-                let port: u16 = url.trim().parse().context("invalid OpenCode server port")?;
-                return Ok::<_, anyhow::Error>(format!("http://127.0.0.1:{port}"));
-            }
-        }
-        bail!("OpenCode server closed before listening")
-    })
-    .await
-    .context("OpenCode server startup timed out")??;
+    let (server_url, mut server_error) = opencode_server_url(&mut server).await?;
+    tokio::spawn(async move { while let Ok(Some(_)) = server_error.next_line().await {} });
     let client = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(Duration::from_secs(10))
@@ -420,6 +404,115 @@ async fn run(
         .await
         .ok();
     Ok(())
+}
+
+/// Wait for the server URL, failing as soon as the child says why it stopped.
+///
+/// The pipe carrying stderr used to be discarded, so a broken launcher was
+/// indistinguishable from a slow one until the 30-second deadline expired.
+/// Read both pipes and report what the process actually said.
+async fn opencode_server_url(
+    server: &mut tokio::process::Child,
+) -> Result<(
+    String,
+    tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
+)> {
+    let mut server_output = BufReader::new(
+        server
+            .stdout
+            .take()
+            .context("OpenCode server stdout missing")?,
+    )
+    .lines();
+    let mut server_error = BufReader::new(
+        server
+            .stderr
+            .take()
+            .context("OpenCode server stderr missing")?,
+    )
+    .lines();
+    let mut stderr_lines = Vec::new();
+    let startup = async {
+        loop {
+            tokio::select! {
+                line = server_output.next_line() => {
+                    if let Some(line) = line? {
+                        if let Some(port) = opencode_listen_port(&line)? {
+                            return Ok::<_, anyhow::Error>(format!("http://127.0.0.1:{port}"));
+                        }
+                        continue;
+                    }
+                    let status = server.wait().await;
+                    while let Ok(Some(line)) = server_error.next_line().await {
+                        remember_startup_error(&mut stderr_lines, line);
+                    }
+                    crate::provider_bin::invalidate(crate::provider_bin::Runtime::OpenCode).await;
+                    return match status {
+                        Ok(status) => Err(anyhow::anyhow!(
+                            "OpenCode server exited before listening ({status}){}",
+                            startup_error_detail(&stderr_lines)
+                        )),
+                        Err(error) => Err(anyhow::anyhow!(
+                            "failed waiting for the OpenCode server: {error}{}",
+                            startup_error_detail(&stderr_lines)
+                        )),
+                    };
+                }
+                line = server_error.next_line() => {
+                    if let Some(line) = line? {
+                        remember_startup_error(&mut stderr_lines, line);
+                    }
+                }
+            }
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(30), startup).await {
+        Ok(Ok(url)) => Ok((url, server_error)),
+        Ok(Err(error)) => Err(error),
+        Err(_) => {
+            let _ = server.kill().await;
+            while let Ok(Some(line)) = server_error.next_line().await {
+                remember_startup_error(&mut stderr_lines, line);
+            }
+            crate::provider_bin::invalidate(crate::provider_bin::Runtime::OpenCode).await;
+            bail!(
+                "OpenCode server startup timed out after 30s{}",
+                startup_error_detail(&stderr_lines)
+            );
+        }
+    }
+}
+
+/// Parse the line OpenCode prints once its HTTP server is ready.
+///
+/// OpenCode 2.2 prints `server listening on ...`; older builds prefixed it
+/// with `opencode `. Accept either so an output-format change cannot turn a
+/// healthy server into a 30-second startup timeout.
+fn opencode_listen_port(line: &str) -> Result<Option<u16>> {
+    let marker = "server listening on http://127.0.0.1:";
+    let Some(start) = line.find(marker).map(|index| index + marker.len()) else {
+        return Ok(None);
+    };
+    let port = line[start..]
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim();
+    Ok(Some(port.parse().context("invalid OpenCode server port")?))
+}
+
+fn remember_startup_error(lines: &mut Vec<String>, line: String) {
+    if lines.len() < 8 {
+        lines.push(line.chars().take(500).collect());
+    }
+}
+
+fn startup_error_detail(lines: &[String]) -> String {
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", lines.join(" | "))
+    }
 }
 
 fn is_command_tool(name: &str) -> bool {
@@ -1034,7 +1127,7 @@ mod tests {
 
     use super::{
         ChatStreamEvent, EventStream, LocalAgentPermission, blocked_tools, emit_tool,
-        opencode_base_config, parse_usage,
+        opencode_base_config, opencode_listen_port, opencode_server_url, parse_usage,
     };
 
     /// A stand-in OpenCode server that aborts the event stream the way the real
@@ -1126,6 +1219,61 @@ mod tests {
                 )
                 .await;
         }
+    }
+
+    #[cfg(unix)]
+    fn shell_child(command: &str) -> tokio::process::Child {
+        let mut command_builder = tokio::process::Command::new("sh");
+        command_builder
+            .args(["-c", command])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start shell child")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_exit_reports_stderr_instead_of_waiting_for_the_timeout() {
+        let mut child = shell_child("printf 'postinstall script was not run\n' >&2; exit 7");
+        let error = tokio::time::timeout(Duration::from_secs(2), opencode_server_url(&mut child))
+            .await
+            .expect("startup error must be immediate")
+            .expect_err("the child never listened");
+        let message = format!("{error:#}");
+        assert!(message.contains("exited before listening"), "{message}");
+        assert!(
+            message.contains("postinstall script was not run"),
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_url_is_read_from_the_current_listen_line() {
+        let mut child =
+            shell_child("printf 'server listening on http://127.0.0.1:41234\n'; sleep 10");
+        let (url, _) =
+            tokio::time::timeout(Duration::from_secs(2), opencode_server_url(&mut child))
+                .await
+                .expect("listen line must be immediate")
+                .expect("server URL");
+        assert_eq!(url, "http://127.0.0.1:41234");
+    }
+
+    #[test]
+    fn server_listening_line_accepts_current_and_legacy_prefixes() {
+        assert_eq!(
+            opencode_listen_port("server listening on http://127.0.0.1:4123").unwrap(),
+            Some(4123)
+        );
+        assert_eq!(
+            opencode_listen_port("opencode server listening on http://127.0.0.1:4123").unwrap(),
+            Some(4123)
+        );
+        assert_eq!(opencode_listen_port("starting server").unwrap(), None);
     }
 
     #[test]
