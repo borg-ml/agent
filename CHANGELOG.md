@@ -16,9 +16,13 @@ Git comparison.
   sent, so OpenCode Go and other OpenAI-compatible providers no longer reject
   the request with HTTP 400 for apparently unanswered `tool_call_id`s.
 
-- A thinking block delivered after its answer is placed above that answer using
-  the block's start time, so the transcript no longer shows the response before
-  the reasoning that produced it.
+- A thinking block delivered after its answer is placed above the current
+  trailing answer, so the transcript no longer shows the response before the
+  reasoning that produced it.
+
+- Empty assistant rows from tool-only model rounds no longer split action
+  groups. Consecutive work now stays in one counted group even when a round
+  produced reasoning or tool calls without prose.
 
 - Private-display input and observations now use a 45-second helper deadline, longer than the compositor socket deadline. A slow game no longer loses its display merely because the ordinary desktop deadline expires first.
 

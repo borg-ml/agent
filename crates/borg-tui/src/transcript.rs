@@ -4367,7 +4367,7 @@ mod parallel_preparation_tests {
     }
 
     #[test]
-    fn late_reasoning_is_placed_above_the_answer_it_precedes() {
+    fn late_reasoning_is_placed_above_the_current_answer() {
         let session_id = Uuid::new_v4();
         let reasoning_id = Uuid::new_v4();
         let message_id = Uuid::new_v4();
@@ -4384,7 +4384,7 @@ mod parallel_preparation_tests {
         ] {
             apply(
                 sequence,
-                started_at + chrono::Duration::seconds(1),
+                started_at,
                 SessionEventKind::Message {
                     message_id,
                     actor: EventActor::Assistant,
@@ -4397,19 +4397,19 @@ mod parallel_preparation_tests {
         }
         apply(
             3,
-            started_at,
+            started_at + chrono::Duration::seconds(1),
             SessionEventKind::ReasoningBlockStarted { reasoning_id },
         );
         apply(
             4,
-            started_at,
+            started_at + chrono::Duration::seconds(1),
             SessionEventKind::ProviderEvent {
                 provider: CodingProvider::OpenCode,
                 kind: "reasoning_snapshot".into(),
                 payload: serde_json::json!({
                     "reasoning_id": reasoning_id,
                     "reasoning_block": true,
-                    "started_at": started_at,
+                    "started_at": started_at + chrono::Duration::seconds(1),
                     "text": "I should answer briefly.",
                     "complete": true,
                 }),
@@ -4417,7 +4417,7 @@ mod parallel_preparation_tests {
         );
         apply(
             5,
-            started_at,
+            started_at + chrono::Duration::seconds(1),
             SessionEventKind::ReasoningBlockCompleted { reasoning_id },
         );
         let rendered = transcript
@@ -4518,6 +4518,87 @@ mod parallel_preparation_tests {
             &transcript.order[1],
             TranscriptEntry::Message { .. }
         ));
+    }
+
+    #[test]
+    fn hidden_tool_only_rounds_do_not_split_an_action_group() {
+        let session = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let mut transcript = Transcript::default();
+        let mut sequence = 0;
+        for (kind, expected_groups) in [
+            (
+                SessionEventKind::ToolStarted {
+                    tool_call_id: "a".into(),
+                    name: "exec".into(),
+                    input: serde_json::json!({"cmd": "true"}),
+                    input_ref: None,
+                    parent_tool_call_id: None,
+                },
+                None,
+            ),
+            (
+                SessionEventKind::ToolStarted {
+                    tool_call_id: "b".into(),
+                    name: "exec".into(),
+                    input: serde_json::json!({"cmd": "true"}),
+                    input_ref: None,
+                    parent_tool_call_id: None,
+                },
+                Some((1, 2)),
+            ),
+            (
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::Assistant,
+                    text: String::new(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::InProgress,
+                    delivery: None,
+                },
+                None,
+            ),
+            (
+                SessionEventKind::ToolStarted {
+                    tool_call_id: "c".into(),
+                    name: "exec".into(),
+                    input: serde_json::json!({"cmd": "true"}),
+                    input_ref: None,
+                    parent_tool_call_id: None,
+                },
+                None,
+            ),
+            (
+                SessionEventKind::ToolStarted {
+                    tool_call_id: "d".into(),
+                    name: "exec".into(),
+                    input: serde_json::json!({"cmd": "true"}),
+                    input_ref: None,
+                    parent_tool_call_id: None,
+                },
+                Some((1, 4)),
+            ),
+        ] {
+            sequence += 1;
+            transcript.apply(&SessionEvent::new(session, sequence, kind));
+            if let Some((expected_groups, expected_total)) = expected_groups {
+                let rendered = transcript
+                    .render_for_cache_at(80, 20, Utc::now())
+                    .0
+                    .iter()
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>();
+                let groups = rendered
+                    .iter()
+                    .filter(|line| line.contains("actions"))
+                    .collect::<Vec<_>>();
+                assert_eq!(groups.len(), expected_groups, "{rendered:#?}");
+                assert!(
+                    groups[0].contains(&format!("{expected_total} actions")),
+                    "{rendered:#?}"
+                );
+            }
+        }
     }
 
     #[test]

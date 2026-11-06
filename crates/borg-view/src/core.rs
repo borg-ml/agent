@@ -3860,10 +3860,11 @@ impl TranscriptCore {
             }
             self.active_reasoning = None;
         }
-        // A provider may deliver the answer before a coalesced thinking
-        // snapshot. The snapshot still carries when the thinking began, so put
-        // it above the trailing answer it produced rather than below it. A new
-        // turn starts with a user row after that answer, which opts out.
+        // A provider may deliver a coalesced thinking snapshot after the
+        // answer's first text has already been displayed. The reasoning still
+        // belongs above the current trailing answer, regardless of which one
+        // the provider timestamped first. A new turn starts with a user row
+        // after that answer, which opts out.
         let index = self
             .order
             .last()
@@ -3874,9 +3875,7 @@ impl TranscriptCore {
                         actor: EventActor::Assistant,
                         ..
                     }
-                ) && entry
-                    .execution()
-                    .is_some_and(|execution| execution.started_at() >= started_at)
+                )
             })
             .map_or(self.order.len(), |_| self.order.len() - 1);
         if index < self.order.len() {

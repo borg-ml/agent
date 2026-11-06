@@ -1,5 +1,6 @@
 //! Transcript grouping authority, extracted from terminal semantics.
 use crate::entry::{OperationKind, ToolRunWindow, TranscriptEntry};
+use borg_agent_runtime::{EventActor, MessageStatus};
 use std::borrow::Cow;
 const TOOL_RUN_BOX_THRESHOLD: usize = 1;
 pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
@@ -183,24 +184,49 @@ pub fn same_action_type(left: &TranscriptEntry, right: &TranscriptEntry) -> bool
         }
 }
 
-/// A run is every maximal sequence of consecutive operations.
+/// Empty in-progress assistant rows are ordering anchors for a reply that
+/// follows a preparing tool, but they render nothing. They must not break a
+/// run of actions into separate groups.
+fn is_empty_assistant_anchor(entry: &TranscriptEntry) -> bool {
+    matches!(
+        entry,
+        TranscriptEntry::Message {
+            actor: EventActor::Assistant,
+            text,
+            attachments,
+            status: MessageStatus::InProgress,
+            ..
+        } if text.trim().is_empty() && attachments.is_empty()
+    )
+}
+
+/// A run is every maximal sequence of consecutive operations, ignoring empty
+/// assistant anchors that render nothing.
 pub fn tool_run_windows(entries: &[TranscriptEntry]) -> Vec<Option<ToolRunWindow>> {
     let mut windows = vec![None; entries.len()];
     let mut index = 0;
     while index < entries.len() {
-        let start = index;
-        while index < entries.len() && entries[index].is_operation() {
+        if !entries[index].is_operation() {
             index += 1;
+            continue;
         }
-        let total = index - start;
+        let start = index;
+        let mut end = index;
+        let mut total = 0;
+        while index < entries.len() {
+            if entries[index].is_operation() {
+                total += 1;
+                index += 1;
+                end = index;
+            } else if is_empty_assistant_anchor(&entries[index]) {
+                index += 1;
+            } else {
+                break;
+            }
+        }
         if total > TOOL_RUN_BOX_THRESHOLD {
-            windows[start..index].fill(Some(ToolRunWindow {
-                start,
-                end: index,
-                total,
-            }));
+            windows[start..end].fill(Some(ToolRunWindow { start, end, total }));
         }
-        index = index.max(start + 1);
     }
     windows
 }
@@ -216,19 +242,30 @@ pub fn action_run_windows(
             index += 1;
             continue;
         };
-        let start = index;
-        index += 1;
-        while index < parent.end && same_action_type(&entries[start], &entries[index]) {
+        if !entries[index].is_operation() {
             index += 1;
+            continue;
         }
-        let total = index - start;
+        let start = index;
+        let first = &entries[start];
+        index += 1;
+        let mut end = index;
+        let mut total = 1;
+        while index < parent.end {
+            let entry = &entries[index];
+            if is_empty_assistant_anchor(entry) {
+                index += 1;
+            } else if entry.is_operation() && same_action_type(first, entry) {
+                total += 1;
+                index += 1;
+                end = index;
+            } else {
+                break;
+            }
+        }
         if total > 1 {
-            let window = ToolRunWindow {
-                start,
-                end: index,
-                total,
-            };
-            windows[start..index].fill(Some(window));
+            let window = ToolRunWindow { start, end, total };
+            windows[start..end].fill(Some(window));
         }
     }
     windows
