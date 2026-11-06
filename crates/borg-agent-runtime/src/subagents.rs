@@ -3628,6 +3628,56 @@ impl AgentToolDispatcher {
                     "instruction": "Provider admission is host-local; it does not enable session tools. Check session_capabilities.subagents before delegation or messaging, and provider can_spawn before cross-provider work."
                 }))
             }
+            "select_provider_account" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct SelectProviderAccountArgs {
+                    provider: String,
+                    account: String,
+                }
+                let args: SelectProviderAccountArgs = serde_json::from_value(arguments)?;
+                let provider = match args.provider.trim().to_ascii_lowercase().as_str() {
+                    "claude" => CodingProvider::Claude,
+                    "codex" => CodingProvider::Codex,
+                    other => anyhow::bail!(
+                        "only claude and codex keep subscription accounts; {other} has none"
+                    ),
+                };
+                let auth = match provider {
+                    CodingProvider::Claude => borg_provider::ProviderAuthProvider::Claude,
+                    _ => borg_provider::ProviderAuthProvider::Openai,
+                };
+                let billed_by_api_key = match provider {
+                    CodingProvider::Claude => borg_provider::credentials::claude_uses_api_key(),
+                    _ => borg_provider::credentials::openai_uses_api_key(),
+                };
+                anyhow::ensure!(
+                    !billed_by_api_key,
+                    "{} turns currently bill an API key; select the subscription lane with /login before choosing an account",
+                    provider.label()
+                );
+                let account =
+                    borg_provider::subscription_accounts::activate(auth, &args.account).await?;
+                // The selected authority changed, so every usage and admission
+                // value derived from the old one is stale.
+                crate::provider_usage::clear_login_dependent_usage_caches().await;
+                let providers = crate::provider_usage::refresh_provider_capability_usage(
+                    &self.provider_capabilities,
+                )
+                .await;
+                let accounts = providers
+                    .iter()
+                    .find(|capability| capability.provider == provider)
+                    .map(|capability| capability.accounts.clone())
+                    .unwrap_or_default();
+                Ok(json!({
+                    "provider": provider,
+                    "active_account": account.name,
+                    "accounts": accounts,
+                    "providers": providers,
+                    "instruction": "The next turn on this provider uses the selected account. Usage and reset times above are refreshed."
+                }))
+            }
             "web_search" => {
                 let args: WebSearchArgs = serde_json::from_value(arguments)?;
                 let provider = self
@@ -10595,10 +10645,23 @@ pub fn agent_tool_specs_for_surface(
         ),
         tool(
             "get_provider_capabilities",
-            "Read a fresh host-local, secret-free authentication, usage, and admission snapshot before cross-provider collaboration or consultation. It distinguishes authenticated subscriptions, configured API-key routes, and exhausted usage windows. Only providers with can_spawn=true can be used; never ask for or expose credentials.",
+            "Read a fresh host-local, secret-free authentication, usage, and admission snapshot before cross-provider collaboration or consultation. It distinguishes authenticated subscriptions, configured API-key routes, and exhausted usage windows, and lists each connected subscription account with its remaining usage and reset times. Only providers with can_spawn=true can be used; never ask for or expose credentials.",
             json!({
                 "type": "object",
                 "properties": {},
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "select_provider_account",
+            "Switch which connected subscription login a provider uses, after reading what each account has left with get_provider_capabilities. Use it when the active login is exhausted or nearly out and another has capacity. It only selects another login of the same provider: it never changes provider, model, or the API-key billing lane. The selection is host-wide, so every session on this machine uses it from its next turn; a turn already running finishes on the account it started with. Returns the refreshed account list.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "provider": { "type": "string", "enum": ["claude", "codex"] },
+                    "account": { "type": "string", "minLength": 1, "maxLength": 40, "description": "Connected account name reported by get_provider_capabilities." }
+                },
+                "required": ["provider", "account"],
                 "additionalProperties": false
             }),
         ),

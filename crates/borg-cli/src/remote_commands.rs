@@ -593,7 +593,7 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
             );
         }
         RemoteCommand::Login { provider } => {
-            login_command(Some(provider), false, None).await?;
+            login_command(Some(provider), false, None, None).await?;
         }
         RemoteCommand::Status { roots, config } => {
             let roots = roots
@@ -8952,7 +8952,16 @@ pub(crate) async fn login_command(
     provider: Option<crate::cli::RemoteProviderArg>,
     api_key: bool,
     auth_file: Option<PathBuf>,
+    account: Option<String>,
 ) -> Result<()> {
+    if let Some(name) = account {
+        let provider = provider
+            .context("--account needs a provider: borg login claude --account NAME")?
+            .into();
+        borg_remote::login_provider_account_with_output(provider, &name, |line| println!("{line}"))
+            .await?;
+        return Ok(());
+    }
     if let Some(path) = auth_file {
         anyhow::ensure!(
             provider.map(CodingProvider::from) == Some(CodingProvider::Codex) && !api_key,
@@ -9050,6 +9059,102 @@ pub(crate) async fn login_command(
         }
     }
     Ok(())
+}
+
+/// `borg accounts`: what every connected Claude/ChatGPT login has left and when
+/// each window resets. The active login is the one the next turn bills.
+pub(crate) async fn accounts_command(json: bool) -> Result<()> {
+    let mut rows = Vec::new();
+    for provider in [CodingProvider::Claude, CodingProvider::Codex] {
+        rows.push((
+            provider,
+            borg_remote::provider_usage::subscription_accounts(provider).await,
+        ));
+    }
+    if json {
+        let payload = rows
+            .iter()
+            .map(|(provider, accounts)| {
+                serde_json::json!({ "provider": provider, "accounts": accounts })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+    for (index, (provider, accounts)) in rows.into_iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        print_account_rows(provider, &accounts);
+    }
+    Ok(())
+}
+
+/// `borg accounts use`: make one connected login the one turns bill.
+pub(crate) async fn use_account_command(
+    provider: crate::cli::SubscriptionProviderArg,
+    account: String,
+) -> Result<()> {
+    let selected =
+        borg_provider::subscription_accounts::activate(provider.into(), &account).await?;
+    let provider: CodingProvider = provider.into();
+    println!(
+        "{} turns now use the {} login ({}).",
+        provider.label(),
+        selected.name,
+        selected.path.display()
+    );
+    let accounts = borg_remote::provider_usage::subscription_accounts(provider).await;
+    print_account_rows(provider, &accounts);
+    Ok(())
+}
+
+fn print_account_rows(provider: CodingProvider, accounts: &[borg_remote::ProviderAccount]) {
+    println!("{} subscriptions", provider.label());
+    if accounts.is_empty() {
+        println!(
+            "  none connected · connect one with `borg login {}`",
+            match provider {
+                CodingProvider::Claude => "claude",
+                _ => "codex",
+            }
+        );
+        return;
+    }
+    for account in accounts {
+        let marker = if account.active { "*" } else { " " };
+        let capacity = match account.usage.as_ref() {
+            Some(usage) if !usage.windows.is_empty() => account_window_text(usage),
+            Some(usage) => usage
+                .detail
+                .clone()
+                .unwrap_or_else(|| "no quota reported".to_string()),
+            None => account
+                .detail
+                .clone()
+                .unwrap_or_else(|| "usage unavailable".to_string()),
+        };
+        println!(" {marker} {:<14} {capacity}", account.name);
+    }
+}
+
+fn account_window_text(usage: &borg_remote::ProviderUsage) -> String {
+    usage
+        .windows
+        .iter()
+        .map(|window| {
+            let left = 100_u8.saturating_sub(window.used_percent.min(100));
+            match window.resets_at {
+                Some(reset) => format!(
+                    "{} {left}% left (resets {})",
+                    window.label,
+                    reset.with_timezone(&Local).format("%H:%M on %d %b")
+                ),
+                None => format!("{} {left}% left", window.label),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// The coding plan a provider is served by, if it is a plan provider.
@@ -11081,10 +11186,10 @@ async fn usage_summary(
     journaled: Option<borg_remote::ProviderUsage>,
 ) -> String {
     let fetched = match provider {
-        CodingProvider::Codex => read_codex_account_rate_limits()
+        CodingProvider::Codex => read_codex_account_rate_limits(None)
             .await
             .map(|limits| Some(AccountRateLimits::Codex(limits))),
-        CodingProvider::Claude => read_claude_account_rate_limits(true)
+        CodingProvider::Claude => read_claude_account_rate_limits(None, true)
             .await
             .map(|limits| Some(AccountRateLimits::Claude(limits))),
         _ => Ok(None),

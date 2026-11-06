@@ -12,6 +12,7 @@ pub mod provider_bin;
 pub mod provider_install;
 pub mod runtime;
 pub mod subscription;
+pub mod subscription_accounts;
 pub mod ultrathink;
 
 mod auth;
@@ -20,6 +21,7 @@ mod env;
 pub mod subprocess;
 
 pub use auth::{ProviderAuthBundle, ProviderAuthFile, ProviderAuthProvider};
+pub use subscription_accounts::SubscriptionAccount;
 pub use provider_bin::{Runtime, command as runtime_command, executable as runtime_executable};
 pub use provider_install::Healed;
 pub use runtime::{

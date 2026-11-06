@@ -46,6 +46,7 @@ impl Cli {
             "__agent"
                 | "resume"
                 | "login"
+                | "accounts"
                 | "config"
                 | "gui"
                 | "remote"
@@ -107,6 +108,23 @@ pub(crate) enum Command {
         /// Use an existing ChatGPT auth file in place, without copying rotating tokens.
         #[arg(long, conflicts_with = "api_key", requires = "provider")]
         auth_file: Option<PathBuf>,
+        /// Connect this named subscription login instead of the current one.
+        /// Claude and ChatGPT keep several logins side by side.
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with = "api_key",
+            requires = "provider"
+        )]
+        account: Option<String>,
+    },
+    /// List connected Claude/ChatGPT subscription accounts with usage and resets.
+    Accounts {
+        #[command(subcommand)]
+        command: Option<AccountsCommand>,
+        /// Emit machine-readable JSON output.
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// Locate, create, open, or validate the agent configuration file.
     Config {
@@ -1380,6 +1398,42 @@ impl From<RemoteProviderArg> for borg_remote::CodingProvider {
             RemoteProviderArg::OpenAiCompatible => Self::OpenAiCompatible,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum SubscriptionProviderArg {
+    Claude,
+    #[value(alias = "chatgpt", alias = "openai")]
+    Codex,
+}
+
+impl From<SubscriptionProviderArg> for borg_provider::ProviderAuthProvider {
+    fn from(value: SubscriptionProviderArg) -> Self {
+        match value {
+            SubscriptionProviderArg::Claude => Self::Claude,
+            SubscriptionProviderArg::Codex => Self::Openai,
+        }
+    }
+}
+
+impl From<SubscriptionProviderArg> for borg_remote::CodingProvider {
+    fn from(value: SubscriptionProviderArg) -> Self {
+        match value {
+            SubscriptionProviderArg::Claude => Self::Claude,
+            SubscriptionProviderArg::Codex => Self::Codex,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AccountsCommand {
+    /// Use a connected account for this provider's next turns.
+    Use {
+        #[arg(value_enum)]
+        provider: SubscriptionProviderArg,
+        /// Account name as shown by `borg accounts`.
+        account: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

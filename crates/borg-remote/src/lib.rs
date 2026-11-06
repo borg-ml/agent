@@ -25,7 +25,8 @@ pub use command::{
 };
 pub use host::{
     DirectListenerConfig, HostConfig, HostExecutorFactory, device_authorization_request,
-    enroll_host, host_launch_is_local_mirror, login_provider, login_provider_with_output,
+    enroll_host, host_launch_is_local_mirror, login_provider, login_provider_account_with_output,
+    login_provider_with_output,
     mirror_local_session, probe_capabilities, probe_provider_admission_capabilities,
     probe_provider_capabilities, provider_credentials_present,
     provider_subscription_credentials_present, read_config as read_host_config,

@@ -13611,6 +13611,7 @@ fn billing_status_follows_the_configured_provider_and_capability_refresh() {
             plan: Some(plan.to_string()),
         }),
         billing: Some(billing),
+        accounts: Vec::new(),
     };
     let mut transcript = Transcript::default();
     transcript.seed_session_state(&SessionState {

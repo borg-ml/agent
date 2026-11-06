@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use chrono::{DateTime, Utc};
 
 use crate::{
-    CodingProvider, ProviderAuthMethod, ProviderCapability, ProviderUsage,
+    CodingProvider, ProviderAccount, ProviderAuthMethod, ProviderCapability, ProviderUsage,
     ProviderUsageAvailability, ProviderUsageWindow,
 };
 
@@ -214,6 +214,11 @@ pub async fn refresh_provider_capability_usage(
         }
     };
     let (codex, claude) = tokio::join!(codex, claude);
+    // Account rows are read after the provider probes above so Claude's usage
+    // endpoint is asked once per interval rather than once per row, and so a
+    // connected login is still described when the selected one is unusable.
+    let codex_accounts = subscription_accounts(CodingProvider::Codex).await;
+    let claude_accounts = subscription_accounts(CodingProvider::Claude).await;
     capabilities
         .iter()
         .cloned()
@@ -228,6 +233,12 @@ pub async fn refresh_provider_capability_usage(
             } else if usage.is_some() {
                 capability.usage = usage;
             }
+            let accounts: &[ProviderAccount] = match capability.provider {
+                CodingProvider::Codex => &codex_accounts,
+                CodingProvider::Claude => &claude_accounts,
+                _ => &[],
+            };
+            attach_account_usage(&mut capability, accounts);
             apply_spawn_admission(&mut capability);
             capability
         })
@@ -275,14 +286,16 @@ async fn probe_provider_usage(provider: CodingProvider) -> Option<ProviderUsage>
         return usage.clone();
     }
     let usage = match provider {
-        CodingProvider::Codex => borg_provider::provider::read_codex_account_rate_limits()
+        CodingProvider::Codex => borg_provider::provider::read_codex_account_rate_limits(None)
             .await
             .ok()
             .map(codex_provider_usage),
-        CodingProvider::Claude => borg_provider::provider::read_claude_account_rate_limits(false)
-            .await
-            .ok()
-            .map(claude_provider_usage),
+        CodingProvider::Claude => {
+            borg_provider::provider::read_claude_account_rate_limits(None, false)
+                .await
+                .ok()
+                .map(claude_provider_usage)
+        }
         _ => None,
     };
     cache
@@ -290,6 +303,114 @@ async fn probe_provider_usage(provider: CodingProvider) -> Option<ProviderUsage>
         .await
         .insert(provider, (Instant::now(), usage.clone()));
     usage
+}
+
+/// Publish connected accounts on a subscription capability. A login that
+/// answers keeps the provider admitted even when the selected login's own read
+/// failed, because the agent can still see every account and switch to one
+/// with capacity. API-key lanes own no subscription accounts.
+fn attach_account_usage(capability: &mut ProviderCapability, accounts: &[ProviderAccount]) {
+    if accounts.is_empty() || capability.billing == Some(crate::BillingLane::ApiKey) {
+        return;
+    }
+    capability.authenticated |= accounts.iter().any(|account| account.usage.is_some());
+    capability.accounts = accounts.to_vec();
+}
+
+/// How long one account's usage read is shared by every capability refresh.
+const ACCOUNT_USAGE_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Clone)]
+struct AccountProbe {
+    usage: Option<ProviderUsage>,
+    detail: Option<String>,
+}
+
+type AccountUsageCache = HashMap<(CodingProvider, String), (Instant, AccountProbe)>;
+
+static PROVIDER_ACCOUNT_USAGE_CACHE: OnceLock<Mutex<AccountUsageCache>> = OnceLock::new();
+
+/// Connected Claude/ChatGPT logins, each with its own usage and reset times.
+///
+/// A selected API-key lane reports no subscription accounts: probing one there
+/// would suggest a switch that does not exist, and switching lanes is never
+/// implicit.
+pub async fn subscription_accounts(provider: CodingProvider) -> Vec<ProviderAccount> {
+    let auth = match provider {
+        CodingProvider::Claude if !borg_provider::credentials::claude_uses_api_key() => {
+            borg_provider::ProviderAuthProvider::Claude
+        }
+        CodingProvider::Codex if !borg_provider::credentials::openai_uses_api_key() => {
+            borg_provider::ProviderAuthProvider::Openai
+        }
+        _ => return Vec::new(),
+    };
+    let accounts = borg_provider::subscription_accounts::list(auth)
+        .await
+        .unwrap_or_default();
+    let mut rows = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        let probe = account_probe(provider, &account.path).await;
+        rows.push(ProviderAccount {
+            name: account.name,
+            active: account.active,
+            plan: probe.usage.as_ref().and_then(|usage| usage.plan.clone()),
+            usage: probe.usage,
+            detail: probe.detail,
+        });
+    }
+    rows
+}
+
+async fn account_probe(provider: CodingProvider, path: &std::path::Path) -> AccountProbe {
+    let cache = PROVIDER_ACCOUNT_USAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (provider, path.display().to_string());
+    if let Some((probed_at, probe)) = cache.lock().await.get(&key)
+        && probed_at.elapsed() < ACCOUNT_USAGE_TTL
+    {
+        return probe.clone();
+    }
+    let probe = match provider {
+        CodingProvider::Claude => {
+            borg_provider::provider::read_claude_account_rate_limits(Some(path), false)
+                .await
+                .map(claude_provider_usage)
+        }
+        CodingProvider::Codex => {
+            borg_provider::provider::read_codex_account_rate_limits(Some(path.to_path_buf()))
+                .await
+                .map(codex_provider_usage)
+        }
+        _ => {
+            return AccountProbe {
+                usage: None,
+                detail: Some("this provider has no subscription accounts".to_string()),
+            };
+        }
+    };
+    let probe = match probe {
+        Ok(usage) => AccountProbe {
+            usage: Some(usage),
+            detail: None,
+        },
+        Err(error) => AccountProbe {
+            usage: None,
+            detail: Some(bounded_usage_error(&error)),
+        },
+    };
+    cache
+        .lock()
+        .await
+        .insert(key, (Instant::now(), probe.clone()));
+    probe
+}
+
+/// Provider errors can quote request context; only one bounded line reaches a
+/// journaled capability snapshot.
+fn bounded_usage_error(error: &anyhow::Error) -> String {
+    let text = format!("{error:#}");
+    let first = text.lines().next().unwrap_or_default().trim();
+    first.chars().take(160).collect()
 }
 
 fn codex_provider_usage(limits: borg_provider::provider::CodexAccountRateLimits) -> ProviderUsage {
@@ -414,6 +535,7 @@ mod tests {
             can_spawn: true,
             usage: None,
             billing: Some(crate::BillingLane::Subscription),
+            accounts: Vec::new(),
         };
         hold_unverified_claude_transport(&mut capability);
         assert!(!capability.can_spawn);
@@ -449,6 +571,7 @@ mod tests {
                 plan: None,
             }),
             billing: Some(crate::BillingLane::Subscription),
+            accounts: Vec::new(),
         };
         apply_spawn_admission(&mut capability);
         assert!(capability.can_spawn);
@@ -474,6 +597,70 @@ mod tests {
         assert!(!capability.can_spawn);
     }
 
+    fn subscription_capability(provider: CodingProvider) -> ProviderCapability {
+        ProviderCapability {
+            provider,
+            installed: true,
+            version: None,
+            authenticated: false,
+            auth_detail: None,
+            auth_methods: Vec::new(),
+            can_spawn: false,
+            usage: None,
+            billing: Some(crate::BillingLane::Subscription),
+            accounts: Vec::new(),
+        }
+    }
+
+    fn account(name: &str, active: bool, used_percent: u8) -> ProviderAccount {
+        ProviderAccount {
+            name: name.to_string(),
+            active,
+            plan: None,
+            usage: Some(ProviderUsage {
+                availability: ProviderUsageAvailability::Available,
+                windows: vec![ProviderUsageWindow {
+                    label: "5-hour".to_string(),
+                    used_percent,
+                    resets_at: None,
+                    global: true,
+                }],
+                detail: None,
+                plan: None,
+            }),
+            detail: None,
+        }
+    }
+
+    // The agent chooses an account from this snapshot: a login that answers
+    // must both appear and keep the provider admissible when the selected one
+    // is unusable, while an API-key lane must never advertise one.
+    #[test]
+    fn account_usage_reaches_the_snapshot_and_keeps_a_working_login_admitted() {
+        let mut capability = subscription_capability(CodingProvider::Claude);
+        attach_account_usage(
+            &mut capability,
+            &[account("work", true, 100), account("personal", false, 10)],
+        );
+        assert!(capability.authenticated);
+        assert_eq!(
+            capability
+                .accounts
+                .iter()
+                .map(|account| (account.name.as_str(), account.active))
+                .collect::<Vec<_>>(),
+            [("work", true), ("personal", false)]
+        );
+        apply_spawn_admission(&mut capability);
+        assert!(capability.can_spawn);
+
+        let mut api_key = subscription_capability(CodingProvider::Codex);
+        api_key.billing = Some(crate::BillingLane::ApiKey);
+        attach_account_usage(&mut api_key, &[account("work", true, 10)]);
+        assert!(api_key.accounts.is_empty());
+        assert!(!api_key.authenticated);
+    }
+
     #[test]
     fn fresh_claude_login_repairs_a_stale_admission_snapshot() {
         let mut capability = ProviderCapability {
@@ -486,6 +673,7 @@ mod tests {
             can_spawn: false,
             usage: None,
             billing: None,
+            accounts: Vec::new(),
         };
         apply_claude_subscription_status(&mut capability, true);
         assert!(capability.authenticated);

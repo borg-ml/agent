@@ -593,6 +593,26 @@ pub struct ProviderUsage {
     pub plan: Option<String>,
 }
 
+/// One connected subscription login for a provider. Several can be connected
+/// side by side; exactly one is active and is what the next turn bills.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProviderAccount {
+    /// The name the account was connected under.
+    pub name: String,
+    /// Whether turns on this provider currently use this login.
+    pub active: bool,
+    /// Provider-reported plan tier for this login, when known.
+    #[serde(default)]
+    pub plan: Option<String>,
+    /// This login's own quota windows, including when each one resets.
+    #[serde(default)]
+    pub usage: Option<ProviderUsage>,
+    /// Why this login's usage is unavailable, when the probe failed.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ProviderCapability {
@@ -625,6 +645,10 @@ pub struct ProviderCapability {
     /// provider has no usable credential or an older host did not classify it.
     #[serde(default)]
     pub billing: Option<BillingLane>,
+    /// Connected subscription logins, each with its own usage and reset times.
+    /// Empty on API-key lanes and on hosts that predate named accounts.
+    #[serde(default)]
+    pub accounts: Vec<ProviderAccount>,
 }
 
 /// Which account a provider turn is charged to.
@@ -1230,33 +1254,7 @@ pub fn provider_capabilities_prompt(capabilities: &[ProviderCapability]) -> Stri
         } else {
             format!("authenticated via {}", methods.join(" + "))
         };
-        let usage = capability.usage.as_ref().map(|usage| {
-            let availability = match usage.availability {
-                ProviderUsageAvailability::Available => "available",
-                ProviderUsageAvailability::Exhausted => "EXHAUSTED",
-                ProviderUsageAvailability::Unknown => "unknown",
-            };
-            let windows = usage
-                .windows
-                .iter()
-                .map(|window| {
-                    let left = 100_u8.saturating_sub(window.used_percent.min(100));
-                    match window.resets_at {
-                        Some(reset) => format!(
-                            "{} {left}% left (resets {})",
-                            window.label,
-                            reset.to_rfc3339()
-                        ),
-                        None => format!("{} {left}% left", window.label),
-                    }
-                })
-                .collect::<Vec<_>>();
-            if windows.is_empty() {
-                format!("usage {availability}")
-            } else {
-                format!("usage {availability}: {}", windows.join(", "))
-            }
-        });
+        let usage = capability.usage.as_ref().map(provider_usage_text);
         let status = if capability.can_spawn {
             if capability
                 .usage
@@ -1282,12 +1280,59 @@ pub fn provider_capabilities_prompt(capabilities: &[ProviderCapability]) -> Stri
         if let Some(usage) = usage {
             prompt.push_str(&format!("; {usage}"));
         }
+        if !capability.accounts.is_empty() {
+            let accounts = capability
+                .accounts
+                .iter()
+                .map(|account| {
+                    let state = if account.active { "active" } else { "idle" };
+                    let capacity = account
+                        .usage
+                        .as_ref()
+                        .map(provider_usage_text)
+                        .or_else(|| account.detail.clone())
+                        .unwrap_or_else(|| "usage unknown".to_string());
+                    format!("{} [{state}] {capacity}", account.name)
+                })
+                .collect::<Vec<_>>();
+            prompt.push_str(&format!("; accounts: {}", accounts.join(" | ")));
+        }
         prompt.push_str(".\n");
     }
     prompt.push_str(
-        "Before cross-provider collaboration or consultation, call `get_provider_capabilities` for a fresh structured usage snapshot. Only use `spawn_agent`, `consult_peer`, or `consult_model` with a provider marked READY.",
+        "Before cross-provider collaboration or consultation, call `get_provider_capabilities` for a fresh structured usage snapshot. Only use `spawn_agent`, `consult_peer`, or `consult_model` with a provider marked READY. Several subscription accounts can be connected per provider; `select_provider_account` switches which login the next turn bills, and both tools report what each account has left and when it resets.",
     );
     prompt
+}
+
+/// Availability plus one `left% (resets at)` figure per quota window, shared by
+/// the provider line and each connected account so both read alike.
+pub fn provider_usage_text(usage: &ProviderUsage) -> String {
+    let availability = match usage.availability {
+        ProviderUsageAvailability::Available => "available",
+        ProviderUsageAvailability::Exhausted => "EXHAUSTED",
+        ProviderUsageAvailability::Unknown => "unknown",
+    };
+    let windows = usage
+        .windows
+        .iter()
+        .map(|window| {
+            let left = 100_u8.saturating_sub(window.used_percent.min(100));
+            match window.resets_at {
+                Some(reset) => format!(
+                    "{} {left}% left (resets {})",
+                    window.label,
+                    reset.to_rfc3339()
+                ),
+                None => format!("{} {left}% left", window.label),
+            }
+        })
+        .collect::<Vec<_>>();
+    if windows.is_empty() {
+        format!("usage {availability}")
+    } else {
+        format!("usage {availability}: {}", windows.join(", "))
+    }
 }
 
 /// Provider-neutral runtime capability names exposed to hosts and clients.
@@ -3448,6 +3493,7 @@ mod tests {
             can_spawn: true,
             usage: None,
             billing: Some(BillingLane::Subscription),
+            accounts: Vec::new(),
         };
         assert_eq!(capability.billing_label().as_deref(), Some("sub"));
         capability.usage = Some(ProviderUsage {
@@ -3503,6 +3549,7 @@ mod tests {
                     plan: None,
                 }),
                 billing: Some(BillingLane::Subscription),
+                accounts: Vec::new(),
             },
             ProviderCapability {
                 provider: CodingProvider::OpenRouter,
@@ -3514,6 +3561,7 @@ mod tests {
                 can_spawn: true,
                 usage: None,
                 billing: Some(BillingLane::ApiKey),
+                accounts: Vec::new(),
             },
             ProviderCapability {
                 provider: CodingProvider::Claude,
@@ -3535,6 +3583,7 @@ mod tests {
                     plan: None,
                 }),
                 billing: Some(BillingLane::Subscription),
+                accounts: Vec::new(),
             },
         ]);
         assert!(prompt.contains("Codex: READY"));
@@ -3545,6 +3594,57 @@ mod tests {
         assert!(prompt.contains("Claude: NOT READY (usage exhausted)"));
         assert!(prompt.contains("5-hour 0% left"));
         assert!(!prompt.contains(secret));
+    }
+
+    // An agent decides which subscription to spend only from this prompt: it
+    // must name every connected login, mark the active one, and carry each
+    // login's remaining quota and reset time.
+    #[test]
+    fn provider_prompt_names_each_subscription_account_with_its_reset() {
+        let reset = DateTime::parse_from_rfc3339("2026-11-07T04:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let prompt = provider_capabilities_prompt(&[ProviderCapability {
+            provider: CodingProvider::Claude,
+            installed: true,
+            version: None,
+            authenticated: true,
+            auth_detail: None,
+            auth_methods: vec![ProviderAuthMethod::Subscription],
+            can_spawn: true,
+            usage: None,
+            billing: Some(BillingLane::Subscription),
+            accounts: vec![
+                ProviderAccount {
+                    name: "personal".to_string(),
+                    active: false,
+                    plan: Some("pro".to_string()),
+                    usage: None,
+                    detail: Some("quota unreadable".to_string()),
+                },
+                ProviderAccount {
+                    name: "work".to_string(),
+                    active: true,
+                    plan: Some("max".to_string()),
+                    usage: Some(ProviderUsage {
+                        availability: ProviderUsageAvailability::Available,
+                        windows: vec![ProviderUsageWindow {
+                            label: "5-hour".to_string(),
+                            used_percent: 40,
+                            resets_at: Some(reset),
+                            global: true,
+                        }],
+                        detail: None,
+                        plan: Some("max".to_string()),
+                    }),
+                    detail: None,
+                },
+            ],
+        }]);
+        assert!(prompt.contains(
+            "accounts: personal [idle] quota unreadable | work [active] usage available: 5-hour 60% left (resets 2026-11-07T04:30:00+00:00)"
+        ));
+        assert!(prompt.contains("select_provider_account"));
     }
 }
 

@@ -27,7 +27,7 @@ async fn probe() -> Result<()> {
         subscription.plan.as_deref().unwrap_or("unknown")
     );
     if std::env::args().any(|arg| arg == "--usage-only") {
-        let usage = borg_provider::provider::read_codex_account_rate_limits().await?;
+        let usage = borg_provider::provider::read_codex_account_rate_limits(None).await?;
         println!("Native usage: {usage:?}");
         return Ok(());
     }

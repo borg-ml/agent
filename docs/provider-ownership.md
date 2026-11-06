@@ -39,6 +39,28 @@ Borg Remote. Refresh and replay remain bound to the selected account; opaque
 continuations cannot be reused under a different account. Missing entitlement
 or authentication must surface explicitly, never silently switch billing.
 
+## Several subscription accounts
+
+Claude and ChatGPT keep more than one login at a time. `borg login claude
+--account work` (or `borg login codex --account work`) signs in to a new
+persistent authority under `~/.borg/accounts/`, and the credential store maps
+the name to that path in
+`crates/borg-provider/src/subscription_accounts.rs`. Rotating tokens are never
+copied: each login refreshes only its own authority.
+
+Selecting an account writes the same key the adapter already reads
+(`claude_subscription_config_dir` / `openai_subscription_auth_file`), so no
+adapter keeps account state and no turn can silently change account while it
+runs. A login connected before named accounts is adopted as `default` the first
+time another login is named, so it stays visible and switchable.
+
+Usage is read per account and published with the provider capability snapshot:
+`get_provider_capabilities`, the volatile provider appendix and `borg accounts`
+all report each login's remaining windows and reset times. `select_provider_account`
+(agents) and `borg accounts use` (humans) change which login the next turn
+bills. Switching only chooses another login of the same provider; it never
+moves a turn to API-key billing.
+
 ## Model and replay contract
 
 Adapters normalize text, reasoning, complete tool calls, usage and errors.

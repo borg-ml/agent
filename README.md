@@ -68,6 +68,23 @@ are stored in `~/.borg/credentials.json` (mode 0600); an environment variable
 for the same key takes precedence. Subscription limits never switch you to API
 billing automatically, and the footer shows the active billing mode.
 
+Several Claude or ChatGPT subscriptions can stay connected at once. Give each
+sign-in its own name:
+
+```sh
+borg login claude --account work
+borg login codex --account personal
+borg accounts                       # every login, with what is left and when it resets
+borg accounts use claude work       # the login turns bill from now on
+```
+
+Each named login keeps its own authority under `~/.borg/accounts/`, so one
+subscription never refreshes another's token. An agent sees the same picture in
+`get_provider_capabilities` (every account with its remaining quota and reset
+times) and switches with `select_provider_account`; switching only ever picks
+another login of the same provider and never moves a turn to API-key billing. A
+login connected before named accounts appear as `default`.
+
 Credentials do not own a session: switching accounts or replacing a key keeps
 its history, forks and collaborators. Provider continuation data is reused only
 for the account that created it, and credentials stay fixed within a running

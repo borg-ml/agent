@@ -293,6 +293,7 @@ mod tests {
             can_spawn: true,
             usage: None,
             billing: Some(billing),
+            accounts: Vec::new(),
         };
         let capabilities = [
             capability(CodingProvider::Claude, BillingLane::ApiKey),

@@ -1928,6 +1928,7 @@ fn test_provider_capabilities() -> Vec<crate::ProviderCapability> {
         can_spawn: true,
         usage: None,
         billing: None,
+        accounts: Vec::new(),
     })
     .collect()
 }
@@ -15606,6 +15607,7 @@ async fn team_steer_admits_a_distinct_prompt_for_each_active_child() {
                 can_spawn: true,
                 usage: None,
                 billing: None,
+                accounts: Vec::new(),
             }],
             ..Default::default()
         },

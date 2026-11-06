@@ -940,6 +940,7 @@ async fn probe_provider(
         can_spawn,
         usage: None,
         billing,
+        accounts: Vec::new(),
     }
 }
 
@@ -1418,9 +1419,32 @@ async fn stream_provider_login_output(
 }
 
 /// Run a provider's browser/device login without requiring a terminal and
-/// stream its user-facing output to a native frontend.
+/// stream its user-facing output to a native frontend. Re-signs in the login
+/// the provider currently uses.
 pub async fn login_provider_with_output(
     provider: CodingProvider,
+    on_output: impl FnMut(&str) + Send,
+) -> Result<()> {
+    login_subscription(provider, None, on_output).await
+}
+
+/// Connect an additional named subscription login and select it. Only Claude
+/// and ChatGPT keep several logins; every other provider has a single authority.
+pub async fn login_provider_account_with_output(
+    provider: CodingProvider,
+    account: &str,
+    on_output: impl FnMut(&str) + Send,
+) -> Result<()> {
+    anyhow::ensure!(
+        matches!(provider, CodingProvider::Claude | CodingProvider::Codex),
+        "named subscription accounts exist for Claude and ChatGPT only"
+    );
+    login_subscription(provider, Some(account), on_output).await
+}
+
+async fn login_subscription(
+    provider: CodingProvider,
+    account: Option<&str>,
     mut on_output: impl FnMut(&str) + Send,
 ) -> Result<()> {
     #[cfg(feature = "subscription-adapters")]
@@ -1429,10 +1453,16 @@ pub async fn login_provider_with_output(
         // programs refreshing one login invalidate each other's tokens. The
         // selection is saved only once the sign-in succeeded, so an abandoned
         // login leaves the working one in place.
-        let directory = match borg_provider::credentials::claude_subscription_config_dir()? {
-            Some(directory) => directory,
-            None => borg_provider::credentials::default_claude_subscription_config_dir()
-                .context("cannot locate a home directory for the Claude login")?,
+        let directory = match account {
+            Some(name) => borg_provider::subscription_accounts::new_account_path(
+                borg_provider::ProviderAuthProvider::Claude,
+                name,
+            )?,
+            None => match borg_provider::credentials::claude_subscription_config_dir()? {
+                Some(directory) => directory,
+                None => borg_provider::credentials::default_claude_subscription_config_dir()
+                    .context("cannot locate a home directory for the Claude login")?,
+            },
         };
         std::fs::create_dir_all(&directory)
             .with_context(|| format!("create {}", directory.display()))?;
@@ -1444,16 +1474,37 @@ pub async fn login_provider_with_output(
             login.authorize_url()
         ));
         login.complete().await?;
-        borg_provider::credentials::set_claude_subscription_config_dir(&directory)?;
+        let connected = match account {
+            Some(name) => {
+                borg_provider::subscription_accounts::register(
+                    borg_provider::ProviderAuthProvider::Claude,
+                    name,
+                    &directory,
+                )
+                .await?;
+                format!("Connected Claude subscription account {name}.")
+            }
+            None => {
+                borg_provider::credentials::set_claude_subscription_config_dir(&directory)?;
+                "Connected Claude subscription.".to_string()
+            }
+        };
         if let Some(cache) = PROVIDER_CAPABILITIES_CACHE.get() {
             cache.lock().await.clear();
         }
         crate::provider_usage::clear_login_dependent_usage_caches().await;
-        on_output("Connected Claude subscription. Saved API credentials were kept.");
+        on_output(&format!("{connected} Saved API credentials were kept."));
         return Ok(());
     }
     if provider == CodingProvider::Codex {
-        let login = borg_provider::openai_subscription::begin_device_login().await?;
+        let path = match account {
+            Some(name) => borg_provider::subscription_accounts::new_account_path(
+                borg_provider::ProviderAuthProvider::Openai,
+                name,
+            )?,
+            None => borg_provider::openai_subscription::auth_path()?,
+        };
+        let login = borg_provider::openai_subscription::begin_device_login(path.clone()).await?;
         on_output(&format!(
             "Open {} and enter code {} (expires in 15 minutes).",
             login.verification_url, login.user_code
@@ -1462,11 +1513,23 @@ pub async fn login_provider_with_output(
         borg_provider::credentials::set_openai_auth_mode(
             borg_provider::credentials::OpenAiAuthMode::Subscription,
         )?;
+        let connected = match account {
+            Some(name) => {
+                borg_provider::subscription_accounts::register(
+                    borg_provider::ProviderAuthProvider::Openai,
+                    name,
+                    &path,
+                )
+                .await?;
+                format!("Connected ChatGPT subscription account {name}.")
+            }
+            None => "Connected ChatGPT subscription.".to_string(),
+        };
         if let Some(cache) = PROVIDER_CAPABILITIES_CACHE.get() {
             cache.lock().await.clear();
         }
         crate::provider_usage::clear_login_dependent_usage_caches().await;
-        on_output("Connected ChatGPT subscription. Saved API credentials were kept.");
+        on_output(&format!("{connected} Saved API credentials were kept."));
         return Ok(());
     }
     let command = if provider == CodingProvider::Muse {

@@ -37,7 +37,8 @@ use std::sync::Mutex;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
 use crate::cli::{
-    CapabilitiesArgs, Cli, Command, ExtensionCommand, ExtensionsArgs, LimitsArgs, LimitsCommand,
+    AccountsCommand, CapabilitiesArgs, Cli, Command, ExtensionCommand, ExtensionsArgs, LimitsArgs,
+    LimitsCommand,
     LocalAgentCliArgs,
 };
 use crate::remote_commands::{print_local_workspaces, run_local_agent, run_remote_command};
@@ -187,7 +188,14 @@ async fn run() -> Result<()> {
             provider,
             api_key,
             auth_file,
-        } => remote_commands::login_command(provider, api_key, auth_file).await,
+            account,
+        } => remote_commands::login_command(provider, api_key, auth_file, account).await,
+        Command::Accounts { command, json } => match command {
+            Some(AccountsCommand::Use { provider, account }) => {
+                remote_commands::use_account_command(provider, account).await
+            }
+            None => remote_commands::accounts_command(json).await,
+        },
         Command::Config { command } => agent_config::run_config(command),
         Command::Gui { session } => run_gui(session).await,
         Command::Remote { command } => run_remote_command(command).await,

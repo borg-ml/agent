@@ -223,10 +223,29 @@ pub fn set_claude_uses_api_key(api_key: bool) -> Result<PathBuf> {
     )
 }
 
+pub(crate) const CLAUDE_CONFIG_DIR_KEY: &str = "claude_subscription_config_dir";
+pub(crate) const OPENAI_AUTH_FILE_KEY: &str = "openai_subscription_auth_file";
+
+fn env_override(env_var: &str) -> Option<PathBuf> {
+    crate::env::nonempty_var(env_var).map(PathBuf::from)
+}
+
+/// An operator-set `BORG_CLAUDE_CONFIG_DIR`. It wins over every stored
+/// selection, so account switching must refuse rather than pretend.
+pub fn claude_config_dir_env_override() -> Option<PathBuf> {
+    env_override("BORG_CLAUDE_CONFIG_DIR")
+}
+
+/// An operator-set `BORG_OPENAI_AUTH_FILE`; see
+/// [`claude_config_dir_env_override`].
+pub fn openai_auth_file_env_override() -> Option<PathBuf> {
+    env_override("BORG_OPENAI_AUTH_FILE")
+}
+
 /// A path setting: the environment variable wins, the store is the fallback.
 fn stored_path(env_var: &str, storage_key: &str) -> Result<Option<PathBuf>> {
-    if let Some(path) = crate::env::nonempty_var(env_var) {
-        return Ok(Some(PathBuf::from(path)));
+    if let Some(path) = env_override(env_var) {
+        return Ok(Some(path));
     }
     let Some(path) = credentials_path() else {
         return Ok(None);
@@ -238,20 +257,17 @@ fn stored_path(env_var: &str, storage_key: &str) -> Result<Option<PathBuf>> {
 }
 
 pub fn openai_subscription_auth_file() -> Result<Option<PathBuf>> {
-    stored_path("BORG_OPENAI_AUTH_FILE", "openai_subscription_auth_file")
+    stored_path("BORG_OPENAI_AUTH_FILE", OPENAI_AUTH_FILE_KEY)
 }
 
 /// The Claude config directory Borg signs in to, when Borg owns one instead
 /// of sharing Claude Code's.
 pub fn claude_subscription_config_dir() -> Result<Option<PathBuf>> {
-    stored_path("BORG_CLAUDE_CONFIG_DIR", "claude_subscription_config_dir")
+    stored_path("BORG_CLAUDE_CONFIG_DIR", CLAUDE_CONFIG_DIR_KEY)
 }
 
 pub fn set_claude_subscription_config_dir(path: &Path) -> Result<PathBuf> {
-    store_value(
-        "claude_subscription_config_dir",
-        path.to_str().context("Claude config path must be UTF-8")?,
-    )
+    store_values(&[(CLAUDE_CONFIG_DIR_KEY, path_string(path, "Claude config")?)])
 }
 
 /// Where `borg login claude` keeps a Borg-owned Claude login.
@@ -260,10 +276,21 @@ pub fn default_claude_subscription_config_dir() -> Option<PathBuf> {
 }
 
 pub fn set_openai_subscription_auth_file(path: &Path) -> Result<PathBuf> {
-    store_value(
-        "openai_subscription_auth_file",
-        path.to_str().context("ChatGPT auth path must be UTF-8")?,
-    )
+    store_values(&[(OPENAI_AUTH_FILE_KEY, path_string(path, "ChatGPT auth")?)])
+}
+
+fn path_string<'a>(path: &'a Path, label: &str) -> Result<&'a str> {
+    path.to_str()
+        .with_context(|| format!("{label} path must be UTF-8"))
+}
+
+/// Stored values, for callers that own a family of keys (the subscription
+/// account registry). Environment overrides are not part of the store.
+pub(crate) fn stored_values() -> Result<BTreeMap<String, String>> {
+    match credentials_path() {
+        Some(path) => Ok(read_credentials(&path)?.keys),
+        None => Ok(BTreeMap::new()),
+    }
 }
 
 pub fn codex_auth_json() -> Option<serde_json::Value> {
@@ -377,15 +404,25 @@ fn lock_credentials(dir: &Path) -> Result<fs::File> {
 }
 
 fn store_value(storage_key: &str, key: &str) -> Result<PathBuf> {
-    let key = key.trim();
-    anyhow::ensure!(!key.is_empty(), "API key cannot be empty");
+    store_values(&[(storage_key, key)])
+}
+
+/// Replace several values in one locked write, so a selection and the account
+/// it belongs to can never be observed half-updated.
+pub(crate) fn store_values(entries: &[(&str, &str)]) -> Result<PathBuf> {
+    for (storage_key, key) in entries {
+        anyhow::ensure!(!key.trim().is_empty(), "{storage_key} cannot be empty");
+    }
     let dir = borg_dir().context("cannot locate a home directory for the key store")?;
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     restrict_permissions(&dir, 0o700)?;
     let _lock = lock_credentials(&dir)?;
     let path = dir.join("credentials.json");
     let mut file = read_credentials(&path)?;
-    file.keys.insert(storage_key.to_string(), key.to_string());
+    for (storage_key, key) in entries {
+        file.keys
+            .insert((*storage_key).to_string(), key.trim().to_string());
+    }
     let contents = serde_json::to_vec_pretty(&file).context("serialize credential store")?;
 
     // Same-directory temp file keeps the rename atomic and never widens the
@@ -447,15 +484,17 @@ fn restrict_permissions(_path: &Path, _mode: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
 
     #[test]
     fn stored_key_round_trips_and_env_wins() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_lock();
         let home = tempfile::tempdir().unwrap();
-        // SAFETY: serialised by ENV_LOCK for the duration of the test.
+        // SAFETY: serialised by env_lock() for the duration of the test.
         unsafe {
             std::env::set_var("BORG_HOME", home.path());
             std::env::remove_var("ANTHROPIC_API_KEY");
@@ -474,7 +513,7 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
 
-        // SAFETY: serialised by ENV_LOCK for the duration of the test.
+        // SAFETY: serialised by env_lock() for the duration of the test.
         unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-env") };
         assert_eq!(
             api_key(ApiKeyCredential::Anthropic).as_deref(),
@@ -521,7 +560,7 @@ mod tests {
                 Some("saved-openai-key")
             );
         }
-        // SAFETY: serialised by ENV_LOCK for the duration of the test.
+        // SAFETY: serialised by env_lock() for the duration of the test.
         unsafe {
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("BORG_HOME");

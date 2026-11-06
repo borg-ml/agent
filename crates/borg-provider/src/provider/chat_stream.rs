@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
@@ -420,11 +420,15 @@ pub struct ClaudeAccountRateLimits {
 }
 
 /// Read native ChatGPT subscription usage without starting a provider process.
-pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits> {
-    let response =
-        tokio::time::timeout(Duration::from_secs(10), crate::openai_subscription::usage())
-            .await
-            .context("timed out reading ChatGPT account limits")??;
+pub async fn read_codex_account_rate_limits(
+    auth_file: Option<PathBuf>,
+) -> Result<CodexAccountRateLimits> {
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::openai_subscription::usage(auth_file),
+    )
+    .await
+    .context("timed out reading ChatGPT account limits")??;
     parse_codex_account_rate_limits(&response)
 }
 
@@ -437,7 +441,10 @@ pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits> 
 ///
 /// `fresh` asks the endpoint now, for an explicit user request; otherwise the
 /// shared host-wide interval applies.
-pub async fn read_claude_account_rate_limits(fresh: bool) -> Result<ClaudeAccountRateLimits> {
+pub async fn read_claude_account_rate_limits(
+    config_dir: Option<&Path>,
+    fresh: bool,
+) -> Result<ClaudeAccountRateLimits> {
     #[cfg(not(feature = "claude"))]
     {
         bail!("Claude account limits require the Claude subscription adapter")
@@ -445,7 +452,7 @@ pub async fn read_claude_account_rate_limits(fresh: bool) -> Result<ClaudeAccoun
     #[cfg(feature = "claude")]
     {
         let access = tokio::time::timeout(Duration::from_secs(10), async {
-            let authority = crate::claude_subscription::AuthAuthority::resolve(None)?;
+            let authority = crate::claude_subscription::AuthAuthority::resolve(config_dir)?;
             crate::claude_subscription::discover(authority).await
         })
         .await

@@ -13,6 +13,14 @@ pub(crate) fn nonempty_var(name: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
+    // Tests that mutate process-wide environment variables serialize here, so
+    // a scratch BORG_HOME in one module cannot move another's key store.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

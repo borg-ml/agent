@@ -252,6 +252,14 @@ fn jwt_claims(token: &str) -> Result<Value> {
     serde_json::from_slice(&bytes).context("invalid saved ChatGPT token claims")
 }
 
+fn resolved(path: PathBuf) -> PathBuf {
+    if path.exists() {
+        path.canonicalize().unwrap_or(path)
+    } else {
+        path
+    }
+}
+
 fn load(path: &Path) -> Result<Value> {
     let file = fs::File::open(path).context("read saved ChatGPT subscription")?;
     let bytes = crate::bounded_io::read_open_file_bytes_with_limit(
@@ -313,8 +321,9 @@ async fn response_json(response: reqwest::Response) -> Result<Value> {
 }
 
 /// Account usage metadata is subscription-only and never starts a model turn.
-pub async fn usage() -> Result<Value> {
-    let mut credentials = access(None).await?;
+/// `auth_file` reads a named account's authority; `None` reads the selected one.
+pub async fn usage(auth_file: Option<PathBuf>) -> Result<Value> {
+    let mut credentials = access_from(auth_file.clone(), None).await?;
     let account_id = credentials.account_id.clone();
     let client = client()?;
     for attempt in 0..2 {
@@ -328,7 +337,7 @@ pub async fn usage() -> Result<Value> {
             .context("ChatGPT usage connection failed")?;
         if attempt == 0 && response.status() == reqwest::StatusCode::UNAUTHORIZED {
             drop(response);
-            credentials = access(Some(credentials.token)).await?;
+            credentials = access_from(auth_file.clone(), Some(credentials.token)).await?;
             ensure!(
                 credentials.account_id == account_id,
                 "ChatGPT account changed during usage recovery; retry for the selected account"
@@ -353,15 +362,16 @@ pub struct DeviceLogin {
     interval: Duration,
     deadline: tokio::time::Instant,
     path: PathBuf,
+    /// The selected authority when the login began; a concurrent selection
+    /// change must not be overwritten by this login's result.
+    selection_at_start: PathBuf,
 }
 
-pub async fn begin_device_login() -> Result<DeviceLogin> {
-    let path = auth_path()?;
-    let path = if path.exists() {
-        path.canonicalize()?
-    } else {
-        path
-    };
+/// `path` is the authority file this login owns: the selected one for a
+/// re-login, or a named account's own file.
+pub async fn begin_device_login(path: PathBuf) -> Result<DeviceLogin> {
+    let selection_at_start = resolved(auth_path()?);
+    let path = resolved(path);
     let response = client()?
         .post("https://auth.openai.com/api/accounts/deviceauth/usercode")
         .json(&json!({"client_id": CLIENT_ID}))
@@ -407,6 +417,7 @@ pub async fn begin_device_login() -> Result<DeviceLogin> {
         interval: Duration::from_secs(interval),
         deadline: tokio::time::Instant::now() + Duration::from_secs(15 * 60),
         path,
+        selection_at_start,
     })
 }
 
@@ -457,9 +468,10 @@ pub async fn complete_device_login(login: DeviceLogin) -> Result<SubscriptionAcc
         }, "last_refresh": Utc::now().to_rfc3339()});
         let account = account_from_document(&document)?;
         document["tokens"]["account_id"] = json!(account.account_id);
-        let current = auth_path()?;
-        let current = if current.exists() { current.canonicalize()? } else { current };
-        ensure!(current == login.path, "ChatGPT credential selection changed during login; saved credentials were kept");
+            ensure!(
+            resolved(auth_path()?) == login.selection_at_start,
+            "ChatGPT credential selection changed during login; saved credentials were kept"
+        );
         private_directory(login.path.parent().context("ChatGPT credential path has no parent")?)?;
         let _lock = credential_lock(&login.path).await?;
         save(&login.path, &document)?;

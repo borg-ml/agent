@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.20.3)
 
+- Several Claude or ChatGPT subscriptions can stay connected at once. `borg
+  login claude --account work` (or `borg login codex --account personal`) gives
+  each sign-in its own named authority, and every login connected before that
+  appears as `default`. `borg accounts` lists each login with what every quota
+  window has left and when it resets, `borg accounts use` selects one, and
+  `get_provider_capabilities` reports the same per-account usage and reset
+  times to agents, which switch with `select_provider_account` when the active
+  login is exhausted or nearly out.
+
 - Reasoning stays in one block per model round. A compatible provider that
   interleaves empty content writes with its thinking no longer splits the
   stream into a row per fragment.
