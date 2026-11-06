@@ -3,7 +3,9 @@
 # and currently have no safe upgrade. The first two come through syntect; the
 # remaining entries are transitive dependencies of GPUI (paste is also used by
 # image codecs shared with the TUI). cgmath (RUSTSEC-2026-0196) comes through
-# smithay in the borg-display compositor.
+# smithay in the borg-display compositor. pin-utils (RUSTSEC-2026-0441) is only
+# reachable through GPUI's vendored zed-async-tar -> async-std, and its upstream
+# repository was archived with no safe replacement version.
 # zbus_names/zvariant/derive moved into zbus 6; AT-SPI and GPUI still
 # require zbus 5 and provide no compatible migration yet (0370–0372).
 ignore = [
@@ -20,6 +22,7 @@ ignore = [
     "RUSTSEC-2026-0206",
     "RUSTSEC-2026-0192",
     "RUSTSEC-2026-0196",
+    "RUSTSEC-2026-0441",
 ]
 
 [licenses]
