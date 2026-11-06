@@ -220,12 +220,7 @@ impl ComputerUse {
         request.push(b"\n"[0]);
         // Starting a private display, launching into it and tearing it down
         // wait on child processes; everything else is a bounded desktop call.
-        let limit = match op {
-            "start_display" | "launch" | "stop_display" | "attach_display" => {
-                Duration::from_secs(45)
-            }
-            _ => Duration::from_secs(15),
-        };
+        let limit = helper_deadline(op, &arguments);
         // A launch owns a shared display. Finish its exchange even if the caller
         // is cancelled, so dropping a tool future cannot kill the desktop worker
         // or leave an unread response for the next observation.
@@ -510,8 +505,46 @@ async fn macos_helper_binary() -> Result<std::path::PathBuf> {
     Ok(binary)
 }
 
+fn helper_deadline(op: &str, arguments: &Value) -> Duration {
+    match op {
+        "start_display" | "launch" | "stop_display" | "attach_display" => Duration::from_secs(45),
+        // Private input performs several bounded compositor exchanges (each has a 20 s socket deadline),
+        // followed by an accessibility snapshot. The ordinary 15 s desktop limit could kill its owning
+        // helper before even one compositor exchange timed out, taking the running apps down with it.
+        _ if arguments.get("display").and_then(Value::as_str) == Some("private")
+            || arguments
+                .get("window_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("pd:")) =>
+        {
+            Duration::from_secs(45)
+        }
+        _ => Duration::from_secs(15),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn private_deadline_exceeds_compositor_socket_deadline() {
+        use serde_json::json;
+        use std::time::Duration;
+        for args in [json!({"window_id":"pd:1"}), json!({"display":"private"})] {
+            assert_eq!(
+                super::helper_deadline("scroll", &args),
+                Duration::from_secs(45)
+            );
+            assert!(super::helper_deadline("observe", &args) > Duration::from_secs(20));
+        }
+        assert_eq!(
+            super::helper_deadline("scroll", &json!({"window_id":"1"})),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            super::helper_deadline("launch", &json!({})),
+            Duration::from_secs(45)
+        );
+    }
     use super::*;
 
     fn element(role: &str, name: &str) -> ObservedElement {

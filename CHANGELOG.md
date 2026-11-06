@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.20.3)
 
+- Private-display input and observations now use a 45-second helper deadline, longer than the compositor socket deadline. A slow game no longer loses its display merely because the ordinary desktop deadline expires first.
+
 - `runtime_exec` no longer stops a run after 128 Borg tool calls. Scripted
   multi-step work (for example clicking through dozens of listings with
   `cua`) runs to completion within the execution timeout.
