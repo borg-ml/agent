@@ -1473,6 +1473,10 @@ async fn run_borg_provider_turn(
         ),
     };
     let permission = local_permission(turn.permission_mode);
+    if let Some(model) = request.model.as_deref() {
+        let identity = crate::prompt_context::model_identity(turn.provider, model);
+        append_volatile_system_prompt(&mut request, &identity);
+    }
     append_volatile_system_prompt(&mut request, &volatile_appendix);
     let mut stream = match turn.provider {
         CodingProvider::OpenCode if local => run_opencode_local_chat_stream(request, permission),

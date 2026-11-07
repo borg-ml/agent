@@ -5,6 +5,17 @@ Git comparison.
 
 ## Unreleased (since 0.20.4)
 
+- Agents receive their exact current model slug and provider in model-visible
+  context. The identity updates after a model switch and survives replay and
+  compaction without changing the cached system prompt.
+
+- Switching a live session to OpenCode Go now refreshes its execution route
+  before replaying context, instead of continuing through the old CLI and
+  failing with HTTP 405. The old CLI thread is not reused by the native route.
+
+- Replies cut short by a follow-up are labelled as redirected, live and after
+  reopening the session, rather than presenting a fragment as a finished answer.
+
 - Recovering a child after its owner switches to OpenCode Go preserves the
   child's own provider and durable route. Older Claude and independently
   configured children no longer fail recovery with a harness-mismatch error.

@@ -48,6 +48,14 @@ pub(crate) const DECLARATION_BASE_EVENT: &str = "native_declaration_base";
 pub(crate) const DECLARATION_DELTA_EVENT: &str = "native_declaration_delta";
 pub(crate) const PROMPT_CONTEXT_EVENT: &str = "native_prompt_context";
 
+pub(crate) fn model_identity(provider: CodingProvider, model: &str) -> String {
+    format!(
+        "Current inference route (authoritative for this turn):\nProvider: {}\nModel slug: {}\nThis supersedes earlier model identity snapshots; other agents may use different models.",
+        provider.config_alias(),
+        model,
+    )
+}
+
 /// Exact declarations for a cache-preserving checkpoint request after restart.
 /// These definitions never authorize execution; compaction cannot run tools.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,6 +80,8 @@ pub(crate) enum ContextSlot {
     Instructions,
     /// Continual harness state and imported memory.
     Harness,
+    /// The exact provider and model slug serving the current turn.
+    ModelIdentity,
     /// Provider admission and usage status.
     ProviderStatus,
     /// Live child and descendant counts by lifecycle state.

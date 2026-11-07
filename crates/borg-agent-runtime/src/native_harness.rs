@@ -903,7 +903,9 @@ impl NativeHarness {
             .prompt_context_base
             .get(&ContextSlot::Subagents)
             .cloned();
+        let model_identity = crate::prompt_context::model_identity(turn.provider, &model);
         let restated_context = [
+            (ContextSlot::ModelIdentity, model_identity.clone()),
             (ContextSlot::Instructions, varying_instructions.clone()),
             (ContextSlot::Harness, harness_prompt_appendix.clone()),
             (
@@ -915,6 +917,7 @@ impl NativeHarness {
         .filter(|(_, content)| !content.trim().is_empty())
         .collect::<Vec<_>>();
         for (slot, current) in [
+            (ContextSlot::ModelIdentity, model_identity),
             (ContextSlot::Instructions, varying_instructions),
             (ContextSlot::Harness, harness_prompt_appendix),
             (
@@ -1146,6 +1149,14 @@ impl NativeHarness {
                                 attachments: Vec::new(),
                                 status: MessageStatus::Complete,
                                 delivery: None,
+                            },
+                        ).await;
+                        send(
+                            &events,
+                            SessionEventKind::ProviderEvent {
+                                provider: turn.provider,
+                                kind: "message_redirected".into(),
+                                payload: json!({ "message_id": assistant_message_id }),
                             },
                         ).await;
                     }
@@ -12332,6 +12343,86 @@ mod tests {
         );
     }
 
+    // The configured slug is not otherwise visible inside a model request.
+    // A switch must append fresh identity without rewriting cached history.
+    #[tokio::test]
+    async fn model_identity_is_current_durable_and_not_repeated_when_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().to_path_buf();
+        let session_id = Uuid::new_v4();
+        let old =
+            crate::prompt_context::model_identity(crate::CodingProvider::OpenRouter, "old-model");
+        let previous_turn = Uuid::new_v4();
+        let previous = [
+            SessionEventKind::TurnStarted {
+                message_id: previous_turn,
+                provider: crate::CodingProvider::OpenRouter,
+                model: Some("old-model".into()),
+                effort: None,
+                fast: false,
+                ultrafast: false,
+            },
+            SessionEventKind::ProviderEvent {
+                provider: crate::CodingProvider::OpenRouter,
+                kind: crate::prompt_context::PROMPT_CONTEXT_EVENT.into(),
+                payload: json!({"slot": "model_identity", "content": old}),
+            },
+            SessionEventKind::TurnCompleted {
+                message_id: previous_turn,
+                provider_session_id: None,
+                final_text: String::new(),
+                error: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| SessionEvent::new(session_id, index as u64 + 1, kind))
+        .collect();
+        let first = run_prefix_turn(
+            cwd.clone(),
+            session_id,
+            previous,
+            "what is your model slug?",
+            "",
+            false,
+            "",
+        )
+        .await;
+        assert!(first.completed);
+        let current =
+            crate::prompt_context::model_identity(crate::CodingProvider::OpenRouter, "test-model");
+        let identities = |events: &[SessionEvent]| {
+            events
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    SessionEventKind::ProviderEvent { kind, payload, .. }
+                        if kind == crate::prompt_context::PROMPT_CONTEXT_EVENT
+                            && payload["slot"] == "model_identity" =>
+                    {
+                        Some(payload["content"].clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(identities(&first.journal), vec![json!(old), json!(current)]);
+        let first_request = first.rounds.first().unwrap();
+        assert!(
+            first_request.iter().any(|message| matches!(message,
+            ModelMessage::User { content, .. } if content.contains(&current))),
+            "the model must see its current configured slug, not only an API field"
+        );
+
+        let second =
+            run_prefix_turn(cwd, session_id, first.journal, "and now?", "", false, "").await;
+        assert!(second.completed);
+        assert_eq!(
+            identities(&second.journal),
+            vec![json!(old), json!(current)]
+        );
+        assert_eq!(&second.rounds[0][..first_request.len()], first_request);
+    }
+
     /// Provider admission status carries live usage percentages and reset
     /// timestamps, so it differs between turns. Held in the system prompt it
     /// precedes the whole conversation, so every tick rewrites the head of the
@@ -14149,10 +14240,39 @@ mod tests {
                 .expect("a journaled steer is acknowledged as accepted");
 
             let mut journal = Vec::new();
+            let mut partial_message_id = None;
             while let Ok(event) = events_rx.try_recv() {
+                if let SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::Assistant,
+                    text,
+                    status,
+                    ..
+                } = &event
+                    && text == "I checked the first result."
+                    && *status == MessageStatus::Complete
+                {
+                    partial_message_id = Some(*message_id);
+                }
                 if let SessionEventKind::ProviderEvent { kind, payload, .. } = event {
                     journal.push((kind, payload));
                 }
+            }
+            if human {
+                let partial_message_id = partial_message_id.expect("preempted text keeps its row");
+                assert_eq!(
+                    journal
+                        .iter()
+                        .filter(|(kind, payload)| {
+                            kind == "message_redirected"
+                                && payload["message_id"] == partial_message_id.to_string()
+                        })
+                        .count(),
+                    1,
+                    "the truncated reply is durably marked, not passed off as a finished answer"
+                );
+            } else {
+                assert!(!journal.iter().any(|(kind, _)| kind == "message_redirected"));
             }
             let recorded = |needle: &str| {
                 journal.iter().position(|(kind, payload)| {

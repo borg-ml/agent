@@ -341,7 +341,9 @@ impl SessionEventKind {
             // turn ran at, a reply Claude's server summarized) has to read the
             // same after a resume as it did live.
             Self::ProviderEvent { kind, .. }
-                if kind == "turn_effort" || kind == "message_summarized" =>
+                if kind == "turn_effort"
+                    || kind == "message_summarized"
+                    || kind == "message_redirected" =>
             {
                 EventPersistence::Durable
             }

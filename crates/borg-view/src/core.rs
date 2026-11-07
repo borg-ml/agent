@@ -2424,6 +2424,22 @@ impl TranscriptCore {
                 }
             }
             SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "message_redirected" =>
+            {
+                if let Some(index) = payload["message_id"]
+                    .as_str()
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .and_then(|id| self.messages.get(&id).copied())
+                    && let Some(TranscriptEntry::Message {
+                        actor: EventActor::Assistant,
+                        redirected,
+                        ..
+                    }) = self.order.get_mut(index)
+                {
+                    *redirected = true;
+                }
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "message_summarized" =>
             {
                 if let Some(index) = payload["message_id"]

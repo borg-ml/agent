@@ -2034,3 +2034,89 @@ fn turn_effort_and_summary_events_label_the_reply() {
     });
     assert_eq!(label.as_deref(), Some("xhigh · summarized"));
 }
+
+// A completed partial row precedes the successor's full answer. Turn settlement
+// cannot label it retroactively; its own durable marker must survive replay.
+#[test]
+fn redirected_partial_reply_is_labeled_live_and_after_replay() {
+    use borg_agent_runtime::{CodingProvider, EventPersistence};
+    use borg_view::{core::TranscriptCore, entry::TranscriptEntry};
+    let session = Uuid::new_v4();
+    let partial = Uuid::new_v4();
+    let answer = Uuid::new_v4();
+    let marker = SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::OpenCode,
+            kind: "message_redirected".into(),
+            payload: serde_json::json!({ "message_id": partial }),
+        },
+    );
+    assert_eq!(marker.kind.persistence(), EventPersistence::Durable);
+    let events = [
+        message(
+            session,
+            1,
+            partial,
+            EventActor::Assistant,
+            "You",
+            MessageStatus::Complete,
+        ),
+        marker,
+        message(
+            session,
+            3,
+            answer,
+            EventActor::Assistant,
+            "The follow-up answer.",
+            MessageStatus::Complete,
+        ),
+        SessionEvent::new(
+            session,
+            4,
+            SessionEventKind::TurnCompleted {
+                message_id: Uuid::new_v4(),
+                provider_session_id: None,
+                final_text: "The follow-up answer.".into(),
+                error: None,
+            },
+        ),
+    ];
+    for replay in [false, true] {
+        let mut core = TranscriptCore::default();
+        for event in &events {
+            if replay {
+                core.apply_history(event);
+            } else {
+                core.apply(event);
+            }
+        }
+        let replies: Vec<_> = core
+            .order
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Message {
+                    actor: EventActor::Assistant,
+                    text,
+                    redirected,
+                    ..
+                } => Some((text.as_str(), *redirected)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replies, [("You", true), ("The follow-up answer.", false)]);
+    }
+    let mut view = ViewReducer::new(session, "epoch".into());
+    for event in events {
+        let marks_partial = event.sequence == 2;
+        let ops = view.apply(event);
+        if marks_partial {
+            assert!(ops.iter().any(|op| matches!(op,
+                ViewOp::RowUpsert { row } if matches!(&row.body,
+                    RowBody::Message { text, redirected: true, .. } if text == "You"))));
+        }
+    }
+    assert!(view.snapshot().rows.iter().any(|row| matches!(&row.body,
+        RowBody::Message { text, redirected: true, .. } if text == "You")));
+}

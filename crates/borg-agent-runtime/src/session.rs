@@ -2615,10 +2615,11 @@ async fn run_agent_session_store_kernel_inner(
         .unwrap_or_default();
     let runtime_mcp_servers = runtime_mcp_context.provider_external_servers();
     store.create_session(session_id).await?;
-    let executor = executor
+    let mut executor = executor
         .for_session(session_id, store.as_ref(), launch.model.as_deref())
         .await?
         .unwrap_or(executor);
+    let mut executor_selection = (launch.provider, launch.model.clone());
     // Verify the subscription and load the model's metadata while the user is
     // still typing, so the first turn does not wait on account checks. Any
     // failure resurfaces on the turn itself.
@@ -3399,6 +3400,14 @@ async fn run_agent_session_store_kernel_inner(
     work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
     let mut launch_plan_settled = false;
     'session: loop {
+        refresh_session_executor(
+            &mut executor,
+            &mut executor_selection,
+            session_id,
+            store.as_ref(),
+            &launch,
+        )
+        .await?;
         if let Some(receiver) = title_result_rx.as_mut() {
             match receiver.try_recv() {
                 Ok(result) => {
@@ -3667,6 +3676,14 @@ async fn run_agent_session_store_kernel_inner(
                 session_id,
             );
             loop {
+                refresh_session_executor(
+                    &mut executor,
+                    &mut executor_selection,
+                    session_id,
+                    store.as_ref(),
+                    &launch,
+                )
+                .await?;
                 let usage_limit_wait = wait_for_retry_deadline(retry_not_before);
                 // A yielded goal is ended by watchers, and a watcher that cannot
                 // fire never ends anything: bound the silence here so the session
@@ -5267,6 +5284,11 @@ async fn run_agent_session_store_kernel_inner(
             }
         }
 
+        let native_provider = executor.uses_native_harness(launch.provider);
+        if native_provider {
+            provider_session_id = None;
+            provider_fork_turn_id = None;
+        }
         if subscription_context_reusable
             && !executor
                 .has_provider_context(session_id, launch.provider)
@@ -5304,7 +5326,6 @@ async fn run_agent_session_store_kernel_inner(
             }
         }
 
-        let native_provider = executor.uses_native_harness(launch.provider);
         let reuse_subscription_context = !native_provider
             && subscription_context_reusable
             && executor.supports_subscription_context_reuse(launch.provider);
@@ -13096,6 +13117,27 @@ async fn apply_live_session_config(
         );
     }
     result
+}
+
+// A model change can move a live session between a CLI and Borg's harness.
+// Refresh before context replay or idle compaction chooses either route.
+async fn refresh_session_executor(
+    executor: &mut Arc<dyn AgentTurnExecutor>,
+    selection: &mut (CodingProvider, Option<String>),
+    session_id: Uuid,
+    store: &dyn SessionStore,
+    launch: &LaunchSession,
+) -> Result<()> {
+    if selection.0 != launch.provider || selection.1 != launch.model {
+        if let Some(bound) = executor
+            .for_session(session_id, store, launch.model.as_deref())
+            .await?
+        {
+            *executor = bound;
+        }
+        *selection = (launch.provider, launch.model.clone());
+    }
+    Ok(())
 }
 
 pub(crate) async fn apply_session_config(

@@ -26493,3 +26493,157 @@ async fn private_interactions_keep_raw_answers_out_of_durable_history() {
         scratch.discard().await;
     }
 }
+
+// Switching to Go must choose native replay before constructing the next turn,
+// not keep the CLI executor that was bound when this session first started.
+#[tokio::test]
+async fn model_switch_rebinds_the_live_executor_before_replaying_context() {
+    struct SwitchingExecutor {
+        native: bool,
+        seen: mpsc::UnboundedSender<(bool, AgentTurn)>,
+    }
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for SwitchingExecutor {
+        async fn for_session(
+            &self,
+            _: Uuid,
+            _: &dyn SessionStore,
+            model: Option<&str>,
+        ) -> Result<Option<Arc<dyn AgentTurnExecutor>>> {
+            Ok(Some(Arc::new(Self {
+                native: model.is_some_and(borg_provider::provider::opencode_model::is_go_model),
+                seen: self.seen.clone(),
+            })))
+        }
+        fn uses_native_harness(&self, _: CodingProvider) -> bool {
+            self.native
+        }
+        async fn execute(
+            &self,
+            turn: AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            _: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            self.seen.send((self.native, turn)).unwrap();
+            events
+                .send(SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: "first reply".into(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                })
+                .await
+                .unwrap();
+            Ok(AgentTurnResult {
+                provider_session_id: Some("old-cli-thread".into()),
+                final_text: "first reply".into(),
+            })
+        }
+    }
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    let (commands, command_rx) = mpsc::channel(8);
+    let (events, mut event_rx) = mpsc::channel(128);
+    let (seen, mut turns) = mpsc::unbounded_channel();
+    let actor = tokio::spawn({
+        let store = store.clone();
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_session_actor(
+                &cwd.join("session.lock"),
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd: cwd.clone(),
+                    provider: CodingProvider::OpenCode,
+                    model: Some("opencode/legacy".into()),
+                    effort: None,
+                    fast: Some(false),
+                    ultrafast: None,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                events,
+                Arc::new(SwitchingExecutor {
+                    native: false,
+                    seen,
+                }),
+                store,
+            )
+            .await
+        }
+    });
+    for (index, text) in ["preserve my original request", "continue on Go"]
+        .into_iter()
+        .enumerate()
+    {
+        if index == 1 {
+            commands
+                .send(HostCommand::Configure {
+                    session_id,
+                    action: crate::SessionConfigAction::SetModel {
+                        model: "opencode-go/deepseek-v4.1-flash".into(),
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        let message_id = Uuid::new_v4();
+        commands
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id,
+                text: text.into(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Queue,
+            })
+            .await
+            .unwrap();
+        loop {
+            let event = tokio::time::timeout(EVENT_TIMEOUT, event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let SessionEventKind::TurnCompleted {
+                message_id: id,
+                error,
+                ..
+            } = event.kind
+                && id == message_id
+            {
+                assert!(error.is_none(), "{error:?}");
+                break;
+            }
+        }
+    }
+    let (native, _) = turns.recv().await.unwrap();
+    assert!(!native);
+    let (native, turn) = turns.recv().await.unwrap();
+    assert!(native, "model switch must rebind before admission");
+    assert!(
+        turn.provider_session_id.is_none(),
+        "never reuse the old CLI thread"
+    );
+    assert_eq!(turn.prompt, "continue on Go");
+    let replay = serde_json::to_string(&turn.conversation).unwrap();
+    assert!(replay.contains("preserve my original request"), "{replay}");
+    assert!(replay.contains("first reply"), "{replay}");
+    commands
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+    scratch.discard().await;
+}
