@@ -225,7 +225,7 @@ pub async fn accounts(lane: Lane) -> Result<Vec<Account>> {
 /// [`accounts`], read synchronously from the credential store. This is what a
 /// settings screen draws every frame: no login discovery, no provider process.
 pub fn stored_accounts(lane: Lane) -> Vec<Account> {
-    let accounts = match (lane.auth_provider(), lane.key_lane()) {
+    match (lane.auth_provider(), lane.key_lane()) {
         (Some(provider), _) => crate::subscription_accounts::stored(provider)
             .unwrap_or_default()
             .into_iter()
@@ -247,8 +247,7 @@ pub fn stored_accounts(lane: Lane) -> Vec<Account> {
             })
             .collect(),
         (None, None) => Vec::new(),
-    };
-    accounts
+    }
 }
 
 /// Make `name` the login the next turn of this lane spends.

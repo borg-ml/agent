@@ -149,9 +149,7 @@ pub fn stored(provider: ProviderAuthProvider) -> Result<Vec<SubscriptionAccount>
             })
         })
         .collect::<Vec<_>>();
-    let selected = values
-        .get(selection_key(provider))
-        .map(|path| PathBuf::from(path));
+    let selected = values.get(selection_key(provider)).map(PathBuf::from);
     if accounts.is_empty()
         && let Some(path) = &selected
     {
