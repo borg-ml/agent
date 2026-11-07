@@ -172,12 +172,9 @@ impl PostgresSessionStore {
             return Ok(Some(true));
         }
 
+        // A pinned route always wins: inheritance only reaches an undecided
+        // child, so a disagreement between the two cannot arise here.
         if let Some(existing) = existing {
-            ensure!(
-                inherited.is_none_or(|owner| owner == existing),
-                "child OpenCode harness differs from its owner's durable route; \
-                 start a new child session"
-            );
             return Ok(Some(existing));
         }
 
@@ -305,6 +302,21 @@ impl PostgresSessionStore {
     ) -> Result<()> {
         Self::resolve_codex_harness(transaction, source_session_id).await?;
         Self::resolve_codex_harness(transaction, session_id).await?;
+        // Recovery registers every child again, so a child that already owns a
+        // transcript keeps the route it was pinned to: an owner that has since
+        // moved to a Go model cannot take over a history the child wrote under
+        // another harness. Without this, a roster restore rejected the child
+        // and marked a working worker failed for a route it no longer used.
+        let pinned: Option<bool> = sqlx::query_scalar(
+            "select native from session_harness_routes \
+             where session_id = $1 and provider = 'open_code'",
+        )
+        .bind(session_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if pinned.is_some() {
+            return Ok(());
+        }
         // Team ownership is not transcript inheritance. A configured child
         // selects its own provider/model; only an unconfigured child needs the
         // owner's default route. Forks copy their transcript route separately.

@@ -550,6 +550,56 @@ async fn child_recovery_preserves_its_route_after_owner_go_migration() {
     scratch.discard().await;
 }
 
+/// A child pinned to the CLI route before it was ever configured keeps that
+/// route when its owner later moves to a Go model.
+///
+/// Recovery registers every child again. The owner's newer route is not the
+/// child's transcript owner, and the child has no configuration yet to say so,
+/// so inheritance used to reject the registration outright: the roster restore
+/// marked the worker failed with "child OpenCode harness differs from its
+/// owner's durable route" and the agent could never be resumed.
+#[tokio::test]
+async fn recovery_keeps_a_child_route_pinned_before_the_child_was_configured() {
+    let (scratch, store) = store().await;
+    let owner = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    store.create_session(owner).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            owner,
+            0,
+            opencode_configured("opencode-go/glm-5.3"),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .uses_native_opencode_harness(owner, None)
+            .await
+            .unwrap()
+    );
+    // The child was registered while the owner still ran a CLI-only model, and
+    // it has not run a turn of its own yet.
+    store.create_session(child).await.unwrap();
+    sqlx::query(
+        "insert into session_harness_routes (session_id, provider, native) \
+         values ($1, 'open_code', false)",
+    )
+    .bind(child)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    store.register_child_session(owner, child).await.unwrap();
+    assert!(
+        !store
+            .uses_native_opencode_harness(child, None)
+            .await
+            .unwrap(),
+        "the child keeps the route that owns its transcript"
+    );
+    scratch.discard().await;
+}
+
 /// Explicit child settings must win over the owner's default route. A native
 /// Go owner cannot force a different provider or CLI-only model onto Go, and a
 /// CLI owner cannot prevent a configured Go child from using Borg's harness.

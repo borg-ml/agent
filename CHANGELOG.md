@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.20.7)
 
+- A subagent is no longer marked failed when its owner has moved to a model on
+  another OpenCode harness. Restoring a roster re-registers every child, and a
+  child whose route was pinned before it was configured was rejected with
+  "child OpenCode harness differs from its owner's durable route", so the whole
+  worker became unusable after a restart. A child that already owns a
+  transcript keeps its own route; only an undecided child inherits.
+
 - A shell call whose command arrived in the tool schema's `action` summary
   field instead of `cmd` no longer fails. Every tool schema advertises `action`
   first, and weaker models sometimes write the whole command there while still
