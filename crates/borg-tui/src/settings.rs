@@ -808,11 +808,7 @@ fn choice_action(row: &SettingRow, index: usize) -> Option<UiAction> {
         Id::Footer => UiAction::SetShowFooter(on),
         Id::SubscriptionStrategy(lane) => UiAction::SetAccountStrategy {
             lane: *borg_provider::subscriptions::Lane::ALL.get(lane)?,
-            strategy: if on {
-                borg_provider::subscriptions::Strategy::Auto
-            } else {
-                borg_provider::subscriptions::Strategy::Manual
-            },
+            strategy: *borg_provider::subscriptions::Strategy::ALL.get(index)?,
         },
         Id::Effort => UiAction::SetEffort(option.clone()),
         Id::Speed => match option.as_str() {

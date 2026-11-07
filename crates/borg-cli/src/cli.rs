@@ -1441,8 +1441,12 @@ impl From<SubscriptionProviderArg> for borg_remote::CodingProvider {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum AccountStrategyArg {
-    /// Move to the login of the same provider with the most quota left.
-    Auto,
+    /// Spend the login whose remaining quota expires first, so nothing is
+    /// wasted at a reset. This is the default.
+    #[value(alias = "auto", alias = "soonest")]
+    Drain,
+    /// Spend the login of the same provider with the most quota left.
+    Headroom,
     /// Keep using the selected login until it is changed by hand.
     Manual,
 }
@@ -1450,7 +1454,8 @@ pub(crate) enum AccountStrategyArg {
 impl From<AccountStrategyArg> for borg_provider::subscriptions::Strategy {
     fn from(value: AccountStrategyArg) -> Self {
         match value {
-            AccountStrategyArg::Auto => Self::Auto,
+            AccountStrategyArg::Drain => Self::Drain,
+            AccountStrategyArg::Headroom => Self::Headroom,
             AccountStrategyArg::Manual => Self::Manual,
         }
     }

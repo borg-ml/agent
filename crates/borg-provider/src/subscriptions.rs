@@ -13,36 +13,57 @@ use crate::ProviderAuthProvider;
 use crate::key_accounts::{self, KeyLane};
 
 /// What happens when a provider has several connected subscriptions.
+///
+/// A turn only ever moves between logins of the same provider, and never into
+/// API-key billing. On a lane that reports no quota at all, both automatic
+/// strategies rotate to the login that has waited longest, because there is
+/// nothing else to rank on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Strategy {
     /// The selected login stays selected until the user changes it.
     Manual,
-    /// A turn may move to another login of the same provider which has more
-    /// quota left (or, for a lane that reports no quota, the one that has
-    /// waited longest). Switching never crosses into a different billing lane.
+    /// Spend the login that has the most quota left, switching only when the
+    /// selected one is exhausted or markedly behind.
+    Headroom,
+    /// Spend the login whose remaining quota expires first, so an allowance
+    /// that would be lost at its reset is used before a later one. This drains
+    /// a stack of subscriptions in the order it would otherwise waste them.
     #[default]
-    Auto,
+    Drain,
 }
 
 impl Strategy {
+    pub const ALL: [Strategy; 3] = [Strategy::Manual, Strategy::Headroom, Strategy::Drain];
+
     pub fn id(self) -> &'static str {
         match self {
             Strategy::Manual => "manual",
-            Strategy::Auto => "auto",
+            Strategy::Headroom => "headroom",
+            Strategy::Drain => "drain",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Strategy::Manual => "Manual",
-            Strategy::Auto => "Automatic",
+            Strategy::Headroom => "Most headroom",
+            Strategy::Drain => "Soonest reset",
         }
+    }
+
+    /// Whether a turn may move between this provider's logins on its own.
+    pub fn is_automatic(self) -> bool {
+        self != Strategy::Manual
     }
 
     pub fn parse(value: &str) -> Option<Strategy> {
         match value.trim().to_ascii_lowercase().as_str() {
             "manual" | "manual-only" | "off" => Some(Strategy::Manual),
-            "auto" | "automatic" | "on" | "balance" => Some(Strategy::Auto),
+            "headroom" | "most-headroom" | "most" => Some(Strategy::Headroom),
+            // `auto` predates the choice and now means the default strategy.
+            "drain" | "soonest" | "soonest-reset" | "auto" | "automatic" | "on" | "balance" => {
+                Some(Strategy::Drain)
+            }
             _ => None,
         }
     }
@@ -159,8 +180,8 @@ fn strategy_key(lane: Lane) -> String {
 }
 
 /// The switching policy for `lane`. A lane that never chose one follows
-/// [`Strategy::Auto`]: with a single connected login nothing changes, and with
-/// several an exhausted login no longer stops the work.
+/// [`Strategy::Drain`]: with a single connected login nothing changes, and with
+/// several the allowance that expires first is spent first.
 pub fn strategy(lane: Lane) -> Strategy {
     crate::credentials::stored_values()
         .ok()

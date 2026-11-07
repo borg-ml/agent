@@ -14,6 +14,13 @@ Git comparison.
   in the server's own locale. A start that cannot reach a serving server now
   fails with a message naming the port, instead of blocking for minutes.
 
+- Subscription switching has a policy per provider: **soonest reset** (the
+  default) spends the login whose remaining allowance expires first, so usage
+  drains in the order it would otherwise be wasted; **most headroom** spends
+  the login with the most quota left; **manual** keeps the one you pick.
+  Choose it in settings under Subscriptions or with `borg accounts strategy
+  <provider> drain|headroom|manual`.
+
 - Several subscriptions per provider now balance automatically. A turn moves to
   another login of the same provider when the selected one is exhausted or has
   markedly less quota left, and on a plan that reports no quota (OpenCode Go,

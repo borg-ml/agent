@@ -6736,7 +6736,8 @@ impl BorgTerminal {
                     .and_then(|capability| capability.account_strategy)
                     .map(|strategy| match strategy {
                         AccountStrategy::Manual => Strategy::Manual,
-                        AccountStrategy::Auto => Strategy::Auto,
+                        AccountStrategy::Headroom => Strategy::Headroom,
+                        AccountStrategy::Drain => Strategy::Drain,
                     })
                     .unwrap_or_else(|| borg_provider::subscriptions::strategy(*lane));
                 let accounts = borg_provider::subscriptions::stored_accounts(*lane)

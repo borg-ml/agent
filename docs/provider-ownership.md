@@ -68,12 +68,20 @@ turn spends. It runs once, at the start of a turn, before the turn resolves its
 credential, so a running turn keeps the login it began with. The policy is per
 provider (`borg accounts strategy <provider> auto|manual`):
 
-- **Automatic** (the default) moves to the login with the most headroom when
-  the selected one is exhausted or at least 15 points behind it. The margin
-  stops two similar logins from trading the selection every turn. A login whose
-  quota is unknown never wins on a guess, and only quota reads that already
-  happened are used: a turn must not wait on a usage probe to start.
+- **Soonest reset** (the default) spends the login whose remaining allowance
+  expires first, so quota that would be lost at a reset is used before quota
+  with a longer horizon. The horizon is the reset of the furthest window that
+  still has quota, which is the weekly window where a provider reports one.
+  Logins that expire together drain fullest-last.
+- **Most headroom** moves to the login with the most quota left when the
+  selected one is exhausted or at least 15 points behind it. The margin stops
+  two similar logins from trading the selection every turn.
 - **Manual** keeps the selected login until a human changes it.
+
+Either automatic strategy ignores a login whose quota is unknown, and only
+quota reads that already happened are used: a turn must not wait on a usage
+probe to start. A provider that reports no reset times falls back to the
+headroom order.
 
 A lane that reports no quota (OpenCode Go, GLM, Kimi, Qwen) instead rotates to
 the login that waited longest, so turns spread over the connected

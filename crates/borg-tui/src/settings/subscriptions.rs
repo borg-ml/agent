@@ -73,14 +73,6 @@ fn row(
     }
 }
 
-fn choice(options: &[&str], selected: usize) -> SettingControl {
-    SettingControl::Choice {
-        options: options.iter().map(|option| (*option).to_string()).collect(),
-        selected: Some(selected),
-        disabled: vec![false; options.len()],
-    }
-}
-
 /// One short line per login, for the control on the right of its row.
 pub(crate) fn capacity(account: &AccountView) -> String {
     let Some(usage) = &account.usage else {
@@ -152,11 +144,14 @@ pub(crate) fn list_rows(lanes: &[LaneView], editor: &AccountEditor) -> Vec<Setti
                 count => format!("{count} logins"),
             },
             match view.strategy {
-                Strategy::Auto => {
-                    "automatic switching spends the login with the most quota left, and on a plan that reports none, the one that waited longest."
-                }
                 Strategy::Manual => {
                     "manual switching keeps the login you pick until you pick another."
+                }
+                Strategy::Headroom => {
+                    "most headroom spends the login with the most quota left, switching only when the selected one runs out or falls well behind."
+                }
+                Strategy::Drain => {
+                    "soonest reset spends the login whose remaining allowance expires first, so quota that would be lost at its reset is used before quota that has longer to live. On a plan that reports no quota, turns rotate instead."
                 }
             }
         );
@@ -164,10 +159,16 @@ pub(crate) fn list_rows(lanes: &[LaneView], editor: &AccountEditor) -> Vec<Setti
             Id::SubscriptionStrategy(lane_position),
             "Switching",
             switching,
-            choice(
-                &["Manual", "Automatic"],
-                usize::from(view.strategy == Strategy::Auto),
-            ),
+            SettingControl::Choice {
+                options: Strategy::ALL
+                    .iter()
+                    .map(|strategy| strategy.label().to_string())
+                    .collect(),
+                selected: Strategy::ALL
+                    .iter()
+                    .position(|strategy| *strategy == view.strategy),
+                disabled: vec![false; Strategy::ALL.len()],
+            },
         ));
         for (account_position, account) in view.accounts.iter().enumerate() {
             let state = if account.active {
@@ -361,7 +362,7 @@ mod tests {
         vec![
             LaneView {
                 lane: Lane::Claude,
-                strategy: Strategy::Auto,
+                strategy: Strategy::Drain,
                 accounts: vec![
                     AccountView {
                         name: "default".to_string(),
@@ -379,7 +380,7 @@ mod tests {
             },
             LaneView {
                 lane: Lane::OpenCode,
-                strategy: Strategy::Auto,
+                strategy: Strategy::Drain,
                 accounts: vec![AccountView {
                     name: "default".to_string(),
                     active: true,
@@ -420,6 +421,32 @@ mod tests {
             rows.iter()
                 .any(|row| row.id == SettingId::SubscriptionStrategy(0))
         );
+    }
+
+    // Every strategy the page offers must be reachable: a drawn choice with no
+    // action is a dead control that silently leaves the old policy in place.
+    #[test]
+    fn every_switching_choice_selects_its_strategy() {
+        for row in list_rows(&lanes(), &AccountEditor::default()) {
+            let SettingControl::Choice { options, .. } = &row.control else {
+                continue;
+            };
+            let SettingId::SubscriptionStrategy(lane) = row.id else {
+                continue;
+            };
+            for (index, option) in options.iter().enumerate() {
+                match choice_action(&row, index) {
+                    Some(UiAction::SetAccountStrategy {
+                        lane: chosen,
+                        strategy,
+                    }) => {
+                        assert_eq!(chosen, Lane::ALL[lane]);
+                        assert_eq!(strategy.label(), option);
+                    }
+                    other => panic!("{option} has no strategy action: {other:?}"),
+                }
+            }
+        }
     }
 
     // Adding a login must not fire with half the input; a named key plan needs

@@ -663,17 +663,20 @@ pub enum AccountStrategy {
     /// The selected login stays selected until the user changes it.
     Manual,
     /// A turn may move to the login of the same provider with the most quota
-    /// left, or, on a lane that reports no quota, the one that waited longest.
-    /// It never moves to API-key billing or another provider.
+    /// left. It never moves to API-key billing or another provider.
+    Headroom,
+    /// A turn may move to the login whose remaining quota expires first, so an
+    /// allowance that would be lost at its reset is spent before a later one.
     #[default]
-    Auto,
+    Drain,
 }
 
 impl From<borg_provider::subscriptions::Strategy> for AccountStrategy {
     fn from(strategy: borg_provider::subscriptions::Strategy) -> Self {
         match strategy {
             borg_provider::subscriptions::Strategy::Manual => AccountStrategy::Manual,
-            borg_provider::subscriptions::Strategy::Auto => AccountStrategy::Auto,
+            borg_provider::subscriptions::Strategy::Headroom => AccountStrategy::Headroom,
+            borg_provider::subscriptions::Strategy::Drain => AccountStrategy::Drain,
         }
     }
 }
@@ -3671,7 +3674,7 @@ mod tests {
                     detail: None,
                 },
             ],
-            account_strategy: Some(AccountStrategy::Auto),
+            account_strategy: Some(AccountStrategy::Drain),
         }]);
         assert!(prompt.contains(
             "accounts: personal [idle] quota unreadable | work [active] usage available: 5-hour 60% left (resets 2026-11-07T04:30:00+00:00)"
