@@ -109,7 +109,7 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with = "api_key", requires = "provider")]
         auth_file: Option<PathBuf>,
         /// Connect this named subscription login instead of the current one.
-        /// Claude and ChatGPT keep several logins side by side.
+        /// Every subscription lane keeps several logins side by side.
         #[arg(
             long,
             value_name = "NAME",
@@ -118,7 +118,7 @@ pub(crate) enum Command {
         )]
         account: Option<String>,
     },
-    /// List connected Claude/ChatGPT subscription accounts with usage and resets.
+    /// List connected subscription logins with usage, resets and switching policy.
     Accounts {
         #[command(subcommand)]
         command: Option<AccountsCommand>,
@@ -1405,13 +1405,23 @@ pub(crate) enum SubscriptionProviderArg {
     Claude,
     #[value(alias = "chatgpt", alias = "openai")]
     Codex,
+    #[value(alias = "go")]
+    Opencode,
+    Glm,
+    Kimi,
+    Qwen,
 }
 
-impl From<SubscriptionProviderArg> for borg_provider::ProviderAuthProvider {
+impl From<SubscriptionProviderArg> for borg_provider::subscriptions::Lane {
     fn from(value: SubscriptionProviderArg) -> Self {
+        use borg_provider::subscriptions::Lane;
         match value {
-            SubscriptionProviderArg::Claude => Self::Claude,
-            SubscriptionProviderArg::Codex => Self::Openai,
+            SubscriptionProviderArg::Claude => Lane::Claude,
+            SubscriptionProviderArg::Codex => Lane::Codex,
+            SubscriptionProviderArg::Opencode => Lane::OpenCode,
+            SubscriptionProviderArg::Glm => Lane::Glm,
+            SubscriptionProviderArg::Kimi => Lane::Kimi,
+            SubscriptionProviderArg::Qwen => Lane::Qwen,
         }
     }
 }
@@ -1421,6 +1431,27 @@ impl From<SubscriptionProviderArg> for borg_remote::CodingProvider {
         match value {
             SubscriptionProviderArg::Claude => Self::Claude,
             SubscriptionProviderArg::Codex => Self::Codex,
+            SubscriptionProviderArg::Opencode => Self::OpenCode,
+            SubscriptionProviderArg::Glm => Self::Glm,
+            SubscriptionProviderArg::Kimi => Self::Kimi,
+            SubscriptionProviderArg::Qwen => Self::Qwen,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum AccountStrategyArg {
+    /// Move to the login of the same provider with the most quota left.
+    Auto,
+    /// Keep using the selected login until it is changed by hand.
+    Manual,
+}
+
+impl From<AccountStrategyArg> for borg_provider::subscriptions::Strategy {
+    fn from(value: AccountStrategyArg) -> Self {
+        match value {
+            AccountStrategyArg::Auto => Self::Auto,
+            AccountStrategyArg::Manual => Self::Manual,
         }
     }
 }
@@ -1433,6 +1464,13 @@ pub(crate) enum AccountsCommand {
         provider: SubscriptionProviderArg,
         /// Account name as shown by `borg accounts`.
         account: String,
+    },
+    /// Choose whether turns may switch between this provider's logins.
+    Strategy {
+        #[arg(value_enum)]
+        provider: SubscriptionProviderArg,
+        #[arg(value_enum)]
+        strategy: AccountStrategyArg,
     },
 }
 

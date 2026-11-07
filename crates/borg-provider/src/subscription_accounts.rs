@@ -132,6 +132,44 @@ pub async fn list(provider: ProviderAuthProvider) -> Result<Vec<SubscriptionAcco
     Ok(accounts)
 }
 
+/// Every named login in the store, without consulting the filesystem. A
+/// settings screen has to draw this on every frame, so it must not await a
+/// login discovery; a host that never named an account reports its single
+/// selected login as `default`, exactly as [`list`] does.
+pub fn stored(provider: ProviderAuthProvider) -> Result<Vec<SubscriptionAccount>> {
+    let values = credentials::stored_values()?;
+    let prefix = format!("{}_account_", provider.as_str());
+    let mut accounts = values
+        .iter()
+        .filter_map(|(key, value)| {
+            key.strip_prefix(&prefix).map(|name| SubscriptionAccount {
+                name: name.to_owned(),
+                path: PathBuf::from(value),
+                active: false,
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected = values
+        .get(selection_key(provider))
+        .map(|path| PathBuf::from(path));
+    if accounts.is_empty()
+        && let Some(path) = &selected
+    {
+        accounts.push(SubscriptionAccount {
+            name: LEGACY_ACCOUNT.to_owned(),
+            path: path.clone(),
+            active: true,
+        });
+    }
+    for account in &mut accounts {
+        account.active = selected
+            .as_ref()
+            .is_some_and(|path| same_path(path, &account.path));
+    }
+    accounts.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(accounts)
+}
+
 /// The authority the provider adapter resolves when no selection is stored,
 /// but only when a login is actually present there.
 async fn resolved_default(provider: ProviderAuthProvider) -> Option<PathBuf> {

@@ -941,6 +941,7 @@ async fn probe_provider(
         usage: None,
         billing,
         accounts: Vec::new(),
+        account_strategy: None,
     }
 }
 

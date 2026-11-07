@@ -54,11 +54,37 @@ adapter keeps account state and no turn can silently change account while it
 runs. A login connected before named accounts is adopted as `default` the first
 time another login is named, so it stays visible and switchable.
 
+Key-billed plans (OpenCode Go, the GLM and Qwen coding plans, Kimi Code) keep
+their logins in the same store as a name -> key map
+(`crates/borg-provider/src/key_accounts.rs`), with one selected name per lane,
+and `api_key` resolves environment, then the selected login, then the single
+legacy key. A login connected before named accounts is adopted as `default` the
+first time another one is named.
+
+### Automatic switching
+
+`crates/borg-agent-runtime/src/subscription_balance.rs` decides which login a
+turn spends. It runs once, at the start of a turn, before the turn resolves its
+credential, so a running turn keeps the login it began with. The policy is per
+provider (`borg accounts strategy <provider> auto|manual`):
+
+- **Automatic** (the default) moves to the login with the most headroom when
+  the selected one is exhausted or at least 15 points behind it. The margin
+  stops two similar logins from trading the selection every turn. A login whose
+  quota is unknown never wins on a guess, and only quota reads that already
+  happened are used: a turn must not wait on a usage probe to start.
+- **Manual** keeps the selected login until a human changes it.
+
+A lane that reports no quota (OpenCode Go, GLM, Kimi, Qwen) instead rotates to
+the login that waited longest, so turns spread over the connected
+subscriptions. The choice is always another login of the same provider; it
+never moves to API-key billing, and no adapter keeps account state.
+
 Usage is read per account and published with the provider capability snapshot:
 `get_provider_capabilities`, the volatile provider appendix and `borg accounts`
 all report each login's remaining windows and reset times. `select_provider_account`
-(agents) and `borg accounts use` (humans) change which login the next turn
-bills. Switching only chooses another login of the same provider; it never
+(agents), `borg accounts use` (humans) and the settings Subscriptions page change
+which login the next turn bills. Switching only chooses another login of the same provider; it never
 moves a turn to API-key billing.
 
 ## Model and replay contract

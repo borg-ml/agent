@@ -121,10 +121,14 @@ pub fn stored_api_key(credential: ApiKeyCredential) -> Option<String> {
         .filter(|key| !key.is_empty())
 }
 
-/// The effective key for `credential`: the environment wins, the store is the
-/// fallback.
+/// The effective key for `credential`: the environment wins, then the
+/// selected named subscription, then the single stored key. A lane with named
+/// accounts spends the one the user selected; a lane without them keeps using
+/// its single key.
 pub fn api_key(credential: ApiKeyCredential) -> Option<String> {
-    crate::env::nonempty_var(credential.env_var()).or_else(|| stored_api_key(credential))
+    crate::env::nonempty_var(credential.env_var())
+        .or_else(|| crate::key_accounts::selected_key_for_credential(credential))
+        .or_else(|| stored_api_key(credential))
 }
 
 /// Persists `key` for `credential`, replacing any previously stored value.
@@ -442,6 +446,37 @@ pub(crate) fn store_values(entries: &[(&str, &str)]) -> Result<PathBuf> {
 /// Removes the stored key for `credential`, if any.
 pub fn clear_api_key(credential: ApiKeyCredential) -> Result<()> {
     clear_value(credential.storage_key())
+}
+
+/// Remove several values in one locked write, so a removed login and its
+/// selection can never be observed half-deleted.
+pub(crate) fn clear_values(storage_keys: &[&str]) -> Result<()> {
+    let Some(path) = credentials_path() else {
+        return Ok(());
+    };
+    let dir = path.parent().context("credential store has no parent")?;
+    if !dir.exists() {
+        return Ok(());
+    }
+    let _lock = lock_credentials(dir)?;
+    let mut file = read_credentials(&path)?;
+    let mut removed = false;
+    for storage_key in storage_keys {
+        removed |= file.keys.remove(*storage_key).is_some();
+    }
+    if removed {
+        let contents = serde_json::to_vec_pretty(&file).context("serialize credential store")?;
+        use std::io::Write;
+        let mut temp =
+            tempfile::NamedTempFile::new_in(dir).context("create private credential file")?;
+        temp.write_all(&contents)
+            .context("write private credential file")?;
+        temp.as_file().sync_all().context("sync credential store")?;
+        temp.persist(&path)
+            .with_context(|| format!("replace {}", path.display()))?;
+        restrict_permissions(&path, 0o600)?;
+    }
+    Ok(())
 }
 
 fn clear_value(storage_key: &str) -> Result<()> {

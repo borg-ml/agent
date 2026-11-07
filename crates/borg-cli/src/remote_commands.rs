@@ -6258,6 +6258,114 @@ async fn run_local_agent_session(
                             ),
                         );
                     }
+                    UiAction::SwitchAccount { lane, account } => {
+                        let notice = match borg_provider::subscriptions::activate(lane, &account)
+                            .await
+                        {
+                            Ok(()) => format!(
+                                "{} turns now use the {account} login.",
+                                lane.label()
+                            ),
+                            Err(error) => format!(
+                                "Could not switch {} to {account}: {error}",
+                                lane.label()
+                            ),
+                        };
+                        terminal.as_mut().expect("terminal").set_notice(notice);
+                        terminal_dirty = true;
+                    }
+                    UiAction::SetAccountStrategy { lane, strategy } => {
+                        let notice =
+                            match borg_provider::subscriptions::set_strategy(lane, strategy) {
+                                Ok(()) => format!(
+                                    "{} logins switch {}.",
+                                    lane.label(),
+                                    strategy.label()
+                                ),
+                                Err(error) => format!(
+                                    "Could not change {} switching: {error}",
+                                    lane.label()
+                                ),
+                            };
+                        terminal.as_mut().expect("terminal").set_notice(notice);
+                        terminal_dirty = true;
+                    }
+                    UiAction::RemoveAccount { lane, account } => {
+                        let notice = match borg_provider::subscriptions::remove(lane, &account) {
+                            Ok(()) => format!("Removed the {account} {} login.", lane.label()),
+                            Err(error) => format!(
+                                "Could not remove {account} from {}: {error}",
+                                lane.label()
+                            ),
+                        };
+                        terminal.as_mut().expect("terminal").set_notice(notice);
+                        terminal_dirty = true;
+                    }
+                    UiAction::AddKeyAccount {
+                        lane,
+                        account,
+                        key,
+                    } => {
+                        let notice =
+                            match borg_provider::subscriptions::add_key(lane, &account, &key) {
+                                Ok(()) => format!(
+                                    "{} login {account} connected and selected.",
+                                    lane.label()
+                                ),
+                                Err(error) => format!(
+                                    "Could not connect {account} to {}: {error}",
+                                    lane.label()
+                                ),
+                            };
+                        terminal.as_mut().expect("terminal").set_notice(notice);
+                        terminal_dirty = true;
+                    }
+                    UiAction::ConnectAccount { lane, account } => {
+                        if matches!(
+                            status,
+                            SessionStatus::Starting
+                                | SessionStatus::Running
+                                | SessionStatus::WaitingForApproval
+                        ) {
+                            terminal.as_mut().expect("terminal").set_notice(
+                                "Interrupt the current turn before connecting a subscription."
+                                    .to_string(),
+                            );
+                            terminal_dirty = true;
+                            continue;
+                        }
+                        let provider = lane_provider(lane);
+                        let mut output = String::new();
+                        let outcome = borg_remote::login_provider_account_with_output(
+                            provider,
+                            &account,
+                            |line| {
+                                if output.len() < 8_000 {
+                                    output.push_str(line);
+                                    output.push('\n');
+                                }
+                            },
+                        )
+                        .await;
+                        let notice = match outcome {
+                            Ok(()) => {
+                                let latest = output.lines().last().unwrap_or_default();
+                                format!(
+                                    "{} login {account} connected and selected. {latest}",
+                                    lane.label()
+                                )
+                            }
+                            Err(error) => {
+                                format!("Could not connect {account} to {}: {error}", lane.label())
+                            }
+                        };
+                        terminal.as_mut().expect("terminal").set_notice(notice);
+                        terminal_dirty = true;
+                    }
+                    UiAction::Notice(message) => {
+                        terminal.as_mut().expect("terminal").set_notice(message);
+                        terminal_dirty = true;
+                    }
                     UiAction::SetRefreshRate(fps) => {
                         tui_fps = fps.clamp(MIN_TUI_FPS, MAX_TUI_FPS);
                         terminal.as_mut().expect("terminal").set_refresh_rate(tui_fps);
@@ -8955,11 +9063,30 @@ pub(crate) async fn login_command(
     account: Option<String>,
 ) -> Result<()> {
     if let Some(name) = account {
-        let provider = provider
+        let provider: CodingProvider = provider
             .context("--account needs a provider: borg login claude --account NAME")?
             .into();
-        borg_remote::login_provider_account_with_output(provider, &name, |line| println!("{line}"))
+        let lane = borg_provider::subscriptions::Lane::ALL
+            .into_iter()
+            .find(|lane| lane_provider(*lane) == provider)
+            .with_context(|| format!("{} keeps no subscription logins", provider.label()))?;
+        if lane.auth_provider().is_some() {
+            borg_remote::login_provider_account_with_output(provider, &name, |line| {
+                println!("{line}")
+            })
             .await?;
+            return Ok(());
+        }
+        // A key-billed plan is connected by pasting its key, so naming one
+        // starts an additional subscription rather than reusing the single key.
+        println!(
+            "Paste the {} key for the login you are naming {name} (input hidden), then press Enter:",
+            lane.label()
+        );
+        io::stdout().flush().ok();
+        let key = read_secret_line()?;
+        borg_provider::subscriptions::add_key(lane, &name, &key)?;
+        println!("{} login {name} connected and selected.", lane.label());
         return Ok(());
     }
     if let Some(path) = auth_file {
@@ -9032,17 +9159,8 @@ pub(crate) async fn login_command(
                 plan.label()
             );
             io::stdout().flush().ok();
-            let key = if io::stdin().is_terminal() {
-                read_hidden_line().context("failed to read API key")?
-            } else {
-                use std::io::Read;
-                let mut key = String::new();
-                io::stdin().take(16 * 1024).read_to_string(&mut key)?;
-                key
-            };
-            let key = key.trim();
-            anyhow::ensure!(!key.is_empty(), "no key entered; nothing was saved");
-            let path = borg_provider::credentials::store_api_key(plan.credential(), key)?;
+            let key = read_secret_line()?;
+            let path = borg_provider::credentials::store_api_key(plan.credential(), &key)?;
             borg_provider::credentials::set_active_subscription(plan.id())?;
             println!(
                 "{} connected · key saved to {} · served directly by Borg, no CLI required",
@@ -9061,31 +9179,52 @@ pub(crate) async fn login_command(
     Ok(())
 }
 
-/// `borg accounts`: what every connected Claude/ChatGPT login has left and when
-/// each window resets. The active login is the one the next turn bills.
+/// The provider a subscription lane bills against.
+fn lane_provider(lane: borg_provider::subscriptions::Lane) -> CodingProvider {
+    use borg_provider::subscriptions::Lane;
+    match lane {
+        Lane::Claude => CodingProvider::Claude,
+        Lane::Codex => CodingProvider::Codex,
+        Lane::OpenCode => CodingProvider::OpenCode,
+        Lane::Glm => CodingProvider::Glm,
+        Lane::Kimi => CodingProvider::Kimi,
+        Lane::Qwen => CodingProvider::Qwen,
+    }
+}
+
+/// `borg accounts`: every connected subscription login, what it has left and
+/// when each window resets, plus whether turns may switch between them. The
+/// active login is the one the next turn bills.
 pub(crate) async fn accounts_command(json: bool) -> Result<()> {
+    use borg_provider::subscriptions::Lane;
     let mut rows = Vec::new();
-    for provider in [CodingProvider::Claude, CodingProvider::Codex] {
+    for lane in Lane::ALL {
         rows.push((
-            provider,
-            borg_remote::provider_usage::subscription_accounts(provider).await,
+            lane,
+            borg_remote::provider_usage::subscription_accounts(lane_provider(lane)).await,
+            borg_provider::subscriptions::strategy(lane),
         ));
     }
     if json {
         let payload = rows
             .iter()
-            .map(|(provider, accounts)| {
-                serde_json::json!({ "provider": provider, "accounts": accounts })
+            .map(|(lane, accounts, strategy)| {
+                serde_json::json!({
+                    "provider": lane_provider(*lane),
+                    "lane": lane.id(),
+                    "strategy": strategy.id(),
+                    "accounts": accounts,
+                })
             })
             .collect::<Vec<_>>();
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
-    for (index, (provider, accounts)) in rows.into_iter().enumerate() {
+    for (index, (lane, accounts, strategy)) in rows.into_iter().enumerate() {
         if index > 0 {
             println!();
         }
-        print_account_rows(provider, &accounts);
+        print_account_rows(lane, &accounts, strategy);
     }
     Ok(())
 }
@@ -9095,30 +9234,45 @@ pub(crate) async fn use_account_command(
     provider: crate::cli::SubscriptionProviderArg,
     account: String,
 ) -> Result<()> {
-    let selected =
-        borg_provider::subscription_accounts::activate(provider.into(), &account).await?;
-    let provider: CodingProvider = provider.into();
-    println!(
-        "{} turns now use the {} login ({}).",
-        provider.label(),
-        selected.name,
-        selected.path.display()
+    let lane: borg_provider::subscriptions::Lane = provider.into();
+    borg_provider::subscriptions::activate(lane, &account).await?;
+    println!("{} turns now use the {account} login.", lane.label());
+    let accounts = borg_remote::provider_usage::subscription_accounts(lane_provider(lane)).await;
+    print_account_rows(
+        lane,
+        &accounts,
+        borg_provider::subscriptions::strategy(lane),
     );
-    let accounts = borg_remote::provider_usage::subscription_accounts(provider).await;
-    print_account_rows(provider, &accounts);
     Ok(())
 }
 
-fn print_account_rows(provider: CodingProvider, accounts: &[borg_remote::ProviderAccount]) {
-    println!("{} subscriptions", provider.label());
+/// `borg accounts strategy`: choose whether turns may switch between the
+/// several logins of one provider on their own.
+pub(crate) async fn strategy_account_command(
+    provider: crate::cli::SubscriptionProviderArg,
+    strategy: crate::cli::AccountStrategyArg,
+) -> Result<()> {
+    let lane: borg_provider::subscriptions::Lane = provider.into();
+    let strategy: borg_provider::subscriptions::Strategy = strategy.into();
+    borg_provider::subscriptions::set_strategy(lane, strategy)?;
+    println!("{} logins switch {}.", lane.label(), strategy.label());
+    let accounts = borg_remote::provider_usage::subscription_accounts(lane_provider(lane)).await;
+    print_account_rows(lane, &accounts, strategy);
+    Ok(())
+}
+
+fn print_account_rows(
+    lane: borg_provider::subscriptions::Lane,
+    accounts: &[borg_remote::ProviderAccount],
+    strategy: borg_provider::subscriptions::Strategy,
+) {
+    println!(
+        "{} subscriptions · switching {}",
+        lane.label(),
+        strategy.label()
+    );
     if accounts.is_empty() {
-        println!(
-            "  none connected · connect one with `borg login {}`",
-            match provider {
-                CodingProvider::Claude => "claude",
-                _ => "codex",
-            }
-        );
+        println!("  none connected · {}", lane.connect_hint());
         return;
     }
     for account in accounts {
@@ -9339,6 +9493,22 @@ async fn authenticate_provider(
         return Ok("Claude subscription selected. Saved Anthropic API key kept.".to_string());
     }
     Ok(format!("Connected {}.", provider.label()))
+}
+
+/// A key typed at a terminal (echo off) or piped in, trimmed. Never empty: a
+/// blank entry means nothing was connected.
+fn read_secret_line() -> Result<String> {
+    let key = if io::stdin().is_terminal() {
+        read_hidden_line().context("failed to read API key")?
+    } else {
+        use std::io::Read;
+        let mut key = String::new();
+        io::stdin().take(16 * 1024).read_to_string(&mut key)?;
+        key
+    };
+    let key = key.trim().to_string();
+    anyhow::ensure!(!key.is_empty(), "no key entered; nothing was saved");
+    Ok(key)
 }
 
 /// Line editor with echo suppressed. Only printable characters, backspace and

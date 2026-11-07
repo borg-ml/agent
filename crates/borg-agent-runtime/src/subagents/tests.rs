@@ -1388,6 +1388,7 @@ fn test_provider_capabilities() -> Vec<crate::ProviderCapability> {
         usage: None,
         billing: None,
         accounts: Vec::new(),
+        account_strategy: None,
     })
     .collect()
 }
@@ -2643,6 +2644,7 @@ async fn a_child_without_a_lane_inherits_the_parent_live_lane() {
             usage: None,
             billing: None,
             accounts: Vec::new(),
+            account_strategy: None,
         });
     // Its own turns have run on OpenCode since the switch: this is the lane the
     // parent is really on, and the one its children must inherit.
@@ -3274,6 +3276,7 @@ async fn director_configures_live_child_speed_and_reuses_its_new_lane_after_wake
             usage: None,
             billing: None,
             accounts: Vec::new(),
+            account_strategy: None,
         });
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),

@@ -219,7 +219,7 @@ pub async fn refresh_provider_capability_usage(
     // connected login is still described when the selected one is unusable.
     let codex_accounts = subscription_accounts(CodingProvider::Codex).await;
     let claude_accounts = subscription_accounts(CodingProvider::Claude).await;
-    capabilities
+    let mut capabilities: Vec<ProviderCapability> = capabilities
         .iter()
         .cloned()
         .map(|mut capability| {
@@ -242,7 +242,25 @@ pub async fn refresh_provider_capability_usage(
             apply_spawn_admission(&mut capability);
             capability
         })
-        .collect()
+        .collect();
+    // Key-billed plans (OpenCode Go, GLM, Kimi, Qwen) keep their logins as
+    // named keys rather than authorities, so they are read here instead of
+    // being probed per path. None of them reports quota, so these rows carry
+    // the name and selection and no windows.
+    for capability in &mut capabilities {
+        if matches!(
+            capability.provider,
+            CodingProvider::OpenCode
+                | CodingProvider::Glm
+                | CodingProvider::Kimi
+                | CodingProvider::Qwen
+        ) && capability.billing != Some(crate::BillingLane::Endpoint)
+        {
+            let accounts = account_rows(capability.provider, false).await;
+            attach_account_usage(capability, &accounts);
+        }
+    }
+    capabilities
 }
 
 // Codex's reported allowance excludes subscription credit-backed capacity.
@@ -314,7 +332,27 @@ fn attach_account_usage(capability: &mut ProviderCapability, accounts: &[Provide
         return;
     }
     capability.authenticated |= accounts.iter().any(|account| account.usage.is_some());
+    capability.account_strategy = subscription_lane(capability.provider)
+        .map(|lane| borg_provider::subscriptions::strategy(lane).into());
     capability.accounts = accounts.to_vec();
+}
+
+/// The subscription lane a provider bills subscriptions against. API-key-only
+/// providers have none, and a login lane switched to API-key billing reports
+/// none either.
+pub fn subscription_lane(provider: CodingProvider) -> Option<borg_provider::subscriptions::Lane> {
+    use borg_provider::subscriptions::Lane;
+    Some(match provider {
+        CodingProvider::Claude if !borg_provider::credentials::claude_uses_api_key() => {
+            Lane::Claude
+        }
+        CodingProvider::Codex if !borg_provider::credentials::openai_uses_api_key() => Lane::Codex,
+        CodingProvider::OpenCode => Lane::OpenCode,
+        CodingProvider::Glm => Lane::Glm,
+        CodingProvider::Kimi => Lane::Kimi,
+        CodingProvider::Qwen => Lane::Qwen,
+        _ => return None,
+    })
 }
 
 /// How long one account's usage read is shared by every capability refresh.
@@ -330,27 +368,40 @@ type AccountUsageCache = HashMap<(CodingProvider, String), (Instant, AccountProb
 
 static PROVIDER_ACCOUNT_USAGE_CACHE: OnceLock<Mutex<AccountUsageCache>> = OnceLock::new();
 
-/// Connected Claude/ChatGPT logins, each with its own usage and reset times.
-///
-/// A selected API-key lane reports no subscription accounts: probing one there
-/// would suggest a switch that does not exist, and switching lanes is never
+/// Connected subscriptions for `provider`, each with its own usage and reset
+/// times. A selected API-key lane reports none: probing one there would
+/// suggest a switch that does not exist, and switching lanes is never
 /// implicit.
 pub async fn subscription_accounts(provider: CodingProvider) -> Vec<ProviderAccount> {
-    let auth = match provider {
-        CodingProvider::Claude if !borg_provider::credentials::claude_uses_api_key() => {
-            borg_provider::ProviderAuthProvider::Claude
-        }
-        CodingProvider::Codex if !borg_provider::credentials::openai_uses_api_key() => {
-            borg_provider::ProviderAuthProvider::Openai
-        }
-        _ => return Vec::new(),
+    account_rows(provider, true).await
+}
+
+/// The same rows, but only from quota reads that already happened. A turn
+/// must not wait on a provider round trip before it can start, so automatic
+/// switching uses this warm view and simply keeps the current login when a
+/// quota read has not completed yet.
+pub async fn cached_subscription_accounts(provider: CodingProvider) -> Vec<ProviderAccount> {
+    account_rows(provider, false).await
+}
+
+async fn account_rows(provider: CodingProvider, probe: bool) -> Vec<ProviderAccount> {
+    let Some(lane) = subscription_lane(provider) else {
+        return Vec::new();
     };
-    let accounts = borg_provider::subscription_accounts::list(auth)
+    let accounts = borg_provider::subscriptions::accounts(lane)
         .await
         .unwrap_or_default();
     let mut rows = Vec::with_capacity(accounts.len());
     for account in accounts {
-        let probe = account_probe(provider, &account.path).await;
+        let probe = match &account.path {
+            Some(path) => account_probe(provider, path, probe).await,
+            None => AccountProbe {
+                usage: None,
+                detail: Some(
+                    "this plan reports no quota; turns rotate between its logins".to_string(),
+                ),
+            },
+        };
         rows.push(ProviderAccount {
             name: account.name,
             active: account.active,
@@ -362,13 +413,23 @@ pub async fn subscription_accounts(provider: CodingProvider) -> Vec<ProviderAcco
     rows
 }
 
-async fn account_probe(provider: CodingProvider, path: &std::path::Path) -> AccountProbe {
+async fn account_probe(
+    provider: CodingProvider,
+    path: &std::path::Path,
+    probe: bool,
+) -> AccountProbe {
     let cache = PROVIDER_ACCOUNT_USAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (provider, path.display().to_string());
     if let Some((probed_at, probe)) = cache.lock().await.get(&key)
         && probed_at.elapsed() < ACCOUNT_USAGE_TTL
     {
         return probe.clone();
+    }
+    if !probe {
+        return AccountProbe {
+            usage: None,
+            detail: Some("quota has not been read yet".to_string()),
+        };
     }
     let probe = match provider {
         CodingProvider::Claude => {
@@ -536,6 +597,7 @@ mod tests {
             usage: None,
             billing: Some(crate::BillingLane::Subscription),
             accounts: Vec::new(),
+            account_strategy: None,
         };
         hold_unverified_claude_transport(&mut capability);
         assert!(!capability.can_spawn);
@@ -572,6 +634,7 @@ mod tests {
             }),
             billing: Some(crate::BillingLane::Subscription),
             accounts: Vec::new(),
+            account_strategy: None,
         };
         apply_spawn_admission(&mut capability);
         assert!(capability.can_spawn);
@@ -609,6 +672,7 @@ mod tests {
             usage: None,
             billing: Some(crate::BillingLane::Subscription),
             accounts: Vec::new(),
+            account_strategy: None,
         }
     }
 
@@ -674,6 +738,7 @@ mod tests {
             usage: None,
             billing: None,
             accounts: Vec::new(),
+            account_strategy: None,
         };
         apply_claude_subscription_status(&mut capability, true);
         assert!(capability.authenticated);

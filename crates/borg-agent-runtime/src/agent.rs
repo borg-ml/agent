@@ -1258,6 +1258,10 @@ pub async fn run_agent_turn_controlled(
         })
         .await
         .ok();
+    // Balance subscription logins before the turn resolves its credential, so
+    // an exhausted login does not fail the work the user just asked for. The
+    // decision is made once, here: a turn never changes login while it runs.
+    crate::subscription_balance::before_turn(turn.provider).await;
     let executor = LocalAgentTurnExecutor::default();
     let bound = if let Some(store) = turn.agent_tools.session_store() {
         executor

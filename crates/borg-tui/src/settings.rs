@@ -7,8 +7,11 @@
 
 use super::*;
 mod providers;
+mod subscriptions;
+
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
+pub(crate) use subscriptions::{AccountView, LaneView};
 
 const MAX_WIDTH: u16 = 112;
 /// Taller windows centre the screen instead of opening a gap above the help.
@@ -31,6 +34,7 @@ pub(crate) enum SettingsSection {
     Agent,
     Helpers,
     Providers,
+    Subscriptions,
     Transcript,
     Names,
     Appearance,
@@ -39,10 +43,11 @@ pub(crate) enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::Agent,
         Self::Helpers,
         Self::Providers,
+        Self::Subscriptions,
         Self::Transcript,
         Self::Names,
         Self::Appearance,
@@ -55,6 +60,7 @@ impl SettingsSection {
             Self::Agent => "Agent",
             Self::Helpers => "Helper models",
             Self::Providers => "Providers",
+            Self::Subscriptions => "Subscriptions",
             Self::Transcript => "Transcript",
             Self::Names => "Names & colours",
             Self::Appearance => "Appearance",
@@ -68,6 +74,7 @@ impl SettingsSection {
             Self::Agent => "Model, reasoning and how Borg works",
             Self::Helpers => "Models that write commit messages and thread titles",
             Self::Providers => "Custom endpoints, credentials, models and variants",
+            Self::Subscriptions => "Logins, their remaining quota and automatic switching",
             Self::Transcript => "What the conversation shows",
             Self::Names => "How you and Borg appear in the conversation",
             Self::Appearance => "Language, cursor, icons and motion",
@@ -102,6 +109,13 @@ pub(crate) enum SettingId {
     ProviderModelVariants,
     ProviderModelSave,
     ProviderModelDelete,
+
+    SubscriptionStrategy(usize),
+    SubscriptionAccount(usize, usize),
+    SubscriptionName(usize),
+    SubscriptionKey(usize),
+    SubscriptionConnect(usize),
+    SubscriptionRemove(usize),
 
     Model,
     CommitModel,
@@ -213,6 +227,8 @@ pub(crate) struct SettingsValues {
     pub(crate) configured_models: Vec<borg_provider::DynamicModelEntry>,
     pub(crate) custom_providers:
         std::collections::BTreeMap<String, borg_ui::providers::ConfiguredProvider>,
+    /// Every subscription lane with its logins and switching policy.
+    pub(crate) subscriptions: Vec<subscriptions::LaneView>,
     pub(crate) streaming_refresh_fps: u64,
     pub(crate) layout: borg_ui::preferences::LayoutPreferences,
 }
@@ -790,6 +806,14 @@ fn choice_action(row: &SettingRow, index: usize) -> Option<UiAction> {
             attachments: Vec::new(),
         },
         Id::Footer => UiAction::SetShowFooter(on),
+        Id::SubscriptionStrategy(lane) => UiAction::SetAccountStrategy {
+            lane: *borg_provider::subscriptions::Lane::ALL.get(lane)?,
+            strategy: if on {
+                borg_provider::subscriptions::Strategy::Auto
+            } else {
+                borg_provider::subscriptions::Strategy::Manual
+            },
+        },
         Id::Effort => UiAction::SetEffort(option.clone()),
         Id::Speed => match option.as_str() {
             "Ultrafast" => UiAction::SetUltrafast(true),
@@ -878,6 +902,9 @@ enum Target {
 pub(crate) struct SettingsScreen {
     custom_providers: std::collections::BTreeMap<String, borg_ui::providers::ConfiguredProvider>,
     provider_editor: Option<providers::ProviderEditor>,
+    subscription_editor: subscriptions::AccountEditor,
+    /// The lanes as last drawn, so a row can act on the login it names.
+    subscription_lanes: Vec<subscriptions::LaneView>,
     section: usize,
     /// Index into the visible rows.
     selected: usize,
@@ -897,7 +924,12 @@ impl SettingsScreen {
     /// chosen so a click never appears to bounce back.
     pub(crate) fn rows(&mut self, values: &SettingsValues) -> Vec<SettingRow> {
         self.custom_providers = values.custom_providers.clone();
+        self.subscription_lanes = values.subscriptions.clone();
         let mut rows = setting_rows(values);
+        rows.extend(subscriptions::list_rows(
+            &self.subscription_lanes,
+            &self.subscription_editor,
+        ));
         if let Some(editor) = &self.provider_editor {
             rows.retain(|row| row.section != SettingsSection::Providers);
             rows.extend(providers::editor_rows(editor));
@@ -1024,6 +1056,19 @@ impl SettingsScreen {
         {
             return effect;
         }
+        if matches!(row.control, SettingControl::Action(_))
+            && let Some(action) =
+                subscriptions::action(row.id, &self.subscription_lanes, &self.subscription_editor)
+        {
+            // The name and key have been handed to the action; keeping them in
+            // the fields would risk connecting the same login twice.
+            if let UiAction::ConnectAccount { lane, .. } | UiAction::AddKeyAccount { lane, .. } =
+                action
+            {
+                self.subscription_editor.clear(lane);
+            }
+            return SettingsEffect::Apply(Box::new(action));
+        }
         match &row.control {
             SettingControl::Secret(_) => {
                 self.editing = Some((row.id, String::new()));
@@ -1066,6 +1111,16 @@ impl SettingsScreen {
             return SettingsEffect::None;
         };
         let value = value.trim();
+        if let Some(result) = subscriptions::edit(&mut self.subscription_editor, id, value) {
+            match result {
+                Ok(()) => self.error = None,
+                Err(error) => {
+                    self.error = Some(error.to_string());
+                    self.editing = Some((id, value.to_string()));
+                }
+            }
+            return SettingsEffect::None;
+        }
         if let Some(result) = self.provider_edit(id, value) {
             match result {
                 Ok(()) => self.error = None,
@@ -2092,6 +2147,7 @@ mod tests {
             title_model: borg_remote::DEFAULT_HELPER_MODEL.to_string(),
             configured_models: Vec::new(),
             custom_providers: Default::default(),
+            subscriptions: Vec::new(),
             streaming_refresh_fps: 120,
             layout: Default::default(),
         }

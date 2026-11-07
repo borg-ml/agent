@@ -472,6 +472,7 @@ async fn child_probe() -> Result<()> {
         usage: None,
         billing: Some(borg_remote::BillingLane::Subscription),
         accounts: Vec::new(),
+        account_strategy: None,
     };
     let root = tempfile::tempdir()?;
     let session_id = Uuid::new_v4();

@@ -1929,6 +1929,7 @@ fn test_provider_capabilities() -> Vec<crate::ProviderCapability> {
         usage: None,
         billing: None,
         accounts: Vec::new(),
+        account_strategy: None,
     })
     .collect()
 }
@@ -15608,6 +15609,7 @@ async fn team_steer_admits_a_distinct_prompt_for_each_active_child() {
                 usage: None,
                 billing: None,
                 accounts: Vec::new(),
+                account_strategy: None,
             }],
             ..Default::default()
         },

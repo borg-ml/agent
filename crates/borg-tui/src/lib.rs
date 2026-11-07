@@ -1066,6 +1066,34 @@ pub enum UiAction {
     SetUiLanguage(UiLanguage),
     SetFast(bool),
     SetUltrafast(bool),
+    /// Make one connected subscription login the one this provider spends.
+    SwitchAccount {
+        lane: borg_provider::subscriptions::Lane,
+        account: String,
+    },
+    /// Disconnect a named key subscription from this machine.
+    RemoveAccount {
+        lane: borg_provider::subscriptions::Lane,
+        account: String,
+    },
+    /// Choose whether turns may switch between a provider's logins.
+    SetAccountStrategy {
+        lane: borg_provider::subscriptions::Lane,
+        strategy: borg_provider::subscriptions::Strategy,
+    },
+    /// Sign in to an additional subscription login under a name.
+    ConnectAccount {
+        lane: borg_provider::subscriptions::Lane,
+        account: String,
+    },
+    /// Store an additional key-billed subscription login.
+    AddKeyAccount {
+        lane: borg_provider::subscriptions::Lane,
+        account: String,
+        key: String,
+    },
+    /// Tell the user something from a settings row that could not act.
+    Notice(String),
     SetRefreshRate(u64),
     SetPreventSleep {
         enabled: bool,
@@ -6682,6 +6710,61 @@ impl BorgTerminal {
         self.prevent_lid_sleep = lid;
     }
 
+    /// Subscription lanes for the settings page: logins from the credential
+    /// store, quota from the host's latest capability snapshot, and the policy
+    /// the host reports (falling back to the store it shares with us).
+    fn subscription_lanes(
+        capabilities: &[borg_remote::ProviderCapability],
+    ) -> Vec<crate::settings::LaneView> {
+        use borg_provider::subscriptions::{Lane, Strategy};
+        use borg_remote::AccountStrategy;
+        Lane::ALL
+            .iter()
+            .map(|lane| {
+                let provider = match lane {
+                    Lane::Claude => CodingProvider::Claude,
+                    Lane::Codex => CodingProvider::Codex,
+                    Lane::OpenCode => CodingProvider::OpenCode,
+                    Lane::Glm => CodingProvider::Glm,
+                    Lane::Kimi => CodingProvider::Kimi,
+                    Lane::Qwen => CodingProvider::Qwen,
+                };
+                let capability = capabilities
+                    .iter()
+                    .find(|capability| capability.provider == provider);
+                let strategy = capability
+                    .and_then(|capability| capability.account_strategy)
+                    .map(|strategy| match strategy {
+                        AccountStrategy::Manual => Strategy::Manual,
+                        AccountStrategy::Auto => Strategy::Auto,
+                    })
+                    .unwrap_or_else(|| borg_provider::subscriptions::strategy(*lane));
+                let accounts = borg_provider::subscriptions::stored_accounts(*lane)
+                    .into_iter()
+                    .map(|account| {
+                        let row = capability.and_then(|capability| {
+                            capability
+                                .accounts
+                                .iter()
+                                .find(|row| row.name == account.name)
+                        });
+                        crate::settings::AccountView {
+                            name: account.name,
+                            active: account.active,
+                            usage: row.and_then(|row| row.usage.clone()),
+                            detail: row.and_then(|row| row.detail.clone()),
+                        }
+                    })
+                    .collect();
+                crate::settings::LaneView {
+                    lane: *lane,
+                    strategy,
+                    accounts,
+                }
+            })
+            .collect()
+    }
+
     fn settings_values(&self) -> SettingsValues {
         let config = self.transcript.config.as_ref();
         let director = self
@@ -6742,6 +6825,7 @@ impl BorgTerminal {
             title_model: self.title_model.label(),
             configured_models: self.configured_model_entries.clone(),
             custom_providers: self.custom_providers.clone(),
+            subscriptions: Self::subscription_lanes(&self.transcript.provider_capabilities),
             streaming_refresh_fps: self.streaming_refresh_rate_fps,
             layout: borg_ui::preferences::LayoutPreferences {
                 horizontal_margin: self.horizontal_margin,

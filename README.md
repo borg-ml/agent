@@ -85,6 +85,14 @@ times) and switches with `select_provider_account`; switching only ever picks
 another login of the same provider and never moves a turn to API-key billing. A
 login connected before named accounts appear as `default`.
 
+By default a turn moves to the login of the same provider that has the most
+quota left, so an exhausted subscription no longer stops the work; settings has
+a Subscriptions page with every login, its remaining windows, and a
+per-provider Manual/Automatic switch, and `borg accounts` shows the same
+picture from a terminal. Plans billed by a key rather than a sign-in
+(OpenCode Go, GLM Coding, Kimi Code, Qwen Coding) keep several named keys and
+spread turns over them.
+
 Credentials do not own a session: switching accounts or replacing a key keeps
 its history, forks and collaborators. Provider continuation data is reused only
 for the account that created it, and credentials stay fixed within a running

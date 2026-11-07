@@ -2,6 +2,7 @@
 pub mod claude_subscription;
 pub mod credentials;
 pub mod image_tiles;
+pub mod key_accounts;
 pub mod local;
 pub mod mcp;
 pub mod models_catalog;
@@ -13,6 +14,7 @@ pub mod provider_install;
 pub mod runtime;
 pub mod subscription;
 pub mod subscription_accounts;
+pub mod subscriptions;
 pub mod ultrathink;
 
 mod auth;
@@ -21,6 +23,7 @@ mod env;
 pub mod subprocess;
 
 pub use auth::{ProviderAuthBundle, ProviderAuthFile, ProviderAuthProvider};
+pub use key_accounts::{KeyAccount, KeyLane};
 pub use provider_bin::{Runtime, command as runtime_command, executable as runtime_executable};
 pub use provider_install::Healed;
 pub use runtime::{

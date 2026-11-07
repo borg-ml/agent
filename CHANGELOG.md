@@ -5,6 +5,21 @@ Git comparison.
 
 ## Unreleased (since 0.20.6)
 
+- Several subscriptions per provider now balance automatically. A turn moves to
+  another login of the same provider when the selected one is exhausted or has
+  markedly less quota left, and on a plan that reports no quota (OpenCode Go,
+  GLM Coding, Kimi Code, Qwen Coding) turns rotate between the connected
+  logins. Switching never crosses into API-key billing or another provider, and
+  the selected login is kept when the difference is small. `borg accounts
+  strategy <provider> auto|manual` chooses the policy per provider.
+
+- Settings gains a Subscriptions page: every subscription lane with its
+  logins, each login's remaining windows and reset times, which login turns
+  spend, a per-lane Manual/Automatic switch, and rows to sign in to or paste a
+  key for an additional login and to remove one. `borg accounts` lists the same
+  picture, `borg login <provider> --account NAME` names a new login on every
+  lane, and `borg accounts use` switches between them.
+
 ## 0.20.6 (2026-11-07)
 
 - Preserve typed model-picker filters and the selected matching model while live configuration and team updates refresh the list.

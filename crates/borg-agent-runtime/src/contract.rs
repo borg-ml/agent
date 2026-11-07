@@ -649,6 +649,33 @@ pub struct ProviderCapability {
     /// Empty on API-key lanes and on hosts that predate named accounts.
     #[serde(default)]
     pub accounts: Vec<ProviderAccount>,
+    /// Whether turns may move to another login of this provider on their own.
+    /// `None` on hosts that predate account strategies.
+    #[serde(default)]
+    pub account_strategy: Option<AccountStrategy>,
+}
+
+/// What happens when a provider has several connected subscriptions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum AccountStrategy {
+    /// The selected login stays selected until the user changes it.
+    Manual,
+    /// A turn may move to the login of the same provider with the most quota
+    /// left, or, on a lane that reports no quota, the one that waited longest.
+    /// It never moves to API-key billing or another provider.
+    #[default]
+    Auto,
+}
+
+impl From<borg_provider::subscriptions::Strategy> for AccountStrategy {
+    fn from(strategy: borg_provider::subscriptions::Strategy) -> Self {
+        match strategy {
+            borg_provider::subscriptions::Strategy::Manual => AccountStrategy::Manual,
+            borg_provider::subscriptions::Strategy::Auto => AccountStrategy::Auto,
+        }
+    }
 }
 
 /// Which account a provider turn is charged to.
@@ -3494,6 +3521,7 @@ mod tests {
             usage: None,
             billing: Some(BillingLane::Subscription),
             accounts: Vec::new(),
+            account_strategy: None,
         };
         assert_eq!(capability.billing_label().as_deref(), Some("sub"));
         capability.usage = Some(ProviderUsage {
@@ -3550,6 +3578,7 @@ mod tests {
                 }),
                 billing: Some(BillingLane::Subscription),
                 accounts: Vec::new(),
+                account_strategy: None,
             },
             ProviderCapability {
                 provider: CodingProvider::OpenRouter,
@@ -3562,6 +3591,7 @@ mod tests {
                 usage: None,
                 billing: Some(BillingLane::ApiKey),
                 accounts: Vec::new(),
+                account_strategy: None,
             },
             ProviderCapability {
                 provider: CodingProvider::Claude,
@@ -3584,6 +3614,7 @@ mod tests {
                 }),
                 billing: Some(BillingLane::Subscription),
                 accounts: Vec::new(),
+                account_strategy: None,
             },
         ]);
         assert!(prompt.contains("Codex: READY"));
@@ -3640,6 +3671,7 @@ mod tests {
                     detail: None,
                 },
             ],
+            account_strategy: Some(AccountStrategy::Auto),
         }]);
         assert!(prompt.contains(
             "accounts: personal [idle] quota unreadable | work [active] usage available: 5-hour 60% left (resets 2026-11-07T04:30:00+00:00)"

@@ -193,6 +193,9 @@ async fn run() -> Result<()> {
             Some(AccountsCommand::Use { provider, account }) => {
                 remote_commands::use_account_command(provider, account).await
             }
+            Some(AccountsCommand::Strategy { provider, strategy }) => {
+                remote_commands::strategy_account_command(provider, strategy).await
+            }
             None => remote_commands::accounts_command(json).await,
         },
         Command::Config { command } => agent_config::run_config(command),

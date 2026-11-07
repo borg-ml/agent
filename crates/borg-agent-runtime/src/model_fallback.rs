@@ -294,6 +294,7 @@ mod tests {
             usage: None,
             billing: Some(billing),
             accounts: Vec::new(),
+            account_strategy: None,
         };
         let capabilities = [
             capability(CodingProvider::Claude, BillingLane::ApiKey),

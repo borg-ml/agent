@@ -97,6 +97,7 @@ async fn provider_capability_snapshot_is_durable_metadata_not_context() {
         usage: None,
         billing: None,
         accounts: Vec::new(),
+        account_strategy: None,
     }];
     store
         .append(SessionEvent::new(
