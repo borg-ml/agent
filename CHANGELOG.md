@@ -7,7 +7,8 @@ Git comparison.
 
 - Agents receive their exact current model slug and provider in model-visible
   context. The identity updates after a model switch and survives replay and
-  compaction without changing the cached system prompt.
+  compaction without changing the cached system prompt. Server compaction that
+  retains the identity in its live tail does not append a duplicate snapshot.
 
 - Switching a live session to OpenCode Go now refreshes its execution route
   before replaying context, instead of continuing through the old CLI and

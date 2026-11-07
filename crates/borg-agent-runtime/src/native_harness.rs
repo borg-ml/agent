@@ -5331,7 +5331,8 @@ async fn restate_after_compaction(
     for (slot, content) in restated_context {
         // A short turn's retained tail can still hold the slot verbatim.
         let retained = messages.iter().skip(1).any(|message| {
-            matches!(message, ModelMessage::User { content: held, .. } if held == content)
+            matches!(message, ModelMessage::User { content: held, .. }
+                if held == content || (*slot == ContextSlot::ModelIdentity && held.contains(content)))
         });
         if retained {
             continue;
