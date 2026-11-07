@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.20.4)
+## Unreleased (since 0.20.5)
+
+## 0.20.5 (2026-11-07)
 
 - Agents receive their exact current model slug and provider in model-visible
   context. The identity updates after a model switch and survives replay and
