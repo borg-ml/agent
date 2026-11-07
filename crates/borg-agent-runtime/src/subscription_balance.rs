@@ -77,9 +77,13 @@ pub fn rotate(
     if strategy == Strategy::Manual || accounts.len() < 2 {
         return None;
     }
+    // Least recently used wins. Two logins used in the same second tie on the
+    // stamp, so the one that is not selected now goes first instead of one
+    // name being preferred forever.
     let next = accounts.iter().min_by(|left, right| {
         waited(&left.name)
             .cmp(&waited(&right.name))
+            .then_with(|| left.active.cmp(&right.active))
             .then_with(|| left.name.cmp(&right.name))
     })?;
     (accounts
@@ -203,6 +207,12 @@ mod tests {
         };
         assert_eq!(
             rotate(&accounts, Strategy::Auto, waited).as_deref(),
+            Some("home")
+        );
+        // Two turns inside the same second tie on the stamp; the login that is
+        // not selected goes first so one login is not preferred forever.
+        assert_eq!(
+            rotate(&accounts, Strategy::Auto, |_| 7).as_deref(),
             Some("home")
         );
         assert_eq!(rotate(&accounts, Strategy::Manual, |_| 0), None);
