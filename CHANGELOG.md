@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.20.5)
+## Unreleased (since 0.20.6)
+
+## 0.20.6 (2026-11-07)
 
 - Preserve typed model-picker filters and the selected matching model while live configuration and team updates refresh the list.
 
