@@ -464,6 +464,160 @@ async fn opencode_route_is_inherited_by_forks_and_children() {
     scratch.discard().await;
 }
 
+/// Recovery must not reapply an owner's route after that owner changes models.
+/// The child's journal and configuration remain independent, including when a
+/// fork of the owner takes over the team.
+#[tokio::test]
+async fn child_recovery_preserves_its_route_after_owner_go_migration() {
+    let (scratch, store) = store().await;
+    let owner = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    store.create_session(owner).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            owner,
+            0,
+            opencode_configured("opencode/glm"),
+        ))
+        .await
+        .unwrap();
+    store.register_child_session(owner, child).await.unwrap();
+    let mut configuration = configured(Path::new("/tmp"));
+    if let SessionEventKind::SessionConfigured {
+        provider, model, ..
+    } = &mut configuration
+    {
+        *provider = CodingProvider::Claude;
+        *model = Some("claude-test".to_string());
+    }
+    store
+        .append(SessionEvent::new(child, 0, configuration))
+        .await
+        .unwrap();
+    // A historical registration left an inactive OpenCode pin on this child.
+    assert!(
+        !store
+            .uses_native_opencode_harness(child, None)
+            .await
+            .unwrap()
+    );
+    store
+        .append(SessionEvent::new(
+            owner,
+            0,
+            opencode_configured("opencode-go/glm-5.3"),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .uses_native_opencode_harness(owner, None)
+            .await
+            .unwrap()
+    );
+    let history = serde_json::to_value(store.read(child).await.unwrap()).unwrap();
+    let state = serde_json::to_value(store.state(child).await.unwrap()).unwrap();
+    store.pool().close().await;
+
+    let reopened = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+        .await
+        .unwrap();
+    reopened.register_child_session(owner, child).await.unwrap();
+    let fork = Uuid::new_v4();
+    reopened.fork_before(owner, fork, 3).await.unwrap();
+    reopened.register_child_session(fork, child).await.unwrap();
+    reopened.register_child_session(fork, child).await.unwrap();
+    assert!(
+        reopened
+            .uses_native_opencode_harness(fork, None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !reopened
+            .uses_native_opencode_harness(child, None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(reopened.read(child).await.unwrap()).unwrap(),
+        history
+    );
+    assert_eq!(
+        serde_json::to_value(reopened.state(child).await.unwrap()).unwrap(),
+        state
+    );
+    scratch.discard().await;
+}
+
+/// Explicit child settings must win over the owner's default route. A native
+/// Go owner cannot force a different provider or CLI-only model onto Go, and a
+/// CLI owner cannot prevent a configured Go child from using Borg's harness.
+#[tokio::test]
+async fn configured_children_resolve_their_own_harness_routes() {
+    let (scratch, store) = store().await;
+    for (owner_model, child_provider, child_model, expected_route) in [
+        (
+            "opencode-go/glm-5.3",
+            CodingProvider::Claude,
+            "claude-test",
+            None,
+        ),
+        (
+            "opencode-go/glm-5.3",
+            CodingProvider::OpenCode,
+            "opencode/glm",
+            Some(false),
+        ),
+        (
+            "opencode/glm",
+            CodingProvider::OpenCode,
+            "opencode-go/glm-5.3",
+            Some(true),
+        ),
+    ] {
+        let owner = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        store.create_session(owner).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                owner,
+                0,
+                opencode_configured(owner_model),
+            ))
+            .await
+            .unwrap();
+        store.create_session(child).await.unwrap();
+        let mut configuration = opencode_configured(child_model);
+        if let SessionEventKind::SessionConfigured { provider, .. } = &mut configuration {
+            *provider = child_provider;
+        }
+        store
+            .append(SessionEvent::new(child, 0, configuration))
+            .await
+            .unwrap();
+        let history = serde_json::to_value(store.read(child).await.unwrap()).unwrap();
+        store.register_child_session(owner, child).await.unwrap();
+        store.register_child_session(owner, child).await.unwrap();
+        let route: Option<bool> = sqlx::query_scalar(
+            "select native from session_harness_routes where session_id = $1 and provider = 'open_code'",
+        )
+        .bind(child)
+        .fetch_optional(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            route, expected_route,
+            "{owner_model} -> {child_provider:?}/{child_model}"
+        );
+        assert_eq!(
+            serde_json::to_value(store.read(child).await.unwrap()).unwrap(),
+            history
+        );
+    }
+    scratch.discard().await;
+}
+
 /// A fresh session with no model yet must stay undecided. Pinning it here
 /// would strand it on the compatibility route before its model was ever known.
 #[tokio::test]

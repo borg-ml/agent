@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.20.4)
 
+- Recovering a child after its owner switches to OpenCode Go preserves the
+  child's own provider and durable route. Older Claude and independently
+  configured children no longer fail recovery with a harness-mismatch error.
+
 ## 0.20.4 (2026-11-06)
 
 - Several Claude or ChatGPT subscriptions can stay connected at once. `borg

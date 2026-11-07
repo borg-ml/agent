@@ -305,6 +305,21 @@ impl PostgresSessionStore {
     ) -> Result<()> {
         Self::resolve_codex_harness(transaction, source_session_id).await?;
         Self::resolve_codex_harness(transaction, session_id).await?;
+        // Team ownership is not transcript inheritance. A configured child
+        // selects its own provider/model; only an unconfigured child needs the
+        // owner's default route. Forks copy their transcript route separately.
+        let provider: Option<String> = sqlx::query_scalar(
+            "select state_json::jsonb #>> '{configuration,provider}' from sessions where id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&mut **transaction)
+        .await?;
+        if let Some(provider) = provider {
+            if provider == "open_code" {
+                Self::resolve_opencode_harness(transaction, session_id, None, None).await?;
+            }
+            return Ok(());
+        }
         // An undecided source leaves the child free to resolve its own route.
         let source_opencode =
             Self::resolve_opencode_harness(transaction, source_session_id, None, None).await?;

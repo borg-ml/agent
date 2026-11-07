@@ -558,9 +558,9 @@ impl PostgresSessionStore {
 
     /// Record `session_id` as a child of `owner_session_id`.
     ///
-    /// A child shares its owner's conversation, so it also shares the harness
-    /// route that owns it; an owner whose route is undecided leaves the child
-    /// free to resolve its own.
+    /// An unconfigured child inherits its owner's default harness route on
+    /// first registration. Recovery and team takeover preserve the child's own
+    /// durable route and configuration.
     pub async fn register_child_session(
         &self,
         owner_session_id: Uuid,
@@ -612,11 +612,9 @@ impl PostgresSessionStore {
                 .execute(&mut *transaction)
                 .await?;
         }
-        // A child shares its owner's conversation, so it must share the route
-        // that owns it. Resolving with the owner's route rather than copying
-        // means a child that already pinned a different route is refused
-        // instead of being silently re-homed.
-        Self::inherit_harness_routes(&mut transaction, owner_session_id, session_id).await?;
+        if existing_owner.is_none() {
+            Self::inherit_harness_routes(&mut transaction, owner_session_id, session_id).await?;
+        }
         let owner_workspace: Option<Uuid> = sqlx::query_scalar(
             "select workspace_id from session_workspace_bindings where session_id = $1",
         )
