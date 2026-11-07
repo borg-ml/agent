@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.20.6)
+## Unreleased (since 0.20.7)
+
+## 0.20.7 (2026-11-07)
 
 - Models can be pinned: press Ctrl-P on a model in the model picker, and it
   moves to the top of every picker on this machine under a Pinned section,
