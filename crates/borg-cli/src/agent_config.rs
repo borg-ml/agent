@@ -1328,9 +1328,30 @@ pub(crate) fn save_model_fallback(
     let table = models
         .as_table_like_mut()
         .context("`models` in the agent configuration is not a table")?;
+    // Rewrite the array in place when there is one, so a hand-maintained
+    // one-entry-per-line list keeps that shape instead of collapsing to one
+    // long line. A missing array is created with the same layout.
+    let existing = table.get("fallback").and_then(|item| item.as_array());
+    let decor = existing
+        .and_then(|array| array.iter().next())
+        .map(|value| value.decor().clone());
+    let trailing = existing.map(|array| array.trailing().to_owned());
+    let trailing_comma = existing.is_some_and(|array| array.trailing_comma());
     let mut array = toml_edit::Array::new();
     for spec in next {
-        array.push(spec.trim());
+        let mut value = toml_edit::Value::from(spec.trim());
+        if let Some(decor) = &decor {
+            *value.decor_mut() = decor.clone();
+        }
+        array.push(value);
+    }
+    if let Some(trailing) = trailing {
+        array.set_trailing(trailing);
+        array.set_trailing_comma(trailing_comma);
+    } else if !next.is_empty() {
+        // A brand-new array is written one entry per line.
+        array.set_trailing("\n");
+        array.set_trailing_comma(true);
     }
     table.insert("fallback", toml_edit::value(array));
 
@@ -2605,7 +2626,7 @@ paid = [{ route = "anthropic/claude-opus-5-5", allow_api_billing = true }]
         let path = home.path().join("agent.toml");
         std::fs::write(
             &path,
-            "# my settings\n[models]\nfallback = [\"claude-opus-5-5@max\"]\n\n             [presentation]\nui_language = \"en\"\n",
+            "# my settings\n[models]\nfallback = [\n    \"claude-opus-5-5@max\",\n]\n\n[presentation]\nui_language = \"en\"\n",
         )
         .unwrap();
         let config = save_model_fallback(
@@ -2621,6 +2642,12 @@ paid = [{ route = "anthropic/claude-opus-5-5", allow_api_billing = true }]
         );
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("# my settings"), "{written}");
+        // A one-entry-per-line chain keeps that shape for the person who
+        // maintains the file by hand.
+        assert!(
+            written.contains("fallback = [\n    \"gpt-6-sol@xhigh\",\n]"),
+            "{written}"
+        );
         assert!(written.contains("gpt-6-sol@xhigh"), "{written}");
         assert!(written.contains("ui_language"), "{written}");
         assert!(!written.contains("claude-opus-5-5@max"), "{written}");
