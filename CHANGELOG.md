@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.20.6)
 
+- Starting the Borg session cluster no longer freezes the terminal on Windows.
+  `pg_ctl` was run with piped output, and the postmaster inherits those handles,
+  so waiting for the pipe to close waited for the server to exit: Borg sat at
+  "starting the Borg session cluster" until its own cluster went away. Output
+  goes to the cluster log instead, and readiness is read from the server
+  (`pg_isready`) rather than from its startup log line, which PostgreSQL writes
+  in the server's own locale. A start that cannot reach a serving server now
+  fails with a message naming the port, instead of blocking for minutes.
+
 - Several subscriptions per provider now balance automatically. A turn moves to
   another login of the same provider when the selected one is exhausted or has
   markedly less quota left, and on a plan that reports no quota (OpenCode Go,

@@ -91,6 +91,12 @@ const MAX_CONNECTIONS: u32 = 1000;
 
 const WEDGE_GRACE: Duration = Duration::from_secs(10);
 
+/// How long a start may take before Borg reports what it waited for instead of
+/// blocking the terminal. Recovery of a small journal cluster takes about a
+/// second; anything near this bound is a postmaster that is holding the port
+/// without serving it.
+const STARTUP_BUDGET: Duration = Duration::from_secs(60);
+
 /// Where `initdb` and `pg_ctl` live when they are not on `PATH`.
 ///
 /// Distributions keep server binaries off the default `PATH` on purpose, since
@@ -465,9 +471,35 @@ impl ManagedCluster {
     // second postmaster attaching to one data directory.
 
     /// Run `pg_ctl start`, distinguishing a failed launch from a failed call.
+    ///
+    /// Two things this must not do:
+    ///
+    /// - Wait for the child's stdout/stderr to close. The postmaster inherits
+    ///   those handles on Windows, so the pipe stays open for as long as the
+    ///   server runs: Borg froze at "starting the Borg session cluster" until
+    ///   the cluster it had just started went away. Both streams go to the
+    ///   cluster log instead.
+    /// - Trust the log to say the server is ready. PostgreSQL logs that line in
+    ///   the server's own locale, so a French or Japanese server never matched
+    ///   it. Readiness is asked of the server itself.
     async fn spawn_postmaster(&self, pg_ctl: &Path) -> Result<std::result::Result<(), String>> {
         tracing::info!(port = self.port, "starting the Borg session cluster");
-        let output = Command::new(pg_ctl)
+        if let Some(parent) = self.log_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("could not create {} for the cluster log", parent.display())
+            })?;
+        }
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)
+            .with_context(|| {
+                format!(
+                    "could not open {} for the cluster log",
+                    self.log_path.display()
+                )
+            })?;
+        let mut child = Command::new(pg_ctl)
             .kill_on_drop(true)
             .arg("-D")
             .arg(&self.data_dir)
@@ -485,13 +517,54 @@ impl ManagedCluster {
             .arg("-w")
             .arg("start")
             .stdin(Stdio::null())
-            .output()
-            .await
+            .stdout(Stdio::from(
+                log.try_clone().context("duplicate cluster log")?,
+            ))
+            .stderr(Stdio::from(log))
+            .spawn()
             .with_context(|| format!("could not run {}", pg_ctl.display()))?;
-        if output.status.success() {
-            return Ok(Ok(()));
+        let deadline = tokio::time::Instant::now() + STARTUP_BUDGET;
+        loop {
+            if self.accepts_connections().await {
+                // Ready before pg_ctl said so; it has nothing left to report.
+                child.kill().await.ok();
+                return Ok(Ok(()));
+            }
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(Ok(())),
+                Ok(Some(status)) => return Ok(Err(format!("pg_ctl exited with {status}"))),
+                Ok(None) => {}
+                Err(error) => return Ok(Err(format!("could not wait for pg_ctl: {error}"))),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                child.kill().await.ok();
+                return Ok(Err(format!(
+                    "the cluster did not accept connections within {}s; a postmaster may be holding port {} without serving it",
+                    STARTUP_BUDGET.as_secs(),
+                    self.port
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        Ok(Err(last_error_line(&output.stderr)))
+    }
+
+    /// Whether the server is accepting connections.
+    ///
+    /// `pg_isready` asks the server, so the answer does not depend on the
+    /// locale its log is written in. A host without the helper falls back to
+    /// `pg_ctl`'s own wait: it means the same thing, only later.
+    async fn accepts_connections(&self) -> bool {
+        let Ok(pg_isready) = locate_binary("pg_isready") else {
+            return false;
+        };
+        Command::new(pg_isready)
+            .args(["-h", "127.0.0.1", "-p", &self.port.to_string(), "-q"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success())
     }
 
     /// Whether the postmaster is still in its post-crash reset after
@@ -897,6 +970,54 @@ fn install_hint() -> &'static str {
 mod tests {
     use super::*;
 
+    // The freeze this guards: pg_ctl was run with piped stdout/stderr, and the
+    // postmaster inherits those handles on Windows, so waiting for the pipe to
+    // close waited for the server to exit. Borg sat at "starting the Borg
+    // session cluster" for as long as the cluster it had just started ran.
+    // Starting must return with the server still up and answering.
+    #[tokio::test]
+    async fn starting_a_cluster_does_not_wait_for_the_server_to_exit() {
+        let home = tempfile::tempdir().unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut cluster = ManagedCluster::in_home(home.path());
+        cluster.port = port;
+        let pg_ctl = locate_binary("pg_ctl").unwrap();
+        cluster
+            .initialize(&locate_binary("initdb").unwrap())
+            .await
+            .unwrap();
+        // `spawn_postmaster` is the pg_ctl route, which is the one Windows
+        // takes; the systemd route has its own tests.
+        let started =
+            tokio::time::timeout(Duration::from_secs(30), cluster.spawn_postmaster(&pg_ctl))
+                .await
+                .expect("starting must not wait for the server to exit")
+                .unwrap();
+        let running = cluster.is_running(&pg_ctl).await.unwrap();
+        let answered = cluster.accepts_connections().await;
+        Command::new(&pg_ctl)
+            .args([
+                "-D",
+                cluster.data_dir.to_str().unwrap(),
+                "-m",
+                "fast",
+                "stop",
+            ])
+            .status()
+            .await
+            .unwrap();
+        started.expect("pg_ctl starts the cluster");
+        assert!(running, "the server is still running after start returns");
+        assert!(
+            answered,
+            "the server accepts connections when start returns"
+        );
+    }
+
     #[test]
     fn a_cluster_lives_under_the_borg_home_and_not_on_the_system_port() {
         let cluster = ManagedCluster::in_home("/tmp/borg-home");
@@ -915,7 +1036,6 @@ mod tests {
     async fn server_timeouts_protect_existing_main_and_child_connections() {
         use crate::{SessionEvent, SessionEventKind, SessionStore};
         use sqlx::{Connection, Executor, postgres::PgConnection};
-        use tokio::io::{AsyncBufReadExt, BufReader};
 
         let home = tempfile::tempdir().unwrap();
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -948,16 +1068,17 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let mut log = BufReader::new(server.stderr.take().unwrap()).lines();
+        // Ask the server, not its log: the same reason Borg's own startup does.
         tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let line = log
-                    .next_line()
+            let mut ready = false;
+            while !ready {
+                ready = Command::new(locate_binary("pg_isready").unwrap())
+                    .args(["-h", "127.0.0.1", "-p", &port.to_string(), "-q"])
+                    .status()
                     .await
-                    .unwrap()
-                    .expect("Postgres exited during startup");
-                if line.contains("database system is ready to accept connections") {
-                    break;
+                    .is_ok_and(|status| status.success());
+                if !ready {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
         })
