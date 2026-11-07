@@ -38,8 +38,7 @@ use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
 use crate::cli::{
     AccountsCommand, CapabilitiesArgs, Cli, Command, ExtensionCommand, ExtensionsArgs, LimitsArgs,
-    LimitsCommand,
-    LocalAgentCliArgs,
+    LimitsCommand, LocalAgentCliArgs,
 };
 use crate::remote_commands::{print_local_workspaces, run_local_agent, run_remote_command};
 

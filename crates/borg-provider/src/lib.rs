@@ -21,7 +21,6 @@ mod env;
 pub mod subprocess;
 
 pub use auth::{ProviderAuthBundle, ProviderAuthFile, ProviderAuthProvider};
-pub use subscription_accounts::SubscriptionAccount;
 pub use provider_bin::{Runtime, command as runtime_command, executable as runtime_executable};
 pub use provider_install::Healed;
 pub use runtime::{
@@ -38,6 +37,7 @@ pub use runtime::{
     set_vercel_model_entries, vercel_model_entries,
 };
 pub use subscription::Plan;
+pub use subscription_accounts::SubscriptionAccount;
 
 pub use local::{
     FitReport, FitStatus, GgufError, GgufHeader, GgufValue, HuggingFaceCacheSource, LocalModel,
