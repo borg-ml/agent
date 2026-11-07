@@ -2254,6 +2254,28 @@ impl Picker {
         }
     }
 
+    // Refreshes can replace the catalog while the picker is open. Keep the
+    // user's filter and highlighted model rather than replacing their input.
+    fn retain_search(&mut self, previous: &Self) {
+        let Some(query) = previous.query.as_ref().filter(|query| !query.is_empty()) else {
+            return;
+        };
+        let selected = previous
+            .options
+            .get(previous.selected)
+            .map(|option| &option.value);
+        self.set_query(query.clone());
+        if let Some(index) = selected.and_then(|value| {
+            self.options
+                .iter()
+                .position(|option| &option.value == value)
+        }) && self.matches().contains(&index)
+        {
+            self.selected = index;
+            self.viewport_offset.set(previous.viewport_offset.get());
+        }
+    }
+
     fn select_index(&mut self, index: usize) -> bool {
         let Some(&option) = self.matches().get(index) else {
             return false;
@@ -5206,14 +5228,23 @@ impl BorgTerminal {
     }
 
     fn refresh_configuration_picker(&mut self) {
-        match self.picker.as_ref().map(|picker| &picker.kind) {
+        let previous = self.picker.take();
+        match previous.as_ref().map(|picker| &picker.kind) {
             Some(PickerKind::Effort) => self.open_effort_picker(),
             Some(PickerKind::Model) => self.open_model_picker(),
             Some(PickerKind::HelperModel(kind)) => self.open_helper_model_picker(*kind),
             Some(PickerKind::Fast) => self.open_fast_picker(),
             Some(PickerKind::Permission) => self.open_permission_picker(),
             Some(PickerKind::Language) => self.open_language_picker(),
-            _ => {}
+            _ => {
+                self.picker = previous;
+                return;
+            }
+        }
+        if let (Some(previous), Some(current)) = (&previous, &mut self.picker)
+            && matches!(current.kind, PickerKind::Model | PickerKind::HelperModel(_))
+        {
+            current.retain_search(previous);
         }
     }
 

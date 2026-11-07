@@ -9995,6 +9995,45 @@ fn resume_picker_scroll_keeps_every_loaded_option_reachable() {
 }
 
 #[test]
+fn model_picker_refresh_preserves_filter_and_selected_matching_model() {
+    let option = |value: &str| PickerOption::new(value, value);
+    let mut before = Picker {
+        kind: PickerKind::Model,
+        title: "Choose model",
+        options: vec![option("claude-a"), option("claude-b"), option("gpt-a")],
+        selected: 1,
+        query: Some("claude".into()),
+        viewport_offset: Cell::new(4),
+    };
+    before.scroll(-1);
+    before.scroll(1);
+    let mut refreshed = Picker {
+        kind: PickerKind::Model,
+        title: "Choose model",
+        options: vec![option("gpt-a"), option("claude-b"), option("claude-c")],
+        selected: 0,
+        query: Some(String::new()),
+        viewport_offset: Cell::new(0),
+    };
+    refreshed.retain_search(&before);
+    assert_eq!(refreshed.query.as_deref(), Some("claude"));
+    assert_eq!(refreshed.options[refreshed.selected].value, "claude-b");
+    assert_eq!(refreshed.viewport_offset.get(), 4);
+    refreshed.options.remove(1);
+    let mut next = Picker {
+        kind: PickerKind::Model,
+        title: "Choose model",
+        options: vec![option("gpt-a"), option("claude-c")],
+        selected: 0,
+        query: Some(String::new()),
+        viewport_offset: Cell::new(0),
+    };
+    next.retain_search(&before);
+    assert_eq!(next.query.as_deref(), Some("claude"));
+    assert_eq!(next.options[next.selected].value, "claude-c");
+}
+
+#[test]
 fn model_picker_wheel_and_hover_share_one_stable_viewport() {
     let options = (0..30)
         .map(|index| {
@@ -21779,6 +21818,22 @@ async fn focused_child_configuration_keeps_pickers_and_status_synced() {
     );
     terminal.open_model_picker();
     assert_eq!(selected(&terminal), "claude-haiku-5-5");
+    for character in "claude".chars() {
+        terminal
+            .handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+            .unwrap();
+    }
+    terminal
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    let selected_before = selected(&terminal).to_string();
+    terminal.seed_team_roster(&[child.clone()]);
+    assert_eq!(
+        terminal.picker.as_ref().unwrap().query.as_deref(),
+        Some("claude")
+    );
+    assert_eq!(selected(&terminal), selected_before);
+    terminal.open_model_picker();
     let metadata = SessionEvent::new(
         child.session_id,
         2,

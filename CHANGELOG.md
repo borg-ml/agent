@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.20.5)
 
+- Preserve typed model-picker filters and the selected matching model while live configuration and team updates refresh the list.
+
 ## 0.20.5 (2026-11-07)
 
 - Agents receive their exact current model slug and provider in model-visible
