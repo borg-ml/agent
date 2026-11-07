@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.20.7)
 
+- A shell call whose command arrived in the tool schema's `action` summary
+  field instead of `cmd` no longer fails. Every tool schema advertises `action`
+  first, and weaker models sometimes write the whole command there while still
+  setting `workdir` and `yield_time_ms`; those arguments only mean anything for
+  a start call, so the text is now taken as the command. One session spent 50
+  rejected round-trips on this, each re-sending a full context. A call carrying
+  only a summary, with nothing else to start, still reports the missing `cmd`.
+
 ## 0.20.7 (2026-11-07)
 
 - Models can be pinned: press Ctrl-P on a model in the model picker, and it

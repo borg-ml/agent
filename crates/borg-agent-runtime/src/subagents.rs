@@ -11248,28 +11248,31 @@ fn parse_exec_args(arguments: Value) -> Result<RuntimeExecArgs> {
             keys.join(", ")
         })
         .unwrap_or_else(|| "a non-object value".to_string());
-    serde_json::from_value(arguments).map_err(|error| {
+    let mut args: RuntimeExecArgs = serde_json::from_value(arguments).map_err(|error| {
         anyhow::anyhow!(
             "invalid exec arguments ({error}). Received fields: {received}. \
              Accepted fields are `cmd` (or `command`), `session_id`, `chars`, `terminate`, \
              `workdir`, `yield_time_ms`, `max_output_tokens` and `timeout_ms`."
         )
-    })
+    })?;
+    if args.cmd.is_none() && args.session_id.is_none() {
+        args.cmd = args.presentation_command();
+    }
+    Ok(args)
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeExecArgs {
-    /// The tool schema carries a presentation field the runtime does not read,
-    /// and it arrives under both spellings. It used to be rejected as an
-    /// unknown field, so a call the model formed exactly as the schema described
-    /// failed outright - which is most of the flakiness this tool showed.
-    /// Denying genuine typos is worth keeping, so these are absorbed rather than
-    /// the strict check removed.
-    #[allow(dead_code, reason = "absorbed for compatibility, never read")]
+    /// Every tool schema advertises `action` first, so a model that is unsure
+    /// what to call it puts the command itself here; `description` is the same
+    /// field under a spelling some providers use. Both used to be rejected as
+    /// unknown fields, and an `action` holding the command still failed for
+    /// having no `cmd`, which was most of the flakiness this tool showed.
+    /// Denying genuine typos is worth keeping, so these are absorbed and read
+    /// by `presentation_command` rather than the strict check removed.
     #[serde(default)]
     action: Option<serde_json::Value>,
-    #[allow(dead_code, reason = "absorbed for compatibility, never read")]
     #[serde(default)]
     description: Option<serde_json::Value>,
     #[serde(alias = "command")]
@@ -11281,6 +11284,32 @@ struct RuntimeExecArgs {
     yield_time_ms: Option<u64>,
     max_output_tokens: Option<usize>,
     timeout_ms: Option<u64>,
+}
+
+impl RuntimeExecArgs {
+    /// The command a model wrote into the presentation field instead of `cmd`.
+    ///
+    /// `workdir`, `yield_time_ms`, `max_output_tokens` and `timeout_ms` mean
+    /// nothing on an interact call, so a request carrying one of them was meant
+    /// to start a command and the text beside it is that command. Without one
+    /// of them the field is just a summary - `run tests` is not a command - and
+    /// the explicit error stands.
+    fn presentation_command(&self) -> Option<String> {
+        if self.workdir.is_none()
+            && self.yield_time_ms.is_none()
+            && self.max_output_tokens.is_none()
+            && self.timeout_ms.is_none()
+        {
+            return None;
+        }
+        [self.action.as_ref(), self.description.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .find(|text| !text.is_empty())
+            .map(str::to_string)
+    }
 }
 
 #[cfg(test)]
@@ -11314,6 +11343,34 @@ mod exec_args_tests {
         .expect("`command` is a near miss for `cmd`, not a typo to reject");
         assert_eq!(args.cmd.as_deref(), Some("echo hi"));
         assert_eq!(args.yield_time_ms, Some(100));
+    }
+
+    /// A model can write the command into the schema's presentation field and
+    /// still set `workdir` and `yield_time_ms`, leaving `cmd` unset, and the
+    /// call then failed although the intent was plain: 50 rejections in one
+    /// observed session, each costing a round-trip on a large context.
+    #[test]
+    fn exec_adopts_a_command_written_into_the_presentation_field() {
+        let args = parse_exec_args(serde_json::json!({
+            "action": "cd /repo && rg -n toplevel compiler/native.grl",
+            "workdir": "/repo",
+            "yield_time_ms": 1000,
+            "max_output_tokens": 400,
+        }))
+        .expect("start-only arguments prove a command was intended");
+        assert_eq!(
+            args.cmd.as_deref(),
+            Some("cd /repo && rg -n toplevel compiler/native.grl")
+        );
+    }
+
+    /// The same field holding only a summary is not a command, and a call with
+    /// nothing else to start keeps the error that says what is missing.
+    #[test]
+    fn exec_does_not_run_a_bare_summary_as_a_command() {
+        let args =
+            parse_exec_args(serde_json::json!({"action": "run tests"})).expect("still parses");
+        assert!(args.cmd.is_none());
     }
 
     /// The schema advertises a presentation field the runtime never reads, and
