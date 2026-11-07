@@ -1,10 +1,10 @@
 //! Automatic switching between the subscription logins of one provider.
 //!
 //! Two facts shape the policy:
-//!   - Claude and ChatGPT report per-login quota windows, so both the login with
-//!     the most headroom and the login whose allowance expires first are
-//!     knowable ([`most_headroom`], [`expires_first`]). OpenCode Go and the
-//!     coding plans report no quota, so their logins are spread by turn.
+//!   - Claude, ChatGPT and OpenCode Go report per-login quota windows, so both
+//!     the login with the most headroom and the login whose allowance expires
+//!     first are knowable ([`most_headroom`], [`expires_first`]). The GLM, Kimi
+//!     and Qwen coding plans report no quota, so their logins are spread by turn.
 //!   - A turn resolves its credential once, at the start. Switching is decided
 //!     there and never mid-turn, so a running turn keeps the login it began
 //!     with even when another session has just moved the selection.

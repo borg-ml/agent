@@ -11,6 +11,8 @@ use tokio::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 
+use borg_provider::key_accounts::KeyLane;
+
 use crate::{
     CodingProvider, ProviderAccount, ProviderAuthMethod, ProviderCapability, ProviderUsage,
     ProviderUsageAvailability, ProviderUsageWindow,
@@ -213,7 +215,14 @@ pub async fn refresh_provider_capability_usage(
             None
         }
     };
-    let (codex, claude) = tokio::join!(codex, claude);
+    let opencode = async {
+        if has_subscription(CodingProvider::OpenCode) {
+            probe_provider_usage(CodingProvider::OpenCode).await
+        } else {
+            None
+        }
+    };
+    let (codex, claude, opencode) = tokio::join!(codex, claude, opencode);
     // Account rows are read after the provider probes above so Claude's usage
     // endpoint is asked once per interval rather than once per row, and so a
     // connected login is still described when the selected one is unusable.
@@ -226,6 +235,7 @@ pub async fn refresh_provider_capability_usage(
             let usage = match capability.provider {
                 CodingProvider::Codex => codex.clone(),
                 CodingProvider::Claude => claude.clone(),
+                CodingProvider::OpenCode => opencode.clone(),
                 _ => return capability,
             };
             if capability.billing == Some(crate::BillingLane::ApiKey) {
@@ -245,8 +255,8 @@ pub async fn refresh_provider_capability_usage(
         .collect();
     // Key-billed plans (OpenCode Go, GLM, Kimi, Qwen) keep their logins as
     // named keys rather than authorities, so they are read here instead of
-    // being probed per path. None of them reports quota, so these rows carry
-    // the name and selection and no windows.
+    // being probed per path. A lane with an allowance endpoint reports it per
+    // key; a plan that publishes none says so rather than showing zeroes.
     for capability in &mut capabilities {
         if matches!(
             capability.provider,
@@ -256,7 +266,7 @@ pub async fn refresh_provider_capability_usage(
                 | CodingProvider::Qwen
         ) && capability.billing != Some(crate::BillingLane::Endpoint)
         {
-            let accounts = account_rows(capability.provider, false).await;
+            let accounts = account_rows(capability.provider, true).await;
             attach_account_usage(capability, &accounts);
         }
     }
@@ -314,6 +324,13 @@ async fn probe_provider_usage(provider: CodingProvider) -> Option<ProviderUsage>
                 .ok()
                 .map(claude_provider_usage)
         }
+        CodingProvider::OpenCode => match selected_key_account(KeyLane::OpenCodeGo) {
+            Some(key) => borg_provider::provider::opencode_model::usage(&key)
+                .await
+                .ok()
+                .map(opencode_provider_usage),
+            None => None,
+        },
         _ => None,
     };
     cache
@@ -393,15 +410,7 @@ async fn account_rows(provider: CodingProvider, probe: bool) -> Vec<ProviderAcco
         .unwrap_or_default();
     let mut rows = Vec::with_capacity(accounts.len());
     for account in accounts {
-        let probe = match &account.path {
-            Some(path) => account_probe(provider, path, probe).await,
-            None => AccountProbe {
-                usage: None,
-                detail: Some(
-                    "this plan reports no quota; turns rotate between its logins".to_string(),
-                ),
-            },
-        };
+        let probe = account_probe(provider, &account, probe).await;
         rows.push(ProviderAccount {
             name: account.name,
             active: account.active,
@@ -415,11 +424,20 @@ async fn account_rows(provider: CodingProvider, probe: bool) -> Vec<ProviderAcco
 
 async fn account_probe(
     provider: CodingProvider,
-    path: &std::path::Path,
+    account: &borg_provider::subscriptions::Account,
     probe: bool,
 ) -> AccountProbe {
     let cache = PROVIDER_ACCOUNT_USAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (provider, path.display().to_string());
+    // A login is identified by its authority file, or by its name when the
+    // subscription is a key rather than an authority.
+    let key = (
+        provider,
+        account
+            .path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| format!("key:{}", account.name)),
+    );
     if let Some((probed_at, probe)) = cache.lock().await.get(&key)
         && probed_at.elapsed() < ACCOUNT_USAGE_TTL
     {
@@ -431,16 +449,40 @@ async fn account_probe(
             detail: Some("quota has not been read yet".to_string()),
         };
     }
-    let probe = match provider {
-        CodingProvider::Claude => {
+    let probe = match (provider, account.path.as_ref()) {
+        (CodingProvider::Claude, Some(path)) => {
             borg_provider::provider::read_claude_account_rate_limits(Some(path), false)
                 .await
                 .map(claude_provider_usage)
         }
-        CodingProvider::Codex => {
-            borg_provider::provider::read_codex_account_rate_limits(Some(path.to_path_buf()))
+        (CodingProvider::Codex, Some(path)) => {
+            borg_provider::provider::read_codex_account_rate_limits(Some(path.clone()))
                 .await
                 .map(codex_provider_usage)
+        }
+        // The Go plan reports an allowance against the key itself, so every
+        // named login answers for its own windows.
+        (CodingProvider::OpenCode, _) => {
+            let Some(key) = borg_provider::key_accounts::key(KeyLane::OpenCodeGo, &account.name)
+            else {
+                return AccountProbe {
+                    usage: None,
+                    detail: Some("this login's key is no longer readable".to_string()),
+                };
+            };
+            borg_provider::provider::opencode_model::usage(&key)
+                .await
+                .map(opencode_provider_usage)
+        }
+        // GLM, Kimi and Qwen publish no per-key allowance to a client, so their
+        // rows carry the name and the selection and say why that is all.
+        (CodingProvider::Glm | CodingProvider::Kimi | CodingProvider::Qwen, _) => {
+            return AccountProbe {
+                usage: None,
+                detail: Some(
+                    "this plan reports no quota; turns rotate between its logins".to_string(),
+                ),
+            };
         }
         _ => {
             return AccountProbe {
@@ -537,6 +579,42 @@ fn claude_provider_usage(
             None
         },
         plan,
+    }
+}
+
+/// The key the next turn on `lane` spends: the selected named login, or the
+/// lane's single legacy key when no login was ever selected.
+fn selected_key_account(lane: KeyLane) -> Option<String> {
+    borg_provider::key_accounts::selected_key(lane)
+        .or_else(|| borg_provider::credentials::api_key(lane.credential()))
+}
+
+/// The Go plan reports percentages already spent, one window per period, each
+/// with its own reset. A window the plan is not serving blocks the provider:
+/// the allowance is per subscription, not per model.
+fn opencode_provider_usage(
+    windows: Vec<borg_provider::provider::opencode_model::UsageWindow>,
+) -> ProviderUsage {
+    let exhausted = windows
+        .iter()
+        .any(|window| window.exhausted || window.used_percent >= 100);
+    ProviderUsage {
+        availability: if exhausted {
+            ProviderUsageAvailability::Exhausted
+        } else {
+            ProviderUsageAvailability::Available
+        },
+        windows: windows
+            .into_iter()
+            .map(|window| ProviderUsageWindow {
+                label: window.label.to_string(),
+                used_percent: window.used_percent,
+                resets_at: window.resets_at,
+                global: true,
+            })
+            .collect(),
+        detail: exhausted.then(|| "OpenCode Go subscription usage is exhausted".to_string()),
+        plan: None,
     }
 }
 
@@ -693,6 +771,54 @@ mod tests {
                 plan: None,
             }),
             detail: None,
+        }
+    }
+
+    /// The Go plan reports its own allowance, so its windows drive admission
+    /// like any other reported quota: a blocked or fully spent window stops new
+    /// work on that login instead of letting a turn fail mid-flight.
+    #[test]
+    fn opencode_go_windows_reach_the_capability_and_gate_admission() {
+        use borg_provider::provider::opencode_model::UsageWindow;
+        let window = |label: &'static str, used_percent: u8, exhausted: bool| UsageWindow {
+            label,
+            used_percent,
+            resets_at: None,
+            exhausted,
+        };
+        let usage = opencode_provider_usage(vec![
+            window("Rolling", 38, false),
+            window("Weekly", 25, false),
+            window("Monthly", 12, false),
+        ]);
+        assert_eq!(usage.availability, ProviderUsageAvailability::Available);
+        assert_eq!(usage.windows.len(), 3);
+        assert!(
+            usage.windows.iter().all(|window| window.global),
+            "the allowance is per subscription, not per model"
+        );
+
+        for exhausted_window in [
+            window("Monthly", 100, false),
+            window("Rolling", 38, true),
+        ] {
+            let mut capability = subscription_capability(CodingProvider::OpenCode);
+            capability.authenticated = true;
+            capability.can_spawn = true;
+            capability.usage = Some(opencode_provider_usage(vec![exhausted_window]));
+            apply_spawn_admission(&mut capability);
+            assert!(
+                !capability.can_spawn,
+                "an exhausted Go plan must not admit new work"
+            );
+            assert!(
+                capability
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.detail.as_deref())
+                    .is_some_and(|detail| detail.contains("exhausted")),
+                "the row must say why it is blocked"
+            );
         }
     }
 

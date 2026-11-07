@@ -11416,6 +11416,32 @@ async fn usage_summary(
         CodingProvider::Claude => read_claude_account_rate_limits(None, true)
             .await
             .map(|limits| Some(AccountRateLimits::Claude(limits))),
+        // A key-billed plan reports its allowance against the subscription key,
+        // so the selected login is what the next turn spends and what this
+        // command shows. A plan that publishes no quota says so instead of
+        // claiming the provider exposes nothing.
+        provider if key_billed_lane(provider) => {
+            let accounts = borg_remote::provider_usage::subscription_accounts(provider).await;
+            let account = accounts
+                .iter()
+                .find(|account| account.active)
+                .or_else(|| accounts.first());
+            Ok(account.map(|account| {
+                AccountRateLimits::Host(account.usage.clone().unwrap_or_else(|| {
+                    borg_remote::ProviderUsage {
+                        availability: borg_remote::ProviderUsageAvailability::Unknown,
+                        windows: Vec::new(),
+                        detail: Some(
+                            account
+                                .detail
+                                .clone()
+                                .unwrap_or_else(|| "no quota reported".to_string()),
+                        ),
+                        plan: None,
+                    }
+                }))
+            }))
+        }
         _ => Ok(None),
     };
     let (limits, error) = match fetched {
@@ -11428,6 +11454,15 @@ async fn usage_summary(
         ),
     };
     format_usage_summary(provider, session, limits.as_ref(), error.as_deref())
+}
+
+/// Whether `/usage` reads this provider's allowance from its subscription keys
+/// rather than from an OAuth login.
+fn key_billed_lane(provider: CodingProvider) -> bool {
+    matches!(
+        provider,
+        CodingProvider::OpenCode | CodingProvider::Glm | CodingProvider::Kimi | CodingProvider::Qwen
+    )
 }
 
 enum AccountRateLimits {

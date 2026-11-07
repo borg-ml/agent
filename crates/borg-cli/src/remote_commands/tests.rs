@@ -3648,6 +3648,65 @@ fn usage_screen_keeps_account_limits_and_session_usage_distinct() {
     );
     assert!(claude_summary.contains("Account limits · Claude"));
     assert!(claude_summary.contains("[░░░░░░░░░░░░░░░░░░░░] 0% left"));
+
+    // A key-billed plan reports its own windows, so the screen shows them
+    // rather than claiming the provider exposes nothing.
+    let opencode = AccountRateLimits::Host(borg_remote::ProviderUsage {
+        availability: borg_remote::ProviderUsageAvailability::Available,
+        windows: vec![
+            borg_remote::ProviderUsageWindow {
+                label: "Rolling".to_string(),
+                used_percent: 42,
+                resets_at: None,
+                global: true,
+            },
+            borg_remote::ProviderUsageWindow {
+                label: "Weekly".to_string(),
+                used_percent: 26,
+                resets_at: None,
+                global: true,
+            },
+            borg_remote::ProviderUsageWindow {
+                label: "Monthly".to_string(),
+                used_percent: 13,
+                resets_at: None,
+                global: true,
+            },
+        ],
+        detail: None,
+        plan: None,
+    });
+    let opencode_summary = format_usage_summary(
+        CodingProvider::OpenCode,
+        &SessionUsage::default(),
+        Some(&opencode),
+        None,
+    );
+    assert!(opencode_summary.contains("Account limits · OpenCode"));
+    for window in ["Rolling", "Weekly", "Monthly"] {
+        assert!(opencode_summary.contains(window), "{opencode_summary}");
+    }
+    assert!(opencode_summary.contains("58% left"), "{opencode_summary}");
+    assert!(!opencode_summary.contains("not exposed by"));
+
+    // A plan that publishes no quota says so, instead of the provider-level
+    // "not exposed" line that hid which plans actually answer.
+    let no_quota = AccountRateLimits::Host(borg_remote::ProviderUsage {
+        availability: borg_remote::ProviderUsageAvailability::Unknown,
+        windows: Vec::new(),
+        detail: Some("this plan reports no quota; turns rotate between its logins".to_string()),
+        plan: None,
+    });
+    let glm_summary = format_usage_summary(
+        CodingProvider::Glm,
+        &SessionUsage::default(),
+        Some(&no_quota),
+        None,
+    );
+    assert!(
+        glm_summary.contains("this plan reports no quota"),
+        "{glm_summary}"
+    );
 }
 
 /// Run against a database copy: opening the store may apply schema updates.

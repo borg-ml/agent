@@ -36,7 +36,8 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::ModelGateway;
@@ -175,6 +176,91 @@ pub async fn context_window_tokens(model: &str) -> Option<u64> {
 const MODELS_DEV_PROVIDER: &str = "opencode-go";
 
 /// The catalog quotes dollars per million tokens; Borg accounts in micro-USD.
+/// One allowance window the Go plan reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageWindow {
+    /// The plan's own name for the window, titled for display.
+    pub label: &'static str,
+    /// Percentage of the window already spent, as the plan reports it.
+    pub used_percent: u8,
+    /// When the window refills.
+    pub resets_at: Option<DateTime<Utc>>,
+    /// The plan is serving nothing on this window.
+    pub exhausted: bool,
+}
+
+/// The Go plan's own allowance report: `rolling`, `weekly` and `monthly`,
+/// each with the percentage already spent and the moment it resets.
+///
+/// This is the only quota a key-billed coding plan exposes to a client, so
+/// `/usage` reads it rather than estimating from token counts it would have to
+/// guess a ceiling for.
+pub async fn usage(key: &str) -> Result<Vec<UsageWindow>> {
+    let key = key.trim();
+    ensure!(!key.is_empty(), "the subscription key is empty");
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .context("create OpenCode Go usage client")?
+        .get(format!("{BASE_URL}/usage"))
+        .bearer_auth(key)
+        .header("accept", "application/json")
+        .send()
+        .await
+        .context("OpenCode Go usage connection failed")?;
+    let status = response.status();
+    ensure!(
+        status.is_success(),
+        "OpenCode Go usage unavailable (HTTP {status})"
+    );
+    let body: serde_json::Value = serde_json::from_str(
+        &crate::provider::read_provider_success_response_text(response).await?,
+    )
+    .context("invalid OpenCode Go usage response")?;
+    usage_from(&body)
+}
+
+/// Only the three windows the plan documents are read. A window that a future
+/// plan adds is ignored rather than shown under a guessed label.
+fn usage_from(body: &serde_json::Value) -> Result<Vec<UsageWindow>> {
+    let usage = body
+        .get("usage")
+        .context("OpenCode Go usage response has no `usage`")?;
+    usage
+        .as_object()
+        .context("OpenCode Go usage `usage` is not an object")?;
+    let mut windows = Vec::new();
+    for (key, label) in [
+        ("rolling", "Rolling"),
+        ("weekly", "Weekly"),
+        ("monthly", "Monthly"),
+    ] {
+        let Some(window) = usage.get(key) else {
+            continue;
+        };
+        let percent = window
+            .get("percent")
+            .and_then(serde_json::Value::as_f64)
+            .with_context(|| format!("OpenCode Go `{key}` usage has no `percent`"))?;
+        let status = window
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("ok");
+        windows.push(UsageWindow {
+            label,
+            used_percent: percent.clamp(0.0, 100.0).round() as u8,
+            resets_at: window
+                .get("resetsAt")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+                .map(|at| at.with_timezone(&Utc)),
+            exhausted: status != "ok",
+        });
+    }
+    ensure!(!windows.is_empty(), "OpenCode Go reported no usage windows");
+    Ok(windows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +283,44 @@ mod tests {
     /// The adapter must not treat "authenticated for one OpenCode route" as
     /// "authenticated for all of them". Each of these would otherwise be billed
     /// against the Go allowance, or fail upstream with the wrong credential.
+    /// The plan reports percentages already spent, one per window, with its own
+    /// reset time. This is the document `/usage` renders, so the shape is pinned
+    /// against the service's real answer rather than a simplification of it.
+    #[test]
+    fn usage_windows_are_read_from_the_plans_own_report() {
+        let body = serde_json::json!({
+            "usage": {
+                "rolling": {"status": "ok", "percent": 38, "resetsAt": "2026-11-08T01:28:44.000Z"},
+                "weekly": {"status": "ok", "percent": 25.4, "resetsAt": "2026-11-09T00:00:00.000Z"},
+                "monthly": {"status": "blocked", "percent": 100, "resetsAt": "2026-12-07T15:25:03.000Z"}
+            }
+        });
+        let windows = usage_from(&body).unwrap();
+        let labels: Vec<&str> = windows.iter().map(|window| window.label).collect();
+        assert_eq!(labels, ["Rolling", "Weekly", "Monthly"]);
+        assert_eq!(windows[0].used_percent, 38);
+        assert_eq!(windows[1].used_percent, 25);
+        assert!(!windows[0].exhausted);
+        assert!(windows[2].exhausted, "a non-ok status serves nothing");
+        assert_eq!(
+            windows[0].resets_at.unwrap().to_rfc3339(),
+            "2026-11-08T01:28:44+00:00"
+        );
+    }
+
+    /// A window the plan stops reporting is skipped, and a report with no
+    /// windows at all is an error rather than an empty capability that would
+    /// read as "no quota".
+    #[test]
+    fn an_unreadable_usage_report_is_an_error() {
+        assert!(usage_from(&serde_json::json!({"usage": {}})).is_err());
+        assert!(usage_from(&serde_json::json!({})).is_err());
+        assert!(
+            usage_from(&serde_json::json!({"usage": {"weekly": {"status": "ok"}}})).is_err(),
+            "a window without a percentage cannot be rendered"
+        );
+    }
+
     #[test]
     fn non_go_routes_are_refused_rather_than_assumed() {
         for model in [

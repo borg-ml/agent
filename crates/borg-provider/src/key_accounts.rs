@@ -161,6 +161,26 @@ pub fn selected_key(lane: KeyLane) -> Option<String> {
     (!key.is_empty()).then(|| key.to_string())
 }
 
+/// The key stored for one named login.
+///
+/// A usage probe is per subscription: several named logins each report their
+/// own allowance, so the selected key is not enough. `default` falls back to the
+/// lane's single legacy key, which is the login [`list`] synthesizes for a lane
+/// that was connected before named accounts existed.
+pub fn key(lane: KeyLane, name: &str) -> Option<String> {
+    let values = credentials::stored_values().ok()?;
+    if let Some(key) = values
+        .get(&account_key(lane, name))
+        .map(|key| key.trim())
+        .filter(|key| !key.is_empty())
+    {
+        return Some(key.to_string());
+    }
+    (name == "default")
+        .then(|| credentials::stored_api_key(lane.credential()))
+        .flatten()
+}
+
 /// The selected key for any credential backed by a key-billed subscription.
 pub fn selected_key_for_credential(credential: ApiKeyCredential) -> Option<String> {
     KeyLane::for_credential(credential).and_then(selected_key)

@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.20.7)
 
+- `/usage` (and `/status`, and `borg accounts`) now show the OpenCode Go plan's
+  own allowance: the rolling, weekly and monthly windows with the percentage
+  left and when each resets, read from the plan's usage endpoint per connected
+  login. It used to say only that the plan reports no quota. An OpenCode Go
+  login whose plan is exhausted now stops admitting new work instead of failing
+  mid-turn, and several Go logins can be balanced by headroom rather than by
+  turn. The GLM, Kimi and Qwen coding plans still show that they report no
+  quota, because their services publish none to a client.
+
 - Waiting for subagents is no longer cut short after ten seconds.
   `wait_agent` and `await_watchers` are the actions whose whole job is to stay
   in the turn, but the auto-background window applied to them too, so the model
