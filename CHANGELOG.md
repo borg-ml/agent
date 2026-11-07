@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.20.7)
 
+- Waiting for subagents is no longer cut short after ten seconds.
+  `wait_agent` and `await_watchers` are the actions whose whole job is to stay
+  in the turn, but the auto-background window applied to them too, so the model
+  got a watch id instead of news and called the wait again: one session parked
+  nine concurrent waits and learned nothing from any of them. A wait now blocks
+  for as long as it asked, whether it is called directly or through
+  `capability`, and still ends early when a child or a person speaks.
+
 - A subagent is no longer marked failed when its owner has moved to a model on
   another OpenCode harness. Restoring a roster re-registers every child, and a
   child whose route was pinned before it was configured was rejected with

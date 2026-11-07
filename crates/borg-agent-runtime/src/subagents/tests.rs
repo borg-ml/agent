@@ -6,6 +6,26 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::tempdir;
 
+/// A wait is the one action whose whole point is to stay in the turn. The
+/// ten-second grace turned each `wait_agent` into a watch id, so a session
+/// parked nine concurrent waits and learned nothing from any of them.
+#[test]
+fn waits_are_not_backgrounded_by_the_grace_window() {
+    use serde_json::json;
+    for name in ["wait_agent", "await_watchers"] {
+        assert!(super::unbounded_wait(name, &json!({})), "{name}");
+        assert!(
+            super::unbounded_wait("capability", &json!({"name": name})),
+            "{name} through the capability passthrough"
+        );
+    }
+    assert!(!super::unbounded_wait("exec", &json!({"cmd": "true"})));
+    assert!(!super::unbounded_wait(
+        "capability",
+        &json!({"name": "poll_kitchen"})
+    ));
+}
+
 #[test]
 fn subagent_counts_partition_all_lifecycle_states() {
     let counts = [

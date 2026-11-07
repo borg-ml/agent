@@ -1061,6 +1061,28 @@ async fn serve_agent_tool_connection<S>(
     }
 }
 
+/// Whether an action is itself a wait, so the ten-second grace must not
+/// background it.
+///
+/// `wait_agent` and `await_watchers` park the turn until a child or a watcher
+/// has something to say; their contract is one blocking call. Backgrounding
+/// them at ten seconds hands the model a watch id instead of news, and a model
+/// that reads "running in background" does the obvious thing and calls again:
+/// one session parked nine concurrent waits, none of which it could learn from.
+/// The capability passthrough can carry either name, so its inner argument
+/// decides as well.
+fn unbounded_wait(name: &str, arguments: &Value) -> bool {
+    let name = if name == "capability" {
+        arguments
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(name)
+    } else {
+        name
+    };
+    matches!(name, "wait_agent" | "await_watchers")
+}
+
 /// An execution-policy flag (`async`, `blocking`). Tools reached without a
 /// provider-side schema (routed by name, e.g. `await_watchers`) can carry it
 /// as the string "true" / "false" instead of a JSON boolean.
@@ -2642,6 +2664,14 @@ impl AgentToolDispatcher {
                 !(immediate && blocking),
                 "async and blocking cannot both be true"
             );
+            // Decided before the action moves its arguments into the call.
+            let grace = if immediate {
+                Some(Duration::ZERO)
+            } else if blocking || unbounded_wait(name, &arguments) {
+                None
+            } else {
+                Some(Duration::from_secs(10))
+            };
             if let Some(watches) = &self.watches {
                 let shell_start =
                     matches!(name, "exec" | "exec_command") && arguments.get("cmd").is_some();
@@ -2698,13 +2728,7 @@ impl AgentToolDispatcher {
                             result
                         },
                         cancel,
-                        if immediate {
-                            Some(Duration::ZERO)
-                        } else if blocking {
-                            None
-                        } else {
-                            Some(Duration::from_secs(10))
-                        },
+                        grace,
                     )
                     .await?;
                 if shell_start && result["background"] == true {
