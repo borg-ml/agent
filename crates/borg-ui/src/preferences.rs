@@ -26,6 +26,18 @@ pub struct EditorPreferences {
     pub interaction: InteractionPreferences,
     pub presentation: PresentationPreferences,
     pub layout: LayoutPreferences,
+    pub models: ModelPreferences,
+}
+
+/// Model choices a user marked as theirs. Pins are per machine rather than per
+/// session: the picker shows them first in every session on this host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[derive(Default)]
+pub struct ModelPreferences {
+    /// Picker values (`model` or `provider/model`) in the order they were
+    /// pinned.
+    pub pinned: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,6 +402,16 @@ impl EditorPreferences {
             "streaming refresh rate must be between {MIN_REFRESH_RATE_FPS} and {MAX_REFRESH_RATE_FPS} FPS"
         );
         anyhow::ensure!(
+            self.models.pinned.len() <= 64,
+            "at most 64 models can be pinned"
+        );
+        for model in &self.models.pinned {
+            anyhow::ensure!(
+                !model.trim().is_empty() && model.trim() == model,
+                "a pinned model id cannot be empty or padded"
+            );
+        }
+        anyhow::ensure!(
             self.layout.horizontal_margin <= 40,
             "horizontal margin must be at most 40 cells"
         );
@@ -548,6 +570,31 @@ fn validate_label(kind: &str, value: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    // Pins outlive the session that set them and survive an older build
+    // writing the same file, so a pin is not lost by opening another window.
+    #[test]
+    fn pinned_models_round_trip_and_older_writers_keep_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("editor.toml");
+        let mut preferences = EditorPreferences::default();
+        preferences.models.pinned = vec!["claude-opus-5-5@max".to_string()];
+        preferences.save_to(&path).unwrap();
+        assert_eq!(
+            EditorPreferences::load_from(&path).unwrap().models.pinned,
+            ["claude-opus-5-5@max"]
+        );
+
+        // A build that predates the section writes the rest of the file.
+        let older = "\n[presentation]\nui_language = \"english\"\n";
+        std::fs::write(&path, older).unwrap();
+        let loaded = EditorPreferences::load_from(&path).unwrap();
+        assert!(loaded.models.pinned.is_empty());
+
+        let mut rejected = EditorPreferences::default();
+        rejected.models.pinned = vec!["   ".to_string()];
+        assert!(rejected.save_to(&dir.path().join("bad.toml")).is_err());
+    }
+
     #[test]
     fn new_editor_streams_partial_replies_by_default() {
         assert_eq!(ResponseStreaming::default(), ResponseStreaming::Token);
@@ -656,6 +703,9 @@ keep = true
                 horizontal_margin: 5,
                 composer_max_height: 14,
                 show_footer: false,
+            },
+            models: ModelPreferences {
+                pinned: vec!["claude-opus-5-5@max".to_string()],
             },
         };
 

@@ -5,6 +5,17 @@ Git comparison.
 
 ## Unreleased (since 0.20.6)
 
+- Models can be pinned: press Ctrl-P on a model in the model picker, and it
+  moves to the top of every picker on this machine under a Pinned section,
+  marked with a star. Settings → Models lists what is pinned and unpins it.
+
+- The model fallback chain is editable in Settings → Models rather than only in
+  `agent.toml`: each step shows the route with move-earlier, move-later and
+  remove, and a new route can be typed and appended. The edit rewrites only
+  `[models].fallback`, keeps the rest of the file including comments, refuses a
+  chain that changed underneath the form, and says plainly that chains using
+  `chain:` includes or per-route tables are still hand-edited.
+
 - Starting the Borg session cluster no longer freezes the terminal on Windows.
   `pg_ctl` was run with piped output, and the postmaster inherits those handles,
   so waiting for the pipe to close waited for the server to exit: Borg sat at

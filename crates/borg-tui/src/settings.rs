@@ -6,6 +6,7 @@
 //! slash commands use; the host applies and persists it.
 
 use super::*;
+mod models;
 mod providers;
 mod subscriptions;
 
@@ -35,6 +36,7 @@ pub(crate) enum SettingsSection {
     Helpers,
     Providers,
     Subscriptions,
+    Models,
     Transcript,
     Names,
     Appearance,
@@ -43,11 +45,12 @@ pub(crate) enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub(crate) const ALL: [Self; 9] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::Agent,
         Self::Helpers,
         Self::Providers,
         Self::Subscriptions,
+        Self::Models,
         Self::Transcript,
         Self::Names,
         Self::Appearance,
@@ -61,6 +64,7 @@ impl SettingsSection {
             Self::Helpers => "Helper models",
             Self::Providers => "Providers",
             Self::Subscriptions => "Subscriptions",
+            Self::Models => "Models",
             Self::Transcript => "Transcript",
             Self::Names => "Names & colours",
             Self::Appearance => "Appearance",
@@ -75,6 +79,7 @@ impl SettingsSection {
             Self::Helpers => "Models that write commit messages and thread titles",
             Self::Providers => "Custom endpoints, credentials, models and variants",
             Self::Subscriptions => "Logins, their remaining quota and automatic switching",
+            Self::Models => "Pinned models and the fallback chain",
             Self::Transcript => "What the conversation shows",
             Self::Names => "How you and Borg appear in the conversation",
             Self::Appearance => "Language, cursor, icons and motion",
@@ -116,6 +121,11 @@ pub(crate) enum SettingId {
     SubscriptionKey(usize),
     SubscriptionConnect(usize),
     SubscriptionRemove(usize),
+
+    ModelPin(usize),
+    FallbackEntry(usize),
+    FallbackNew,
+    FallbackAdd,
 
     Model,
     CommitModel,
@@ -229,6 +239,12 @@ pub(crate) struct SettingsValues {
         std::collections::BTreeMap<String, borg_ui::providers::ConfiguredProvider>,
     /// Every subscription lane with its logins and switching policy.
     pub(crate) subscriptions: Vec<subscriptions::LaneView>,
+    /// Models the user pinned, in pin order.
+    pub(crate) pinned_models: Vec<String>,
+    /// The configured fallback chain, as route specs.
+    pub(crate) fallback_chain: Vec<String>,
+    /// Whether that chain is a plain list this screen may rewrite.
+    pub(crate) fallback_editable: bool,
     pub(crate) streaming_refresh_fps: u64,
     pub(crate) layout: borg_ui::preferences::LayoutPreferences,
 }
@@ -899,6 +915,10 @@ pub(crate) struct SettingsScreen {
     custom_providers: std::collections::BTreeMap<String, borg_ui::providers::ConfiguredProvider>,
     provider_editor: Option<providers::ProviderEditor>,
     subscription_editor: subscriptions::AccountEditor,
+    fallback_editor: models::FallbackEditor,
+    pinned_models: Vec<String>,
+    fallback_chain: Vec<String>,
+    fallback_editable: bool,
     /// The lanes as last drawn, so a row can act on the login it names.
     subscription_lanes: Vec<subscriptions::LaneView>,
     section: usize,
@@ -925,6 +945,15 @@ impl SettingsScreen {
         rows.extend(subscriptions::list_rows(
             &self.subscription_lanes,
             &self.subscription_editor,
+        ));
+        self.pinned_models = values.pinned_models.clone();
+        self.fallback_chain = values.fallback_chain.clone();
+        self.fallback_editable = values.fallback_editable;
+        rows.extend(models::list_rows(
+            &self.pinned_models,
+            &self.fallback_chain,
+            self.fallback_editable,
+            &self.fallback_editor.new_route,
         ));
         if let Some(editor) = &self.provider_editor {
             rows.retain(|row| row.section != SettingsSection::Providers);
@@ -1006,6 +1035,16 @@ impl SettingsScreen {
         if disabled.get(index).copied().unwrap_or(true) || *selected == Some(index) {
             return SettingsEffect::None;
         }
+        if matches!(row.id, SettingId::FallbackEntry(_))
+            && let Some(action) = models::chain_action(
+                row.id,
+                &self.fallback_chain,
+                &self.fallback_editor.new_route,
+                Some(index),
+            )
+        {
+            return SettingsEffect::Apply(Box::new(action));
+        }
         match choice_action(row, index) {
             Some(action) => {
                 self.pending.retain(|(id, ..)| *id != row.id);
@@ -1051,6 +1090,23 @@ impl SettingsScreen {
             && let Some(effect) = self.provider_action(row.id)
         {
             return effect;
+        }
+        if row.id == SettingId::FallbackAdd
+            && let Some(action) = models::chain_action(
+                row.id,
+                &self.fallback_chain,
+                &self.fallback_editor.new_route,
+                None,
+            )
+        {
+            return SettingsEffect::Apply(Box::new(action));
+        }
+        if let SettingId::ModelPin(index) = row.id
+            && index < self.pinned_models.len()
+        {
+            let mut pinned = self.pinned_models.clone();
+            pinned.remove(index);
+            return SettingsEffect::Apply(Box::new(UiAction::SetPinnedModels(pinned)));
         }
         if matches!(row.control, SettingControl::Action(_))
             && let Some(action) =
@@ -1107,6 +1163,10 @@ impl SettingsScreen {
             return SettingsEffect::None;
         };
         let value = value.trim();
+        if models::edit(&mut self.fallback_editor, id, value).is_some() {
+            self.error = None;
+            return SettingsEffect::None;
+        }
         if let Some(result) = subscriptions::edit(&mut self.subscription_editor, id, value) {
             match result {
                 Ok(()) => self.error = None,
@@ -2144,6 +2204,9 @@ mod tests {
             configured_models: Vec::new(),
             custom_providers: Default::default(),
             subscriptions: Vec::new(),
+            pinned_models: Vec::new(),
+            fallback_chain: Vec::new(),
+            fallback_editable: true,
             streaming_refresh_fps: 120,
             layout: Default::default(),
         }

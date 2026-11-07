@@ -74,6 +74,29 @@ pub(crate) enum RouteEntry {
 }
 
 impl ModelsConfig {
+    /// The chain as it is written in the file: plain route specs, in order.
+    pub(crate) fn specs(&self) -> Vec<String> {
+        self.fallback
+            .iter()
+            .map(|entry| match entry {
+                RouteEntry::Spec(spec) => spec.trim().to_string(),
+                RouteEntry::Route { route, .. } => route.trim().to_string(),
+            })
+            .collect()
+    }
+
+    /// Whether this chain is a plain list a settings screen may rewrite.
+    ///
+    /// `chain:` includes and per-route tables carry grouping and billing
+    /// intent that a flat editor would silently drop, so those chains stay
+    /// hand-edited rather than being flattened by a form.
+    pub(crate) fn is_flat(&self) -> bool {
+        self.fallback.iter().all(|entry| match entry {
+            RouteEntry::Spec(spec) => !spec.trim().starts_with("chain:"),
+            RouteEntry::Route { .. } => false,
+        })
+    }
+
     /// Expand the fallback chain into the flat, ordered list a session runs.
     pub(crate) fn resolve(&self) -> Result<Vec<borg_remote::ModelRoute>> {
         let mut routes = Vec::new();
@@ -1242,6 +1265,95 @@ impl AgentConfig {
             })
             .collect()
     }
+}
+
+/// Replace `[models].fallback` with `next`, leaving every other key, comment
+/// and table in the file alone.
+///
+/// `expected` is the chain the form was drawn from. If the file's chain has
+/// moved on since, the edit is refused rather than overwriting what another
+/// session (or the user's editor) just wrote.
+pub(crate) fn save_model_fallback(
+    path: &Path,
+    expected: &[String],
+    next: &[String],
+) -> Result<AgentConfig> {
+    use std::io::Write;
+    use toml_edit::{DocumentMut, Item};
+
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).context("cannot read agent configuration"),
+    };
+    let mut config: AgentConfig =
+        toml::from_str(&source).context("cannot edit invalid agent configuration")?;
+    anyhow::ensure!(
+        config.models.is_flat(),
+        "This chain uses `chain:` includes or per-route tables. Edit `[models]` in the agent configuration by hand instead."
+    );
+    anyhow::ensure!(
+        config.models.specs() == expected,
+        "The fallback chain changed in another session. Reopen settings before saving."
+    );
+    let mut routes = Vec::with_capacity(next.len());
+    for spec in next {
+        let spec = spec.trim();
+        anyhow::ensure!(
+            !spec.starts_with("chain:"),
+            "`chain:` includes are edited in the agent configuration, not here"
+        );
+        let route = borg_remote::ModelRoute::parse(spec)
+            .with_context(|| format!("invalid model route `{spec}`"))?;
+        anyhow::ensure!(
+            !routes
+                .iter()
+                .any(|known: &borg_remote::ModelRoute| known.label() == route.label()),
+            "`{}` is already in the chain",
+            route.label()
+        );
+        routes.push(route);
+    }
+    config.models.fallback = next
+        .iter()
+        .map(|spec| RouteEntry::Spec(spec.trim().to_string()))
+        .collect();
+    config.validate()?;
+    config.capabilities.model_fallback = config.models.resolve()?;
+
+    let mut document = source.parse::<DocumentMut>()?;
+    let models = document
+        .entry("models")
+        .or_insert(Item::Table(toml_edit::Table::new()));
+    let table = models
+        .as_table_like_mut()
+        .context("`models` in the agent configuration is not a table")?;
+    let mut array = toml_edit::Array::new();
+    for spec in next {
+        array.push(spec.trim());
+    }
+    table.insert("fallback", toml_edit::value(array));
+
+    let parent = path
+        .parent()
+        .context("agent configuration has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(document.to_string().as_bytes())?;
+    temporary.as_file().sync_all()?;
+    let latest = fs::read_to_string(path).or_else(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(String::new())
+        } else {
+            Err(error)
+        }
+    })?;
+    anyhow::ensure!(
+        latest == source,
+        "Configuration changed while saving. Try again."
+    );
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(config)
 }
 
 /// Apply one settings edit to the latest file, not the stale session snapshot.
@@ -2482,5 +2594,76 @@ paid = [{ route = "anthropic/claude-opus-5-5", allow_api_billing = true }]
         )
         .expect("config parses");
         assert!(cyclic.models.resolve().is_err());
+    }
+
+    // The settings form rewrites one array in a file the user also edits by
+    // hand: everything else in that file has to survive, and a chain that
+    // changed underneath the form must not be overwritten.
+    #[test]
+    fn saving_the_fallback_chain_keeps_the_rest_of_the_file() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("agent.toml");
+        std::fs::write(
+            &path,
+            "# my settings\n[models]\nfallback = [\"claude-opus-5-5@max\"]\n\n             [presentation]\nui_language = \"en\"\n",
+        )
+        .unwrap();
+        let config = save_model_fallback(
+            &path,
+            &["claude-opus-5-5@max".to_string()],
+            &["gpt-6-sol@xhigh".to_string()],
+        )
+        .expect("chain saves");
+        assert_eq!(config.models.specs(), ["gpt-6-sol@xhigh"]);
+        assert_eq!(
+            config.capabilities.model_fallback[0].provider,
+            borg_remote::CodingProvider::Codex
+        );
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# my settings"), "{written}");
+        assert!(written.contains("gpt-6-sol@xhigh"), "{written}");
+        assert!(written.contains("ui_language"), "{written}");
+        assert!(!written.contains("claude-opus-5-5@max"), "{written}");
+        assert_eq!(
+            AgentConfig::load(Some(&path)).unwrap().models.specs(),
+            ["gpt-6-sol@xhigh"]
+        );
+
+        // A stale form must not land on top of a chain another session wrote.
+        let error = save_model_fallback(
+            &path,
+            &["claude-opus-5-5@max".to_string()],
+            &["gpt-6-sol@xhigh".to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("changed in another session"),
+            "{error}"
+        );
+    }
+
+    // Includes and per-route tables carry intent a flat list cannot express, so
+    // the form refuses them instead of flattening them away.
+    #[test]
+    fn a_chain_with_includes_is_not_edited_by_the_form() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("agent.toml");
+        std::fs::write(
+            &path,
+            "[models]\nfallback = [\"chain:paid\"]\n[models.chains]\npaid = [\"gpt-6-sol\"]\n",
+        )
+        .unwrap();
+        let error = save_model_fallback(
+            &path,
+            &["chain:paid".to_string()],
+            &["gpt-6-sol".to_string()],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("chain:"), "{error}");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("chain:paid")
+        );
     }
 }

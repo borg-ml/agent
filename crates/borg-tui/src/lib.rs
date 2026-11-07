@@ -1094,6 +1094,11 @@ pub enum UiAction {
     },
     /// Tell the user something from a settings row that could not act.
     Notice(String),
+    /// Pin or unpin a model in the picker; persisted as a host preference.
+    SetPinnedModels(Vec<String>),
+    /// Replace the ordered model fallback chain; persisted in the agent
+    /// configuration.
+    SetModelFallback(Vec<String>),
     SetRefreshRate(u64),
     SetPreventSleep {
         enabled: bool,
@@ -1770,6 +1775,11 @@ pub struct BorgTerminal {
     ui_language: UiLanguage,
     cwd: PathBuf,
     configured_model_entries: Vec<borg_provider::DynamicModelEntry>,
+    /// Model picker values the user pinned, shown first in every picker.
+    pinned_models: Vec<String>,
+    /// The configured fallback chain, and whether this screen may rewrite it.
+    fallback_chain: Vec<String>,
+    fallback_editable: bool,
     custom_providers: std::collections::BTreeMap<String, borg_ui::providers::ConfiguredProvider>,
     extension_commands: Vec<borg_remote::ExtensionApiCommand>,
     git_status_cache: GitStatusCache,
@@ -2772,6 +2782,69 @@ fn model_picker_options_with_discovered(
     model_picker_options_with_configured(provider, current, discovered, &[])
 }
 
+/// Pinned models first, in the order they were pinned, and starred so a
+/// familiar model is easy to find in a long catalog. A pinned value the picker
+/// does not offer (a model that was removed, or a provider that is not
+/// connected) is simply not drawn.
+fn pin_first(options: Vec<PickerOption>, pinned: &[String]) -> Vec<PickerOption> {
+    let mut pinned_options = Vec::new();
+    let mut rest = options;
+    for value in pinned {
+        let Some(index) = rest.iter().position(|option| &option.value == value) else {
+            continue;
+        };
+        let mut option = rest.remove(index);
+        option.label = format!("★ {}", option.label);
+        if pinned_options.is_empty() {
+            option.section = Some("Pinned".to_string());
+        }
+        pinned_options.push(option);
+    }
+    if pinned_options.is_empty() {
+        return rest;
+    }
+    pinned_options.extend(rest);
+    pinned_options
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    fn option(value: &str) -> PickerOption {
+        PickerOption::new(value.to_string(), value)
+    }
+
+    // Pinning is the promise that a familiar model is the first thing under the
+    // cursor, in the order it was pinned, without hiding the rest.
+    #[test]
+    fn pinned_models_come_first_in_pin_order_and_keep_their_star() {
+        let build = || vec![option("a"), option("b"), option("c"), option("d")];
+        let pinned = pin_first(build(), &["c".to_string(), "a".to_string()]);
+        assert_eq!(
+            pinned
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            ["c", "a", "b", "d"]
+        );
+        assert!(pinned[0].label.starts_with('★'));
+        assert!(pinned[1].label.starts_with('★'));
+        assert_eq!(pinned[0].section.as_deref(), Some("Pinned"));
+        assert!(!pinned[2].label.starts_with('★'));
+
+        // A pin for a model this picker does not offer changes nothing.
+        let unchanged = pin_first(build(), &["gone".to_string()]);
+        assert_eq!(
+            unchanged
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c", "d"]
+        );
+    }
+}
+
 fn model_picker_options_with_configured(
     provider: Option<CodingProvider>,
     current: Option<&str>,
@@ -3265,6 +3338,9 @@ impl BorgTerminal {
             ui_language: UiLanguage::Auto,
             cwd,
             configured_model_entries: Vec::new(),
+            pinned_models: Vec::new(),
+            fallback_chain: Vec::new(),
+            fallback_editable: false,
             custom_providers: Default::default(),
             extension_commands: Vec::new(),
             git_status_cache: GitStatusCache::default(),
@@ -6462,6 +6538,29 @@ impl BorgTerminal {
         self.extension_commands = commands;
     }
 
+    /// The fallback chain the agent configuration resolves to, as route specs.
+    /// `editable` is false for a chain with includes or per-route tables, which
+    /// a flat form would flatten if it rewrote them.
+    pub fn set_model_fallback(&mut self, chain: Vec<String>, editable: bool) {
+        self.fallback_chain = chain;
+        self.fallback_editable = editable;
+    }
+
+    /// The models the user pinned, in pin order. Setting them again reopens a
+    /// visible picker so the stars match what was just saved.
+    pub fn set_pinned_models(&mut self, pinned: Vec<String>) {
+        if pinned == self.pinned_models {
+            return;
+        }
+        self.pinned_models = pinned;
+        if matches!(
+            self.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Model)
+        ) {
+            self.refresh_configuration_picker();
+        }
+    }
+
     pub fn open_model_picker(&mut self) {
         let provider = self
             .transcript
@@ -6534,6 +6633,7 @@ impl BorgTerminal {
                 option.label = format!("{} · current", option.label);
             }
         }
+        options = pin_first(options, &self.pinned_models);
         let mut connection = PickerOption::new("Manage connection / billing…", "/login");
         connection.section = Some("Connections".to_string());
         connection.preview = Some(
@@ -6554,6 +6654,31 @@ impl BorgTerminal {
             query: Some(String::new()),
             viewport_offset: Cell::new(0),
         });
+    }
+
+    /// Pin or unpin the model under the picker cursor. Staying in the picker is
+    /// deliberate: pinning several models is one visit.
+    fn toggle_selected_model_pin(&mut self) -> UiAction {
+        let Some(picker) = self.picker.as_ref() else {
+            return UiAction::None;
+        };
+        let Some(option) = picker.options.get(picker.selected) else {
+            return UiAction::None;
+        };
+        let Some(provider) = CodingProvider::for_model(&option.value) else {
+            // `/login` and `/model-custom` are actions, not models.
+            return UiAction::None;
+        };
+        let _ = provider;
+        let value = option.value.clone();
+        let mut pinned = self.pinned_models.clone();
+        match pinned.iter().position(|pinned| *pinned == value) {
+            Some(index) => {
+                pinned.remove(index);
+            }
+            None => pinned.push(value),
+        }
+        UiAction::SetPinnedModels(pinned)
     }
 
     fn helper(&self, kind: HelperKind) -> &HelperModel {
@@ -6827,6 +6952,9 @@ impl BorgTerminal {
             configured_models: self.configured_model_entries.clone(),
             custom_providers: self.custom_providers.clone(),
             subscriptions: Self::subscription_lanes(&self.transcript.provider_capabilities),
+            pinned_models: self.pinned_models.clone(),
+            fallback_chain: self.fallback_chain.clone(),
+            fallback_editable: self.fallback_editable,
             streaming_refresh_fps: self.streaming_refresh_rate_fps,
             layout: borg_ui::preferences::LayoutPreferences {
                 horizontal_margin: self.horizontal_margin,
@@ -10003,6 +10131,11 @@ impl BorgTerminal {
                 self.keymap.label(KeyAction::Send),
                 self.keymap.label(KeyAction::Interrupt)
             )
+        } else if matches!(
+            self.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Model)
+        ) {
+            "↑↓ select · enter confirm · ^P pin · esc cancel".to_string()
         } else if self.picker.is_some() {
             "↑↓ select · enter confirm · esc cancel".to_string()
         } else {
@@ -12419,6 +12552,9 @@ impl BorgTerminal {
                 KeyCode::Down | KeyCode::Tab => {
                     picker.next();
                     Ok(UiAction::None)
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Ok(self.toggle_selected_model_pin())
                 }
                 KeyCode::Enter => self.run_selected_picker(),
                 KeyCode::Esc => {

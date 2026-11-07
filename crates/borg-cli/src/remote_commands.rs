@@ -3099,6 +3099,7 @@ async fn run_local_agent_session(
             terminal.set_configured_model_entries(agent_config.configured_model_entries());
             terminal.set_commit_model_gateways(agent_config.configured_model_gateways());
             terminal.set_custom_providers(agent_config.providers.clone());
+            terminal.set_model_fallback(agent_config.models.specs(), agent_config.models.is_flat());
             terminal.set_extension_commands(extension_catalog.api_snapshot().commands);
             Some(terminal)
         } else {
@@ -3121,6 +3122,9 @@ async fn run_local_agent_session(
     } else {
         None
     };
+    if let Some(terminal) = terminal.as_mut() {
+        terminal.set_pinned_models(editor_preferences.models.pinned.clone());
+    }
     crash_context
         .tui_active
         .store(terminal.is_some(), Ordering::Release);
@@ -6362,6 +6366,52 @@ async fn run_local_agent_session(
                         terminal.as_mut().expect("terminal").set_notice(notice);
                         terminal_dirty = true;
                     }
+                    UiAction::SetModelFallback(chain) => {
+                        let notice = match agent_config_path.as_deref() {
+                            None => "No agent configuration file is in use, so the chain cannot be saved.".to_string(),
+                            Some(path) => {
+                                let expected = agent_config.models.specs();
+                                match crate::agent_config::save_model_fallback(path, &expected, &chain) {
+                                    Ok(config) => {
+                                        agent_config = config;
+                                        agent_config_signature = agent_config_file_signature(
+                                            agent_config_path.as_deref(),
+                                        );
+                                        let terminal = terminal.as_mut().expect("terminal");
+                                        terminal.set_model_fallback(
+                                            agent_config.models.specs(),
+                                            agent_config.models.is_flat(),
+                                        );
+                                        format!(
+                                            "Fallback chain saved ({} routes) · sessions started after this use it",
+                                            agent_config.models.specs().len()
+                                        )
+                                    }
+                                    Err(error) => format!("Could not save the fallback chain: {error:#}"),
+                                }
+                            }
+                        };
+                        terminal.as_mut().expect("terminal").set_notice(notice);
+                        terminal_dirty = true;
+                    }
+                    UiAction::SetPinnedModels(pinned) => {
+                        editor_preferences.models.pinned = pinned.clone();
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
+                        terminal
+                            .as_mut()
+                            .expect("terminal")
+                            .set_pinned_models(pinned.clone());
+                        let notice = if pinned.is_empty() {
+                            "No pinned models.".to_string()
+                        } else {
+                            format!("Pinned models: {}", pinned.join(", "))
+                        };
+                        terminal.as_mut().expect("terminal").set_notice(notice);
+                        terminal_dirty = true;
+                    }
                     UiAction::Notice(message) => {
                         terminal.as_mut().expect("terminal").set_notice(message);
                         terminal_dirty = true;
@@ -6622,6 +6672,10 @@ async fn run_local_agent_session(
                                 live_extension_executor.replace_configured_model_gateways(agent_config.configured_model_gateways());
                                 agent_config_signature = agent_config_file_signature(agent_config_path.as_deref());
                                 terminal.set_custom_providers(agent_config.providers.clone());
+                                terminal.set_model_fallback(
+                                    agent_config.models.specs(),
+                                    agent_config.models.is_flat(),
+                                );
                                 terminal.set_configured_model_entries(agent_config.configured_model_entries());
                                 terminal.set_commit_model_gateways(agent_config.configured_model_gateways());
                                 terminal.custom_provider_save_result(None);
