@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.20.8)
+## Unreleased (since 0.20.9)
+
+## 0.20.9 (2026-11-08)
 
 - Control shortcuts are spelled the way the platform writes them: macOS shows
   the caret form (`^P`, `^C`), and every other platform spells the modifier
