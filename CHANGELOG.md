@@ -5,6 +5,23 @@ Git comparison.
 
 ## Unreleased (since 0.20.9)
 
+- Borg starts its own PostgreSQL session cluster on Windows again instead of
+  failing with "the process cannot access the file because it is being used
+  by another process": Borg no longer holds the server log that `pg_ctl`
+  writes to. `pg_ctl`'s own output goes to `~/.borg/logs/pg_ctl.log`, and its
+  last line now appears in a start error. Closing one Borg terminal no longer
+  stops the cluster other Borg windows share. A cluster that keeps its port but
+  drops every connection (on Windows, looping on "could not reserve shared
+  memory region ... error code 487") is restarted automatically instead of
+  leaving Borg unable to open, and a cluster that never starts serving is
+  reported within 20 seconds.
+
+- Claude subscription login, prompts and `borg accounts` work on Windows
+  again. Borg's credential lock opened its lock directory in a way Windows
+  rejects, so every save failed with "cannot acquire Claude storage write
+  lock" or "cannot acquire Claude refresh lock". Lock failures now name the
+  lock and the operating-system error, and are written to `borg.log`.
+
 - Connecting a subscription no longer blanks the screen. Signing in to
   ChatGPT or Claude, from the model picker or from Subscriptions → Add login,
   now runs while Borg stays on screen: the sign-in page opens in the browser,
