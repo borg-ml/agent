@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.20.7)
+## Unreleased (since 0.20.8)
+
+## 0.20.8 (2026-11-08)
 
 - `/usage` (and `/status`, and `borg accounts`) now show the OpenCode Go plan's
   own allowance: the rolling, weekly and monthly windows with the percentage
