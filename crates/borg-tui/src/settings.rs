@@ -941,6 +941,30 @@ pub(crate) struct SettingsScreen {
 }
 
 impl SettingsScreen {
+    pub(crate) fn open_subscription_lane(
+        &mut self,
+        lane: borg_provider::subscriptions::Lane,
+        values: &SettingsValues,
+    ) {
+        self.set_section(
+            SettingsSection::ALL
+                .iter()
+                .position(|section| *section == SettingsSection::Subscriptions)
+                .unwrap(),
+        );
+        let rows = self.rows(values);
+        let lane_index = borg_provider::subscriptions::Lane::ALL
+            .iter()
+            .position(|candidate| *candidate == lane)
+            .unwrap();
+        self.selected = self
+            .visible(&rows)
+            .iter()
+            .position(|index| rows[*index].id == SettingId::SubscriptionStrategy(lane_index))
+            .unwrap_or(0);
+        self.scroll = self.selected;
+    }
+
     /// Rows to show, with choices the host has not confirmed yet shown as
     /// chosen so a click never appears to bounce back.
     pub(crate) fn rows(&mut self, values: &SettingsValues) -> Vec<SettingRow> {
@@ -2252,6 +2276,27 @@ mod tests {
             streaming_refresh_fps: 120,
             layout: Default::default(),
         }
+    }
+
+    #[test]
+    fn opening_subscription_lane_focuses_the_requested_provider() {
+        use borg_provider::subscriptions::{Lane, Strategy};
+        let mut values = values();
+        values.subscriptions = Lane::ALL
+            .iter()
+            .map(|lane| LaneView {
+                lane: *lane,
+                strategy: Strategy::Manual,
+                accounts: Vec::new(),
+            })
+            .collect();
+        let mut screen = SettingsScreen::default();
+        screen.open_subscription_lane(Lane::OpenCode, &values);
+        let rows = screen.rows(&values);
+        let selected = screen.selected_row(&rows).unwrap();
+        assert_eq!(selected.id, SettingId::SubscriptionStrategy(2));
+        assert!(selected.description.contains("OpenCode Go"));
+        assert_eq!(screen.scroll, screen.selected);
     }
 
     /// The panel is sized to the section it shows, so the description follows

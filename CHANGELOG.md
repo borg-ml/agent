@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.20.9)
 
+- Managing OpenCode Go logins from the connection picker now opens the
+  Subscriptions settings at OpenCode immediately, instead of clearing the
+  screen and launching an external login. Add, select and balance logins in
+  place; other OpenCode provider connections remain available through
+  `borg login opencode`.
+
 - A burst of human input reaches the model as one request instead of one
   request per message. Messages typed as a single instruction arrive a moment
   apart, and admitting the first one on its own made the model answer half of

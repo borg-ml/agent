@@ -215,8 +215,9 @@ pub(crate) fn list_rows(lanes: &[LaneView], editor: &AccountEditor) -> Vec<Setti
                 Id::SubscriptionKey(lane_position),
                 "New login key",
                 format!(
-                    "The {} key for that login. It is kept in Borg's credential store, never in a session or a journal.",
-                    lane.label()
+                    "The {} key for that login. {}It is kept in Borg's credential store, never in a session or a journal.",
+                    lane.label(),
+                    if lane == Lane::OpenCode { "Get it at opencode.ai/auth. " } else { "" }
                 ),
                 SettingControl::Secret(if editor.key(lane).is_empty() {
                     String::new()

@@ -23076,3 +23076,24 @@ async fn private_input_preserves_draft_but_never_saves_or_recalls_secret() {
         "the ambiguous older draft is preserved for local human recovery"
     );
 }
+
+#[test]
+#[ignore = "requires a PTY; run under script with a sized terminal"]
+fn opencode_login_management_stays_in_borg() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = composer_test_terminal(&directory);
+    terminal.open_provider_auth_picker(CodingProvider::OpenCode, "opencode-go/example".into());
+    let picker = terminal.picker.as_mut().unwrap();
+    picker.selected = picker
+        .options
+        .iter()
+        .position(|option| option.value == "manage-opencode-logins")
+        .unwrap();
+    assert!(matches!(
+        terminal.run_selected_picker().unwrap(),
+        UiAction::None
+    ));
+    assert!(terminal.settings.is_some());
+    assert!(terminal.picker.is_none());
+    assert!(terminal.pending_auth_model.is_none());
+}

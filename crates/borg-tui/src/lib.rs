@@ -6785,7 +6785,7 @@ impl BorgTerminal {
             CodingProvider::OpenCode => vec![
                 PickerOption::new("OpenCode Go · subscription key", "api-key"),
                 PickerOption::new("Add or replace Go key…", "replace-api-key"),
-                PickerOption::new("Other OpenCode connections…", "reconnect-subscription"),
+                PickerOption::new("Manage OpenCode Go logins…", "manage-opencode-logins"),
             ],
             CodingProvider::Claude => vec![
                 PickerOption::new("Claude subscription · included allowance", "subscription"),
@@ -6813,6 +6813,7 @@ impl BorgTerminal {
                 "subscription" if provider == CodingProvider::Claude => "Use your saved Claude login. If needed, Borg opens the subscription sign-in flow.",
                 "api-key" if provider == CodingProvider::Claude => "Use your saved Anthropic key, or enter one privately. Requests are billed to your Anthropic Console credits. Your Claude login is kept.",
                 "api-key" | "replace-api-key" if provider == CodingProvider::OpenCode => "Get your subscription key at opencode.ai/auth. Go models use your Go allowance; select one in /model.",
+                "manage-opencode-logins" => "Open Subscriptions settings to add, select or balance OpenCode Go logins. Other OpenCode providers can be connected with `borg login opencode`.",
                 "reconnect-subscription" if provider == CodingProvider::Grok => "Opens the Grok Build sign-in. SuperGrok and X Premium Plus plans are supported; set XAI_API_KEY to use the API instead.",
                 "reconnect-subscription" if provider == CodingProvider::Muse => "Opens Muse Code account sign-in. META_API_KEY and stored API keys override subscription login and use pay-as-you-go billing.",
                 _ => "Credentials are entered privately and are never added to the conversation.",
@@ -9555,6 +9556,17 @@ impl BorgTerminal {
                 model => UiAction::SetModel(model.to_string()),
             },
             PickerKind::ProviderAuth => {
+                if picker.selected_value() == "manage-opencode-logins" {
+                    self.pending_auth_model = None;
+                    let values = self.settings_values();
+                    let mut settings = SettingsScreen::default();
+                    settings.open_subscription_lane(
+                        borg_provider::subscriptions::Lane::OpenCode,
+                        &values,
+                    );
+                    self.settings = Some(settings);
+                    return Ok(UiAction::None);
+                }
                 let choice = match picker.selected_value().as_str() {
                     "subscription" => Some(ProviderAuthChoice::Subscription),
                     "api-key" => Some(ProviderAuthChoice::ApiKey),
