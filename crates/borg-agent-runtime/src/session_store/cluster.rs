@@ -75,13 +75,15 @@ const DATABASE: &str = "borg_sessions";
 /// bounded wait into a multiple of itself.
 pub(crate) const TRANSITION_BUDGET: Duration = Duration::from_secs(30);
 
-/// How long a postmaster may hold its post-crash reset before it counts as
-/// wedged.
+/// How long a postmaster may fail every connection the way [`is_wedged`]
+/// describes before it counts as wedged.
 ///
-/// The reset only waits for the crashed cluster's children to exit, which
-/// takes well under a second. A child blocked on a full disk can hold it open
-/// indefinitely, and the postmaster never retries once space returns. Short
-/// enough that the restart still fits inside [`TRANSITION_BUDGET`].
+/// The post-crash reset only waits for the crashed cluster's children to exit,
+/// which takes well under a second. A child blocked on a full disk can hold it
+/// open indefinitely, and the postmaster never retries once space returns.
+/// Short enough that the restart still fits inside [`TRANSITION_BUDGET`].
+const WEDGE_GRACE: Duration = Duration::from_secs(10);
+
 /// Every Borg process keeps its own pool (up to 64 connections, see
 /// `POSTGRES_MAX_CONNECTIONS`), and an update briefly runs old and new workers
 /// side by side. PostgreSQL's default of 100 made a dozen busy sessions refuse
@@ -89,13 +91,12 @@ pub(crate) const TRANSITION_BUDGET: Duration = Duration::from_secs(30);
 /// shared memory, so this is cheap headroom rather than a tuning knob.
 const MAX_CONNECTIONS: u32 = 1000;
 
-const WEDGE_GRACE: Duration = Duration::from_secs(10);
-
 /// How long a start may take before Borg reports what it waited for instead of
 /// blocking the terminal. Recovery of a small journal cluster takes about a
 /// second; anything near this bound is a postmaster that is holding the port
-/// without serving it.
-const STARTUP_BUDGET: Duration = Duration::from_secs(60);
+/// without serving it. Inside [`TRANSITION_BUDGET`], which bounds the whole
+/// open, so this message is the one reported rather than a bare timeout.
+const STARTUP_BUDGET: Duration = Duration::from_secs(20);
 
 /// Where `initdb` and `pg_ctl` live when they are not on `PATH`.
 ///
@@ -184,7 +185,7 @@ impl ManagedCluster {
                 self.start(&pg_ctl).await?;
             }
             match self.ensure_database().await {
-                Err(error) if is_crash_reset(&error) && self.stays_in_crash_reset().await => {
+                Err(error) if is_wedged(&error) && self.stays_wedged().await => {
                     self.restart_wedged(&pg_ctl).await?;
                     self.ensure_database().await?;
                 }
@@ -477,8 +478,11 @@ impl ManagedCluster {
     /// - Wait for the child's stdout/stderr to close. The postmaster inherits
     ///   those handles on Windows, so the pipe stays open for as long as the
     ///   server runs: Borg froze at "starting the Borg session cluster" until
-    ///   the cluster it had just started went away. Both streams go to the
-    ///   cluster log instead.
+    ///   the cluster it had just started went away. Both streams go to a file.
+    /// - Hold the server log open. On Windows pg_ctl starts the postmaster
+    ///   through cmd.exe, whose `>>` redirect opens the `-l` file without write
+    ///   sharing and fails against any handle Borg still has on it. pg_ctl's
+    ///   own output goes to a sibling file instead.
     /// - Trust the log to say the server is ready. PostgreSQL logs that line in
     ///   the server's own locale, so a French or Japanese server never matched
     ///   it. Readiness is asked of the server itself.
@@ -489,17 +493,19 @@ impl ManagedCluster {
                 format!("could not create {} for the cluster log", parent.display())
             })?;
         }
-        let log = std::fs::OpenOptions::new()
+        let output_path = self.log_path.with_file_name("pg_ctl.log");
+        let output = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.log_path)
-            .with_context(|| {
-                format!(
-                    "could not open {} for the cluster log",
-                    self.log_path.display()
-                )
-            })?;
-        let mut child = Command::new(pg_ctl)
+            .open(&output_path)
+            .with_context(|| format!("could not open {}", output_path.display()))?;
+        let output_start = output.metadata().map_or(0, |metadata| metadata.len());
+        let mut command = Command::new(pg_ctl);
+        // Its own hidden console, so closing or interrupting this Borg's
+        // terminal does not stop a postmaster other Borg processes share.
+        #[cfg(windows)]
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        let mut child = command
             .kill_on_drop(true)
             .arg("-D")
             .arg(&self.data_dir)
@@ -518,9 +524,9 @@ impl ManagedCluster {
             .arg("start")
             .stdin(Stdio::null())
             .stdout(Stdio::from(
-                log.try_clone().context("duplicate cluster log")?,
+                output.try_clone().context("duplicate pg_ctl output")?,
             ))
-            .stderr(Stdio::from(log))
+            .stderr(Stdio::from(output))
             .spawn()
             .with_context(|| format!("could not run {}", pg_ctl.display()))?;
         let deadline = tokio::time::Instant::now() + STARTUP_BUDGET;
@@ -532,7 +538,12 @@ impl ManagedCluster {
             }
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => return Ok(Ok(())),
-                Ok(Some(status)) => return Ok(Err(format!("pg_ctl exited with {status}"))),
+                Ok(Some(status)) => {
+                    return Ok(Err(format!(
+                        "pg_ctl exited with {status}: {}",
+                        appended_last_line(&output_path, output_start)
+                    )));
+                }
                 Ok(None) => {}
                 Err(error) => return Ok(Err(format!("could not wait for pg_ctl: {error}"))),
             }
@@ -567,9 +578,9 @@ impl ManagedCluster {
             .is_ok_and(|status| status.success())
     }
 
-    /// Whether the postmaster is still in its post-crash reset after
+    /// Whether the postmaster still fails every connection as wedged after
     /// [`WEDGE_GRACE`]. Any other answer means it moved on by itself.
-    async fn stays_in_crash_reset(&self) -> bool {
+    async fn stays_wedged(&self) -> bool {
         use sqlx::{Connection, postgres::PgConnection};
 
         let maintenance = format!("postgres://{ROLE}@127.0.0.1:{}/postgres", self.port);
@@ -577,7 +588,7 @@ impl ManagedCluster {
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(500)).await;
             match PgConnection::connect(&maintenance).await {
-                Err(error) if is_crash_reset_reply(&error) => {}
+                Err(error) if is_wedged_reply(&error) => {}
                 Ok(connection) => {
                     connection.close().await.ok();
                     return false;
@@ -590,12 +601,12 @@ impl ManagedCluster {
 
     /// Stop a wedged postmaster and start it again.
     ///
-    /// An immediate stop is what the crash that wedged it already did, so it
-    /// loses nothing further; the start replays WAL as any crash recovery does.
+    /// Nothing can connect to it, so an immediate stop loses no work a client
+    /// could still finish; the start replays WAL as any crash recovery does.
     async fn restart_wedged(&self, pg_ctl: &Path) -> Result<()> {
         tracing::warn!(
             data_dir = %self.data_dir.display(),
-            "the Borg session cluster is stuck resetting after a crash; restarting it"
+            "the Borg session cluster is running but not serving connections; restarting it"
         );
         let output = Command::new(pg_ctl)
             .kill_on_drop(true)
@@ -753,18 +764,30 @@ pub(crate) fn is_between_states(error: &anyhow::Error) -> bool {
     })
 }
 
-/// The postmaster refusing connections while it resets after a crash.
+/// A live postmaster that cannot serve: either it refuses connections while it
+/// resets after a crash, or it drops every handshake because it cannot start a
+/// backend. The second is how a Windows postmaster looping on "could not
+/// reserve shared memory region ... error code 487" looks to a client, and it
+/// carries no SQLSTATE, so it is matched in any server locale.
 ///
 /// `57P03` alone also covers starting up and shutting down, and only the
-/// message separates this case. A server logging in another locale is never
-/// matched, which leaves it with the plain transitional wait.
-fn is_crash_reset(error: &anyhow::Error) -> bool {
+/// message separates the crash reset. A server logging in another locale is
+/// never matched there, which leaves it with the plain transitional wait.
+fn is_wedged(error: &anyhow::Error) -> bool {
     error
         .chain()
-        .any(|cause| cause.downcast_ref().is_some_and(is_crash_reset_reply))
+        .any(|cause| cause.downcast_ref().is_some_and(is_wedged_reply))
 }
 
-fn is_crash_reset_reply(error: &sqlx::Error) -> bool {
+fn is_wedged_reply(error: &sqlx::Error) -> bool {
+    if let sqlx::Error::Io(error) = error {
+        return matches!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+        );
+    }
     error.as_database_error().is_some_and(|error| {
         error.code().as_deref() == Some("57P03") && error.message().contains("in recovery mode")
     })
@@ -870,6 +893,20 @@ fn port_from_env() -> Option<u16> {
     std::env::var(PORT_ENV)
         .ok()
         .and_then(|value| value.trim().parse().ok())
+}
+
+/// The last meaningful line written to `path` past `offset`.
+fn appended_last_line(path: &Path, offset: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|mut file| {
+            file.seek(SeekFrom::Start(offset))?;
+            file.take(64 * 1024).read_to_end(&mut bytes)
+        })
+        .ok();
+    last_error_line(&bytes)
 }
 
 /// The last meaningful line of a failed command's stderr.
