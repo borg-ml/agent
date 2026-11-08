@@ -2867,7 +2867,9 @@ async fn run_agent_session_store_kernel_inner(
     // (TUI, GUI, remote) sees the same billing label durably.
     let (capability_refresh_tx, mut capability_refresh_rx) =
         mpsc::channel::<Vec<crate::ProviderCapability>>(1);
-    if !launch.capabilities.provider_capabilities.is_empty() {
+    // Tests supply fixed capabilities; a host refresh would overwrite them with
+    // the machine's real logins.
+    if !cfg!(test) && !launch.capabilities.provider_capabilities.is_empty() {
         let mut seed = launch.capabilities.provider_capabilities.clone();
         tokio::spawn(async move {
             loop {
