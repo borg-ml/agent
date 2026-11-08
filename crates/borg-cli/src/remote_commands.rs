@@ -1665,7 +1665,7 @@ async fn ensure_detached_session_host(
         &mut child,
         || Ok(socket_path.exists() && local_session_owner_is_active(&sessions_dir, session_id)?),
         |terminal| show_session_recovery_notice(terminal,
-            &format!("Session {session_id} is still starting or recovering. Ctrl-C detaches; the host keeps recovering. {}", session_host_diagnostics(&diagnostics_path, diagnostics_start))),
+            &format!("Session {session_id} is still starting or recovering. {} detaches; the host keeps recovering. {}", borg_ui::control_shortcut('c'), session_host_diagnostics(&diagnostics_path, diagnostics_start))),
         SESSION_HOST_START_NOTICE_INTERVAL,
         terminal,
     ).await;
@@ -1855,7 +1855,10 @@ async fn wait_for_detached_session_host(
                         if repeated_ctrl_c(&mut last_ctrl_c, std::time::Instant::now()) {
                             return Ok(DetachedHostWait::Detach);
                         }
-                        tui.set_notice("Host is recovering. Press Ctrl-C again to detach without stopping the host.");
+                        tui.set_notice(&format!(
+                            "Host is recovering. Press {} again to detach without stopping the host.",
+                            borg_ui::control_shortcut('c')
+                        ));
                     }
                     UiAction::Submit { .. } => {
                         if let Some((text, attachments)) = draft {
@@ -8727,10 +8730,10 @@ async fn run_local_agent_session(
                     }
                     stop_sent = true;
                     user_requested_exit = true;
-                    exit_notice = Some(
-                        "Interrupted; Borg stopped the local session. Press Ctrl-C again to exit at once."
-                            .to_string(),
-                    );
+                    exit_notice = Some(format!(
+                        "Interrupted; Borg stopped the local session. Press {} again to exit at once.",
+                        borg_ui::control_shortcut('c')
+                    ));
                     dispatch_host_command_without_blocking(
                         &session_command_tx,
                         HostCommand::Stop { session_id },
@@ -8745,7 +8748,10 @@ async fn run_local_agent_session(
                     terminal.handle_external_interrupt();
                     terminal_dirty = true;
                 } else {
-                    eprintln!("\n  Prompt cleared. Press Ctrl-C again to exit.");
+                    eprintln!(
+                        "\n  Prompt cleared. Press {} again to exit.",
+                        borg_ui::control_shortcut('c')
+                    );
                 }
             }
             signal = shutdown_signals.recv(), if shutdown_signal_open => {

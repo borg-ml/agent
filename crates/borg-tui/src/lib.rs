@@ -457,10 +457,22 @@ fn parse_key_chord(value: &str) -> Result<KeyChord> {
             _ => anyhow::bail!("unsupported key chord `{value}`"),
         }
     }
+    let code = code.with_context(|| format!("key chord `{value}` has no key"))?;
+    // A configured control chord is shown the way this platform writes one, so
+    // the footer never mixes `ctrl+p` with a hint's `^P`.
+    let label = match (code, modifiers) {
+        (KeyCode::Char(key), held)
+            if held.contains(KeyModifiers::CONTROL)
+                && !held.intersects(KeyModifiers::SUPER | KeyModifiers::ALT) =>
+        {
+            borg_ui::control_shortcut(key)
+        }
+        _ => value.to_ascii_lowercase(),
+    };
     Ok(KeyChord {
-        code: code.with_context(|| format!("key chord `{value}` has no key"))?,
+        code,
         modifiers,
-        label: value.to_ascii_lowercase(),
+        label,
     })
 }
 
@@ -10135,7 +10147,10 @@ impl BorgTerminal {
             self.picker.as_ref().map(|picker| picker.kind),
             Some(PickerKind::Model)
         ) {
-            "↑↓ select · enter confirm · ^P pin · esc cancel".to_string()
+            format!(
+                "↑↓ select · enter confirm · {} pin · esc cancel",
+                borg_ui::control_shortcut('p')
+            )
         } else if self.picker.is_some() {
             "↑↓ select · enter confirm · esc cancel".to_string()
         } else {
@@ -12798,7 +12813,10 @@ impl BorgTerminal {
             )
         {
             self.rewind_primed = false;
-            self.notice = Some("Press Ctrl-C again to exit".to_string());
+            self.notice = Some(format!(
+                "Press {} again to exit",
+                borg_ui::control_shortcut('c')
+            ));
             return Ok(UiAction::None);
         }
         if self.keymap.matches(KeyAction::Interrupt, &key)

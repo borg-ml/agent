@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.20.8)
 
+- Control shortcuts are spelled the way the platform writes them: macOS shows
+  the caret form (`^P`, `^C`), and every other platform spells the modifier
+  (`Ctrl-P`, `Ctrl-C`). The model picker's pin hint, the settings note about
+  pinning and the exit prompts now agree with each other, and a configured
+  control chord is shown in the same style instead of lowercase `ctrl+p`.
+
 - The settings screen is sized to the section it shows. A section with a few
   rows no longer strands its description at the bottom of an empty panel: the
   panel fits the rows, the description follows them, and the key hints keep a

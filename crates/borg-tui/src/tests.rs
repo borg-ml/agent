@@ -2379,7 +2379,9 @@ fn keybinding_help_is_key_first_and_uses_configuration() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(help.contains("send"));
-    assert!(help.find("ctrl+s").unwrap() < help.find("send").unwrap());
+    // A configured control chord is displayed the way this platform writes one.
+    let send = borg_ui::control_shortcut('s');
+    assert!(help.find(&send).unwrap() < help.find("send").unwrap());
     let separators = help
         .lines()
         .map(|line| line.find("│").unwrap())
@@ -2393,7 +2395,7 @@ fn keybinding_help_is_key_first_and_uses_configuration() {
     assert!(wide_help.iter().all(|line| line.width() <= 86));
     assert!(wide_help.iter().any(|line| {
         line.spans.iter().any(|span| {
-            span.content == "ctrl+s"
+            span.content == send
                 && span.style.fg == Some(BORG_ORANGE_HOVER)
                 && span.style.add_modifier.contains(Modifier::BOLD)
         })

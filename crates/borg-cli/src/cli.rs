@@ -4,7 +4,9 @@ use std::{env, ffi::OsString};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
-const QUICKSTART: &str = "\
+fn quickstart() -> String {
+    format!(
+        "\
 Quickstart:
   borg                       start a session in the current directory
   borg login codex           connect a ChatGPT/Codex subscription (or: claude, opencode)
@@ -16,13 +18,16 @@ Quickstart:
   borg doctor                check durable storage and provider readiness
   borg bug --output b.json   collect a local-only diagnostic bundle to attach to a report
 
-Inside a session: type a request, `/help` lists controls, Ctrl-C twice exits (the session stays resumable).";
+Inside a session: type a request, `/help` lists controls, {} twice exits (the session stays resumable).",
+        borg_ui::control_shortcut('c')
+    )
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "borg")]
 #[command(about = "A high-performance, open-source agent harness and orchestrator")]
 #[command(version)]
-#[command(after_help = QUICKSTART)]
+#[command(after_help = quickstart())]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Option<Command>,

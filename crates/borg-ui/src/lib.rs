@@ -145,6 +145,21 @@ impl KeybindingConfig {
     }
 }
 
+/// How this platform writes a Control-modified shortcut.
+///
+/// macOS terminals read the caret form (`^P`); everywhere else the modifier is
+/// spelled out (`Ctrl-P`). Every hint goes through this so a macOS user is
+/// never told to press a key their keyboard does not label "Ctrl", and a
+/// Linux or Windows user is never shown a caret they have to interpret.
+pub fn control_shortcut(key: char) -> String {
+    let key = key.to_ascii_uppercase();
+    if cfg!(target_os = "macos") {
+        format!("^{key}")
+    } else {
+        format!("Ctrl-{key}")
+    }
+}
+
 pub fn validate_key_chord(value: &str) -> anyhow::Result<()> {
     let mut parts = value.split('+').peekable();
     let mut key = None;
@@ -542,6 +557,19 @@ pub mod palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shortcut label has to name a key the platform's keyboard actually
+    /// has: macOS terminals read the caret form, everyone else spells it out.
+    #[test]
+    fn control_shortcuts_use_the_platforms_spelling() {
+        let expected = if cfg!(target_os = "macos") {
+            "^P"
+        } else {
+            "Ctrl-P"
+        };
+        assert_eq!(control_shortcut('p'), expected);
+        assert_eq!(control_shortcut('P'), expected);
+    }
 
     #[test]
     fn selected_child_todo_command_keeps_owner_and_target_distinct() {

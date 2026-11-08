@@ -21,7 +21,10 @@ pub(crate) fn list_rows(
             id: Id::ModelPin(usize::MAX),
             section: SettingsSection::Models,
             label: "Pinned models",
-            description: "No models pinned yet. Open the model picker and press Ctrl-P on a model to pin it here, first in every picker on this machine.".to_string(),
+            description: format!(
+                "No models pinned yet. Open the model picker and press {} on a model to pin it here, first in every picker on this machine.",
+                borg_ui::control_shortcut('p')
+            ),
             control: SettingControl::Action("None".to_string()),
             enabled: false,
         });
