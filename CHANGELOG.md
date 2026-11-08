@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.20.10)
 
+- The agent no longer parks on `wait_agent` or `await_watchers` while it still
+  has work it could do; it waits only once nothing else is left.
+
 ## 0.20.10 (2026-11-08)
 
 - Borg starts its own PostgreSQL session cluster on Windows again instead of

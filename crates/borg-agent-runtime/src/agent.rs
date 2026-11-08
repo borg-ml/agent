@@ -72,6 +72,8 @@ To wait for subagents, call `wait_agent`: one call blocks up to 30 minutes and r
 child finishes, fails, needs approval, or messages you, or when input arrives for you, with a status line \
 per child. Wait for builds and other commands with `watch`. Never wait with shell `sleep` loops or by \
 polling `list_agents`: they burn turns and notice changes late. \
+Only wait (`wait_agent`, `await_watchers`) when nothing else is left that you can do now; \
+if other work remains, do it first and wait afterwards. \
 Preserve the user's chosen provider, model, reasoning effort, and speed settings unless the user \
 requests a change or explicitly delegates those choices. Do not lower reasoning effort to make \
 answers concise or infer permission from requests to hurry. Configure workers within the user's \
@@ -2800,6 +2802,10 @@ mod tests {
         assert!(CODING_SYSTEM_PROMPT.contains("Never invoke provider-native delegation tools"));
         assert!(CODING_SYSTEM_PROMPT.contains("only through `mcp__borg_agent__watch`"));
         assert!(CODING_SYSTEM_PROMPT.contains("Never wait with shell `sleep` loops"));
+        assert!(
+            CODING_SYSTEM_PROMPT
+                .contains("Only wait (`wait_agent`, `await_watchers`) when nothing else")
+        );
         assert!(CODING_SYSTEM_PROMPT.contains("`mcp__borg_agent__spawn_agent`"));
         assert!(CODING_SYSTEM_PROMPT.contains("put it first"));
         assert!(CODING_SYSTEM_PROMPT.contains("one- or two-word lowercase summary"));
