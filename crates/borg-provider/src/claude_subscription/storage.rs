@@ -178,7 +178,7 @@ impl AuthAuthority {
         let paths = [self.config_dir.join(".storage-write.lock")];
         loop {
             if let Some(lock) = RefreshLock::try_acquire(&paths)
-                .map_err(|_| anyhow::anyhow!("cannot acquire Claude storage write lock"))?
+                .map_err(|error| lock_error("storage write", &paths, error))?
             {
                 return Ok(lock);
             }
@@ -208,9 +208,18 @@ impl AuthAuthority {
             directory.join(".oauth_refresh.lock"),
             PathBuf::from(format!("{}.lock", directory.display())),
         ];
-        RefreshLock::try_acquire(&paths)
-            .map_err(|_| anyhow::anyhow!("cannot acquire Claude refresh lock"))
+        RefreshLock::try_acquire(&paths).map_err(|error| lock_error("refresh", &paths, error))
     }
+}
+
+fn lock_error(kind: &str, paths: &[PathBuf], error: std::io::Error) -> anyhow::Error {
+    let paths = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::warn!(%error, paths, "cannot acquire Claude {kind} lock");
+    anyhow::anyhow!("cannot acquire Claude {kind} lock ({paths}): {error}")
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {
@@ -249,6 +258,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     temporary
         .persist(path)
         .map_err(|_| anyhow::anyhow!("replace Claude credential file"))?;
+    // Windows has no directory fsync; std cannot even open a directory there.
+    #[cfg(unix)]
     fs::File::open(directory)?
         .sync_all()
         .context("sync Claude credential directory")?;
@@ -259,8 +270,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 // Holders refresh the directory mtime every 5s; like native, a lock left
 // unrefreshed for 60s belongs to a dead process and is reclaimed.
 const STALE: Duration = Duration::from_secs(60);
+// Only an identity snapshot is kept, never an open handle: Windows cannot remove
+// an open directory, so a held handle would wedge the next acquisition.
 pub(super) struct RefreshLock {
-    entries: Vec<(PathBuf, fs::File)>,
+    entries: Vec<(PathBuf, fs::Metadata)>,
     heartbeat: tokio::task::JoinHandle<()>,
 }
 impl RefreshLock {
@@ -301,8 +314,8 @@ impl RefreshLock {
                 }
                 return Err(error);
             }
-            match fs::File::open(path) {
-                Ok(file) => entries.push((path.clone(), file)),
+            match fs::symlink_metadata(path) {
+                Ok(held) => entries.push((path.clone(), held)),
                 Err(error) => {
                     let _ = fs::remove_dir(path);
                     for (path, _) in &entries {
@@ -312,21 +325,22 @@ impl RefreshLock {
                 }
             }
         }
-        let heartbeat_entries: Vec<_> = entries
-            .iter()
-            .map(|(path, file)| Ok((path.clone(), file.try_clone()?)))
-            .collect::<std::io::Result<_>>()?;
+        let heartbeat_entries = entries.clone();
         let heartbeat = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             loop {
                 interval.tick().await;
-                for (path, file) in &heartbeat_entries {
-                    if !same_directory(path, file) {
+                for (path, held) in &heartbeat_entries {
+                    let Ok(file) = open_directory(path) else {
                         return;
-                    }
-                    if file
-                        .set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
-                        .is_err()
+                    };
+                    if !same_directory(path, held)
+                        || !file
+                            .metadata()
+                            .is_ok_and(|opened| same_identity(&opened, held))
+                        || file
+                            .set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
+                            .is_err()
                     {
                         return;
                     }
@@ -341,7 +355,7 @@ impl RefreshLock {
                 && self
                     .entries
                     .iter()
-                    .all(|(path, file)| same_directory(path, file)),
+                    .all(|(path, held)| same_directory(path, held)),
             "Claude refresh lock compromised; credentials kept"
         );
         Ok(())
@@ -350,23 +364,37 @@ impl RefreshLock {
 impl Drop for RefreshLock {
     fn drop(&mut self) {
         self.heartbeat.abort();
-        for (path, file) in &self.entries {
-            if same_directory(path, file) {
+        for (path, held) in &self.entries {
+            if same_directory(path, held) {
                 let _ = fs::remove_dir(path);
             }
         }
     }
 }
-fn same_directory(path: &Path, file: &fs::File) -> bool {
-    let Ok(current) = fs::symlink_metadata(path) else {
-        return false;
-    };
-    let Ok(held) = file.metadata() else {
-        return false;
-    };
-    if !current.is_dir() || current.file_type().is_symlink() {
-        return false;
+/// Directory handle able to update the heartbeat mtime. Windows only opens
+/// directories with backup semantics and needs write-attributes access.
+pub(super) fn open_directory(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    #[cfg(not(windows))]
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
+        };
+        options
+            .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
     }
+    options.open(path)
+}
+fn same_directory(path: &Path, held: &fs::Metadata) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|current| {
+        current.is_dir() && !current.file_type().is_symlink() && same_identity(&current, held)
+    })
+}
+fn same_identity(current: &fs::Metadata, held: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

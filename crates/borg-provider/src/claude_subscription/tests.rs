@@ -253,7 +253,7 @@ async fn refresh_lock_waits_for_live_holder_and_reclaims_dead_one() {
     drop(held);
     let dead = directory.path().join(".oauth_refresh.lock");
     std::fs::create_dir(&dead).unwrap();
-    std::fs::File::open(&dead)
+    super::storage::open_directory(&dead)
         .unwrap()
         .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
         .unwrap();
