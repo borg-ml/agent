@@ -11461,7 +11461,10 @@ async fn usage_summary(
 fn key_billed_lane(provider: CodingProvider) -> bool {
     matches!(
         provider,
-        CodingProvider::OpenCode | CodingProvider::Glm | CodingProvider::Kimi | CodingProvider::Qwen
+        CodingProvider::OpenCode
+            | CodingProvider::Glm
+            | CodingProvider::Kimi
+            | CodingProvider::Qwen
     )
 }
 

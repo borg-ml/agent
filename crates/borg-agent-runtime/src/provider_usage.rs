@@ -798,10 +798,7 @@ mod tests {
             "the allowance is per subscription, not per model"
         );
 
-        for exhausted_window in [
-            window("Monthly", 100, false),
-            window("Rolling", 38, true),
-        ] {
+        for exhausted_window in [window("Monthly", 100, false), window("Rolling", 38, true)] {
             let mut capability = subscription_capability(CodingProvider::OpenCode);
             capability.authenticated = true;
             capability.can_spawn = true;
