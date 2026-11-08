@@ -12,7 +12,7 @@ mod subscriptions;
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-pub(crate) use subscriptions::{AccountView, LaneView};
+pub(crate) use subscriptions::{AccountView, LaneView, SignIn};
 
 const MAX_WIDTH: u16 = 140;
 /// Taller windows grow the panel for the rows they hold, up to this.
@@ -2288,6 +2288,7 @@ mod tests {
                 lane: *lane,
                 strategy: Strategy::Manual,
                 accounts: Vec::new(),
+                sign_in: None,
             })
             .collect();
         let mut screen = SettingsScreen::default();

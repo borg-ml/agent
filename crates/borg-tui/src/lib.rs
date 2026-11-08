@@ -1977,6 +1977,8 @@ pub struct BorgTerminal {
     /// Model the user picked from a provider that still needs credentials;
     /// applied once the auth picker resolves.
     pending_auth_model: Option<(CodingProvider, String)>,
+    /// The subscription sign-in the host is running, shown on its lane.
+    subscription_sign_in: Option<(borg_provider::subscriptions::Lane, crate::settings::SignIn)>,
     /// True once the enable-dictation flow has completed (mirrors the durable
     /// preference); gates whether the dictation key records or opens the flow.
     dictation_enabled: bool,
@@ -3510,6 +3512,7 @@ impl BorgTerminal {
             history_page_loading: false,
             picker: None,
             pending_auth_model: None,
+            subscription_sign_in: None,
             dictation_enabled: false,
             dictation_enable_flow: false,
             dictation_model: None,
@@ -6831,6 +6834,65 @@ impl BorgTerminal {
         });
     }
 
+    /// Open the fullscreen settings screen at a subscription lane.
+    pub fn open_subscription_settings(&mut self, lane: borg_provider::subscriptions::Lane) {
+        self.picker = None;
+        self.pending_auth_model = None;
+        let values = self.settings_values();
+        let mut settings = SettingsScreen::default();
+        settings.open_subscription_lane(lane, &values);
+        self.settings = Some(settings);
+    }
+
+    /// A subscription sign-in started on the host. It is shown on the lane's
+    /// Subscriptions section while the rest of Borg stays usable.
+    pub fn begin_subscription_sign_in(&mut self, lane: borg_provider::subscriptions::Lane) {
+        self.subscription_sign_in = Some((
+            lane,
+            crate::settings::SignIn {
+                status: "Starting sign-in…".to_string(),
+                url: None,
+            },
+        ));
+        if self.settings.is_none() {
+            self.open_subscription_settings(lane);
+        }
+    }
+
+    /// The running sign-in reported a line. The first sign-in link is opened
+    /// in the browser and kept in the transcript, where it can be copied on a
+    /// machine without one.
+    pub fn subscription_sign_in_output(&mut self, line: &str) -> Option<TerminalIoRequest> {
+        let line = line.trim();
+        let (lane, sign_in) = self.subscription_sign_in.as_mut()?;
+        if line.is_empty() {
+            return None;
+        }
+        sign_in.status = line.to_string();
+        if sign_in.url.is_some() {
+            return None;
+        }
+        let url = line
+            .split_whitespace()
+            .find(|word| word.starts_with("https://"))?
+            .trim_end_matches(['.', ',', ')'])
+            .to_string();
+        sign_in.url = Some(url.clone());
+        let title = format!("{} sign-in", lane.label());
+        self.show_info(title, line.to_string());
+        Some(TerminalIoRequest::open_link(url))
+    }
+
+    /// The sign-in ended; `notice` says how.
+    pub fn finish_subscription_sign_in(&mut self, notice: String) {
+        self.subscription_sign_in = None;
+        self.set_notice(notice);
+    }
+
+    pub fn close_settings(&mut self) {
+        self.settings = None;
+    }
+
     /// Open the fullscreen settings screen.
     pub fn open_settings(&mut self) {
         self.picker = None;
@@ -6853,6 +6915,7 @@ impl BorgTerminal {
     /// the host reports (falling back to the store it shares with us).
     fn subscription_lanes(
         capabilities: &[borg_remote::ProviderCapability],
+        sign_in: Option<&(borg_provider::subscriptions::Lane, crate::settings::SignIn)>,
     ) -> Vec<crate::settings::LaneView> {
         use borg_provider::subscriptions::{Lane, Strategy};
         use borg_remote::AccountStrategy;
@@ -6899,6 +6962,9 @@ impl BorgTerminal {
                     lane: *lane,
                     strategy,
                     accounts,
+                    sign_in: sign_in
+                        .filter(|(signing, _)| signing == lane)
+                        .map(|(_, sign_in)| sign_in.clone()),
                 }
             })
             .collect()
@@ -6964,7 +7030,10 @@ impl BorgTerminal {
             title_model: self.title_model.label(),
             configured_models: self.configured_model_entries.clone(),
             custom_providers: self.custom_providers.clone(),
-            subscriptions: Self::subscription_lanes(&self.transcript.provider_capabilities),
+            subscriptions: Self::subscription_lanes(
+                &self.transcript.provider_capabilities,
+                self.subscription_sign_in.as_ref(),
+            ),
             pinned_models: self.pinned_models.clone(),
             fallback_chain: self.fallback_chain.clone(),
             fallback_editable: self.fallback_editable,
@@ -9556,18 +9625,12 @@ impl BorgTerminal {
                 model => UiAction::SetModel(model.to_string()),
             },
             PickerKind::ProviderAuth => {
-                if picker.selected_value() == "manage-opencode-logins" {
-                    self.pending_auth_model = None;
-                    let values = self.settings_values();
-                    let mut settings = SettingsScreen::default();
-                    settings.open_subscription_lane(
-                        borg_provider::subscriptions::Lane::OpenCode,
-                        &values,
-                    );
-                    self.settings = Some(settings);
+                let selected = picker.selected_value();
+                if selected == "manage-opencode-logins" {
+                    self.open_subscription_settings(borg_provider::subscriptions::Lane::OpenCode);
                     return Ok(UiAction::None);
                 }
-                let choice = match picker.selected_value().as_str() {
+                let choice = match selected.as_str() {
                     "subscription" => Some(ProviderAuthChoice::Subscription),
                     "api-key" => Some(ProviderAuthChoice::ApiKey),
                     "reconnect-subscription" => Some(ProviderAuthChoice::ReconnectSubscription),

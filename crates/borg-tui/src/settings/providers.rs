@@ -599,6 +599,8 @@ mod terminal_tests {
             scroll_repetitions: 1,
         };
         let key = |code| input(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        // Agent, then Helper models, then Providers.
+        terminal.handle_event(key(KeyCode::Tab)).unwrap();
         terminal.handle_event(key(KeyCode::Tab)).unwrap();
         terminal.handle_event(key(KeyCode::Enter)).unwrap();
         // Select the ID field after the back button, enter a draft, then leave it.

@@ -11,6 +11,16 @@ pub(crate) struct LaneView {
     pub(crate) lane: Lane,
     pub(crate) strategy: Strategy,
     pub(crate) accounts: Vec<AccountView>,
+    /// A sign-in running for this lane, drawn in place of its `Add login` row.
+    pub(crate) sign_in: Option<SignIn>,
+}
+
+/// A browser or device sign-in the host is waiting on.
+#[derive(Clone, Debug)]
+pub(crate) struct SignIn {
+    /// The provider's latest instruction, such as the device code to enter.
+    pub(crate) status: String,
+    pub(crate) url: Option<String>,
 }
 
 /// One login on a lane.
@@ -157,7 +167,7 @@ pub(crate) fn list_rows(lanes: &[LaneView], editor: &AccountEditor) -> Vec<Setti
         );
         rows.push(row(
             Id::SubscriptionStrategy(lane_position),
-            "Switching",
+            lane.label(),
             switching,
             SettingControl::Choice {
                 options: Strategy::ALL
@@ -178,7 +188,7 @@ pub(crate) fn list_rows(lanes: &[LaneView], editor: &AccountEditor) -> Vec<Setti
             };
             rows.push(row(
                 Id::SubscriptionAccount(lane_position, account_position),
-                "Login",
+                "  Login",
                 format!(
                     "{} · {}{} · {state}",
                     lane.label(),
@@ -192,7 +202,7 @@ pub(crate) fn list_rows(lanes: &[LaneView], editor: &AccountEditor) -> Vec<Setti
         if removals && let Some(active) = view.accounts.iter().find(|account| account.active) {
             rows.push(row(
                 Id::SubscriptionRemove(lane_position),
-                "Remove login",
+                "  Remove login",
                 format!(
                     "Disconnect the {} login named {} from this machine. Another connected login takes over.",
                     lane.label(),
@@ -203,7 +213,7 @@ pub(crate) fn list_rows(lanes: &[LaneView], editor: &AccountEditor) -> Vec<Setti
         }
         rows.push(row(
             Id::SubscriptionName(lane_position),
-            "New login",
+            "  New login",
             format!(
                 "Name for an additional {} subscription: 1-40 letters, digits, '-' or '_'.",
                 lane.label()
@@ -213,7 +223,7 @@ pub(crate) fn list_rows(lanes: &[LaneView], editor: &AccountEditor) -> Vec<Setti
         if lane.key_lane().is_some() {
             rows.push(row(
                 Id::SubscriptionKey(lane_position),
-                "New login key",
+                "  New login key",
                 format!(
                     "The {} key for that login. {}It is kept in Borg's credential store, never in a session or a journal.",
                     lane.label(),
@@ -226,12 +236,29 @@ pub(crate) fn list_rows(lanes: &[LaneView], editor: &AccountEditor) -> Vec<Setti
                 }),
             ));
         }
+        if let Some(sign_in) = &view.sign_in {
+            rows.push(row(
+                Id::SubscriptionConnect(lane_position),
+                "  Signing in",
+                format!(
+                    "{} · {} · Borg keeps working while it waits, and the current login keeps working until the new one succeeds.",
+                    lane.label(),
+                    sign_in.status
+                ),
+                SettingControl::Action(if sign_in.url.is_some() {
+                    "Open sign-in page".to_string()
+                } else {
+                    "Starting…".to_string()
+                }),
+            ));
+            continue;
+        }
         rows.push(row(
             Id::SubscriptionConnect(lane_position),
-            "Add login",
+            "  Add login",
             match lane.auth_provider().is_some() {
                 true => format!(
-                    "Sign in to another {} subscription under the name above. The current login keeps working until the new one succeeds.",
+                    "Sign in to another {} subscription under the name above. Your browser opens; the current login keeps working until the new one succeeds.",
                     lane.label()
                 ),
                 false => format!(
@@ -306,6 +333,18 @@ pub(crate) fn action(
         }
         SettingId::SubscriptionConnect(lane_position) => {
             let view = view(lane_position)?;
+            if let Some(sign_in) = &view.sign_in {
+                return sign_in
+                    .url
+                    .clone()
+                    .map(|url| UiAction::TerminalIo(TerminalIoRequest::open_link(url)));
+            }
+            if let Some(busy) = lanes.iter().find(|view| view.sign_in.is_some()) {
+                return Some(UiAction::Notice(format!(
+                    "Finish the {} sign-in first.",
+                    busy.lane.label()
+                )));
+            }
             let name = editor.name(view.lane).trim();
             if name.is_empty() {
                 return Some(UiAction::Notice(format!(
@@ -378,6 +417,7 @@ mod tests {
                         detail: None,
                     },
                 ],
+                sign_in: None,
             },
             LaneView {
                 lane: Lane::OpenCode,
@@ -390,8 +430,37 @@ mod tests {
                         "this plan reports no quota; turns rotate between its logins".to_string(),
                     ),
                 }],
+                sign_in: None,
             },
         ]
+    }
+
+    // While a browser sign-in is pending, its lane offers the page again
+    // instead of a second sign-in, and no other lane can start one.
+    #[test]
+    fn a_pending_sign_in_reopens_its_page_and_blocks_another() {
+        let mut lanes = lanes();
+        lanes[0].sign_in = Some(SignIn {
+            status: "Open https://claude.ai/x to connect".to_string(),
+            url: Some("https://claude.ai/x".to_string()),
+        });
+        let mut editor = AccountEditor::default();
+        editor.names[lane_index(Lane::OpenCode)] = "work".to_string();
+        let claude = SettingId::SubscriptionConnect(lane_index(Lane::Claude));
+        let row = list_rows(&lanes, &editor)
+            .into_iter()
+            .find(|row| row.id == claude)
+            .unwrap();
+        assert!(row.description.contains("https://claude.ai/x"));
+        assert!(matches!(
+            action(claude, &lanes, &editor),
+            Some(UiAction::TerminalIo(_))
+        ));
+        let opencode = SettingId::SubscriptionConnect(lane_index(Lane::OpenCode));
+        assert!(matches!(
+            action(opencode, &lanes, &editor),
+            Some(UiAction::Notice(notice)) if notice.contains("Claude")
+        ));
     }
 
     // The page has to answer two questions per provider at a glance: which

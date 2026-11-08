@@ -23077,9 +23077,9 @@ async fn private_input_preserves_draft_but_never_saves_or_recalls_secret() {
     );
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "requires a PTY; run under script with a sized terminal"]
-fn opencode_login_management_stays_in_borg() {
+async fn opencode_login_management_stays_in_borg() {
     let directory = tempfile::tempdir().unwrap();
     let mut terminal = composer_test_terminal(&directory);
     terminal.open_provider_auth_picker(CodingProvider::OpenCode, "opencode-go/example".into());

@@ -3426,6 +3426,8 @@ async fn run_local_agent_session(
         None;
     let mut dictation_start_task: Option<DictationStartTask> = None;
     let mut usage_summary_task: Option<tokio::task::JoinHandle<String>> = None;
+    let mut subscription_login: Option<SubscriptionLogin> = None;
+    let mut subscription_login_output: Option<mpsc::UnboundedReceiver<String>> = None;
     let mut resume_lookup_task: Option<tokio::task::JoinHandle<ResumeLookupResult>> = None;
     let mut dictation_backend: Option<LocalDictationBackend> = None;
     sleep_inhibitor.set_turn_active(matches!(
@@ -3847,6 +3849,66 @@ async fn run_local_agent_session(
                     }
                 }
                 terminal_dirty = true;
+            }
+            Some(line) = async {
+                subscription_login_output
+                    .as_mut()
+                    .expect("subscription login output branch is guarded")
+                    .recv()
+                    .await
+            }, if subscription_login_output.is_some() => {
+                if let Some(terminal) = terminal.as_mut() {
+                    if let Some(request) = terminal.subscription_sign_in_output(&line)
+                        && !terminal_io_tx.send(request)
+                    {
+                        terminal.set_notice("Could not open the browser; use the link in the transcript.".to_string());
+                    }
+                    terminal_dirty = true;
+                }
+            }
+            result = async {
+                (&mut subscription_login
+                    .as_mut()
+                    .expect("subscription login branch is guarded")
+                    .task)
+                    .await
+            }, if subscription_login.is_some() => {
+                let login = subscription_login.take().expect("subscription login branch is guarded");
+                subscription_login_output = None;
+                let label = login.lane.label();
+                let outcome = result
+                    .map_err(anyhow::Error::from)
+                    .and_then(|outcome| outcome)
+                    .and_then(|()| match &login.account {
+                        Some(account) => Ok(format!("{label} login {account} connected and selected.")),
+                        None => select_subscription_billing(lane_provider(login.lane)),
+                    });
+                if outcome.is_ok() && login.account.is_none() {
+                    // Drop any retained native subscription process so the
+                    // next turn cannot use the old credential context.
+                    lifecycle_executor.stop_session(session_id).await?;
+                }
+                if let Some(terminal) = terminal.as_mut() {
+                    match &outcome {
+                        Ok(message) => terminal.finish_subscription_sign_in(message.clone()),
+                        Err(error) => terminal.finish_subscription_sign_in(format!(
+                            "{label} sign-in did not finish: {error:#}. The current login is unchanged."
+                        )),
+                    }
+                    if outcome.is_ok()
+                        && let Some(model) = login.model
+                    {
+                        let target = lane_provider(login.lane);
+                        let active = terminal.session_provider().unwrap_or(provider);
+                        terminal.close_settings();
+                        dispatch_ui_command(
+                            &ui_interaction_tx,
+                            model_selection_command(session_id, terminal.focused_child(), active, target, model.clone()),
+                        );
+                        terminal.open_effort_picker_for(Some(target), Some(&model));
+                    }
+                    terminal_dirty = true;
+                }
             }
             result = async {
                 usage_summary_task
@@ -6122,6 +6184,47 @@ async fn run_local_agent_session(
                                     continue;
                                 }
                             };
+                            let lane = provider_lane(target);
+                            if interactive
+                                && matches!(target, CodingProvider::Codex | CodingProvider::Claude)
+                                && matches!(
+                                    choice,
+                                    ProviderAuthChoice::Subscription
+                                        | ProviderAuthChoice::ReconnectSubscription
+                                )
+                                && let Some(lane) = lane
+                            {
+                                let terminal = terminal.as_mut().expect("terminal");
+                                if subscription_login.is_some() {
+                                    terminal.set_notice("Finish the sign-in that is already running first.".to_string());
+                                } else {
+                                    if target == CodingProvider::Codex {
+                                        keep_codex_api_key()?;
+                                    }
+                                    let (login, output) = SubscriptionLogin::start(lane, None, Some(model));
+                                    subscription_login = Some(login);
+                                    subscription_login_output = Some(output);
+                                    terminal.begin_subscription_sign_in(lane);
+                                }
+                                terminal_dirty = true;
+                                continue;
+                            }
+                            if interactive
+                                && matches!(
+                                    choice,
+                                    ProviderAuthChoice::ApiKey | ProviderAuthChoice::ReplaceApiKey
+                                )
+                                && let Some(lane) = lane.filter(|lane| lane.key_lane().is_some())
+                            {
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.open_subscription_settings(lane);
+                                terminal.set_notice(format!(
+                                    "Name the {} login and paste its key below, then choose Save login.",
+                                    lane.label()
+                                ));
+                                terminal_dirty = true;
+                                continue;
+                            }
                             if interactive {
                                 shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
                             }
@@ -6341,32 +6444,15 @@ async fn run_local_agent_session(
                             terminal_dirty = true;
                             continue;
                         }
-                        let provider = lane_provider(lane);
-                        let mut output = String::new();
-                        let outcome = borg_remote::login_provider_account_with_output(
-                            provider,
-                            &account,
-                            |line| {
-                                if output.len() < 8_000 {
-                                    output.push_str(line);
-                                    output.push('\n');
-                                }
-                            },
-                        )
-                        .await;
-                        let notice = match outcome {
-                            Ok(()) => {
-                                let latest = output.lines().last().unwrap_or_default();
-                                format!(
-                                    "{} login {account} connected and selected. {latest}",
-                                    lane.label()
-                                )
-                            }
-                            Err(error) => {
-                                format!("Could not connect {account} to {}: {error}", lane.label())
-                            }
-                        };
-                        terminal.as_mut().expect("terminal").set_notice(notice);
+                        let terminal = terminal.as_mut().expect("terminal");
+                        if subscription_login.is_some() {
+                            terminal.set_notice("Finish the sign-in that is already running first.".to_string());
+                        } else {
+                            let (login, output) = SubscriptionLogin::start(lane, Some(account), None);
+                                    subscription_login = Some(login);
+                                    subscription_login_output = Some(output);
+                            terminal.begin_subscription_sign_in(lane);
+                        }
                         terminal_dirty = true;
                     }
                     UiAction::SetModelFallback(chain) => {
@@ -9126,9 +9212,7 @@ pub(crate) async fn login_command(
         let provider: CodingProvider = provider
             .context("--account needs a provider: borg login claude --account NAME")?
             .into();
-        let lane = borg_provider::subscriptions::Lane::ALL
-            .into_iter()
-            .find(|lane| lane_provider(*lane) == provider)
+        let lane = provider_lane(provider)
             .with_context(|| format!("{} keeps no subscription logins", provider.label()))?;
         if lane.auth_provider().is_some() {
             borg_remote::login_provider_account_with_output(provider, &name, |line| {
@@ -9237,6 +9321,13 @@ pub(crate) async fn login_command(
         }
     }
     Ok(())
+}
+
+/// The subscription lane a provider bills against, if it keeps logins.
+fn provider_lane(provider: CodingProvider) -> Option<borg_provider::subscriptions::Lane> {
+    borg_provider::subscriptions::Lane::ALL
+        .into_iter()
+        .find(|lane| lane_provider(*lane) == provider)
 }
 
 /// The provider a subscription lane bills against.
@@ -9534,16 +9625,31 @@ async fn authenticate_provider(
         return Ok(format!("{} API key saved.", provider.label()));
     }
     if provider_auth_requires_terminal(provider, choice).await? {
-        if provider == CodingProvider::Codex
-            && credentials::stored_api_key(credentials::ApiKeyCredential::OpenAi).is_none()
-            && let Some(key) = credentials::codex_auth_json()
-                .and_then(|auth| auth["OPENAI_API_KEY"].as_str().map(str::to_string))
-            && !key.trim().is_empty()
-        {
-            credentials::store_api_key(credentials::ApiKeyCredential::OpenAi, &key)?;
+        if provider == CodingProvider::Codex {
+            keep_codex_api_key()?;
         }
         login_provider(provider).await?;
     }
+    select_subscription_billing(provider)
+}
+
+/// Keep an API key that only Codex's own login file holds before a ChatGPT
+/// sign-in replaces that login.
+fn keep_codex_api_key() -> Result<()> {
+    use borg_provider::credentials;
+    if credentials::stored_api_key(credentials::ApiKeyCredential::OpenAi).is_none()
+        && let Some(key) = credentials::codex_auth_json()
+            .and_then(|auth| auth["OPENAI_API_KEY"].as_str().map(str::to_string))
+        && !key.trim().is_empty()
+    {
+        credentials::store_api_key(credentials::ApiKeyCredential::OpenAi, &key)?;
+    }
+    Ok(())
+}
+
+/// Bill `provider` to its subscription login rather than a saved API key.
+fn select_subscription_billing(provider: CodingProvider) -> Result<String> {
+    use borg_provider::credentials::{self, OpenAiAuthMode};
     if provider == CodingProvider::Codex {
         credentials::set_openai_auth_mode(OpenAiAuthMode::Subscription)?;
         return Ok("ChatGPT subscription selected. Saved OpenAI API key kept.".to_string());
@@ -9553,6 +9659,49 @@ async fn authenticate_provider(
         return Ok("Claude subscription selected. Saved Anthropic API key kept.".to_string());
     }
     Ok(format!("Connected {}.", provider.label()))
+}
+
+/// A subscription sign-in running beside the TUI, so the screen stays live
+/// while the provider waits for the browser.
+struct SubscriptionLogin {
+    lane: borg_provider::subscriptions::Lane,
+    /// The login being added, or `None` to sign the current one in again.
+    account: Option<String>,
+    /// The model the user picked before being asked to sign in.
+    model: Option<String>,
+    task: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl SubscriptionLogin {
+    fn start(
+        lane: borg_provider::subscriptions::Lane,
+        account: Option<String>,
+        model: Option<String>,
+    ) -> (Self, mpsc::UnboundedReceiver<String>) {
+        let (output_tx, output) = mpsc::unbounded_channel();
+        let provider = lane_provider(lane);
+        let name = account.clone();
+        let task = tokio::spawn(async move {
+            let send = move |line: &str| {
+                let _ = output_tx.send(line.to_string());
+            };
+            match name {
+                Some(name) => {
+                    borg_remote::login_provider_account_with_output(provider, &name, send).await
+                }
+                None => borg_remote::login_provider_with_output(provider, send).await,
+            }
+        });
+        (
+            Self {
+                lane,
+                account,
+                model,
+                task,
+            },
+            output,
+        )
+    }
 }
 
 /// A key typed at a terminal (echo off) or piped in, trimmed. Never empty: a

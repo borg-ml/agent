@@ -5,11 +5,17 @@ Git comparison.
 
 ## Unreleased (since 0.20.9)
 
-- Managing OpenCode Go logins from the connection picker now opens the
-  Subscriptions settings at OpenCode immediately, instead of clearing the
-  screen and launching an external login. Add, select and balance logins in
-  place; other OpenCode provider connections remain available through
-  `borg login opencode`.
+- Connecting a subscription no longer blanks the screen. Signing in to
+  ChatGPT or Claude, from the model picker or from Subscriptions → Add login,
+  now runs while Borg stays on screen: the sign-in page opens in the browser,
+  the provider's Subscriptions section shows the code to enter and that Borg
+  is waiting, Enter opens the page again, and the link is kept in the
+  transcript for machines without a browser. A sign-in started from the model
+  picker finishes by switching to the model you chose. OpenCode Go and the GLM,
+  Kimi and Qwen coding plans are connected on the same page by naming the login
+  and pasting its key, instead of a hidden prompt on a cleared terminal; the
+  OpenCode picker's "Manage OpenCode Go logins…" opens it directly. Only Grok
+  and Muse, whose own login programs need the terminal, still take it over.
 
 - A burst of human input reaches the model as one request instead of one
   request per message. Messages typed as a single instruction arrive a moment
