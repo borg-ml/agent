@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.20.9)
+## Unreleased (since 0.20.10)
+
+## 0.20.10 (2026-11-08)
 
 - Borg starts its own PostgreSQL session cluster on Windows again instead of
   failing with "the process cannot access the file because it is being used
