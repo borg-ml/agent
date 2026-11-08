@@ -1855,7 +1855,7 @@ async fn wait_for_detached_session_host(
                         if repeated_ctrl_c(&mut last_ctrl_c, std::time::Instant::now()) {
                             return Ok(DetachedHostWait::Detach);
                         }
-                        tui.set_notice(&format!(
+                        tui.set_notice(format!(
                             "Host is recovering. Press {} again to detach without stopping the host.",
                             borg_ui::control_shortcut('c')
                         ));
