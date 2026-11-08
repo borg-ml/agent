@@ -14,9 +14,14 @@ use ratatui::Frame;
 use ratatui::buffer::Buffer;
 pub(crate) use subscriptions::{AccountView, LaneView};
 
-const MAX_WIDTH: u16 = 112;
-/// Taller windows centre the screen instead of opening a gap above the help.
-const MAX_HEIGHT: u16 = 34;
+const MAX_WIDTH: u16 = 140;
+/// Taller windows grow the panel for the rows they hold, up to this.
+const MAX_HEIGHT: u16 = 44;
+/// Below this the panel cannot show a section and its description at all.
+const MIN_HEIGHT: u16 = 12;
+/// Everything the panel draws around its body: the blank, title and rule at
+/// the top, then the description rule, its two lines, a blank and the keys.
+const BODY_CHROME: u16 = 10;
 const SIDEBAR_WIDTH: u16 = 18;
 /// Choices with more options than this open a list instead of a segment row.
 const MAX_SEGMENTS: usize = 4;
@@ -1529,14 +1534,30 @@ impl SettingsScreen {
         buffer.set_style(full, Style::default().bg(Color::Reset));
         let width = full.width.min(MAX_WIDTH);
         let margin = if width >= 48 { 2 } else { 0 };
-        let height = full.height.min(MAX_HEIGHT);
+        // The panel is as tall as the section it shows: the sidebar and the
+        // rows set the body height, and the description sits directly under
+        // them instead of being stranded at the bottom of an empty screen.
+        let visible = self.visible(rows);
+        let sidebar_need = if width >= 60 {
+            SettingsSection::ALL.len() as u16 * 2 - 1
+        } else {
+            0
+        };
+        let rows_need = if visible.is_empty() {
+            0
+        } else {
+            2 + (visible.len() as u16 * 2 - 1)
+        };
+        let height = (BODY_CHROME + sidebar_need.max(rows_need))
+            .min(MAX_HEIGHT)
+            .min(full.height);
         let area = Rect {
             x: full.x + (full.width - width) / 2 + margin,
             y: full.y + (full.height - height) / 2,
             width: width.saturating_sub(margin * 2),
             height,
         };
-        if area.width < 20 || area.height < 8 {
+        if area.width < 20 || area.height < MIN_HEIGHT {
             buffer.set_string(
                 area.x,
                 area.y,
@@ -1545,7 +1566,6 @@ impl SettingsScreen {
             );
             return;
         }
-        let visible = self.visible(rows);
         self.selected = self.selected.min(visible.len().saturating_sub(1));
 
         // Header: title, search, close.
@@ -1600,9 +1620,10 @@ impl SettingsScreen {
             Style::default().fg(Color::Rgb(54, 54, 58)),
         );
 
-        // Footer and description occupy the bottom.
+        // Footer and description occupy the bottom, with a blank row between the
+        // description and the keys so the two do not read as one block.
         let footer_y = area.bottom().saturating_sub(1);
-        let description_y = footer_y.saturating_sub(3);
+        let description_y = footer_y.saturating_sub(4);
         let body = Rect {
             x: area.x,
             y: rule_y + 2,
@@ -1770,16 +1791,7 @@ impl SettingsScreen {
                 list_anchor = Some((row, y));
             }
         }
-        if visible.len() > self.scroll + capacity {
-            put(
-                buffer,
-                list.right().saturating_sub(8),
-                list.bottom().saturating_sub(1),
-                list.right(),
-                "↓ more",
-                Style::default().fg(Color::DarkGray),
-            );
-        }
+        let more = visible.len() > self.scroll + capacity;
 
         // Description of the focused row.
         put(
@@ -1790,6 +1802,18 @@ impl SettingsScreen {
             &"─".repeat(content.width as usize),
             Style::default().fg(Color::Rgb(44, 44, 48)),
         );
+        // The overflow marker rides on the rule rather than inside the list,
+        // where it would land on the last row's own control.
+        if more {
+            put(
+                buffer,
+                content.right().saturating_sub(8),
+                description_y,
+                content.right(),
+                "↓ more",
+                Style::default().fg(Color::DarkGray),
+            );
+        }
         let (description, description_style) = if let Some(error) = &self.error {
             (error.clone(), Style::default().fg(Color::LightRed))
         } else if self.editing.is_some() {
@@ -1805,11 +1829,29 @@ impl SettingsScreen {
                 Style::default().fg(Color::Gray),
             )
         };
-        for (line, text) in wrap_display(&description, content.width.saturating_sub(2) as usize)
-            .into_iter()
-            .take(2)
-            .enumerate()
-        {
+        // The description gets every row between its rule and the keys. A line
+        // that does not fit is elided rather than cut mid-word, and the blank
+        // row above the keys is kept only when the text leaves room for it.
+        let mut lines: Vec<String> =
+            wrap_display(&description, content.width.saturating_sub(2) as usize)
+                .into_iter()
+                .collect();
+        let band = footer_y.saturating_sub(description_y + 1);
+        let room = if lines.len() as u16 > band.saturating_sub(1) {
+            band
+        } else {
+            band.saturating_sub(1)
+        } as usize;
+        let truncated = lines.len() > room;
+        for (line, text) in lines.drain(..).take(room).enumerate() {
+            let text = if truncated && line + 1 == room {
+                let keep = content.width.saturating_sub(3) as usize;
+                let mut short: String = text.chars().take(keep).collect();
+                short.push('…');
+                short
+            } else {
+                text
+            };
             put(
                 buffer,
                 content.x + 2,
@@ -2210,6 +2252,87 @@ mod tests {
             streaming_refresh_fps: 120,
             layout: Default::default(),
         }
+    }
+
+    /// The panel is sized to the section it shows, so the description follows
+    /// the rows it explains instead of being stranded at the bottom of an
+    /// empty screen, and the keys keep a row of air above them.
+    #[test]
+    fn settings_fit_their_section_and_keep_the_help_readable() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        fn screen(width: u16, height: u16) -> Vec<String> {
+            let mut rows = setting_rows(&values());
+            rows.extend(models::list_rows(&[], &[], true, ""));
+            let mut screen = SettingsScreen::default();
+            screen.set_section(
+                SettingsSection::ALL
+                    .iter()
+                    .position(|section| *section == SettingsSection::Models)
+                    .unwrap(),
+            );
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| screen.render(frame, &rows, None, "*"))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    let mut line = String::new();
+                    for x in 0..buffer.area.width {
+                        line.push_str(buffer[(x, y)].symbol());
+                    }
+                    line.trim_end().to_string()
+                })
+                .collect()
+        }
+
+        // A tall window no longer leaves the hint floating far below the rows.
+        let wide = screen(200, 56);
+        let hint = wide
+            .iter()
+            .position(|line| line.contains("No models pinned yet"))
+            .expect("the focused row's description is drawn");
+        let last_row = wide
+            .iter()
+            .position(|line| line.contains("System"))
+            .expect("the section list is drawn");
+        assert!(
+            hint - last_row <= 3,
+            "the description follows the rows it belongs to: {wide:#?}"
+        );
+        let keys = wide.iter().rposition(|line| !line.is_empty()).unwrap();
+        assert!(wide[keys].contains("Esc close"));
+        assert!(
+            wide[keys - 1].is_empty(),
+            "the keys keep a row of air: {wide:#?}"
+        );
+
+        // A narrow window fits the whole hint instead of cutting it mid-word.
+        let narrow = screen(80, 22);
+        assert!(
+            narrow.iter().any(|line| line.contains("machine.")),
+            "the hint is elided, never clipped: {narrow:#?}"
+        );
+        let keys = narrow.iter().rposition(|line| !line.is_empty()).unwrap();
+        assert!(narrow[keys].contains("Esc close"));
+
+        // The overflow marker never lands on a row's own control.
+        let short = screen(60, 14);
+        assert!(
+            short
+                .iter()
+                .all(|line| !(line.contains("Empty") && line.contains("more"))),
+            "the marker belongs on the rule: {short:#?}"
+        );
+
+        // Below the floor the screen says so rather than drawing a broken panel.
+        assert!(
+            screen(30, 9)
+                .iter()
+                .any(|line| line.contains("larger window"))
+        );
     }
 
     /// A choice the screen draws but cannot apply is a dead control: the

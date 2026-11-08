@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.20.8)
 
+- The settings screen is sized to the section it shows. A section with a few
+  rows no longer strands its description at the bottom of an empty panel: the
+  panel fits the rows, the description follows them, and the key hints keep a
+  row of air above them. A narrow terminal wraps the hint instead of cutting it
+  mid-word, and the "more rows" marker sits on the divider, where it cannot land
+  on a row's own value.
+
 ## 0.20.8 (2026-11-08)
 
 - `/usage` (and `/status`, and `borg accounts`) now show the OpenCode Go plan's
