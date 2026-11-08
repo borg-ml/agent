@@ -5,6 +5,17 @@ Git comparison.
 
 ## Unreleased (since 0.20.9)
 
+- A burst of human input reaches the model as one request instead of one
+  request per message. Messages typed as a single instruction arrive a moment
+  apart, and admitting the first one on its own made the model answer half of
+  the instruction before the rest of it was even sent, so the remainder was
+  answered as a separate request. Human input now waits for the rest of its
+  burst — at most a quarter of a second after the last message, and never more
+  than two seconds in total — and everything the burst holds is handed over
+  together as one user message, whether it arrives while a turn is running or
+  while the session is idle. Flushing pending input is unaffected: it still
+  sends immediately.
+
 ## 0.20.9 (2026-11-08)
 
 - Control shortcuts are spelled the way the platform writes them: macOS shows

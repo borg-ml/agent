@@ -5322,14 +5322,28 @@ async fn assert_interrupted_fifo(
         .await
     });
 
-    for (text, attachments, delivery) in [
-        ("first", Vec::new(), PromptDelivery::Steer),
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "first".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
+        .await
+        .expect("first turn starts");
+    // Queued behind the running turn: sent as a burst, which is one request,
+    // and the interrupt must still leave it to run.
+    for (text, attachments) in [
         (
             "second [Image 1]",
             vec![PathBuf::from("/tmp/queued-image.png")],
-            PromptDelivery::Queue,
         ),
-        ("third", Vec::new(), PromptDelivery::Queue),
+        ("third", Vec::new()),
     ] {
         command_tx
             .send(HostCommand::Prompt {
@@ -5338,14 +5352,11 @@ async fn assert_interrupted_fifo(
                 text: text.to_string(),
                 attachments,
                 output_schema: None,
-                delivery,
+                delivery: PromptDelivery::Queue,
             })
             .await
             .unwrap();
     }
-    tokio::time::timeout(EVENT_TIMEOUT, called.notified())
-        .await
-        .expect("first turn starts");
     command_tx
         .send(if flush {
             HostCommand::FlushPendingInput { session_id }
@@ -18851,6 +18862,148 @@ async fn human_mid_turn_steers_keep_human_priority_and_frame_only_human_batches(
         (format!("{human}\n\n{team}"), true),
         "a mixed batch retains human priority without framing team input as human"
     );
+}
+
+/// Takes one turn, records every steer the model is handed, and holds the turn
+/// open until the test releases it.
+struct BurstSteerExecutor {
+    turn_started: Arc<Notify>,
+    steers: Arc<Mutex<Vec<String>>>,
+    steer_seen: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for BurstSteerExecutor {
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        self.turn_started.notify_one();
+        let mut controls = controls.expect("active turn has controls");
+        loop {
+            tokio::select! {
+                _ = self.release.notified() => break,
+                control = controls.recv() => match control {
+                    Some(AgentTurnControl::Steer {
+                        text,
+                        admission,
+                        ack,
+                        ..
+                    }) => {
+                        assert!(admission.accept());
+                        self.steers.lock().unwrap().push(text);
+                        let _ = ack.send(Ok(()));
+                        self.steer_seen.notify_one();
+                    }
+                    Some(AgentTurnControl::Interrupt) | None => break,
+                    Some(_) => {}
+                },
+            }
+        }
+        Ok(AgentTurnResult {
+            provider_session_id: Some("provider-session".to_string()),
+            final_text: String::new(),
+        })
+    }
+}
+
+/// One instruction is routinely typed and sent as several messages a moment
+/// apart. They must reach the model in one user message; one request per
+/// message is what makes the model answer half of the instruction first and
+/// then answer the rest as a separate request.
+#[tokio::test]
+async fn a_human_burst_reaches_the_model_as_one_steer() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, _event_rx) = mpsc::channel(64);
+    let turn_started = Arc::new(Notify::new());
+    let steers = Arc::new(Mutex::new(Vec::new()));
+    let steer_seen = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let executor = Arc::new(BurstSteerExecutor {
+        turn_started: Arc::clone(&turn_started),
+        steers: Arc::clone(&steers),
+        steer_seen: Arc::clone(&steer_seen),
+        release: Arc::clone(&release),
+    });
+    let actor_store = Arc::clone(&store);
+    let actor = tokio::spawn(async move {
+        run_session_actor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: Some(false),
+                ultrafast: None,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+            actor_store,
+        )
+        .await
+    });
+
+    let prompt = |text: &str| HostCommand::Prompt {
+        session_id,
+        message_id: Uuid::new_v4(),
+        text: text.to_string(),
+        attachments: Vec::new(),
+        output_schema: None,
+        delivery: PromptDelivery::Steer,
+    };
+    command_tx.send(prompt("first")).await.unwrap();
+    tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
+        .await
+        .expect("first turn starts");
+
+    command_tx.send(prompt("check the logs")).await.unwrap();
+    command_tx
+        .send(prompt("and then restart it"))
+        .await
+        .unwrap();
+    tokio::time::timeout(EVENT_TIMEOUT, steer_seen.notified())
+        .await
+        .expect("the model is handed the burst");
+    // Long enough for a second steer to arrive if the burst had been split.
+    tokio::time::sleep(3 * super::HUMAN_INPUT_SETTLE).await;
+
+    let steers = steers.lock().unwrap().clone();
+    assert_eq!(
+        steers.len(),
+        1,
+        "a burst must not be handed to the model one message at a time: {steers:?}"
+    );
+    assert!(steers[0].contains("check the logs"), "{}", steers[0]);
+    assert!(steers[0].contains("and then restart it"), "{}", steers[0]);
+
+    release.notify_waiters();
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+    scratch.discard().await;
 }
 
 /// A turn that ends while a steer is still in flight must not strand the

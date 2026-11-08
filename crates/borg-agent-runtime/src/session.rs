@@ -3399,6 +3399,9 @@ async fn run_agent_session_store_kernel_inner(
     }
     work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
     let mut launch_plan_settled = false;
+    // Human input reaches the provider as one batch per burst, never one
+    // message at a time.
+    let mut human_settle = HumanInputSettle::default();
     'session: loop {
         refresh_session_executor(
             &mut executor,
@@ -3566,7 +3569,23 @@ async fn run_agent_session_store_kernel_inner(
         {
             continue;
         }
+        // While a person's burst is still arriving, the turn waits for the
+        // rest of it instead of starting on the first message alone.
+        let human_settle_at = human_settle.deadline(Instant::now());
+        // Settled human input is one request even when no turn boundary folded
+        // it: a burst that spans the start of a session has no boundary to
+        // reach, and admitting it one message at a time is what this prevents.
+        if human_settle_at.is_none()
+            && pending
+                .iter()
+                .filter(|prompt| prompt.actor == EventActor::User)
+                .count()
+                > 1
+        {
+            coalesce_queued_prompts(&mut pending);
+        }
         let next = if !usage_limit_retry_waiting
+            && human_settle_at.is_none()
             && let Some(prompt) = pop_next_pending_prompt(&mut pending, &held_by_stop)
         {
             Some(prompt)
@@ -3705,8 +3724,14 @@ async fn run_agent_session_store_kernel_inner(
                         && retry_not_before.is_none()
                         && dispatcher.parent_session_id().await.is_none(),
                 );
+                let settle_wake = human_settle_at.unwrap_or_else(Instant::now);
                 let command = tokio::select! {
                     biased;
+                    _ = tokio::time::sleep_until(settle_wake.into()), if human_settle_at.is_some() => {
+                        // The burst settled. Re-enter the loop so the whole of
+                        // it opens the next turn as one request.
+                        continue 'session;
+                    }
 
                                     result = async { title_result_rx.as_mut().expect("guarded title receiver").await }, if title_result_rx.is_some() => {
                                         title_result_rx = None;
@@ -4187,6 +4212,26 @@ async fn run_agent_session_store_kernel_inner(
                             }
                             continue;
                         }
+                        if actor == EventActor::User {
+                            // A person's message joins its burst instead of
+                            // opening a turn on its own: one instruction sent
+                            // as several messages must reach the model as one
+                            // request.
+                            queue_pending_prompt(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                &mut pending,
+                                &mut team_message_ids,
+                                message_id,
+                                text,
+                                attachments,
+                                output_schema,
+                            )
+                            .await?;
+                            human_settle.note(Instant::now());
+                            continue 'session;
+                        }
                         break Some(QueuedPrompt {
                             message_id,
                             text,
@@ -4321,6 +4366,9 @@ async fn run_agent_session_store_kernel_inner(
                         coalesce_queued_prompts(&mut pending);
                     }
                     Some(HostCommand::FlushPendingInput { .. }) => {
+                        // Flushing is the person asking for the pending input
+                        // now, so it is not held for the rest of a burst.
+                        human_settle = HumanInputSettle::default();
                         if let Some(interrupt) = &interrupt {
                             interrupt.settle();
                             commands.interrupt_delivered = false;
@@ -5919,8 +5967,27 @@ async fn run_agent_session_store_kernel_inner(
             dispatcher.set_input_pending(
                 !pending_steers.is_empty() || !steers_awaiting_consumption.is_empty(),
             );
+            let steer_settle_at = human_settle.open_deadline();
             tokio::select! {
                 biased;
+                _ = tokio::time::sleep_until(
+                    steer_settle_at.unwrap_or_else(Instant::now).into(),
+                ), if steer_settle_at.is_some() => {
+                    // The burst settled. Everything it holds goes to the model
+                    // as one user message, not one request per message.
+                    human_settle = HumanInputSettle::default();
+                    if !context_compaction_in_progress && !interrupted {
+                        steer_boundary_generation = steer_boundary_generation.saturating_add(1);
+                        retry_pending_steers(
+                            &control_tx,
+                            &steer_result_tx,
+                            &mut pending_steers,
+                            steer_boundary_generation,
+                            launch.capabilities.frames_steers_for(launch.provider, launch.model.as_deref()),
+                        )
+                        .await;
+                    }
+                }
                 result = async { title_result_rx.as_mut().expect("guarded title receiver").await }, if title_result_rx.is_some() => {
                     let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "title", provider_events.len() + provider_carry.len());
                     title_result_rx = None;
@@ -6939,7 +7006,16 @@ async fn run_agent_session_store_kernel_inner(
                                         |entry| (entry, MessageStatus::Queued, PromptDelivery::Steer),
                                     ));
                                 }
-                                let will_send = !context_compaction_in_progress && !has_pending;
+                                if prompt.actor == EventActor::User {
+                                    // Human input reaches the provider as one
+                                    // batch per burst, so it waits for the rest
+                                    // of it instead of being sent alone.
+                                    human_settle.note(Instant::now());
+                                }
+                                let will_send = !context_compaction_in_progress
+                                    && !has_pending
+                                    && (prompt.actor != EventActor::User
+                                        || human_settle.deadline(Instant::now()).is_none());
                                 admitted.push((
                                     prompt,
                                     SteerAdmission::pending(),
@@ -7081,6 +7157,9 @@ async fn run_agent_session_store_kernel_inner(
                             }
                         }
                         HostCommand::FlushPendingInput { .. } => {
+                            // Flushing is the person asking for the pending
+                            // input now, so it is not held for a burst.
+                            human_settle = HumanInputSettle::default();
                             let cancellation_requested = interrupt.as_ref().is_some_and(SessionInterrupt::requested);
                             if let Some(interrupt) = &interrupt {
                                 interrupt.settle();
@@ -11838,6 +11917,51 @@ async fn settle_non_waking_team_notifications(
     }
     *pending = retained;
     record_prompt_statuses(journal, events, session_id, statuses).await
+}
+
+/// How long a person's input waits for the rest of its burst before it becomes
+/// a provider request.
+///
+/// One instruction is routinely typed and sent as several messages a moment
+/// apart. Admitting the first on its own is what makes the model answer half
+/// of the instruction and then answer the rest as a second, separate request;
+/// waiting for the burst to settle puts all of it in one request.
+const HUMAN_INPUT_SETTLE: Duration = Duration::from_millis(250);
+
+/// Ceiling on that wait, so someone typing steadily is never postponed
+/// indefinitely.
+const HUMAN_INPUT_SETTLE_MAX: Duration = Duration::from_millis(2_000);
+
+/// The open settle window for the current burst of human input.
+#[derive(Default)]
+struct HumanInputSettle {
+    first: Option<Instant>,
+    last: Option<Instant>,
+}
+
+impl HumanInputSettle {
+    /// Records human input arriving now and opens or extends its burst.
+    fn note(&mut self, now: Instant) {
+        self.last = Some(now);
+        self.first.get_or_insert(now);
+    }
+
+    /// The instant the open burst settles, whether or not it already has.
+    fn open_deadline(&self) -> Option<Instant> {
+        let (first, last) = (self.first?, self.last?);
+        Some((last + HUMAN_INPUT_SETTLE).min(first + HUMAN_INPUT_SETTLE_MAX))
+    }
+
+    /// The instant the open burst may be handed to the provider, or `None`
+    /// once it has settled, which closes it.
+    fn deadline(&mut self, now: Instant) -> Option<Instant> {
+        let deadline = self.open_deadline()?;
+        if now < deadline {
+            return Some(deadline);
+        }
+        *self = Self::default();
+        None
+    }
 }
 
 fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
