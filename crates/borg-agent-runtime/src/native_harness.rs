@@ -805,6 +805,15 @@ impl NativeHarness {
                 "Inside commands, `$BORG_AGENT_CLI` is the exact Borg executable when `borg` is not on PATH. Keep intermediate data in files, pipes, or programs and return only useful results. ",
                 "To actually see an image, run `borg image FILE` on a PNG or JPEG; printing base64 to stdout does not work, because shell output is truncated and arrives as text."
         ));
+        // Claude shows the user only a server summary of text written before
+        // a tool call, which turns a direct answer into progress narration.
+        if turn.provider == crate::CodingProvider::Claude {
+            system_prompt.push_str(concat!(
+                "\n\nText you write before a tool call reaches the user only as a server-written summary of it, not your words, so a direct answer there gets lost. ",
+                "When the user asks you something while you are working (a question, an opinion, yes or no, a value), answer it with `SendUserMessage` before calling any other tool, or answer and end the turn. ",
+                "Routine progress updates can stay ordinary text."
+            ));
+        }
         // Stable for the session, so it stays in the cached prefix.
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&crate::capability_catalog::prompt_listing(

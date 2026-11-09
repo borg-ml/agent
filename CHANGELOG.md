@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.20.11)
 
+- Claude agents now answer questions you ask mid-task in their own words.
+  Claude shows only a server summary of text written before a tool call, so a
+  direct answer ("yes, it should be one mechanism, because…") reached you as a
+  progress note, and the agent seemed to ignore the question. Claude turns are
+  now told to send such answers through `SendUserMessage`, which you read
+  verbatim, or to answer and end the turn.
+
 ## 0.20.11 (2026-11-09)
 
 - Stopping a turn now stays stopped. Team reports and watcher output that
