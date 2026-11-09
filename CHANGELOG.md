@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.20.10)
 
+- Resuming a session that has directed many workers is fast again. Restoring
+  the team roster read every event the session ever wrote (about 35 seconds
+  cold for a 630k-event director with 137 workers); it now reads only the
+  rows it needs (under 0.1 seconds). Borg also builds the supporting index in
+  the background without blocking other sessions, and lets PostgreSQL
+  autovacuum the append-only journal, which it previously never did.
 - Sessions that direct many workers no longer compact every few minutes on a
   1M-token window. The per-worker prompt-cache list (about 10k tokens with a
   hundred workers) was re-appended to the conversation on every model request

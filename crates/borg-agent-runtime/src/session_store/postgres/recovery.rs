@@ -97,21 +97,35 @@ fn recovery_scan_predicate(parts: RecoveryParts, alias: &str) -> String {
 /// any child's current state reached the journal and the Team panel. A row
 /// stored in the opaque body tier is skipped here, which only moves the cursor
 /// back to an older mirrored event.
+///
+/// The children are enumerated by skipping through the subagent index one
+/// child at a time rather than grouping every activity row: a director with
+/// hundreds of thousands of activity rows reads a few hundred index entries
+/// instead of all of them on every resume.
 const LATEST_SUBAGENT_ROWS: &str = "e.sequence in ( \
-     select kept.sequence from ( \
-       select subagent_session_id, max(sequence) as latest from session_events \
-       where session_id = $1 and event_kind = 'subagent_activity' \
-       group by subagent_session_id \
-     ) child cross join lateral ( \
-       select child.latest as sequence \
-       union all ( \
-         select sequence from session_events \
-         where session_id = $1 and event_kind = 'subagent_activity' \
-           and subagent_session_id = child.subagent_session_id \
-           and jsonb_typeof(event_json -> 'kind' -> 'event') = 'object' \
-         order by sequence desc limit 1 \
-       ) \
-     ) kept \
+     with recursive child(id) as ( \
+       (select subagent_session_id from session_events \
+        where session_id = $1 and event_kind = 'subagent_activity' \
+        order by subagent_session_id limit 1) \
+       union all \
+       select (select s.subagent_session_id from session_events s \
+               where s.session_id = $1 and s.event_kind = 'subagent_activity' \
+                 and s.subagent_session_id > child.id \
+               order by s.subagent_session_id limit 1) \
+       from child where child.id is not null \
+     ) \
+     select kept.sequence from child cross join lateral ( \
+       (select sequence from session_events \
+        where session_id = $1 and event_kind = 'subagent_activity' \
+          and subagent_session_id = child.id \
+        order by sequence desc limit 1) \
+       union all \
+       (select sequence from session_events \
+        where session_id = $1 and event_kind = 'subagent_activity' \
+          and subagent_session_id = child.id \
+          and jsonb_typeof(event_json -> 'kind' -> 'event') = 'object' \
+        order by sequence desc limit 1) \
+     ) kept where child.id is not null \
    )";
 
 impl PostgresSessionStore {
@@ -325,11 +339,14 @@ impl PostgresSessionStore {
 
         if parts.subagents {
             let sql = format!(
-                "select e.event_json, e.event_body, e.dict_id from session_events e \
+                "select e.sequence, e.event_json, e.event_body, e.dict_id from session_events e \
                  where e.session_id = $1 and e.sequence < $2 \
-                   and ((e.event_kind = 'subagent_activity' and {LATEST_SUBAGENT_ROWS}) \
-                     or e.event_kind in ('agent_message_received', 'team_director_changed')) \
-                 order by e.sequence"
+                   and e.event_kind = 'subagent_activity' and {LATEST_SUBAGENT_ROWS} \
+                 union all \
+                 select e.sequence, e.event_json, e.event_body, e.dict_id from session_events e \
+                 where e.session_id = $1 and e.sequence < $2 \
+                   and e.event_kind in ('agent_message_received', 'team_director_changed') \
+                 order by 1"
             );
             let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(session_id)
