@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.20.10)
 
+- `~/.borg/logs/borg.log` no longer grows without bound: a starting Borg moves
+  a log over 256 MB to `borg.log.1`. Unknown-key warnings for `agent.toml`
+  and `editor.toml` are logged once rather than on every config reload
+  (several times a second), and `[scout]` and `[search]` in `agent.toml` are
+  no longer reported as unknown.
 - Remote-view sync no longer fails for every session created before tool and
   action rows were merged into operation rows. Their stored text kept the old
   field names, so restoring the projection failed with "missing checkpoint

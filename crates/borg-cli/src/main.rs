@@ -686,14 +686,20 @@ fn log_dir() -> std::path::PathBuf {
         .join("logs")
 }
 
+/// Above this size a starting process moves `borg.log` to `borg.log.1`
+/// (replacing the previous one), so the log directory stays bounded at about
+/// twice this. Processes already running keep appending to the moved file
+/// until they restart.
+const LOG_ROTATE_BYTES: u64 = 256 * 1024 * 1024;
+
 fn log_writer() -> BoxMakeWriter {
     let log_dir = log_dir();
-    let file = fs::create_dir_all(&log_dir).and_then(|()| {
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_dir.join("borg.log"))
-    });
+    let path = log_dir.join("borg.log");
+    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > LOG_ROTATE_BYTES) {
+        let _ = fs::rename(&path, log_dir.join("borg.log.1"));
+    }
+    let file = fs::create_dir_all(&log_dir)
+        .and_then(|()| OpenOptions::new().create(true).append(true).open(&path));
     match file {
         Ok(file) => BoxMakeWriter::new(Mutex::new(file)),
         Err(_) => BoxMakeWriter::new(std::io::sink),

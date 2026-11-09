@@ -570,10 +570,16 @@ impl AgentConfig {
             .with_context(|| format!("failed to read agent config {}", path.display()))?;
         // Keys from a newer Borg load with a warning instead of refusing to
         // start: a downgrade or side-by-side install must not strand the user.
-        let (config, unknown_keys) =
+        let (config, mut unknown_keys) =
             borg_ui::preferences::from_toml_str_lenient::<Self>(&source)
                 .with_context(|| format!("invalid agent config {}", path.display()))?;
-        if !unknown_keys.is_empty() {
+        // `[scout]` and `[search]` live in this file but are read live by the
+        // runtime's settings tools, not by this struct.
+        unknown_keys.retain(|key| {
+            let section = key.split('.').next().unwrap_or(key);
+            !matches!(section, "scout" | "search")
+        });
+        if borg_ui::preferences::unknown_keys_changed(&path, &unknown_keys) {
             tracing::warn!(
                 path = %path.display(),
                 keys = %unknown_keys.join(", "),

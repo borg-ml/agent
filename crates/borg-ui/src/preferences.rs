@@ -294,7 +294,7 @@ impl EditorPreferences {
         // downgrade or side-by-side install, so they are reported and kept.
         let (preferences, unknown_keys) = from_toml_str_lenient::<Self>(&source)
             .with_context(|| format!("invalid editor preferences {}", path.display()))?;
-        if !unknown_keys.is_empty() {
+        if unknown_keys_changed(path, &unknown_keys) {
             tracing::warn!(
                 path = %path.display(),
                 keys = %unknown_keys.join(", "),
@@ -467,6 +467,27 @@ where
 }
 
 /// Parse a TOML document leniently; see [`deserialize_lenient`].
+/// Whether `keys` differ from the unknown keys last reported for `path`.
+///
+/// Configuration is reloaded on every file-change poll, so warning on each
+/// load wrote the same line several times a second for as long as Borg ran.
+pub fn unknown_keys_changed(path: &Path, keys: &[String]) -> bool {
+    static REPORTED: std::sync::Mutex<Vec<(PathBuf, Vec<String>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut reported = REPORTED.lock().unwrap_or_else(|poison| poison.into_inner());
+    match reported.iter_mut().find(|(seen, _)| seen == path) {
+        Some((_, previous)) if previous.as_slice() == keys => false,
+        Some((_, previous)) => {
+            *previous = keys.to_vec();
+            !keys.is_empty()
+        }
+        None => {
+            reported.push((path.to_path_buf(), keys.to_vec()));
+            !keys.is_empty()
+        }
+    }
+}
+
 pub fn from_toml_str_lenient<T: DeserializeOwned>(
     source: &str,
 ) -> std::result::Result<(T, Vec<String>), toml::de::Error> {
