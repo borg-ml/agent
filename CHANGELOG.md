@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.20.11)
+## Unreleased (since 0.20.12)
+
+## 0.20.12 (2026-11-09)
 
 - The Team panel's Inactive list now puts the most recently active agent first.
   An agent's activity time was refreshed by interrupt bookkeeping (including
