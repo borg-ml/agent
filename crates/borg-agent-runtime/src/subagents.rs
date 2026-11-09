@@ -330,7 +330,7 @@ impl SubagentSnapshot {
         child_sequence: Option<u64>,
     ) {
         self.set_lifecycle(lifecycle, detail);
-        self.advance(child_sequence, Utc::now());
+        self.advance(child_sequence);
     }
 
     /// Accept state once, before updating any dependent projection. Equal
@@ -348,7 +348,10 @@ impl SubagentSnapshot {
         }
     }
 
-    fn advance(&mut self, child_sequence: Option<u64>, updated_at: DateTime<Utc>) {
+    /// Moves the revision cursor only. `updated_at` is the last real activity
+    /// of the child and the roster orders idle agents by it, so bookkeeping
+    /// (interrupt records, parking, usage refreshes) must not touch it.
+    fn advance(&mut self, child_sequence: Option<u64>) {
         let current = self.source.unwrap_or(SubagentSourceCursor {
             child_sequence: 0,
             revision: 0,
@@ -362,7 +365,6 @@ impl SubagentSnapshot {
                 .max(child_sequence.unwrap_or(0)),
         });
         self.set_lifecycle(self.lifecycle(), self.detail.clone());
-        self.updated_at = self.updated_at.max(updated_at);
     }
 
     /// Display text only; lifecycle never depends on this label for new data.
@@ -5803,10 +5805,7 @@ impl SubagentCoordinator {
             snapshot.set_lifecycle(snapshot.lifecycle(), snapshot.detail.clone());
             let changed = serde_json::to_value(&snapshot)? != serde_json::to_value(&mirrored)?;
             if changed {
-                snapshot.advance(
-                    snapshot.source.map(|source| source.child_sequence),
-                    snapshot.updated_at,
-                );
+                snapshot.advance(snapshot.source.map(|source| source.child_sequence));
             }
             {
                 let mut table = self.table.lock().await;
@@ -8636,10 +8635,10 @@ impl SubagentCoordinator {
             entry.snapshot.effort = config.effort;
             entry.snapshot.fast = config.fast;
             entry.snapshot.ultrafast = config.ultrafast;
-            entry.snapshot.advance(
-                Some(state.latest_sequence),
-                state.activity_at.unwrap_or(entry.snapshot.updated_at),
-            );
+            entry.snapshot.advance(Some(state.latest_sequence));
+            if let Some(activity_at) = state.activity_at {
+                entry.snapshot.updated_at = entry.snapshot.updated_at.max(activity_at);
+            }
             let agent = entry.snapshot.clone();
             drop(table);
             let _ = self.activity_tx.send(snapshot_activity(agent.clone()));
@@ -8757,7 +8756,7 @@ impl SubagentCoordinator {
             && let Some(entry) = table.entries.get_mut(&id)
         {
             entry.snapshot.interrupted_by = interrupter;
-            entry.snapshot.advance(None, Utc::now());
+            entry.snapshot.advance(None);
         }
     }
 
@@ -9596,7 +9595,7 @@ impl SubagentCoordinator {
                     let id = table.resolve(&args.target)?;
                     if let Some(entry) = table.entries.get_mut(&id) {
                         entry.snapshot.interrupted_by = Some(actor_session_id);
-                        entry.snapshot.advance(None, Utc::now());
+                        entry.snapshot.advance(None);
                     }
                 }
                 if let Err(error) = self
@@ -13634,14 +13633,10 @@ async fn update_from_session_event(
             {
                 // Only an authorized wake may leave a terminal worker state.
                 // Consume stale actor output without undoing that overlay.
-                entry
-                    .snapshot
-                    .advance(Some(event.sequence), event.created_at);
+                entry.snapshot.advance(Some(event.sequence));
             } else {
                 entry.snapshot.set_lifecycle(lifecycle, detail.clone());
-                entry
-                    .snapshot
-                    .advance(Some(event.sequence), event.created_at);
+                entry.snapshot.advance(Some(event.sequence));
             }
             // An idle child stays reusable for the life of the parent, so its
             // actor would otherwise retain the whole conversation between
@@ -13736,11 +13731,15 @@ async fn update_from_session_event(
         }
         _ => {}
     }
-    entry.snapshot.updated_at = entry.snapshot.updated_at.max(event.created_at);
+    // A status change is the child starting or finishing a turn; usage,
+    // title and capability refreshes are bookkeeping, not activity.
+    if event.kind.advances_activity_clock()
+        || matches!(event.kind, SessionEventKind::StatusChanged { .. })
+    {
+        entry.snapshot.updated_at = entry.snapshot.updated_at.max(event.created_at);
+    }
     if event.sequence > 0 && !matches!(event.kind, SessionEventKind::StatusChanged { .. }) {
-        entry
-            .snapshot
-            .advance(Some(event.sequence), event.created_at);
+        entry.snapshot.advance(Some(event.sequence));
     }
     Some(entry.snapshot.task_name.clone())
 }

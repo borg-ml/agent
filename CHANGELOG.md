@@ -5,6 +5,16 @@ Git comparison.
 
 ## Unreleased (since 0.20.11)
 
+- The Team panel's Inactive list now puts the most recently active agent first.
+  An agent's activity time was refreshed by interrupt bookkeeping (including
+  interrupting agents that were already idle), so an agent that had just
+  finished or been interrupted could sit below agents idle for hours. Only real
+  activity now moves it, and a stale metadata copy of an agent no longer rolls
+  it back.
+- `just release` passes `cargo deny check advisories` again: SQLx is bumped to a
+  revision that allows `libsqlite3-sys` 0.39, which bundles SQLite 3.54
+  (RUSTSEC-2026-0459).
+
 - Claude agents now answer questions you ask mid-task in their own words.
   Claude shows only a server summary of text written before a tool call, so a
   direct answer ("yes, it should be one mechanism, because…") reached you as a

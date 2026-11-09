@@ -94,7 +94,7 @@ fn canonical_lifecycle_and_cursor_survive_legacy_snapshot_decode() {
     assert_eq!(legacy.lifecycle(), SubagentLifecycle::WaitingOnWatchers);
     let mut newer = agent.clone();
     newer.lifecycle = Some(SubagentLifecycle::Running);
-    newer.advance(Some(9), agent.updated_at);
+    newer.advance(Some(9));
     assert_eq!(newer.updated_at, agent.updated_at);
     agent.updated_at = newer.updated_at + chrono::Duration::hours(1);
     assert!(
@@ -4164,6 +4164,62 @@ async fn an_idle_child_releases_retained_context_and_a_stop_still_stops() {
         table.lock().await.entries[&child_id].snapshot.status,
         SubagentStatus::Stopped
     );
+}
+
+#[tokio::test]
+async fn bookkeeping_events_do_not_move_a_childs_last_activity() {
+    // The roster lists idle agents by `updated_at`; a usage or context refresh
+    // arriving after the work finished must not reorder them.
+    let table = Arc::new(Mutex::new(SubagentTable {
+        root_session_id: Uuid::new_v4(),
+        max_children: 4,
+        entries: HashMap::new(),
+        task_names: HashMap::new(),
+        parking: None,
+        resume_after_restore: Vec::new(),
+    }));
+    let finished_at = Utc::now() - chrono::Duration::hours(3);
+    let child_id = {
+        let mut table = table.lock().await;
+        let child = table.reserve("worker", &launch()).unwrap();
+        let entry = table.entries.get_mut(&child.session_id).unwrap();
+        entry.snapshot.updated_at = finished_at;
+        child.session_id
+    };
+
+    update_from_session_event(
+        &table,
+        child_id,
+        &SessionEvent::new(
+            child_id,
+            1,
+            SessionEventKind::ContextWindowUpdated {
+                context_tokens: 10,
+                context_window_tokens: 100,
+            },
+        ),
+    )
+    .await;
+    assert_eq!(
+        table.lock().await.entries[&child_id].snapshot.updated_at,
+        finished_at
+    );
+
+    update_from_session_event(
+        &table,
+        child_id,
+        &SessionEvent::new(
+            child_id,
+            2,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                lifecycle: None,
+                detail: None,
+            },
+        ),
+    )
+    .await;
+    assert!(table.lock().await.entries[&child_id].snapshot.updated_at > finished_at);
 }
 
 #[tokio::test]

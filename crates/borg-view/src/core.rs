@@ -4573,11 +4573,18 @@ impl TranscriptCore {
     }
 
     pub fn effective_subagent_snapshot(&self, child_id: Uuid) -> Option<SubagentSnapshot> {
-        let child = self.subagent_snapshots.get(&child_id)?.clone();
-        self.child_meta_refs
+        let child = self.subagent_snapshots.get(&child_id)?;
+        let Some(mut meta) = self
+            .child_meta_refs
             .get(&child_id)
             .and_then(|reference| reference.snapshot.clone())
-            .or(Some(child))
+        else {
+            return Some(child.clone());
+        };
+        // The metadata copy was cloned from an older child snapshot; it must
+        // not roll the child's last activity back.
+        meta.updated_at = meta.updated_at.max(child.updated_at);
+        Some(meta)
     }
     pub fn subagent_summary(&self, child_id: Uuid) -> Option<crate::wire::ChildSummary> {
         let child = self.effective_subagent_snapshot(child_id)?;

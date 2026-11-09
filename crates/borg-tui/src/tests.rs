@@ -9041,6 +9041,66 @@ fn agent_roster_lists_running_children_then_all_inactive_states() {
 }
 
 #[test]
+fn agent_roster_inactive_order_follows_last_activity_through_stale_metadata() {
+    // Failure mode: the metadata copy of a child is cloned from an older
+    // snapshot and wins over the live one, so a child that just finished sinks
+    // below agents idle for hours.
+    let parent_id = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let snapshot = |name: &str, age_minutes| SubagentSnapshot {
+        lifecycle: None,
+        source: None,
+        desktop: false,
+        session_id: Uuid::new_v4(),
+        parent_session_id: parent_id,
+        task_name: format!("/root/{name}"),
+        status: SubagentStatus::Ready,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        fast: false,
+        ultrafast: false,
+        cwd: PathBuf::from("/workspace"),
+        created_at: now - chrono::Duration::days(1),
+        updated_at: now - chrono::Duration::minutes(age_minutes),
+        detail: None,
+        final_text: None,
+        usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
+    };
+    let mut transcript = Transcript::default();
+    let recent = snapshot("recent", 300);
+    let hours_idle = snapshot("hours_idle", 60);
+    transcript.upsert_subagent_snapshot(&recent);
+    transcript.upsert_subagent_snapshot(&hours_idle);
+    transcript
+        .apply_child_meta(
+            recent.session_id,
+            borg_view::wire::Cursor {
+                epoch: "child".into(),
+                revision: "1".into(),
+            },
+            &borg_view::wire::Meta {
+                status: Some(SessionStatus::Ready),
+                source_sequence: Some("10".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut finished = snapshot("recent", 1);
+    finished.session_id = recent.session_id;
+    finished.source = Some(borg_remote::SubagentSourceCursor {
+        child_sequence: 5,
+        revision: 5,
+    });
+    transcript.upsert_subagent_snapshot(&finished);
+
+    let rows = transcript.agent_roster_entries();
+    assert_eq!(rows[1].name, "recent");
+    assert_eq!(rows[2].name, "hours_idle");
+}
+
+#[test]
 fn agents_status_hover_underlines_only_the_label() {
     let spinner = agents_status_spinner_style(true);
     let label = agents_status_text_style(true);
