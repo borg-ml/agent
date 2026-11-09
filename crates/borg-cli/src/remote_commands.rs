@@ -2511,6 +2511,7 @@ async fn run_local_agent_session(
         }
     };
     let store: Arc<dyn SessionStore> = Arc::clone(resolved.session());
+    let state_started = std::time::Instant::now();
     let mut session_state = store.state(session_id).await?;
     let suppress_terminal_live_tail = interactive_store_open
         && matches!(
@@ -2527,6 +2528,7 @@ async fn run_local_agent_session(
     // snapshot too; otherwise every long session briefly (or permanently,
     // until the next provider event) advertises the misleading 100% headroom.
     let live_state_events = store.live_events_after(session_id, 0).await?;
+    let state_ms = state_started.elapsed().as_millis() as u64;
     for live in &live_state_events {
         if let SessionEventKind::ContextWindowUpdated {
             context_tokens,
@@ -2889,6 +2891,7 @@ async fn run_local_agent_session(
     };
     // Views need the complete roster before replay; headless hosts need it
     // for idle/upgrade safety. Include the fork's takeover roster too.
+    let roster_started = std::time::Instant::now();
     let team_snapshots =
         if resuming && ((can_prompt && !fallback_terminal) || args.session_host.is_some()) {
             let team = restored_team_history(store.as_ref(), session_id)
@@ -2898,6 +2901,7 @@ async fn run_local_agent_session(
         } else {
             tail_team_snapshots
         };
+    let roster_ms = roster_started.elapsed().as_millis() as u64;
     // The initial host prompt keeps its admission key across startup retries.
     let request_id = if args.session_host.is_some() {
         session_id
@@ -3278,8 +3282,10 @@ async fn run_local_agent_session(
         tracing::info!(
             %session_id,
             store_open_ms,
+            state_ms,
             provider_probe_ms,
             history_ms,
+            roster_ms,
             seed_ms,
             draw_ms,
             first_paint_ms = startup_started.elapsed().as_millis() as u64,
