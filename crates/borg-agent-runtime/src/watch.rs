@@ -23,7 +23,6 @@ pub(crate) fn action_tool_call_id() -> Option<String> {
     ACTION_TOOL_CALL_ID.try_with(Clone::clone).ok()
 }
 
-const MAX_WATCHES: usize = 4;
 const MAX_BACKGROUND_JOBS: usize = 64;
 
 /// How long a wait may hear nothing before the session takes it back.
@@ -637,14 +636,6 @@ impl Watches {
         let _start = self.starts.lock().await;
         ensure!(!self.cancel.is_cancelled(), "session watchers have stopped");
         let mut entries = self.entries.lock().await;
-        ensure!(
-            entries
-                .values()
-                .filter(|entry| !entry.runtime && entry.info.running)
-                .count()
-                < MAX_WATCHES,
-            "at most {MAX_WATCHES} watchers can run; stop one first"
-        );
         prune_completed_watches(&mut entries);
         if let Some(process) = attached {
             ensure!(
@@ -770,14 +761,6 @@ impl Watches {
         ensure!(!self.cancel.is_cancelled(), "session watchers have stopped");
         let subjects = AgentSubjects::new(args.agents, signal, args.aggregate);
         let mut entries = self.entries.lock().await;
-        ensure!(
-            entries
-                .values()
-                .filter(|entry| !entry.runtime && entry.info.running)
-                .count()
-                < MAX_WATCHES,
-            "at most {MAX_WATCHES} watchers can run; stop one first"
-        );
         prune_completed_watches(&mut entries);
         let info = WatchInfo {
             watch_id: Uuid::new_v4(),
@@ -1731,7 +1714,7 @@ mod tests {
         })
         .await
         .expect("exited shell retained a running watcher while its report queue was full");
-        for _ in 0..MAX_WATCHES {
+        for _ in 0..4 {
             watches
                 .start_agents(agent_args(
                     vec![Uuid::new_v4()],

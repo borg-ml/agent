@@ -14,6 +14,9 @@ Git comparison.
 - `just release` passes `cargo deny check advisories` again: SQLx is bumped to a
   revision that allows `libsqlite3-sys` 0.39, which bundles SQLite 3.54
   (RUSTSEC-2026-0459).
+- A session can run any number of watchers. Starting a fifth used to fail with
+  "at most 4 watchers can run; stop one first", which forced long test runs to
+  wait for a slot even when the machine had room.
 
 - Claude agents now answer questions you ask mid-task in their own words.
   Claude shows only a server summary of text written before a tool call, so a
