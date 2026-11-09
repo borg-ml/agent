@@ -1050,6 +1050,9 @@ impl NativeHarness {
         // reply, assistant text the person can see pays it, and a parked turn
         // that still owes one gets a single further response to write it.
         let mut reply_owed = turn.answers_human;
+        // What the user saw instead of a summarized reply, owed to the model
+        // with the round's first tool result.
+        let mut summary_note: Option<String> = None;
         let mut reply_round_spent = false;
         // The latest reply delivered through `SendUserMessage`.
         let mut sent_reply: Option<String> = None;
@@ -1603,8 +1606,10 @@ impl NativeHarness {
                 .await;
                 if summarized {
                     mark_summarized(&events, turn.provider, assistant_message_id).await;
+                    summary_note = Some(summary_note_for_model(narration));
+                } else {
+                    reply_owed = false;
                 }
-                reply_owed = false;
             }
             assistant_message_id = Uuid::new_v4();
             for reply in tool_calls.iter().filter_map(sent_user_message) {
@@ -1754,6 +1759,7 @@ impl NativeHarness {
                                 &tool_call.id,
                                 output,
                                 is_error,
+                                &mut summary_note,
                             )
                             .await?,
                         );
@@ -1778,6 +1784,7 @@ impl NativeHarness {
                                 &tool_call.id,
                                 &output,
                                 Vec::new(),
+                                &mut summary_note,
                             )
                             .await?,
                         );
@@ -1823,6 +1830,7 @@ impl NativeHarness {
                             &tool_call.id,
                             output,
                             is_error,
+                            &mut summary_note,
                         )
                         .await?,
                     );
@@ -5202,6 +5210,15 @@ fn skipped_tool_result() -> (String, bool) {
     )
 }
 
+/// The model replays its own words, so it believes the user read a reply that
+/// Claude's server only showed them as a summary.
+fn summary_note_for_model(summary: &str) -> String {
+    format!(
+        "[Borg: the user did not see the text you wrote before this tool call. Claude's server showed them only this summary of it: \"{}\". If it held anything they need to read exactly (an answer, options to choose from, values), send it with SendUserMessage.]",
+        summary.trim()
+    )
+}
+
 /// Tell the transcript a reply is Claude's summary of what it wrote.
 async fn mark_summarized(
     events: &mpsc::Sender<SessionEventKind>,
@@ -5260,10 +5277,16 @@ async fn record_native_tool_message(
     tool_call_id: &str,
     output: &str,
     attachments: Vec<ModelInputAttachment>,
+    note: &mut Option<String>,
 ) -> Result<u64> {
+    let mut content = bounded_tool_content(command_result_for_model(output));
+    if let Some(note) = note.take() {
+        content.push_str("\n\n");
+        content.push_str(&note);
+    }
     let message = ModelMessage::Tool {
         tool_call_id: tool_call_id.to_string(),
-        content: bounded_tool_content(command_result_for_model(output)),
+        content,
         attachments,
     };
     let tokens = estimated_message_tokens(&message);
@@ -5279,6 +5302,7 @@ async fn record_native_tool_result(
     tool_call_id: &str,
     output: String,
     is_error: bool,
+    note: &mut Option<String>,
 ) -> Result<u64> {
     let (output, attachments) = split_tool_result_attachments(output);
     let attachment_count = attachments.len();
@@ -5289,6 +5313,7 @@ async fn record_native_tool_result(
         tool_call_id,
         &output,
         attachments,
+        note,
     )
     .await?;
     let output = if attachment_count == 0 {
@@ -10175,6 +10200,7 @@ mod tests {
             "call-1",
             output,
             false,
+            &mut None,
         )
         .await
         .expect("record result");

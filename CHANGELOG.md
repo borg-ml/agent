@@ -19,12 +19,15 @@ Git comparison.
   wait for a slot even when the machine had room.
 
 - Claude agents no longer lose answers and options they write mid-turn.
-  Claude shows only a server summary of text written before a tool call, so a
-  list of options or a direct answer ("yes, it should be one mechanism,
-  because…") reached you as "tell me which of the four options you want" or a
-  progress note. Claude turns are now told to send anything you must read
-  exactly through `SendUserMessage`, which you read verbatim, whenever more
-  tool calls follow.
+  On roughly one reply in five between tool calls, Claude's server returns
+  only a summary of what the model wrote, while the model keeps its own words
+  and assumes you read them. Four display-curve options reached you as "tell
+  me which of the four options you want", and the agent then asked you to
+  pick "1, 2, 3 or 4". The agent is now told, with that round's tool result,
+  exactly what you saw, so it resends anything you need through
+  `SendUserMessage`. A summarized reply no longer counts as answering your
+  question, and Claude turns are told up front to send anything you must read
+  exactly through `SendUserMessage` when more tool calls follow.
 
 ## 0.20.11 (2026-11-09)
 
