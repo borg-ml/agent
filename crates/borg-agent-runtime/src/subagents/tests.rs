@@ -787,25 +787,7 @@ async fn live_subagent_count_tracks_lifecycle_and_descendant_scope() {
     assert!(dispatcher.subagent_count_prompt().await.starts_with(
         "Live subagent counts — direct children: running=0, starting=1, waiting=0, inactive=1; all descendants: running=1, starting=1, waiting=0, inactive=1."
     ));
-    {
-        let mut table = coordinator.table.lock().await;
-        let agent = &mut table.entries.get_mut(&grandchild).unwrap().snapshot;
-        agent.usage.prompt_cache = Some(crate::PromptCacheObservation {
-            at: Utc::now() - chrono::Duration::hours(2),
-            provider: agent.provider,
-            model: agent.model.clone().unwrap_or_else(|| "gpt-6.1-sol".into()),
-            effort: agent.effort.clone(),
-            retention: crate::PromptCacheRetention::Seconds(3600),
-            prompt_tokens: 100_000,
-            cached_input_tokens: 90_000,
-        });
-    }
     dispatcher.actor_session_id = child;
-    let prompt = dispatcher.subagent_count_prompt().await;
-    assert!(prompt.contains("possibly cold"));
-    assert!(prompt.contains("prior prompt=100000 tokens"));
-    assert!(!prompt.contains(&format!("session:{sibling}")));
-    assert!(!prompt.contains(&format!("session:{child}")));
     assert!(dispatcher.subagent_count_prompt().await.starts_with(
         "Live subagent counts — direct children: running=1, starting=0, waiting=0, inactive=0; all descendants: running=1, starting=0, waiting=0, inactive=0."
     ));

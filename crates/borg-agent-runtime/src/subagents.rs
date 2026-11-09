@@ -2230,8 +2230,6 @@ impl AgentToolDispatcher {
             .filter(|team| team.director().epoch > 0)
             .map(|team| format!("\n\n{}", team.role_prompt(self.actor_session_id)))
             .unwrap_or_default();
-        let mut caches = Vec::new();
-        let now = Utc::now();
         let mut direct = SubagentCounts::default();
         let mut descendants = SubagentCounts::default();
         if let Some(subagents) = &self.subagents {
@@ -2249,26 +2247,6 @@ impl AgentToolDispatcher {
                         } else {
                             agent.status
                         };
-                        let cache = agent.usage.prompt_cache.as_ref();
-                        let warmth =
-                            cache.map_or("unknown (no completed request telemetry)", |cache| {
-                                cache.status(
-                                    now,
-                                    agent.provider,
-                                    agent.model.as_deref(),
-                                    agent.effort.as_deref(),
-                                )
-                            });
-                        caches.push(format!(
-                            "- {} (session:{}; {:?}; {:?}/{}): {}; last request/refresh={}; prior prompt={} tokens (last cached={} tokens); context={} tokens.",
-                            agent.task_name, agent.session_id,
-                            if entry.dormant { SubagentLifecycle::Dormant } else { agent.lifecycle() },
-                            agent.provider, agent.model.as_deref().unwrap_or("default"), warmth,
-                            cache.map(|cache| cache.at.to_rfc3339()).unwrap_or_else(|| "unknown".into()),
-                            cache.map(|cache| cache.prompt_tokens.to_string()).unwrap_or_else(|| "unknown".into()),
-                            cache.map(|cache| cache.cached_input_tokens.to_string()).unwrap_or_else(|| "unknown".into()),
-                            agent.usage.context_tokens.map(|tokens| tokens.to_string()).unwrap_or_else(|| "unknown".into()),
-                        ));
                         descendants.add_snapshot(agent, status);
                         if agent.parent_session_id == self.actor_session_id {
                             direct.add_snapshot(agent, status);
@@ -2277,14 +2255,10 @@ impl AgentToolDispatcher {
                 }
             }
         }
-        caches.sort();
-        let cache_prompt = if caches.is_empty() {
-            String::new()
+        let cache_prompt = if descendants.inactive == 0 {
+            ""
         } else {
-            format!(
-                "\n\nLive subagent prompt-cache estimates (supersede earlier estimates; retention is not a hit guarantee):\n{}\nBefore waking an inactive worker, weigh its retained context against reprocessing its prior prompt. If it may be cold and that context is unnecessary, prefer spawn_agent with a concise brief for a new worker. A fresh worker also pays for its initial prompt; unknown is not cold. Do not interrupt active/watcher-backed work or change model/provider/billing just to chase cache savings.",
-                caches.join("\n")
-            )
+            "\n\nBefore waking an inactive worker, check its usage.prompt_cache in list_agents and weigh its retained context against reprocessing its prior prompt; if it may be cold and that context is unnecessary, prefer spawn_agent with a concise brief. Unknown is not cold. Do not interrupt active work or change model/provider/billing just to chase cache savings."
         };
         let goal = match self.goals.call(SessionGoalToolRequest::Get).await {
             Ok(response) => match response.goal {

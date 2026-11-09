@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.20.10)
 
+- Sessions that direct many workers no longer compact every few minutes on a
+  1M-token window. The per-worker prompt-cache list (about 10k tokens with a
+  hundred workers) was re-appended to the conversation on every model request
+  whenever any worker's timing changed; it is gone from the per-request status,
+  which now keeps only the counts and a pointer to `list_agents`, where each
+  worker's `usage.prompt_cache` is still reported.
 - The agent no longer parks on `wait_agent` or `await_watchers` while it still
   has work it could do; it waits only once nothing else is left.
 
