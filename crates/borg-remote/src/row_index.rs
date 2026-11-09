@@ -232,6 +232,39 @@ pub async fn persist_text(
     Ok(())
 }
 
+/// The field name a row's text is stored under.
+///
+/// Operation rows were separate tool and action rows; the checkpoint reader
+/// renames their fields, but text persisted earlier keeps the old name and is
+/// never rewritten unless the row changes. Without this, restoring any older
+/// projection fails with "missing checkpoint text" on every recovery pass.
+async fn stored_field<'a>(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: &str,
+    id: &str,
+    field: &'a str,
+) -> Result<&'a str> {
+    let legacy: &[&'static str] = match field {
+        "operation_input" => &["tool_input"],
+        "operation_output" => &["tool_output", "action_body"],
+        _ => return Ok(field),
+    };
+    for name in std::iter::once(field).chain(legacy.iter().copied()) {
+        let found: Option<i32> = sqlx::query_scalar(
+            "select 1 from remote_view_text_heads where scope=$1 and row_id=$2 and field=$3",
+        )
+        .bind(scope)
+        .bind(id)
+        .bind(name)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if found.is_some() {
+            return Ok(name);
+        }
+    }
+    Ok(field)
+}
+
 pub async fn resolve_text(
     pool: &sqlx::PgPool,
     scope: &str,
@@ -244,6 +277,7 @@ pub async fn resolve_text(
     sqlx::query("set transaction isolation level repeatable read read only")
         .execute(&mut *tx)
         .await?;
+    let field = stored_field(&mut tx, scope, id, field).await?;
     let head=sqlx::query("select revision,text_bytes,generation from remote_view_text_heads where scope=$1 and row_id=$2 and field=$3")
         .bind(scope).bind(id).bind(field).fetch_optional(&mut *tx).await?;
     if head.is_none() && bytes == 0 {
@@ -294,6 +328,7 @@ pub async fn field_page_at(
     sqlx::query("set transaction isolation level repeatable read read only")
         .execute(&mut *tx)
         .await?;
+    let field = stored_field(&mut tx, scope, id, field).await?;
     let total: Option<(i64, uuid::Uuid)> = if let Some(revision) = revision {
         sqlx::query_as("select text_bytes,generation from remote_view_text_versions where scope=$1 and row_id=$2 and field=$3 and revision=$4")
             .bind(scope).bind(id).bind(field).bind(revision).fetch_optional(&mut *tx).await?
@@ -322,6 +357,37 @@ pub async fn field_page_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Text persisted before operation rows replaced tool/action rows keeps its
+    // old field name; restoring such a projection must still find it.
+    #[tokio::test]
+    async fn operation_fields_resolve_text_stored_under_legacy_names() {
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        initialize_text_fields(store.pool()).await.unwrap();
+        let mut tx = store.pool().begin().await.unwrap();
+        persist_text(&mut tx, "scope", "row", "tool_input", "1", "in", false)
+            .await
+            .unwrap();
+        persist_text(&mut tx, "scope", "row", "action_body", "1", "out", false)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let pool = store.pool();
+        assert_eq!(
+            resolve_text(pool, "scope", "row", "operation_input", "1", 2).await.unwrap(),
+            "in"
+        );
+        assert_eq!(
+            resolve_text(pool, "scope", "row", "operation_output", "1", 3).await.unwrap(),
+            "out"
+        );
+        assert_eq!(
+            field_page(pool, "scope", "row", "operation_output", 0, 16).await.unwrap(),
+            (b"out".to_vec(), 3)
+        );
+        drop(store);
+        scratch.discard().await;
+    }
+
     // Readonly asset addresses outlive an append/correction. A compiler cannot
     // guard returning different bytes for an already captured public reference.
     #[tokio::test]

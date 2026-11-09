@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.20.10)
 
+- Remote-view sync no longer fails for every session created before tool and
+  action rows were merged into operation rows. Their stored text kept the old
+  field names, so restoring the projection failed with "missing checkpoint
+  text", and the host reprojected every session every few minutes. That flooded
+  `borg.log` (one error per session per pass) and bloated the view tables.
 - After an upgrade, an open session no longer sits on "stopped" while its
   window takes over from the exited host: the takeover was waiting on the
   same slow roster recovery fixed above, and the window now says it is
