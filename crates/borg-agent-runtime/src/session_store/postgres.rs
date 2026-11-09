@@ -536,17 +536,12 @@ impl PostgresSessionStore {
     }
 }
 
-
-/// Index and autovacuum maintenance too slow for the schema transaction.
-///
-/// `session_events` is append-only and large, so inside the startup schema
-/// transaction an index build would block every session's writes for minutes,
-/// and the default insert autovacuum threshold (20% of the table) is never
-/// reached, which leaves index-only scans hitting the heap for every row. Both
-/// are applied here instead, off the startup path: the setting once, the index
-/// with `create index concurrently`, under a session advisory lock so only one
-/// process builds (and only it may drop an invalid leftover of its own crash).
-/// Queries are correct without the index; it only makes them fast.
+/// Builds the team-roster index on a journal too large to index inside the
+/// startup schema transaction, where the build would block every session's
+/// writes for minutes. `create index concurrently` runs here instead, under a
+/// session advisory lock so only one process builds (and only it may drop an
+/// invalid leftover of its own crash). Queries are correct without the index;
+/// it only makes them fast. Small journals get it from the schema itself.
 async fn maintain_session_event_indexes(pool: PgPool) {
     const LOCK_KEY: i64 = 0x626f_7267_5f69_6478; // "borg_idx"
     let result: Result<()> = async {
@@ -559,19 +554,6 @@ async fn maintain_session_event_indexes(pool: PgPool) {
             .await?;
         if !locked {
             return Ok(());
-        }
-        let tuned: bool = sqlx::query_scalar(
-            "select coalesce('autovacuum_vacuum_insert_scale_factor=0.01' = any(reloptions), false) \
-             from pg_class where oid = 'session_events'::regclass",
-        )
-        .fetch_one(&mut conn)
-        .await?;
-        if !tuned {
-            sqlx::query(
-                "alter table session_events set (autovacuum_vacuum_insert_scale_factor = 0.01)",
-            )
-            .execute(&mut conn)
-            .await?;
         }
         let valid: Option<bool> = sqlx::query_scalar(
             "select i.indisvalid from pg_index i join pg_class c on c.oid = i.indexrelid \

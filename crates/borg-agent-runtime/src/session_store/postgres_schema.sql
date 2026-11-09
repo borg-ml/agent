@@ -184,6 +184,24 @@ create index if not exists idx_session_events_context_clear
     on session_events (session_id, sequence desc)
     where event_kind = 'context_cleared';
 
+-- Team-roster recovery reads these two rare kinds across a whole session.
+-- Built here only while the journal is small: inside this transaction a build
+-- over a large journal would block every session's writes, so a large
+-- existing journal gets it from `create index concurrently` after startup
+-- (maintain_session_event_indexes in postgres.rs).
+do $$
+begin
+    if (select reltuples from pg_class where oid = 'session_events'::regclass) < 1000000 then
+        create index if not exists idx_session_events_team
+            on session_events (session_id, sequence)
+            where event_kind in ('agent_message_received', 'team_director_changed');
+    end if;
+end $$;
+
+-- Append-only: the default insert threshold (20% of the table) is never
+-- reached on a large journal, so index-only scans would keep visiting the heap.
+alter table session_events set (autovacuum_vacuum_insert_scale_factor = 0.01);
+
 -- Ad-hoc containment queries over readable bodies: the capability agents use
 -- to query their own and each other's history directly in SQL. jsonb_path_ops
 -- is chosen over the default opclass because it is substantially smaller and
