@@ -373,15 +373,21 @@ mod tests {
         tx.commit().await.unwrap();
         let pool = store.pool();
         assert_eq!(
-            resolve_text(pool, "scope", "row", "operation_input", "1", 2).await.unwrap(),
+            resolve_text(pool, "scope", "row", "operation_input", "1", 2)
+                .await
+                .unwrap(),
             "in"
         );
         assert_eq!(
-            resolve_text(pool, "scope", "row", "operation_output", "1", 3).await.unwrap(),
+            resolve_text(pool, "scope", "row", "operation_output", "1", 3)
+                .await
+                .unwrap(),
             "out"
         );
         assert_eq!(
-            field_page(pool, "scope", "row", "operation_output", 0, 16).await.unwrap(),
+            field_page(pool, "scope", "row", "operation_output", 0, 16)
+                .await
+                .unwrap(),
             (b"out".to_vec(), 3)
         );
         drop(store);
