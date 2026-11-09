@@ -9094,6 +9094,12 @@ async fn run_local_agent_session(
     }
     if session_access.is_attached() && !user_requested_exit && resume_session.is_none() {
         tracing::info!(%session_id, "active session owner exited; acquiring ownership");
+        // The reused screen still shows the old owner's last status (often
+        // "stopped" after an upgrade) until the takeover reaches first paint.
+        if let Some(terminal) = terminal.as_mut() {
+            terminal.set_notice("The session's host exited; reopening it here…");
+            terminal.draw().ok();
+        }
         return Ok(Some((session_id, next_prompt, terminal)));
     }
     let next_terminal = if resume_session.is_some() && !user_requested_exit {

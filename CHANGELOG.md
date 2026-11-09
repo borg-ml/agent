@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.20.10)
 
+- After an upgrade, an open session no longer sits on "stopped" while its
+  window takes over from the exited host: the takeover was waiting on the
+  same slow roster recovery fixed above, and the window now says it is
+  reopening the session until the new host is ready.
 - Resuming a session that has directed many workers is fast again. Restoring
   the team roster read every event the session ever wrote (about 35 seconds
   cold for a 630k-event director with 137 workers); it now reads only the
