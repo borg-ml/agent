@@ -18,12 +18,13 @@ Git comparison.
   "at most 4 watchers can run; stop one first", which forced long test runs to
   wait for a slot even when the machine had room.
 
-- Claude agents now answer questions you ask mid-task in their own words.
+- Claude agents no longer lose answers and options they write mid-turn.
   Claude shows only a server summary of text written before a tool call, so a
-  direct answer ("yes, it should be one mechanism, because…") reached you as a
-  progress note, and the agent seemed to ignore the question. Claude turns are
-  now told to send such answers through `SendUserMessage`, which you read
-  verbatim, or to answer and end the turn.
+  list of options or a direct answer ("yes, it should be one mechanism,
+  because…") reached you as "tell me which of the four options you want" or a
+  progress note. Claude turns are now told to send anything you must read
+  exactly through `SendUserMessage`, which you read verbatim, whenever more
+  tool calls follow.
 
 ## 0.20.11 (2026-11-09)
 

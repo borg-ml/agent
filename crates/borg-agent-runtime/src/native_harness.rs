@@ -806,12 +806,12 @@ impl NativeHarness {
                 "To actually see an image, run `borg image FILE` on a PNG or JPEG; printing base64 to stdout does not work, because shell output is truncated and arrives as text."
         ));
         // Claude shows the user only a server summary of text written before
-        // a tool call, which turns a direct answer into progress narration.
+        // a tool call, which drops answers and options the user asked for.
         if turn.provider == crate::CodingProvider::Claude {
             system_prompt.push_str(concat!(
-                "\n\nText you write before a tool call reaches the user only as a server-written summary of it, not your words, so a direct answer there gets lost. ",
-                "When the user asks you something while you are working (a question, an opinion, yes or no, a value), answer it with `SendUserMessage` before calling any other tool, or answer and end the turn. ",
-                "Routine progress updates can stay ordinary text."
+                "\n\nText you write before a tool call reaches the user only as a short server-written summary, not your words: options, lists, numbers and direct answers in it are lost. ",
+                "Whenever the user must read something exactly (an answer to their question, options to choose from, a value, a snippet) and you will call more tools afterwards, send it with `SendUserMessage` first. ",
+                "Routine progress updates can stay ordinary text; a final answer with no tool call after it is shown in full."
             ));
         }
         // Stable for the session, so it stays in the cached prefix.
