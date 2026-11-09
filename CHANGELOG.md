@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.20.10)
 
+- Stopping a turn now stays stopped. Team reports and watcher output that
+  arrive after a Stop wait in the queue until you send the next message,
+  instead of starting a new turn a fraction of a second later; a director
+  with many workers previously appeared to ignore the Stop.
+- `await_watchers` works without an active goal: a finished watcher wakes the
+  session either way, so refusing the wait only pushed agents into polling.
 - `~/.borg/logs/borg.log` no longer grows without bound: a starting Borg moves
   a log over 256 MB to `borg.log.1`. Unknown-key warnings for `agent.toml`
   and `editor.toml` are logged once rather than on every config reload

@@ -5964,8 +5964,7 @@ fn queued_team_notifications_batch_without_borrowing_priority_or_losing_members(
     assert!(!merged.interrupt_batch);
 
     // Human priority is untouched: the person is still admitted first.
-    let admitted =
-        pop_next_pending_prompt(&mut pending, &HashSet::new()).expect("a prompt is admitted");
+    let admitted = pop_next_pending_prompt(&mut pending, false).expect("a prompt is admitted");
     assert_eq!(admitted.message_id, human.message_id);
 
     // Excluded classes kept their places rather than being absorbed.
@@ -9958,12 +9957,20 @@ fn pending_user_input_always_owns_the_next_turn_boundary() {
         prompt(EventActor::User, "human request"),
     ]);
 
-    let next = pop_next_pending_prompt(&mut pending, &HashSet::new()).unwrap();
+    let next = pop_next_pending_prompt(&mut pending, false).unwrap();
 
     assert_eq!(next.actor, EventActor::User);
     assert_eq!(next.text, "human request");
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].actor, EventActor::System);
+
+    // After a Stop, internal input stays queued until the human speaks.
+    assert!(pop_next_pending_prompt(&mut pending, true).is_none());
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pop_next_pending_prompt(&mut pending, false).unwrap().text,
+        "internal report"
+    );
 }
 
 #[test]
@@ -19418,10 +19425,7 @@ async fn acknowledged_queued_team_input_cannot_reopen_completed_work() {
         .unwrap(),
         "a human prompt is never inspected as team input"
     );
-    assert_eq!(
-        pop_next_pending_prompt(&mut pending, &HashSet::new()).unwrap(),
-        human
-    );
+    assert_eq!(pop_next_pending_prompt(&mut pending, false).unwrap(), human);
     assert!(
         settle_acknowledged_team_notifications(
             &mut journal,
