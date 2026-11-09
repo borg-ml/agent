@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.20.10)
+## Unreleased (since 0.20.11)
+
+## 0.20.11 (2026-11-09)
 
 - Stopping a turn now stays stopped. Team reports and watcher output that
   arrive after a Stop wait in the queue until you send the next message,
