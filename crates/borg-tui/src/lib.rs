@@ -12975,6 +12975,18 @@ impl BorgTerminal {
                 });
             }
         }
+        if matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+            && let Some(selection) = self.composer_selection.take()
+            && !selection.is_empty()
+        {
+            self.composer.delete_range(
+                selection.anchor.min(selection.focus),
+                selection.anchor.max(selection.focus),
+            );
+            self.slash_selection = 0;
+            self.update_slash_notice();
+            return Ok(UiAction::None);
+        }
         if deletes_line_prefix(&key) {
             self.composer_selection = None;
             self.composer.backspace_line();
@@ -14979,16 +14991,26 @@ impl Composer {
         self.backspace_to(start);
     }
 
-    fn backspace_to(&mut self, mut start: usize) {
-        let end = self.cursor;
-        for attachment in &self.attachments {
-            if attachment.start < end && attachment.end > start {
-                start = start.min(attachment.start);
-            }
-        }
-        for pasted in &self.pasted_texts {
-            if pasted.start < end && pasted.end > start {
-                start = start.min(pasted.start);
+    fn backspace_to(&mut self, start: usize) {
+        self.delete_range(start, self.cursor);
+    }
+
+    /// Remove `start..end`, widened so no attachment or pasted-text token is
+    /// left half-deleted, and leave the cursor at the start.
+    fn delete_range(&mut self, mut start: usize, mut end: usize) {
+        for (token_start, token_end) in self
+            .attachments
+            .iter()
+            .map(|attachment| (attachment.start, attachment.end))
+            .chain(
+                self.pasted_texts
+                    .iter()
+                    .map(|pasted| (pasted.start, pasted.end)),
+            )
+        {
+            if token_start < end && token_end > start {
+                start = start.min(token_start);
+                end = end.max(token_end);
             }
         }
         if start == end {

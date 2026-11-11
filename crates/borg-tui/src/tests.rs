@@ -2523,6 +2523,21 @@ fn composer_treats_an_image_token_as_one_editable_unit() {
 }
 
 #[test]
+fn deleting_a_selection_removes_whole_tokens_it_touches() {
+    let mut composer = Composer::default();
+    composer.insert("keep ");
+    composer.insert_attachment(PathBuf::from("capture.png"));
+    composer.insert(" drop tail");
+    // Select from inside "[Image 1]" through "drop".
+    let start = "keep [Im".len();
+    let end = "keep [Image 1] drop".len();
+    composer.delete_range(start, end);
+    assert_eq!(composer.text, "keep  tail");
+    assert_eq!(composer.cursor, "keep ".len());
+    assert!(composer.attachments.is_empty());
+}
+
+#[test]
 fn edit_tool_accepts_the_array_diff_contract() {
     let input = serde_json::json!([
         {"diff": "@@ -1 +1 @@\n-old\n+new"}

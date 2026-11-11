@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.20.12)
 
+- Backspace and Delete in the TUI composer now delete the highlighted
+  selection instead of one character next to it.
 - A subagent that ends its turn with its own background jobs still running
   (an auto-backgrounded `exec`, a `watch`) now reports `waiting on N jobs:
   labels` instead of `ready`. It was always going to wake when they finished,
