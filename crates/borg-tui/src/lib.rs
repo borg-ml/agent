@@ -1851,6 +1851,8 @@ pub struct BorgTerminal {
     settings_painted: bool,
     settings_button_area: Option<Rect>,
     settings_button_hovered: bool,
+    resume_button_area: Option<Rect>,
+    resume_button_hovered: bool,
     refresh_rate_fps: u64,
     prevent_sleep: bool,
     prevent_lid_sleep: bool,
@@ -2040,6 +2042,7 @@ struct HoverState {
     keybindings_hovered: bool,
     dictation_button_hovered: bool,
     settings_button_hovered: bool,
+    resume_button_hovered: bool,
 }
 
 impl BorgTerminal {
@@ -2076,6 +2079,7 @@ impl BorgTerminal {
             keybindings_hovered: self.keybindings_hovered,
             dictation_button_hovered: self.dictation_button_hovered,
             settings_button_hovered: self.settings_button_hovered,
+            resume_button_hovered: self.resume_button_hovered,
         }
     }
 }
@@ -3405,6 +3409,8 @@ impl BorgTerminal {
             settings_painted: false,
             settings_button_area: None,
             settings_button_hovered: false,
+            resume_button_area: None,
+            resume_button_hovered: false,
             refresh_rate_fps: 60,
             prevent_sleep: false,
             prevent_lid_sleep: false,
@@ -3625,6 +3631,8 @@ impl BorgTerminal {
         self.dictation_button_hovered = false;
         self.settings_button_area = None;
         self.settings_button_hovered = false;
+        self.resume_button_area = None;
+        self.resume_button_hovered = false;
         self.dictation_state = DictationState::Idle;
         self.tool_hit_areas.clear();
         self.tool_run_hit_areas.clear();
@@ -6171,6 +6179,7 @@ impl BorgTerminal {
         self.keybindings_hovered = false;
         self.dictation_button_hovered = false;
         self.settings_button_hovered = false;
+        self.resume_button_hovered = false;
     }
 
     /// Focusable status-line controls in reading order, from the last frame.
@@ -8125,6 +8134,9 @@ impl BorgTerminal {
                 self.settings_button_hovered = self
                     .settings_button_area
                     .is_some_and(|area| area.contains(pointer));
+                self.resume_button_hovered = self
+                    .resume_button_area
+                    .is_some_and(|area| area.contains(pointer));
                 if background_hover_suppressed {
                     self.clear_background_hover();
                 }
@@ -8179,6 +8191,13 @@ impl BorgTerminal {
                     if self.settings_button_hovered {
                         self.open_settings();
                         return Ok(UiAction::None);
+                    }
+                    if self.resume_button_hovered {
+                        return Ok(UiAction::Submit {
+                            target: None,
+                            text: "/resume".to_owned(),
+                            attachments: Vec::new(),
+                        });
                     }
                     if self.dictation_button_hovered {
                         if self.dictation_enabled {
@@ -10529,6 +10548,8 @@ impl BorgTerminal {
         let mut next_dictation_button_area = None;
         let mut next_settings_button_area = None;
         let settings_button_hovered = self.settings_button_hovered;
+        let mut next_resume_button_area = None;
+        let resume_button_hovered = self.resume_button_hovered;
         let dictation_state = self.dictation_state;
         let dictation_button_hovered = self.dictation_button_hovered;
         let pending_transcript_anchor = if using_committed_snapshot {
@@ -10642,6 +10663,24 @@ impl BorgTerminal {
                         button,
                     );
                     next_settings_button_area = Some(button);
+                    let label = format!(" {} ", ui_text(ui_language, "Resume"));
+                    let button = Rect {
+                        x: screen.x.saturating_add(1),
+                        width: (label.width() as u16).min(screen.width.saturating_sub(1)),
+                        ..button
+                    };
+                    frame.render_widget(
+                        Paragraph::new(label).style(if resume_button_hovered {
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(BORG_ORANGE)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        }),
+                        button,
+                    );
+                    next_resume_button_area = Some(button);
                 }
                 (
                     chunks[4],
@@ -12444,6 +12483,7 @@ impl BorgTerminal {
             next_keybindings_hint_area = None;
             next_dictation_button_area = None;
             next_settings_button_area = None;
+            next_resume_button_area = None;
         }
         if picker_open || self.keybindings_open {
             next_team_roster_hit_areas.clear();
@@ -12487,6 +12527,7 @@ impl BorgTerminal {
         self.keybindings_hint_area = next_keybindings_hint_area;
         self.dictation_button_area = next_dictation_button_area;
         self.settings_button_area = next_settings_button_area;
+        self.resume_button_area = next_resume_button_area;
         self.scroll_from_bottom = restored_scroll_from_bottom
             .unwrap_or(self.scroll_from_bottom)
             .min(next_scroll_max);

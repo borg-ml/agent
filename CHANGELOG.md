@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.20.12)
 
+- The splash screen has a Resume button in the top-left corner, opposite
+  Settings, that opens the recent-sessions picker (same as `/resume`).
+- Agents are told to use fzf for fuzzy matching, run non-interactively with
+  `fzf --filter QUERY`.
 - `query_history` takes `all_sessions: true` to search every session's journal,
   not only the caller's. Sessions whose search index was never built are
   indexed newest-first within a 20 s budget per search, and the result reports
