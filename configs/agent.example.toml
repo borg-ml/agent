@@ -43,10 +43,10 @@ resume_paused_goal_on_message = false
 claude_refusal_fallback = false
 # Provider names or model ids whose model gets a message typed while the agent
 # is working framed with an instruction to address it in the next visible
-# response (claude-fable-5-1 otherwise folds it silently into the running task;
+# response (Fable otherwise folds it silently into the running task;
 # Codex answers on its own). `true` selects this default set, `false` always
 # delivers the bare text; e.g. ["claude"] frames every Claude model.
-steer_reply_prompt = ["claude-fable-5-1"]
+steer_reply_prompt = ["claude-fable-5-1", "claude-fable-5-2"]
 # `shared_work`, `presence`, `cloud_sync`, `web_relay`, and `telemetry` are
 # reserved provider-neutral declarations in this CLI release. They do not
 # initialize a runtime or register tools yet.

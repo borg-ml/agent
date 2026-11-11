@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.20.12)
 
+- `query_history` takes `all_sessions: true` to search every session's journal,
+  not only the caller's. Sessions whose search index was never built are
+  indexed newest-first within a 20 s budget per search, and the result reports
+  `search_incomplete` with the number still unindexed instead of an empty
+  answer that reads as "never happened".
+- Fable 5.2 (`claude-fable-5-2`) replaces Fable 5.1 in the model pickers and
+  the `fable` alias. Sessions already on 5.1 keep resolving, and 5.2 inherits
+  5.1's mid-turn message framing by default.
+
 ## 0.20.12 (2026-11-09)
 
 - The Team panel's Inactive list now puts the most recently active agent first.

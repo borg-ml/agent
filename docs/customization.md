@@ -180,12 +180,12 @@ an OpenAI API key. Changes apply to threads started afterwards. Dictation
 configuration does not start recording.
 
 Messages sent while a turn is running (`/followups steer`) reach the model at
-its next tool boundary. For `claude-fable-5-1`, Borg frames each one with an instruction to address it
+its next tool boundary. For Fable (`claude-fable-5-1` and `claude-fable-5-2`), Borg frames each one with an instruction to address it
 in the agent's next visible response, because that model tends to fold the
 bare text into the running task without a word (Codex answers such messages
 promptly on its own, so it is not framed). `capabilities.steer_reply_prompt`
 in `agent.toml` is that list of provider names and model ids:
-`["claude-fable-5-1"]` by default, `["claude"]` for every Claude model,
+`["claude-fable-5-1", "claude-fable-5-2"]` by default, `["claude"]` for every Claude model,
 `false` to always deliver the bare text, `true` for the default set (see
 `configs/agent.example.toml`). The session journal
 keeps your message verbatim either way, and team messages are never framed as

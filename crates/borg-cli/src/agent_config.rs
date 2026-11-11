@@ -2157,10 +2157,11 @@ reasoning_format = "deepseek"
         let config: AgentConfig = toml::from_str("").unwrap();
         assert_eq!(
             config.capabilities.steer_reply_prompt.0,
-            ["claude-fable-5-1"]
+            ["claude-fable-5-1", "claude-fable-5-2"]
         );
         let capabilities = borg_remote::SessionCapabilities::from(&config.capabilities);
         assert!(capabilities.frames_steers_for(CodingProvider::Claude, Some("claude-fable-5-1")));
+        assert!(capabilities.frames_steers_for(CodingProvider::Claude, Some("claude-fable-5-2")));
         assert!(!capabilities.frames_steers_for(CodingProvider::Claude, Some("claude-opus-5")));
         assert!(!capabilities.frames_steers_for(CodingProvider::Claude, None));
         assert!(!capabilities.frames_steers_for(CodingProvider::Codex, Some("gpt-6-astra")));
@@ -2171,7 +2172,7 @@ reasoning_format = "deepseek"
             toml::from_str("[capabilities]\nsteer_reply_prompt = true\n").unwrap();
         assert_eq!(
             config.capabilities.steer_reply_prompt.0,
-            ["claude-fable-5-1"]
+            ["claude-fable-5-1", "claude-fable-5-2"]
         );
         let config: AgentConfig =
             toml::from_str("[capabilities]\nsteer_reply_prompt = [\"codex\"]\n").unwrap();

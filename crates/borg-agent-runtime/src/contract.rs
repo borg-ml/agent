@@ -1191,9 +1191,10 @@ const fn default_true() -> bool {
 pub struct SteerReplyPrompt(pub Vec<String>);
 impl Default for SteerReplyPrompt {
     /// Measured on real sessions: claude-fable-5-1 answers a mid-turn message
-    /// after a median of nine tool calls; Codex answers at once.
+    /// after a median of nine tool calls; Codex answers at once. Fable 5.2
+    /// replaces 5.1 in the picker and keeps its framing until measured apart.
     fn default() -> Self {
-        Self(vec!["claude-fable-5-1".to_string()])
+        Self(vec!["claude-fable-5-1".to_string(), "claude-fable-5-2".to_string()])
     }
 }
 impl SteerReplyPrompt {

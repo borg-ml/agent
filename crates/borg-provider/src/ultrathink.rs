@@ -8,7 +8,7 @@ use std::ops::Range;
 pub const REMINDER: &str = "The user included the keyword \"ultrathink\", requesting deeper reasoning on this turn. Reason as thoroughly as the task warrants.";
 
 /// Whether typing the keyword can take effect on this Claude model: the
-/// models Claude Code raises (Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1).
+/// models Claude Code raises (Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.2).
 pub fn available(model: &str) -> bool {
     crate::CLAUDE_SELECTABLE_MODELS
         .iter()

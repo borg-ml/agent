@@ -43,6 +43,7 @@ pub fn claude_refusal_fallback_model(model: &str) -> Option<&'static str> {
             | "claude-opus-5-5"
             | "claude-fable-5"
             | "claude-fable-5-1"
+            | "claude-fable-5-2"
     )
     .then_some("claude-opus-4-8")
 }

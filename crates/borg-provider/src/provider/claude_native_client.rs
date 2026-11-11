@@ -551,7 +551,7 @@ fn aliases(served: Option<&VerifiedServedCatalog>) -> BTreeMap<String, String> {
         ("opus".into(), "claude-opus-5-5".into()),
         ("sonnet".into(), "claude-sonnet-5-5".into()),
         ("haiku".into(), "claude-haiku-5-5".into()),
-        ("fable".into(), "claude-fable-5-1".into()),
+        ("fable".into(), "claude-fable-5-2".into()),
     ]);
     if let Some(served) = served {
         for family in ["opus", "sonnet", "haiku"] {

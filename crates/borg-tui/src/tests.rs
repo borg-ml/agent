@@ -2351,7 +2351,7 @@ fn model_picker_none_yields_no_open_ended_placeholder() {
     // With None and no current, the dynamic arm returns empty; only catalogs render.
     // We still check that catalog providers remain selectable.
     assert!(options.iter().any(|o| o.value == "gpt-6-luna"));
-    assert!(options.iter().any(|o| o.value == "claude-fable-5-1"));
+    assert!(options.iter().any(|o| o.value == "claude-fable-5-2"));
     assert!(!options.iter().any(|o| o.value == "claude-opus-5"));
 }
 

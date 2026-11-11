@@ -105,6 +105,7 @@ pub(super) fn source_model_facts(model: &str, approved_betas: &[String]) -> Opti
         ("claude-opus-5-5", "claude-opus-5-5", 1000000, 128000, 128000, 5, true, true, true),
         ("claude-fable-5", "claude-fable-5", 1000000, 64000, 128000, 5, true, true, false),
         ("claude-fable-5-1", "claude-fable-5-1", 1000000, 64000, 128000, 5, true, true, false),
+        ("claude-fable-5-2", "claude-fable-5-2", 1000000, 64000, 128000, 5, true, true, false),
         ("claude-mythos-5", "claude-mythos-5", 1000000, 64000, 128000, 5, true, false, false),
         ("claude-mythos-5-1", "claude-mythos-5-1", 1000000, 64000, 128000, 5, true, true, false),
     ];
@@ -594,6 +595,7 @@ mod tests {
             "claude-opus-5-5",
             "claude-fable-5",
             "claude-fable-5-1",
+            "claude-fable-5-2",
             "claude-mythos-5",
             "claude-mythos-5-1",
         ];

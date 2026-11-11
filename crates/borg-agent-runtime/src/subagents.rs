@@ -3470,9 +3470,12 @@ impl AgentToolDispatcher {
                 let store = self
                     .session_store()
                     .context("lossless session history is unavailable for this session")?;
-                Ok(serde_json::to_value(
-                    store.query_history(self.actor_session_id, query).await?,
-                )?)
+                let page = if query.all_sessions {
+                    store.search_all_sessions(query).await?
+                } else {
+                    store.query_history(self.actor_session_id, query).await?
+                };
+                Ok(serde_json::to_value(page)?)
             }
             "history_index" => {
                 let args: HistoryIndexArgs = serde_json::from_value(arguments)?;
@@ -10532,7 +10535,7 @@ pub fn agent_tool_specs_for_surface(
         ),
         tool(
             "query_history",
-            "Search this session's canonical lossless journal with lexical/regex/typed filters. Normal small hits retain event; opaque or oversized hits expose event_preview with event_projected/content_truncated, never a fake canonical event. Defaults omit native_model_message assistant.provider_state. max_payload_bytes bounds aggregate inline previews, snippets and expanded deferred text, excluding fixed metadata. Exact event_id plus expand_payloads returns a full canonical event only when it fits; canonical_lookup_required means the event or payload exceeds the 1 MiB tool cap: use programmatic SessionStore history hit.event/load_payload or payload references, not an impossible larger tool budget. Canonical ids and search_incomplete/window semantics remain authoritative for lookup, not for actor liveness.",
+            "Search this session's canonical lossless journal with lexical/regex/typed filters; all_sessions=true searches every session's journal instead (lexical text only, hits carry their session_id, unindexed sessions reported via search_incomplete). Normal small hits retain event; opaque or oversized hits expose event_preview with event_projected/content_truncated, never a fake canonical event. Defaults omit native_model_message assistant.provider_state. max_payload_bytes bounds aggregate inline previews, snippets and expanded deferred text, excluding fixed metadata. Exact event_id plus expand_payloads returns a full canonical event only when it fits; canonical_lookup_required means the event or payload exceeds the 1 MiB tool cap: use programmatic SessionStore history hit.event/load_payload or payload references, not an impossible larger tool budget. Canonical ids and search_incomplete/window semantics remain authoritative for lookup, not for actor liveness.",
             json!({
                 "type": "object",
                 "properties": {
@@ -10565,6 +10568,11 @@ pub fn agent_tool_specs_for_surface(
                     },
                     "newest_first": { "type": "boolean", "default": false },
                     "case_sensitive": { "type": "boolean", "default": false },
+                    "all_sessions": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Search every session's journal, not only this one. Lexical text search only."
+                    },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,

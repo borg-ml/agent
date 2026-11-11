@@ -49,7 +49,7 @@ impl PromptCacheObservation {
                         && !(cache.provider == CodingProvider::Claude
                             && matches!(
                                 cache.model.as_str(),
-                                "claude-opus-5-5" | "claude-fable-5-1"
+                                "claude-opus-5-5" | "claude-fable-5-1" | "claude-fable-5-2"
                             )))
             }) =>
             {

@@ -128,6 +128,9 @@ pub struct SessionHistoryQuery {
     pub expand_payloads: bool,
     /// Aggregate content budget for inline previews, snippets, and expanded payloads.
     pub max_payload_bytes: Option<usize>,
+    /// Search every session's journal instead of only the caller's own.
+    /// Lexical text search only; hits carry their own `session_id`.
+    pub all_sessions: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

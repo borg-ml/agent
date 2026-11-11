@@ -30,6 +30,8 @@ use crate::session_store::{
 /// Rows projected per transaction. Small enough that a session with a long
 /// history never holds one transaction open for the whole backfill.
 const PROJECTION_BATCH: i64 = 256;
+/// Wall-clock indexing a single all-sessions search may spend before answering.
+const GLOBAL_PROJECTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// One search row, before it is written.
 struct ProjectedRow {
@@ -405,28 +407,54 @@ impl PostgresSessionStore {
         let text = self.validate_history_query(&query)?;
         // Every session must be projected before a global search can be
         // trusted; an unprojected session would silently contribute nothing.
+        // Projection is built lazily per session, so a store can hold millions
+        // of never-indexed events. Indexing all of them before answering would
+        // make the first global search take hours, so each call indexes the
+        // most recently active sessions first within a time budget, and a
+        // session left over makes the page say so instead of silently
+        // contributing nothing.
+        let mut unindexed_sessions = 0usize;
         if text.is_some() {
             let sessions: Vec<Uuid> = sqlx::query_scalar(
                 "select id from sessions where inherited_event_count = 0 \
                  and exists (select 1 from session_events e where e.session_id = sessions.id \
                    and not exists (select 1 from session_event_search s \
-                     where s.session_id = e.session_id and s.event_id = e.event_id))",
+                     where s.session_id = e.session_id and s.event_id = e.event_id)) \
+                 order by updated_at desc",
             )
             .fetch_all(self.pool())
             .await?;
-            for session_id in sessions {
-                self.ensure_history_projection(session_id).await?;
+            let deadline = std::time::Instant::now() + GLOBAL_PROJECTION_BUDGET;
+            for (index, session_id) in sessions.iter().enumerate() {
+                if std::time::Instant::now() >= deadline {
+                    unindexed_sessions = sessions.len() - index;
+                    break;
+                }
+                // One session over the tsvector cap must not block recall of
+                // every other session; it stays unindexed and is counted.
+                if self.ensure_history_projection(*session_id).await.is_err() {
+                    unindexed_sessions += 1;
+                }
             }
         }
-        match (text.as_deref(), query.mode) {
-            (None, _) => self.query_history_exact(None, &query).await,
+        let mut page = match (text.as_deref(), query.mode) {
+            (None, _) => self.query_history_exact(None, &query).await?,
             (Some(text), SessionHistorySearchMode::Lexical) => {
-                self.query_history_lexical(None, &query, text).await
+                self.query_history_lexical(None, &query, text).await?
             }
             (Some(text), SessionHistorySearchMode::Regex) => {
-                self.query_history_regex(None, &query, text).await
+                self.query_history_regex(None, &query, text).await?
             }
+        };
+        if unindexed_sessions > 0 {
+            page.search_incomplete = true;
+            page.truncated = true;
+            page.backend = format!(
+                "{} ({unindexed_sessions} sessions not yet indexed; each all_sessions search indexes more, newest first)",
+                page.backend
+            );
         }
+        Ok(page)
     }
 
     /// A typed or ranged read with no text, straight off the journal.
