@@ -3663,6 +3663,30 @@ async fn run_agent_session_store_kernel_inner(
                 )
                 .await?;
             }
+            // Background jobs this session started and left running wake it when
+            // they report, exactly like an explicit yield: a session that ended
+            // its turn with `exec` or a watch still running is waiting on that
+            // work, not idle. Reporting it as Ready made working agents look
+            // stalled to their parent and the roster (2026-11-11: two lanes each
+            // timing a GPU job read as "no agents running").
+            let live_jobs = if watches.yielded().is_none() && network_retry_message_id.is_none() {
+                watches
+                    .list()
+                    .await
+                    .into_iter()
+                    .filter(|watch| watch.running)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if !live_jobs.is_empty() && next_ready_detail.is_none() {
+                let labels = live_jobs.iter().map(|watch| watch.label.clone()).collect::<Vec<_>>();
+                next_ready_detail = Some(format!(
+                    "Waiting on {} watcher(s): {}",
+                    live_jobs.len(),
+                    labels.join(", ")
+                ));
+            }
             // The first Ready reports a settled plan (projection and legacy
             // migration); later refreshes stay in the background.
             if !launch_plan_settled {
@@ -3684,7 +3708,7 @@ async fn run_agent_session_store_kernel_inner(
                     },
                     lifecycle: Some(if network_retry_message_id.is_some() {
                         SubagentLifecycle::Starting
-                    } else if watches.yielded().is_some() {
+                    } else if watches.yielded().is_some() || !live_jobs.is_empty() {
                         SubagentLifecycle::WaitingOnWatchers
                     } else {
                         SubagentLifecycle::Ready

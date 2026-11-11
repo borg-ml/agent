@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.20.12)
 
+- A subagent that ends its turn with its own background jobs still running
+  (an auto-backgrounded `exec`, a `watch`) now reports `waiting on N jobs:
+  labels` instead of `ready`. It was always going to wake when they finished,
+  but it counted as idle, so parents and the roster showed working agents as
+  "not running".
+- `inspect_agent` takes `include_tools: true` to also return the child's tool
+  calls and results, secret-scrubbed and clipped to 1200 characters each, so a
+  parent can see what a stalled child ran, what failed and what it left
+  running.
 - The splash screen has a Resume button in the top-left corner, opposite
   Settings, that opens the recent-sessions picker (same as `/resume`).
 - Agents are told to use fzf for fuzzy matching, run non-interactively with

@@ -17,6 +17,11 @@ struct InspectArgs {
     after_sequence: Option<u64>,
     limit: Option<usize>,
     max_bytes: Option<usize>,
+    /// Also expose the child's tool calls and results, scrubbed and truncated:
+    /// a parent diagnosing a stalled or looping child needs to see what it ran,
+    /// what failed and which jobs it left in the background.
+    #[serde(default)]
+    include_tools: bool,
 }
 
 #[derive(Deserialize)]
@@ -50,6 +55,35 @@ where
 
 // Deliberate allowlist: no provider events, nested child events, reasoning,
 // tool payloads, attachments, environment or interaction payloads cross this API.
+/// Text kept per tool input or output in an inspect page: enough to read the
+/// command, its exit status and a background watch id, never a whole log.
+const INSPECT_TOOL_TEXT: usize = 1200;
+
+fn clipped(text: &str) -> String {
+    let text = crate::secret_scrub::scrub_secrets(text);
+    match text.char_indices().nth(INSPECT_TOOL_TEXT) {
+        Some((end, _)) => format!("{}… [{} more chars]", &text[..end], text[end..].chars().count()),
+        None => text.to_string(),
+    }
+}
+
+/// A tool call or result for `inspect_agent { include_tools }`.
+fn tool_event(event: &SessionEvent) -> Option<Value> {
+    let body = match &event.kind {
+        SessionEventKind::ToolStarted { tool_call_id, name, input, parent_tool_call_id, .. } => json!({
+            "type": "tool_started", "tool_call_id": tool_call_id, "name": name,
+            "input": clipped(&input.to_string()), "nested": parent_tool_call_id.is_some()}),
+        SessionEventKind::ToolCompleted { tool_call_id, output, is_error, parent_tool_call_id, .. } => json!({
+            "type": "tool_completed", "tool_call_id": tool_call_id, "is_error": is_error,
+            "output": clipped(output), "nested": parent_tool_call_id.is_some()}),
+        _ => return None,
+    };
+    let mut body = body;
+    body["sequence"] = json!(event.sequence);
+    body["created_at"] = json!(event.created_at);
+    Some(body)
+}
+
 fn public_event(event: &SessionEvent) -> Option<Value> {
     let body = match &event.kind {
         SessionEventKind::Message {
@@ -457,7 +491,9 @@ impl SubagentCoordinator {
             .iter()
             .filter(|event| event.sequence <= state.latest_sequence)
         {
-            if let Some(value) = public_event(event) {
+            let value = public_event(event)
+                .or_else(|| args.include_tools.then(|| tool_event(event)).flatten());
+            if let Some(value) = value {
                 let size = serde_json::to_vec(&value)?.len();
                 if bytes + size > max_bytes {
                     ensure!(
@@ -479,7 +515,11 @@ impl SubagentCoordinator {
             "caveat": "Page is bounded at the reported canonical revision; later events require another read. Canonical and workspace projections can advance independently.",
             "source": "canonical session journal", "observed_at": Utc::now(),
             "projection_lag": "Workspace delivery projection is independent; this read does not repair it.",
-            "excluded": "Private reasoning, provider payloads, tool payloads, nested events, attachments and interaction payloads."}),
+            "excluded": if args.include_tools {
+                "Private reasoning, provider payloads, attachments and interaction payloads. Tool inputs and outputs are scrubbed and clipped."
+            } else {
+                "Private reasoning, provider payloads, tool payloads (pass include_tools), nested events, attachments and interaction payloads."
+            }}),
         )
     }
 }
@@ -835,6 +875,52 @@ fn bounded_recent_message(mut event: Value) -> Value {
 #[cfg(test)]
 mod observation_tests {
     use super::*;
+
+    #[test]
+    fn inspect_tool_events_are_opt_in_scrubbed_and_clipped() {
+        let started = SessionEvent::new(
+            Uuid::nil(),
+            7,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "call-1".into(),
+                name: "exec".into(),
+                input: json!({"cmd": "x".repeat(5000)}),
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        );
+        // Not a public event: only include_tools exposes it.
+        assert!(public_event(&started).is_none());
+        let value = tool_event(&started).unwrap();
+        assert_eq!(value["type"], "tool_started");
+        assert_eq!(value["name"], "exec");
+        assert_eq!(value["sequence"], 7);
+        let input = value["input"].as_str().unwrap();
+        assert!(input.chars().count() < INSPECT_TOOL_TEXT + 40, "clipped");
+        assert!(input.contains("more chars"));
+        let done = SessionEvent::new(
+            Uuid::nil(),
+            8,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "call-1".into(),
+                output: "{\"running\":true,\"background\":true,\"watch_id\":\"w\"}".into(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+                parent_tool_call_id: None,
+            },
+        );
+        let value = tool_event(&done).unwrap();
+        assert_eq!(value["type"], "tool_completed");
+        assert!(value["output"].as_str().unwrap().contains("background"));
+        let message = SessionEvent::new(
+            Uuid::nil(),
+            9,
+            SessionEventKind::StatusChanged { status: crate::SessionStatus::Ready, lifecycle: None, detail: None },
+        );
+        assert!(tool_event(&message).is_none());
+    }
 
     #[test]
     fn batch_goal_extension_preserves_legacy_request_serialization() {

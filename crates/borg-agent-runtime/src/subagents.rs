@@ -9883,8 +9883,8 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "inspect_agent",
-            "Read an authorized descendant's canonical goal and bounded journal/message page. Denies unrelated sessions. Excludes private reasoning, provider payloads and tool inputs/outputs; sanitizes exposed text. Returns exact event IDs/sequences/timestamps and a next cursor; never mutates or starts the target.",
-            json!({"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"after_sequence":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":200},"max_bytes":{"type":"integer","minimum":1024,"maximum":1048576}},"required":["session_id"],"additionalProperties":false}),
+            "Read an authorized descendant's canonical goal and bounded journal/message page. Denies unrelated sessions. Excludes private reasoning and provider payloads; tool inputs/outputs only with include_tools (scrubbed, clipped to 1200 chars each), for diagnosing what a child ran, what failed and which jobs it left running. Sanitizes exposed text. Returns exact event IDs/sequences/timestamps and a next cursor; never mutates or starts the target.",
+            json!({"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"after_sequence":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":200},"max_bytes":{"type":"integer","minimum":1024,"maximum":1048576},"include_tools":{"type":"boolean","description":"Also return tool calls and results (scrubbed, clipped)."}},"required":["session_id"],"additionalProperties":false}),
         ),
         tool(
             "team_batch",
