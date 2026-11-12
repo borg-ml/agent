@@ -2196,7 +2196,7 @@ fn session_has_pending_work(state: &SessionState) -> bool {
 }
 
 async fn local_subagents_are_idle(store: &dyn SessionStore, session_id: Uuid) -> Result<bool> {
-    let agents = latest_subagent_snapshots(&restored_team_history(store, session_id).await?);
+    let agents = latest_subagent_snapshots(&store.team_roster(session_id).await?);
     for agent in agents {
         if session_has_pending_work(&store.state(agent.session_id).await?) {
             return Ok(false);
@@ -2504,6 +2504,7 @@ async fn run_local_agent_session(
     // present before entering any loop that would otherwise retry a missing one
     // forever. A host that exited above never reaches here, and so never pays
     // to build tiers it would not have used.
+    let resolve_started = std::time::Instant::now();
     let resolved = match opened {
         Some(opened) => opened.resolve().await?,
         None => {
@@ -2511,6 +2512,7 @@ async fn run_local_agent_session(
         }
     };
     let store: Arc<dyn SessionStore> = Arc::clone(resolved.session());
+    let resolve_ms = resolve_started.elapsed().as_millis() as u64;
     let state_started = std::time::Instant::now();
     let mut session_state = store.state(session_id).await?;
     let suppress_terminal_live_tail = interactive_store_open
@@ -2741,8 +2743,10 @@ async fn run_local_agent_session(
     let mut current_ultrafast = ultrafast.unwrap_or(false);
     let mut current_response_language = response_language;
     let local_settings = agent_config.local_agent_settings()?;
+    let extensions_started = std::time::Instant::now();
     let (mut extension_catalog, extension_servers, extension_workflows) =
         crate::extensions::discover(&cwd, &agent_config.capabilities, &agent_config.extensions)?;
+    let extensions_ms = extensions_started.elapsed().as_millis() as u64;
     extension_catalog.apply_editor_customization(&mut editor_preferences, &mut agent_config)?;
     let extension_skill_roots = extension_catalog.active_skill_roots();
     let mut observed_extension_revision = extension_catalog.revision.clone();
@@ -2894,7 +2898,9 @@ async fn run_local_agent_session(
     let roster_started = std::time::Instant::now();
     let team_snapshots =
         if resuming && ((can_prompt && !fallback_terminal) || args.session_host.is_some()) {
-            let team = restored_team_history(store.as_ref(), session_id)
+            let team = store
+                .as_ref()
+                .team_roster(session_id)
                 .await
                 .context("failed to restore the team roster before transcript replay")?;
             latest_subagent_snapshots(&team)
@@ -3053,6 +3059,22 @@ async fn run_local_agent_session(
     };
     if let Some(server) = control_server.as_ref() {
         server.seed_durable_watermark(session_state.latest_sequence);
+    }
+    if args.session_host.is_some() {
+        // A resuming terminal waits for exactly this moment; every phase
+        // before it is time the user stares at a blank screen.
+        tracing::info!(
+            %session_id,
+            store_open_ms,
+            resolve_ms,
+            state_ms,
+            provider_probe_ms,
+            extensions_ms,
+            history_ms,
+            roster_ms,
+            control_ms = store_open_started.elapsed().as_millis() as u64,
+            "session host published control"
+        );
     }
     let actor = if session_access.is_attached() {
         tokio::spawn(run_attached_session(
@@ -10392,7 +10414,7 @@ async fn load_subagent_thread_state(
     Vec<SubagentSnapshot>,
     HashMap<Uuid, Vec<SessionEvent>>,
 )> {
-    let team_history = restored_team_history(store, session_id).await?;
+    let team_history = store.team_roster(session_id).await?;
     let mut team_snapshots = latest_subagent_snapshots(&team_history);
     reconcile_subagent_snapshots(store, sessions_dir, &mut team_snapshots).await;
     // A large team hydrates one bounded tail per child. Run those reads with
@@ -10435,20 +10457,6 @@ async fn load_subagent_thread_state(
     )
     .await;
     Ok((team_history, team_snapshots, child_histories))
-}
-
-async fn restored_team_history(
-    store: &dyn SessionStore,
-    session_id: Uuid,
-) -> Result<Vec<SessionEvent>> {
-    let mut team_history = store.fork_team_events(session_id).await?;
-    team_history.extend(
-        store
-            .recovery_parts(session_id, RecoveryParts::SUBAGENTS)
-            .await?
-            .subagent_events,
-    );
-    Ok(team_history)
 }
 
 async fn reconcile_subagent_snapshots(

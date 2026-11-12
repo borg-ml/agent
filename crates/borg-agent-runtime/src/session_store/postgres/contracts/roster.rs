@@ -484,5 +484,59 @@ async fn dropping_live_only_child_rows_does_not_change_the_reconstructed_roster(
         from_everything.usage.total_tokens
     );
     assert_eq!(from_store.status, from_everything.status);
+
+    // Resume reads the roster through `team_roster`, which looks up each
+    // child's rows by index instead of scanning the journal; it must rebuild
+    // the same snapshot.
+    let roster: Vec<SessionEventKind> = store
+        .team_roster(parent_id)
+        .await
+        .expect("team roster")
+        .into_iter()
+        .map(|event| event.kind)
+        .collect();
+    let from_roster = latest_agent(&roster);
+    assert_eq!(from_roster.session_id, child_id);
+    assert_eq!(from_roster.detail, from_everything.detail);
+    assert_eq!(from_roster.status, from_everything.status);
+
+    // A child waiting on an approval whose newest row carries no child event
+    // still brings the row that names the approval, or resume would forget
+    // which approval the child is blocked on.
+    let mut waiting = settled.clone();
+    waiting.status = crate::SubagentStatus::WaitingForApproval;
+    for kind in [
+        row(
+            waiting.clone(),
+            Some(SessionEventKind::ApprovalRequested {
+                approval_id: "approval-1".to_string(),
+                title: "Run".to_string(),
+                detail: String::new(),
+                command: None,
+            }),
+        ),
+        row(waiting, None),
+    ] {
+        store
+            .append(SessionEvent::new(parent_id, 0, kind))
+            .await
+            .expect("waiting child row");
+    }
+    let roster = store.team_roster(parent_id).await.expect("team roster");
+    assert!(roster.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::SubagentActivity { event: Some(child), .. }
+            if matches!(&child.kind, SessionEventKind::ApprovalRequested { approval_id, .. } if approval_id == "approval-1")
+    )));
+    assert_eq!(
+        latest_agent(
+            &roster
+                .into_iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>()
+        )
+        .status,
+        crate::SubagentStatus::WaitingForApproval
+    );
     scratch.discard().await;
 }

@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use super::PostgresSessionStore;
 use super::recovery::StoredSession;
-use crate::SessionEvent;
 use crate::session_store::{SessionState, SessionStoreFork};
+use crate::{SessionEvent, SessionEventKind, SubagentStatus};
 
 /// A forked session renumbers its inherited prefix, so an inherited event needs
 /// a stable id of its own rather than reusing the parent's.
@@ -55,23 +55,82 @@ impl PostgresSessionStore {
             } else {
                 Vec::new()
             };
+            events.extend(self.latest_team_rows(session_id, until).await?);
+            Ok(events)
+        })
+    }
+
+    /// This session's own team roster up to `until`: each child's latest
+    /// activity row and the latest director change, read by index lookups per
+    /// child rather than by walking every activity row a long session holds.
+    /// A child waiting on an approval also brings its latest event-bearing row,
+    /// which is what names the pending approval.
+    pub(super) async fn latest_team_rows(
+        &self,
+        session_id: Uuid,
+        until: u64,
+    ) -> Result<Vec<SessionEvent>> {
+        let until = i64::try_from(until).unwrap_or(i64::MAX);
+        let rows = sqlx::query(
+            "select e.event_json, e.event_body, e.dict_id from session_events e \
+             where e.session_id = $1 and e.sequence = any(array( \
+               with recursive child(id) as ( \
+                 (select subagent_session_id from session_events \
+                  where session_id = $1 and event_kind = 'subagent_activity' \
+                  order by subagent_session_id limit 1) \
+                 union all \
+                 select (select s.subagent_session_id from session_events s \
+                         where s.session_id = $1 and s.event_kind = 'subagent_activity' \
+                           and s.subagent_session_id > child.id \
+                         order by s.subagent_session_id limit 1) \
+                 from child where child.id is not null \
+               ) \
+               select (select sequence from session_events \
+                       where session_id = $1 and event_kind = 'subagent_activity' \
+                         and subagent_session_id = child.id and sequence <= $2 \
+                       order by sequence desc limit 1) \
+               from child where child.id is not null \
+               union all \
+               (select sequence from session_events \
+                where session_id = $1 and event_kind = 'team_director_changed' \
+                  and sequence <= $2 \
+                order by sequence desc limit 1) \
+             )) \
+             order by e.sequence",
+        )
+        .bind(session_id)
+        .bind(until)
+        .fetch_all(self.pool())
+        .await?;
+        let mut events = self.decode_events(&rows).await?;
+        let waiting: Vec<(Uuid, u64)> = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::SubagentActivity {
+                    agent, event: None, ..
+                } if agent.status == SubagentStatus::WaitingForApproval => {
+                    Some((agent.session_id, event.sequence))
+                }
+                _ => None,
+            })
+            .collect();
+        for (child, latest) in waiting {
             let rows = sqlx::query(
-                "select latest.event_json, latest.event_body, latest.dict_id \
-                 from (select distinct on (subagent_session_id) \
-                       sequence, event_json, event_body, dict_id \
-                       from session_events \
-                       where session_id = $1 and sequence <= $2 \
-                         and event_kind in ('subagent_activity', 'team_director_changed') \
-                       order by subagent_session_id, sequence desc) latest \
-                 order by latest.sequence",
+                "select event_json, event_body, dict_id from session_events \
+                 where session_id = $1 and event_kind = 'subagent_activity' \
+                   and subagent_session_id = $2 and sequence < $3 \
+                   and jsonb_typeof(event_json -> 'kind' -> 'event') = 'object' \
+                 order by sequence desc limit 1",
             )
             .bind(session_id)
-            .bind(i64::try_from(until).unwrap_or(i64::MAX))
+            .bind(child)
+            .bind(i64::try_from(latest).unwrap_or(i64::MAX))
             .fetch_all(self.pool())
             .await?;
             events.extend(self.decode_events(&rows).await?);
-            Ok(events)
-        })
+        }
+        events.sort_by_key(|event| event.sequence);
+        Ok(events)
     }
 
     /// Count inherited events without fetching their bodies.

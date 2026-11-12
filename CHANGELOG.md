@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.20.12)
 
+- Resuming a long thread with many subagents no longer stalls for seconds
+  before the first frame. Both the background session host and the terminal
+  rebuilt the team roster with a query that walked every subagent activity row
+  the thread ever journaled, plus every inter-agent message: on a 2.5 million
+  event thread that took 6 s with a cold cache, and on one 389 thousand event
+  fork resume took 5-11 s. The roster is now read by index, one lookup per
+  child, so the host is ready about 100 ms after it starts. The host logs
+  `session host published control` with its startup phase timings.
 - The "Connection & billing" picker is gone. Picking a model from a provider
   that is not connected, `/login`, and the billing badge open that provider's
   page in Settings › Providers; a model you picked is switched to as soon as a

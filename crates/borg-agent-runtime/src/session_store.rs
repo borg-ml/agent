@@ -1725,6 +1725,19 @@ pub trait SessionStore: Send + Sync {
     async fn fork_team_events(&self, _session_id: Uuid) -> Result<Vec<SessionEvent>> {
         Ok(Vec::new())
     }
+    /// The team roster of a session, inherited fork roster first: enough
+    /// activity rows for each child's latest snapshot and any approval it is
+    /// waiting on. A resuming view and a starting host both wait on this, so a
+    /// store should answer it without walking the session's whole journal.
+    async fn team_roster(&self, session_id: Uuid) -> Result<Vec<SessionEvent>> {
+        let mut events = self.fork_team_events(session_id).await?;
+        events.extend(
+            self.recovery_parts(session_id, RecoveryParts::SUBAGENTS)
+                .await?
+                .subagent_events,
+        );
+        Ok(events)
+    }
     async fn live_events_after(
         &self,
         session_id: Uuid,

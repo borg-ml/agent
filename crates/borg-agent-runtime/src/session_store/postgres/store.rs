@@ -2183,6 +2183,12 @@ impl SessionStore for PostgresSessionStore {
             .await
     }
 
+    async fn team_roster(&self, session_id: Uuid) -> Result<Vec<SessionEvent>> {
+        let mut events = self.fork_team_events(session_id).await?;
+        events.extend(self.latest_team_rows(session_id, u64::MAX).await?);
+        Ok(events)
+    }
+
     async fn fork_team_events(&self, session_id: Uuid) -> Result<Vec<SessionEvent>> {
         let session = self.session_row(session_id).await?;
         let (Some(parent), Some(cut)) = (session.parent_session_id, session.parent_cut_sequence)
