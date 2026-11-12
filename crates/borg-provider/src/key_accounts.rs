@@ -25,23 +25,39 @@ pub enum KeyLane {
     Glm,
     Kimi,
     Qwen,
+    /// Pay-per-use API keys. Several can be kept and one selected, exactly like
+    /// the subscription keys above; they are never rotated automatically.
+    Anthropic,
+    OpenAi,
+    OpenRouter,
+    Vercel,
 }
 
 impl KeyLane {
-    pub const ALL: [KeyLane; 4] = [
+    pub const ALL: [KeyLane; 8] = [
         KeyLane::OpenCodeGo,
         KeyLane::Glm,
         KeyLane::Kimi,
         KeyLane::Qwen,
+        KeyLane::Anthropic,
+        KeyLane::OpenAi,
+        KeyLane::OpenRouter,
+        KeyLane::Vercel,
     ];
 
-    /// Storage id, matching the provider id clients already use.
+    /// Storage id, matching the provider id clients already use. The API-key
+    /// lanes avoid `claude` and `openai`, whose `{id}_account_` prefix belongs
+    /// to the OAuth login registry.
     pub fn id(self) -> &'static str {
         match self {
             KeyLane::OpenCodeGo => "opencode",
             KeyLane::Glm => "glm",
             KeyLane::Kimi => "kimi",
             KeyLane::Qwen => "qwen",
+            KeyLane::Anthropic => "anthropic_key",
+            KeyLane::OpenAi => "openai_key",
+            KeyLane::OpenRouter => "openrouter",
+            KeyLane::Vercel => "vercel",
         }
     }
 
@@ -51,6 +67,10 @@ impl KeyLane {
             KeyLane::Glm => "GLM Coding Plan",
             KeyLane::Kimi => "Kimi Code",
             KeyLane::Qwen => "Qwen Coding Plan",
+            KeyLane::Anthropic => "Anthropic API",
+            KeyLane::OpenAi => "OpenAI API",
+            KeyLane::OpenRouter => "OpenRouter",
+            KeyLane::Vercel => "Vercel AI Gateway",
         }
     }
 
@@ -60,6 +80,10 @@ impl KeyLane {
             KeyLane::Glm => ApiKeyCredential::Zai,
             KeyLane::Kimi => ApiKeyCredential::Kimi,
             KeyLane::Qwen => ApiKeyCredential::Qwen,
+            KeyLane::Anthropic => ApiKeyCredential::Anthropic,
+            KeyLane::OpenAi => ApiKeyCredential::OpenAi,
+            KeyLane::OpenRouter => ApiKeyCredential::OpenRouter,
+            KeyLane::Vercel => ApiKeyCredential::Vercel,
         }
     }
 
@@ -131,13 +155,16 @@ fn named(lane: KeyLane) -> Result<Vec<KeyAccount>> {
         .keys()
         .filter_map(|key| {
             let name = key.strip_prefix(&prefix)?;
-            // `{lane}_account_used_{name}` shares the prefix; it is rotation
-            // bookkeeping, not a login.
-            (!name.starts_with("used_")).then(|| KeyAccount {
-                lane,
-                name: name.to_owned(),
-                active: false,
-            })
+            // `{lane}_account_used_{name}` and the lane's
+            // `{lane}_account_strategy` share the prefix; they are bookkeeping,
+            // not logins.
+            (!name.starts_with("used_") && name != crate::subscription_accounts::STRATEGY).then(
+                || KeyAccount {
+                    lane,
+                    name: name.to_owned(),
+                    active: false,
+                },
+            )
         })
         .collect())
 }
@@ -289,6 +316,25 @@ mod tests {
             std::env::remove_var("OPENCODE_GO_API_KEY");
         }
         (guard, home)
+    }
+
+    // The switching policy is stored under the logins' own prefix; it must
+    // never show up as a login that can be selected or removed.
+    #[tokio::test]
+    async fn the_switching_policy_is_not_a_login() {
+        let (_guard, _home) = scratch_home().await;
+        register(KeyLane::OpenCodeGo, "work", "sk-work").unwrap();
+        crate::subscriptions::set_strategy(
+            crate::subscriptions::Lane::OpenCode,
+            crate::subscriptions::Strategy::Manual,
+        )
+        .unwrap();
+        let names: Vec<_> = list(KeyLane::OpenCodeGo)
+            .unwrap()
+            .into_iter()
+            .map(|account| account.name)
+            .collect();
+        assert_eq!(names, ["work"]);
     }
 
     // A key connected before named accounts must stay selected and reachable

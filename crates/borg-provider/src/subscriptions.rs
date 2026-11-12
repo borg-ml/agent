@@ -69,7 +69,9 @@ impl Strategy {
     }
 }
 
-/// A provider lane a user can connect one or more subscriptions to.
+/// A built-in provider whose logins Borg keeps: subscription logins, API
+/// keys, or both. Every lane offers the same verbs -- list, add, select, remove
+/// -- whichever registry stores its logins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lane {
     Claude,
@@ -78,16 +80,28 @@ pub enum Lane {
     Glm,
     Kimi,
     Qwen,
+    OpenRouter,
+    Vercel,
+}
+
+/// Whether a login spends a subscription's included allowance or is billed per
+/// use through an API key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountKind {
+    Subscription,
+    ApiKey,
 }
 
 impl Lane {
-    pub const ALL: [Lane; 6] = [
+    pub const ALL: [Lane; 8] = [
         Lane::Claude,
         Lane::Codex,
         Lane::OpenCode,
         Lane::Glm,
         Lane::Kimi,
         Lane::Qwen,
+        Lane::OpenRouter,
+        Lane::Vercel,
     ];
 
     /// Storage id, shared with the credential store keys.
@@ -99,6 +113,8 @@ impl Lane {
             Lane::Glm => "glm",
             Lane::Kimi => "kimi",
             Lane::Qwen => "qwen",
+            Lane::OpenRouter => "openrouter",
+            Lane::Vercel => "vercel",
         }
     }
 
@@ -110,6 +126,8 @@ impl Lane {
             Lane::Glm => "GLM Coding Plan",
             Lane::Kimi => "Kimi Code",
             Lane::Qwen => "Qwen Coding Plan",
+            Lane::OpenRouter => "OpenRouter",
+            Lane::Vercel => "Vercel AI Gateway",
         }
     }
 
@@ -122,8 +140,16 @@ impl Lane {
             "glm" | "zai" => Some(Lane::Glm),
             "kimi" | "moonshot" => Some(Lane::Kimi),
             "qwen" | "alibaba" => Some(Lane::Qwen),
+            "openrouter" => Some(Lane::OpenRouter),
+            "vercel" => Some(Lane::Vercel),
             _ => None,
         }
+    }
+
+    /// Whether this lane has subscription logins at all, and so quota and a
+    /// switching policy.
+    pub fn has_subscriptions(self) -> bool {
+        self.auth_provider().is_some() || self.key_lane().is_some()
     }
 
     /// The OAuth login registry behind this lane, if it keeps authorities as
@@ -132,18 +158,38 @@ impl Lane {
         match self {
             Lane::Claude => Some(ProviderAuthProvider::Claude),
             Lane::Codex => Some(ProviderAuthProvider::Openai),
-            Lane::OpenCode | Lane::Glm | Lane::Kimi | Lane::Qwen => None,
+            _ => None,
         }
     }
 
-    /// The key registry behind this lane, if it is billed by a key.
+    /// The key registry behind this lane's subscriptions, if they are billed
+    /// by a key.
     pub fn key_lane(self) -> Option<KeyLane> {
         match self {
-            Lane::Claude | Lane::Codex => None,
             Lane::OpenCode => Some(KeyLane::OpenCodeGo),
             Lane::Glm => Some(KeyLane::Glm),
             Lane::Kimi => Some(KeyLane::Kimi),
             Lane::Qwen => Some(KeyLane::Qwen),
+            _ => None,
+        }
+    }
+
+    /// The registry of this lane's pay-per-use API keys.
+    pub fn api_key_lane(self) -> Option<KeyLane> {
+        match self {
+            Lane::Claude => Some(KeyLane::Anthropic),
+            Lane::Codex => Some(KeyLane::OpenAi),
+            Lane::OpenRouter => Some(KeyLane::OpenRouter),
+            Lane::Vercel => Some(KeyLane::Vercel),
+            _ => None,
+        }
+    }
+
+    /// The registry that stores logins of `kind` on this lane as keys.
+    pub fn keys(self, kind: AccountKind) -> Option<KeyLane> {
+        match kind {
+            AccountKind::Subscription => self.key_lane(),
+            AccountKind::ApiKey => self.api_key_lane(),
         }
     }
 
@@ -160,23 +206,59 @@ impl Lane {
             Lane::Glm => "glm",
             Lane::Kimi => "kimi",
             Lane::Qwen => "qwen",
+            Lane::OpenRouter => "openrouter",
+            Lane::Vercel => "vercel",
+        }
+    }
+
+    /// On a lane with both kinds, which kind turns bill now.
+    fn billing(self) -> AccountKind {
+        let api = match self {
+            Lane::Claude => crate::credentials::claude_uses_api_key(),
+            Lane::Codex => crate::credentials::openai_uses_api_key(),
+            _ => !self.has_subscriptions(),
+        };
+        if api {
+            AccountKind::ApiKey
+        } else {
+            AccountKind::Subscription
+        }
+    }
+
+    fn set_billing(self, kind: AccountKind) -> Result<()> {
+        let api = kind == AccountKind::ApiKey;
+        match self {
+            Lane::Claude => crate::credentials::set_claude_uses_api_key(api).map(|_| ()),
+            Lane::Codex => crate::credentials::set_openai_auth_mode(if api {
+                crate::credentials::OpenAiAuthMode::ApiKey
+            } else {
+                crate::credentials::OpenAiAuthMode::Subscription
+            })
+            .map(|_| ()),
+            _ => Ok(()),
         }
     }
 }
 
-/// One connected subscription login on a lane.
+/// One connected login on a lane.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Account {
     pub lane: Lane,
+    pub kind: AccountKind,
     pub name: String,
+    /// Whether the next turn on this lane spends this login.
     pub active: bool,
     /// The authority path of an OAuth login, which is also what a per-login
-    /// quota probe needs. `None` for a key-billed plan.
+    /// quota probe needs. `None` for a key.
     pub path: Option<std::path::PathBuf>,
 }
 
 fn strategy_key(lane: Lane) -> String {
-    format!("{}_account_strategy", lane.id())
+    format!(
+        "{}_account_{}",
+        lane.id(),
+        crate::subscription_accounts::STRATEGY
+    )
 }
 
 /// The switching policy for `lane`. A lane that never chose one follows
@@ -194,77 +276,98 @@ pub fn set_strategy(lane: Lane, strategy: Strategy) -> Result<()> {
     crate::credentials::store_values(&[(&strategy_key(lane), strategy.id())]).map(|_| ())
 }
 
-/// Every connected login for `lane`, from whichever registry stores it.
+fn key_accounts_of(lane: Lane, kind: AccountKind, key_lane: KeyLane) -> Vec<Account> {
+    key_accounts::list(key_lane)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|account| Account {
+            lane,
+            kind,
+            name: account.name,
+            active: account.active,
+            path: None,
+        })
+        .collect()
+}
+
+fn oauth_accounts(lane: Lane, accounts: Vec<crate::SubscriptionAccount>) -> Vec<Account> {
+    accounts
+        .into_iter()
+        .map(|account| Account {
+            lane,
+            kind: AccountKind::Subscription,
+            name: account.name,
+            active: account.active,
+            path: Some(account.path),
+        })
+        .collect()
+}
+
+/// Every subscription login for `lane`, from whichever registry stores it.
+/// This is what quota probes and automatic switching work over; API keys are
+/// never part of it.
 pub async fn accounts(lane: Lane) -> Result<Vec<Account>> {
     let mut accounts = match (lane.auth_provider(), lane.key_lane()) {
-        (Some(provider), _) => crate::subscription_accounts::list(provider)
-            .await?
-            .into_iter()
-            .map(|account| Account {
-                lane,
-                name: account.name,
-                active: account.active,
-                path: Some(account.path),
-            })
-            .collect(),
-        (None, Some(key_lane)) => key_accounts::list(key_lane)?
-            .into_iter()
-            .map(|account| Account {
-                lane,
-                name: account.name,
-                active: account.active,
-                path: None,
-            })
-            .collect(),
+        (Some(provider), _) => {
+            oauth_accounts(lane, crate::subscription_accounts::list(provider).await?)
+        }
+        (None, Some(key_lane)) => key_accounts_of(lane, AccountKind::Subscription, key_lane),
         (None, None) => Vec::new(),
     };
     accounts.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(accounts)
 }
 
-/// [`accounts`], read synchronously from the credential store. This is what a
-/// settings screen draws every frame: no login discovery, no provider process.
+/// Every login on `lane` -- subscriptions first, then API keys -- read
+/// synchronously from the credential store, with only the login the next turn
+/// spends marked active. This is what a settings screen draws every frame: no
+/// login discovery, no provider process.
 pub fn stored_accounts(lane: Lane) -> Vec<Account> {
-    match (lane.auth_provider(), lane.key_lane()) {
-        (Some(provider), _) => crate::subscription_accounts::stored(provider)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|account| Account {
-                lane,
-                name: account.name,
-                active: account.active,
-                path: Some(account.path),
-            })
-            .collect(),
-        (None, Some(key_lane)) => crate::key_accounts::list(key_lane)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|account| Account {
-                lane,
-                name: account.name,
-                active: account.active,
-                path: None,
-            })
-            .collect(),
+    let mut subscriptions = match (lane.auth_provider(), lane.key_lane()) {
+        (Some(provider), _) => oauth_accounts(
+            lane,
+            crate::subscription_accounts::stored(provider).unwrap_or_default(),
+        ),
+        (None, Some(key_lane)) => key_accounts_of(lane, AccountKind::Subscription, key_lane),
         (None, None) => Vec::new(),
-    }
+    };
+    let mut keys = lane
+        .api_key_lane()
+        .map(|key_lane| key_accounts_of(lane, AccountKind::ApiKey, key_lane))
+        .unwrap_or_default();
+    subscriptions.sort_by(|left, right| left.name.cmp(&right.name));
+    keys.sort_by(|left, right| left.name.cmp(&right.name));
+    let billing = lane.billing();
+    subscriptions
+        .into_iter()
+        .chain(keys)
+        .map(|mut account| {
+            account.active &= account.kind == billing;
+            account
+        })
+        .collect()
 }
 
-/// Make `name` the login the next turn of this lane spends.
-pub async fn activate(lane: Lane, name: &str) -> Result<()> {
-    match (lane.auth_provider(), lane.key_lane()) {
-        (Some(provider), _) => crate::subscription_accounts::activate(provider, name)
-            .await
-            .map(|_| ()),
-        (None, Some(key_lane)) => key_accounts::activate(key_lane, name).map(|_| ()),
-        (None, None) => bail!("{} keeps no subscription logins", lane.label()),
+/// Make `name` the login the next turn of this lane spends. On a lane with
+/// both kinds this also chooses how turns are billed.
+pub async fn activate(lane: Lane, kind: AccountKind, name: &str) -> Result<()> {
+    match (kind, lane.auth_provider(), lane.keys(kind)) {
+        (_, _, Some(key_lane)) => key_accounts::activate(key_lane, name).map(|_| ())?,
+        (AccountKind::Subscription, Some(provider), None) => {
+            crate::subscription_accounts::activate(provider, name)
+                .await
+                .map(|_| ())?
+        }
+        _ => bail!("{} keeps no such login", lane.label()),
     }
+    lane.set_billing(kind)
 }
 
-/// Connect a named key subscription. OAuth lanes are connected by signing in,
-/// so they are refused here rather than silently doing nothing.
-pub fn add_key(lane: Lane, name: &str, key: &str) -> Result<()> {
-    let key_lane = lane.key_lane().with_context(|| {
+/// Connect a named key. It is selected among the lane's keys of that kind, but
+/// billing only moves to it when the user selects it, so adding a pay-per-use
+/// key never silently stops spending a subscription.
+pub fn add_key(lane: Lane, kind: AccountKind, name: &str, key: &str) -> Result<()> {
+    let key_lane = lane.keys(kind).with_context(|| {
         format!(
             "{} is connected by signing in, not with a key",
             lane.label()
@@ -273,10 +376,10 @@ pub fn add_key(lane: Lane, name: &str, key: &str) -> Result<()> {
     key_accounts::register(key_lane, name, key).map(|_| ())
 }
 
-/// Disconnect a named key subscription. An OAuth login owns a directory of
-/// rotating tokens, so it is removed by signing that login out, not here.
-pub fn remove(lane: Lane, name: &str) -> Result<()> {
-    let key_lane = lane.key_lane().with_context(|| {
+/// Disconnect a named key. An OAuth login owns a directory of rotating tokens,
+/// so it is removed by signing that login out, not here.
+pub fn remove(lane: Lane, kind: AccountKind, name: &str) -> Result<()> {
+    let key_lane = lane.keys(kind).with_context(|| {
         format!(
             "{} logins own rotating credentials; sign in to another login instead of removing one",
             lane.label()

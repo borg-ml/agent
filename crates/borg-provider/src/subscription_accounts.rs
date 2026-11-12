@@ -58,6 +58,10 @@ pub fn new_account_path(provider: ProviderAuthProvider, name: &str) -> Result<Pa
     })
 }
 
+/// The lane's switching policy is stored as `{id}_account_strategy`, under
+/// the same prefix as the logins; it is not one.
+pub(crate) const STRATEGY: &str = "strategy";
+
 fn account_key(provider: ProviderAuthProvider, name: &str) -> String {
     format!("{}_account_{name}", provider.as_str())
 }
@@ -101,11 +105,13 @@ pub async fn list(provider: ProviderAuthProvider) -> Result<Vec<SubscriptionAcco
     let mut accounts = values
         .iter()
         .filter_map(|(key, value)| {
-            key.strip_prefix(&prefix).map(|name| SubscriptionAccount {
-                name: name.to_owned(),
-                path: PathBuf::from(value),
-                active: false,
-            })
+            key.strip_prefix(&prefix)
+                .filter(|name| *name != STRATEGY)
+                .map(|name| SubscriptionAccount {
+                    name: name.to_owned(),
+                    path: PathBuf::from(value),
+                    active: false,
+                })
         })
         .collect::<Vec<_>>();
     // The effective authority is the single source of truth: it is exactly
@@ -142,11 +148,13 @@ pub fn stored(provider: ProviderAuthProvider) -> Result<Vec<SubscriptionAccount>
     let mut accounts = values
         .iter()
         .filter_map(|(key, value)| {
-            key.strip_prefix(&prefix).map(|name| SubscriptionAccount {
-                name: name.to_owned(),
-                path: PathBuf::from(value),
-                active: false,
-            })
+            key.strip_prefix(&prefix)
+                .filter(|name| *name != STRATEGY)
+                .map(|name| SubscriptionAccount {
+                    name: name.to_owned(),
+                    path: PathBuf::from(value),
+                    active: false,
+                })
         })
         .collect::<Vec<_>>();
     let selected = values.get(selection_key(provider)).map(PathBuf::from);
@@ -199,7 +207,11 @@ async fn resolved_default(provider: ProviderAuthProvider) -> Option<PathBuf> {
 async fn adopt_selected_login(provider: ProviderAuthProvider) -> Result<()> {
     let values = credentials::stored_values()?;
     let prefix = format!("{}_account_", provider.as_str());
-    if values.keys().any(|key| key.starts_with(&prefix)) {
+    if values
+        .keys()
+        .filter_map(|key| key.strip_prefix(&prefix))
+        .any(|name| name != STRATEGY)
+    {
         return Ok(());
     }
     // The selected authority, or the default one the adapter reads when no

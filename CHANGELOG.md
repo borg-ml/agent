@@ -5,11 +5,20 @@ Git comparison.
 
 ## Unreleased (since 0.20.12)
 
-- Settings › Subscriptions is tidier. Each provider gets one bold heading with
-  `Connect` or `Add login`, and the name and key fields appear only after you
-  press it. Logins are listed by name, with ● marking the one turns spend. The
-  switching strategy appears only when a provider has two or more logins, and
-  providers are separated by blank lines.
+- Settings › Providers is now the one place for every provider's logins. The
+  separate Subscriptions section is gone. The overview has one row per
+  provider (Claude, ChatGPT, OpenCode Go, GLM, Kimi, Qwen, OpenRouter, Vercel
+  and custom endpoints) showing which login it spends and what it has left.
+  Enter opens the same page for each provider: subscription logins and API
+  keys listed together (● marks the one in use), Enter to select one (which
+  also switches between subscription and pay-per-use billing), Delete twice to
+  remove a key, a switching policy when there are two or more subscriptions,
+  and one form to sign in or save a key. Every API-key provider can now keep
+  several named keys. The connection picker's "Manage … logins and keys" entry
+  opens that provider's page.
+- Setting a provider's switching policy no longer adds a phantom login named
+  "strategy" to its list, and no longer stops the first login being kept as
+  `default` when a second one is added.
 - Backspace and Delete in the TUI composer now delete the highlighted
   selection instead of one character next to it.
 - A subagent that ends its turn with its own background jobs still running

@@ -117,6 +117,8 @@ use borg_ui::KeybindingConfig;
 
 const INLINE_VIEWPORT_HEIGHT: u16 = 24;
 const HORIZONTAL_MARGIN: u16 = 0;
+/// The connection picker entry that opens the provider's settings page.
+const MANAGE_LOGINS: &str = "manage-logins";
 const BORG_ORANGE: Color = Color::Rgb(255, 142, 36);
 const BORG_ORANGE_HOVER: Color = Color::Rgb(255, 184, 92);
 const RUNNING_STATUS_PEACH: Color = Color::Rgb(255, 132, 112);
@@ -1078,14 +1080,17 @@ pub enum UiAction {
     SetUiLanguage(UiLanguage),
     SetFast(bool),
     SetUltrafast(bool),
-    /// Make one connected subscription login the one this provider spends.
+    /// Make one connected login the one this provider spends, which also
+    /// chooses subscription or per-use billing.
     SwitchAccount {
         lane: borg_provider::subscriptions::Lane,
+        kind: borg_provider::subscriptions::AccountKind,
         account: String,
     },
-    /// Disconnect a named key subscription from this machine.
+    /// Disconnect a named key from this machine.
     RemoveAccount {
         lane: borg_provider::subscriptions::Lane,
+        kind: borg_provider::subscriptions::AccountKind,
         account: String,
     },
     /// Choose whether turns may switch between a provider's logins.
@@ -1098,9 +1103,10 @@ pub enum UiAction {
         lane: borg_provider::subscriptions::Lane,
         account: String,
     },
-    /// Store an additional key-billed subscription login.
+    /// Store an additional named key: a subscription key or an API key.
     AddKeyAccount {
         lane: borg_provider::subscriptions::Lane,
+        kind: borg_provider::subscriptions::AccountKind,
         account: String,
         key: String,
     },
@@ -6797,7 +6803,6 @@ impl BorgTerminal {
             CodingProvider::OpenCode => vec![
                 PickerOption::new("OpenCode Go · subscription key", "api-key"),
                 PickerOption::new("Add or replace Go key…", "replace-api-key"),
-                PickerOption::new("Manage OpenCode Go logins…", "manage-opencode-logins"),
             ],
             CodingProvider::Claude => vec![
                 PickerOption::new("Claude subscription · included allowance", "subscription"),
@@ -6825,11 +6830,20 @@ impl BorgTerminal {
                 "subscription" if provider == CodingProvider::Claude => "Use your saved Claude login. If needed, Borg opens the subscription sign-in flow.",
                 "api-key" if provider == CodingProvider::Claude => "Use your saved Anthropic key, or enter one privately. Requests are billed to your Anthropic Console credits. Your Claude login is kept.",
                 "api-key" | "replace-api-key" if provider == CodingProvider::OpenCode => "Get your subscription key at opencode.ai/auth. Go models use your Go allowance; select one in /model.",
-                "manage-opencode-logins" => "Open Subscriptions settings to add, select or balance OpenCode Go logins. Other OpenCode providers can be connected with `borg login opencode`.",
                 "reconnect-subscription" if provider == CodingProvider::Grok => "Opens the Grok Build sign-in. SuperGrok and X Premium Plus plans are supported; set XAI_API_KEY to use the API instead.",
                 "reconnect-subscription" if provider == CodingProvider::Muse => "Opens Muse Code account sign-in. META_API_KEY and stored API keys override subscription login and use pay-as-you-go billing.",
                 _ => "Credentials are entered privately and are never added to the conversation.",
             }.to_string());
+        }
+        if let Some(lane) = borg_remote::provider_usage::provider_lane(provider) {
+            let mut manage = PickerOption::new(
+                format!("Manage {} logins and keys…", lane.label()),
+                MANAGE_LOGINS,
+            );
+            manage.preview = Some(
+                "Open this provider in Settings › Providers to add, select or remove its logins and keys, and see what each has left.".to_string(),
+            );
+            options.push(manage);
         }
         options.push(PickerOption::new("Cancel", "cancel"));
         self.pending_auth_model = Some((provider, model));
@@ -6843,18 +6857,17 @@ impl BorgTerminal {
         });
     }
 
-    /// Open the fullscreen settings screen at a subscription lane.
+    /// Open the fullscreen settings screen at one provider's page.
     pub fn open_subscription_settings(&mut self, lane: borg_provider::subscriptions::Lane) {
         self.picker = None;
         self.pending_auth_model = None;
-        let values = self.settings_values();
         let mut settings = SettingsScreen::default();
-        settings.open_subscription_lane(lane, &values);
+        settings.show_lane(lane);
         self.settings = Some(settings);
     }
 
     /// A subscription sign-in started on the host. It is shown on the lane's
-    /// Subscriptions section while the rest of Borg stays usable.
+    /// provider page in Settings › Providers while the rest of Borg stays usable.
     pub fn begin_subscription_sign_in(&mut self, lane: borg_provider::subscriptions::Lane) {
         self.subscription_sign_in = Some((
             lane,
@@ -6919,26 +6932,19 @@ impl BorgTerminal {
         self.prevent_lid_sleep = lid;
     }
 
-    /// Subscription lanes for the settings page: logins from the credential
-    /// store, quota from the host's latest capability snapshot, and the policy
-    /// the host reports (falling back to the store it shares with us).
-    fn subscription_lanes(
+    /// Every provider's logins for the settings page: logins and keys from the
+    /// credential store, quota from the host's latest capability snapshot, and
+    /// the policy the host reports (falling back to the store it shares).
+    fn provider_lanes(
         capabilities: &[borg_remote::ProviderCapability],
         sign_in: Option<&(borg_provider::subscriptions::Lane, crate::settings::SignIn)>,
     ) -> Vec<crate::settings::LaneView> {
-        use borg_provider::subscriptions::{Lane, Strategy};
+        use borg_provider::subscriptions::{AccountKind, Lane, Strategy};
         use borg_remote::AccountStrategy;
         Lane::ALL
             .iter()
             .map(|lane| {
-                let provider = match lane {
-                    Lane::Claude => CodingProvider::Claude,
-                    Lane::Codex => CodingProvider::Codex,
-                    Lane::OpenCode => CodingProvider::OpenCode,
-                    Lane::Glm => CodingProvider::Glm,
-                    Lane::Kimi => CodingProvider::Kimi,
-                    Lane::Qwen => CodingProvider::Qwen,
-                };
+                let provider = borg_remote::provider_usage::lane_provider(*lane);
                 let capability = capabilities
                     .iter()
                     .find(|capability| capability.provider == provider);
@@ -6953,13 +6959,18 @@ impl BorgTerminal {
                 let accounts = borg_provider::subscriptions::stored_accounts(*lane)
                     .into_iter()
                     .map(|account| {
-                        let row = capability.and_then(|capability| {
-                            capability
-                                .accounts
-                                .iter()
-                                .find(|row| row.name == account.name)
-                        });
+                        // Quota belongs to subscriptions; a key that shares a
+                        // login's name must not borrow its windows.
+                        let row = capability
+                            .filter(|_| account.kind == AccountKind::Subscription)
+                            .and_then(|capability| {
+                                capability
+                                    .accounts
+                                    .iter()
+                                    .find(|row| row.name == account.name)
+                            });
                         crate::settings::AccountView {
+                            kind: account.kind,
                             name: account.name,
                             active: account.active,
                             usage: row.and_then(|row| row.usage.clone()),
@@ -7039,7 +7050,7 @@ impl BorgTerminal {
             title_model: self.title_model.label(),
             configured_models: self.configured_model_entries.clone(),
             custom_providers: self.custom_providers.clone(),
-            subscriptions: Self::subscription_lanes(
+            lanes: Self::provider_lanes(
                 &self.transcript.provider_capabilities,
                 self.subscription_sign_in.as_ref(),
             ),
@@ -9645,8 +9656,12 @@ impl BorgTerminal {
             },
             PickerKind::ProviderAuth => {
                 let selected = picker.selected_value();
-                if selected == "manage-opencode-logins" {
-                    self.open_subscription_settings(borg_provider::subscriptions::Lane::OpenCode);
+                if selected == MANAGE_LOGINS {
+                    if let Some((provider, _)) = self.pending_auth_model.take()
+                        && let Some(lane) = borg_remote::provider_usage::provider_lane(provider)
+                    {
+                        self.open_subscription_settings(lane);
+                    }
                     return Ok(UiAction::None);
                 }
                 let choice = match selected.as_str() {

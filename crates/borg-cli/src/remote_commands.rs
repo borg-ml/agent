@@ -6220,12 +6220,14 @@ async fn run_local_agent_session(
                                     choice,
                                     ProviderAuthChoice::ApiKey | ProviderAuthChoice::ReplaceApiKey
                                 )
-                                && let Some(lane) = lane.filter(|lane| lane.key_lane().is_some())
+                                && let Some(lane) = lane.filter(|lane| {
+                                    lane.key_lane().is_some() || lane.api_key_lane().is_some()
+                                })
                             {
                                 let terminal = terminal.as_mut().expect("terminal");
                                 terminal.open_subscription_settings(lane);
                                 terminal.set_notice(format!(
-                                    "Name the {} login and paste its key below, then choose Save login.",
+                                    "Name the {} key and paste it below, save it, then select it.",
                                     lane.label()
                                 ));
                                 terminal_dirty = true;
@@ -6374,13 +6376,17 @@ async fn run_local_agent_session(
                             ),
                         );
                     }
-                    UiAction::SwitchAccount { lane, account } => {
-                        let notice = match borg_provider::subscriptions::activate(lane, &account)
+                    UiAction::SwitchAccount { lane, kind, account } => {
+                        let notice = match borg_provider::subscriptions::activate(lane, kind, &account)
                             .await
                         {
                             Ok(()) => format!(
-                                "{} turns now use the {account} login.",
-                                lane.label()
+                                "{} turns now use {account}{}.",
+                                lane.label(),
+                                match kind {
+                                    borg_provider::subscriptions::AccountKind::ApiKey => " · pay per use",
+                                    borg_provider::subscriptions::AccountKind::Subscription => "",
+                                }
                             ),
                             Err(error) => format!(
                                 "Could not switch {} to {account}: {error}",
@@ -6406,8 +6412,8 @@ async fn run_local_agent_session(
                         terminal.as_mut().expect("terminal").set_notice(notice);
                         terminal_dirty = true;
                     }
-                    UiAction::RemoveAccount { lane, account } => {
-                        let notice = match borg_provider::subscriptions::remove(lane, &account) {
+                    UiAction::RemoveAccount { lane, kind, account } => {
+                        let notice = match borg_provider::subscriptions::remove(lane, kind, &account) {
                             Ok(()) => format!("Removed the {account} {} login.", lane.label()),
                             Err(error) => format!(
                                 "Could not remove {account} from {}: {error}",
@@ -6419,11 +6425,21 @@ async fn run_local_agent_session(
                     }
                     UiAction::AddKeyAccount {
                         lane,
+                        kind,
                         account,
                         key,
                     } => {
                         let notice =
-                            match borg_provider::subscriptions::add_key(lane, &account, &key) {
+                            match borg_provider::subscriptions::add_key(lane, kind, &account, &key) {
+                                Ok(())
+                                    if kind == borg_provider::subscriptions::AccountKind::ApiKey
+                                        && lane.has_subscriptions() =>
+                                {
+                                    format!(
+                                        "{} API key {account} saved. Select it to bill turns per use.",
+                                        lane.label()
+                                    )
+                                }
                                 Ok(()) => format!(
                                     "{} login {account} connected and selected.",
                                     lane.label()
@@ -9226,7 +9242,7 @@ pub(crate) async fn login_command(
             .into();
         let lane = provider_lane(provider)
             .with_context(|| format!("{} keeps no subscription logins", provider.label()))?;
-        if lane.auth_provider().is_some() {
+        if lane.auth_provider().is_some() && !api_key {
             borg_remote::login_provider_account_with_output(provider, &name, |line| {
                 println!("{line}")
             })
@@ -9241,7 +9257,12 @@ pub(crate) async fn login_command(
         );
         io::stdout().flush().ok();
         let key = read_secret_line()?;
-        borg_provider::subscriptions::add_key(lane, &name, &key)?;
+        let kind = if lane.key_lane().is_some() && !api_key {
+            borg_provider::subscriptions::AccountKind::Subscription
+        } else {
+            borg_provider::subscriptions::AccountKind::ApiKey
+        };
+        borg_provider::subscriptions::add_key(lane, kind, &name, &key)?;
         println!("{} login {name} connected and selected.", lane.label());
         return Ok(());
     }
@@ -9335,25 +9356,7 @@ pub(crate) async fn login_command(
     Ok(())
 }
 
-/// The subscription lane a provider bills against, if it keeps logins.
-fn provider_lane(provider: CodingProvider) -> Option<borg_provider::subscriptions::Lane> {
-    borg_provider::subscriptions::Lane::ALL
-        .into_iter()
-        .find(|lane| lane_provider(*lane) == provider)
-}
-
-/// The provider a subscription lane bills against.
-fn lane_provider(lane: borg_provider::subscriptions::Lane) -> CodingProvider {
-    use borg_provider::subscriptions::Lane;
-    match lane {
-        Lane::Claude => CodingProvider::Claude,
-        Lane::Codex => CodingProvider::Codex,
-        Lane::OpenCode => CodingProvider::OpenCode,
-        Lane::Glm => CodingProvider::Glm,
-        Lane::Kimi => CodingProvider::Kimi,
-        Lane::Qwen => CodingProvider::Qwen,
-    }
-}
+use borg_remote::provider_usage::{lane_provider, provider_lane};
 
 /// `borg accounts`: every connected subscription login, what it has left and
 /// when each window resets, plus whether turns may switch between them. The
@@ -9361,7 +9364,10 @@ fn lane_provider(lane: borg_provider::subscriptions::Lane) -> CodingProvider {
 pub(crate) async fn accounts_command(json: bool) -> Result<()> {
     use borg_provider::subscriptions::Lane;
     let mut rows = Vec::new();
-    for lane in Lane::ALL {
+    for lane in Lane::ALL
+        .into_iter()
+        .filter(|lane| lane.has_subscriptions())
+    {
         rows.push((
             lane,
             borg_remote::provider_usage::subscription_accounts(lane_provider(lane)).await,
@@ -9398,7 +9404,12 @@ pub(crate) async fn use_account_command(
     account: String,
 ) -> Result<()> {
     let lane: borg_provider::subscriptions::Lane = provider.into();
-    borg_provider::subscriptions::activate(lane, &account).await?;
+    borg_provider::subscriptions::activate(
+        lane,
+        borg_provider::subscriptions::AccountKind::Subscription,
+        &account,
+    )
+    .await?;
     println!("{} turns now use the {account} login.", lane.label());
     let accounts = borg_remote::provider_usage::subscription_accounts(lane_provider(lane)).await;
     print_account_rows(

@@ -51,12 +51,7 @@ fn action(
 
 pub(super) fn list_rows(providers: &BTreeMap<String, ConfiguredProvider>) -> Vec<SettingRow> {
     use SettingId as Id;
-    let mut rows = vec![action(
-        Id::ProviderAdd,
-        "Add custom provider",
-        "Connect any OpenAI-compatible endpoint: local servers, cloud APIs or your own gateway. No API key is required for an unauthenticated local server.",
-        "Add provider…",
-    )];
+    let mut rows = Vec::new();
     for (index, (id, provider)) in providers.iter().enumerate() {
         let auth = if let Some(env) = &provider.api_key_env {
             format!(
@@ -74,17 +69,25 @@ pub(super) fn list_rows(providers: &BTreeMap<String, ConfiguredProvider>) -> Vec
         } else {
             "no API key".into()
         };
-        rows.push(action(
+        let mut entry = action(
             Id::ProviderEntry(index),
-            "Custom provider",
+            "",
             &format!(
                 "{id} · {} · {auth} · {} models. Enter to edit; changes apply after Save provider.",
                 provider.base_url,
                 provider.models.len()
             ),
-            format!("{} · {id}", provider.name.as_deref().unwrap_or(id)),
-        ));
+            format!("Custom endpoint · {auth}"),
+        );
+        entry.label = provider.name.clone().unwrap_or_else(|| id.clone()).into();
+        rows.push(entry);
     }
+    rows.push(action(
+        Id::ProviderAdd,
+        "Add custom provider",
+        "Connect any OpenAI-compatible endpoint: local servers, cloud APIs or your own gateway. No API key is required for an unauthenticated local server.",
+        "Add provider…",
+    ));
     rows
 }
 

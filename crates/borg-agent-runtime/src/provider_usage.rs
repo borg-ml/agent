@@ -372,6 +372,32 @@ pub fn subscription_lane(provider: CodingProvider) -> Option<borg_provider::subs
     })
 }
 
+/// The provider a lane's logins bill against.
+pub fn lane_provider(lane: borg_provider::subscriptions::Lane) -> CodingProvider {
+    use borg_provider::subscriptions::Lane;
+    match lane {
+        Lane::Claude => CodingProvider::Claude,
+        Lane::Codex => CodingProvider::Codex,
+        Lane::OpenCode => CodingProvider::OpenCode,
+        Lane::Glm => CodingProvider::Glm,
+        Lane::Kimi => CodingProvider::Kimi,
+        Lane::Qwen => CodingProvider::Qwen,
+        Lane::OpenRouter => CodingProvider::OpenRouter,
+        Lane::Vercel => CodingProvider::Vercel,
+    }
+}
+
+/// The lane that keeps `provider`'s logins. The Anthropic API provider spends
+/// the API keys kept on the Claude lane.
+pub fn provider_lane(provider: CodingProvider) -> Option<borg_provider::subscriptions::Lane> {
+    if provider == CodingProvider::Anthropic {
+        return Some(borg_provider::subscriptions::Lane::Claude);
+    }
+    borg_provider::subscriptions::Lane::ALL
+        .into_iter()
+        .find(|lane| lane_provider(*lane) == provider)
+}
+
 /// How long one account's usage read is shared by every capability refresh.
 const ACCOUNT_USAGE_TTL: Duration = Duration::from_secs(60);
 

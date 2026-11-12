@@ -23163,7 +23163,7 @@ async fn opencode_login_management_stays_in_borg() {
     picker.selected = picker
         .options
         .iter()
-        .position(|option| option.value == "manage-opencode-logins")
+        .position(|option| option.value == crate::MANAGE_LOGINS)
         .unwrap();
     assert!(matches!(
         terminal.run_selected_picker().unwrap(),

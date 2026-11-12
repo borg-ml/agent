@@ -6,13 +6,13 @@
 //! slash commands use; the host applies and persists it.
 
 use super::*;
+mod logins;
 mod models;
 mod providers;
-mod subscriptions;
 
+pub(crate) use logins::{AccountView, LaneView, SignIn};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-pub(crate) use subscriptions::{AccountView, LaneView, SignIn};
 
 const MAX_WIDTH: u16 = 140;
 /// Taller windows grow the panel for the rows they hold, up to this.
@@ -40,7 +40,6 @@ pub(crate) enum SettingsSection {
     Agent,
     Helpers,
     Providers,
-    Subscriptions,
     Models,
     Transcript,
     Names,
@@ -50,11 +49,10 @@ pub(crate) enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::Agent,
         Self::Helpers,
         Self::Providers,
-        Self::Subscriptions,
         Self::Models,
         Self::Transcript,
         Self::Names,
@@ -68,7 +66,6 @@ impl SettingsSection {
             Self::Agent => "Agent",
             Self::Helpers => "Helper models",
             Self::Providers => "Providers",
-            Self::Subscriptions => "Subscriptions",
             Self::Models => "Models",
             Self::Transcript => "Transcript",
             Self::Names => "Names & colours",
@@ -82,8 +79,7 @@ impl SettingsSection {
         match self {
             Self::Agent => "Model, reasoning and how Borg works",
             Self::Helpers => "Models that write commit messages and thread titles",
-            Self::Providers => "Custom endpoints, credentials, models and variants",
-            Self::Subscriptions => "Logins, their remaining quota and automatic switching",
+            Self::Providers => "Logins, API keys, quota and custom endpoints",
             Self::Models => "Pinned models and the fallback chain",
             Self::Transcript => "What the conversation shows",
             Self::Names => "How you and Borg appear in the conversation",
@@ -120,13 +116,15 @@ pub(crate) enum SettingId {
     ProviderModelSave,
     ProviderModelDelete,
 
-    SubscriptionAdd(usize),
-    SubscriptionStrategy(usize),
-    SubscriptionAccount(usize, usize),
-    SubscriptionName(usize),
-    SubscriptionKey(usize),
-    SubscriptionConnect(usize),
-    SubscriptionRemove(usize),
+    /// A built-in provider on the overview, by its position in `Lane::ALL`.
+    Lane(usize),
+    LaneBack,
+    LaneAccount(usize, usize),
+    LaneStrategy(usize),
+    LaneName(usize),
+    LaneKey(usize),
+    LaneSignIn(usize),
+    LaneSaveKey(usize, borg_provider::subscriptions::AccountKind),
 
     ModelPin(usize),
     FallbackEntry(usize),
@@ -202,13 +200,6 @@ pub(crate) struct SettingRow {
     pub(crate) enabled: bool,
 }
 
-impl SettingRow {
-    /// Whether this row heads a group of indented rows beneath it.
-    fn starts_group(&self) -> bool {
-        matches!(self.id, SettingId::SubscriptionAdd(_))
-    }
-}
-
 /// Everything the screen displays, read from live state each frame.
 #[derive(Clone, Debug)]
 pub(crate) struct SettingsValues {
@@ -250,8 +241,8 @@ pub(crate) struct SettingsValues {
     pub(crate) configured_models: Vec<borg_provider::DynamicModelEntry>,
     pub(crate) custom_providers:
         std::collections::BTreeMap<String, borg_ui::providers::ConfiguredProvider>,
-    /// Every subscription lane with its logins and switching policy.
-    pub(crate) subscriptions: Vec<subscriptions::LaneView>,
+    /// Every built-in provider with its logins and switching policy.
+    pub(crate) lanes: Vec<logins::LaneView>,
     /// Models the user pinned, in pin order.
     pub(crate) pinned_models: Vec<String>,
     /// The configured fallback chain, as route specs.
@@ -835,7 +826,7 @@ fn choice_action(row: &SettingRow, index: usize) -> Option<UiAction> {
             attachments: Vec::new(),
         },
         Id::Footer => UiAction::SetShowFooter(on),
-        Id::SubscriptionStrategy(lane) => UiAction::SetAccountStrategy {
+        Id::LaneStrategy(lane) => UiAction::SetAccountStrategy {
             lane: *borg_provider::subscriptions::Lane::ALL.get(lane)?,
             strategy: *borg_provider::subscriptions::Strategy::ALL.get(index)?,
         },
@@ -927,13 +918,17 @@ enum Target {
 pub(crate) struct SettingsScreen {
     custom_providers: std::collections::BTreeMap<String, borg_ui::providers::ConfiguredProvider>,
     provider_editor: Option<providers::ProviderEditor>,
-    subscription_editor: subscriptions::AccountEditor,
+    login_editor: logins::AccountEditor,
     fallback_editor: models::FallbackEditor,
     pinned_models: Vec<String>,
     fallback_chain: Vec<String>,
     fallback_editable: bool,
     /// The lanes as last drawn, so a row can act on the login it names.
-    subscription_lanes: Vec<subscriptions::LaneView>,
+    lanes: Vec<logins::LaneView>,
+    /// The built-in provider whose page is open, by position in `Lane::ALL`.
+    open_lane: Option<usize>,
+    /// A login row armed for removal by one Delete; a second removes it.
+    confirm_remove: Option<SettingId>,
     section: usize,
     /// Index into the visible rows.
     selected: usize,
@@ -949,40 +944,24 @@ pub(crate) struct SettingsScreen {
 }
 
 impl SettingsScreen {
-    pub(crate) fn open_subscription_lane(
-        &mut self,
-        lane: borg_provider::subscriptions::Lane,
-        values: &SettingsValues,
-    ) {
+    /// Open the Providers page of one built-in provider.
+    pub(crate) fn show_lane(&mut self, lane: borg_provider::subscriptions::Lane) {
         self.set_section(
             SettingsSection::ALL
                 .iter()
-                .position(|section| *section == SettingsSection::Subscriptions)
+                .position(|section| *section == SettingsSection::Providers)
                 .unwrap(),
         );
-        let rows = self.rows(values);
-        let lane_index = borg_provider::subscriptions::Lane::ALL
-            .iter()
-            .position(|candidate| *candidate == lane)
-            .unwrap();
-        self.selected = self
-            .visible(&rows)
-            .iter()
-            .position(|index| rows[*index].id == SettingId::SubscriptionAdd(lane_index))
-            .unwrap_or(0);
-        self.scroll = self.selected;
+        self.provider_editor = None;
+        self.open_lane = Some(logins::lane_index(lane));
     }
 
     /// Rows to show, with choices the host has not confirmed yet shown as
     /// chosen so a click never appears to bounce back.
     pub(crate) fn rows(&mut self, values: &SettingsValues) -> Vec<SettingRow> {
         self.custom_providers = values.custom_providers.clone();
-        self.subscription_lanes = values.subscriptions.clone();
+        self.lanes = values.lanes.clone();
         let mut rows = setting_rows(values);
-        rows.extend(subscriptions::list_rows(
-            &self.subscription_lanes,
-            &self.subscription_editor,
-        ));
         self.pinned_models = values.pinned_models.clone();
         self.fallback_chain = values.fallback_chain.clone();
         self.fallback_editable = values.fallback_editable;
@@ -992,9 +971,27 @@ impl SettingsScreen {
             self.fallback_editable,
             &self.fallback_editor.new_route,
         ));
+        // The Providers section is the overview, or the one page open in it.
+        let lane_page = self.open_lane.and_then(|position| {
+            let lane = borg_provider::subscriptions::Lane::ALL.get(position)?;
+            self.lanes.iter().find(|view| view.lane == *lane)
+        });
         if let Some(editor) = &self.provider_editor {
             rows.retain(|row| row.section != SettingsSection::Providers);
             rows.extend(providers::editor_rows(editor));
+        } else if let Some(view) = lane_page {
+            rows.retain(|row| row.section != SettingsSection::Providers);
+            rows.extend(logins::detail_rows(
+                view,
+                &self.login_editor,
+                self.confirm_remove,
+            ));
+        } else {
+            let at = rows
+                .iter()
+                .position(|row| row.section == SettingsSection::Providers)
+                .unwrap_or(rows.len());
+            rows.splice(at..at, logins::overview_rows(&self.lanes));
         }
         self.pending.retain(|(id, index, at)| {
             if at.elapsed() > PENDING_TTL {
@@ -1041,12 +1038,23 @@ impl SettingsScreen {
 
     fn set_section(&mut self, section: usize) {
         self.section = section % SettingsSection::ALL.len();
+        self.open_lane = None;
+        self.confirm_remove = None;
         self.query.clear();
         self.selected = 0;
         self.scroll = 0;
         self.list = None;
         self.editing = None;
         self.error = None;
+    }
+
+    /// Leave a provider's page for the overview, focused on that provider.
+    fn close_lane(&mut self) {
+        if let Some(position) = self.open_lane.take() {
+            self.selected = position;
+            self.scroll = 0;
+        }
+        self.confirm_remove = None;
     }
 
     fn move_selection(&mut self, rows: &[SettingRow], delta: isize) {
@@ -1056,6 +1064,7 @@ impl SettingsScreen {
         }
         self.selected = self.selected.saturating_add_signed(delta).min(count - 1);
         self.error = None;
+        self.confirm_remove = None;
     }
 
     fn choose(&mut self, row: &SettingRow, index: usize) -> SettingsEffect {
@@ -1145,20 +1154,28 @@ impl SettingsScreen {
             pinned.remove(index);
             return SettingsEffect::Apply(Box::new(UiAction::SetPinnedModels(pinned)));
         }
-        if let SettingId::SubscriptionAdd(lane) = row.id {
-            self.subscription_editor.toggle(lane);
-            return SettingsEffect::None;
+        match row.id {
+            SettingId::Lane(position) => {
+                self.open_lane = Some(position);
+                self.selected = 0;
+                self.scroll = 0;
+                return SettingsEffect::None;
+            }
+            SettingId::LaneBack => {
+                self.close_lane();
+                return SettingsEffect::None;
+            }
+            _ => {}
         }
         if matches!(row.control, SettingControl::Action(_))
-            && let Some(action) =
-                subscriptions::action(row.id, &self.subscription_lanes, &self.subscription_editor)
+            && let Some(action) = logins::action(row.id, &self.lanes, &self.login_editor)
         {
             // The name and key have been handed to the action; keeping them in
             // the fields would risk connecting the same login twice.
             if let UiAction::ConnectAccount { lane, .. } | UiAction::AddKeyAccount { lane, .. } =
                 action
             {
-                self.subscription_editor.clear(lane);
+                self.login_editor.clear(lane);
             }
             return SettingsEffect::Apply(Box::new(action));
         }
@@ -1208,7 +1225,7 @@ impl SettingsScreen {
             self.error = None;
             return SettingsEffect::None;
         }
-        if let Some(result) = subscriptions::edit(&mut self.subscription_editor, id, value) {
+        if let Some(result) = logins::edit(&mut self.login_editor, id, value) {
             match result {
                 Ok(()) => self.error = None,
                 Err(error) => {
@@ -1401,6 +1418,18 @@ impl SettingsScreen {
                     .provider_action(SettingId::ProviderBack)
                     .unwrap_or(SettingsEffect::None);
             }
+            KeyCode::Esc if self.open_lane.is_some() => self.close_lane(),
+            KeyCode::Delete => {
+                if let Some(row) = self.selected_row(rows)
+                    && let Some(action) = logins::removal(row.id, &self.lanes)
+                {
+                    if self.confirm_remove == Some(row.id) {
+                        self.confirm_remove = None;
+                        return SettingsEffect::Apply(Box::new(action));
+                    }
+                    self.confirm_remove = Some(row.id);
+                }
+            }
             KeyCode::Esc => return SettingsEffect::Close,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return SettingsEffect::Close;
@@ -1579,17 +1608,10 @@ impl SettingsScreen {
         } else {
             0
         };
-        // A heading that opens a group is set off by one blank line.
-        let gaps: Vec<u16> = visible
-            .iter()
-            .enumerate()
-            .map(|(slot, index)| u16::from(slot > 0 && rows[*index].starts_group()))
-            .collect();
-        let gap_lines: u16 = gaps.iter().sum();
         let rows_need = if visible.is_empty() {
             0
         } else {
-            2 + (visible.len() as u16 * 2 - 1) + gap_lines
+            2 + (visible.len() as u16 * 2 - 1)
         };
         let height = (BODY_CHROME + sidebar_need.max(rows_need))
             .min(MAX_HEIGHT)
@@ -1721,22 +1743,31 @@ impl SettingsScreen {
         // Content heading.
         if self.query.is_empty() {
             let section = SettingsSection::ALL[self.section];
+            let page = self
+                .open_lane
+                .and_then(|position| borg_provider::subscriptions::Lane::ALL.get(position));
+            let title = match page {
+                Some(lane) => format!("{} › {}", section.label(), lane.label()),
+                None => section.label().to_string(),
+            };
             let x = put(
                 buffer,
                 content.x + 2,
                 content.y,
                 content.right(),
-                section.label(),
+                &title,
                 bold(Color::White),
             );
-            put(
-                buffer,
-                x + 2,
-                content.y,
-                content.right(),
-                section.summary(),
-                Style::default().fg(MUTED),
-            );
+            if page.is_none() {
+                put(
+                    buffer,
+                    x + 2,
+                    content.y,
+                    content.right(),
+                    section.summary(),
+                    Style::default().fg(MUTED),
+                );
+            }
         } else {
             let heading = match visible.len() {
                 0 => format!("Nothing matches “{}”", self.query.trim()),
@@ -1760,49 +1791,36 @@ impl SettingsScreen {
             width: content.width,
             height: content.height.saturating_sub(2),
         };
-        let spacing: u16 =
-            if list.height as usize >= (visible.len() * 2).saturating_sub(1) + gap_lines as usize {
-                2
-            } else {
-                1
-            };
-        // Offset of row `to` below row `from` when `from` is the first shown.
-        let offset = |from: usize, to: usize| -> usize {
-            (from + 1..=to)
-                .map(|slot| (spacing + gaps[slot]) as usize)
-                .sum()
+        let spacing: u16 = if list.height as usize >= (visible.len() * 2).saturating_sub(1) {
+            2
+        } else {
+            1
         };
-        let height = list.height as usize;
-        let last = visible.len().saturating_sub(1);
-        self.scroll = self.scroll.min(self.selected);
-        while self.scroll < self.selected && offset(self.scroll, self.selected) >= height {
-            self.scroll += 1;
+        let capacity = list.height.div_ceil(spacing).max(1) as usize;
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + capacity {
+            self.scroll = self.selected + 1 - capacity;
         }
-        while self.scroll > 0 && offset(self.scroll - 1, last) < height {
-            self.scroll -= 1;
-        }
+        self.scroll = self.scroll.min(visible.len().saturating_sub(capacity));
         let mut list_anchor = None;
         let mut caret = None;
-        let mut more = false;
-        for (index, row) in visible
+        for (slot, (index, row)) in visible
             .iter()
             .map(|row| &rows[*row])
             .enumerate()
             .skip(self.scroll)
+            .take(capacity)
+            .enumerate()
         {
-            let line = offset(self.scroll, index);
-            if line >= height {
-                more = true;
-                break;
-            }
-            let y = list.y + line as u16;
+            let y = list.y + slot as u16 * spacing;
             let selected = index == self.selected;
             let row_area = Rect::new(list.x, y, list.width, 1);
             if selected {
                 buffer.set_style(row_area, Style::default().bg(ROW_SELECTED));
             }
             self.hits.push((row_area, Target::Row(index)));
-            let label_style = match (row.enabled, selected || row.starts_group()) {
+            let label_style = match (row.enabled, selected) {
                 (false, _) => Style::default().fg(Color::DarkGray),
                 (true, true) => bold(Color::White),
                 (true, false) => Style::default().fg(Color::Gray),
@@ -1847,6 +1865,7 @@ impl SettingsScreen {
                 list_anchor = Some((row, y));
             }
         }
+        let more = visible.len() > self.scroll + capacity;
 
         // Description of the focused row.
         put(
@@ -2304,7 +2323,7 @@ mod tests {
             title_model: borg_remote::DEFAULT_HELPER_MODEL.to_string(),
             configured_models: Vec::new(),
             custom_providers: Default::default(),
-            subscriptions: Vec::new(),
+            lanes: Vec::new(),
             pinned_models: Vec::new(),
             fallback_chain: Vec::new(),
             fallback_editable: true,
@@ -2313,11 +2332,13 @@ mod tests {
         }
     }
 
+    // Opening a provider from elsewhere (a sign-in, the /login picker) lands
+    // on that provider's own page, and Esc returns to the overview on it.
     #[test]
-    fn opening_subscription_lane_focuses_the_requested_provider() {
+    fn opening_a_provider_shows_its_page_and_esc_returns_to_it() {
         use borg_provider::subscriptions::{Lane, Strategy};
         let mut values = values();
-        values.subscriptions = Lane::ALL
+        values.lanes = Lane::ALL
             .iter()
             .map(|lane| LaneView {
                 lane: *lane,
@@ -2327,12 +2348,19 @@ mod tests {
             })
             .collect();
         let mut screen = SettingsScreen::default();
-        screen.open_subscription_lane(Lane::OpenCode, &values);
+        screen.show_lane(Lane::OpenCode);
         let rows = screen.rows(&values);
-        let selected = screen.selected_row(&rows).unwrap();
-        assert_eq!(selected.id, SettingId::SubscriptionAdd(2));
-        assert!(selected.description.contains("OpenCode Go"));
-        assert_eq!(screen.scroll, screen.selected);
+        let page: Vec<_> = screen
+            .visible(&rows)
+            .iter()
+            .map(|index| rows[*index].id)
+            .collect();
+        assert_eq!(page[0], SettingId::LaneBack);
+        assert!(page.contains(&SettingId::LaneName(2)));
+        assert!(!page.iter().any(|id| matches!(id, SettingId::Lane(_))));
+        screen.handle_key(KeyEvent::from(KeyCode::Esc), &rows);
+        let rows = screen.rows(&values);
+        assert_eq!(screen.selected_row(&rows).unwrap().id, SettingId::Lane(2));
     }
 
     /// The panel is sized to the section it shows, so the description follows

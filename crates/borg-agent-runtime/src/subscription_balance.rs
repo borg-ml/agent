@@ -183,9 +183,13 @@ pub async fn before_turn(provider: CodingProvider) -> Option<String> {
         }),
         None => choose(&accounts, strategy),
     }?;
-    borg_provider::subscriptions::activate(lane, &target)
-        .await
-        .ok()?;
+    borg_provider::subscriptions::activate(
+        lane,
+        borg_provider::subscriptions::AccountKind::Subscription,
+        &target,
+    )
+    .await
+    .ok()?;
     if let Some(key_lane) = lane.key_lane() {
         let _ = borg_provider::key_accounts::mark_used(key_lane, &target);
     }
