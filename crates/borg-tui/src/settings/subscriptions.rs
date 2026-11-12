@@ -40,9 +40,27 @@ pub(crate) struct AccountView {
 pub(crate) struct AccountEditor {
     names: [String; Lane::ALL.len()],
     keys: [String; Lane::ALL.len()],
+    /// Lanes whose add-login form is open.
+    open: [bool; Lane::ALL.len()],
 }
 
 impl AccountEditor {
+    pub(crate) fn open(&self, lane: Lane) -> bool {
+        self.open[lane_index(lane)]
+    }
+
+    /// Open or close a lane's add-login form; closing it forgets the entry.
+    pub(crate) fn toggle(&mut self, lane_position: usize) {
+        let Some(lane) = Lane::ALL.get(lane_position) else {
+            return;
+        };
+        if self.open[lane_position] {
+            self.clear(*lane);
+        } else {
+            self.open[lane_position] = true;
+        }
+    }
+
     pub(crate) fn name(&self, lane: Lane) -> &str {
         &self.names[lane_index(lane)]
     }
@@ -57,6 +75,7 @@ impl AccountEditor {
         let index = lane_index(lane);
         self.names[index].clear();
         self.keys[index].clear();
+        self.open[index] = false;
     }
 }
 
@@ -69,14 +88,14 @@ fn lane_index(lane: Lane) -> usize {
 
 fn row(
     id: SettingId,
-    label: &'static str,
+    label: impl Into<std::borrow::Cow<'static, str>>,
     description: String,
     control: SettingControl,
 ) -> SettingRow {
     SettingRow {
         id,
         section: SettingsSection::Subscriptions,
-        label,
+        label: label.into(),
         description,
         control,
         enabled: true,
@@ -145,97 +164,34 @@ pub(crate) fn list_rows(lanes: &[LaneView], editor: &AccountEditor) -> Vec<Setti
         // slice, so a row always acts on the lane it names.
         let lane_position = lane_index(lane);
         let count = view.accounts.len();
-        let switching = format!(
-            "{} · {} · {}",
-            lane.label(),
-            match count {
-                0 => "no logins yet".to_string(),
-                1 => "1 login".to_string(),
-                count => format!("{count} logins"),
-            },
-            match view.strategy {
-                Strategy::Manual => {
-                    "manual switching keeps the login you pick until you pick another."
-                }
-                Strategy::Headroom => {
-                    "most headroom spends the login with the most quota left, switching only when the selected one runs out or falls well behind."
-                }
-                Strategy::Drain => {
-                    "soonest reset spends the login whose remaining allowance expires first, so quota that would be lost at its reset is used before quota that has longer to live. On a plan that reports no quota, turns rotate instead."
-                }
-            }
-        );
+        let adding = editor.open(lane);
+        let key_lane = lane.key_lane().is_some();
+        // The lane's heading row opens and closes its add-login form, so a
+        // provider with no logins costs one row.
         rows.push(row(
-            Id::SubscriptionStrategy(lane_position),
+            Id::SubscriptionAdd(lane_position),
             lane.label(),
-            switching,
-            SettingControl::Choice {
-                options: Strategy::ALL
-                    .iter()
-                    .map(|strategy| strategy.label().to_string())
-                    .collect(),
-                selected: Strategy::ALL
-                    .iter()
-                    .position(|strategy| *strategy == view.strategy),
-                disabled: vec![false; Strategy::ALL.len()],
+            match (adding, count) {
+                (true, _) => format!("Close the form for a new {} login.", lane.label()),
+                (false, 0) => format!("Connect a {} subscription.", lane.label()),
+                (false, _) => format!(
+                    "Connect another {} subscription alongside {}.",
+                    lane.label(),
+                    match count {
+                        1 => "the current login".to_string(),
+                        count => format!("the {count} current logins"),
+                    }
+                ),
             },
-        ));
-        for (account_position, account) in view.accounts.iter().enumerate() {
-            let state = if account.active {
-                "Turns on this provider use this login now."
-            } else {
-                "Press Enter to make this the login turns spend."
-            };
-            rows.push(row(
-                Id::SubscriptionAccount(lane_position, account_position),
-                "  Login",
-                format!(
-                    "{} · {}{} · {state}",
-                    lane.label(),
-                    detail(account),
-                    if account.active { " · active" } else { "" }
-                ),
-                SettingControl::Action(format!("{}  {}", account.name, capacity(account))),
-            ));
-        }
-        let removals = lane.key_lane().is_some() && count > 1;
-        if removals && let Some(active) = view.accounts.iter().find(|account| account.active) {
-            rows.push(row(
-                Id::SubscriptionRemove(lane_position),
-                "  Remove login",
-                format!(
-                    "Disconnect the {} login named {} from this machine. Another connected login takes over.",
-                    lane.label(),
-                    active.name
-                ),
-                SettingControl::Action(format!("Remove {}", active.name)),
-            ));
-        }
-        rows.push(row(
-            Id::SubscriptionName(lane_position),
-            "  New login",
-            format!(
-                "Name for an additional {} subscription: 1-40 letters, digits, '-' or '_'.",
-                lane.label()
+            SettingControl::Action(
+                match (adding, count) {
+                    (true, _) => "Cancel",
+                    (false, 0) => "Connect",
+                    (false, _) => "Add login",
+                }
+                .to_string(),
             ),
-            SettingControl::Text(editor.name(lane).to_string()),
         ));
-        if lane.key_lane().is_some() {
-            rows.push(row(
-                Id::SubscriptionKey(lane_position),
-                "  New login key",
-                format!(
-                    "The {} key for that login. {}It is kept in Borg's credential store, never in a session or a journal.",
-                    lane.label(),
-                    if lane == Lane::OpenCode { "Get it at opencode.ai/auth. " } else { "" }
-                ),
-                SettingControl::Secret(if editor.key(lane).is_empty() {
-                    String::new()
-                } else {
-                    "•".repeat(editor.key(lane).chars().count().min(24))
-                }),
-            ));
-        }
         if let Some(sign_in) = &view.sign_in {
             rows.push(row(
                 Id::SubscriptionConnect(lane_position),
@@ -251,33 +207,119 @@ pub(crate) fn list_rows(lanes: &[LaneView], editor: &AccountEditor) -> Vec<Setti
                     "Starting…".to_string()
                 }),
             ));
-            continue;
+        } else if adding {
+            rows.push(row(
+                Id::SubscriptionName(lane_position),
+                "  Name",
+                format!(
+                    "Name for the new {} login: 1-40 letters, digits, '-' or '_'.",
+                    lane.label()
+                ),
+                SettingControl::Text(editor.name(lane).to_string()),
+            ));
+            if key_lane {
+                rows.push(row(
+                    Id::SubscriptionKey(lane_position),
+                    "  Key",
+                    format!(
+                        "The {} key for that login. {}It is kept in Borg's credential store, never in a session or a journal.",
+                        lane.label(),
+                        if lane == Lane::OpenCode { "Get it at opencode.ai/auth. " } else { "" }
+                    ),
+                    SettingControl::Secret(if editor.key(lane).is_empty() {
+                        String::new()
+                    } else {
+                        "•".repeat(editor.key(lane).chars().count().min(24))
+                    }),
+                ));
+            }
+            rows.push(row(
+                Id::SubscriptionConnect(lane_position),
+                "",
+                if key_lane {
+                    format!(
+                        "Connect the {} login with the name and key above.",
+                        lane.label()
+                    )
+                } else {
+                    format!(
+                        "Sign in to {} under the name above. Your browser opens; the current login keeps working until the new one succeeds.",
+                        lane.label()
+                    )
+                },
+                SettingControl::Action(
+                    if key_lane { "Save login" } else { "Sign in" }.to_string(),
+                ),
+            ));
         }
-        rows.push(row(
-            Id::SubscriptionConnect(lane_position),
-            "  Add login",
-            match lane.auth_provider().is_some() {
-                true => format!(
-                    "Sign in to another {} subscription under the name above. Your browser opens; the current login keeps working until the new one succeeds.",
-                    lane.label()
-                ),
-                false => format!(
-                    "Connect another {} subscription with the name and key above.",
-                    lane.label()
-                ),
-            },
-            SettingControl::Action(if lane.auth_provider().is_some() {
-                "Sign in".to_string()
+        for (account_position, account) in view.accounts.iter().enumerate() {
+            let state = if account.active {
+                "Turns on this provider use this login now."
             } else {
-                "Save login".to_string()
-            }),
-        ));
+                "Press Enter to make this the login turns spend."
+            };
+            rows.push(row(
+                Id::SubscriptionAccount(lane_position, account_position),
+                format!(
+                    "  {} {}",
+                    if account.active { "●" } else { "○" },
+                    account.name
+                ),
+                format!(
+                    "{} login {} · {} · {state}",
+                    lane.label(),
+                    account.name,
+                    detail(account)
+                ),
+                SettingControl::Action(capacity(account)),
+            ));
+        }
+        if count > 1 {
+            rows.push(row(
+                Id::SubscriptionStrategy(lane_position),
+                "  Switching",
+                match view.strategy {
+                    Strategy::Manual => {
+                        "Manual keeps the login you pick until you pick another."
+                    }
+                    Strategy::Headroom => {
+                        "Most headroom spends the login with the most quota left, switching only when the selected one runs out or falls well behind."
+                    }
+                    Strategy::Drain => {
+                        "Soonest reset spends the login whose remaining allowance expires first, so quota that would be lost at its reset is used before quota that has longer to live. On a plan that reports no quota, turns rotate instead."
+                    }
+                }
+                .to_string(),
+                SettingControl::Choice {
+                    options: Strategy::ALL
+                        .iter()
+                        .map(|strategy| strategy.label().to_string())
+                        .collect(),
+                    selected: Strategy::ALL
+                        .iter()
+                        .position(|strategy| *strategy == view.strategy),
+                    disabled: vec![false; Strategy::ALL.len()],
+                },
+            ));
+            if key_lane && let Some(active) = view.accounts.iter().find(|account| account.active) {
+                rows.push(row(
+                    Id::SubscriptionRemove(lane_position),
+                    "  Remove login",
+                    format!(
+                        "Disconnect the {} login named {} from this machine. Another connected login takes over.",
+                        lane.label(),
+                        active.name
+                    ),
+                    SettingControl::Action(format!("Remove {}", active.name)),
+                ));
+            }
+        }
     }
     rows
 }
 
-/// Accept the text a `New login` or `New login key` field just committed.
-/// Both are kept in the editor so `Add login` can use them, so there is
+/// Accept the text a `Name` or `Key` field just committed.
+/// Both are kept in the editor so `Sign in` or `Save login` can use them, so there is
 /// nothing to send yet.
 pub(crate) fn edit(editor: &mut AccountEditor, id: SettingId, value: &str) -> Option<Result<()>> {
     match id {
@@ -473,7 +515,7 @@ mod tests {
             .filter(|row| matches!(row.id, SettingId::SubscriptionAccount(..)))
             .map(|row| {
                 (
-                    row.description.clone(),
+                    format!("{} {}", row.label, row.description),
                     match &row.control {
                         SettingControl::Action(value) => value.clone(),
                         other => panic!("an account row must be an action, got {other:?}"),
@@ -482,10 +524,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(accounts.len(), 3);
-        assert!(accounts[0].1.contains("default") && accounts[0].1.contains("5-hour 0%"));
-        assert!(accounts[0].0.contains("active"));
-        assert!(accounts[1].1.contains("work") && accounts[1].1.contains("5-hour 62%"));
-        assert!(!accounts[1].0.contains("active"));
+        assert!(accounts[0].0.contains("● default") && accounts[0].1.contains("5-hour 0%"));
+        assert!(accounts[1].0.contains("○ work") && accounts[1].1.contains("5-hour 62%"));
         assert!(accounts[2].1.contains("no quota reported"));
         assert!(
             rows.iter()

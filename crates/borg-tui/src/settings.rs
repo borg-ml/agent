@@ -120,6 +120,7 @@ pub(crate) enum SettingId {
     ProviderModelSave,
     ProviderModelDelete,
 
+    SubscriptionAdd(usize),
     SubscriptionStrategy(usize),
     SubscriptionAccount(usize, usize),
     SubscriptionName(usize),
@@ -195,10 +196,17 @@ pub(crate) enum SettingControl {
 pub(crate) struct SettingRow {
     pub(crate) id: SettingId,
     pub(crate) section: SettingsSection,
-    pub(crate) label: &'static str,
+    pub(crate) label: std::borrow::Cow<'static, str>,
     pub(crate) description: String,
     pub(crate) control: SettingControl,
     pub(crate) enabled: bool,
+}
+
+impl SettingRow {
+    /// Whether this row heads a group of indented rows beneath it.
+    fn starts_group(&self) -> bool {
+        matches!(self.id, SettingId::SubscriptionAdd(_))
+    }
 }
 
 /// Everything the screen displays, read from live state each frame.
@@ -294,10 +302,10 @@ fn alert_policy(index: usize) -> CompletionAlertPolicy {
 pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
     use SettingId as Id;
     use SettingsSection as Section;
-    let row = |id, section, label, description: &str, control| SettingRow {
+    let row = |id, section, label: &'static str, description: &str, control| SettingRow {
         id,
         section,
-        label,
+        label: label.into(),
         description: description.to_string(),
         control,
         enabled: true,
@@ -746,10 +754,10 @@ fn helper_rows(kind: HelperKind, spec: &str, values: &SettingsValues) -> [Settin
     let optional =
         borg_provider::gateway_effort_is_optional(model.model_id(), &values.configured_models)
             || effort_is_optional(model.provider(), Some(model.model_id()));
-    let row = |id, label, description: String, control| SettingRow {
+    let row = |id, label: &'static str, description: String, control| SettingRow {
         id,
         section: SettingsSection::Helpers,
-        label,
+        label: label.into(),
         description,
         control,
         enabled: true,
@@ -960,7 +968,7 @@ impl SettingsScreen {
         self.selected = self
             .visible(&rows)
             .iter()
-            .position(|index| rows[*index].id == SettingId::SubscriptionStrategy(lane_index))
+            .position(|index| rows[*index].id == SettingId::SubscriptionAdd(lane_index))
             .unwrap_or(0);
         self.scroll = self.selected;
     }
@@ -1136,6 +1144,10 @@ impl SettingsScreen {
             let mut pinned = self.pinned_models.clone();
             pinned.remove(index);
             return SettingsEffect::Apply(Box::new(UiAction::SetPinnedModels(pinned)));
+        }
+        if let SettingId::SubscriptionAdd(lane) = row.id {
+            self.subscription_editor.toggle(lane);
+            return SettingsEffect::None;
         }
         if matches!(row.control, SettingControl::Action(_))
             && let Some(action) =
@@ -1567,10 +1579,17 @@ impl SettingsScreen {
         } else {
             0
         };
+        // A heading that opens a group is set off by one blank line.
+        let gaps: Vec<u16> = visible
+            .iter()
+            .enumerate()
+            .map(|(slot, index)| u16::from(slot > 0 && rows[*index].starts_group()))
+            .collect();
+        let gap_lines: u16 = gaps.iter().sum();
         let rows_need = if visible.is_empty() {
             0
         } else {
-            2 + (visible.len() as u16 * 2 - 1)
+            2 + (visible.len() as u16 * 2 - 1) + gap_lines
         };
         let height = (BODY_CHROME + sidebar_need.max(rows_need))
             .min(MAX_HEIGHT)
@@ -1741,36 +1760,49 @@ impl SettingsScreen {
             width: content.width,
             height: content.height.saturating_sub(2),
         };
-        let spacing: u16 = if list.height as usize >= (visible.len() * 2).saturating_sub(1) {
-            2
-        } else {
-            1
+        let spacing: u16 =
+            if list.height as usize >= (visible.len() * 2).saturating_sub(1) + gap_lines as usize {
+                2
+            } else {
+                1
+            };
+        // Offset of row `to` below row `from` when `from` is the first shown.
+        let offset = |from: usize, to: usize| -> usize {
+            (from + 1..=to)
+                .map(|slot| (spacing + gaps[slot]) as usize)
+                .sum()
         };
-        let capacity = list.height.div_ceil(spacing).max(1) as usize;
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + capacity {
-            self.scroll = self.selected + 1 - capacity;
+        let height = list.height as usize;
+        let last = visible.len().saturating_sub(1);
+        self.scroll = self.scroll.min(self.selected);
+        while self.scroll < self.selected && offset(self.scroll, self.selected) >= height {
+            self.scroll += 1;
         }
-        self.scroll = self.scroll.min(visible.len().saturating_sub(capacity));
+        while self.scroll > 0 && offset(self.scroll - 1, last) < height {
+            self.scroll -= 1;
+        }
         let mut list_anchor = None;
         let mut caret = None;
-        for (slot, (index, row)) in visible
+        let mut more = false;
+        for (index, row) in visible
             .iter()
             .map(|row| &rows[*row])
             .enumerate()
             .skip(self.scroll)
-            .take(capacity)
-            .enumerate()
         {
-            let y = list.y + slot as u16 * spacing;
+            let line = offset(self.scroll, index);
+            if line >= height {
+                more = true;
+                break;
+            }
+            let y = list.y + line as u16;
             let selected = index == self.selected;
             let row_area = Rect::new(list.x, y, list.width, 1);
             if selected {
                 buffer.set_style(row_area, Style::default().bg(ROW_SELECTED));
             }
             self.hits.push((row_area, Target::Row(index)));
-            let label_style = match (row.enabled, selected) {
+            let label_style = match (row.enabled, selected || row.starts_group()) {
                 (false, _) => Style::default().fg(Color::DarkGray),
                 (true, true) => bold(Color::White),
                 (true, false) => Style::default().fg(Color::Gray),
@@ -1815,7 +1847,6 @@ impl SettingsScreen {
                 list_anchor = Some((row, y));
             }
         }
-        let more = visible.len() > self.scroll + capacity;
 
         // Description of the focused row.
         put(
@@ -2043,7 +2074,11 @@ impl SettingsScreen {
                     "••••••••"
                 };
                 let masked_editing = editing.map(|value| "•".repeat(value.chars().count()));
-                let value = if secret { masked_value } else { value.as_str() };
+                let value = if secret || value.is_empty() {
+                    masked_value
+                } else {
+                    value.as_str()
+                };
                 let editing = if secret {
                     masked_editing.as_deref()
                 } else {
@@ -2295,7 +2330,7 @@ mod tests {
         screen.open_subscription_lane(Lane::OpenCode, &values);
         let rows = screen.rows(&values);
         let selected = screen.selected_row(&rows).unwrap();
-        assert_eq!(selected.id, SettingId::SubscriptionStrategy(2));
+        assert_eq!(selected.id, SettingId::SubscriptionAdd(2));
         assert!(selected.description.contains("OpenCode Go"));
         assert_eq!(screen.scroll, screen.selected);
     }

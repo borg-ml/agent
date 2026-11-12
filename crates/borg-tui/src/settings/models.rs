@@ -20,7 +20,7 @@ pub(crate) fn list_rows(
         rows.push(SettingRow {
             id: Id::ModelPin(usize::MAX),
             section: SettingsSection::Models,
-            label: "Pinned models",
+            label: "Pinned models".into(),
             description: format!(
                 "No models pinned yet. Open the model picker and press {} on a model to pin it here, first in every picker on this machine.",
                 borg_ui::control_shortcut('p')
@@ -33,7 +33,7 @@ pub(crate) fn list_rows(
         rows.push(SettingRow {
             id: Id::ModelPin(index),
             section: SettingsSection::Models,
-            label: "Pinned model",
+            label: "Pinned model".into(),
             description: format!(
                 "{model} · pinned, so it appears first in every model picker. Press Enter to unpin it."
             ),
@@ -45,7 +45,7 @@ pub(crate) fn list_rows(
         rows.push(SettingRow {
             id: Id::FallbackEntry(usize::MAX),
             section: SettingsSection::Models,
-            label: "Fallback chain",
+            label: "Fallback chain".into(),
             description: "No fallback chain. A session runs the first route that has quota; when that route reaches its usage limit it continues on the next one, and only waits when every route is limited.".to_string(),
             control: SettingControl::Action("Empty".to_string()),
             enabled: false,
@@ -74,7 +74,7 @@ pub(crate) fn list_rows(
         rows.push(SettingRow {
             id: Id::FallbackEntry(index),
             section: SettingsSection::Models,
-            label: "Fallback",
+            label: "Fallback".into(),
             description: format!(
                 "Step {} of {}: {spec}. A turn runs the first route with quota and continues down the chain when a route hits its usage limit. “↑ up” moves it earlier, “↓ down” later, “✕ remove” drops it.",
                 index + 1,
@@ -92,7 +92,7 @@ pub(crate) fn list_rows(
         rows.push(SettingRow {
             id: Id::FallbackNew,
             section: SettingsSection::Models,
-            label: "New fallback",
+            label: "New fallback".into(),
             description: "A route to add at the end of the chain: a model id, `model@effort`, or `provider/model@effort`.".to_string(),
             control: SettingControl::Text(new_route.to_string()),
             enabled: true,
@@ -100,7 +100,7 @@ pub(crate) fn list_rows(
         rows.push(SettingRow {
             id: Id::FallbackAdd,
             section: SettingsSection::Models,
-            label: "Add fallback",
+            label: "Add fallback".into(),
             description: "Append the route above to the chain. It is saved to the agent configuration, so sessions started afterwards use it."
                 .to_string(),
             control: SettingControl::Action("Add".to_string()),

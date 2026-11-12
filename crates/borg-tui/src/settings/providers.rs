@@ -26,7 +26,7 @@ fn row(
     SettingRow {
         id,
         section: SettingsSection::Providers,
-        label,
+        label: label.into(),
         description: description.into(),
         control,
         enabled: true,

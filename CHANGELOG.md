@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.20.12)
 
+- Settings › Subscriptions is tidier. Each provider gets one bold heading with
+  `Connect` or `Add login`, and the name and key fields appear only after you
+  press it. Logins are listed by name, with ● marking the one turns spend. The
+  switching strategy appears only when a provider has two or more logins, and
+  providers are separated by blank lines.
 - Backspace and Delete in the TUI composer now delete the highlighted
   selection instead of one character next to it.
 - A subagent that ends its turn with its own background jobs still running
