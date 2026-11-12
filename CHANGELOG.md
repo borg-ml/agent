@@ -5,6 +5,16 @@ Git comparison.
 
 ## Unreleased (since 0.20.12)
 
+- On Windows, reading Borg's output through a pipe (`borg doctor | more`, a
+  script, CI) no longer hangs after Borg exits. The session cluster Borg
+  starts kept Borg's own stdout open for as long as it ran, so the reader
+  waited on PostgreSQL instead of on Borg.
+- Borg finds the PostgreSQL the installer sets up (under
+  `%LOCALAPPDATA%\Borg\postgres` on Windows, `~/.local/share/borg/postgres`
+  elsewhere) even in a terminal opened before the install, and Homebrew's
+  `postgresql@NN` and Postgres.app, which are not linked into `bin`. When none
+  is found, Borg says to re-run the installer, which now sets PostgreSQL up.
+
 - Resuming a long thread with many subagents no longer stalls for seconds
   before the first frame. Both the background session host and the terminal
   rebuilt the team roster with a query that walked every subagent activity row

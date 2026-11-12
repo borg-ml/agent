@@ -107,8 +107,11 @@ const BINARY_SEARCH_PREFIXES: &[&str] = &[
     "/usr/lib/postgresql",
     "/usr/pgsql",
     "/usr/local/pgsql/bin",
-    "/usr/local/opt/postgresql/bin",
-    "/opt/homebrew/opt/postgresql/bin",
+    // Homebrew's versioned formulae (`postgresql@17`) are keg-only, so their
+    // binaries are never linked into `bin`; expanding `opt` finds them.
+    "/opt/homebrew/opt",
+    "/usr/local/opt",
+    "/Applications/Postgres.app/Contents/Versions",
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/usr/bin",
@@ -500,6 +503,8 @@ impl ManagedCluster {
             .open(&output_path)
             .with_context(|| format!("could not open {}", output_path.display()))?;
         let output_start = output.metadata().map_or(0, |metadata| metadata.len());
+        #[cfg(windows)]
+        stop_children_inheriting_std_handles();
         let mut command = Command::new(pg_ctl);
         // Its own hidden console, so closing or interrupting this Borg's
         // terminal does not stop a postmaster other Borg processes share.
@@ -919,6 +924,39 @@ fn last_error_line(stderr: &[u8]) -> String {
         .to_string()
 }
 
+/// Keep this process's own stdin/stdout/stderr out of every child it spawns.
+///
+/// Windows hands a child every inheritable handle the parent holds, not just
+/// the three it is given, and `pg_ctl` passes them on to the postmaster. When
+/// Borg's output is a pipe (`borg doctor | more`, a script, CI), the
+/// postmaster then holds the caller's pipe open for as long as the cluster
+/// runs, so the caller never sees end-of-file and hangs after Borg exits.
+/// Clearing the flag is safe for every other child: `Stdio::inherit`
+/// duplicates the handle as inheritable for that child alone.
+#[cfg(windows)]
+fn stop_children_inheriting_std_handles() {
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(which: u32) -> *mut std::ffi::c_void;
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle has no preconditions. A null or invalid handle
+        // (no console, detached service) makes SetHandleInformation fail
+        // harmlessly, and there is nothing to un-inherit in that case.
+        unsafe {
+            let handle = GetStdHandle(which);
+            if !handle.is_null() && handle as isize != -1 {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
 /// Find a PostgreSQL server binary, or explain how to install one.
 fn locate_binary(name: &str) -> Result<PathBuf> {
     #[cfg(windows)]
@@ -929,7 +967,7 @@ fn locate_binary(name: &str) -> Result<PathBuf> {
     bail!(
         "Borg defaults to PostgreSQL so several agents can write at once, but `{name}` \
          was not found on this machine.\n\n\
-         Install PostgreSQL:\n{}\n\n\
+         Re-run the Borg installer, which sets PostgreSQL up:\n{}\n\n\
          Or point Borg at a server you already run:\n  \
          BORG_SESSIONS_URL=postgres://user@host/db",
         install_hint()
@@ -954,6 +992,7 @@ fn search_prefixes(name: &str) -> Option<PathBuf> {
         .map(|root| PathBuf::from(root).join("PostgreSQL"))
         .into_iter()
         .chain(prefixes);
+    let prefixes = installer_postgres_dir().into_iter().chain(prefixes);
     for prefix in prefixes {
         let direct = prefix.join(name);
         if is_executable(&direct) {
@@ -991,15 +1030,25 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+/// Where the Borg installer puts its portable PostgreSQL, one directory per
+/// version (`<dir>/18.6/bin`). Kept in step with `install` and `install.ps1`.
+fn installer_postgres_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let data = std::env::var_os("LOCALAPPDATA").map(|root| PathBuf::from(root).join("Borg"));
+    #[cfg(not(windows))]
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .map(|root| root.join("borg"));
+    data.map(|root| root.join("postgres"))
+}
+
 fn install_hint() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "  brew install postgresql@17"
-    } else if cfg!(target_os = "windows") {
-        "  winget install --id PostgreSQL.PostgreSQL.18 --exact"
+    if cfg!(target_os = "windows") {
+        "  irm https://borg.ml/install.ps1 | iex"
     } else {
-        "  Debian/Ubuntu:  sudo apt install postgresql\n  \
-           Fedora/RHEL:    sudo dnf install postgresql-server\n  \
-           Arch:           sudo pacman -S postgresql"
+        "  curl -fsSL https://borg.ml/install | sh"
     }
 }
 

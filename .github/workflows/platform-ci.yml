@@ -81,6 +81,25 @@ jobs:
           fi
           "$binary" --version
           "$binary" --help >/dev/null
+      # The managed cluster outlives the Borg that started it. If it inherits
+      # Borg's stdout, anything reading Borg's output through a pipe (scripts,
+      # CI, `borg doctor | more`) waits on the cluster instead of on Borg.
+      - name: Piped borg doctor finishes while its session cluster keeps running
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $binary = Resolve-Path "target/${{ matrix.target }}/release/borg.exe"
+          $env:BORG_HOME = Join-Path $env:RUNNER_TEMP "borg-doctor-home"
+          if (-not (Get-Command pg_ctl -ErrorAction SilentlyContinue)) {
+            $env:Path = "$(Join-Path $env:RUNNER_TEMP 'postgres/pgsql/bin');$env:Path"
+          }
+          $job = Start-Job { & $using:binary doctor 2>&1 | Out-String }
+          $finished = Wait-Job $job -Timeout 120
+          $output = Receive-Job $job | Out-String
+          $output
+          cmd /c "pg_ctl -D `"$env:BORG_HOME\pgdata`" -m fast -w stop > NUL 2>&1"
+          if (-not $finished) { throw "borg doctor's output pipe stayed open after Borg exited" }
+          if ($output -notmatch "Durable session store: ready") { throw "borg doctor did not start its session cluster" }
       - name: Package and extract-smoke the Unix archive
         if: matrix.archive == 'tar'
         shell: bash
